@@ -25,7 +25,18 @@
     "@medusajs/admin-sdk": "2.11.3",
     "@medusajs/cli": "2.11.3",
     "@medusajs/framework": "2.11.3",
-    "@medusajs/medusa": "2.11.3"
+    "@medusajs/icons": "2.11.3",
+    "@medusajs/medusa": "2.11.3",
+    "@medusajs/ui": "4.0.25",
+    "@mercurjs/b2c-core": "^1.5.3",
+    "@mercurjs/commission": "^1.5.3",
+    "@mercurjs/framework": "^1.5.3",
+    "@mercurjs/requests": "^1.5.3",
+    "@mercurjs/resend": "^1.5.3",
+    "@mercurjs/reviews": "^1.5.3",
+    "awilix": "^8.0.1",
+    "posthog-node": "^5.11.0",
+    "resend": "^4.1.2"
   },
   "devDependencies": {
     "@medusajs/test-utils": "2.11.3",
