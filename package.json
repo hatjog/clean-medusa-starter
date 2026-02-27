@@ -20,6 +20,8 @@
     "gp-config-mcp": "ts-node ./mcp/gp-config-mcp.ts",
     "gp-market-storefront-key": "ts-node ./mcp/gp-market-storefront-key.ts",
     "seed": "medusa exec ./src/scripts/seed.ts",
+    "gp-config-sync-catalog": "medusa exec ./src/scripts/gp-config-sync-catalog.ts",
+    "gp-config-sync-media": "medusa exec ./src/scripts/gp-config-sync-media.ts",
     "test:integration:http": "TEST_TYPE=integration:http NODE_OPTIONS=--experimental-vm-modules jest --silent=false --runInBand --forceExit",
     "test:integration:modules": "TEST_TYPE=integration:modules NODE_OPTIONS=--experimental-vm-modules jest --silent=false --runInBand --forceExit",
     "test:unit": "TEST_TYPE=unit NODE_OPTIONS=--experimental-vm-modules jest --silent --runInBand --forceExit"
