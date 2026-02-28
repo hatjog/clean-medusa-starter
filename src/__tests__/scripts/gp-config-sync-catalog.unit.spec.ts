@@ -148,10 +148,9 @@ describe("normalizeHandle", () => {
     expect(normalizeHandle("Twarz i Szyja")).toBe("twarz-i-szyja")
   })
 
-  it("strips special characters (non-alphanumeric become empty, may leave double hyphens)", () => {
-    // "Hair & Care!" → lowercase → "hair-&-care!" → strip special → "hair--care"
-    // The function does not collapse consecutive hyphens by design
-    expect(normalizeHandle("Hair & Care!")).toBe("hair--care")
+  it("strips special characters and collapses consecutive hyphens", () => {
+    // "Hair & Care!" → lowercase → "hair-&-care!" → strip special → "hair--care" → collapse → "hair-care"
+    expect(normalizeHandle("Hair & Care!")).toBe("hair-care")
   })
 
   it("collapses multiple spaces to single hyphen", () => {
@@ -164,6 +163,10 @@ describe("normalizeHandle", () => {
 
   it("returns empty string for empty input", () => {
     expect(normalizeHandle("")).toBe("")
+  })
+
+  it("trims leading and trailing hyphens", () => {
+    expect(normalizeHandle("---test---")).toBe("test")
   })
 })
 

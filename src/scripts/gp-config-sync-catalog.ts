@@ -106,6 +106,8 @@ export function normalizeHandle(str: string): string {
     .toLowerCase()
     .replace(/\s+/g, "-")
     .replace(/[^a-z0-9-]/g, "")
+    .replace(/-{2,}/g, "-")   // collapse consecutive hyphens
+    .replace(/^-|-$/g, "")    // trim leading/trailing hyphens
 }
 
 async function listAll(service: any, methodNames: string[], query: object = {}): Promise<any[]> {
