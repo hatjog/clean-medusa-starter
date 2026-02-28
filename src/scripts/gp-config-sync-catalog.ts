@@ -261,6 +261,7 @@ export async function syncCategories(
 
   // Pre-validate: unique handles in fixture
   const handleSet = new Set<string>()
+  const skipCategoryIds = new Set<string>()
   for (const cat of active) {
     const h = normalizeHandle((cat.handle ?? cat.slug ?? "").trim())
     if (!h) continue
@@ -268,6 +269,7 @@ export async function syncCategories(
       warnings.push(
         `Category '${cat.category_id}': duplicate handle '${h}' in fixture, second occurrence skipped`
       )
+      skipCategoryIds.add(cat.category_id)
     }
     handleSet.add(h)
   }
@@ -289,6 +291,11 @@ export async function syncCategories(
     const handle = normalizeHandle((cat.handle ?? cat.slug ?? "").trim())
     if (!handle) {
       warnings.push(`Category '${cat.category_id}': missing handle/slug, skipping`)
+      continue
+    }
+
+    if (skipCategoryIds.has(cat.category_id)) {
+      counts.skipped++
       continue
     }
 
