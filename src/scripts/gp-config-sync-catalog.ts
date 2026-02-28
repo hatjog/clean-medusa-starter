@@ -60,7 +60,7 @@ type Prerequisites = {
 
 // ---- Utilities (pattern from gp-config-sync-media) ----
 
-function parseArgs(args: string[] | undefined): {
+export function parseArgs(args: string[] | undefined): {
   instanceId: string
   marketId: string
   configRoot: string
@@ -101,7 +101,7 @@ function resolveService(container: any, keysToTry: string[]): any {
   )
 }
 
-function normalizeHandle(str: string): string {
+export function normalizeHandle(str: string): string {
   return str
     .toLowerCase()
     .replace(/\s+/g, "-")
@@ -124,7 +124,7 @@ async function listAll(service: any, methodNames: string[], query: object = {}):
 
 // ---- Prerequisites ----
 
-async function validatePrerequisites(
+export async function validatePrerequisites(
   container: any,
   marketId: string,
   currency: string,
@@ -248,7 +248,7 @@ async function validatePrerequisites(
 
 // ---- Category Sync (two-pass) ----
 
-async function syncCategories(
+export async function syncCategories(
   productModuleService: any,
   categories: FixtureCategory[],
   marketId: string,
@@ -389,7 +389,7 @@ async function syncCategories(
 
 // ---- Collection Sync ----
 
-async function syncCollections(
+export async function syncCollections(
   productModuleService: any,
   collections: FixtureCollection[],
   marketId: string,
@@ -471,7 +471,7 @@ async function syncCollections(
 
 // ---- Product Sync ----
 
-async function syncProducts(
+export async function syncProducts(
   container: any,
   productModuleService: any,
   products: FixtureProduct[],
