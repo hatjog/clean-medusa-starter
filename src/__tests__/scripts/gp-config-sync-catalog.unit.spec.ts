@@ -181,11 +181,8 @@ describe("validatePrerequisites", () => {
   })
 
   it("throws when no sales channel found for market", async () => {
-    const container = makeContainer({
-      salesChannelModuleService: {
-        listSalesChannels: jest.fn().mockResolvedValue([]),
-      },
-    })
+    // Default mock has "bonbeauty" channel only — "unknown-market" won't match any
+    const container = makeContainer()
     const warnings: string[] = []
     await expect(validatePrerequisites(container, "unknown-market", "PLN", warnings)).rejects.toThrow(
       /Sales channel not found for market 'unknown-market'/
@@ -298,21 +295,53 @@ describe("syncCategories", () => {
     expect(svc.listProductCategories).toHaveBeenCalledTimes(1)
   })
 
-  it("warns on duplicate handles in fixture", async () => {
+  it("warns on duplicate handles in fixture and skips second occurrence", async () => {
     const svc = makeProductModuleService()
     const warnings: string[] = []
 
-    await syncCategories(
+    const { counts } = await syncCategories(
       svc,
       [
         { category_id: "cat-1", name: "Cat A", handle: "twarz" },
-        { category_id: "cat-2", name: "Cat B", handle: "twarz" }, // duplicate
+        { category_id: "cat-2", name: "Cat B", handle: "twarz" }, // duplicate — must be skipped
       ],
       "bonbeauty",
       warnings
     )
 
     expect(warnings.some((w) => w.includes("duplicate handle"))).toBe(true)
+    // Second occurrence must be actually skipped (not just warned)
+    expect(counts.created).toBe(1)
+    expect(counts.skipped).toBe(1)
+  })
+
+  it("3x run is idempotent — counts stable across runs (AC-2 idempotency)", async () => {
+    const categories = [{ category_id: "cat-1", name: "Twarz", handle: "twarz" }]
+    const existingCategory = [
+      { id: "medusa-cat-twarz", handle: "twarz", metadata: { gp: { market_id: "bonbeauty" } } },
+    ]
+
+    // First run: category does not exist → creates
+    const svc1 = makeProductModuleService()
+    const { counts: counts1 } = await syncCategories(svc1, categories, "bonbeauty", [])
+    expect(counts1.created).toBe(1)
+    expect(counts1.updated).toBe(0)
+
+    // Second run: same fixture, category exists → updates (not creates)
+    const svc2 = makeProductModuleService({
+      listProductCategories: jest.fn().mockResolvedValue(existingCategory),
+    })
+    const { counts: counts2 } = await syncCategories(svc2, categories, "bonbeauty", [])
+    expect(counts2.created).toBe(0)
+    expect(counts2.updated).toBe(1)
+
+    // Third run: same fixture again → still updates (counts stable, no drift)
+    const svc3 = makeProductModuleService({
+      listProductCategories: jest.fn().mockResolvedValue(existingCategory),
+    })
+    const { counts: counts3 } = await syncCategories(svc3, categories, "bonbeauty", [])
+    expect(counts3.created).toBe(0)
+    expect(counts3.updated).toBe(1)
   })
 
   it("skips category with missing handle and pushes warning (H-8)", async () => {
@@ -527,6 +556,42 @@ describe("syncProducts", () => {
     )
 
     expect(warnings.some((w) => w.includes("category_id") && w.includes("not in category map"))).toBe(true)
+  })
+
+  it("update payload does not contain variants or prices — pricing preserved (H-4, AC-2)", async () => {
+    // Existing product with matching market
+    const svc = makeProductModuleService({
+      listProducts: jest.fn().mockResolvedValue([
+        {
+          id: "existing-prod",
+          handle: "nail-art",
+          categories: [],
+          metadata: { gp: { market_id: "bonbeauty" } },
+        },
+      ]),
+    })
+    const warnings: string[] = []
+
+    await syncProducts(
+      makeContainer2(),
+      svc,
+      [{ product_id: "p-nail", name: "Nail Art", handle: "nail-art", base_price: { amount: 50, currency: "PLN" } }],
+      prereqs,
+      emptyMaps.categoryMap,
+      emptyMaps.collectionMap,
+      "bonbeauty",
+      warnings
+    )
+
+    // Must have triggered an update (not create) for existing product
+    expect(svc.updateProducts).toHaveBeenCalledTimes(1)
+
+    // H-4: updateProducts payload must NOT contain variants or prices (preserve existing pricing)
+    const [, updatePayload] = (svc.updateProducts as jest.Mock).mock.calls[0]
+    expect(updatePayload).not.toHaveProperty("variants")
+    expect(updatePayload).not.toHaveProperty("prices")
+    expect(updatePayload).toHaveProperty("title", "Nail Art")
+    expect(updatePayload).toHaveProperty("status", "published")
   })
 
   it("filters out inactive products (D-3)", async () => {
