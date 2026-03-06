@@ -19,7 +19,8 @@ module.exports = {
     ],
   },
   testEnvironment: "node",
-  moduleFileExtensions: ["js", "ts", "json"],
+  // Prefer TS sources over generated JS when tests reach into sibling packages.
+  moduleFileExtensions: ["ts", "js", "json"],
   modulePathIgnorePatterns: ["dist/", "<rootDir>/.medusa/"],
   setupFiles: ["./integration-tests/setup.js"],
 };

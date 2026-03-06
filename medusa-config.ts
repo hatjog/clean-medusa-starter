@@ -42,6 +42,13 @@ module.exports = defineConfig({
     },
   ],
   modules: {
+    gp_core: {
+      resolve: "./src/modules/gp-core",
+      options: {
+        databaseUrl: process.env.GP_CORE_DATABASE_URL,
+        mercurDatabaseUrl: process.env.GP_MERCUR_DATABASE_URL || process.env.DATABASE_URL,
+      },
+    },
     event_bus: {
       resolve: "@medusajs/event-bus-redis",
       options: {

@@ -15,7 +15,28 @@
  * Running this submodule standalone will fail. See jest.config.js note.
  */
 
-import { initMarket, buildMarketConfigCreateData } from "../../../portal/src/lib/initMarket"
+let initMarket: (args: {
+  payload: unknown
+  user: { role?: string } | null
+  body: unknown
+}) => Promise<{ status: number; body: Record<string, unknown> }>
+
+let buildMarketConfigCreateData: (args: {
+  template: Record<string, unknown>
+  vendor: Record<string, unknown>
+}) => Record<string, unknown>
+
+function loadPortalInitMarketModule(): Promise<{
+  initMarket: typeof initMarket
+  buildMarketConfigCreateData: typeof buildMarketConfigCreateData
+}> {
+  return eval('import("../../../portal/src/lib/initMarket.js")')
+}
+
+beforeAll(async () => {
+  ;({ initMarket, buildMarketConfigCreateData } =
+    await loadPortalInitMarketModule())
+})
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -239,16 +260,28 @@ describe("initMarket — 422 Validation", () => {
 // ---------------------------------------------------------------------------
 
 describe("buildMarketConfigCreateData", () => {
-  it("includes all non-null template fields in create data", () => {
+  it("includes all non-null template fields in create data and canonicalizes homepage sections", () => {
     const vendor = makeVendor()
-    const template = makeTemplate({ homepage_sections: [{ type: "hero" }], footer: { copyright: "GP" } })
+    const template = makeTemplate({
+      homepage_sections: [{ blockType: "hero", heading: "Legacy Hero" }],
+      footer: { copyright: "GP" },
+    })
 
     const data = buildMarketConfigCreateData({ template, vendor })
 
     expect(data.market_id).toBe("bonbeauty")
     expect(data.slug).toBe("bonbeauty")
     expect(data.storefront_template).toBe("tmpl-1")
-    expect(data.homepage_sections).toEqual([{ type: "hero" }])
+    expect(data.homepage_sections).toMatchObject([
+      { blockType: "hero", heading: "Legacy Hero" },
+      { blockType: "products_carousel" },
+      { blockType: "categories_grid" },
+      { blockType: "banner", label: "Explore collection", cta_link: "/collections" },
+      { blockType: "style_section" },
+      { blockType: "blog_section" },
+    ])
+    expect(Array.isArray(data.homepage_sections)).toBe(true)
+    expect((data.homepage_sections as Array<unknown>)).toHaveLength(6)
     expect(data.footer).toEqual({ copyright: "GP" })
   })
 
