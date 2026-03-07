@@ -20,12 +20,14 @@ jest.mock("../../lib/rls-pool-hook", () => ({
 }));
 
 function createMockContainer() {
+  const logger = { error: jest.fn() };
+
   mockResolve.mockImplementation((key: string) => {
     if (key === "__pg_connection__") return { raw: mockRaw };
-    if (key === "logger") return { error: jest.fn() };
+    if (key === "logger") return logger;
     return undefined;
   });
-  return { resolve: mockResolve } as any;
+  return { resolve: mockResolve, logger } as any;
 }
 
 beforeEach(() => {
@@ -192,7 +194,10 @@ describe("MarketContextCache", () => {
 
     await marketContextCacheLoader({ container });
 
-    expect(mockInstallRlsPoolHook).toHaveBeenCalledWith({ raw: mockRaw });
+    expect(mockInstallRlsPoolHook).toHaveBeenCalledWith(
+      { raw: mockRaw },
+      container.logger
+    );
     expect(marketContextCache.get("sc_001")).toBe("bonbeauty");
 
     marketContextCache.destroy();

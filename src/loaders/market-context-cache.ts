@@ -1,6 +1,6 @@
 import type { MedusaContainer } from "@medusajs/types";
 import { ContainerRegistrationKeys } from "@medusajs/framework/utils";
-import { installRlsPoolHook } from "../lib/rls-pool-hook";
+import { installRlsPoolHook, type HookLogger } from "../lib/rls-pool-hook";
 
 const TTL_MS = 60_000;
 
@@ -11,7 +11,7 @@ function resolveLogger(container: MedusaContainer | null) {
 
   try {
     return container.resolve(ContainerRegistrationKeys.LOGGER) as
-      | { error?: (...args: unknown[]) => void }
+      | HookLogger
       | undefined;
   } catch {
     return undefined;
@@ -122,6 +122,6 @@ export default async function marketContextCacheLoader({
   container: MedusaContainer;
 }): Promise<void> {
   const pgConnection = container.resolve(ContainerRegistrationKeys.PG_CONNECTION);
-  installRlsPoolHook(pgConnection);
+  installRlsPoolHook(pgConnection, resolveLogger(container));
   await marketContextCache.ensureLoaded(container);
 }
