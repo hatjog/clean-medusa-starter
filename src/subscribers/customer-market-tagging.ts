@@ -1,5 +1,8 @@
 import type { SubscriberArgs, SubscriberConfig } from "@medusajs/framework";
-import { Modules } from "@medusajs/framework/utils";
+import {
+  ContainerRegistrationKeys,
+  Modules,
+} from "@medusajs/framework/utils";
 import {
   type CustomerMetadata,
   mergeCustomerMarketMetadata,
@@ -12,8 +15,20 @@ type CustomerRecord = {
   metadata?: CustomerMetadata;
 };
 
+type LoggerLike = {
+  warn?: (...args: unknown[]) => void;
+};
+
 function hasMarketMetadata(customer: CustomerRecord): boolean {
   return typeof customer.metadata?.gp?.market_id === "string";
+}
+
+function resolveLogger(container: { resolve: (key: string) => unknown }): LoggerLike | undefined {
+  try {
+    return container.resolve(ContainerRegistrationKeys.LOGGER) as LoggerLike | undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 export default async function customerMarketTaggingHandler({
@@ -33,31 +48,46 @@ export default async function customerMarketTaggingHandler({
   const alsContext = marketContextStorage.getStore();
   let marketId = alsContext?.market_id;
 
-  if (!marketId) {
-    const customer = await customerService.retrieveCustomer(event.data.id);
-    marketId = parseScopedCustomerEmail(customer.email)?.marketId ?? null;
-
+  try {
     if (!marketId) {
-      // Admin-created customer without market scope — skip tagging.
+      const customer = await customerService.retrieveCustomer(event.data.id);
+      marketId = parseScopedCustomerEmail(customer.email)?.marketId;
+
+      if (!marketId) {
+        // Admin-created customer without market scope — skip tagging.
+        return;
+      }
+
+      if (hasMarketMetadata(customer)) {
+        // Metadata already set by create middleware — nothing to do.
+        return;
+      }
+
+      await customerService.updateCustomers(event.data.id, {
+        metadata: mergeCustomerMarketMetadata(customer.metadata, marketId),
+      });
       return;
     }
 
+    const customer = await customerService.retrieveCustomer(event.data.id);
+
     if (hasMarketMetadata(customer)) {
-      // Metadata already set by create middleware — nothing to do.
+      // Metadata already set by create middleware — skip redundant write.
       return;
     }
 
     await customerService.updateCustomers(event.data.id, {
       metadata: mergeCustomerMarketMetadata(customer.metadata, marketId),
     });
-    return;
+  } catch (error) {
+    resolveLogger(container)?.warn?.(
+      "customerMarketTaggingHandler failed",
+      {
+        customer_id: event.data.id,
+        error: error instanceof Error ? error.message : String(error),
+      }
+    );
   }
-
-  const customer = await customerService.retrieveCustomer(event.data.id);
-
-  await customerService.updateCustomers(event.data.id, {
-    metadata: mergeCustomerMarketMetadata(customer.metadata, marketId),
-  });
 }
 
 export const config: SubscriberConfig = {

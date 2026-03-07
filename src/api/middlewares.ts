@@ -21,8 +21,6 @@ import { marketContextStorage } from "../lib/market-context";
 import { installRlsPoolHook, type HookLogger } from "../lib/rls-pool-hook";
 import { marketContextCache } from "../loaders/market-context-cache";
 
-type LoggerLike = HookLogger;
-
 type PublishableKeyContext = {
   key: string;
   sales_channel_ids: string[];
@@ -200,13 +198,13 @@ async function ensurePublishableKeyContext(
 
 function resolveLogger(
   scope: MedusaRequest["scope"] | undefined
-): LoggerLike | undefined {
+): HookLogger | undefined {
   if (!scope) {
     return undefined;
   }
 
   try {
-    return scope.resolve(ContainerRegistrationKeys.LOGGER) as LoggerLike;
+    return scope.resolve(ContainerRegistrationKeys.LOGGER) as HookLogger;
   } catch {
     return undefined;
   }

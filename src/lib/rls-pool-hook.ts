@@ -1,5 +1,5 @@
 /**
- * RLS Pool Hook — Story 10-3
+ * RLS Pool Hook — Story 10-3, hardened in 10-9
  *
  * Monkey-patches Knex's acquireConnection/releaseConnection to inject
  * SET ROLE medusa_store + SET app.gp_market_id on every connection
