@@ -12,6 +12,12 @@ type ProductsCatalogCategory = {
   photo_url?: string
 }
 
+type ProductsCatalogCollection = {
+  collection_id: string
+  handle?: string
+  photo_url?: string
+}
+
 type ProductsCatalogProduct = {
   product_id: string
   slug: string
@@ -33,6 +39,7 @@ type VendorProductsCatalog = {
 
 type ProductsCatalog = {
   market_id: string
+  collections?: ProductsCatalogCollection[]
   categories: ProductsCatalogCategory[]
   products: ProductsCatalogProduct[]
 }
@@ -70,6 +77,103 @@ function computeProductMedia(input: {
   if (imageUrls.length) result.image_urls = imageUrls
 
   return result
+}
+
+function readGpMarketId(value: unknown): string | null {
+  if (!value || typeof value !== 'object') {
+    return null
+  }
+
+  const marketId = (value as { metadata?: { gp?: { market_id?: unknown } } }).metadata?.gp?.market_id
+  return typeof marketId === 'string' && marketId.trim() ? marketId.trim() : null
+}
+
+function selectCollectionMatch(matches: any[], marketId: string): { match?: any; reason?: string } {
+  if (!Array.isArray(matches) || matches.length === 0) {
+    return {}
+  }
+
+  const exactMatches = matches.filter(match => readGpMarketId(match) === marketId)
+  if (exactMatches.length === 1) {
+    return { match: exactMatches[0] }
+  }
+
+  if (exactMatches.length > 1) {
+    return {
+      reason:
+        `multiple collections found for market '${marketId}' and handle collision prevents safe update`
+    }
+  }
+
+  const untaggedMatches = matches.filter(match => readGpMarketId(match) === null)
+  if (untaggedMatches.length === 1) {
+    return { match: untaggedMatches[0] }
+  }
+
+  if (untaggedMatches.length > 1) {
+    return {
+      reason: 'multiple untagged collections found for the same handle; manual cleanup required'
+    }
+  }
+
+  const knownMarkets = [...new Set(matches.map(match => readGpMarketId(match)).filter(Boolean))]
+  return {
+    reason: knownMarkets.length > 0
+      ? `cross-market guard — entity belongs to '${knownMarkets.join(", ")}'`
+      : 'no eligible collection match found'
+  }
+}
+
+export async function syncCollectionMedia(
+  productModuleService: any,
+  collections: ProductsCatalogCollection[],
+  marketId: string,
+  warnings: string[]
+): Promise<{ updated: number; skipped: number }> {
+  let updated = 0
+  let skipped = 0
+
+  for (const collection of collections ?? []) {
+    const coverUrl = collection.photo_url?.trim()
+    if (!coverUrl) {
+      skipped++
+      continue
+    }
+
+    const handle = (collection.handle ?? collection.collection_id ?? '').trim()
+    if (!handle) {
+      warnings.push(
+        `Collection '${collection.collection_id}': missing handle; cannot resolve collection`
+      )
+      skipped++
+      continue
+    }
+
+    const matches = await productModuleService.listProductCollections({ handle })
+    const { match: dbCollection, reason } = selectCollectionMatch(matches ?? [], marketId)
+    if (!dbCollection?.id) {
+      warnings.push(
+        `Collection '${collection.collection_id}' handle='${handle}': ${reason ?? 'no Mercur collection found'}`
+      )
+      skipped++
+      continue
+    }
+
+    await productModuleService.updateProductCollections(dbCollection.id, {
+      metadata: {
+        ...(dbCollection.metadata ?? {}),
+        photo_url: coverUrl,
+        gp: {
+          ...((dbCollection.metadata as any)?.gp ?? {}),
+          market_id: marketId,
+        },
+      },
+    })
+
+    updated++
+  }
+
+  return { updated, skipped }
 }
 
 function parseArgs(args: string[] | undefined): {
@@ -141,6 +245,8 @@ export default async function gpConfigSyncMedia({ container, args }: ExecArgs) {
   ])
 
   const warnings: string[] = []
+  let collectionsUpdated = 0
+  let collectionsSkipped = 0
   let categoriesUpdated = 0
   let categoriesSkipped = 0
   let productsUpdated = 0
@@ -158,7 +264,17 @@ export default async function gpConfigSyncMedia({ container, args }: ExecArgs) {
     }
   }
 
-  // 1) Categories: categories[].photo_url -> Mercur ProductCategory.metadata.photo_url
+  // 1) Collections: collections[].photo_url -> Mercur ProductCollection.metadata.photo_url
+  const collectionMediaCounts = await syncCollectionMedia(
+    productModuleService,
+    catalog.collections ?? [],
+    marketId,
+    warnings
+  )
+  collectionsUpdated = collectionMediaCounts.updated
+  collectionsSkipped = collectionMediaCounts.skipped
+
+  // 2) Categories: categories[].photo_url -> Mercur ProductCategory.metadata.photo_url
   for (const category of catalog.categories ?? []) {
     const coverUrl = category.photo_url?.trim()
     if (!coverUrl) {
@@ -190,7 +306,7 @@ export default async function gpConfigSyncMedia({ container, args }: ExecArgs) {
     categoriesUpdated++
   }
 
-  // 2) Products: products[].photo_url/gallery_urls -> Mercur Product.thumbnail + Product.images[]
+  // 3) Products: products[].photo_url/gallery_urls -> Mercur Product.thumbnail + Product.images[]
   for (const product of catalog.products ?? []) {
     const media = computeProductMedia({
       photo_url: product.photo_url,
@@ -240,7 +356,7 @@ export default async function gpConfigSyncMedia({ container, args }: ExecArgs) {
     productsUpdated++
   }
 
-  // 3) Vendor overrides: vendors/*/products.yaml photo_url/gallery_urls -> Product.metadata.gp.vendor_media[vendor_id]
+  // 4) Vendor overrides: vendors/*/products.yaml photo_url/gallery_urls -> Product.metadata.gp.vendor_media[vendor_id]
   const vendorsDir = path.resolve(
     configRoot,
     instanceId,
@@ -367,6 +483,10 @@ export default async function gpConfigSyncMedia({ container, args }: ExecArgs) {
         market_id: marketId,
         config_root: configRoot,
         products_path: productsPath,
+        collections: {
+          updated: collectionsUpdated,
+          skipped: collectionsSkipped,
+        },
         categories: {
           updated: categoriesUpdated,
           skipped: categoriesSkipped,
