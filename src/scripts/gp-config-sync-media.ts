@@ -238,12 +238,6 @@ export default async function gpConfigSyncMedia({ container, args }: ExecArgs) {
     "product_module",
   ])
 
-  const productCategoryService = resolveService(container, [
-    "productCategoryService",
-    "productCategory",
-    "product_category",
-  ])
-
   const warnings: string[] = []
   let collectionsUpdated = 0
   let collectionsSkipped = 0
@@ -288,7 +282,7 @@ export default async function gpConfigSyncMedia({ container, args }: ExecArgs) {
       continue
     }
 
-    const matches = await productCategoryService.list({ handle })
+    const matches = await productModuleService.listProductCategories({ handle })
     const dbCategory = matches?.[0]
     if (!dbCategory?.id) {
       warnings.push(
@@ -302,7 +296,7 @@ export default async function gpConfigSyncMedia({ container, args }: ExecArgs) {
       photo_url: coverUrl,
     }
 
-    await productCategoryService.update([{ id: dbCategory.id, metadata: mergedMetadata }])
+    await productModuleService.updateProductCategories(dbCategory.id, { metadata: mergedMetadata })
     categoriesUpdated++
   }
 
