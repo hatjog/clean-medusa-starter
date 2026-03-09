@@ -302,7 +302,10 @@ export async function syncCategories(
     }
 
     try {
-      const matches = await productModuleService.listProductCategories({ handle })
+      const matches = await productModuleService.listProductCategories(
+        { handle },
+        { select: ["id", "handle", "name", "description", "rank", "metadata"] }
+      )
       const existing = matches?.[0]
 
       if (existing) {
@@ -318,6 +321,8 @@ export async function syncCategories(
         }
 
         // H-1: explicit field update — updateProductCategories(id, data)
+        // Safe hierarchical merge: preserves top-level metadata keys (e.g. photo_url)
+        // while adding/updating gp sub-object. Requires metadata to be fetched via select.
         await productModuleService.updateProductCategories(existing.id, {
           name: cat.name,
           description: cat.description ?? existing.description,
@@ -543,7 +548,7 @@ export async function syncProducts(
     try {
       const matches = await productModuleService.listProducts(
         { handle },
-        { relations: ["variants", "categories"] }
+        { select: ["id", "handle", "title", "description", "status", "metadata"], relations: ["variants", "categories"] }
       )
       const existing = matches?.[0]
 
