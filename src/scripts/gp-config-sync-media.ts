@@ -279,21 +279,27 @@ export default async function gpConfigSyncMedia({ container, args }: ExecArgs) {
     const handle = (category.handle ?? category.slug)?.trim()
     if (!handle) {
       warnings.push(`Category '${category.category_id}': missing slug/handle; cannot resolve category`)
+      categoriesSkipped++
       continue
     }
 
     const matches = await productModuleService.listProductCategories({ handle })
-    const dbCategory = matches?.[0]
+    const { match: dbCategory, reason } = selectCollectionMatch(matches ?? [], marketId)
     if (!dbCategory?.id) {
       warnings.push(
-        `Category '${category.category_id}': no Mercur category found with handle='${handle}'`
+        `Category '${category.category_id}' handle='${handle}': ${reason ?? 'no Mercur category found'}`
       )
+      categoriesSkipped++
       continue
     }
 
     const mergedMetadata = {
       ...(dbCategory.metadata ?? {}),
       photo_url: coverUrl,
+      gp: {
+        ...((dbCategory.metadata as any)?.gp ?? {}),
+        market_id: marketId,
+      },
     }
 
     await productModuleService.updateProductCategories(dbCategory.id, { metadata: mergedMetadata })
@@ -315,6 +321,7 @@ export default async function gpConfigSyncMedia({ container, args }: ExecArgs) {
     const handle = product.slug?.trim()
     if (!handle) {
       warnings.push(`Product '${product.product_id}': missing slug; cannot resolve product`)
+      productsSkipped++
       continue
     }
 
@@ -359,7 +366,12 @@ export default async function gpConfigSyncMedia({ container, args }: ExecArgs) {
     "vendors"
   )
 
-  const vendorDirEntries = await fs.readdir(vendorsDir, { withFileTypes: true }).catch(() => [])
+  const vendorDirEntries = await fs.readdir(vendorsDir, { withFileTypes: true }).catch((err: any) => {
+    if (err?.code !== 'ENOENT') {
+      warnings.push(`Vendor directory read failed (${vendorsDir}): ${err?.message ?? String(err)}`)
+    }
+    return []
+  })
   const productCacheByHandle = new Map<
     string,
     { id: string; metadata?: Record<string, any> | null }
@@ -463,7 +475,8 @@ export default async function gpConfigSyncMedia({ container, args }: ExecArgs) {
         metadata: nextMetadata,
       })
 
-      dbProduct.metadata = nextMetadata
+      // Update cache only after successful DB write
+      productCacheByHandle.set(handle, { ...dbProduct, metadata: nextMetadata })
       if (explicitClear) vendorMediaCleared++
       else vendorMediaUpdated++
     }
