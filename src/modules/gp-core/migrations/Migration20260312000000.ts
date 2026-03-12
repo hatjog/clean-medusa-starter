@@ -11,7 +11,7 @@ import { Migration } from "@medusajs/framework/mikro-orm/migrations";
  *     ON product_variant (((metadata->>'duration')::int))
  *     WHERE metadata->>'duration' IS NOT NULL AND metadata->>'duration' ~ '^\d+$';
  *   CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_seller_city ON seller (city);
- *   CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_seller_avg_rating ON seller (avg_rating);
+ *   (idx_seller_avg_rating removed — column does not exist, see Migration20260312100000)
  *   CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_sspp_product_id ON seller_seller_product_product (product_id);
  *   CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_product_tags_tag_id ON product_tags (product_tag_id);
  */
@@ -29,9 +29,8 @@ export class Migration20260312000000 extends Migration {
     this.addSql(
       `CREATE INDEX IF NOT EXISTS idx_seller_city ON seller (city)`
     );
-    this.addSql(
-      `CREATE INDEX IF NOT EXISTS idx_seller_avg_rating ON seller (avg_rating)`
-    );
+    // idx_seller_avg_rating removed — seller.avg_rating column does not exist.
+    // Replaced by idx_ssrr_seller_id in Migration20260312100000.
 
     // Junction table lookup indexes
     this.addSql(
@@ -47,7 +46,7 @@ export class Migration20260312000000 extends Migration {
       `DROP INDEX IF EXISTS idx_variant_metadata_duration`
     );
     this.addSql(`DROP INDEX IF EXISTS idx_seller_city`);
-    this.addSql(`DROP INDEX IF EXISTS idx_seller_avg_rating`);
+    // idx_seller_avg_rating removed — see Migration20260312100000
     this.addSql(`DROP INDEX IF EXISTS idx_sspp_product_id`);
     this.addSql(`DROP INDEX IF EXISTS idx_product_tags_tag_id`);
   }

@@ -93,7 +93,7 @@ export async function filterProductIdsByFilters(
 
   // LEFT JOIN seller chain so we can:
   //  (a) filter out SUSPENDED sellers
-  //  (b) optionally filter by city / avg_rating
+  //  (b) optionally filter by city / seller rating (via review subquery)
   // Soft-deleted links / sellers are excluded via ON clause to preserve LEFT JOIN semantics.
   query = query
     .leftJoin("seller_seller_product_product as sspp", function () {
@@ -147,9 +147,23 @@ export async function filterProductIdsByFilters(
       );
   }
 
-  // min_rating: WHERE on seller.avg_rating — products without a seller are excluded
+  // min_rating: correlated subquery computes AVG(rating) from review table
+  // via junction table seller_seller_review_review.
+  // Products without a seller (NULL seller.id) are naturally excluded.
   if (filters.min_rating !== undefined) {
-    query = query.where("seller.avg_rating", ">=", filters.min_rating);
+    // prettier-ignore
+    query = query.whereRaw(
+      `COALESCE((
+        SELECT AVG(r.rating)
+        FROM review r
+        JOIN seller_seller_review_review ssrr
+          ON ssrr.review_id = r.id
+          AND ssrr.deleted_at IS NULL
+        WHERE ssrr.seller_id = seller.id
+          AND r.deleted_at IS NULL
+      ), 0) >= ?`,
+      [filters.min_rating]
+    );
   }
 
   // COUNT: wrap the DISTINCT subquery to get total matching products
