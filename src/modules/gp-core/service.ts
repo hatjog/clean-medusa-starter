@@ -19,6 +19,8 @@ import {
   CreateMarketInput,
   CreateVendorInput,
   CreateVerticalInput,
+  Entitlement,
+  EntitlementCreateDto,
   GpCoreMarket,
   GpCoreMarketDetail,
   GpCoreMarketRecord,
@@ -27,8 +29,16 @@ import {
   GpCoreVendorMarketAssignment,
   GpCoreVendorMarketAssignmentDetail,
   GpCoreVertical,
+  RedemptionCreateDto,
   UpdateMarketInput,
 } from "./models"
+
+export class NotImplementedError extends Error {
+  constructor(storyId: string) {
+    super(`Not implemented — see ${storyId}`)
+    this.name = "NotImplementedError"
+  }
+}
 
 type Queryable = Pick<Pool, "query"> | Pick<PoolClient, "query">
 type EventBusLike = {
@@ -811,6 +821,60 @@ export default class GpCoreService {
     }
 
     return assignment
+  }
+
+  // --- Entitlement Domain Stubs (Story 1.2) ---
+
+  async createEntitlement(_dto: EntitlementCreateDto): Promise<Entitlement> {
+    throw new NotImplementedError("Story 1.3")
+  }
+
+  async claimVoucher(_claimToken: string, _customerId: string): Promise<Entitlement> {
+    throw new NotImplementedError("Story 1.3")
+  }
+
+  async verifyVoucher(_voucherCode: string): Promise<Entitlement> {
+    throw new NotImplementedError("Story 1.3")
+  }
+
+  async redeemVoucher(_dto: RedemptionCreateDto): Promise<Entitlement> {
+    throw new NotImplementedError("Story 1.3")
+  }
+
+  async resolveVendorId(_mercurSellerId: string): Promise<string> {
+    throw new NotImplementedError("Story 1.3")
+  }
+
+  async searchVouchers(_query: { market_id?: string; vendor_id?: string; status?: string }): Promise<Entitlement[]> {
+    throw new NotImplementedError("Story 1.3")
+  }
+
+  async voidEntitlement(_entitlementId: string, _reason: string): Promise<Entitlement> {
+    throw new NotImplementedError("Story 1.3")
+  }
+
+  async refundEntitlement(_entitlementId: string, _reason: string): Promise<Entitlement> {
+    throw new NotImplementedError("Story 1.3")
+  }
+
+  async healthCheck(): Promise<{ core: boolean; mercur: boolean }> {
+    const result = { core: false, mercur: false }
+
+    try {
+      await this.getCorePool().query("SELECT 1")
+      result.core = true
+    } catch (error) {
+      this.logger_.warn?.(`gp_core health check failed (core pool): ${String(error)}`)
+    }
+
+    try {
+      await this.getMercurPool().query("SELECT 1")
+      result.mercur = true
+    } catch (error) {
+      this.logger_.warn?.(`gp_core health check failed (mercur pool): ${String(error)}`)
+    }
+
+    return result
   }
 
   async findSalesChannelId(marketId: string): Promise<string | null> {
