@@ -56,6 +56,17 @@ Po włączeniu backend loguje zdarzenia:
 
 Runbook użycia tych logów znajduje się w [../../../../specs/ops/rls-debugging-runbook.md](../../../../specs/ops/rls-debugging-runbook.md).
 
+## Route Groups
+
+GP backend API is organized into four route groups with distinct auth and middleware requirements. Full documentation: [ROUTE_GROUPS.md](ROUTE_GROUPS.md).
+
+| Group | Routes | Auth | GP Middleware |
+|-------|--------|------|--------------|
+| public | `/v1/health`, `/status` | None | — |
+| storefront | `/store/*` | Publishable key | marketContext → marketGuard → customerMarketGuard (see above) |
+| vendor | `/vendor/*` | Mercur seller auth | Native Mercur (no GP middleware) |
+| admin | `/admin/*` | Medusa admin auth | Native Medusa (no GP middleware) |
+
 ## Notes utrzymaniowe
 
 - Jeśli dokładasz nowy publiczny route `/store/*`, najpierw sprawdź, czy wystarczy globalny chain, czy potrzebny jest dodatkowy guard route-specific.
