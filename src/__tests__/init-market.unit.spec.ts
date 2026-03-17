@@ -274,8 +274,8 @@ describe("buildMarketConfigCreateData", () => {
     expect(data.storefront_template).toBe("tmpl-1")
     expect(data.homepage_sections).toMatchObject([
       { blockType: "hero", heading: "Legacy Hero" },
-      { blockType: "products_carousel" },
       { blockType: "categories_grid" },
+      { blockType: "products_carousel" },
       { blockType: "banner", label: "Explore collection", cta_link: "/collections" },
       { blockType: "style_section" },
       { blockType: "blog_section" },

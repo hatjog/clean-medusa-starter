@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from "vitest"
+import { describe, it, expect, beforeEach, jest } from "@jest/globals"
 
 import GpCoreService, { NotImplementedError } from "../service"
 import {
@@ -11,12 +11,12 @@ import {
 } from "../models"
 
 // Mock pg module to avoid real DB connections
-vi.mock("pg", () => {
-  const mockQuery = vi.fn().mockResolvedValue({ rows: [{ "?column?": 1 }] })
-  const mockPool = vi.fn(() => ({
+jest.mock("pg", () => {
+  const mockQuery = jest.fn().mockResolvedValue({ rows: [{ "?column?": 1 }] })
+  const mockPool = jest.fn(() => ({
     query: mockQuery,
-    connect: vi.fn(),
-    end: vi.fn().mockResolvedValue(undefined),
+    connect: jest.fn(),
+    end: jest.fn().mockResolvedValue(undefined),
   }))
   return { Pool: mockPool }
 })

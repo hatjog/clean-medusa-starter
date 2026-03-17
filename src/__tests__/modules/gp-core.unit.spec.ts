@@ -137,20 +137,20 @@ describe("gp_core schema and service", () => {
     )
   })
 
-  it("seed creates 3 markets, 3 verticals and 3 assignments", async () => {
+  it("seed creates 4 markets, 3 verticals and 8 assignments", async () => {
     const summary = await seedGpCoreFromFixtures(service, {
       instanceId: "gp-dev",
       configRoot: CONFIG_ROOT,
     })
 
-    expect(summary.markets.created).toBe(3)
+    expect(summary.markets.created).toBe(4)
     expect(summary.verticals.created).toBe(3)
-    expect(summary.assignments.created).toBe(3)
+    expect(summary.assignments.created).toBe(8)
 
     const markets = await service.listMarkets("gp-dev")
     const verticals = await service.listVerticals("gp-dev")
 
-    expect(markets).toHaveLength(3)
+    expect(markets).toHaveLength(4)
     expect(verticals).toHaveLength(3)
     expect(verticals.map((vertical) => vertical.slug).sort()).toEqual(
       Object.values(DEFAULT_MARKET_VERTICALS).sort()
@@ -167,10 +167,10 @@ describe("gp_core schema and service", () => {
       configRoot: CONFIG_ROOT,
     })
 
-    expect(first.markets.created).toBe(3)
+    expect(first.markets.created).toBe(4)
     expect(second.markets.created).toBe(0)
-    expect(second.markets.updated).toBe(3)
-    expect(second.verticals.updated).toBe(3)
+    expect(second.markets.updated).toBe(4)
+    expect(second.verticals.updated).toBe(4)
 
     const counts = await testPool.query(`
       SELECT
@@ -181,10 +181,10 @@ describe("gp_core schema and service", () => {
     `)
 
     expect(counts.rows[0]).toMatchObject({
-      markets: "3",
+      markets: "4",
       verticals: "3",
-      vendors: "3",
-      assignments: "3",
+      vendors: "8",
+      assignments: "8",
     })
   })
 
@@ -325,8 +325,10 @@ describe("gp_core schema and service", () => {
 
     expect(market).not.toBeNull()
     expect(market?.vertical.slug).toBe("beauty")
-    expect(market?.assignments).toHaveLength(1)
-    expect(market?.assignments[0].vendor.name).toBe("Studio Nova")
+    expect(market?.assignments).toHaveLength(3)
+    expect(market?.assignments.map((a) => a.vendor.name).sort()).toEqual(
+      ["City Beauty", "KREM i DOTYK", "Studio Nova"]
+    )
   })
 
   it("seed populates sales_channel_id for each market", async () => {

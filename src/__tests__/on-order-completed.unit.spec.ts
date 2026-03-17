@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest"
+import { describe, it, expect, jest, beforeEach } from "@jest/globals"
 
 import onOrderCompleted from "../subscribers/on-order-completed"
 import { NotImplementedError } from "../modules/gp-core/service"
@@ -8,17 +8,17 @@ function buildMockContainer(overrides: {
   logger?: Record<string, unknown>
 } = {}) {
   const logger = overrides.logger ?? {
-    info: vi.fn(),
-    warn: vi.fn(),
-    error: vi.fn(),
+    info: jest.fn(),
+    warn: jest.fn(),
+    error: jest.fn(),
   }
 
   const gpCore = overrides.gpCore !== undefined ? overrides.gpCore : {
-    createEntitlement: vi.fn().mockRejectedValue(new NotImplementedError("Story 1.3")),
+    createEntitlement: jest.fn().mockRejectedValue(new NotImplementedError("Story 1.3")),
   }
 
   return {
-    resolve: vi.fn((key: string) => {
+    resolve: jest.fn((key: string) => {
       if (key === "logger") return logger
       if (key === "gp_core") return gpCore
       return null
@@ -92,7 +92,7 @@ describe("on-order-completed subscriber", () => {
   it("logs unexpected errors as error", async () => {
     const container = buildMockContainer({
       gpCore: {
-        createEntitlement: vi.fn().mockRejectedValue(new Error("DB down")),
+        createEntitlement: jest.fn().mockRejectedValue(new Error("DB down")),
       },
     })
 
@@ -107,7 +107,7 @@ describe("on-order-completed subscriber", () => {
   })
 
   it("continues processing remaining orders if one fails", async () => {
-    const createEntitlement = vi.fn()
+    const createEntitlement = jest.fn()
       .mockRejectedValueOnce(new Error("temporary"))
       .mockRejectedValueOnce(new NotImplementedError("Story 1.3"))
     const container = buildMockContainer({
@@ -137,7 +137,7 @@ describe("on-order-completed subscriber", () => {
   it("does not throw — subscriber errors are caught", async () => {
     const container = buildMockContainer({
       gpCore: {
-        createEntitlement: vi.fn().mockRejectedValue(new Error("catastrophic")),
+        createEntitlement: jest.fn().mockRejectedValue(new Error("catastrophic")),
       },
     })
 
