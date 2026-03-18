@@ -197,7 +197,19 @@ export async function searchProductIdsForSalesChannel(
   salesChannelId: string,
   args: SearchArgs
 ): Promise<{ productIds: string[]; count: number }> {
-  const baseQuery = buildScopedProductQuery(db, salesChannelId);
+  // Apply seller status whitelist (ACTIVE only) consistent with filterProductIdsByFilters.
+  // Soft-deleted links / sellers excluded via ON clause to preserve LEFT JOIN semantics.
+  const baseQuery = buildScopedProductQuery(db, salesChannelId)
+    .leftJoin("seller_seller_product_product as sspp", function () {
+      this.on("product.id", "=", "sspp.product_id").andOnNull("sspp.deleted_at");
+    })
+    .leftJoin("seller", function () {
+      this.on("sspp.seller_id", "=", "seller.id").andOnNull("seller.deleted_at");
+    })
+    .where((builder) => {
+      builder.where("seller.store_status", "ACTIVE").orWhereNull("seller.id");
+    });
+
   const trimmedQuery = args.query.trim();
 
   if (trimmedQuery) {
