@@ -108,7 +108,7 @@ export async function filterProductIdsByFilters(
     })
     .where((builder) => {
       builder
-        .where("seller.store_status", "!=", "SUSPENDED")
+        .where("seller.store_status", "ACTIVE")
         .orWhereNull("seller.id");
     });
 

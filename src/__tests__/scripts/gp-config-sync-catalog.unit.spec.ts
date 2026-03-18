@@ -8,6 +8,8 @@
  * - syncCategories: cross-market guard, inactive filtering, duplicate handles, parent refs
  * - syncCollections: cross-market guard, inactive filtering, missing handle
  * - syncProducts: runtime validation (H-8), cross-market guard (H-3), H-7 partial assignment
+ * - evaluateQualityGate: quality gate criteria (description, price, image)
+ * - isPlaceholderUrl: placeholder URL detection
  */
 
 import {
@@ -17,6 +19,8 @@ import {
   syncCategories,
   syncCollections,
   syncProducts,
+  evaluateQualityGate,
+  isPlaceholderUrl,
 } from "../../scripts/gp-config-sync-catalog"
 
 // ---------------------------------------------------------------------------
@@ -594,7 +598,8 @@ describe("syncProducts", () => {
     expect(updatePayload).not.toHaveProperty("variants")
     expect(updatePayload).not.toHaveProperty("prices")
     expect(updatePayload).toHaveProperty("title", "Nail Art")
-    expect(updatePayload).toHaveProperty("status", "published")
+    // Quality gate: short description + no photo_url → draft
+    expect(updatePayload).toHaveProperty("status", "draft")
   })
 
   it("filters out inactive products (D-3)", async () => {
@@ -621,5 +626,220 @@ describe("syncProducts", () => {
       { handle: "active-prod" },
       expect.anything()
     )
+  })
+
+  it("quality gate: product with short description → draft status on sync", async () => {
+    const svc = makeProductModuleService({
+      listProducts: jest.fn().mockResolvedValue([
+        {
+          id: "existing-prod",
+          handle: "short-desc",
+          categories: [],
+          metadata: { gp: { market_id: "bonbeauty" } },
+        },
+      ]),
+    })
+    const warnings: string[] = []
+
+    await syncProducts(
+      makeContainer2(),
+      svc,
+      [{
+        product_id: "p-short",
+        name: "Short Desc",
+        handle: "short-desc",
+        description: "Only a few words here.",
+        base_price: { amount: 150, currency: "PLN" },
+        photo_url: "https://cdn.example.com/image.jpg",
+      }],
+      prereqs,
+      emptyMaps.categoryMap,
+      emptyMaps.collectionMap,
+      "bonbeauty",
+      warnings
+    )
+
+    expect(svc.updateProducts).toHaveBeenCalledTimes(1)
+    const [, payload] = (svc.updateProducts as jest.Mock).mock.calls[0]
+    expect(payload).toHaveProperty("status", "draft")
+  })
+
+  it("quality gate: product with ≥80 words + image + price → published status on sync", async () => {
+    const svc = makeProductModuleService({
+      listProducts: jest.fn().mockResolvedValue([
+        {
+          id: "existing-prod",
+          handle: "full-desc",
+          categories: [],
+          metadata: { gp: { market_id: "bonbeauty" } },
+        },
+      ]),
+    })
+    const warnings: string[] = []
+
+    const longDesc = Array(85).fill("word").join(" ")
+    await syncProducts(
+      makeContainer2(),
+      svc,
+      [{
+        product_id: "p-full",
+        name: "Full Product",
+        handle: "full-desc",
+        description: longDesc,
+        base_price: { amount: 150, currency: "PLN" },
+        photo_url: "https://cdn.example.com/products/full/thumb.jpg",
+      }],
+      prereqs,
+      emptyMaps.categoryMap,
+      emptyMaps.collectionMap,
+      "bonbeauty",
+      warnings
+    )
+
+    expect(svc.updateProducts).toHaveBeenCalledTimes(1)
+    const [, payload] = (svc.updateProducts as jest.Mock).mock.calls[0]
+    expect(payload).toHaveProperty("status", "published")
+  })
+
+  it("quality gate: vendor inactive → all products draft after vendor status gate", async () => {
+    const svc = makeProductModuleService({
+      listProducts: jest.fn().mockResolvedValue([
+        {
+          id: "existing-prod",
+          handle: "inactive-vendor-prod",
+          categories: [],
+          metadata: { gp: { market_id: "bonbeauty" } },
+        },
+      ]),
+    })
+    const warnings: string[] = []
+
+    await syncProducts(
+      makeContainer2(),
+      svc,
+      [{
+        product_id: "p-inactive-v",
+        name: "Inactive Vendor Product",
+        handle: "inactive-vendor-prod",
+        description: "Short description",
+        base_price: { amount: 0, currency: "PLN" },
+      }],
+      prereqs,
+      emptyMaps.categoryMap,
+      emptyMaps.collectionMap,
+      "bonbeauty",
+      warnings
+    )
+
+    // Price=0 + short desc → draft
+    expect(svc.updateProducts).toHaveBeenCalledTimes(1)
+    const [, payload] = (svc.updateProducts as jest.Mock).mock.calls[0]
+    expect(payload).toHaveProperty("status", "draft")
+  })
+})
+
+// ---------------------------------------------------------------------------
+// evaluateQualityGate
+// ---------------------------------------------------------------------------
+
+describe("evaluateQualityGate", () => {
+  it("returns published when all gates pass", () => {
+    const longDesc = Array(85).fill("word").join(" ")
+    const result = evaluateQualityGate({
+      product_id: "p-1",
+      name: "Test",
+      base_price: { amount: 150, currency: "PLN" },
+      description: longDesc,
+      photo_url: "https://cdn.example.com/image.jpg",
+    })
+    expect(result.status).toBe("published")
+    expect(result.reasons).toHaveLength(0)
+  })
+
+  it("returns draft when description <80 words", () => {
+    const result = evaluateQualityGate({
+      product_id: "p-1",
+      name: "Test",
+      base_price: { amount: 150, currency: "PLN" },
+      description: "Short description only.",
+      photo_url: "https://cdn.example.com/image.jpg",
+    })
+    expect(result.status).toBe("draft")
+    expect(result.reasons.some((r) => r.includes("words="))).toBe(true)
+  })
+
+  it("returns draft when price is 0", () => {
+    const longDesc = Array(85).fill("word").join(" ")
+    const result = evaluateQualityGate({
+      product_id: "p-1",
+      name: "Test",
+      base_price: { amount: 0, currency: "PLN" },
+      description: longDesc,
+      photo_url: "https://cdn.example.com/image.jpg",
+    })
+    expect(result.status).toBe("draft")
+    expect(result.reasons.some((r) => r.includes("price="))).toBe(true)
+  })
+
+  it("returns draft when image is missing", () => {
+    const longDesc = Array(85).fill("word").join(" ")
+    const result = evaluateQualityGate({
+      product_id: "p-1",
+      name: "Test",
+      base_price: { amount: 150, currency: "PLN" },
+      description: longDesc,
+    })
+    expect(result.status).toBe("draft")
+    expect(result.reasons.some((r) => r.includes("image=missing"))).toBe(true)
+  })
+
+  it("returns draft when image URL is a placeholder", () => {
+    const longDesc = Array(85).fill("word").join(" ")
+    const result = evaluateQualityGate({
+      product_id: "p-1",
+      name: "Test",
+      base_price: { amount: 150, currency: "PLN" },
+      description: longDesc,
+      photo_url: "https://via.placeholder.com/400x300",
+    })
+    expect(result.status).toBe("draft")
+    expect(result.reasons.some((r) => r.includes("image=placeholder"))).toBe(true)
+  })
+
+  it("accumulates multiple failure reasons", () => {
+    const result = evaluateQualityGate({
+      product_id: "p-1",
+      name: "Test",
+      base_price: { amount: 0, currency: "PLN" },
+      description: "Short",
+    })
+    expect(result.status).toBe("draft")
+    expect(result.reasons.length).toBeGreaterThanOrEqual(3) // words, price, image
+  })
+})
+
+// ---------------------------------------------------------------------------
+// isPlaceholderUrl
+// ---------------------------------------------------------------------------
+
+describe("isPlaceholderUrl", () => {
+  it("detects via.placeholder.com URLs", () => {
+    expect(isPlaceholderUrl("https://via.placeholder.com/400x300")).toBe(true)
+  })
+
+  it("detects placeholder in path", () => {
+    expect(isPlaceholderUrl("https://cdn.example.com/placeholder.jpg")).toBe(true)
+  })
+
+  it("detects no-image pattern", () => {
+    expect(isPlaceholderUrl("https://cdn.example.com/no-image.png")).toBe(true)
+  })
+
+  it("detects default-product pattern", () => {
+    expect(isPlaceholderUrl("https://cdn.example.com/default-product.jpg")).toBe(true)
+  })
+
+  it("returns false for normal product images", () => {
+    expect(isPlaceholderUrl("https://cdn.example.com/products/srv_0101/thumb.jpg")).toBe(false)
   })
 })

@@ -39,6 +39,7 @@ type FixtureProduct = {
   base_price: { amount: number; currency: string }
   duration_minutes?: number | null
   description?: string
+  photo_url?: string
   tags?: string[]
   active?: boolean
 }
@@ -122,6 +123,54 @@ async function listAll(service: any, methodNames: string[], query: object = {}):
     }
   }
   return []
+}
+
+// ---- Quality Gate ----
+
+const MIN_DESCRIPTION_WORDS = 80
+
+const PLACEHOLDER_PATTERNS = [
+  /placeholder/i,
+  /no-image/i,
+  /default-product/i,
+  /via\.placeholder\.com/i,
+]
+
+export type QualityGateResult = {
+  status: "published" | "draft"
+  reasons: string[]
+  details: { words: number; price: number; image: string }
+}
+
+export function isPlaceholderUrl(url: string): boolean {
+  return PLACEHOLDER_PATTERNS.some((pattern) => pattern.test(url))
+}
+
+export function evaluateQualityGate(product: FixtureProduct): QualityGateResult {
+  const reasons: string[] = []
+
+  const wordCount = (product.description ?? "").split(/\s+/).filter(Boolean).length
+  if (wordCount < MIN_DESCRIPTION_WORDS) {
+    reasons.push(`words=${wordCount} < ${MIN_DESCRIPTION_WORDS}`)
+  }
+
+  const price = product.base_price?.amount ?? 0
+  if (price <= 0) {
+    reasons.push(`price=${price} <= 0`)
+  }
+
+  const imageUrl = product.photo_url ?? ""
+  if (!imageUrl) {
+    reasons.push("image=missing")
+  } else if (isPlaceholderUrl(imageUrl)) {
+    reasons.push("image=placeholder")
+  }
+
+  return {
+    status: reasons.length === 0 ? "published" : "draft",
+    reasons,
+    details: { words: wordCount, price, image: imageUrl ? "OK" : "missing" },
+  }
 }
 
 // ---- Prerequisites ----
@@ -572,11 +621,19 @@ export async function syncProducts(
           new Set([...existingCategoryIds, ...resolvedCategoryIds])
         )
 
+        // Quality gate evaluation before status assignment
+        const gateResult = evaluateQualityGate(product)
+        const gateStatus = gateResult.status
+        console.log(
+          `Product '${product.product_id}': ${gateStatus.toUpperCase()} (words=${gateResult.details.words}, image=${gateResult.details.image}, price=${gateResult.details.price})` +
+            (gateResult.reasons.length > 0 ? ` — failed: ${gateResult.reasons.join(", ")}` : "")
+        )
+
         // H-1: explicit fields, H-4: no pricing/variants update
         const updatePayload: Record<string, any> = {
           title: product.name,
           description: product.description ?? existing.description,
-          status: "published",
+          status: gateStatus,
           metadata: {
             ...(existing.metadata ?? {}),
             gp: {
@@ -613,6 +670,13 @@ export async function syncProducts(
 
         counts.updated++
       } else {
+        // Quality gate evaluation before status assignment
+        const createGateResult = evaluateQualityGate(product)
+        console.log(
+          `Product '${product.product_id}': ${createGateResult.status.toUpperCase()} (words=${createGateResult.details.words}, image=${createGateResult.details.image}, price=${createGateResult.details.price})` +
+            (createGateResult.reasons.length > 0 ? ` — failed: ${createGateResult.reasons.join(", ")}` : "")
+        )
+
         // Create via createProductsWorkflow (handles variants + pricing + sales_channels + shipping)
         const { result, errors } = await createProductsWorkflow(container).run({
           input: {
@@ -620,7 +684,7 @@ export async function syncProducts(
               {
                 title: product.name,
                 handle,
-                status: "published",
+                status: createGateResult.status as any,
                 description: product.description,
                 discountable: product.discountable ?? true,
                 shipping_profile_id: prereqs.shippingProfileId,
@@ -673,6 +737,78 @@ export async function syncProducts(
     `Products: created=${counts.created}, updated=${counts.updated}, skipped=${counts.skipped}`
   )
   return counts
+}
+
+// ---- Vendor Status Enforcement ----
+
+type MarketVendor = {
+  vendor_id: string
+  status: string
+}
+
+type MarketConfig = {
+  market_id: string
+  vendors?: MarketVendor[]
+}
+
+export async function enforceVendorStatusGate(
+  productModuleService: any,
+  marketConfigPath: string,
+  marketId: string,
+  warnings: string[]
+): Promise<{ draftedCount: number }> {
+  let marketConfig: MarketConfig
+  try {
+    marketConfig = await readYamlFile<MarketConfig>(marketConfigPath)
+  } catch (e: any) {
+    warnings.push(`Vendor status gate: cannot read market.yaml — ${e?.message ?? String(e)}`)
+    return { draftedCount: 0 }
+  }
+
+  const vendors = marketConfig.vendors ?? []
+  const nonActiveVendors = vendors.filter((v) => v.status !== "active" && v.status !== "onboarded")
+
+  if (nonActiveVendors.length === 0) {
+    return { draftedCount: 0 }
+  }
+
+  console.log(
+    `Vendor status gate: ${nonActiveVendors.length} non-active vendor(s): ${nonActiveVendors.map((v) => `${v.vendor_id}=${v.status}`).join(", ")}`
+  )
+
+  let draftedCount = 0
+
+  for (const vendor of nonActiveVendors) {
+    // Find products in Medusa with metadata.gp.vendor_id matching this vendor
+    // This relies on vendor products being tagged during vendor-level sync or seller assignment
+    try {
+      const allProducts = await productModuleService.listProducts(
+        {},
+        { select: ["id", "handle", "status", "metadata"], take: 1000 }
+      )
+
+      const vendorProducts = (allProducts ?? []).filter((p: any) => {
+        const gpMeta = (p.metadata as any)?.gp
+        return gpMeta?.market_id === marketId && gpMeta?.vendor_id === vendor.vendor_id
+      })
+
+      for (const prod of vendorProducts) {
+        if (prod.status !== "draft") {
+          await productModuleService.updateProducts(prod.id, { status: "draft" })
+          console.log(
+            `Product '${prod.handle}': DRAFT (vendor '${vendor.vendor_id}' status='${vendor.status}')`
+          )
+          draftedCount++
+        }
+      }
+    } catch (e: any) {
+      warnings.push(
+        `Vendor status gate for '${vendor.vendor_id}': error — ${e?.message ?? String(e)}`
+      )
+    }
+  }
+
+  return { draftedCount }
 }
 
 // ---- Main Orchestrator ----
@@ -746,6 +882,18 @@ export default async function gpConfigSyncCatalog({ container, args }: ExecArgs)
     warnings
   )
 
+  // Vendor status enforcement — draft products from non-active vendors
+  const marketConfigPath = path.resolve(configRoot, instanceId, "markets", marketId, "market.yaml")
+  const { draftedCount } = await enforceVendorStatusGate(
+    productModuleService,
+    marketConfigPath,
+    marketId,
+    warnings
+  )
+  if (draftedCount > 0) {
+    console.log(`Vendor status gate: ${draftedCount} product(s) set to draft`)
+  }
+
   // JSON summary (like sync-media)
   const summary = {
     ok: warnings.length === 0,
@@ -756,6 +904,7 @@ export default async function gpConfigSyncCatalog({ container, args }: ExecArgs)
     categories: categoryCounts,
     collections: collectionCounts,
     products: productCounts,
+    vendor_gate: { drafted: draftedCount },
     warnings,
     timestamp: new Date().toISOString(),
   }
