@@ -166,10 +166,12 @@ export function evaluateQualityGate(product: FixtureProduct): QualityGateResult 
     reasons.push("image=placeholder")
   }
 
+  const imageDetail = !imageUrl ? "missing" : isPlaceholderUrl(imageUrl) ? "placeholder" : "OK"
+
   return {
     status: reasons.length === 0 ? "published" : "draft",
     reasons,
-    details: { words: wordCount, price, image: imageUrl ? "OK" : "missing" },
+    details: { words: wordCount, price, image: imageDetail },
   }
 }
 
@@ -684,7 +686,7 @@ export async function syncProducts(
               {
                 title: product.name,
                 handle,
-                status: createGateResult.status as any,
+                status: createGateResult.status as "published" | "draft",
                 description: product.description,
                 discountable: product.discountable ?? true,
                 shipping_profile_id: prereqs.shippingProfileId,
@@ -751,6 +753,12 @@ type MarketConfig = {
   vendors?: MarketVendor[]
 }
 
+type VendorProductCatalog = {
+  vendor_id: string
+  market_id: string
+  products?: Array<{ product_id: string }>
+}
+
 export async function enforceVendorStatusGate(
   productModuleService: any,
   marketConfigPath: string,
@@ -766,7 +774,7 @@ export async function enforceVendorStatusGate(
   }
 
   const vendors = marketConfig.vendors ?? []
-  const nonActiveVendors = vendors.filter((v) => v.status !== "active" && v.status !== "onboarded")
+  const nonActiveVendors = vendors.filter((v) => v.status !== "active")
 
   if (nonActiveVendors.length === 0) {
     return { draftedCount: 0 }
@@ -776,35 +784,64 @@ export async function enforceVendorStatusGate(
     `Vendor status gate: ${nonActiveVendors.length} non-active vendor(s): ${nonActiveVendors.map((v) => `${v.vendor_id}=${v.status}`).join(", ")}`
   )
 
-  let draftedCount = 0
+  // Build set of fixture product_ids belonging to non-active vendors
+  // by reading vendor product catalog files (vendors/{vendor_id}/products.yaml)
+  const marketDir = path.dirname(marketConfigPath)
+  const blockedFixtureIds = new Set<string>()
 
   for (const vendor of nonActiveVendors) {
-    // Find products in Medusa with metadata.gp.vendor_id matching this vendor
-    // This relies on vendor products being tagged during vendor-level sync or seller assignment
+    const vendorProductsPath = path.resolve(marketDir, "vendors", vendor.vendor_id, "products.yaml")
     try {
-      const allProducts = await productModuleService.listProducts(
-        {},
-        { select: ["id", "handle", "status", "metadata"], take: 1000 }
-      )
-
-      const vendorProducts = (allProducts ?? []).filter((p: any) => {
-        const gpMeta = (p.metadata as any)?.gp
-        return gpMeta?.market_id === marketId && gpMeta?.vendor_id === vendor.vendor_id
-      })
-
-      for (const prod of vendorProducts) {
-        if (prod.status !== "draft") {
-          await productModuleService.updateProducts(prod.id, { status: "draft" })
-          console.log(
-            `Product '${prod.handle}': DRAFT (vendor '${vendor.vendor_id}' status='${vendor.status}')`
-          )
-          draftedCount++
+      const vendorCatalog = await readYamlFile<VendorProductCatalog>(vendorProductsPath)
+      for (const vp of vendorCatalog.products ?? []) {
+        if (vp.product_id) {
+          blockedFixtureIds.add(vp.product_id)
         }
       }
     } catch (e: any) {
       warnings.push(
-        `Vendor status gate for '${vendor.vendor_id}': error — ${e?.message ?? String(e)}`
+        `Vendor status gate: cannot read vendor products for '${vendor.vendor_id}' — ${e?.message ?? String(e)}`
       )
+    }
+  }
+
+  if (blockedFixtureIds.size === 0) {
+    return { draftedCount: 0 }
+  }
+
+  // Fetch all market products from Medusa in one query
+  let allProducts: any[]
+  try {
+    allProducts = await productModuleService.listProducts(
+      {},
+      { select: ["id", "handle", "status", "metadata"], take: null }
+    )
+    allProducts = allProducts ?? []
+  } catch (e: any) {
+    warnings.push(`Vendor status gate: cannot list products — ${e?.message ?? String(e)}`)
+    return { draftedCount: 0 }
+  }
+
+  // Filter to market products whose fixture_id is in the blocked set
+  const toBlock = allProducts.filter((p: any) => {
+    const gpMeta = (p.metadata as any)?.gp
+    return gpMeta?.market_id === marketId && blockedFixtureIds.has(gpMeta?.fixture_id)
+  })
+
+  let draftedCount = 0
+  for (const prod of toBlock) {
+    if (prod.status !== "draft") {
+      try {
+        await productModuleService.updateProducts(prod.id, { status: "draft" })
+        console.log(
+          `Product '${prod.handle}': DRAFT (vendor product blocked by vendor status gate)`
+        )
+        draftedCount++
+      } catch (e: any) {
+        warnings.push(
+          `Vendor status gate for product '${prod.handle}': update error — ${e?.message ?? String(e)}`
+        )
+      }
     }
   }
 

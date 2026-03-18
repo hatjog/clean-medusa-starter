@@ -10,6 +10,7 @@
  * - syncProducts: runtime validation (H-8), cross-market guard (H-3), H-7 partial assignment
  * - evaluateQualityGate: quality gate criteria (description, price, image)
  * - isPlaceholderUrl: placeholder URL detection
+ * - enforceVendorStatusGate: vendor status enforcement via vendor product files
  */
 
 import {
@@ -21,6 +22,7 @@ import {
   syncProducts,
   evaluateQualityGate,
   isPlaceholderUrl,
+  enforceVendorStatusGate,
 } from "../../scripts/gp-config-sync-catalog"
 
 // ---------------------------------------------------------------------------
@@ -701,7 +703,7 @@ describe("syncProducts", () => {
     expect(payload).toHaveProperty("status", "published")
   })
 
-  it("quality gate: vendor inactive → all products draft after vendor status gate", async () => {
+  it("quality gate: product with price=0 + short desc → draft (quality gate, not vendor gate)", async () => {
     const svc = makeProductModuleService({
       listProducts: jest.fn().mockResolvedValue([
         {
@@ -841,5 +843,215 @@ describe("isPlaceholderUrl", () => {
 
   it("returns false for normal product images", () => {
     expect(isPlaceholderUrl("https://cdn.example.com/products/srv_0101/thumb.jpg")).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// enforceVendorStatusGate
+// ---------------------------------------------------------------------------
+
+// Mock fs and js-yaml for file reads in enforceVendorStatusGate
+jest.mock("node:fs/promises", () => ({
+  readFile: jest.fn(),
+}))
+
+import fs from "node:fs/promises"
+import * as yaml from "js-yaml"
+
+describe("enforceVendorStatusGate", () => {
+  const mockReadFile = fs.readFile as jest.Mock
+
+  beforeEach(() => {
+    mockReadFile.mockReset()
+  })
+
+  function setupFiles(marketYaml: object, vendorFiles: Record<string, object>) {
+    mockReadFile.mockImplementation(async (filePath: string) => {
+      if (filePath.endsWith("market.yaml")) {
+        return yaml.dump(marketYaml)
+      }
+      for (const [vendorId, data] of Object.entries(vendorFiles)) {
+        if (filePath.includes(`vendors/${vendorId}/products.yaml`)) {
+          return yaml.dump(data)
+        }
+      }
+      throw new Error(`File not found: ${filePath}`)
+    })
+  }
+
+  it("drafts products from suspended vendor based on vendor product file", async () => {
+    setupFiles(
+      {
+        market_id: "bonbeauty",
+        vendors: [
+          { vendor_id: "good-vendor", status: "active" },
+          { vendor_id: "bad-vendor", status: "suspended" },
+        ],
+      },
+      {
+        "bad-vendor": {
+          vendor_id: "bad-vendor",
+          market_id: "bonbeauty",
+          products: [{ product_id: "srv_0101" }, { product_id: "srv_0102" }],
+        },
+      }
+    )
+
+    const svc = {
+      listProducts: jest.fn().mockResolvedValue([
+        { id: "p1", handle: "product-1", status: "published", metadata: { gp: { market_id: "bonbeauty", fixture_id: "srv_0101" } } },
+        { id: "p2", handle: "product-2", status: "published", metadata: { gp: { market_id: "bonbeauty", fixture_id: "srv_0102" } } },
+        { id: "p3", handle: "product-3", status: "published", metadata: { gp: { market_id: "bonbeauty", fixture_id: "srv_0201" } } },
+      ]),
+      updateProducts: jest.fn().mockResolvedValue({}),
+    }
+    const warnings: string[] = []
+
+    const result = await enforceVendorStatusGate(svc, "/config/bonbeauty/market.yaml", "bonbeauty", warnings)
+
+    expect(result.draftedCount).toBe(2)
+    expect(svc.updateProducts).toHaveBeenCalledTimes(2)
+    expect(svc.updateProducts).toHaveBeenCalledWith("p1", { status: "draft" })
+    expect(svc.updateProducts).toHaveBeenCalledWith("p2", { status: "draft" })
+    expect(warnings).toHaveLength(0)
+  })
+
+  it("skips products already in draft status", async () => {
+    setupFiles(
+      {
+        market_id: "bonbeauty",
+        vendors: [{ vendor_id: "bad-vendor", status: "suspended" }],
+      },
+      {
+        "bad-vendor": {
+          vendor_id: "bad-vendor",
+          market_id: "bonbeauty",
+          products: [{ product_id: "srv_0101" }],
+        },
+      }
+    )
+
+    const svc = {
+      listProducts: jest.fn().mockResolvedValue([
+        { id: "p1", handle: "product-1", status: "draft", metadata: { gp: { market_id: "bonbeauty", fixture_id: "srv_0101" } } },
+      ]),
+      updateProducts: jest.fn().mockResolvedValue({}),
+    }
+    const warnings: string[] = []
+
+    const result = await enforceVendorStatusGate(svc, "/config/bonbeauty/market.yaml", "bonbeauty", warnings)
+
+    expect(result.draftedCount).toBe(0)
+    expect(svc.updateProducts).not.toHaveBeenCalled()
+  })
+
+  it("returns 0 when all vendors are active", async () => {
+    setupFiles(
+      {
+        market_id: "bonbeauty",
+        vendors: [{ vendor_id: "good-vendor", status: "active" }],
+      },
+      {}
+    )
+
+    const svc = {
+      listProducts: jest.fn(),
+      updateProducts: jest.fn(),
+    }
+    const warnings: string[] = []
+
+    const result = await enforceVendorStatusGate(svc, "/config/bonbeauty/market.yaml", "bonbeauty", warnings)
+
+    expect(result.draftedCount).toBe(0)
+    expect(svc.listProducts).not.toHaveBeenCalled()
+  })
+
+  it("does not treat 'onboarded' as active — drafts products from onboarded vendors", async () => {
+    setupFiles(
+      {
+        market_id: "bonbeauty",
+        vendors: [{ vendor_id: "new-vendor", status: "onboarded" }],
+      },
+      {
+        "new-vendor": {
+          vendor_id: "new-vendor",
+          market_id: "bonbeauty",
+          products: [{ product_id: "srv_0301" }],
+        },
+      }
+    )
+
+    const svc = {
+      listProducts: jest.fn().mockResolvedValue([
+        { id: "p1", handle: "product-1", status: "published", metadata: { gp: { market_id: "bonbeauty", fixture_id: "srv_0301" } } },
+      ]),
+      updateProducts: jest.fn().mockResolvedValue({}),
+    }
+    const warnings: string[] = []
+
+    const result = await enforceVendorStatusGate(svc, "/config/bonbeauty/market.yaml", "bonbeauty", warnings)
+
+    expect(result.draftedCount).toBe(1)
+  })
+
+  it("warns when market.yaml is unreadable", async () => {
+    mockReadFile.mockRejectedValue(new Error("ENOENT"))
+
+    const svc = { listProducts: jest.fn(), updateProducts: jest.fn() }
+    const warnings: string[] = []
+
+    const result = await enforceVendorStatusGate(svc, "/missing/market.yaml", "bonbeauty", warnings)
+
+    expect(result.draftedCount).toBe(0)
+    expect(warnings.some((w) => w.includes("cannot read market.yaml"))).toBe(true)
+  })
+
+  it("warns when vendor product file is missing but continues", async () => {
+    mockReadFile.mockImplementation(async (filePath: string) => {
+      if (filePath.endsWith("market.yaml")) {
+        return yaml.dump({
+          market_id: "bonbeauty",
+          vendors: [{ vendor_id: "ghost-vendor", status: "suspended" }],
+        })
+      }
+      throw new Error("ENOENT")
+    })
+
+    const svc = { listProducts: jest.fn(), updateProducts: jest.fn() }
+    const warnings: string[] = []
+
+    const result = await enforceVendorStatusGate(svc, "/config/bonbeauty/market.yaml", "bonbeauty", warnings)
+
+    expect(result.draftedCount).toBe(0)
+    expect(warnings.some((w) => w.includes("ghost-vendor"))).toBe(true)
+  })
+
+  it("ignores products from other markets", async () => {
+    setupFiles(
+      {
+        market_id: "bonbeauty",
+        vendors: [{ vendor_id: "bad-vendor", status: "suspended" }],
+      },
+      {
+        "bad-vendor": {
+          vendor_id: "bad-vendor",
+          market_id: "bonbeauty",
+          products: [{ product_id: "srv_0101" }],
+        },
+      }
+    )
+
+    const svc = {
+      listProducts: jest.fn().mockResolvedValue([
+        { id: "p1", handle: "product-1", status: "published", metadata: { gp: { market_id: "other-market", fixture_id: "srv_0101" } } },
+      ]),
+      updateProducts: jest.fn().mockResolvedValue({}),
+    }
+    const warnings: string[] = []
+
+    const result = await enforceVendorStatusGate(svc, "/config/bonbeauty/market.yaml", "bonbeauty", warnings)
+
+    expect(result.draftedCount).toBe(0)
+    expect(svc.updateProducts).not.toHaveBeenCalled()
   })
 })
