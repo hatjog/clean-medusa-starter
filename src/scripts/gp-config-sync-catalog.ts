@@ -134,7 +134,12 @@ const PLACEHOLDER_PATTERNS = [
   /no-image/i,
   /default-product/i,
   /via\.placeholder\.com/i,
+  /cdn\.example\.com/i,
 ]
+
+export type QualityGateOptions = {
+  vendorPricing?: boolean
+}
 
 export type QualityGateResult = {
   status: "published" | "draft"
@@ -146,7 +151,10 @@ export function isPlaceholderUrl(url: string): boolean {
   return PLACEHOLDER_PATTERNS.some((pattern) => pattern.test(url))
 }
 
-export function evaluateQualityGate(product: FixtureProduct): QualityGateResult {
+export function evaluateQualityGate(
+  product: FixtureProduct,
+  options?: QualityGateOptions
+): QualityGateResult {
   const reasons: string[] = []
 
   const wordCount = (product.description ?? "").split(/\s+/).filter(Boolean).length
@@ -155,7 +163,7 @@ export function evaluateQualityGate(product: FixtureProduct): QualityGateResult 
   }
 
   const price = product.base_price?.amount ?? 0
-  if (price <= 0) {
+  if (price <= 0 && !options?.vendorPricing) {
     reasons.push(`price=${price} <= 0`)
   }
 
@@ -173,6 +181,56 @@ export function evaluateQualityGate(product: FixtureProduct): QualityGateResult 
     reasons,
     details: { words: wordCount, price, image: imageDetail },
   }
+}
+
+// ---- Vendor Pricing Lookup ----
+
+type VendorProductEntry = {
+  product_id: string
+  vendor_price?: { amount: number; currency?: string }
+  status?: string
+}
+
+type VendorProductFile = {
+  vendor_id: string
+  products?: VendorProductEntry[]
+}
+
+export async function buildVendorPricingMap(
+  marketConfigPath: string,
+  warnings: string[]
+): Promise<Map<string, boolean>> {
+  const map = new Map<string, boolean>()
+  const marketDir = path.dirname(marketConfigPath)
+
+  let marketConfig: MarketConfig
+  try {
+    marketConfig = await readYamlFile<MarketConfig>(marketConfigPath)
+  } catch {
+    return map
+  }
+
+  const activeVendors = (marketConfig.vendors ?? []).filter(
+    (v) => ACTIVE_VENDOR_STATUSES.has(v.status)
+  )
+
+  for (const vendor of activeVendors) {
+    const vendorProductsPath = path.resolve(
+      marketDir, "vendors", vendor.vendor_id, "products.yaml"
+    )
+    try {
+      const vendorCatalog = await readYamlFile<VendorProductFile>(vendorProductsPath)
+      for (const vp of vendorCatalog.products ?? []) {
+        if (vp.product_id && vp.status !== "inactive" && (vp.vendor_price?.amount ?? 0) > 0) {
+          map.set(vp.product_id, true)
+        }
+      }
+    } catch {
+      // Vendor product file missing — not an error, vendor may have no products yet
+    }
+  }
+
+  return map
 }
 
 // ---- Prerequisites ----
@@ -544,7 +602,8 @@ export async function syncProducts(
   categoryMap: Map<string, string>,
   collectionMap: Map<string, string>,
   marketId: string,
-  warnings: string[]
+  warnings: string[],
+  vendorPricingMap?: Map<string, boolean>
 ): Promise<OpCounts> {
   const counts: OpCounts = { created: 0, updated: 0, skipped: 0 }
 
@@ -624,10 +683,11 @@ export async function syncProducts(
         )
 
         // Quality gate evaluation before status assignment
-        const gateResult = evaluateQualityGate(product)
+        const hasVendorPricing = vendorPricingMap?.get(product.product_id) ?? false
+        const gateResult = evaluateQualityGate(product, { vendorPricing: hasVendorPricing })
         const gateStatus = gateResult.status
         console.log(
-          `Product '${product.product_id}': ${gateStatus.toUpperCase()} (words=${gateResult.details.words}, image=${gateResult.details.image}, price=${gateResult.details.price})` +
+          `Product '${product.product_id}': ${gateStatus.toUpperCase()} (words=${gateResult.details.words}, image=${gateResult.details.image}, price=${gateResult.details.price}${hasVendorPricing ? ", vendorPricing=true" : ""})` +
             (gateResult.reasons.length > 0 ? ` — failed: ${gateResult.reasons.join(", ")}` : "")
         )
 
@@ -643,6 +703,7 @@ export async function syncProducts(
               synced_by: "gp-config-sync-catalog",
               market_id: marketId,
               fixture_id: product.product_id,
+              has_vendor_pricing: hasVendorPricing,
             },
           },
         }
@@ -673,9 +734,10 @@ export async function syncProducts(
         counts.updated++
       } else {
         // Quality gate evaluation before status assignment
-        const createGateResult = evaluateQualityGate(product)
+        const createHasVendorPricing = vendorPricingMap?.get(product.product_id) ?? false
+        const createGateResult = evaluateQualityGate(product, { vendorPricing: createHasVendorPricing })
         console.log(
-          `Product '${product.product_id}': ${createGateResult.status.toUpperCase()} (words=${createGateResult.details.words}, image=${createGateResult.details.image}, price=${createGateResult.details.price})` +
+          `Product '${product.product_id}': ${createGateResult.status.toUpperCase()} (words=${createGateResult.details.words}, image=${createGateResult.details.image}, price=${createGateResult.details.price}${createHasVendorPricing ? ", vendorPricing=true" : ""})` +
             (createGateResult.reasons.length > 0 ? ` — failed: ${createGateResult.reasons.join(", ")}` : "")
         )
 
@@ -714,6 +776,7 @@ export async function syncProducts(
                     synced_by: "gp-config-sync-catalog",
                     market_id: marketId,
                     fixture_id: product.product_id,
+                    has_vendor_pricing: createHasVendorPricing,
                   },
                 },
               },
@@ -742,6 +805,8 @@ export async function syncProducts(
 }
 
 // ---- Vendor Status Enforcement ----
+
+const ACTIVE_VENDOR_STATUSES = new Set(["active", "onboarded"])
 
 type MarketVendor = {
   vendor_id: string
@@ -774,7 +839,7 @@ export async function enforceVendorStatusGate(
   }
 
   const vendors = marketConfig.vendors ?? []
-  const nonActiveVendors = vendors.filter((v) => v.status !== "active")
+  const nonActiveVendors = vendors.filter((v) => !ACTIVE_VENDOR_STATUSES.has(v.status))
 
   if (nonActiveVendors.length === 0) {
     return { draftedCount: 0 }
@@ -907,6 +972,13 @@ export default async function gpConfigSyncCatalog({ container, args }: ExecArgs)
     warnings
   )
 
+  // Build vendor pricing map before product sync
+  const marketConfigPath = path.resolve(configRoot, instanceId, "markets", marketId, "market.yaml")
+  const vendorPricingMap = await buildVendorPricingMap(marketConfigPath, warnings)
+  if (vendorPricingMap.size > 0) {
+    console.log(`Vendor pricing: ${vendorPricingMap.size} product(s) have active vendor prices`)
+  }
+
   // Sync products
   const productCounts = await syncProducts(
     container,
@@ -916,11 +988,11 @@ export default async function gpConfigSyncCatalog({ container, args }: ExecArgs)
     categoryMap,
     collectionMap,
     marketId,
-    warnings
+    warnings,
+    vendorPricingMap
   )
 
   // Vendor status enforcement — draft products from non-active vendors
-  const marketConfigPath = path.resolve(configRoot, instanceId, "markets", marketId, "market.yaml")
   const { draftedCount } = await enforceVendorStatusGate(
     productModuleService,
     marketConfigPath,

@@ -23,6 +23,7 @@ import {
   evaluateQualityGate,
   isPlaceholderUrl,
   enforceVendorStatusGate,
+  buildVendorPricingMap,
 } from "../../scripts/gp-config-sync-catalog"
 
 // ---------------------------------------------------------------------------
@@ -652,7 +653,7 @@ describe("syncProducts", () => {
         handle: "short-desc",
         description: "Only a few words here.",
         base_price: { amount: 150, currency: "PLN" },
-        photo_url: "https://cdn.example.com/image.jpg",
+        photo_url: "https://real-cdn.example.org/image.jpg",
       }],
       prereqs,
       emptyMaps.categoryMap,
@@ -689,7 +690,7 @@ describe("syncProducts", () => {
         handle: "full-desc",
         description: longDesc,
         base_price: { amount: 150, currency: "PLN" },
-        photo_url: "https://cdn.example.com/products/full/thumb.jpg",
+        photo_url: "https://real-cdn.example.org/products/full/thumb.jpg",
       }],
       prereqs,
       emptyMaps.categoryMap,
@@ -752,7 +753,7 @@ describe("evaluateQualityGate", () => {
       name: "Test",
       base_price: { amount: 150, currency: "PLN" },
       description: longDesc,
-      photo_url: "https://cdn.example.com/image.jpg",
+      photo_url: "https://real-cdn.example.org/products/image.jpg",
     })
     expect(result.status).toBe("published")
     expect(result.reasons).toHaveLength(0)
@@ -764,7 +765,7 @@ describe("evaluateQualityGate", () => {
       name: "Test",
       base_price: { amount: 150, currency: "PLN" },
       description: "Short description only.",
-      photo_url: "https://cdn.example.com/image.jpg",
+      photo_url: "https://real-cdn.example.org/image.jpg",
     })
     expect(result.status).toBe("draft")
     expect(result.reasons.some((r) => r.includes("words="))).toBe(true)
@@ -777,8 +778,40 @@ describe("evaluateQualityGate", () => {
       name: "Test",
       base_price: { amount: 0, currency: "PLN" },
       description: longDesc,
-      photo_url: "https://cdn.example.com/image.jpg",
+      photo_url: "https://real-cdn.example.org/image.jpg",
     })
+    expect(result.status).toBe("draft")
+    expect(result.reasons.some((r) => r.includes("price="))).toBe(true)
+  })
+
+  it("returns published when price is 0 but vendorPricing is true", () => {
+    const longDesc = Array(85).fill("word").join(" ")
+    const result = evaluateQualityGate(
+      {
+        product_id: "p-1",
+        name: "Test",
+        base_price: { amount: 0, currency: "PLN" },
+        description: longDesc,
+        photo_url: "https://real-cdn.example.org/image.jpg",
+      },
+      { vendorPricing: true }
+    )
+    expect(result.status).toBe("published")
+    expect(result.reasons).toHaveLength(0)
+  })
+
+  it("returns draft when price is 0 and vendorPricing is false", () => {
+    const longDesc = Array(85).fill("word").join(" ")
+    const result = evaluateQualityGate(
+      {
+        product_id: "p-1",
+        name: "Test",
+        base_price: { amount: 0, currency: "PLN" },
+        description: longDesc,
+        photo_url: "https://real-cdn.example.org/image.jpg",
+      },
+      { vendorPricing: false }
+    )
     expect(result.status).toBe("draft")
     expect(result.reasons.some((r) => r.includes("price="))).toBe(true)
   })
@@ -803,6 +836,19 @@ describe("evaluateQualityGate", () => {
       base_price: { amount: 150, currency: "PLN" },
       description: longDesc,
       photo_url: "https://via.placeholder.com/400x300",
+    })
+    expect(result.status).toBe("draft")
+    expect(result.reasons.some((r) => r.includes("image=placeholder"))).toBe(true)
+  })
+
+  it("returns draft when image URL is cdn.example.com", () => {
+    const longDesc = Array(85).fill("word").join(" ")
+    const result = evaluateQualityGate({
+      product_id: "p-1",
+      name: "Test",
+      base_price: { amount: 150, currency: "PLN" },
+      description: longDesc,
+      photo_url: "https://cdn.example.com/gp/bonbeauty/products/srv_0101/thumb.jpg",
     })
     expect(result.status).toBe("draft")
     expect(result.reasons.some((r) => r.includes("image=placeholder"))).toBe(true)
@@ -841,8 +887,12 @@ describe("isPlaceholderUrl", () => {
     expect(isPlaceholderUrl("https://cdn.example.com/default-product.jpg")).toBe(true)
   })
 
+  it("detects cdn.example.com as placeholder", () => {
+    expect(isPlaceholderUrl("https://cdn.example.com/gp/bonbeauty/products/srv_0101/thumb.jpg")).toBe(true)
+  })
+
   it("returns false for normal product images", () => {
-    expect(isPlaceholderUrl("https://cdn.example.com/products/srv_0101/thumb.jpg")).toBe(false)
+    expect(isPlaceholderUrl("https://real-cdn.example.org/products/srv_0101/thumb.jpg")).toBe(false)
   })
 })
 
@@ -966,7 +1016,7 @@ describe("enforceVendorStatusGate", () => {
     expect(svc.listProducts).not.toHaveBeenCalled()
   })
 
-  it("does not treat 'onboarded' as active — drafts products from onboarded vendors", async () => {
+  it("treats 'onboarded' as active — does NOT draft products from onboarded vendors", async () => {
     setupFiles(
       {
         market_id: "bonbeauty",
@@ -991,7 +1041,8 @@ describe("enforceVendorStatusGate", () => {
 
     const result = await enforceVendorStatusGate(svc, "/config/bonbeauty/market.yaml", "bonbeauty", warnings)
 
-    expect(result.draftedCount).toBe(1)
+    expect(result.draftedCount).toBe(0)
+    expect(svc.updateProducts).not.toHaveBeenCalled()
   })
 
   it("warns when market.yaml is unreadable", async () => {
@@ -1053,5 +1104,99 @@ describe("enforceVendorStatusGate", () => {
 
     expect(result.draftedCount).toBe(0)
     expect(svc.updateProducts).not.toHaveBeenCalled()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// buildVendorPricingMap
+// ---------------------------------------------------------------------------
+
+describe("buildVendorPricingMap", () => {
+  const mockReadFile = fs.readFile as jest.Mock
+
+  beforeEach(() => {
+    mockReadFile.mockReset()
+  })
+
+  function setupFiles(marketYaml: object, vendorFiles: Record<string, object>) {
+    mockReadFile.mockImplementation(async (filePath: string) => {
+      if (filePath.endsWith("market.yaml")) {
+        return yaml.dump(marketYaml)
+      }
+      for (const [vendorId, data] of Object.entries(vendorFiles)) {
+        if (filePath.includes(`vendors/${vendorId}/products.yaml`)) {
+          return yaml.dump(data)
+        }
+      }
+      throw new Error(`File not found: ${filePath}`)
+    })
+  }
+
+  it("returns map with product_ids that have vendor pricing from active vendors", async () => {
+    setupFiles(
+      {
+        market_id: "bonbeauty",
+        vendors: [
+          { vendor_id: "city-beauty", status: "active" },
+          { vendor_id: "kremidotyk", status: "onboarded" },
+        ],
+      },
+      {
+        "city-beauty": {
+          vendor_id: "city-beauty",
+          products: [
+            { product_id: "srv_0101", status: "active", vendor_price: { amount: 160, currency: "PLN" } },
+            { product_id: "srv_0102", status: "active", vendor_price: { amount: 0, currency: "PLN" } },
+          ],
+        },
+        "kremidotyk": {
+          vendor_id: "kremidotyk",
+          products: [
+            { product_id: "srv_0401", status: "active", vendor_price: { amount: 180, currency: "PLN" } },
+          ],
+        },
+      }
+    )
+
+    const warnings: string[] = []
+    const map = await buildVendorPricingMap("/config/bonbeauty/market.yaml", warnings)
+
+    expect(map.get("srv_0101")).toBe(true)
+    expect(map.has("srv_0102")).toBe(false) // price=0 — not valid vendor pricing
+    expect(map.get("srv_0401")).toBe(true) // onboarded vendor counts as active
+    expect(warnings).toHaveLength(0)
+  })
+
+  it("excludes products from suspended vendors", async () => {
+    setupFiles(
+      {
+        market_id: "bonbeauty",
+        vendors: [
+          { vendor_id: "bad-vendor", status: "suspended" },
+        ],
+      },
+      {
+        "bad-vendor": {
+          vendor_id: "bad-vendor",
+          products: [
+            { product_id: "srv_0101", status: "active", vendor_price: { amount: 200, currency: "PLN" } },
+          ],
+        },
+      }
+    )
+
+    const warnings: string[] = []
+    const map = await buildVendorPricingMap("/config/bonbeauty/market.yaml", warnings)
+
+    expect(map.size).toBe(0)
+  })
+
+  it("returns empty map when market.yaml is unreadable", async () => {
+    mockReadFile.mockRejectedValue(new Error("ENOENT"))
+
+    const warnings: string[] = []
+    const map = await buildVendorPricingMap("/missing/market.yaml", warnings)
+
+    expect(map.size).toBe(0)
   })
 })
