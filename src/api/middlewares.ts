@@ -1,4 +1,5 @@
 import {
+  authenticate,
   defineMiddlewares,
   type MedusaNextFunction,
   type MedusaRequest,
@@ -549,7 +550,10 @@ export default defineMiddlewares({
   routes: [
     {
       matcher: "/v1/admin/*",
-      middlewares: [operatorAuthMiddleware],
+      middlewares: [
+        authenticate("user", ["session", "bearer"]),
+        operatorAuthMiddleware,
+      ],
     },
     {
       method: ["POST"],
