@@ -911,6 +911,212 @@ export default class GpCoreService {
     return result
   }
 
+  /**
+   * adminSearchEntitlements — Operator entitlement lookup (Story 8.1, DD-16, CST-1).
+   *
+   * Two query paths:
+   * - Email path (contains "@"): Mercur orders WHERE buyer_email ILIKE → collect order_ids → gp_core entitlements.
+   *   Two separate DB connections — cross-DB FK is impossible (IP-2, DD-16).
+   * - Direct path: ILIKE on voucher_code, exact match on claim_token / order_id.
+   *
+   * Returns full EntitlementAdminView[] with redemption list + audit log.
+   */
+  async adminSearchEntitlements(q: string): Promise<import("../../../lib/contracts/admin").EntitlementAdminView[]> {
+    const isEmailSearch = q.includes("@")
+    const startMs = Date.now()
+
+    if (isEmailSearch) {
+      return this.adminSearchByEmail(q, startMs)
+    }
+
+    return this.adminSearchDirect(q, startMs)
+  }
+
+  private async adminSearchByEmail(
+    email: string,
+    startMs: number
+  ): Promise<import("../../../lib/contracts/admin").EntitlementAdminView[]> {
+    // Step 1: Find order_ids in Mercur DB by buyer_email (ILIKE for case-insensitive)
+    const orderRows = await this.queryMany<{ id: string }>(
+      this.getMercurPool(),
+      `SELECT id FROM public.order WHERE buyer_email ILIKE $1 LIMIT 100`,
+      [`%${email}%`]
+    )
+
+    if (!orderRows.length) {
+      this.logger_.info?.(`[admin.entitlement.search] query_type=email result_count=0 duration_ms=${Date.now() - startMs}`)
+      return []
+    }
+
+    const orderIds = orderRows.map((r) => r.id)
+
+    // Step 2: Fetch entitlements from gp_core by order_id list
+    const entitlements = await this.queryMany<import("../../../lib/contracts/admin").EntitlementAdminView & { raw_id: string }>(
+      this.getCorePool(),
+      `
+        SELECT
+          e.id,
+          e.status,
+          e.voucher_code,
+          e.claim_token,
+          e.order_id,
+          e.face_value_minor,
+          e.remaining_minor,
+          e.currency,
+          e.product_name,
+          e.vendor_name,
+          e.created_at,
+          e.expires_at,
+          e.claimed_at,
+          e.last_redeemed_at
+        FROM entitlements e
+        WHERE e.order_id = ANY($1)
+        ORDER BY e.created_at DESC
+        LIMIT 200
+      `,
+      [orderIds]
+    )
+
+    const result = await this.enrichEntitlements(entitlements)
+    this.logger_.info?.(`[admin.entitlement.search] query_type=email result_count=${result.length} duration_ms=${Date.now() - startMs}`)
+    return result
+  }
+
+  private async adminSearchDirect(
+    q: string,
+    startMs: number
+  ): Promise<import("../../../lib/contracts/admin").EntitlementAdminView[]> {
+    // Direct path: ILIKE on voucher_code, exact match on claim_token and order_id
+    const entitlements = await this.queryMany<import("../../../lib/contracts/admin").EntitlementAdminView>(
+      this.getCorePool(),
+      `
+        SELECT
+          e.id,
+          e.status,
+          e.voucher_code,
+          e.claim_token,
+          e.order_id,
+          e.face_value_minor,
+          e.remaining_minor,
+          e.currency,
+          e.product_name,
+          e.vendor_name,
+          e.created_at,
+          e.expires_at,
+          e.claimed_at,
+          e.last_redeemed_at
+        FROM entitlements e
+        WHERE e.voucher_code ILIKE $1
+           OR e.claim_token = $2
+           OR e.order_id = $2
+        ORDER BY e.created_at DESC
+        LIMIT 100
+      `,
+      [`%${q}%`, q]
+    )
+
+    const result = await this.enrichEntitlements(entitlements)
+    this.logger_.info?.(`[admin.entitlement.search] query_type=direct result_count=${result.length} duration_ms=${Date.now() - startMs}`)
+    return result
+  }
+
+  private async enrichEntitlements(
+    entitlements: import("../../../lib/contracts/admin").EntitlementAdminView[]
+  ): Promise<import("../../../lib/contracts/admin").EntitlementAdminView[]> {
+    if (!entitlements.length) return []
+
+    const ids = entitlements.map((e) => e.id)
+
+    // Fetch redemptions for all entitlements in one query
+    const redemptions = await this.queryMany<{
+      id: string
+      entitlement_id: string
+      amount_minor: number
+      vendor_id: string
+      redeemed_at: string
+      idempotency_key: string
+    }>(
+      this.getCorePool(),
+      `
+        SELECT id, entitlement_id, amount_minor, vendor_id, redeemed_at, idempotency_key
+        FROM redemptions
+        WHERE entitlement_id = ANY($1)
+        ORDER BY redeemed_at ASC
+      `,
+      [ids]
+    )
+
+    // Fetch audit log entries (table may not exist yet — graceful skip)
+    let auditEntries: Array<{
+      id: string
+      entitlement_id: string
+      action: string
+      actor: string
+      reason: string | null
+      created_at: string
+    }> = []
+
+    try {
+      auditEntries = await this.queryMany<{
+        id: string
+        entitlement_id: string
+        action: string
+        actor: string
+        reason: string | null
+        created_at: string
+      }>(
+        this.getCorePool(),
+        `
+          SELECT id, entitlement_id, action, actor, reason, created_at
+          FROM entitlement_audit_log
+          WHERE entitlement_id = ANY($1)
+          ORDER BY created_at ASC
+        `,
+        [ids]
+      )
+    } catch {
+      // entitlement_audit_log table may not exist yet
+    }
+
+    // Group by entitlement_id
+    const redemptionsByEntitlement = new Map<string, typeof redemptions>()
+    const auditByEntitlement = new Map<string, typeof auditEntries>()
+
+    for (const r of redemptions) {
+      const list = redemptionsByEntitlement.get(r.entitlement_id) ?? []
+      list.push(r)
+      redemptionsByEntitlement.set(r.entitlement_id, list)
+    }
+
+    for (const a of auditEntries) {
+      const list = auditByEntitlement.get(a.entitlement_id) ?? []
+      list.push(a)
+      auditByEntitlement.set(a.entitlement_id, list)
+    }
+
+    return entitlements.map((e) => ({
+      ...e,
+      created_at: e.created_at ? new Date(e.created_at).toISOString() : e.created_at,
+      expires_at: e.expires_at ? new Date(e.expires_at).toISOString() : null,
+      claimed_at: e.claimed_at ? new Date(e.claimed_at).toISOString() : null,
+      last_redeemed_at: e.last_redeemed_at ? new Date(e.last_redeemed_at).toISOString() : null,
+      redemptions: (redemptionsByEntitlement.get(e.id) ?? []).map((r) => ({
+        id: r.id,
+        amount_minor: r.amount_minor,
+        vendor_id: r.vendor_id,
+        redeemed_at: new Date(r.redeemed_at).toISOString(),
+        idempotency_key: r.idempotency_key,
+      })),
+      audit_log: (auditByEntitlement.get(e.id) ?? []).map((a) => ({
+        id: a.id,
+        action: a.action,
+        actor: a.actor,
+        reason: a.reason,
+        created_at: new Date(a.created_at).toISOString(),
+      })),
+    }))
+  }
+
   async findSalesChannelId(marketId: string): Promise<string | null> {
     try {
       const byMetadata = await this.queryOne<{ id: string }>(

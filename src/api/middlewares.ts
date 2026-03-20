@@ -4,6 +4,7 @@ import {
   type MedusaRequest,
   type MedusaResponse,
 } from "@medusajs/framework/http";
+import { operatorAuthMiddleware } from "../middlewares/with-operator-auth";
 import type { Knex } from "knex";
 import {
   ContainerRegistrationKeys,
@@ -546,6 +547,10 @@ export async function cartMarketGuardMiddleware(
 
 export default defineMiddlewares({
   routes: [
+    {
+      matcher: "/v1/admin/*",
+      middlewares: [operatorAuthMiddleware],
+    },
     {
       method: ["POST"],
       matcher: "/auth/customer/emailpass/register",

@@ -14,7 +14,8 @@ Related files:
 | **public** | `/v1/health`, `/status`, `/api/v1/entitlements/claim` | None | (future: rate-limit) | Yes (future) | Existing endpoints, no auth required |
 | **storefront** | `/store/*` | Publishable API key | `marketContextMiddleware` → `marketGuardMiddleware` → `customerMarketGuardMiddleware` + route-specific overlays | Yes (future) | Fully implemented — see [MIDDLEWARE_STACK.md](MIDDLEWARE_STACK.md) |
 | **vendor** | `/vendor/*` | Mercur seller auth (`withVendorAuth`) | Native Mercur middleware | No | Native Mercur — no explicit GP middleware needed |
-| **admin** | `/admin/*`, `/api/v1/admin/*` | Medusa admin auth (`withOperatorAuth`) | Native Medusa middleware | No | Native Medusa — no explicit GP middleware needed |
+| **admin** | `/admin/*` | Medusa admin auth | Native Medusa middleware | No | Native Medusa — no explicit GP middleware needed |
+| **operator** | `/api/v1/admin/*` | Medusa admin auth (`withOperatorAuth`) | `operatorAuthMiddleware` (Story 8.1) | No | GP operator API — `actor_type="user"` required; 401/403 fail-closed |
 
 ## Auth Details
 
@@ -36,11 +37,17 @@ Related files:
 - Spike-dependent: if Mercur seller auth works for gp_core → use native; otherwise custom auth (DD-25)
 - No explicit middleware in GP `middlewares.ts` — handled by Mercur framework
 
-### Admin/Operator Group
-- Medusa native admin authentication (`withOperatorAuth`)
+### Admin Group (Medusa native)
+- Medusa native admin authentication
 - Admin panel routes: `/admin/*`
-- GP custom admin routes: `/api/v1/admin/*`
 - No explicit middleware in GP `middlewares.ts` — handled by Medusa framework
+
+### Operator Group (GP custom admin API)
+- GP custom admin routes: `/api/v1/admin/*`
+- Middleware: `operatorAuthMiddleware` from `src/middlewares/with-operator-auth.ts`
+- Verifies `req.auth_context.actor_type === "user"` (Medusa admin user)
+- Vendor/seller tokens return 403; missing auth returns 401
+- Auth auto-discovery CI gate: `__tests__/api/auth-coverage.spec.ts`
 
 ## Notes
 

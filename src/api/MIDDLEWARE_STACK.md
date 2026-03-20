@@ -1,6 +1,6 @@
-# Store Middleware Stack
+# Middleware Stack
 
-Ten dokument jest SSOT dla kolejności middleware używanych przez storefront API w [middlewares.ts](middlewares.ts).
+Ten dokument jest SSOT dla kolejności middleware używanych przez API w [middlewares.ts](middlewares.ts).
 
 Powiązane pliki:
 - runtime chain: [middlewares.ts](middlewares.ts)
@@ -9,6 +9,8 @@ Powiązane pliki:
 - debug runbook: [../../../../specs/ops/rls-debugging-runbook.md](../../../../specs/ops/rls-debugging-runbook.md)
 - unit tests: [../__tests__/api/market-context-middleware.unit.spec.ts](../__tests__/api/market-context-middleware.unit.spec.ts)
 - customer isolation tests: [../__tests__/api/customer-market-guard.unit.spec.ts](../__tests__/api/customer-market-guard.unit.spec.ts)
+- operator auth middleware: [../middlewares/with-operator-auth.ts](../middlewares/with-operator-auth.ts)
+- operator auth tests: [../__tests__/middlewares/with-operator-auth.unit.spec.ts](../__tests__/middlewares/with-operator-auth.unit.spec.ts)
 
 ## Global chain dla `/store/*`
 
@@ -66,6 +68,7 @@ GP backend API is organized into four route groups with distinct auth and middle
 | storefront | `/store/*` | Publishable key | marketContext → marketGuard → customerMarketGuard (see above) |
 | vendor | `/vendor/*` | Mercur seller auth | Native Mercur (no GP middleware) |
 | admin | `/admin/*` | Medusa admin auth | Native Medusa (no GP middleware) |
+| operator | `/api/v1/admin/*` | Medusa admin auth | `operatorAuthMiddleware` — verifies `actor_type="user"`, 401/403 fail-closed |
 
 ## Notes utrzymaniowe
 
