@@ -825,18 +825,37 @@ export default class GpCoreService {
 
   // --- Entitlement Domain Stubs (Story 1.2) ---
 
+  /**
+   * @planned ADR-052 — entitlement issuance via Mercur→gp_core event flow (checkout→issue).
+   * This stub will be implemented when event-driven integration is built.
+   */
   async createEntitlement(_dto: EntitlementCreateDto): Promise<Entitlement> {
     throw new NotImplementedError("Story 1.3")
   }
 
+  /**
+   * @deprecated ADR-052 — salon entitlement operations live in apps/web (direct gp_core access).
+   * This stub is a historical placeholder from before the gp_core/gp_mercur DB separation was established.
+   * Do NOT implement here. If Mercur needs entitlement operations, design a bridge (ADR-052 Option B).
+   */
   async claimVoucher(_claimToken: string, _customerId: string): Promise<Entitlement> {
     throw new NotImplementedError("Story 1.3")
   }
 
+  /**
+   * @deprecated ADR-052 — salon entitlement operations live in apps/web (direct gp_core access).
+   * This stub is a historical placeholder from before the gp_core/gp_mercur DB separation was established.
+   * Do NOT implement here. If Mercur needs entitlement operations, design a bridge (ADR-052 Option B).
+   */
   async verifyVoucher(_voucherCode: string): Promise<Entitlement> {
     throw new NotImplementedError("Story 1.3")
   }
 
+  /**
+   * @deprecated ADR-052 — salon entitlement operations live in apps/web (direct gp_core access).
+   * This stub is a historical placeholder from before the gp_core/gp_mercur DB separation was established.
+   * Do NOT implement here. If Mercur needs entitlement operations, design a bridge (ADR-052 Option B).
+   */
   async redeemVoucher(_dto: RedemptionCreateDto): Promise<Entitlement> {
     throw new NotImplementedError("Story 1.3")
   }
@@ -845,14 +864,29 @@ export default class GpCoreService {
     throw new NotImplementedError("Story 1.3")
   }
 
+  /**
+   * @deprecated ADR-052 — salon entitlement operations live in apps/web (direct gp_core access).
+   * This stub is a historical placeholder from before the gp_core/gp_mercur DB separation was established.
+   * Do NOT implement here. If Mercur needs entitlement operations, design a bridge (ADR-052 Option B).
+   */
   async searchVouchers(_query: { market_id?: string; vendor_id?: string; status?: string }): Promise<Entitlement[]> {
     throw new NotImplementedError("Story 1.3")
   }
 
+  /**
+   * @deprecated ADR-052 — salon entitlement operations live in apps/web (direct gp_core access).
+   * This stub is a historical placeholder from before the gp_core/gp_mercur DB separation was established.
+   * Do NOT implement here. If Mercur needs entitlement operations, design a bridge (ADR-052 Option B).
+   */
   async voidEntitlement(_entitlementId: string, _reason: string): Promise<Entitlement> {
     throw new NotImplementedError("Story 1.3")
   }
 
+  /**
+   * @deprecated ADR-052 — salon entitlement operations live in apps/web (direct gp_core access).
+   * This stub is a historical placeholder from before the gp_core/gp_mercur DB separation was established.
+   * Do NOT implement here. If Mercur needs entitlement operations, design a bridge (ADR-052 Option B).
+   */
   async refundEntitlement(_entitlementId: string, _reason: string): Promise<Entitlement> {
     throw new NotImplementedError("Story 1.3")
   }
