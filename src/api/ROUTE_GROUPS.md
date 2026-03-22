@@ -5,7 +5,7 @@ Formal SSOT for API route group definitions. Each group has distinct auth requir
 Related files:
 - middleware implementation: [middlewares.ts](middlewares.ts)
 - middleware stack docs: [MIDDLEWARE_STACK.md](MIDDLEWARE_STACK.md)
-- architecture reference: `_bmad-output/planning-artifacts/architecture-v1.2.0.md` (DD-25, PP-7)
+- architecture reference: `_bmad-output/planning-artifacts/archive-v1.2.0/architecture-v1.2.0.md` (DD-25, PP-7)
 
 ## Route Groups
 
