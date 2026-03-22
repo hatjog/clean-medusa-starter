@@ -18,7 +18,6 @@ import {
   AssignVendorToMarketInput,
   CreateMarketInput,
   CreateVendorInput,
-  CreateVerticalInput,
   Entitlement,
   EntitlementCreateDto,
   GpCoreMarket,
@@ -28,9 +27,10 @@ import {
   GpCoreVendor,
   GpCoreVendorMarketAssignment,
   GpCoreVendorMarketAssignmentDetail,
-  GpCoreVertical,
   RedemptionCreateDto,
   UpdateMarketInput,
+  UpsertUserMarketMembershipInput,
+  UpsertUserVendorMembershipInput,
 } from "./models"
 
 export class NotImplementedError extends Error {
@@ -51,15 +51,7 @@ type LoggerLike = {
 }
 type MarketSelector = { id: string } | { instance_id: string; slug: string }
 
-type MarketRow = GpCoreMarketRecord & {
-  vertical_entity_id: string
-  vertical_instance_id: string
-  vertical_name: string
-  vertical_slug: string
-  vertical_status: string
-  vertical_created_at: Date | string
-  vertical_updated_at: Date | string
-}
+type MarketRow = GpCoreMarketRecord
 
 type AssignmentRow = GpCoreVendorMarketAssignment & {
   vendor_instance_id: string
@@ -94,21 +86,11 @@ function mapMarketRow(row: MarketRow): GpCoreMarket {
     instance_id: row.instance_id,
     name: row.name,
     slug: row.slug,
-    vertical_id: row.vertical_id,
     status: row.status,
     sales_channel_id: row.sales_channel_id,
     payload_vendor_id: row.payload_vendor_id,
     created_at: row.created_at,
     updated_at: row.updated_at,
-    vertical: {
-      id: row.vertical_entity_id,
-      instance_id: row.vertical_instance_id,
-      name: row.vertical_name,
-      slug: row.vertical_slug,
-      status: row.vertical_status,
-      created_at: row.vertical_created_at,
-      updated_at: row.vertical_updated_at,
-    },
   }
 }
 
@@ -250,7 +232,7 @@ export default class GpCoreService {
     client?: Queryable
   ): Promise<GpCoreMarketRecord | null> {
     const selectCols =
-      "id, instance_id, name, slug, vertical_id, status, sales_channel_id, payload_vendor_id, created_at, updated_at"
+      "id, instance_id, name, slug, status, sales_channel_id, payload_vendor_id, created_at, updated_at"
 
     if ("id" in selector) {
       return await this.queryOne<GpCoreMarketRecord>(
@@ -299,110 +281,14 @@ export default class GpCoreService {
     }
   }
 
-  async listVerticals(instanceId?: string): Promise<GpCoreVertical[]> {
-    return await this.queryMany<GpCoreVertical>(
-      this.getCorePool(),
-      `
-        SELECT id, instance_id, name, slug, status, created_at, updated_at
-        FROM gp_core.verticals
-        WHERE ($1::text IS NULL OR instance_id = $1)
-        ORDER BY slug ASC
-      `,
-      [instanceId ?? null]
-    )
-  }
-
-  async getVerticalBySlug(instanceId: string, slug: string, client?: Queryable): Promise<GpCoreVertical | null> {
-    return await this.queryOne<GpCoreVertical>(
-      client ?? this.getCorePool(),
-      `
-        SELECT id, instance_id, name, slug, status, created_at, updated_at
-        FROM gp_core.verticals
-        WHERE instance_id = $1 AND slug = $2
-      `,
-      [instanceId, slug]
-    )
-  }
-
-  async getVerticalById(verticalId: string, client?: Queryable): Promise<GpCoreVertical | null> {
-    return await this.queryOne<GpCoreVertical>(
-      client ?? this.getCorePool(),
-      `
-        SELECT id, instance_id, name, slug, status, created_at, updated_at
-        FROM gp_core.verticals
-        WHERE id = $1
-      `,
-      [verticalId]
-    )
-  }
-
-  async createVertical(input: CreateVerticalInput, client?: Queryable): Promise<GpCoreVertical> {
-    const vertical = await this.queryOne<GpCoreVertical>(
-      client ?? this.getCorePool(),
-      `
-        INSERT INTO gp_core.verticals (id, instance_id, name, slug, status)
-        VALUES (COALESCE($1::uuid, gen_random_uuid()), $2, $3, $4, $5)
-        RETURNING id, instance_id, name, slug, status, created_at, updated_at
-      `,
-      [input.id ?? null, input.instance_id, input.name, input.slug, input.status ?? "active"]
-    )
-
-    if (!vertical) {
-      throw new Error(`Failed to create vertical '${input.slug}'`)
-    }
-
-    return vertical
-  }
-
-  async upsertVertical(input: CreateVerticalInput, client?: Queryable): Promise<GpCoreVertical> {
-    const vertical = await this.queryOne<GpCoreVertical>(
-      client ?? this.getCorePool(),
-      `
-        INSERT INTO gp_core.verticals (id, instance_id, name, slug, status)
-        VALUES (COALESCE($1::uuid, gen_random_uuid()), $2, $3, $4, $5)
-        ON CONFLICT (instance_id, slug)
-        DO UPDATE
-        SET name = EXCLUDED.name,
-            status = EXCLUDED.status,
-            updated_at = now()
-        RETURNING id, instance_id, name, slug, status, created_at, updated_at
-      `,
-      [input.id ?? null, input.instance_id, input.name, input.slug, input.status ?? "active"]
-    )
-
-    if (!vertical) {
-      throw new Error(`Failed to upsert vertical '${input.slug}'`)
-    }
-
-    return vertical
-  }
-
   async listMarkets(instanceId?: string): Promise<GpCoreMarket[]> {
     const rows = await this.queryMany<MarketRow>(
       this.getCorePool(),
       `
-        SELECT
-          m.id,
-          m.instance_id,
-          m.name,
-          m.slug,
-          m.vertical_id,
-          m.status,
-          m.sales_channel_id,
-          m.payload_vendor_id,
-          m.created_at,
-          m.updated_at,
-          v.id AS vertical_entity_id,
-          v.instance_id AS vertical_instance_id,
-          v.name AS vertical_name,
-          v.slug AS vertical_slug,
-          v.status AS vertical_status,
-          v.created_at AS vertical_created_at,
-          v.updated_at AS vertical_updated_at
-        FROM gp_core.markets m
-        INNER JOIN gp_core.verticals v ON v.id = m.vertical_id
-        WHERE ($1::text IS NULL OR m.instance_id = $1)
-        ORDER BY m.slug ASC
+        SELECT id, instance_id, name, slug, status, sales_channel_id, payload_vendor_id, created_at, updated_at
+        FROM gp_core.markets
+        WHERE ($1::text IS NULL OR instance_id = $1)
+        ORDER BY slug ASC
       `,
       [instanceId ?? null]
     )
@@ -414,7 +300,7 @@ export default class GpCoreService {
     return await this.queryOne<GpCoreMarketRecord>(
       client ?? this.getCorePool(),
       `
-        SELECT id, instance_id, name, slug, vertical_id, status, sales_channel_id, payload_vendor_id, created_at, updated_at
+        SELECT id, instance_id, name, slug, status, sales_channel_id, payload_vendor_id, created_at, updated_at
         FROM gp_core.markets
         WHERE instance_id = $1 AND slug = $2
       `,
@@ -426,28 +312,10 @@ export default class GpCoreService {
     return await this.queryOne<MarketRow>(
       client ?? this.getCorePool(),
       `
-        SELECT
-          m.id,
-          m.instance_id,
-          m.name,
-          m.slug,
-          m.vertical_id,
-          m.status,
-          m.sales_channel_id,
-          m.payload_vendor_id,
-          m.created_at,
-          m.updated_at,
-          v.id AS vertical_entity_id,
-          v.instance_id AS vertical_instance_id,
-          v.name AS vertical_name,
-          v.slug AS vertical_slug,
-          v.status AS vertical_status,
-          v.created_at AS vertical_created_at,
-          v.updated_at AS vertical_updated_at
-        FROM gp_core.markets m
-        INNER JOIN gp_core.verticals v ON v.id = m.vertical_id
-        WHERE m.slug = $1
-          AND ($2::text IS NULL OR m.instance_id = $2)
+        SELECT id, instance_id, name, slug, status, sales_channel_id, payload_vendor_id, created_at, updated_at
+        FROM gp_core.markets
+        WHERE slug = $1
+          AND ($2::text IS NULL OR instance_id = $2)
       `,
       [slug, instanceId ?? null]
     )
@@ -494,11 +362,6 @@ export default class GpCoreService {
       return await this.withTransaction((transactionClient) => this.createMarket(input, transactionClient))
     }
 
-    const vertical = await this.getVerticalById(input.vertical_id, client)
-    if (!vertical) {
-      throw new Error(`Vertical '${input.vertical_id}' not found`)
-    }
-
     const market = await this.queryOne<GpCoreMarketRecord>(
       client,
       `
@@ -507,7 +370,6 @@ export default class GpCoreService {
           instance_id,
           name,
           slug,
-          vertical_id,
           status,
           sales_channel_id,
           payload_vendor_id
@@ -519,17 +381,15 @@ export default class GpCoreService {
           $4,
           $5,
           $6,
-          $7,
-          $8
+          $7
         )
-        RETURNING id, instance_id, name, slug, vertical_id, status, sales_channel_id, payload_vendor_id, created_at, updated_at
+        RETURNING id, instance_id, name, slug, status, sales_channel_id, payload_vendor_id, created_at, updated_at
       `,
       [
         input.id ?? null,
         input.instance_id,
         input.name,
         input.slug,
-        input.vertical_id,
         input.status ?? "active",
         normalizeNullable(input.sales_channel_id),
         normalizeNullable(input.payload_vendor_id),
@@ -540,10 +400,7 @@ export default class GpCoreService {
       throw new Error(`Failed to create market '${input.slug}'`)
     }
 
-    const createdEnvelope = buildMarketCreatedEnvelope({
-      market,
-      vertical,
-    })
+    const createdEnvelope = buildMarketCreatedEnvelope({ market })
 
     // CAVEAT: Medusa EventBus is not transactional — emit happens inside the
     // DB transaction but the bus (Redis/in-memory) is not rolled back on
@@ -568,7 +425,6 @@ export default class GpCoreService {
           instance_id,
           name,
           slug,
-          vertical_id,
           status,
           sales_channel_id,
           payload_vendor_id
@@ -580,25 +436,22 @@ export default class GpCoreService {
           $4,
           $5,
           $6,
-          $7,
-          $8
+          $7
         )
         ON CONFLICT (instance_id, slug)
         DO UPDATE
         SET name = EXCLUDED.name,
-            vertical_id = EXCLUDED.vertical_id,
             status = EXCLUDED.status,
             sales_channel_id = EXCLUDED.sales_channel_id,
             payload_vendor_id = EXCLUDED.payload_vendor_id,
             updated_at = now()
-        RETURNING id, instance_id, name, slug, vertical_id, status, sales_channel_id, payload_vendor_id, created_at, updated_at
+        RETURNING id, instance_id, name, slug, status, sales_channel_id, payload_vendor_id, created_at, updated_at
       `,
       [
         input.id ?? null,
         input.instance_id,
         input.name,
         input.slug,
-        input.vertical_id,
         input.status ?? "active",
         normalizeNullable(input.sales_channel_id),
         normalizeNullable(input.payload_vendor_id),
@@ -618,7 +471,7 @@ export default class GpCoreService {
     client?: Queryable
   ): Promise<GpCoreMarketRecord> {
     const selectCols =
-      "id, instance_id, name, slug, vertical_id, status, sales_channel_id, payload_vendor_id, created_at, updated_at"
+      "id, instance_id, name, slug, status, sales_channel_id, payload_vendor_id, created_at, updated_at"
 
     if (!client) {
       return await this.withTransaction((transactionClient) =>
@@ -821,6 +674,76 @@ export default class GpCoreService {
     }
 
     return assignment
+  }
+
+  // --- User Membership Methods (accounts sync) ---
+
+  async upsertUserMarketMembership(
+    input: UpsertUserMarketMembershipInput,
+    client?: Queryable
+  ): Promise<{ id: string; user_id: string; instance_id: string; market_id: string; role: string }> {
+    const row = await this.queryOne<{
+      id: string
+      user_id: string
+      instance_id: string
+      market_id: string
+      role: string
+      status: string
+      created_at: Date | string
+    }>(
+      client ?? this.getCorePool(),
+      `
+        INSERT INTO gp_core.user_market_memberships (user_id, instance_id, market_id, role)
+        VALUES ($1, $2, $3, $4)
+        ON CONFLICT (user_id, instance_id, market_id)
+        DO UPDATE
+        SET role = EXCLUDED.role
+        RETURNING id, user_id, instance_id, market_id, role, status, created_at
+      `,
+      [input.user_id, input.instance_id, input.market_id, input.role]
+    )
+
+    if (!row) {
+      throw new Error(
+        `Failed to upsert user_market_membership for user '${input.user_id}' and market '${input.market_id}'`
+      )
+    }
+
+    return row
+  }
+
+  async upsertUserVendorMembership(
+    input: UpsertUserVendorMembershipInput,
+    client?: Queryable
+  ): Promise<{ id: string; user_id: string; instance_id: string; vendor_id: string; role: string }> {
+    const row = await this.queryOne<{
+      id: string
+      user_id: string
+      instance_id: string
+      vendor_id: string
+      role: string
+      status: string
+      created_at: Date | string
+    }>(
+      client ?? this.getCorePool(),
+      `
+        INSERT INTO gp_core.user_vendor_memberships (user_id, instance_id, vendor_id, role)
+        VALUES ($1, $2, $3, $4)
+        ON CONFLICT (user_id, instance_id, vendor_id)
+        DO UPDATE
+        SET role = EXCLUDED.role
+        RETURNING id, user_id, instance_id, vendor_id, role, status, created_at
+      `,
+      [input.user_id, input.instance_id, input.vendor_id, input.role]
+    )
+
+    if (!row) {
+      throw new Error(
+        `Failed to upsert user_vendor_membership for user '${input.user_id}' and vendor '${input.vendor_id}'`
+      )
+    }
+
+    return row
   }
 
   // --- Entitlement Domain Stubs (Story 1.2) ---

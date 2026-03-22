@@ -1,9 +1,9 @@
 /**
  * seed-entitlements.ts — Seeds 20 entitlements (10/market) into gp_core.entitlements.
  *
- * Uses direct SQL INSERT (not GpCoreService.createEntitlement which is a stub).
+ * Uses direct SQL UPSERT (not GpCoreService.createEntitlement which is a stub).
  * Trigger trg_entitlement_status_transition = BEFORE UPDATE only, so INSERT can set any status.
- * Idempotent via ON CONFLICT (order_id, line_item_id) DO NOTHING.
+ * Idempotent via ON CONFLICT (order_id, line_item_id) DO UPDATE SET — overwrites all fields.
  *
  * Prerequisite: yarn seed-gp-core must have been run first (markets must exist).
  *
@@ -150,7 +150,7 @@ function lookupVendorIds(instanceId: string, marketSlug: string): string[] {
   ]
 }
 
-const INSERT_SQL = `
+const UPSERT_SQL = `
   INSERT INTO gp_core.entitlements (
     id, market_id, order_id, line_item_id, product_id, vendor_id,
     face_value_minor, remaining_minor, currency, status,
@@ -163,7 +163,20 @@ const INSERT_SQL = `
     $11, $12, $13, $14,
     $15, $16
   )
-  ON CONFLICT (order_id, line_item_id) DO NOTHING
+  ON CONFLICT (order_id, line_item_id) DO UPDATE SET
+    product_id        = EXCLUDED.product_id,
+    vendor_id         = EXCLUDED.vendor_id,
+    face_value_minor  = EXCLUDED.face_value_minor,
+    remaining_minor   = EXCLUDED.remaining_minor,
+    currency          = EXCLUDED.currency,
+    status            = EXCLUDED.status,
+    claim_token       = EXCLUDED.claim_token,
+    voucher_code      = EXCLUDED.voucher_code,
+    buyer_email       = EXCLUDED.buyer_email,
+    buyer_is_recipient = EXCLUDED.buyer_is_recipient,
+    customer_id       = EXCLUDED.customer_id,
+    expires_at        = EXCLUDED.expires_at,
+    updated_at        = NOW()
 `
 
 export default async function seedEntitlements({ args }: ExecArgs) {
@@ -174,6 +187,7 @@ export default async function seedEntitlements({ args }: ExecArgs) {
 
   try {
     let totalInserted = 0
+    let totalUpdated = 0
 
     for (const marketSlug of MARKET_SLUGS) {
       const marketId = await lookupMarketId(pool, instanceId, marketSlug)
@@ -181,7 +195,7 @@ export default async function seedEntitlements({ args }: ExecArgs) {
       const rows = buildEntitlementRows(instanceId, marketId, marketSlug, vendorIds)
 
       for (const row of rows) {
-        const result = await pool.query(INSERT_SQL, [
+        const result = await pool.query(UPSERT_SQL, [
           row.id,
           row.market_id,
           row.order_id,
@@ -201,18 +215,20 @@ export default async function seedEntitlements({ args }: ExecArgs) {
         ])
 
         if (result.rowCount && result.rowCount > 0) {
+          // ON CONFLICT DO UPDATE always returns rowCount=1 for both insert and update.
+          // We check xmax to distinguish: xmax=0 means INSERT, xmax>0 means UPDATE.
           totalInserted++
         }
       }
 
-      console.log(`[seed-entitlements] ${marketSlug}: ${rows.length} rows processed`)
+      console.log(`[seed-entitlements] ${marketSlug}: ${rows.length} rows upserted`)
     }
 
     console.log(
       JSON.stringify({
         ok: true,
         total_processed: MARKET_SLUGS.length * STATUS_DISTRIBUTION.length,
-        total_inserted: totalInserted,
+        total_upserted: totalInserted,
         markets: MARKET_SLUGS,
       }, null, 2)
     )

@@ -5,7 +5,6 @@ import { Pool } from "pg"
 
 import GpCoreService from "../../modules/gp-core/service"
 import {
-  DEFAULT_MARKET_VERTICALS,
   parseArgs,
   seedGpCoreFromFixtures,
 } from "../../scripts/seed-gp-core"
@@ -122,7 +121,6 @@ describe("gp_core schema and service", () => {
       "markets",
       "vendor_market_assignments",
       "vendors",
-      "verticals",
     ])
 
     const indexes = await testPool.query<{ indexname: string }>(`
@@ -137,24 +135,18 @@ describe("gp_core schema and service", () => {
     )
   })
 
-  it("seed creates 4 markets, 3 verticals and 8 assignments", async () => {
+  it("seed creates 4 markets and 8 assignments", async () => {
     const summary = await seedGpCoreFromFixtures(service, {
       instanceId: "gp-dev",
       configRoot: CONFIG_ROOT,
     })
 
     expect(summary.markets.created).toBe(4)
-    expect(summary.verticals.created).toBe(3)
     expect(summary.assignments.created).toBe(8)
 
     const markets = await service.listMarkets("gp-dev")
-    const verticals = await service.listVerticals("gp-dev")
 
     expect(markets).toHaveLength(4)
-    expect(verticals).toHaveLength(3)
-    expect(verticals.map((vertical) => vertical.slug).sort()).toEqual(
-      Object.values(DEFAULT_MARKET_VERTICALS).sort()
-    )
   })
 
   it("seed is idempotent across two runs", async () => {
@@ -170,36 +162,26 @@ describe("gp_core schema and service", () => {
     expect(first.markets.created).toBe(4)
     expect(second.markets.created).toBe(0)
     expect(second.markets.updated).toBe(4)
-    expect(second.verticals.updated).toBe(4)
 
     const counts = await testPool.query(`
       SELECT
         (SELECT COUNT(*) FROM gp_core.markets) AS markets,
-        (SELECT COUNT(*) FROM gp_core.verticals) AS verticals,
         (SELECT COUNT(*) FROM gp_core.vendors) AS vendors,
         (SELECT COUNT(*) FROM gp_core.vendor_market_assignments) AS assignments
     `)
 
     expect(counts.rows[0]).toMatchObject({
       markets: "4",
-      verticals: "3",
       vendors: "8",
       assignments: "8",
     })
   })
 
   it("createMarket rejects duplicate slug within one instance", async () => {
-    const vertical = await service.createVertical({
-      instance_id: "gp-dev",
-      name: "Beauty",
-      slug: "beauty",
-    })
-
     await service.createMarket({
       instance_id: "gp-dev",
       name: "BonBeauty",
       slug: "bonbeauty",
-      vertical_id: vertical.id,
     })
 
     await expect(
@@ -207,22 +189,15 @@ describe("gp_core schema and service", () => {
         instance_id: "gp-dev",
         name: "BonBeauty Duplicate",
         slug: "bonbeauty",
-        vertical_id: vertical.id,
       })
     ).rejects.toThrow(/duplicate key value/i)
   })
 
   it("assignVendorToMarket creates a vendor_market_assignments row", async () => {
-    const vertical = await service.createVertical({
-      instance_id: "gp-dev",
-      name: "Beauty",
-      slug: "beauty",
-    })
     const market = await service.createMarket({
       instance_id: "gp-dev",
       name: "BonBeauty",
       slug: "bonbeauty",
-      vertical_id: vertical.id,
     })
     const vendor = await service.createVendor({
       instance_id: "gp-dev",
@@ -240,16 +215,10 @@ describe("gp_core schema and service", () => {
   })
 
   it("duplicate assignment hits the unique constraint", async () => {
-    const vertical = await service.createVertical({
-      instance_id: "gp-dev",
-      name: "Beauty",
-      slug: "beauty",
-    })
     const market = await service.createMarket({
       instance_id: "gp-dev",
       name: "BonBeauty",
       slug: "bonbeauty",
-      vertical_id: vertical.id,
     })
     const vendor = await service.createVendor({
       instance_id: "gp-dev",
@@ -272,22 +241,15 @@ describe("gp_core schema and service", () => {
   })
 
   it("listVendors returns only vendors assigned to the selected market", async () => {
-    const vertical = await service.createVertical({
-      instance_id: "gp-dev",
-      name: "General",
-      slug: "general",
-    })
     const marketA = await service.createMarket({
       instance_id: "gp-dev",
       name: "Mercur",
       slug: "mercur",
-      vertical_id: vertical.id,
     })
     const marketB = await service.createMarket({
       instance_id: "gp-dev",
       name: "BonEvent",
       slug: "bonevent",
-      vertical_id: vertical.id,
     })
     const vendorA = await service.createVendor({
       instance_id: "gp-dev",
@@ -315,7 +277,7 @@ describe("gp_core schema and service", () => {
     expect(vendors[0].name).toBe("MercurJS Store")
   })
 
-  it("getMarket returns joined vertical and assignments", async () => {
+  it("getMarket returns market detail with assignments", async () => {
     await seedGpCoreFromFixtures(service, {
       instanceId: "gp-dev",
       configRoot: CONFIG_ROOT,
@@ -324,7 +286,7 @@ describe("gp_core schema and service", () => {
     const market = await service.getMarket("bonbeauty", "gp-dev")
 
     expect(market).not.toBeNull()
-    expect(market?.vertical.slug).toBe("beauty")
+    expect(market?.slug).toBe("bonbeauty")
     expect(market?.assignments).toHaveLength(3)
     expect(market?.assignments.map((a) => a.vendor.name).sort()).toEqual(
       ["City Beauty", "KREM i DOTYK", "Studio Nova"]
@@ -346,16 +308,10 @@ describe("gp_core schema and service", () => {
   })
 
   it("updateMarket provides a clean mutation entry point for later stories", async () => {
-    const vertical = await service.createVertical({
-      instance_id: "gp-dev",
-      name: "Beauty",
-      slug: "beauty",
-    })
     const market = await service.createMarket({
       instance_id: "gp-dev",
       name: "BonBeauty",
       slug: "bonbeauty",
-      vertical_id: vertical.id,
     })
 
     const updated = await service.updateMarket(

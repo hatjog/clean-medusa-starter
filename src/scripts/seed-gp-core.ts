@@ -32,8 +32,6 @@ type MarketConfig = {
   market_id: string
   status?: string
   name?: string
-  vertical?: string
-  vertical_slug?: string
   vendors?: MarketVendorConfig[]
 }
 
@@ -51,28 +49,15 @@ type MutationCounts = {
 type SeedSummary = {
   instance_id: string
   instance_path: string
-  verticals: MutationCounts
   markets: MutationCounts
   vendors: MutationCounts
   assignments: MutationCounts
-}
-
-export const DEFAULT_MARKET_VERTICALS: Record<string, string> = {
-  bonbeauty: "beauty",
-  bonevent: "events",
-  mercur: "general",
 }
 
 export const DEFAULT_MARKET_NAMES: Record<string, string> = {
   bonbeauty: "BonBeauty",
   bonevent: "BonEvent",
   mercur: "Mercur",
-}
-
-export const DEFAULT_VERTICAL_NAMES: Record<string, string> = {
-  beauty: "Beauty",
-  events: "Events",
-  general: "General",
 }
 
 export function parseArgs(args: string[] | undefined): {
@@ -112,20 +97,6 @@ function titleize(slug: string): string {
     .filter(Boolean)
     .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
     .join(" ")
-}
-
-export function resolveVerticalSlug(marketRef: InstanceMarketRef, marketConfig: MarketConfig): string {
-  return (
-    marketConfig.vertical_slug ??
-    marketConfig.vertical ??
-    DEFAULT_MARKET_VERTICALS[marketConfig.market_id] ??
-    DEFAULT_MARKET_VERTICALS[marketRef.market_id] ??
-    "general"
-  )
-}
-
-export function resolveVerticalName(verticalSlug: string): string {
-  return DEFAULT_VERTICAL_NAMES[verticalSlug] ?? titleize(verticalSlug)
 }
 
 export function resolveMarketName(marketRef: InstanceMarketRef, marketConfig: MarketConfig): string {
@@ -184,7 +155,6 @@ export async function seedGpCoreFromFixtures(
   const summary: SeedSummary = {
     instance_id: context.instanceConfig.instance_id,
     instance_path: context.instancePath,
-    verticals: { created: 0, updated: 0 },
     markets: { created: 0, updated: 0 },
     vendors: { created: 0, updated: 0 },
     assignments: { created: 0, updated: 0 },
@@ -192,20 +162,6 @@ export async function seedGpCoreFromFixtures(
 
   await service.withTransaction(async (client) => {
     for (const loadedMarket of context.markets) {
-      const verticalSlug = resolveVerticalSlug(loadedMarket.ref, loadedMarket.config)
-      const verticalName = resolveVerticalName(verticalSlug)
-      const existingVertical = await service.getVerticalBySlug(input.instanceId, verticalSlug, client)
-      const vertical = await service.upsertVertical(
-        {
-          instance_id: input.instanceId,
-          name: verticalName,
-          slug: verticalSlug,
-          status: "active",
-        },
-        client
-      )
-      summary.verticals[existingVertical ? "updated" : "created"] += 1
-
       const existingMarket = await service.getMarketBySlug(input.instanceId, loadedMarket.ref.slug, client)
       const salesChannelId = await service.findSalesChannelId(loadedMarket.config.market_id)
       if (!salesChannelId) {
@@ -217,7 +173,6 @@ export async function seedGpCoreFromFixtures(
         instance_id: input.instanceId,
         name: resolveMarketName(loadedMarket.ref, loadedMarket.config),
         slug: loadedMarket.ref.slug,
-        vertical_id: vertical.id,
         status: loadedMarket.config.status ?? loadedMarket.ref.status ?? "active",
         sales_channel_id: salesChannelId,
         payload_vendor_id: payloadVendorId,
@@ -227,10 +182,6 @@ export async function seedGpCoreFromFixtures(
       if (existingMarket) {
         if (existingMarket.name !== marketInput.name) {
           marketUpdate.name = marketInput.name
-        }
-
-        if (existingMarket.vertical_id !== marketInput.vertical_id) {
-          marketUpdate.vertical_id = marketInput.vertical_id
         }
 
         if (existingMarket.status !== marketInput.status) {

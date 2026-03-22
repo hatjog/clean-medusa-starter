@@ -1,21 +1,10 @@
 export type TimestampValue = Date | string
 
-export type GpCoreVertical = {
-  id: string
-  instance_id: string
-  name: string
-  slug: string
-  status: string
-  created_at: TimestampValue
-  updated_at: TimestampValue
-}
-
 export type GpCoreMarketRecord = {
   id: string
   instance_id: string
   name: string
   slug: string
-  vertical_id: string
   status: string
   sales_channel_id: string | null
   payload_vendor_id: string | null
@@ -46,9 +35,7 @@ export type GpCoreVendorMarketAssignmentDetail = GpCoreVendorMarketAssignment & 
   vendor: GpCoreVendor
 }
 
-export type GpCoreMarket = GpCoreMarketRecord & {
-  vertical: GpCoreVertical
-}
+export type GpCoreMarket = GpCoreMarketRecord
 
 export type GpCoreMarketDetail = GpCoreMarket & {
   assignments: GpCoreVendorMarketAssignmentDetail[]
@@ -59,20 +46,11 @@ export type GpCoreModuleOptions = {
   mercurDatabaseUrl?: string
 }
 
-export type CreateVerticalInput = {
-  id?: string
-  instance_id: string
-  name: string
-  slug: string
-  status?: string
-}
-
 export type CreateMarketInput = {
   id?: string
   instance_id: string
   name: string
   slug: string
-  vertical_id: string
   status?: string
   sales_channel_id?: string | null
   payload_vendor_id?: string | null
@@ -80,7 +58,6 @@ export type CreateMarketInput = {
 
 export type UpdateMarketInput = {
   name?: string
-  vertical_id?: string
   status?: string
   sales_channel_id?: string | null
   payload_vendor_id?: string | null
@@ -100,6 +77,22 @@ export type AssignVendorToMarketInput = {
   vendor_id: string
   market_id: string
   status?: string
+}
+
+// --- User Membership Types (accounts sync) ---
+
+export type UpsertUserMarketMembershipInput = {
+  user_id: string
+  instance_id: string
+  market_id: string
+  role: string
+}
+
+export type UpsertUserVendorMembershipInput = {
+  user_id: string
+  instance_id: string
+  vendor_id: string
+  role: string
 }
 
 // --- Entitlement Domain Types (Story 1.2) ---

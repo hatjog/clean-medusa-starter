@@ -2,7 +2,7 @@ import fs from "node:fs"
 import path from "node:path"
 import { createHash } from "node:crypto"
 
-import type { GpCoreMarketRecord, GpCoreVertical, UpdateMarketInput } from "./models"
+import type { GpCoreMarketRecord, UpdateMarketInput } from "./models"
 
 export const MARKET_CREATED_EVENT = "gp.markets.market_created.v1"
 export const MARKET_UPDATED_EVENT = "gp.markets.market_updated.v1"
@@ -12,7 +12,6 @@ export type MarketUpdatedBy = "system" | "admin"
 export type MarketEventActor = "system" | "market_operator"
 export type MarketMutableField =
   | "name"
-  | "vertical_id"
   | "status"
   | "sales_channel_id"
   | "payload_vendor_id"
@@ -28,8 +27,6 @@ export type MarketCreatedPayload = {
   market_id: string
   slug: string
   name: string
-  vertical_id: string
-  vertical_slug?: string
   sales_channel_id: string | null
   status: MarketLifecycleStatus
   instance_id: string
@@ -357,10 +354,6 @@ export function buildMarketUpdatePatch(
     patch.name = update.name
   }
 
-  if (update.vertical_id !== undefined && update.vertical_id !== before.vertical_id) {
-    patch.vertical_id = update.vertical_id
-  }
-
   if (update.status !== undefined && update.status !== before.status) {
     patch.status = update.status
   }
@@ -394,10 +387,6 @@ export function buildMarketRecordChanges(
     changes.name = { old: before.name, new: after.name }
   }
 
-  if (before.vertical_id !== after.vertical_id) {
-    changes.vertical_id = { old: before.vertical_id, new: after.vertical_id }
-  }
-
   if (
     normalizeMarketLifecycleStatus(before.status) !==
     normalizeMarketLifecycleStatus(after.status)
@@ -427,14 +416,11 @@ export function buildMarketRecordChanges(
 
 export function buildMarketCreatedEnvelope(args: {
   market: GpCoreMarketRecord
-  vertical: Pick<GpCoreVertical, "slug">
 }): GpEventEnvelope<MarketCreatedPayload> {
   const payload: MarketCreatedPayload = {
     market_id: args.market.id,
     slug: args.market.slug,
     name: args.market.name,
-    vertical_id: args.market.vertical_id,
-    vertical_slug: args.vertical.slug,
     sales_channel_id: args.market.sales_channel_id,
     status: normalizeMarketLifecycleStatus(args.market.status),
     instance_id: args.market.instance_id,

@@ -36,24 +36,11 @@ export class Migration20260317000000 extends Migration {
 
     // --- Prerequisite tables (IF NOT EXISTS for coexistence with init scripts) ---
     this.addSql(`
-      CREATE TABLE IF NOT EXISTS gp_core.verticals (
-        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        instance_id TEXT NOT NULL,
-        name TEXT NOT NULL,
-        slug TEXT NOT NULL,
-        status TEXT NOT NULL DEFAULT 'active',
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      )
-    `);
-
-    this.addSql(`
       CREATE TABLE IF NOT EXISTS gp_core.markets (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         instance_id TEXT NOT NULL,
         name TEXT NOT NULL,
         slug TEXT NOT NULL,
-        vertical_id UUID REFERENCES gp_core.verticals(id),
         status TEXT NOT NULL DEFAULT 'active',
         sales_channel_id TEXT,
         payload_vendor_id TEXT,

@@ -102,17 +102,10 @@ describe("gp_core market lifecycle eventing", () => {
   })
 
   it("createMarket emits a gp.markets.market_created.v1 event", async () => {
-    const vertical = await service.createVertical({
-      instance_id: "gp-dev",
-      name: "Beauty",
-      slug: "beauty",
-    })
-
     const market = await service.createMarket({
       instance_id: "gp-dev",
       name: "BonBeauty",
       slug: "bonbeauty",
-      vertical_id: vertical.id,
       status: "published",
       sales_channel_id: "sc_bonbeauty",
     })
@@ -135,17 +128,10 @@ describe("gp_core market lifecycle eventing", () => {
   })
 
   it("updateMarket emits a gp.markets.market_updated.v1 event with diff", async () => {
-    const vertical = await service.createVertical({
-      instance_id: "gp-dev",
-      name: "Beauty",
-      slug: "beauty",
-    })
-
     const market = await service.createMarket({
       instance_id: "gp-dev",
       name: "BonBeauty",
       slug: "bonbeauty",
-      vertical_id: vertical.id,
       status: "published",
     })
 
@@ -185,17 +171,10 @@ describe("gp_core market lifecycle eventing", () => {
   })
 
   it("emitted market lifecycle events match the JSON Schema contracts", async () => {
-    const vertical = await service.createVertical({
-      instance_id: "gp-dev",
-      name: "Events",
-      slug: "events",
-    })
-
     const market = await service.createMarket({
       instance_id: "gp-dev",
       name: "BonEvent",
       slug: "bonevent",
-      vertical_id: vertical.id,
       status: "draft",
     })
 
@@ -219,17 +198,10 @@ describe("gp_core market lifecycle eventing", () => {
   })
 
   it("updateMarket with identical values does not emit an event", async () => {
-    const vertical = await service.createVertical({
-      instance_id: "gp-dev",
-      name: "Beauty",
-      slug: "beauty",
-    })
-
     const market = await service.createMarket({
       instance_id: "gp-dev",
       name: "BonBeauty",
       slug: "bonbeauty",
-      vertical_id: vertical.id,
       status: "active",
       sales_channel_id: "sc_bonbeauty",
     })

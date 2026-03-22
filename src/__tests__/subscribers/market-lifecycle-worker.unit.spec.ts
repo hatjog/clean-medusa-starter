@@ -4,7 +4,7 @@ import {
   type GpEventEnvelope,
   type MarketCreatedPayload,
 } from "../../modules/gp-core/market-lifecycle-events"
-import type { GpCoreMarketRecord, GpCoreVertical } from "../../modules/gp-core/models"
+import type { GpCoreMarketRecord } from "../../modules/gp-core/models"
 import { MarketLifecycleWorker } from "../../subscribers/market-lifecycle-worker"
 
 function buildMarket(overrides: Partial<GpCoreMarketRecord> = {}): GpCoreMarketRecord {
@@ -13,23 +13,9 @@ function buildMarket(overrides: Partial<GpCoreMarketRecord> = {}): GpCoreMarketR
     instance_id: "gp-dev",
     name: "BonBeauty",
     slug: "bonbeauty",
-    vertical_id: "22222222-2222-4222-8222-222222222222",
     status: "published",
     sales_channel_id: "sc_bonbeauty",
     payload_vendor_id: null,
-    created_at: "2026-03-06T10:00:00.000Z",
-    updated_at: "2026-03-06T10:00:00.000Z",
-    ...overrides,
-  }
-}
-
-function buildVertical(overrides: Partial<GpCoreVertical> = {}): GpCoreVertical {
-  return {
-    id: "22222222-2222-4222-8222-222222222222",
-    instance_id: "gp-dev",
-    name: "Beauty",
-    slug: "beauty",
-    status: "active",
     created_at: "2026-03-06T10:00:00.000Z",
     updated_at: "2026-03-06T10:00:00.000Z",
     ...overrides,
@@ -51,7 +37,6 @@ describe("market lifecycle worker", () => {
 
     const envelope = buildMarketCreatedEnvelope({
       market: buildMarket(),
-      vertical: buildVertical(),
     })
 
     await worker.handle(envelope)
@@ -78,7 +63,6 @@ describe("market lifecycle worker", () => {
 
     const envelope = buildMarketCreatedEnvelope({
       market: buildMarket(),
-      vertical: buildVertical(),
     })
 
     await worker.handle(envelope)

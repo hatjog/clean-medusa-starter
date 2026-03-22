@@ -4,6 +4,8 @@
  * Separate script (not seed.ts modification) per AC #3.
  * Products distributed: 2 for bonbeauty, 2 for testmarketb, 1 shared.
  * Metadata includes vendor_hint and face_value_minor for downstream testing.
+ * Upsert semantic: updates existing products (title, description, status, metadata, prices)
+ * and creates new ones if they don't exist.
  *
  * Prerequisite: Medusa container must be running (products go into Mercur DB).
  *
@@ -165,7 +167,13 @@ function resolveProductService(container: any): any {
   )
 }
 
-async function listExistingHandles(service: any): Promise<Set<string>> {
+type ExistingProduct = {
+  id: string
+  handle: string
+  variants?: Array<{ id: string; title: string }>
+}
+
+async function listExistingProducts(service: any): Promise<Map<string, ExistingProduct>> {
   const listFn = firstFunction(service, [
     "listProducts",
     "listAndCountProducts",
@@ -174,26 +182,39 @@ async function listExistingHandles(service: any): Promise<Set<string>> {
   ])
 
   if (!listFn) {
-    return new Set()
+    return new Map()
   }
 
   try {
-    const result = await listFn({}, { select: ["handle"] })
-    const items = Array.isArray(result) && Array.isArray(result[0])
+    const result = await listFn(
+      {},
+      { select: ["id", "handle"], relations: ["variants"] }
+    )
+    const items: any[] = Array.isArray(result) && Array.isArray(result[0])
       ? result[0]
       : Array.isArray(result)
         ? result
         : []
 
-    return new Set(items.map((p: any) => p.handle).filter(Boolean))
+    const map = new Map<string, ExistingProduct>()
+    for (const p of items) {
+      if (p.handle) {
+        map.set(p.handle, {
+          id: p.id,
+          handle: p.handle,
+          variants: p.variants,
+        })
+      }
+    }
+    return map
   } catch {
-    return new Set()
+    return new Map()
   }
 }
 
 export default async function seedProducts({ container }: ExecArgs) {
   const productService = resolveProductService(container)
-  const existingHandles = await listExistingHandles(productService)
+  const existingProducts = await listExistingProducts(productService)
 
   const createFn = firstFunction(productService, [
     "createProducts",
@@ -204,27 +225,81 @@ export default async function seedProducts({ container }: ExecArgs) {
     throw new Error("Product service does not expose a create method")
   }
 
+  const updateFn = firstFunction(productService, [
+    "updateProducts",
+    "update",
+  ])
+
+  const { upsertVariantPricesWorkflow } = await import("@medusajs/core-flows")
+
   const created: string[] = []
-  const skipped: string[] = []
+  const updated: string[] = []
 
   for (const fixture of PRODUCT_FIXTURES) {
-    if (existingHandles.has(fixture.handle)) {
-      skipped.push(fixture.handle)
-      continue
-    }
+    const existing = existingProducts.get(fixture.handle)
 
-    try {
-      await createFn([fixture])
-      created.push(fixture.handle)
-    } catch (error) {
-      // If batch create fails, try single
+    if (existing) {
+      // Update existing product fields
       try {
-        await createFn(fixture)
-        created.push(fixture.handle)
-      } catch (retryError) {
+        if (updateFn) {
+          await updateFn(existing.id, {
+            title: fixture.title,
+            description: fixture.description,
+            status: fixture.status,
+            metadata: fixture.metadata,
+          })
+        }
+
+        // Update variant prices via workflow
+        const defaultVariant = existing.variants?.find(
+          (v) => v.title === "Default"
+        ) ?? existing.variants?.[0]
+
+        if (defaultVariant && fixture.variants?.[0]?.prices) {
+          try {
+            await upsertVariantPricesWorkflow(container).run({
+              input: {
+                variantPrices: [
+                  {
+                    variant_id: defaultVariant.id,
+                    product_id: existing.id,
+                    prices: fixture.variants[0].prices.map((p) => ({
+                      amount: p.amount,
+                      currency_code: p.currency_code,
+                    })),
+                  },
+                ],
+                previousVariantIds: [],
+              },
+            })
+          } catch (e) {
+            console.error(
+              `[seed-products] Price update failed for '${fixture.handle}': ${String(e)}`
+            )
+          }
+        }
+
+        updated.push(fixture.handle)
+      } catch (e) {
         console.error(
-          `[seed-products] Failed to create '${fixture.handle}': ${String(retryError)}`
+          `[seed-products] Failed to update '${fixture.handle}': ${String(e)}`
         )
+      }
+    } else {
+      // Create new product
+      try {
+        await createFn([fixture])
+        created.push(fixture.handle)
+      } catch (error) {
+        // If batch create fails, try single
+        try {
+          await createFn(fixture)
+          created.push(fixture.handle)
+        } catch (retryError) {
+          console.error(
+            `[seed-products] Failed to create '${fixture.handle}': ${String(retryError)}`
+          )
+        }
       }
     }
   }
@@ -234,7 +309,7 @@ export default async function seedProducts({ container }: ExecArgs) {
       ok: true,
       total: PRODUCT_FIXTURES.length,
       created,
-      skipped,
+      updated,
     }, null, 2)
   )
 }

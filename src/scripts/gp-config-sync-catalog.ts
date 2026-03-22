@@ -1,5 +1,5 @@
 import { ExecArgs } from "@medusajs/framework/types"
-import { createProductsWorkflow, linkProductsToSalesChannelWorkflow } from "@medusajs/core-flows"
+import { createProductsWorkflow, linkProductsToSalesChannelWorkflow, upsertVariantPricesWorkflow } from "@medusajs/core-flows"
 
 import fs from "node:fs/promises"
 import path from "node:path"
@@ -691,7 +691,7 @@ export async function syncProducts(
             (gateResult.reasons.length > 0 ? ` — failed: ${gateResult.reasons.join(", ")}` : "")
         )
 
-        // H-1: explicit fields, H-4: no pricing/variants update
+        // H-1: explicit fields update (including base price when changed)
         const updatePayload: Record<string, any> = {
           title: product.name,
           description: product.description ?? existing.description,
@@ -716,6 +716,42 @@ export async function syncProducts(
         }
 
         await productModuleService.updateProducts(existing.id, updatePayload)
+
+        // Update base price on Default variant (skip if vendor pricing overrides)
+        if (!hasVendorPricing && existing.variants?.length) {
+          const defaultVariant = existing.variants.find(
+            (v: any) => v.title === "Default"
+          ) ?? existing.variants[0]
+
+          if (defaultVariant?.id) {
+            const fixtureAmountMinor = Math.round(product.base_price.amount * 100)
+            const currencyCode = product.base_price.currency.toLowerCase()
+
+            try {
+              await upsertVariantPricesWorkflow(container).run({
+                input: {
+                  variantPrices: [
+                    {
+                      variant_id: defaultVariant.id,
+                      product_id: existing.id,
+                      prices: [
+                        {
+                          amount: fixtureAmountMinor,
+                          currency_code: currencyCode,
+                        },
+                      ],
+                    },
+                  ],
+                  previousVariantIds: [],
+                },
+              })
+            } catch (e: any) {
+              warnings.push(
+                `Product '${product.product_id}': price update — ${e?.message ?? String(e)}`
+              )
+            }
+          }
+        }
 
         // Ensure sales channel assignment (best-effort, idempotent)
         try {
