@@ -81,7 +81,7 @@ export function parseArgs(args: string[] | undefined): {
 
 async function readYamlFile<T>(filePath: string): Promise<T> {
   const raw = await fs.readFile(filePath, "utf8")
-  const doc = yaml.load(raw)
+  const doc = yaml.load(raw, { schema: yaml.JSON_SCHEMA })
   if (!doc || typeof doc !== "object") {
     throw new Error(`Invalid YAML document: ${filePath}`)
   }
@@ -104,6 +104,9 @@ function resolveService(container: any, keysToTry: string[]): any {
 
 export function normalizeHandle(str: string): string {
   return str
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "") // strip diacritics (ł→l, ó→o, ż→z etc.)
+    .replace(/\u0142/g, "l")         // ł is not a combining char — handle explicitly
     .toLowerCase()
     .replace(/\s+/g, "-")
     .replace(/[^a-z0-9-]/g, "")
@@ -112,17 +115,52 @@ export function normalizeHandle(str: string): string {
 }
 
 async function listAll(service: any, methodNames: string[], query: object = {}): Promise<any[]> {
+  let lastError: Error | null = null
   for (const name of methodNames) {
     if (typeof service[name] !== "function") continue
     try {
       const result = await service[name](query)
       if (Array.isArray(result) && Array.isArray(result[0])) return result[0]
       if (Array.isArray(result)) return result
-    } catch {
+    } catch (e: any) {
+      lastError = e instanceof Error ? e : new Error(String(e))
       continue
     }
   }
+  if (lastError) throw lastError
   return []
+}
+
+function readGpMarketId(entity: any): string | null {
+  const marketId = entity?.metadata?.gp?.market_id
+  return typeof marketId === "string" && marketId.trim() ? marketId.trim() : null
+}
+
+function selectEntityMatch(
+  matches: any[] | undefined,
+  marketId: string
+): { match?: any; reason?: string } {
+  if (!Array.isArray(matches) || matches.length === 0) return {}
+  if (matches.length === 1) {
+    const m = matches[0]
+    const owner = readGpMarketId(m)
+    if (owner && owner !== marketId) {
+      return { reason: `cross-market guard — entity belongs to '${owner}', skipping` }
+    }
+    return { match: m }
+  }
+  const exact = matches.filter((m) => readGpMarketId(m) === marketId)
+  if (exact.length === 1) return { match: exact[0] }
+  if (exact.length > 1) {
+    return { reason: `multiple entities found for market '${marketId}' — handle collision` }
+  }
+  const untagged = matches.filter((m) => readGpMarketId(m) === null)
+  if (untagged.length === 1) return { match: untagged[0] }
+  if (untagged.length > 1) {
+    return { reason: "multiple untagged entities for same handle; manual cleanup required" }
+  }
+  const owners = [...new Set(matches.map(readGpMarketId).filter(Boolean))]
+  return { reason: `cross-market guard — entity belongs to '${owners.join(", ")}', skipping` }
 }
 
 // ---- Quality Gate ----
@@ -415,20 +453,15 @@ export async function syncCategories(
         { handle },
         { select: ["id", "handle", "name", "description", "rank", "metadata"] }
       )
-      const existing = matches?.[0]
+      const { match: existing, reason: matchReason } = selectEntityMatch(matches, marketId)
+
+      if (matchReason) {
+        warnings.push(`Category '${cat.category_id}' handle='${handle}': ${matchReason}`)
+        counts.skipped++
+        continue
+      }
 
       if (existing) {
-        // H-3: cross-market guard
-        const existingMarket = (existing.metadata as any)?.gp?.market_id
-        if (existingMarket && existingMarket !== marketId) {
-          warnings.push(
-            `Category '${cat.category_id}' handle='${handle}': cross-market guard — ` +
-              `entity belongs to '${existingMarket}', skipping`
-          )
-          counts.skipped++
-          continue
-        }
-
         // H-1: explicit field update — updateProductCategories(id, data)
         // Safe hierarchical merge: preserves top-level metadata keys (e.g. photo_url)
         // while adding/updating gp sub-object. Requires metadata to be fetched via select.
@@ -534,20 +567,15 @@ export async function syncCollections(
 
     try {
       const matches = await productModuleService.listProductCollections({ handle })
-      const existing = matches?.[0]
+      const { match: existing, reason: matchReason } = selectEntityMatch(matches, marketId)
+
+      if (matchReason) {
+        warnings.push(`Collection '${col.collection_id}' handle='${handle}': ${matchReason}`)
+        counts.skipped++
+        continue
+      }
 
       if (existing) {
-        // H-3: cross-market guard
-        const existingMarket = (existing.metadata as any)?.gp?.market_id
-        if (existingMarket && existingMarket !== marketId) {
-          warnings.push(
-            `Collection '${col.collection_id}' handle='${handle}': cross-market guard — ` +
-              `entity belongs to '${existingMarket}', skipping`
-          )
-          counts.skipped++
-          continue
-        }
-
         // H-1: explicit field update (no product_ids — managed via products)
         await productModuleService.updateProductCollections(existing.id, {
           title: col.title,
@@ -972,18 +1000,29 @@ export default async function gpConfigSyncCatalog({ container, args }: ExecArgs)
   if (categories.length === 0) console.warn("Warning: 0 categories in fixture — intentional?")
   if (products.length === 0) console.warn("Warning: 0 products in fixture — intentional?")
 
-  // Determine currency from first product (fallback PLN)
-  const activeCurrency =
-    products.find((p) => p.base_price?.currency)?.base_price?.currency ?? "PLN"
+  // Determine all currencies used in fixture (fallback PLN)
+  const allCurrencies = [...new Set(
+    products.map((p) => p.base_price?.currency).filter(Boolean)
+  )]
+  if (allCurrencies.length === 0) allCurrencies.push("PLN")
+  const activeCurrency = allCurrencies[0]
 
   const warnings: string[] = []
 
-  // Prerequisites (fail-fast on critical)
+  // Prerequisites (fail-fast on critical) — validate region for each currency
   console.log(`Validating prerequisites for market '${marketId}'...`)
   const prereqs = await validatePrerequisites(container, marketId, activeCurrency, warnings)
   console.log(`  ✓ Sales channel: ${prereqs.salesChannelId}`)
   console.log(`  ✓ Shipping profile: ${prereqs.shippingProfileId}`)
   console.log(`  ✓ Region with currency '${activeCurrency}' found`)
+  for (const currency of allCurrencies.slice(1)) {
+    try {
+      await validatePrerequisites(container, marketId, currency, warnings)
+      console.log(`  ✓ Region with currency '${currency}' found`)
+    } catch (e: any) {
+      warnings.push(`Additional currency '${currency}': ${e?.message ?? String(e)}`)
+    }
+  }
 
   // Resolve services
   const productModuleService = resolveService(container, [
@@ -1056,8 +1095,8 @@ export default async function gpConfigSyncCatalog({ container, args }: ExecArgs)
 
   console.log(JSON.stringify(summary, null, 2))
 
-  // Exit code 1 if warnings (data synced but with issues)
+  // Signal warnings via exit code (non-destructive — lets event loop drain)
   if (warnings.length > 0) {
-    process.exit(1)
+    process.exitCode = 1
   }
 }

@@ -194,7 +194,7 @@ function parseArgs(args: string[] | undefined): {
 
 async function readYamlFile<T>(filePath: string): Promise<T> {
   const raw = await fs.readFile(filePath, "utf8")
-  const doc = yaml.load(raw)
+  const doc = yaml.load(raw, { schema: yaml.JSON_SCHEMA })
   if (!doc || typeof doc !== "object") {
     throw new Error(`Invalid YAML document: ${filePath}`)
   }
@@ -329,9 +329,9 @@ export default async function gpConfigSyncMedia({ container, args }: ExecArgs) {
       { handle },
       { relations: ["images"] }
     )
-    const dbProduct = matches?.[0]
+    const { match: dbProduct, reason: matchReason } = selectCollectionMatch(matches ?? [], marketId)
     if (!dbProduct?.id) {
-      warnings.push(`Product '${product.product_id}': no Mercur product found with handle='${handle}'`)
+      warnings.push(`Product '${product.product_id}': ${matchReason ?? `no Mercur product found with handle='${handle}'`}`)
       continue
     }
 

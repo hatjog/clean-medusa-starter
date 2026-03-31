@@ -92,7 +92,7 @@ function parseArgs(args: string[] | undefined): {
 
 async function readYamlFile<T>(filePath: string): Promise<T> {
   const raw = await fs.readFile(filePath, "utf8")
-  const doc = yaml.load(raw)
+  const doc = yaml.load(raw, { schema: yaml.JSON_SCHEMA })
   if (!doc || typeof doc !== "object") {
     throw new Error(`Invalid YAML document: ${filePath}`)
   }
@@ -140,48 +140,46 @@ async function findUserByEmail(
   userService: UserModuleService,
   email: string
 ): Promise<any | null> {
-  try {
-    const users = await userService.listUsers({ email }, { take: 1 })
-    return users?.[0] ?? null
-  } catch {
-    return null
-  }
+  const users = await userService.listUsers({ email }, { take: 1 })
+  return users?.[0] ?? null
 }
 
 async function findCustomerByEmail(
   customerService: CustomerModuleService,
   scopedEmail: string
 ): Promise<any | null> {
-  try {
-    const customers = await customerService.listCustomers({ email: scopedEmail }, { take: 1 })
-    return customers?.[0] ?? null
-  } catch {
-    return null
+  const customers = await customerService.listCustomers({ email: scopedEmail }, { take: 1 })
+  return customers?.[0] ?? null
+}
+
+// Cached auth identity lookup — loaded once per sync run, then reused
+let _authIdentityCache: Map<string, any> | null = null
+
+async function loadAuthIdentityCache(
+  authService: AuthModuleService
+): Promise<Map<string, any>> {
+  if (_authIdentityCache) return _authIdentityCache
+  const identities = await authService.listAuthIdentities(
+    {},
+    { relations: ["provider_identities"], take: null }
+  )
+  _authIdentityCache = new Map<string, any>()
+  for (const identity of identities ?? []) {
+    for (const pi of identity.provider_identities ?? []) {
+      if (pi.provider === "emailpass" && pi.entity_id) {
+        _authIdentityCache.set(pi.entity_id, identity)
+      }
+    }
   }
+  return _authIdentityCache
 }
 
 async function findAuthIdentityByEntityId(
   authService: AuthModuleService,
   entityId: string
 ): Promise<any | null> {
-  try {
-    const identities = await authService.listAuthIdentities(
-      {},
-      {
-        relations: ["provider_identities"],
-        take: null,
-      }
-    )
-    return (
-      identities?.find((identity: any) =>
-        identity.provider_identities?.some(
-          (pi: any) => pi.provider === "emailpass" && pi.entity_id === entityId
-        )
-      ) ?? null
-    )
-  } catch {
-    return null
-  }
+  const cache = await loadAuthIdentityCache(authService)
+  return cache.get(entityId) ?? null
 }
 
 const SCRYPT_HASH_CONFIG = { logN: 15, r: 8, p: 1 }
@@ -216,6 +214,10 @@ async function ensureAuthIdentity(
         ],
       },
     ])
+    // Update cache with newly created identity
+    if (identity && _authIdentityCache) {
+      _authIdentityCache.set(email, identity)
+    }
     return identity?.id ?? null
   } catch (e: any) {
     warnings.push(`${context}: auth identity creation failed — ${e?.message ?? String(e)}`)
@@ -255,7 +257,13 @@ async function ensureAdminUser(
   warnings: string[],
   context: string
 ): Promise<{ userId: string; created: boolean } | null> {
-  const existingUser = await findUserByEmail(userService, account.email)
+  let existingUser: any | null
+  try {
+    existingUser = await findUserByEmail(userService, account.email)
+  } catch (e: any) {
+    warnings.push(`${context}: user lookup failed — ${e?.message ?? String(e)}`)
+    return null
+  }
   if (existingUser) {
     // Update display_name if changed
     try {
@@ -442,11 +450,17 @@ async function syncCustomerAccounts(
   const counts: OpCounts = { created: 0, skipped: 0 }
 
   for (const customer of customers) {
-    for (const marketId of customer.markets) {
+    for (const marketId of customer.markets ?? []) {
       const scopedEmail = scopeCustomerEmail(customer.email, marketId)
       const context = `customer_accounts[${customer.email}@${marketId}]`
 
-      const existing = await findCustomerByEmail(customerService, scopedEmail)
+      let existing: any | null
+      try {
+        existing = await findCustomerByEmail(customerService, scopedEmail)
+      } catch (e: any) {
+        warnings.push(`${context}: customer lookup failed — ${e?.message ?? String(e)}`)
+        continue
+      }
       if (existing) {
         // Update fields if changed
         try {
@@ -619,7 +633,11 @@ export default async function gpConfigSyncAccounts({ container, args }: ExecArgs
 
   console.log("\n" + JSON.stringify(summary, null, 2))
 
+  // Signal warnings via exit code (non-destructive — lets event loop drain)
   if (warnings.length > 0) {
-    process.exit(1)
+    process.exitCode = 1
   }
+
+  // Reset auth identity cache for next run
+  _authIdentityCache = null
 }
