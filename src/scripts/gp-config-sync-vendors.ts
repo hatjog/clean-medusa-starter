@@ -126,6 +126,16 @@ type SeedIfEmptyResult = {
   isNewSeed: boolean
 }
 
+/** Deep equality for primitives and JSON-serialisable values (including arrays). */
+function deepEqual(a: unknown, b: unknown): boolean {
+  if (a === b) return true
+  if (typeof a !== typeof b) return false
+  if (typeof a === "object" && a !== null && b !== null) {
+    return JSON.stringify(a) === JSON.stringify(b)
+  }
+  return false
+}
+
 function resolveSeedIfEmpty(
   fieldName: string,
   configValue: unknown,
@@ -138,7 +148,7 @@ function resolveSeedIfEmpty(
   if (isSeeded) {
     // Case 1: field tracked AND current DB == config value → apply (config changed, vendor still on config)
     // Case 2: field tracked AND current DB != config value → skip (vendor edited, preserve)
-    if (dbValue === configValue) {
+    if (deepEqual(dbValue, configValue)) {
       // values match → config wins (applies even if vendor "reverted")
       return { value: configValue, shouldWrite: true, isNewSeed: false }
     } else {
@@ -235,14 +245,11 @@ export async function upsertSeller(
     ? (existingGp.seeded_fields as string[])
     : []
 
-  // config_wins fields — always overwrite
-  const configWinsPayload: Record<string, unknown> = {
-    handle,
-    email: vendor.email,
-    phone: vendor.phone,
-    tax_id: vendor.tax_id,
-    store_status: storeStatus,
-  }
+  // config_wins fields — always overwrite (only include defined values to avoid clearing existing data)
+  const configWinsPayload: Record<string, unknown> = { handle, store_status: storeStatus }
+  if (vendor.email !== undefined) configWinsPayload.email = vendor.email
+  if (vendor.phone !== undefined) configWinsPayload.phone = vendor.phone
+  if (vendor.tax_id !== undefined) configWinsPayload.tax_id = vendor.tax_id
 
   // seed_if_empty fields — check ownership before writing
   const gpMetaUpdate: Record<string, unknown> = {
