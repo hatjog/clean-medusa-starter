@@ -84,5 +84,5 @@ export async function syncBlog(
 export default async function gpConfigSyncBlog({ container: _container, args: _args }: ExecArgs) {
   // Blog sync via YAML config not yet wired to market fixtures.
   // syncBlog() is exported for integration into the orchestrator when blog YAML is ready.
-  console.log("[gp-config-sync-blog] Blog sync not yet wired to market YAML; no-op.")
+  console.warn("[WARN][gp-config-sync-blog] Blog sync not yet wired to market YAML; no-op. Blog posts were NOT synced.")
 }

@@ -112,7 +112,7 @@ function makeArticleService() {
 
 function snapshotStore() {
   const sorted = <T extends { handle?: string }>(arr: T[]): T[] =>
-    arr.sort((a, b) => (a.handle ?? '').localeCompare(b.handle ?? ''))
+    [...arr].sort((a, b) => (a.handle ?? '').localeCompare(b.handle ?? ''))
 
   return {
     categories: JSON.parse(
