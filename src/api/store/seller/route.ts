@@ -61,7 +61,7 @@ export async function GET(req: MedusaRequest, res: MedusaResponse) {
 
   const productCountRows = await db<ProductCountRow>("seller_seller_product_product as sspp")
     .select("sspp.seller_id")
-    .count<ProductCountRow>({ product_count: "sspp.product_id" })
+    .countDistinct<ProductCountRow>({ product_count: "sspp.product_id" })
     .innerJoin("product as p", "sspp.product_id", "p.id")
     .innerJoin("product_sales_channel as psc", "p.id", "psc.product_id")
     .where("psc.sales_channel_id", salesChannelId)
