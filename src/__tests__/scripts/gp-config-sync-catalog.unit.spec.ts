@@ -25,6 +25,7 @@ import {
   enforceVendorStatusGate,
   buildVendorPricingMap,
 } from "../../scripts/gp-config-sync-catalog"
+import { DryRunCollector } from "../../scripts/gp-sync-dry-run"
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -117,6 +118,7 @@ describe("parseArgs", () => {
     delete process.env.GP_INSTANCE_ID
     delete process.env.GP_MARKET_ID
     delete process.env.GP_CONFIG_ROOT
+    delete process.env.GP_DRY_RUN
   })
 
   afterAll(() => {
@@ -127,6 +129,7 @@ describe("parseArgs", () => {
     const result = parseArgs(["gp-dev", "bonbeauty"])
     expect(result.instanceId).toBe("gp-dev")
     expect(result.marketId).toBe("bonbeauty")
+    expect(result.dryRun).toBe(false)
   })
 
   it("falls back to env vars when args are empty", () => {
@@ -136,6 +139,7 @@ describe("parseArgs", () => {
     const result = parseArgs([])
     expect(result.instanceId).toBe("gp-prod")
     expect(result.marketId).toBe("mercur")
+    expect(result.dryRun).toBe(false)
   })
 
   it("uses defaults when args and env are both missing", () => {
@@ -143,6 +147,15 @@ describe("parseArgs", () => {
     const result = parseArgs(undefined)
     expect(result.instanceId).toBe("gp-dev")
     expect(result.marketId).toBe("bonbeauty")
+    expect(result.dryRun).toBe(false)
+  })
+
+  it("parses dryRun from flag and env var", () => {
+    process.env.GP_CONFIG_ROOT = "/config"
+    process.env.GP_DRY_RUN = "true"
+
+    expect(parseArgs(undefined).dryRun).toBe(true)
+    expect(parseArgs(["gp-dev", "bonbeauty", "--dry-run"]).dryRun).toBe(true)
   })
 })
 
@@ -382,6 +395,29 @@ describe("syncCategories", () => {
 
     expect(warnings.some((w) => w.includes("parent_category_id") && w.includes("not found"))).toBe(true)
   })
+
+  it("records planned category writes in dry-run without touching DB", async () => {
+    const svc = makeProductModuleService()
+    const warnings: string[] = []
+    const collector = new DryRunCollector()
+
+    const { counts, fixtureToMedusaMap } = await syncCategories(
+      svc,
+      [{ category_id: "cat-1", name: "Twarz", handle: "twarz" }],
+      "bonbeauty",
+      warnings,
+      collector
+    )
+
+    expect(counts.created).toBe(1)
+    expect(fixtureToMedusaMap.get("cat-1")).toBe("dry-run-category-cat-1")
+    expect(svc.createProductCategories).not.toHaveBeenCalled()
+    expect(collector.getEntries()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ entityType: "category", handle: "twarz", action: "create" }),
+      ])
+    )
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -453,6 +489,29 @@ describe("syncCollections", () => {
 
     expect(counts.created).toBe(0)
     expect(warnings.some((w) => w.includes("missing handle"))).toBe(true)
+  })
+
+  it("records planned collection writes in dry-run without touching DB", async () => {
+    const svc = makeProductModuleService()
+    const warnings: string[] = []
+    const collector = new DryRunCollector()
+
+    const { counts, fixtureToMedusaMap } = await syncCollections(
+      svc,
+      [{ collection_id: "col-1", title: "Premium Core", handle: "premium-core" }],
+      "bonbeauty",
+      warnings,
+      collector
+    )
+
+    expect(counts.created).toBe(1)
+    expect(fixtureToMedusaMap.get("col-1")).toBe("dry-run-collection-col-1")
+    expect(svc.createProductCollections).not.toHaveBeenCalled()
+    expect(collector.getEntries()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ entityType: "collection", handle: "premium-core", action: "create" }),
+      ])
+    )
   })
 })
 
@@ -738,6 +797,44 @@ describe("syncProducts", () => {
     expect(svc.updateProducts).toHaveBeenCalledTimes(1)
     const [, payload] = (svc.updateProducts as jest.Mock).mock.calls[0]
     expect(payload).toHaveProperty("status", "draft")
+  })
+
+  it("records planned product update in dry-run without touching DB", async () => {
+    const svc = makeProductModuleService({
+      listProducts: jest.fn().mockResolvedValue([
+        {
+          id: "existing-prod",
+          handle: "nail-art",
+          categories: [],
+          variants: [{ id: "variant-1", title: "Default" }],
+          metadata: { gp: { market_id: "bonbeauty" } },
+        },
+      ]),
+    })
+    const warnings: string[] = []
+    const collector = new DryRunCollector()
+
+    const counts = await syncProducts(
+      makeContainer2(),
+      svc,
+      [{ product_id: "p-nail", name: "Nail Art", handle: "nail-art", base_price: { amount: 50, currency: "PLN" } }],
+      prereqs,
+      emptyMaps.categoryMap,
+      emptyMaps.collectionMap,
+      "bonbeauty",
+      warnings,
+      undefined,
+      true,
+      collector
+    )
+
+    expect(counts.updated).toBe(1)
+    expect(svc.updateProducts).not.toHaveBeenCalled()
+    expect(collector.getEntries()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ entityType: "product", handle: "nail-art", action: "update" }),
+      ])
+    )
   })
 })
 
@@ -1104,6 +1201,47 @@ describe("enforceVendorStatusGate", () => {
 
     expect(result.draftedCount).toBe(0)
     expect(svc.updateProducts).not.toHaveBeenCalled()
+  })
+
+  it("records planned vendor-gate draft in dry-run without touching DB", async () => {
+    setupFiles(
+      {
+        market_id: "bonbeauty",
+        vendors: [{ vendor_id: "bad-vendor", status: "suspended" }],
+      },
+      {
+        "bad-vendor": {
+          vendor_id: "bad-vendor",
+          market_id: "bonbeauty",
+          products: [{ product_id: "srv_0101" }],
+        },
+      }
+    )
+
+    const svc = {
+      listProducts: jest.fn().mockResolvedValue([
+        { id: "p1", handle: "product-1", status: "published", metadata: { gp: { market_id: "bonbeauty", fixture_id: "srv_0101" } } },
+      ]),
+      updateProducts: jest.fn().mockResolvedValue({}),
+    }
+    const warnings: string[] = []
+    const collector = new DryRunCollector()
+
+    const result = await enforceVendorStatusGate(
+      svc,
+      "/config/bonbeauty/market.yaml",
+      "bonbeauty",
+      warnings,
+      collector
+    )
+
+    expect(result.draftedCount).toBe(1)
+    expect(svc.updateProducts).not.toHaveBeenCalled()
+    expect(collector.getEntries()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ entityType: "product", handle: "product-1", action: "update" }),
+      ])
+    )
   })
 })
 

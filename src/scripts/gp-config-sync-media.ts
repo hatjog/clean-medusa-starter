@@ -5,6 +5,8 @@ import path from "node:path"
 
 import * as yaml from "js-yaml"
 
+import { DryRunCollector, parseDryRunFlag } from "./gp-sync-dry-run"
+
 type ProductsCatalogCategory = {
   category_id: string
   slug: string
@@ -128,7 +130,8 @@ export async function syncCollectionMedia(
   productModuleService: any,
   collections: ProductsCatalogCollection[],
   marketId: string,
-  warnings: string[]
+  warnings: string[],
+  collector?: DryRunCollector
 ): Promise<{ updated: number; skipped: number }> {
   let updated = 0
   let skipped = 0
@@ -136,6 +139,12 @@ export async function syncCollectionMedia(
   for (const collection of collections ?? []) {
     const coverUrl = collection.photo_url?.trim()
     if (!coverUrl) {
+      collector?.add({
+        entityType: "collection-media",
+        handle: (collection.handle ?? collection.collection_id ?? "").trim() || collection.collection_id,
+        action: "skip",
+        note: "missing photo_url",
+      })
       skipped++
       continue
     }
@@ -145,6 +154,12 @@ export async function syncCollectionMedia(
       warnings.push(
         `Collection '${collection.collection_id}': missing handle; cannot resolve collection`
       )
+      collector?.add({
+        entityType: "collection-media",
+        handle: collection.collection_id,
+        action: "skip",
+        note: "missing handle",
+      })
       skipped++
       continue
     }
@@ -155,20 +170,35 @@ export async function syncCollectionMedia(
       warnings.push(
         `Collection '${collection.collection_id}' handle='${handle}': ${reason ?? 'no Mercur collection found'}`
       )
+      collector?.add({
+        entityType: "collection-media",
+        handle,
+        action: "skip",
+        note: reason ?? "no Mercur collection found",
+      })
       skipped++
       continue
     }
 
-    await productModuleService.updateProductCollections(dbCollection.id, {
-      metadata: {
-        ...(dbCollection.metadata ?? {}),
-        photo_url: coverUrl,
-        gp: {
-          ...((dbCollection.metadata as any)?.gp ?? {}),
-          market_id: marketId,
+    if (collector) {
+      collector.add({
+        entityType: "collection-media",
+        handle,
+        action: "update",
+        note: "photo_url",
+      })
+    } else {
+      await productModuleService.updateProductCollections(dbCollection.id, {
+        metadata: {
+          ...(dbCollection.metadata ?? {}),
+          photo_url: coverUrl,
+          gp: {
+            ...((dbCollection.metadata as any)?.gp ?? {}),
+            market_id: marketId,
+          },
         },
-      },
-    })
+      })
+    }
 
     updated++
   }
@@ -176,20 +206,22 @@ export async function syncCollectionMedia(
   return { updated, skipped }
 }
 
-function parseArgs(args: string[] | undefined): {
+export function parseArgs(args: string[] | undefined): {
   instanceId: string
   marketId: string
   configRoot: string
+  dryRun: boolean
 } {
   const instanceId = (args?.[0] ?? process.env.GP_INSTANCE_ID ?? "gp-dev").trim()
   const marketId = (args?.[1] ?? process.env.GP_MARKET_ID ?? "bonbeauty").trim()
   const configRoot = (process.env.GP_CONFIG_ROOT ?? path.resolve(process.cwd(), "../config")).trim()
+  const dryRun = parseDryRunFlag(args)
 
   if (!instanceId) throw new Error("instanceId is required (args[0] or GP_INSTANCE_ID)")
   if (!marketId) throw new Error("marketId is required (args[1] or GP_MARKET_ID)")
   if (!configRoot) throw new Error("configRoot is required (GP_CONFIG_ROOT)")
 
-  return { instanceId, marketId, configRoot }
+  return { instanceId, marketId, configRoot, dryRun }
 }
 
 async function readYamlFile<T>(filePath: string): Promise<T> {
@@ -216,7 +248,8 @@ function resolveService(container: any, keysToTry: string[]): any {
 }
 
 export default async function gpConfigSyncMedia({ container, args }: ExecArgs) {
-  const { instanceId, marketId, configRoot } = parseArgs(args)
+  const { instanceId, marketId, configRoot, dryRun } = parseArgs(args)
+  const collector = dryRun ? new DryRunCollector() : undefined
   const productsPath = path.resolve(
     configRoot,
     instanceId,
@@ -263,7 +296,8 @@ export default async function gpConfigSyncMedia({ container, args }: ExecArgs) {
     productModuleService,
     catalog.collections ?? [],
     marketId,
-    warnings
+    warnings,
+    collector
   )
   collectionsUpdated = collectionMediaCounts.updated
   collectionsSkipped = collectionMediaCounts.skipped
@@ -272,6 +306,12 @@ export default async function gpConfigSyncMedia({ container, args }: ExecArgs) {
   for (const category of catalog.categories ?? []) {
     const coverUrl = category.photo_url?.trim()
     if (!coverUrl) {
+      collector?.add({
+        entityType: "category-media",
+        handle: (category.handle ?? category.slug ?? category.category_id).trim(),
+        action: "skip",
+        note: "missing photo_url",
+      })
       categoriesSkipped++
       continue
     }
@@ -279,6 +319,12 @@ export default async function gpConfigSyncMedia({ container, args }: ExecArgs) {
     const handle = (category.handle ?? category.slug)?.trim()
     if (!handle) {
       warnings.push(`Category '${category.category_id}': missing slug/handle; cannot resolve category`)
+      collector?.add({
+        entityType: "category-media",
+        handle: category.category_id,
+        action: "skip",
+        note: "missing slug/handle",
+      })
       categoriesSkipped++
       continue
     }
@@ -289,6 +335,12 @@ export default async function gpConfigSyncMedia({ container, args }: ExecArgs) {
       warnings.push(
         `Category '${category.category_id}' handle='${handle}': ${reason ?? 'no Mercur category found'}`
       )
+      collector?.add({
+        entityType: "category-media",
+        handle,
+        action: "skip",
+        note: reason ?? "no Mercur category found",
+      })
       categoriesSkipped++
       continue
     }
@@ -302,7 +354,16 @@ export default async function gpConfigSyncMedia({ container, args }: ExecArgs) {
       },
     }
 
-    await productModuleService.updateProductCategories(dbCategory.id, { metadata: mergedMetadata })
+    if (collector) {
+      collector.add({
+        entityType: "category-media",
+        handle,
+        action: "update",
+        note: "photo_url",
+      })
+    } else {
+      await productModuleService.updateProductCategories(dbCategory.id, { metadata: mergedMetadata })
+    }
     categoriesUpdated++
   }
 
@@ -314,6 +375,12 @@ export default async function gpConfigSyncMedia({ container, args }: ExecArgs) {
     })
 
     if (!media.thumbnail && !media.image_urls?.length) {
+      collector?.add({
+        entityType: "product-media",
+        handle: (product.slug ?? product.product_id).trim(),
+        action: "skip",
+        note: "missing media",
+      })
       productsSkipped++
       continue
     }
@@ -321,6 +388,12 @@ export default async function gpConfigSyncMedia({ container, args }: ExecArgs) {
     const handle = product.slug?.trim()
     if (!handle) {
       warnings.push(`Product '${product.product_id}': missing slug; cannot resolve product`)
+      collector?.add({
+        entityType: "product-media",
+        handle: product.product_id,
+        action: "skip",
+        note: "missing slug",
+      })
       productsSkipped++
       continue
     }
@@ -332,6 +405,12 @@ export default async function gpConfigSyncMedia({ container, args }: ExecArgs) {
     const { match: dbProduct, reason: matchReason } = selectCollectionMatch(matches ?? [], marketId)
     if (!dbProduct?.id) {
       warnings.push(`Product '${product.product_id}': ${matchReason ?? `no Mercur product found with handle='${handle}'`}`)
+      collector?.add({
+        entityType: "product-media",
+        handle,
+        action: "skip",
+        note: matchReason ?? "no Mercur product found",
+      })
       continue
     }
 
@@ -349,10 +428,19 @@ export default async function gpConfigSyncMedia({ container, args }: ExecArgs) {
       return existing?.id ? { id: existing.id, url } : { url }
     })
 
-    await productModuleService.updateProducts(dbProduct.id, {
-      ...(media.thumbnail ? { thumbnail: media.thumbnail } : {}),
-      ...(desiredImagesPayload.length ? { images: desiredImagesPayload } : {}),
-    })
+    if (collector) {
+      collector.add({
+        entityType: "product-media",
+        handle,
+        action: "update",
+        note: `thumbnail=${media.thumbnail ? "yes" : "no"}; images=${desiredImagesPayload.length}`,
+      })
+    } else {
+      await productModuleService.updateProducts(dbProduct.id, {
+        ...(media.thumbnail ? { thumbnail: media.thumbnail } : {}),
+        ...(desiredImagesPayload.length ? { images: desiredImagesPayload } : {}),
+      })
+    }
 
     productsUpdated++
   }
@@ -417,6 +505,12 @@ export default async function gpConfigSyncMedia({ container, args }: ExecArgs) {
 
       const hasMedia = !!(media && (media.thumbnail || media.image_urls?.length))
       if (!explicitClear && !hasMedia) {
+        collector?.add({
+          entityType: "vendor-media",
+          handle: (handleByProductId.get(vp.product_id ?? "") ?? vp.product_id ?? "").trim() || vendorId,
+          action: "skip",
+          note: `vendor_id=${vendorId}; missing media`,
+        })
         vendorMediaSkipped++
         continue
       }
@@ -424,12 +518,24 @@ export default async function gpConfigSyncMedia({ container, args }: ExecArgs) {
       const productId = (vp.product_id ?? "").trim()
       if (!productId) {
         warnings.push(`Vendor '${vendorId}': product entry missing product_id; skipping`)
+        collector?.add({
+          entityType: "vendor-media",
+          handle: vendorId,
+          action: "skip",
+          note: "missing product_id",
+        })
         continue
       }
 
       const handle = (handleByProductId.get(productId) ?? productId).trim()
       if (!handle) {
         warnings.push(`Vendor '${vendorId}': cannot resolve handle for product_id='${productId}'`)
+        collector?.add({
+          entityType: "vendor-media",
+          handle: productId,
+          action: "skip",
+          note: `vendor_id=${vendorId}; cannot resolve handle`,
+        })
         continue
       }
 
@@ -441,6 +547,12 @@ export default async function gpConfigSyncMedia({ container, args }: ExecArgs) {
           warnings.push(
             `Vendor '${vendorId}': no Mercur product found with handle='${handle}' (product_id='${productId}')`
           )
+          collector?.add({
+            entityType: "vendor-media",
+            handle,
+            action: "skip",
+            note: `vendor_id=${vendorId}; no Mercur product found`,
+          })
           continue
         }
         dbProduct = { id: p.id, metadata: (p as any).metadata ?? null }
@@ -471,9 +583,18 @@ export default async function gpConfigSyncMedia({ container, args }: ExecArgs) {
         },
       }
 
-      await productModuleService.updateProducts(dbProduct.id, {
-        metadata: nextMetadata,
-      })
+      if (collector) {
+        collector.add({
+          entityType: "vendor-media",
+          handle,
+          action: "update",
+          note: explicitClear ? `vendor_id=${vendorId}; clear` : `vendor_id=${vendorId}; set`,
+        })
+      } else {
+        await productModuleService.updateProducts(dbProduct.id, {
+          metadata: nextMetadata,
+        })
+      }
 
       // Update cache only after successful DB write
       productCacheByHandle.set(handle, { ...dbProduct, metadata: nextMetadata })
@@ -482,10 +603,15 @@ export default async function gpConfigSyncMedia({ container, args }: ExecArgs) {
     }
   }
 
+  if (dryRun && collector) {
+    console.log(collector.renderTable())
+  }
+
   console.log(
     JSON.stringify(
       {
         ok: true,
+        dry_run: dryRun,
         instance_id: instanceId,
         market_id: marketId,
         config_root: configRoot,

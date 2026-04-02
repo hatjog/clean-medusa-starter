@@ -6,6 +6,8 @@ import path from "node:path"
 
 import * as yaml from "js-yaml"
 
+import { DryRunCollector, parseDryRunFlag } from "./gp-sync-dry-run"
+
 // ---- Types ----
 
 type FixtureCollection = {
@@ -65,18 +67,20 @@ export function parseArgs(args: string[] | undefined): {
   instanceId: string
   marketId: string
   configRoot: string
+  dryRun: boolean
 } {
   const instanceId = (args?.[0] ?? process.env.GP_INSTANCE_ID ?? "gp-dev").trim()
   const marketId = (args?.[1] ?? process.env.GP_MARKET_ID ?? "bonbeauty").trim()
   const configRoot = (
     process.env.GP_CONFIG_ROOT ?? path.resolve(process.cwd(), "../config")
   ).trim()
+  const dryRun = parseDryRunFlag(args)
 
   if (!instanceId) throw new Error("instanceId is required (args[0] or GP_INSTANCE_ID)")
   if (!marketId) throw new Error("marketId is required (args[1] or GP_MARKET_ID)")
   if (!configRoot) throw new Error("configRoot is required (GP_CONFIG_ROOT)")
 
-  return { instanceId, marketId, configRoot }
+  return { instanceId, marketId, configRoot, dryRun }
 }
 
 async function readYamlFile<T>(filePath: string): Promise<T> {
@@ -401,7 +405,8 @@ export async function syncCategories(
   productModuleService: any,
   categories: FixtureCategory[],
   marketId: string,
-  warnings: string[]
+  warnings: string[],
+  collector?: DryRunCollector
 ): Promise<{ counts: OpCounts; fixtureToMedusaMap: Map<string, string> }> {
   const counts: OpCounts = { created: 0, updated: 0, skipped: 0 }
   const fixtureToMedusaMap = new Map<string, string>()
@@ -418,6 +423,12 @@ export async function syncCategories(
       warnings.push(
         `Category '${cat.category_id}': duplicate handle '${h}' in fixture, second occurrence skipped`
       )
+      collector?.add({
+        entityType: "category",
+        handle: h || cat.category_id,
+        action: "skip",
+        note: `duplicate handle in fixture (${cat.category_id})`,
+      })
       skipCategoryIds.add(cat.category_id)
     }
     handleSet.add(h)
@@ -440,10 +451,22 @@ export async function syncCategories(
     const handle = normalizeHandle((cat.handle ?? cat.slug ?? "").trim())
     if (!handle) {
       warnings.push(`Category '${cat.category_id}': missing handle/slug, skipping`)
+      collector?.add({
+        entityType: "category",
+        handle: cat.category_id,
+        action: "skip",
+        note: "missing handle/slug",
+      })
       continue
     }
 
     if (skipCategoryIds.has(cat.category_id)) {
+      collector?.add({
+        entityType: "category",
+        handle,
+        action: "skip",
+        note: `duplicate handle in fixture (${cat.category_id})`,
+      })
       counts.skipped++
       continue
     }
@@ -457,6 +480,12 @@ export async function syncCategories(
 
       if (matchReason) {
         warnings.push(`Category '${cat.category_id}' handle='${handle}': ${matchReason}`)
+        collector?.add({
+          entityType: "category",
+          handle,
+          action: "skip",
+          note: matchReason,
+        })
         counts.skipped++
         continue
       }
@@ -465,42 +494,62 @@ export async function syncCategories(
         // H-1: explicit field update — updateProductCategories(id, data)
         // Safe hierarchical merge: preserves top-level metadata keys (e.g. photo_url)
         // while adding/updating gp sub-object. Requires metadata to be fetched via select.
-        await productModuleService.updateProductCategories(existing.id, {
-          name: cat.name,
-          description: cat.description ?? existing.description,
-          is_active: true,
-          rank: cat.rank ?? existing.rank ?? 0,
-          metadata: {
-            ...(existing.metadata ?? {}),
-            gp: {
-              ...((existing.metadata as any)?.gp ?? {}),
-              synced_by: "gp-config-sync-catalog",
-              market_id: marketId,
-              fixture_id: cat.category_id,
+        if (collector) {
+          collector.add({
+            entityType: "category",
+            handle,
+            action: "update",
+            note: `fixture_id=${cat.category_id}`,
+          })
+        } else {
+          await productModuleService.updateProductCategories(existing.id, {
+            name: cat.name,
+            description: cat.description ?? existing.description,
+            is_active: true,
+            rank: cat.rank ?? existing.rank ?? 0,
+            metadata: {
+              ...(existing.metadata ?? {}),
+              gp: {
+                ...((existing.metadata as any)?.gp ?? {}),
+                synced_by: "gp-config-sync-catalog",
+                market_id: marketId,
+                fixture_id: cat.category_id,
+              },
             },
-          },
-        })
+          })
+        }
         fixtureToMedusaMap.set(cat.category_id, existing.id)
         counts.updated++
       } else {
-        const created = await productModuleService.createProductCategories({
-          name: cat.name,
-          handle,
-          description: cat.description,
-          is_active: true,
-          is_internal: false,
-          rank: cat.rank ?? 0,
-          metadata: {
-            gp: {
-              synced_by: "gp-config-sync-catalog",
-              market_id: marketId,
-              fixture_id: cat.category_id,
+        let createdId: string | undefined
+        if (collector) {
+          collector.add({
+            entityType: "category",
+            handle,
+            action: "create",
+            note: `fixture_id=${cat.category_id}`,
+          })
+          createdId = `dry-run-category-${cat.category_id}`
+        } else {
+          const created = await productModuleService.createProductCategories({
+            name: cat.name,
+            handle,
+            description: cat.description,
+            is_active: true,
+            is_internal: false,
+            rank: cat.rank ?? 0,
+            metadata: {
+              gp: {
+                synced_by: "gp-config-sync-catalog",
+                market_id: marketId,
+                fixture_id: cat.category_id,
+              },
             },
-          },
-        })
-        const createdId = (
-          Array.isArray(created) ? created[0]?.id : created?.id
-        ) as string | undefined
+          })
+          createdId = (
+            Array.isArray(created) ? created[0]?.id : created?.id
+          ) as string | undefined
+        }
         if (createdId) {
           fixtureToMedusaMap.set(cat.category_id, createdId)
         }
@@ -527,9 +576,18 @@ export async function syncCategories(
     }
 
     try {
-      await productModuleService.updateProductCategories(medusaId, {
-        parent_category_id: parentMedusaId,
-      })
+      if (collector) {
+        collector.add({
+          entityType: "category-parent",
+          handle: cat.category_id,
+          action: "update",
+          note: `parent_category_id=${cat.parent_category_id}`,
+        })
+      } else {
+        await productModuleService.updateProductCategories(medusaId, {
+          parent_category_id: parentMedusaId,
+        })
+      }
     } catch (e: any) {
       warnings.push(
         `Category '${cat.category_id}' parent update: ${e?.message ?? String(e)}`
@@ -549,7 +607,8 @@ export async function syncCollections(
   productModuleService: any,
   collections: FixtureCollection[],
   marketId: string,
-  warnings: string[]
+  warnings: string[],
+  collector?: DryRunCollector
 ): Promise<{ counts: OpCounts; fixtureToMedusaMap: Map<string, string> }> {
   const counts: OpCounts = { created: 0, updated: 0, skipped: 0 }
   const fixtureToMedusaMap = new Map<string, string>()
@@ -562,6 +621,12 @@ export async function syncCollections(
     const handle = normalizeHandle((col.handle ?? "").trim())
     if (!handle) {
       warnings.push(`Collection '${col.collection_id}': missing handle, skipping`)
+      collector?.add({
+        entityType: "collection",
+        handle: col.collection_id,
+        action: "skip",
+        note: "missing handle",
+      })
       continue
     }
 
@@ -571,39 +636,65 @@ export async function syncCollections(
 
       if (matchReason) {
         warnings.push(`Collection '${col.collection_id}' handle='${handle}': ${matchReason}`)
+        collector?.add({
+          entityType: "collection",
+          handle,
+          action: "skip",
+          note: matchReason,
+        })
         counts.skipped++
         continue
       }
 
       if (existing) {
         // H-1: explicit field update (no product_ids — managed via products)
-        await productModuleService.updateProductCollections(existing.id, {
-          title: col.title,
-          metadata: {
-            ...(existing.metadata ?? {}),
-            gp: {
-              ...((existing.metadata as any)?.gp ?? {}),
-              synced_by: "gp-config-sync-catalog",
-              market_id: marketId,
-              fixture_id: col.collection_id,
+        if (collector) {
+          collector.add({
+            entityType: "collection",
+            handle,
+            action: "update",
+            note: `fixture_id=${col.collection_id}`,
+          })
+        } else {
+          await productModuleService.updateProductCollections(existing.id, {
+            title: col.title,
+            metadata: {
+              ...(existing.metadata ?? {}),
+              gp: {
+                ...((existing.metadata as any)?.gp ?? {}),
+                synced_by: "gp-config-sync-catalog",
+                market_id: marketId,
+                fixture_id: col.collection_id,
+              },
             },
-          },
-        })
+          })
+        }
         fixtureToMedusaMap.set(col.collection_id, existing.id)
         counts.updated++
       } else {
-        const created = await productModuleService.createProductCollections({
-          title: col.title,
-          handle,
-          metadata: {
-            gp: {
-              synced_by: "gp-config-sync-catalog",
-              market_id: marketId,
-              fixture_id: col.collection_id,
+        let createdId: string | undefined
+        if (collector) {
+          collector.add({
+            entityType: "collection",
+            handle,
+            action: "create",
+            note: `fixture_id=${col.collection_id}`,
+          })
+          createdId = `dry-run-collection-${col.collection_id}`
+        } else {
+          const created = await productModuleService.createProductCollections({
+            title: col.title,
+            handle,
+            metadata: {
+              gp: {
+                synced_by: "gp-config-sync-catalog",
+                market_id: marketId,
+                fixture_id: col.collection_id,
+              },
             },
-          },
-        })
-        const createdId = (created?.id ?? created?.[0]?.id) as string | undefined
+          })
+          createdId = (created?.id ?? created?.[0]?.id) as string | undefined
+        }
         if (createdId) {
           fixtureToMedusaMap.set(col.collection_id, createdId)
         }
@@ -631,7 +722,9 @@ export async function syncProducts(
   collectionMap: Map<string, string>,
   marketId: string,
   warnings: string[],
-  vendorPricingMap?: Map<string, boolean>
+  vendorPricingMap?: Map<string, boolean>,
+  dryRun = false,
+  collector?: DryRunCollector
 ): Promise<OpCounts> {
   const counts: OpCounts = { created: 0, updated: 0, skipped: 0 }
 
@@ -644,16 +737,34 @@ export async function syncProducts(
     const handle = normalizeHandle((product.handle ?? product.slug ?? "").trim())
     if (!handle) {
       warnings.push(`Product '${product.product_id}': missing handle/slug, skipping`)
+      collector?.add({
+        entityType: "product",
+        handle: product.product_id,
+        action: "skip",
+        note: "missing handle/slug",
+      })
       continue
     }
     if (typeof product.base_price?.amount !== "number") {
       warnings.push(
         `Product '${product.product_id}': base_price.amount is not a number, skipping`
       )
+      collector?.add({
+        entityType: "product",
+        handle,
+        action: "skip",
+        note: "base_price.amount is not a number",
+      })
       continue
     }
     if (!product.base_price?.currency) {
       warnings.push(`Product '${product.product_id}': base_price.currency is empty, skipping`)
+      collector?.add({
+        entityType: "product",
+        handle,
+        action: "skip",
+        note: "base_price.currency is empty",
+      })
       continue
     }
 
@@ -698,6 +809,12 @@ export async function syncProducts(
             `Product '${product.product_id}' handle='${handle}': cross-market guard — ` +
               `entity belongs to '${existingMarket}', skipping`
           )
+          collector?.add({
+            entityType: "product",
+            handle,
+            action: "skip",
+            note: `cross-market guard (${existingMarket})`,
+          })
           counts.skipped++
           continue
         }
@@ -718,6 +835,31 @@ export async function syncProducts(
           `Product '${product.product_id}': ${gateStatus.toUpperCase()} (words=${gateResult.details.words}, image=${gateResult.details.image}, price=${gateResult.details.price}${hasVendorPricing ? ", vendorPricing=true" : ""})` +
             (gateResult.reasons.length > 0 ? ` — failed: ${gateResult.reasons.join(", ")}` : "")
         )
+
+        if (dryRun && collector) {
+          const noteParts = [
+            `fixture_id=${product.product_id}`,
+            `status=${gateStatus}`,
+            hasVendorPricing
+              ? "price=skipped-vendor-pricing"
+              : `price=${product.base_price.amount} ${product.base_price.currency.toUpperCase()}`,
+          ]
+          if (mergedCategoryIds.length > 0) {
+            noteParts.push(`category_ids=${mergedCategoryIds.length}`)
+          }
+          if (resolvedCollectionId) {
+            noteParts.push(`collection_id=${resolvedCollectionId}`)
+          }
+
+          collector.add({
+            entityType: "product",
+            handle,
+            action: "update",
+            note: noteParts.join("; "),
+          })
+          counts.updated++
+          continue
+        }
 
         // H-1: explicit fields update (including base price when changed)
         const updatePayload: Record<string, any> = {
@@ -804,6 +946,31 @@ export async function syncProducts(
           `Product '${product.product_id}': ${createGateResult.status.toUpperCase()} (words=${createGateResult.details.words}, image=${createGateResult.details.image}, price=${createGateResult.details.price}${createHasVendorPricing ? ", vendorPricing=true" : ""})` +
             (createGateResult.reasons.length > 0 ? ` — failed: ${createGateResult.reasons.join(", ")}` : "")
         )
+
+        if (dryRun && collector) {
+          const noteParts = [
+            `fixture_id=${product.product_id}`,
+            `status=${createGateResult.status}`,
+            createHasVendorPricing
+              ? "price=skipped-vendor-pricing"
+              : `price=${product.base_price.amount} ${product.base_price.currency.toUpperCase()}`,
+          ]
+          if (resolvedCategoryIds.length > 0) {
+            noteParts.push(`category_ids=${resolvedCategoryIds.length}`)
+          }
+          if (resolvedCollectionId) {
+            noteParts.push(`collection_id=${resolvedCollectionId}`)
+          }
+
+          collector.add({
+            entityType: "product",
+            handle,
+            action: "create",
+            note: noteParts.join("; "),
+          })
+          counts.created++
+          continue
+        }
 
         // Create via createProductsWorkflow (handles variants + pricing + sales_channels + shipping)
         const { result, errors } = await createProductsWorkflow(container).run({
@@ -892,7 +1059,8 @@ export async function enforceVendorStatusGate(
   productModuleService: any,
   marketConfigPath: string,
   marketId: string,
-  warnings: string[]
+  warnings: string[],
+  collector?: DryRunCollector
 ): Promise<{ draftedCount: number }> {
   let marketConfig: MarketConfig
   try {
@@ -961,10 +1129,19 @@ export async function enforceVendorStatusGate(
   for (const prod of toBlock) {
     if (prod.status !== "draft") {
       try {
-        await productModuleService.updateProducts(prod.id, { status: "draft" })
-        console.log(
-          `Product '${prod.handle}': DRAFT (vendor product blocked by vendor status gate)`
-        )
+        if (collector) {
+          collector.add({
+            entityType: "product",
+            handle: prod.handle,
+            action: "update",
+            note: "status=draft (vendor status gate)",
+          })
+        } else {
+          await productModuleService.updateProducts(prod.id, { status: "draft" })
+          console.log(
+            `Product '${prod.handle}': DRAFT (vendor product blocked by vendor status gate)`
+          )
+        }
         draftedCount++
       } catch (e: any) {
         warnings.push(
@@ -980,8 +1157,9 @@ export async function enforceVendorStatusGate(
 // ---- Main Orchestrator ----
 
 export default async function gpConfigSyncCatalog({ container, args }: ExecArgs) {
-  const { instanceId, marketId, configRoot } = parseArgs(args)
+  const { instanceId, marketId, configRoot, dryRun } = parseArgs(args)
   const productsPath = path.resolve(configRoot, instanceId, "markets", marketId, "products.yaml")
+  const collector = dryRun ? new DryRunCollector() : undefined
 
   // Load fixture
   const catalog = await readYamlFile<CatalogFixture>(productsPath)
@@ -1036,7 +1214,8 @@ export default async function gpConfigSyncCatalog({ container, args }: ExecArgs)
     productModuleService,
     categories,
     marketId,
-    warnings
+    warnings,
+    collector
   )
 
   // Sync collections
@@ -1044,7 +1223,8 @@ export default async function gpConfigSyncCatalog({ container, args }: ExecArgs)
     productModuleService,
     collections,
     marketId,
-    warnings
+    warnings,
+    collector
   )
 
   // Build vendor pricing map before product sync
@@ -1064,7 +1244,9 @@ export default async function gpConfigSyncCatalog({ container, args }: ExecArgs)
     collectionMap,
     marketId,
     warnings,
-    vendorPricingMap
+    vendorPricingMap,
+    dryRun,
+    collector
   )
 
   // Vendor status enforcement — draft products from non-active vendors
@@ -1072,7 +1254,8 @@ export default async function gpConfigSyncCatalog({ container, args }: ExecArgs)
     productModuleService,
     marketConfigPath,
     marketId,
-    warnings
+    warnings,
+    collector
   )
   if (draftedCount > 0) {
     console.log(`Vendor status gate: ${draftedCount} product(s) set to draft`)
@@ -1081,6 +1264,7 @@ export default async function gpConfigSyncCatalog({ container, args }: ExecArgs)
   // JSON summary (like sync-media)
   const summary = {
     ok: warnings.length === 0,
+    dry_run: dryRun,
     instance_id: instanceId,
     market_id: marketId,
     config_root: configRoot,
@@ -1093,10 +1277,14 @@ export default async function gpConfigSyncCatalog({ container, args }: ExecArgs)
     timestamp: new Date().toISOString(),
   }
 
+  if (dryRun && collector) {
+    console.log(collector.renderTable())
+  }
+
   console.log(JSON.stringify(summary, null, 2))
 
   // Signal warnings via exit code (non-destructive — lets event loop drain)
-  if (warnings.length > 0) {
+  if (warnings.length > 0 && !dryRun) {
     process.exitCode = 1
   }
 }

@@ -5,6 +5,8 @@ import path from "node:path"
 
 import * as yaml from "js-yaml"
 
+import { computeFieldDiffs, DryRunCollector, parseDryRunFlag } from "./gp-sync-dry-run"
+
 // ---- Types ----
 
 type VendorLocation = {
@@ -51,6 +53,7 @@ type MarketConfig = {
 export type SellerSyncResult = {
   sellerId: string | null
   action: "created" | "updated" | "skipped"
+  note?: string
 }
 
 type SyncSummary = {
@@ -64,6 +67,24 @@ type SyncSummary = {
 
 // ---- Utilities ----
 
+function formatDryRunNote(prefix: string, note?: string): string {
+  return note ? `${prefix} (${note})` : prefix
+}
+
+function formatSeedDiffNote(
+  currentValues: Record<string, unknown>,
+  incomingValues: Record<string, unknown>
+): string | undefined {
+  const diffs = computeFieldDiffs(currentValues, incomingValues)
+  if (diffs.length === 0) {
+    return "seed_if_empty=no-op"
+  }
+
+  return diffs
+    .map((diff) => `${diff.field}: ${diff.current} -> ${diff.incoming}`)
+    .join("; ")
+}
+
 function parseArgs(args: string[] | undefined): {
   instanceId: string
   marketId: string
@@ -73,7 +94,7 @@ function parseArgs(args: string[] | undefined): {
   const instanceId = (args?.[0] ?? process.env.GP_INSTANCE_ID ?? "gp-dev").trim()
   const marketId = (args?.[1] ?? process.env.GP_MARKET_ID ?? "bonbeauty").trim()
   const configRoot = (process.env.GP_CONFIG_ROOT ?? path.resolve(process.cwd(), "../config")).trim()
-  const dryRun = args?.includes("--dry-run") ?? false
+  const dryRun = parseDryRunFlag(args)
 
   if (!instanceId) throw new Error("instanceId is required (args[0] or GP_INSTANCE_ID)")
   if (!marketId) throw new Error("marketId is required (args[1] or GP_MARKET_ID)")
@@ -230,8 +251,9 @@ export async function upsertSeller(
     }
 
     if (dryRun) {
-      console.log(`[dry-run] Would CREATE seller handle='${handle}'`)
-      return { sellerId: `dry-run-${handle}`, action: "created" }
+      const note = seededFields.length > 0 ? `seed_if_empty=${seededFields.join(",")}` : undefined
+      console.log(formatDryRunNote(`[dry-run] Would CREATE seller handle='${handle}'`, note))
+      return { sellerId: `dry-run-${handle}`, action: "created", note }
     }
 
     const created = await sellerModuleService.create(createPayload)
@@ -313,8 +335,34 @@ export async function upsertSeller(
   }
 
   if (dryRun) {
-    console.log(`[dry-run] Would UPDATE seller handle='${handle}' id='${existingSeller.id}'`)
-    return { sellerId: existingSeller.id, action: "updated" }
+    const currentSeedValues: Record<string, unknown> = {}
+    const incomingSeedValues: Record<string, unknown> = {}
+
+    if (vendor.display_name !== undefined) {
+      currentSeedValues.name = existingGp.name ?? existingSeller.name
+      incomingSeedValues.name = vendor.display_name
+    }
+    if (vendor.description !== undefined) {
+      currentSeedValues.description = existingGp.description ?? existingSeller.description
+      incomingSeedValues.description = vendor.description
+    }
+    if (vendor.photo_url !== undefined) {
+      currentSeedValues.photo_url = existingGp.photo_url
+      incomingSeedValues.photo_url = vendor.photo_url
+    }
+    if (vendor.gallery_urls !== undefined) {
+      currentSeedValues.gallery = existingGp.gallery
+      incomingSeedValues.gallery = vendor.gallery_urls
+    }
+
+    const note = formatSeedDiffNote(currentSeedValues, incomingSeedValues)
+    console.log(
+      formatDryRunNote(
+        `[dry-run] Would UPDATE seller handle='${handle}' id='${existingSeller.id}'`,
+        note
+      )
+    )
+    return { sellerId: existingSeller.id, action: "updated", note }
   }
 
   await sellerModuleService.update(existingSeller.id, updatePayload)
@@ -325,6 +373,7 @@ export async function upsertSeller(
 
 export default async function gpConfigSyncVendors({ container, args }: ExecArgs) {
   const { instanceId, marketId, configRoot, dryRun } = parseArgs(args)
+  const collector = dryRun ? new DryRunCollector() : undefined
 
   const marketYamlPath = path.resolve(
     configRoot,
@@ -366,6 +415,12 @@ export default async function gpConfigSyncVendors({ container, args }: ExecArgs)
   for (const vendor of vendors) {
     if (!vendor.slug) {
       warnings.push(`Vendor '${vendor.vendor_id}': missing slug; skipping`)
+      collector?.add({
+        entityType: "seller",
+        handle: vendor.vendor_id,
+        action: "skip",
+        note: "missing slug",
+      })
       vendorCounts.skipped++
       continue
     }
@@ -376,6 +431,20 @@ export default async function gpConfigSyncVendors({ container, args }: ExecArgs)
       if (result.action === "created") vendorCounts.created++
       else if (result.action === "updated") vendorCounts.updated++
       else vendorCounts.skipped++
+
+      if (dryRun && collector) {
+        collector.add({
+          entityType: "seller",
+          handle: vendor.slug.trim(),
+          action:
+            result.action === "created"
+              ? "create"
+              : result.action === "updated"
+                ? "update"
+                : "skip",
+          note: result.note,
+        })
+      }
 
       // SellerProductLink sync — skip for suspended vendors
       const isSuspended = vendorStatusToStoreStatus(vendor.status) === "SUSPENDED"
@@ -423,9 +492,12 @@ export default async function gpConfigSyncVendors({ container, args }: ExecArgs)
 
           // Upsert SellerProductLink
           if (dryRun) {
-            console.log(
-              `[dry-run] Would link seller='${result.sellerId}' → product='${product.id}'`
-            )
+            collector?.add({
+              entityType: "seller-product-link",
+              handle: fixtureId,
+              action: "create",
+              note: `seller=${result.sellerId}; product=${product.id}`,
+            })
             splCounts.created++
             continue
           }
@@ -458,9 +530,13 @@ export default async function gpConfigSyncVendors({ container, args }: ExecArgs)
     warnings,
   }
 
+  if (dryRun && collector) {
+    console.log(collector.renderTable())
+  }
+
   console.log(JSON.stringify(summary, null, 2))
 
-  if (warnings.length > 0) {
+  if (warnings.length > 0 && !dryRun) {
     process.exitCode = 1
   }
 }
