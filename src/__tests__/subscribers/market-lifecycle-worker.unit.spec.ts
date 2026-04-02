@@ -88,7 +88,6 @@ describe("market lifecycle worker", () => {
 
     const validEnvelope = buildMarketCreatedEnvelope({
       market: buildMarket(),
-      vertical: buildVertical(),
     })
     const invalidEnvelope: GpEventEnvelope<MarketCreatedPayload> = {
       ...validEnvelope,

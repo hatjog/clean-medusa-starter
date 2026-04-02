@@ -8,6 +8,7 @@ const mockGet = jest.fn();
 
 jest.mock("@medusajs/framework/http", () => ({
   defineMiddlewares: (config: unknown) => config,
+  authenticate: () => jest.fn(),
 }));
 
 jest.mock("@medusajs/framework/utils", () => ({
