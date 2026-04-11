@@ -56,12 +56,20 @@ export type SellerSyncResult = {
   note?: string
 }
 
+type SplDetail = {
+  vendor_id: string
+  fixture_id: string
+  status: "created" | "skipped" | "missing_product"
+  product_db_id?: string
+}
+
 type SyncSummary = {
   ok: boolean
   instance_id: string
   market_id: string
   vendors: { created: number; updated: number; skipped: number }
   spl: { created: number; skipped: number; missing_products: number }
+  spl_details: SplDetail[]
   warnings: string[]
 }
 
@@ -406,6 +414,7 @@ export default async function gpConfigSyncVendors({ container, args }: ExecArgs)
   const warnings: string[] = []
   const vendorCounts = { created: 0, updated: 0, skipped: 0 }
   const splCounts = { created: 0, skipped: 0, missing_products: 0 }
+  const splDetails: SplDetail[] = []
 
   const vendors = marketConfig.vendors ?? []
   if (vendors.length === 0) {
@@ -487,6 +496,7 @@ export default async function gpConfigSyncVendors({ container, args }: ExecArgs)
               `Vendor '${vendor.vendor_id}': product fixture_id='${fixtureId}' not found in DB; skipping SPL`
             )
             splCounts.missing_products++
+            splDetails.push({ vendor_id: vendor.vendor_id, fixture_id: fixtureId, status: "missing_product" })
             continue
           }
 
@@ -499,6 +509,7 @@ export default async function gpConfigSyncVendors({ container, args }: ExecArgs)
               note: `seller=${result.sellerId}; product=${product.id}`,
             })
             splCounts.created++
+            splDetails.push({ vendor_id: vendor.vendor_id, fixture_id: fixtureId, status: "created", product_db_id: product.id })
             continue
           }
 
@@ -510,8 +521,10 @@ export default async function gpConfigSyncVendors({ container, args }: ExecArgs)
             ])
             await splService.upsert({ seller_id: result.sellerId, product_id: product.id })
             splCounts.created++
+            splDetails.push({ vendor_id: vendor.vendor_id, fixture_id: fixtureId, status: "created", product_db_id: product.id })
           } catch {
             splCounts.skipped++
+            splDetails.push({ vendor_id: vendor.vendor_id, fixture_id: fixtureId, status: "skipped", product_db_id: product.id })
           }
         }
       }
@@ -527,6 +540,7 @@ export default async function gpConfigSyncVendors({ container, args }: ExecArgs)
     market_id: marketId,
     vendors: vendorCounts,
     spl: splCounts,
+    spl_details: splDetails,
     warnings,
   }
 
