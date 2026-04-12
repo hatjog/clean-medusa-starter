@@ -238,11 +238,21 @@ type VendorProductFile = {
   products?: VendorProductEntry[]
 }
 
+type VendorPricingEntry = {
+  vendor_id: string
+  amount: number
+  currency?: string
+}
+
+export type VendorPricingInfo = {
+  prices: VendorPricingEntry[]
+}
+
 export async function buildVendorPricingMap(
   marketConfigPath: string,
   warnings: string[]
-): Promise<Map<string, boolean>> {
-  const map = new Map<string, boolean>()
+): Promise<Map<string, VendorPricingInfo>> {
+  const map = new Map<string, VendorPricingInfo>()
   const marketDir = path.dirname(marketConfigPath)
 
   let marketConfig: MarketConfig
@@ -264,7 +274,20 @@ export async function buildVendorPricingMap(
       const vendorCatalog = await readYamlFile<VendorProductFile>(vendorProductsPath)
       for (const vp of vendorCatalog.products ?? []) {
         if (vp.product_id && vp.status !== "inactive" && (vp.vendor_price?.amount ?? 0) > 0) {
-          map.set(vp.product_id, true)
+          const entry: VendorPricingEntry = {
+            vendor_id: vendor.vendor_id,
+            amount: vp.vendor_price!.amount,
+            ...(vp.vendor_price?.currency
+              ? { currency: vp.vendor_price.currency.toUpperCase() }
+              : {}),
+          }
+
+          const existing = map.get(vp.product_id)
+          if (existing) {
+            existing.prices.push(entry)
+          } else {
+            map.set(vp.product_id, { prices: [entry] })
+          }
         }
       }
     } catch {
@@ -273,6 +296,45 @@ export async function buildVendorPricingMap(
   }
 
   return map
+}
+
+type CatalogPriceSource = "base_price" | "min_vendor_price"
+
+function resolveCatalogPrice(
+  product: FixtureProduct,
+  vendorPricing: VendorPricingInfo | undefined,
+  warnings: string[]
+): { amount: number; currency: string; source: CatalogPriceSource } {
+  const baseCurrency = product.base_price.currency.toUpperCase()
+
+  if (!vendorPricing?.prices.length) {
+    return {
+      amount: product.base_price.amount,
+      currency: baseCurrency,
+      source: "base_price",
+    }
+  }
+
+  const matchingCurrencyPrices = vendorPricing.prices.filter(
+    (price) => (price.currency ?? baseCurrency).toUpperCase() === baseCurrency
+  )
+  const candidates = matchingCurrencyPrices.length > 0 ? matchingCurrencyPrices : vendorPricing.prices
+  const selected = candidates.reduce((lowest, current) => {
+    return current.amount < lowest.amount ? current : lowest
+  })
+  const selectedCurrency = (selected.currency ?? baseCurrency).toUpperCase()
+
+  if (matchingCurrencyPrices.length === 0 && selected.currency && selectedCurrency !== baseCurrency) {
+    warnings.push(
+      `Product '${product.product_id}': vendor pricing currency '${selectedCurrency}' does not match base_price.currency '${baseCurrency}'; using vendor price currency`
+    )
+  }
+
+  return {
+    amount: selected.amount,
+    currency: selectedCurrency,
+    source: "min_vendor_price",
+  }
 }
 
 // ---- Prerequisites ----
@@ -722,7 +784,7 @@ export async function syncProducts(
   collectionMap: Map<string, string>,
   marketId: string,
   warnings: string[],
-  vendorPricingMap?: Map<string, boolean>,
+  vendorPricingMap?: Map<string, VendorPricingInfo>,
   dryRun = false,
   collector?: DryRunCollector
 ): Promise<OpCounts> {
@@ -794,6 +856,10 @@ export async function syncProducts(
       }
     }
 
+    const vendorPricing = vendorPricingMap?.get(product.product_id)
+    const hasVendorPricing = Boolean(vendorPricing?.prices.length)
+    const catalogPrice = resolveCatalogPrice(product, vendorPricing, warnings)
+
     try {
       const matches = await productModuleService.listProducts(
         { handle },
@@ -828,7 +894,6 @@ export async function syncProducts(
         )
 
         // Quality gate evaluation before status assignment
-        const hasVendorPricing = vendorPricingMap?.get(product.product_id) ?? false
         const gateResult = evaluateQualityGate(product, { vendorPricing: hasVendorPricing })
         const gateStatus = gateResult.status
         console.log(
@@ -840,9 +905,9 @@ export async function syncProducts(
           const noteParts = [
             `fixture_id=${product.product_id}`,
             `status=${gateStatus}`,
-            hasVendorPricing
-              ? "price=skipped-vendor-pricing"
-              : `price=${product.base_price.amount} ${product.base_price.currency.toUpperCase()}`,
+            catalogPrice.source === "min_vendor_price"
+              ? `price=${catalogPrice.amount} ${catalogPrice.currency} (min-vendor)`
+              : `price=${catalogPrice.amount} ${catalogPrice.currency}`,
           ]
           if (mergedCategoryIds.length > 0) {
             noteParts.push(`category_ids=${mergedCategoryIds.length}`)
@@ -887,15 +952,15 @@ export async function syncProducts(
 
         await productModuleService.updateProducts(existing.id, updatePayload)
 
-        // Update base price on Default variant (skip if vendor pricing overrides)
-        if (!hasVendorPricing && existing.variants?.length) {
+        // Update the catalog/reference price on the default variant.
+        if (existing.variants?.length) {
           const defaultVariant = existing.variants.find(
             (v: any) => v.title === "Default"
           ) ?? existing.variants[0]
 
           if (defaultVariant?.id) {
-            const fixtureAmountMinor = Math.round(product.base_price.amount * 100)
-            const currencyCode = product.base_price.currency.toLowerCase()
+            const fixtureAmountMinor = Math.round(catalogPrice.amount * 100)
+            const currencyCode = catalogPrice.currency.toLowerCase()
 
             try {
               await upsertVariantPricesWorkflow(container).run({
@@ -912,7 +977,7 @@ export async function syncProducts(
                       ],
                     },
                   ],
-                  previousVariantIds: [],
+                  previousVariantIds: [defaultVariant.id],
                 },
               })
             } catch (e: any) {
@@ -940,10 +1005,9 @@ export async function syncProducts(
         counts.updated++
       } else {
         // Quality gate evaluation before status assignment
-        const createHasVendorPricing = vendorPricingMap?.get(product.product_id) ?? false
-        const createGateResult = evaluateQualityGate(product, { vendorPricing: createHasVendorPricing })
+        const createGateResult = evaluateQualityGate(product, { vendorPricing: hasVendorPricing })
         console.log(
-          `Product '${product.product_id}': ${createGateResult.status.toUpperCase()} (words=${createGateResult.details.words}, image=${createGateResult.details.image}, price=${createGateResult.details.price}${createHasVendorPricing ? ", vendorPricing=true" : ""})` +
+          `Product '${product.product_id}': ${createGateResult.status.toUpperCase()} (words=${createGateResult.details.words}, image=${createGateResult.details.image}, price=${createGateResult.details.price}${hasVendorPricing ? ", vendorPricing=true" : ""})` +
             (createGateResult.reasons.length > 0 ? ` — failed: ${createGateResult.reasons.join(", ")}` : "")
         )
 
@@ -951,9 +1015,9 @@ export async function syncProducts(
           const noteParts = [
             `fixture_id=${product.product_id}`,
             `status=${createGateResult.status}`,
-            createHasVendorPricing
-              ? "price=skipped-vendor-pricing"
-              : `price=${product.base_price.amount} ${product.base_price.currency.toUpperCase()}`,
+            catalogPrice.source === "min_vendor_price"
+              ? `price=${catalogPrice.amount} ${catalogPrice.currency} (min-vendor)`
+              : `price=${catalogPrice.amount} ${catalogPrice.currency}`,
           ]
           if (resolvedCategoryIds.length > 0) {
             noteParts.push(`category_ids=${resolvedCategoryIds.length}`)
@@ -993,8 +1057,8 @@ export async function syncProducts(
                     prices: [
                       {
                         // Medusa stores prices in minor units (grosze)
-                        amount: Math.round(product.base_price.amount * 100),
-                        currency_code: product.base_price.currency.toLowerCase(),
+                        amount: Math.round(catalogPrice.amount * 100),
+                        currency_code: catalogPrice.currency.toLowerCase(),
                       },
                     ],
                   },
@@ -1007,7 +1071,7 @@ export async function syncProducts(
                     synced_by: "gp-config-sync-catalog",
                     market_id: marketId,
                     fixture_id: product.product_id,
-                    has_vendor_pricing: createHasVendorPricing,
+                    has_vendor_pricing: hasVendorPricing,
                   },
                 },
               },
@@ -1052,7 +1116,15 @@ type MarketConfig = {
 type VendorProductCatalog = {
   vendor_id: string
   market_id: string
-  products?: Array<{ product_id: string }>
+  products?: Array<{
+    product_id: string
+    status?: string
+    available?: boolean
+  }>
+}
+
+function isVendorProductSellable(product: { status?: string; available?: boolean }): boolean {
+  return product.status !== "inactive" && product.available !== false
 }
 
 export async function enforceVendorStatusGate(
@@ -1081,17 +1153,34 @@ export async function enforceVendorStatusGate(
     `Vendor status gate: ${nonActiveVendors.length} non-active vendor(s): ${nonActiveVendors.map((v) => `${v.vendor_id}=${v.status}`).join(", ")}`
   )
 
-  // Build set of fixture product_ids belonging to non-active vendors
+  const activeVendors = vendors.filter((v) => ACTIVE_VENDOR_STATUSES.has(v.status))
+
+  // Build sets of fixture product_ids belonging to active and non-active vendors
   // by reading vendor product catalog files (vendors/{vendor_id}/products.yaml)
   const marketDir = path.dirname(marketConfigPath)
   const blockedFixtureIds = new Set<string>()
+  const activeFixtureIds = new Set<string>()
+
+  for (const vendor of activeVendors) {
+    const vendorProductsPath = path.resolve(marketDir, "vendors", vendor.vendor_id, "products.yaml")
+    try {
+      const vendorCatalog = await readYamlFile<VendorProductCatalog>(vendorProductsPath)
+      for (const vp of vendorCatalog.products ?? []) {
+        if (vp.product_id && isVendorProductSellable(vp)) {
+          activeFixtureIds.add(vp.product_id)
+        }
+      }
+    } catch {
+      // Vendor product file missing — not an error, vendor may have no products yet
+    }
+  }
 
   for (const vendor of nonActiveVendors) {
     const vendorProductsPath = path.resolve(marketDir, "vendors", vendor.vendor_id, "products.yaml")
     try {
       const vendorCatalog = await readYamlFile<VendorProductCatalog>(vendorProductsPath)
       for (const vp of vendorCatalog.products ?? []) {
-        if (vp.product_id) {
+        if (vp.product_id && isVendorProductSellable(vp) && !activeFixtureIds.has(vp.product_id)) {
           blockedFixtureIds.add(vp.product_id)
         }
       }

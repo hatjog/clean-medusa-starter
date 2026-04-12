@@ -9,6 +9,8 @@ import * as yaml from "js-yaml"
 
 import gpConfigSyncBlog from "./gp-config-sync-blog"
 import gpConfigSyncCatalog from "./gp-config-sync-catalog"
+import gpConfigSyncPayments from "./gp-config-sync-payments"
+import gpConfigSyncShipping from "./gp-config-sync-shipping"
 import gpConfigSyncVendors from "./gp-config-sync-vendors"
 
 const ADVISORY_LOCK_ID = 1234567890
@@ -543,6 +545,26 @@ export default async function gpConfigSyncOrchestrator({ container, args }: Exec
             await invokeStageEntrypoint(gpConfigSyncVendors, container, stageArgs)
           })
           return orchestratorArgs.dryRun ? "vendor dry-run completed" : "vendor sync completed"
+        },
+      },
+      {
+        name: "sync-payments",
+        required: true,
+        execute: async () => {
+          await withStageEnv(orchestratorArgs, async () => {
+            await invokeStageEntrypoint(gpConfigSyncPayments, container, stageArgs)
+          })
+          return orchestratorArgs.dryRun ? "payments dry-run completed" : "payments sync completed"
+        },
+      },
+      {
+        name: "sync-shipping",
+        required: true,
+        execute: async () => {
+          await withStageEnv(orchestratorArgs, async () => {
+            await invokeStageEntrypoint(gpConfigSyncShipping, container, stageArgs)
+          })
+          return orchestratorArgs.dryRun ? "shipping dry-run completed" : "shipping sync completed"
         },
       },
       {

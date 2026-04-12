@@ -70,6 +70,7 @@ describe("seller market scoping", () => {
         id: sellerId,
         name: "Scoped Seller",
         handle: sellerHandle,
+        store_status: "ACTIVE",
       });
       await db("seller_seller_product_product").insert({
         id: linkId,
@@ -110,6 +111,7 @@ describe("seller market scoping", () => {
         id: sellerId,
         name: "Scoped Handle Seller",
         handle: sellerHandle,
+        store_status: "ACTIVE",
       });
       await db("seller_seller_product_product").insert({
         id: linkId,
@@ -128,6 +130,46 @@ describe("seller market scoping", () => {
         getSellerIdByHandleForSalesChannel(
           db,
           bonevent.salesChannelId,
+          sellerHandle
+        )
+      ).resolves.toBeNull();
+    } finally {
+      await db("seller_seller_product_product").where({ id: linkId }).delete();
+      await db("seller").where({ id: sellerId }).delete();
+    }
+  });
+
+  it("does not list or resolve inactive sellers even when they are linked to the market", async () => {
+    const bonbeauty = await getMarketFixture("bonbeauty");
+    const sellerId = buildSellerId("inactive");
+    const sellerHandle = `inactive-seller-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    const linkId = buildLinkId("inactive");
+
+    try {
+      await db("seller").insert({
+        id: sellerId,
+        name: "Inactive Scoped Seller",
+        handle: sellerHandle,
+        store_status: "INACTIVE",
+      });
+      await db("seller_seller_product_product").insert({
+        id: linkId,
+        seller_id: sellerId,
+        product_id: bonbeauty.productId,
+      });
+
+      const ownMarket = await listSellerIdsForSalesChannel(
+        db,
+        bonbeauty.salesChannelId,
+        0,
+        100
+      );
+
+      expect(ownMarket.sellerIds).not.toContain(sellerId);
+      await expect(
+        getSellerIdByHandleForSalesChannel(
+          db,
+          bonbeauty.salesChannelId,
           sellerHandle
         )
       ).resolves.toBeNull();

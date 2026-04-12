@@ -19,6 +19,7 @@ function buildScopedSellerIdQuery(db: Knex, salesChannelId: string) {
       "psc.product_id"
     )
     .where("psc.sales_channel_id", salesChannelId)
+    .where("seller.store_status", "ACTIVE")
     .whereNull("seller.deleted_at")
     .whereNull("sspp.deleted_at")
     .whereNull("product.deleted_at")

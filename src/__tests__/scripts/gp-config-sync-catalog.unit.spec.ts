@@ -1063,6 +1063,44 @@ describe("enforceVendorStatusGate", () => {
     expect(warnings).toHaveLength(0)
   })
 
+  it("does not draft a shared product when an active vendor still offers it", async () => {
+    setupFiles(
+      {
+        market_id: "bonbeauty",
+        vendors: [
+          { vendor_id: "good-vendor", status: "active" },
+          { vendor_id: "bad-vendor", status: "suspended" },
+        ],
+      },
+      {
+        "good-vendor": {
+          vendor_id: "good-vendor",
+          market_id: "bonbeauty",
+          products: [{ product_id: "srv_1201", status: "active", available: true }],
+        },
+        "bad-vendor": {
+          vendor_id: "bad-vendor",
+          market_id: "bonbeauty",
+          products: [{ product_id: "srv_1201", status: "active", available: true }],
+        },
+      }
+    )
+
+    const svc = {
+      listProducts: jest.fn().mockResolvedValue([
+        { id: "p1", handle: "premium-product", status: "published", metadata: { gp: { market_id: "bonbeauty", fixture_id: "srv_1201" } } },
+      ]),
+      updateProducts: jest.fn().mockResolvedValue({}),
+    }
+    const warnings: string[] = []
+
+    const result = await enforceVendorStatusGate(svc, "/config/bonbeauty/market.yaml", "bonbeauty", warnings)
+
+    expect(result.draftedCount).toBe(0)
+    expect(svc.updateProducts).not.toHaveBeenCalled()
+    expect(warnings).toHaveLength(0)
+  })
+
   it("skips products already in draft status", async () => {
     setupFiles(
       {
@@ -1290,6 +1328,7 @@ describe("buildVendorPricingMap", () => {
         "kremidotyk": {
           vendor_id: "kremidotyk",
           products: [
+            { product_id: "srv_0101", status: "active", vendor_price: { amount: 140, currency: "PLN" } },
             { product_id: "srv_0401", status: "active", vendor_price: { amount: 180, currency: "PLN" } },
           ],
         },
@@ -1299,9 +1338,16 @@ describe("buildVendorPricingMap", () => {
     const warnings: string[] = []
     const map = await buildVendorPricingMap("/config/bonbeauty/market.yaml", warnings)
 
-    expect(map.get("srv_0101")).toBe(true)
+    expect(map.get("srv_0101")?.prices).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ vendor_id: "city-beauty", amount: 160, currency: "PLN" }),
+        expect.objectContaining({ vendor_id: "kremidotyk", amount: 140, currency: "PLN" }),
+      ])
+    )
     expect(map.has("srv_0102")).toBe(false) // price=0 — not valid vendor pricing
-    expect(map.get("srv_0401")).toBe(true) // onboarded vendor counts as active
+    expect(map.get("srv_0401")?.prices).toEqual([
+      expect.objectContaining({ vendor_id: "kremidotyk", amount: 180, currency: "PLN" }),
+    ]) // onboarded vendor counts as active
     expect(warnings).toHaveLength(0)
   })
 

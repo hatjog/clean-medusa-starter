@@ -1,4 +1,5 @@
 import { ExecArgs } from "@medusajs/framework/types"
+import { ContainerRegistrationKeys } from "@medusajs/framework/utils"
 
 import fs from "node:fs/promises"
 import path from "node:path"
@@ -61,6 +62,7 @@ type SplDetail = {
   fixture_id: string
   status: "created" | "skipped" | "missing_product"
   product_db_id?: string
+  reason?: string
 }
 
 type SyncSummary = {
@@ -69,8 +71,31 @@ type SyncSummary = {
   market_id: string
   vendors: { created: number; updated: number; skipped: number }
   spl: { created: number; skipped: number; missing_products: number }
+  stale_sellers: { inactivated: number; skipped: number }
   spl_details: SplDetail[]
   warnings: string[]
+}
+
+type DbLinkOutcome = "inserted" | "restored" | "exists"
+
+type MarketProductFixture = {
+  product_id?: string
+  slug?: string
+  handle?: string
+}
+
+type MarketProductsFile = {
+  products?: MarketProductFixture[]
+}
+
+type VendorProductsFile = {
+  products?: Array<{ product_id?: string }>
+}
+
+type MarketScopedSellerRow = {
+  id: string
+  handle: string | null
+  store_status: string | null
 }
 
 // ---- Utilities ----
@@ -132,6 +157,179 @@ function resolveService(container: any, keysToTry: string[]): any {
   throw new Error(
     `Cannot resolve service. Tried keys: ${keysToTry.join(", ")}. Errors: ${errors.join(" | ")}`
   )
+}
+
+function resolveProductListFn(productModuleService: any): (filters: any) => Promise<any[]> {
+  return typeof productModuleService.listProducts === "function"
+    ? (filters: any) => productModuleService.listProducts(filters)
+    : (filters: any) => productModuleService.list(filters)
+}
+
+function buildSellerProductLinkId(sellerId: string, productId: string): string {
+  const ts = Date.now().toString(36)
+  const entropy = Math.random().toString(36).slice(2, 8)
+  return `spl_${sellerId.slice(-8)}_${productId.slice(-8)}_${ts}_${entropy}`
+}
+
+async function upsertSellerProductLinkViaDb(
+  db: any,
+  sellerId: string,
+  productId: string
+): Promise<DbLinkOutcome> {
+  const existing = await db("seller_seller_product_product")
+    .where({ seller_id: sellerId, product_id: productId })
+    .first()
+
+  if (!existing) {
+    await db("seller_seller_product_product").insert({
+      id: buildSellerProductLinkId(sellerId, productId),
+      seller_id: sellerId,
+      product_id: productId,
+    })
+    return "inserted"
+  }
+
+  if (existing.deleted_at) {
+    await db("seller_seller_product_product")
+      .where({ id: existing.id })
+      .update({ deleted_at: null })
+    return "restored"
+  }
+
+  return "exists"
+}
+
+async function createSellerRecord(sellerModuleService: any, payload: Record<string, unknown>): Promise<any> {
+  if (typeof sellerModuleService.create === "function") {
+    return sellerModuleService.create(payload)
+  }
+  if (typeof sellerModuleService.createSeller === "function") {
+    return sellerModuleService.createSeller(payload)
+  }
+  if (typeof sellerModuleService.createSellers === "function") {
+    const created = await sellerModuleService.createSellers([payload])
+    return Array.isArray(created) ? created[0] : created
+  }
+
+  throw new Error("Seller service does not expose a supported create method")
+}
+
+async function updateSellerRecord(
+  sellerModuleService: any,
+  id: string,
+  payload: Record<string, unknown>
+): Promise<any> {
+  if (typeof sellerModuleService.update === "function") {
+    return sellerModuleService.update(id, payload)
+  }
+  if (typeof sellerModuleService.updateSeller === "function") {
+    return sellerModuleService.updateSeller(id, payload)
+  }
+  if (typeof sellerModuleService.updateSellers === "function") {
+    const updated = await sellerModuleService.updateSellers([{ id, ...payload }])
+    return Array.isArray(updated) ? updated[0] : updated
+  }
+
+  throw new Error("Seller service does not expose a supported update method")
+}
+
+async function resolveSalesChannelId(db: any, marketId: string): Promise<string | null> {
+  const row = await db("sales_channel")
+    .select("id")
+    .whereRaw("metadata->>'gp_market_id' = ?", [marketId])
+    .whereNull("deleted_at")
+    .first<{ id: string }>()
+
+  return row?.id ?? null
+}
+
+export async function inactivateStaleMarketSellers(
+  sellerModuleService: any,
+  db: any,
+  salesChannelId: string,
+  configuredVendorHandles: Set<string>,
+  dryRun: boolean,
+  collector?: DryRunCollector
+): Promise<{ inactivated: number; skipped: number }> {
+  const scopedSellers = await db("seller as seller")
+    .distinct("seller.id", "seller.handle", "seller.store_status")
+    .innerJoin("seller_seller_product_product as sspp", "seller.id", "sspp.seller_id")
+    .innerJoin("product as product", "sspp.product_id", "product.id")
+    .innerJoin("product_sales_channel as psc", "product.id", "psc.product_id")
+    .where("psc.sales_channel_id", salesChannelId)
+    .whereNull("seller.deleted_at")
+    .whereNull("sspp.deleted_at")
+    .whereNull("product.deleted_at")
+    .whereNull("psc.deleted_at")
+
+  let inactivated = 0
+  let skipped = 0
+
+  for (const seller of scopedSellers as MarketScopedSellerRow[]) {
+    const handle = seller.handle?.trim() ?? ""
+
+    if (!handle || configuredVendorHandles.has(handle)) {
+      continue
+    }
+
+    if (seller.store_status && seller.store_status !== "ACTIVE") {
+      skipped++
+      continue
+    }
+
+    if (dryRun) {
+      collector?.add({
+        entityType: "seller",
+        handle,
+        action: "update",
+        note: "store_status=INACTIVE (missing from market config)",
+      })
+    } else {
+      await updateSellerRecord(sellerModuleService, seller.id, { store_status: "INACTIVE" })
+    }
+
+    console.log(`Seller '${handle}': set to INACTIVE (missing from market config)`)
+    inactivated++
+  }
+
+  return { inactivated, skipped }
+}
+
+export async function resolveProductByFixture(
+  listProducts: (filters: any) => Promise<any[]>,
+  fixtureId: string,
+  fallbackHandle?: string
+): Promise<{ product: any | null; strategy: "fixture" | "handle" | "none"; error?: string }> {
+  try {
+    const byFixture = (await listProducts({ metadata: { gp: { fixture_id: fixtureId } } })) ?? []
+    if (byFixture[0]?.id) {
+      return { product: byFixture[0], strategy: "fixture" }
+    }
+  } catch (e: any) {
+    const message = e?.message ?? String(e)
+    // Continue to fallback lookup when available.
+    if (!fallbackHandle) {
+      return { product: null, strategy: "none", error: `fixture lookup failed: ${message}` }
+    }
+  }
+
+  if (!fallbackHandle) {
+    return { product: null, strategy: "none" }
+  }
+
+  try {
+    const byHandle = (await listProducts({ handle: fallbackHandle })) ?? []
+    if (byHandle[0]?.id) {
+      return { product: byHandle[0], strategy: "handle" }
+    }
+    return { product: null, strategy: "none", error: `handle lookup returned 0 rows for '${fallbackHandle}'` }
+  } catch (e: any) {
+    return {
+      product: null,
+      strategy: "none",
+      error: `handle lookup failed for '${fallbackHandle}': ${e?.message ?? String(e)}`,
+    }
+  }
 }
 
 function vendorStatusToStoreStatus(status: string | undefined): string {
@@ -264,7 +462,7 @@ export async function upsertSeller(
       return { sellerId: `dry-run-${handle}`, action: "created", note }
     }
 
-    const created = await sellerModuleService.create(createPayload)
+    const created = await createSellerRecord(sellerModuleService, createPayload)
     return { sellerId: created?.id ?? null, action: "created" }
   }
 
@@ -373,7 +571,7 @@ export async function upsertSeller(
     return { sellerId: existingSeller.id, action: "updated", note }
   }
 
-  await sellerModuleService.update(existingSeller.id, updatePayload)
+  await updateSellerRecord(sellerModuleService, existingSeller.id, updatePayload)
   return { sellerId: existingSeller.id, action: "updated" }
 }
 
@@ -398,6 +596,28 @@ export default async function gpConfigSyncVendors({ container, args }: ExecArgs)
     )
   }
 
+  const marketProductsPath = path.resolve(
+    configRoot,
+    instanceId,
+    "markets",
+    marketId,
+    "products.yaml"
+  )
+
+  const fixtureToHandle = new Map<string, string>()
+  try {
+    const marketProducts = await readYamlFile<MarketProductsFile>(marketProductsPath)
+    for (const p of marketProducts.products ?? []) {
+      const fixtureId = (p.product_id ?? "").trim()
+      const candidate = (p.slug ?? p.handle ?? "").trim()
+      if (fixtureId && candidate) {
+        fixtureToHandle.set(fixtureId, candidate)
+      }
+    }
+  } catch {
+    // Optional optimization-only mapping. Keep flow running without this file.
+  }
+
   const sellerModuleService = resolveService(container, [
     "seller",
     "sellerModuleService",
@@ -410,10 +630,27 @@ export default async function gpConfigSyncVendors({ container, args }: ExecArgs)
     "productModuleService",
     "product_module",
   ])
+  const productListFn = resolveProductListFn(productModuleService)
+  const db = container.resolve(ContainerRegistrationKeys.PG_CONNECTION)
+
+  let splService: any = null
+  let splServiceResolveError: string | null = null
+  if (!dryRun) {
+    try {
+      splService = resolveService(container, [
+        "sellerProductLink",
+        "seller_product_link",
+        "ISellerProductLinkService",
+      ])
+    } catch (e: any) {
+      splServiceResolveError = e?.message ?? String(e)
+    }
+  }
 
   const warnings: string[] = []
   const vendorCounts = { created: 0, updated: 0, skipped: 0 }
   const splCounts = { created: 0, skipped: 0, missing_products: 0 }
+  const staleSellerCounts = { inactivated: 0, skipped: 0 }
   const splDetails: SplDetail[] = []
 
   const vendors = marketConfig.vendors ?? []
@@ -457,6 +694,14 @@ export default async function gpConfigSyncVendors({ container, args }: ExecArgs)
 
       // SellerProductLink sync — skip for suspended vendors
       const isSuspended = vendorStatusToStoreStatus(vendor.status) === "SUSPENDED"
+      if (isSuspended) {
+        warnings.push(`Vendor '${vendor.vendor_id}': suspended; skipping seller-product linking`)
+      }
+
+      if (!result.sellerId) {
+        warnings.push(`Vendor '${vendor.vendor_id}': missing sellerId after upsert; skipping seller-product linking`)
+      }
+
       if (!isSuspended && result.sellerId) {
         const vendorProductsPath = path.resolve(
           configRoot,
@@ -468,36 +713,52 @@ export default async function gpConfigSyncVendors({ container, args }: ExecArgs)
           "products.yaml"
         )
 
-        let vendorProducts: { products?: Array<{ product_id: string }> } = {}
+        let vendorProducts: VendorProductsFile = {}
         try {
           vendorProducts = await readYamlFile(vendorProductsPath)
-        } catch {
-          // No products.yaml — not an error
+        } catch (e: any) {
+          warnings.push(
+            `Vendor '${vendor.vendor_id}': cannot read products.yaml for linking (${e?.message ?? String(e)})`
+          )
+          // Keep flow running so other vendors can still sync.
         }
 
         for (const vp of vendorProducts.products ?? []) {
-          const fixtureId = vp.product_id
-          if (!fixtureId) continue
-
-          let products: any[] = []
-          try {
-            const listFn =
-              typeof productModuleService.listProducts === "function"
-                ? (f: any) => productModuleService.listProducts(f)
-                : (f: any) => productModuleService.list(f)
-            products = (await listFn({ metadata: { gp: { fixture_id: fixtureId } } })) ?? []
-          } catch {
-            // try alternate lookup
+          const fixtureId = (vp.product_id ?? "").trim()
+          if (!fixtureId) {
+            warnings.push(`Vendor '${vendor.vendor_id}': product row with empty product_id; skipping SPL`)
+            splCounts.skipped++
+            splDetails.push({
+              vendor_id: vendor.vendor_id,
+              fixture_id: "",
+              status: "skipped",
+              reason: "missing product_id",
+            })
+            continue
           }
 
-          const product = products[0]
+          const fallbackHandle = fixtureToHandle.get(fixtureId)
+          const resolved = await resolveProductByFixture(productListFn, fixtureId, fallbackHandle)
+          const product = resolved.product
           if (!product?.id) {
+            const reason = resolved.error ?? "not found by fixture_id and fallback handle"
             warnings.push(
-              `Vendor '${vendor.vendor_id}': product fixture_id='${fixtureId}' not found in DB; skipping SPL`
+              `Vendor '${vendor.vendor_id}': product fixture_id='${fixtureId}' not found in DB; skipping SPL (${reason})`
             )
             splCounts.missing_products++
-            splDetails.push({ vendor_id: vendor.vendor_id, fixture_id: fixtureId, status: "missing_product" })
+            splDetails.push({
+              vendor_id: vendor.vendor_id,
+              fixture_id: fixtureId,
+              status: "missing_product",
+              reason,
+            })
             continue
+          }
+
+          if (resolved.strategy === "handle") {
+            warnings.push(
+              `Vendor '${vendor.vendor_id}': linked fixture_id='${fixtureId}' using fallback handle='${fallbackHandle}'`
+            )
           }
 
           // Upsert SellerProductLink
@@ -509,22 +770,85 @@ export default async function gpConfigSyncVendors({ container, args }: ExecArgs)
               note: `seller=${result.sellerId}; product=${product.id}`,
             })
             splCounts.created++
-            splDetails.push({ vendor_id: vendor.vendor_id, fixture_id: fixtureId, status: "created", product_db_id: product.id })
+            splDetails.push({
+              vendor_id: vendor.vendor_id,
+              fixture_id: fixtureId,
+              status: "created",
+              product_db_id: product.id,
+              reason: resolved.strategy === "handle" ? "fallback handle" : "fixture_id",
+            })
+            continue
+          }
+
+          if (splServiceResolveError || !splService) {
+            const reason = `seller-product-link service unavailable: ${splServiceResolveError ?? "unknown"}`
+            try {
+              const outcome = await upsertSellerProductLinkViaDb(db, result.sellerId, product.id)
+              splCounts.created++
+              splDetails.push({
+                vendor_id: vendor.vendor_id,
+                fixture_id: fixtureId,
+                status: "created",
+                product_db_id: product.id,
+                reason: `db-fallback:${outcome}`,
+              })
+              warnings.push(
+                `Vendor '${vendor.vendor_id}': ${reason}; linked via DB fallback (${outcome})`
+              )
+            } catch (dbError: any) {
+              const dbReason = dbError?.message ?? String(dbError)
+              warnings.push(`Vendor '${vendor.vendor_id}': ${reason}; DB fallback failed - ${dbReason}`)
+              splCounts.skipped++
+              splDetails.push({
+                vendor_id: vendor.vendor_id,
+                fixture_id: fixtureId,
+                status: "skipped",
+                product_db_id: product.id,
+                reason: `service-unavailable + db-fallback-failed: ${dbReason}`,
+              })
+            }
             continue
           }
 
           try {
-            const splService = resolveService(container, [
-              "sellerProductLink",
-              "seller_product_link",
-              "ISellerProductLinkService",
-            ])
             await splService.upsert({ seller_id: result.sellerId, product_id: product.id })
             splCounts.created++
-            splDetails.push({ vendor_id: vendor.vendor_id, fixture_id: fixtureId, status: "created", product_db_id: product.id })
-          } catch {
-            splCounts.skipped++
-            splDetails.push({ vendor_id: vendor.vendor_id, fixture_id: fixtureId, status: "skipped", product_db_id: product.id })
+            splDetails.push({
+              vendor_id: vendor.vendor_id,
+              fixture_id: fixtureId,
+              status: "created",
+              product_db_id: product.id,
+              reason: resolved.strategy === "handle" ? "fallback handle" : "fixture_id",
+            })
+          } catch (e: any) {
+            const reason = e?.message ?? String(e)
+            try {
+              const outcome = await upsertSellerProductLinkViaDb(db, result.sellerId, product.id)
+              splCounts.created++
+              splDetails.push({
+                vendor_id: vendor.vendor_id,
+                fixture_id: fixtureId,
+                status: "created",
+                product_db_id: product.id,
+                reason: `service-upsert-failed + db-fallback:${outcome}`,
+              })
+              warnings.push(
+                `Vendor '${vendor.vendor_id}': seller-product upsert failed for fixture_id='${fixtureId}' (product='${product.id}') - ${reason}; linked via DB fallback (${outcome})`
+              )
+            } catch (dbError: any) {
+              const dbReason = dbError?.message ?? String(dbError)
+              warnings.push(
+                `Vendor '${vendor.vendor_id}': seller-product upsert failed for fixture_id='${fixtureId}' (product='${product.id}') - ${reason}; DB fallback failed - ${dbReason}`
+              )
+              splCounts.skipped++
+              splDetails.push({
+                vendor_id: vendor.vendor_id,
+                fixture_id: fixtureId,
+                status: "skipped",
+                product_db_id: product.id,
+                reason: `${reason}; db-fallback-failed: ${dbReason}`,
+              })
+            }
           }
         }
       }
@@ -534,12 +858,40 @@ export default async function gpConfigSyncVendors({ container, args }: ExecArgs)
     }
   }
 
+  const configuredVendorHandles = new Set(
+    vendors
+      .map((vendor) => vendor.slug?.trim())
+      .filter((handle): handle is string => Boolean(handle))
+  )
+
+  if (configuredVendorHandles.size > 0) {
+    const salesChannelId = await resolveSalesChannelId(db, marketId)
+
+    if (salesChannelId) {
+      try {
+        const staleSync = await inactivateStaleMarketSellers(
+          sellerModuleService,
+          db,
+          salesChannelId,
+          configuredVendorHandles,
+          dryRun,
+          collector
+        )
+        staleSellerCounts.inactivated = staleSync.inactivated
+        staleSellerCounts.skipped = staleSync.skipped
+      } catch (err: any) {
+        warnings.push(`Stale seller cleanup failed — ${err?.message ?? String(err)}`)
+      }
+    }
+  }
+
   const summary: SyncSummary = {
     ok: warnings.length === 0,
     instance_id: instanceId,
     market_id: marketId,
     vendors: vendorCounts,
     spl: splCounts,
+    stale_sellers: staleSellerCounts,
     spl_details: splDetails,
     warnings,
   }
