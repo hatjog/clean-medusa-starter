@@ -3,22 +3,29 @@ import { ContainerRegistrationKeys } from "@medusajs/framework/utils";
 import type { Knex } from "knex";
 import { marketContextStorage } from "../../../lib/market-context";
 
-const TAG_GROUP_RE = /^[a-z_]+$/;
+const TAG_GROUP_RE = /^[a-z0-9_-]+$/;
 
 type TagRow = {
   id: string;
   value: string;
 };
 
+function buildTagGroupPrefixes(tagGroup: string): string[] {
+  return Array.from(
+    new Set([
+      tagGroup,
+      tagGroup.replace(/_/g, "-"),
+      tagGroup.replace(/-/g, "_"),
+    ])
+  )
+}
+
 /**
- * GET /store/product-tags
+ * GET /store/gp-product-tags
  *
  * Returns distinct product tags scoped to the current sales channel.
  * Optional query param `tag_group` filters by tag group prefix in tag value
- * (e.g. tag_group=treatment_type returns tags whose value prefix matches).
- *
- * NOTE(v1.2.0): tag_group filtering will be enhanced once tags carry
- * explicit group metadata in the DB.
+ * (for example tag_group=treatment_type returns tags whose value prefix matches).
  */
 export async function GET(req: MedusaRequest, res: MedusaResponse) {
   const salesChannelId = marketContextStorage.getStore()?.sales_channel_id;
@@ -28,9 +35,8 @@ export async function GET(req: MedusaRequest, res: MedusaResponse) {
     return;
   }
 
-  // Validate optional tag_group param
   const rawTagGroup =
-    typeof req.query.tag_group === "string" ? req.query.tag_group : undefined;
+    typeof req.query.tag_group === "string" ? req.query.tag_group.trim() : undefined;
   if (rawTagGroup !== undefined && !TAG_GROUP_RE.test(rawTagGroup)) {
     res.status(400).json({ error: "Invalid tag_group parameter" });
     return;
@@ -38,7 +44,6 @@ export async function GET(req: MedusaRequest, res: MedusaResponse) {
 
   const db = req.scope.resolve(ContainerRegistrationKeys.PG_CONNECTION) as Knex;
 
-  // Fetch distinct tags used by products in this sales channel
   let query = db<TagRow>("product_tag as pt")
     .distinct("pt.id", "pt.value")
     .innerJoin("product_tags as ptt", "pt.id", "ptt.product_tag_id")
@@ -51,16 +56,20 @@ export async function GET(req: MedusaRequest, res: MedusaResponse) {
     .orderBy("pt.value", "asc")
     .select("pt.id", "pt.value");
 
-  // NOTE(v1.2.0): Once tags carry explicit group metadata, replace with a
-  // dedicated column filter. For now use value-prefix match as best-effort.
   if (rawTagGroup) {
-    query = query.where("pt.value", "like", `${rawTagGroup}%`) as typeof query;
+    const prefixes = buildTagGroupPrefixes(rawTagGroup)
+
+    query = query.where((builder) => {
+      for (const prefix of prefixes) {
+        builder.orWhere("pt.value", "like", `${prefix}:%`)
+      }
+    }) as typeof query;
   }
 
   const rows = await query;
 
   const tags = rows.map((row) => ({
-    id: row.id,
+    id: row.value,
     value: row.value,
     label: row.value,
   }));

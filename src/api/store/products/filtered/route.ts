@@ -9,8 +9,9 @@ import { filterProductIdsByFilters } from "../../../../lib/product-market-scope"
 
 const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-// Also allow alphanumeric IDs (matches frontend sanitizeSearchParams behavior)
+// Also allow stable config IDs such as style:soft-glow or age-group:3-6.
 const ALPHANUMERIC_RE = /^[a-z0-9]+$/i;
+const STABLE_TAG_ID_RE = /^[a-z0-9_-]+(?::[a-z0-9_-]+)+$/i;
 const CURRENCY_CODE_RE = /^[A-Z]{3}$/;
 const CITY_ALLOWED_CHARS_RE = /[^a-zA-ZąćęłńóśźżĄĆĘŁŃÓŚŹŻ\s-]/g;
 const ALLOWED_DURATIONS = [30, 45, 60, 90] as const;
@@ -36,7 +37,9 @@ type QueryGraphResult = {
  * can switch between endpoints transparently.
  */
 export async function GET(req: MedusaRequest, res: MedusaResponse) {
-  const salesChannelId = marketContextStorage.getStore()?.sales_channel_id;
+  const marketContext = marketContextStorage.getStore();
+  const salesChannelId = marketContext?.sales_channel_id;
+  const marketId = marketContext?.market_id;
 
   if (!salesChannelId) {
     res.json({ products: [], count: 0, offset: 0, limit: 20 });
@@ -51,16 +54,18 @@ export async function GET(req: MedusaRequest, res: MedusaResponse) {
     return val.split(",").map((s) => s.trim()).filter(Boolean);
   };
 
-  // --- tag_id: CSV of UUIDs, max 20 ---
-  const rawTagIds = parseCSV("tag_id");
-  if (rawTagIds.length > 20) {
+  // --- tag_id: CSV of UUIDs or stable config IDs, max 20 ---
+  const rawTagFilters = parseCSV("tag_id");
+  if (rawTagFilters.length > 20) {
     res
       .status(400)
       .json({ message: "tag_id: max 20 values allowed" });
     return;
   }
-  // Accept both UUID and alphanumeric IDs — matches frontend sanitizeSearchParams behavior
-  const tagIds = rawTagIds.filter((id) => UUID_RE.test(id) || ALPHANUMERIC_RE.test(id));
+  const tagIds = rawTagFilters.filter((id) => UUID_RE.test(id));
+  const tagValues = rawTagFilters.filter(
+    (id) => !UUID_RE.test(id) && (ALPHANUMERIC_RE.test(id) || STABLE_TAG_ID_RE.test(id))
+  );
 
   // --- category_id: CSV of UUIDs, max 10 ---
   const rawCategoryIds = parseCSV("category_id");
@@ -162,6 +167,7 @@ export async function GET(req: MedusaRequest, res: MedusaResponse) {
 
   const filters = {
     ...(tagIds.length > 0 && { tag_id: tagIds }),
+    ...(tagValues.length > 0 && { tag_value: tagValues }),
     ...(categoryIds.length > 0 && { category_id: categoryIds }),
     ...(cities.length > 0 && { city: cities }),
     ...(durations.length > 0 && { duration: durations }),
@@ -172,6 +178,13 @@ export async function GET(req: MedusaRequest, res: MedusaResponse) {
   // NOTE: SET LOCAL applies per-statement. The pipeline executes 2 queries (COUNT + IDs),
   // so worst-case wall time is 2 × 3s = 6s. Keep per-statement limit low to catch runaway queries.
   const { productIds, count } = await db.transaction(async (trx) => {
+    // Re-apply RLS context inside the transaction connection. The pool hook sets
+    // context on ordinary acquired connections, but Knex transactions can use a
+    // separate connection where ALS-derived session state is not present.
+    if (marketId) {
+      await trx.raw("SET LOCAL ROLE medusa_store");
+      await trx.raw("SELECT set_config('app.gp_market_id', ?, true)", [marketId]);
+    }
     await trx.raw("SET LOCAL statement_timeout = '3000'");
     return filterProductIdsByFilters(trx, salesChannelId, filters, {
       offset,

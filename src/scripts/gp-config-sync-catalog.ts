@@ -140,6 +140,151 @@ function readGpMarketId(entity: any): string | null {
   return typeof marketId === "string" && marketId.trim() ? marketId.trim() : null
 }
 
+function normalizeProductTagValue(tag: string): string {
+  return tag.trim()
+}
+
+async function resolveProductTagIdMap(
+  productModuleService: any,
+  products: FixtureProduct[],
+  marketId: string,
+  warnings: string[],
+  collector?: DryRunCollector
+): Promise<Map<string, string>> {
+  const uniqueTagValues = Array.from(
+    new Set(
+      products
+        .flatMap((product) => product.tags ?? [])
+        .map(normalizeProductTagValue)
+        .filter(Boolean)
+    )
+  )
+
+  if (uniqueTagValues.length === 0) {
+    return new Map()
+  }
+
+  const existingTags = await productModuleService.listProductTags(
+    { value: uniqueTagValues },
+    { take: null }
+  )
+
+  const tagsByValue = new Map<string, any[]>()
+  for (const tag of existingTags ?? []) {
+    if (typeof tag?.value !== "string" || typeof tag?.id !== "string") continue
+    const bucket = tagsByValue.get(tag.value) ?? []
+    bucket.push(tag)
+    tagsByValue.set(tag.value, bucket)
+  }
+
+  const tagIdMap = new Map<string, string>()
+  const tagsToBackfill: Array<{ id: string; metadata: Record<string, any> }> = []
+  const tagsToCreate: Array<{ value: string; metadata: Record<string, any> }> = []
+
+  for (const tagValue of uniqueTagValues) {
+    const matches = tagsByValue.get(tagValue) ?? []
+    const exact = matches.filter((tag) => readGpMarketId(tag) === marketId)
+
+    if (exact.length === 1) {
+      tagIdMap.set(tagValue, exact[0].id)
+      continue
+    }
+
+    if (exact.length > 1) {
+      warnings.push(
+        `Product tags: multiple tags found for value '${tagValue}' in market '${marketId}'`
+      )
+      continue
+    }
+
+    const untagged = matches.filter((tag) => readGpMarketId(tag) === null)
+    if (untagged.length === 1) {
+      const tag = untagged[0]
+      const metadata = {
+        ...(tag.metadata ?? {}),
+        gp: {
+          ...((tag.metadata as any)?.gp ?? {}),
+          market_id: marketId,
+        },
+      }
+
+      if (collector) {
+        tagIdMap.set(tagValue, tag.id)
+        collector.add({
+          entityType: "product-tag",
+          handle: tagValue,
+          action: "update",
+          note: `value=${tagValue}, market_id=${marketId}`,
+        })
+      } else {
+        tagsToBackfill.push({ id: tag.id, metadata })
+      }
+      continue
+    }
+
+    if (untagged.length > 1) {
+      warnings.push(
+        `Product tags: multiple unscoped tags found for value '${tagValue}'`
+      )
+      continue
+    }
+
+    if (collector) {
+      const dryRunId = `dry-run-tag-${normalizeHandle(tagValue || "tag")}`
+      tagIdMap.set(tagValue, dryRunId)
+      collector.add({
+        entityType: "product-tag",
+        handle: tagValue,
+        action: "create",
+        note: `value=${tagValue}, market_id=${marketId}`,
+      })
+      continue
+    }
+
+    tagsToCreate.push({
+      value: tagValue,
+      metadata: {
+        gp: {
+          market_id: marketId,
+        },
+      },
+    })
+  }
+
+  if (!collector && tagsToBackfill.length > 0) {
+    try {
+      const updatedTags = await productModuleService.upsertProductTags(tagsToBackfill)
+      for (const tag of Array.isArray(updatedTags) ? updatedTags : [updatedTags]) {
+        if (typeof tag?.value === "string" && typeof tag?.id === "string") {
+          tagIdMap.set(tag.value, tag.id)
+        }
+      }
+    } catch (e: any) {
+      warnings.push(
+        `Product tags: update error — ${e?.message ?? String(e)}`
+      )
+    }
+  }
+
+  if (!collector && tagsToCreate.length > 0) {
+    try {
+      const createdTags = await productModuleService.createProductTags(tagsToCreate)
+
+      for (const tag of Array.isArray(createdTags) ? createdTags : [createdTags]) {
+        if (typeof tag?.value === "string" && typeof tag?.id === "string") {
+          tagIdMap.set(tag.value, tag.id)
+        }
+      }
+    } catch (e: any) {
+      warnings.push(
+        `Product tags: create error — ${e?.message ?? String(e)}`
+      )
+    }
+  }
+
+  return tagIdMap
+}
+
 function selectEntityMatch(
   matches: any[] | undefined,
   marketId: string
@@ -782,6 +927,7 @@ export async function syncProducts(
   prereqs: Prerequisites,
   categoryMap: Map<string, string>,
   collectionMap: Map<string, string>,
+  tagIdMap: Map<string, string>,
   marketId: string,
   warnings: string[],
   vendorPricingMap?: Map<string, VendorPricingInfo>,
@@ -855,6 +1001,26 @@ export async function syncProducts(
         )
       }
     }
+
+    const resolvedTagIds = Array.from(
+      new Set(
+        (product.tags ?? [])
+          .map(normalizeProductTagValue)
+          .filter(Boolean)
+          .map((tagValue) => {
+            const tagId = tagIdMap.get(tagValue)
+
+            if (!tagId) {
+              warnings.push(
+                `Product '${product.product_id}': tag '${tagValue}' not resolved in product tag map`
+              )
+            }
+
+            return tagId
+          })
+          .filter((tagId): tagId is string => Boolean(tagId))
+      )
+    )
 
     const vendorPricing = vendorPricingMap?.get(product.product_id)
     const hasVendorPricing = Boolean(vendorPricing?.prices.length)
@@ -949,6 +1115,7 @@ export async function syncProducts(
         if (resolvedCollectionId) {
           updatePayload.collection_id = resolvedCollectionId
         }
+        updatePayload.tag_ids = resolvedTagIds
 
         await productModuleService.updateProducts(existing.id, updatePayload)
 
@@ -1025,6 +1192,9 @@ export async function syncProducts(
           if (resolvedCollectionId) {
             noteParts.push(`collection_id=${resolvedCollectionId}`)
           }
+          if (resolvedTagIds.length > 0) {
+            noteParts.push(`tag_ids=${resolvedTagIds.length}`)
+          }
 
           collector.add({
             entityType: "product",
@@ -1064,6 +1234,7 @@ export async function syncProducts(
                   },
                 ],
                 sales_channels: [{ id: prereqs.salesChannelId }],
+                tag_ids: resolvedTagIds,
                 ...(resolvedCategoryIds.length > 0 ? { category_ids: resolvedCategoryIds } : {}),
                 ...(resolvedCollectionId ? { collection_id: resolvedCollectionId } : {}),
                 metadata: {
@@ -1316,6 +1487,14 @@ export default async function gpConfigSyncCatalog({ container, args }: ExecArgs)
     collector
   )
 
+  const tagIdMap = await resolveProductTagIdMap(
+    productModuleService,
+    products,
+    marketId,
+    warnings,
+    collector
+  )
+
   // Build vendor pricing map before product sync
   const marketConfigPath = path.resolve(configRoot, instanceId, "markets", marketId, "market.yaml")
   const vendorPricingMap = await buildVendorPricingMap(marketConfigPath, warnings)
@@ -1331,6 +1510,7 @@ export default async function gpConfigSyncCatalog({ container, args }: ExecArgs)
     prereqs,
     categoryMap,
     collectionMap,
+    tagIdMap,
     marketId,
     warnings,
     vendorPricingMap,

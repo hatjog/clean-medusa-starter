@@ -10,6 +10,7 @@ type ProductRow = {
  */
 export type FilterParams = {
   tag_id?: string[];
+  tag_value?: string[];
   category_id?: string[];
   city?: string[];
   duration?: number[];
@@ -112,11 +113,25 @@ export async function filterProductIdsByFilters(
         .orWhereNull("seller.id");
     });
 
-  // tag_id: INNER JOIN product_tags (only products with a matching tag survive)
-  if (filters.tag_id?.length) {
-    query = query
-      .join("product_tags as pt", "product.id", "pt.product_id")
-      .whereIn("pt.product_tag_id", filters.tag_id);
+  // tag filters: support both DB UUIDs and stable config values (for example style:soft-glow)
+  if (filters.tag_id?.length || filters.tag_value?.length) {
+    query = query.join("product_tags as pt", "product.id", "pt.product_id");
+
+    if (filters.tag_value?.length) {
+      query = query
+        .join("product_tag as ptag", "pt.product_tag_id", "ptag.id")
+        .whereNull("ptag.deleted_at");
+    }
+
+    query = query.where((builder) => {
+      if (filters.tag_id?.length) {
+        builder.whereIn("pt.product_tag_id", filters.tag_id);
+      }
+
+      if (filters.tag_value?.length) {
+        builder.orWhereIn("ptag.value", filters.tag_value);
+      }
+    });
   }
 
   // category_id: INNER JOIN product_category_product
