@@ -1414,6 +1414,101 @@ export async function enforceVendorStatusGate(
   return { draftedCount }
 }
 
+async function collectConfiguredProductFixtureIds(
+  products: FixtureProduct[],
+  marketConfigPath: string,
+  warnings: string[]
+): Promise<Set<string>> {
+  const configuredFixtureIds = new Set<string>()
+
+  for (const product of products) {
+    const fixtureId = product.product_id?.trim()
+    if (fixtureId) {
+      configuredFixtureIds.add(fixtureId)
+    }
+  }
+
+  let marketConfig: MarketConfig
+  try {
+    marketConfig = await readYamlFile<MarketConfig>(marketConfigPath)
+  } catch (e: any) {
+    warnings.push(`Orphan reconcile: cannot read market.yaml — ${e?.message ?? String(e)}`)
+    return configuredFixtureIds
+  }
+
+  const marketDir = path.dirname(marketConfigPath)
+  for (const vendor of marketConfig.vendors ?? []) {
+    const vendorProductsPath = path.resolve(marketDir, "vendors", vendor.vendor_id, "products.yaml")
+    try {
+      const vendorCatalog = await readYamlFile<VendorProductCatalog>(vendorProductsPath)
+      for (const product of vendorCatalog.products ?? []) {
+        const fixtureId = product.product_id?.trim()
+        if (fixtureId) {
+          configuredFixtureIds.add(fixtureId)
+        }
+      }
+    } catch {
+      // Vendor product file missing — not an error, vendor may have no products yet.
+    }
+  }
+
+  return configuredFixtureIds
+}
+
+export async function draftOrphanMarketProducts(
+  productModuleService: any,
+  configuredFixtureIds: Set<string>,
+  marketId: string,
+  warnings: string[],
+  collector?: DryRunCollector
+): Promise<{ draftedCount: number }> {
+  let allProducts: any[]
+  try {
+    allProducts = await productModuleService.listProducts(
+      {},
+      { select: ["id", "handle", "status", "metadata"], take: null }
+    )
+    allProducts = allProducts ?? []
+  } catch (e: any) {
+    warnings.push(`Orphan reconcile: cannot list products — ${e?.message ?? String(e)}`)
+    return { draftedCount: 0 }
+  }
+
+  const orphanProducts = allProducts.filter((product: any) => {
+    const gpMeta = (product.metadata as any)?.gp
+    const fixtureId = typeof gpMeta?.fixture_id === "string" ? gpMeta.fixture_id.trim() : ""
+    return gpMeta?.market_id === marketId && fixtureId && !configuredFixtureIds.has(fixtureId)
+  })
+
+  let draftedCount = 0
+  for (const product of orphanProducts) {
+    if (product.status === "draft") {
+      continue
+    }
+
+    try {
+      if (collector) {
+        collector.add({
+          entityType: "product",
+          handle: product.handle,
+          action: "update",
+          note: "status=draft (missing from gp-config)",
+        })
+      } else {
+        await productModuleService.updateProducts(product.id, { status: "draft" })
+        console.log(`Product '${product.handle}': DRAFT (missing from gp-config)`)
+      }
+      draftedCount++
+    } catch (e: any) {
+      warnings.push(
+        `Orphan reconcile for product '${product.handle}': update error — ${e?.message ?? String(e)}`
+      )
+    }
+  }
+
+  return { draftedCount }
+}
+
 // ---- Main Orchestrator ----
 
 export default async function gpConfigSyncCatalog({ container, args }: ExecArgs) {
@@ -1518,6 +1613,22 @@ export default async function gpConfigSyncCatalog({ container, args }: ExecArgs)
     collector
   )
 
+  const configuredFixtureIds = await collectConfiguredProductFixtureIds(
+    products,
+    marketConfigPath,
+    warnings
+  )
+  const { draftedCount: orphanDraftedCount } = await draftOrphanMarketProducts(
+    productModuleService,
+    configuredFixtureIds,
+    marketId,
+    warnings,
+    collector
+  )
+  if (orphanDraftedCount > 0) {
+    console.log(`Orphan reconcile: ${orphanDraftedCount} product(s) set to draft`)
+  }
+
   // Vendor status enforcement — draft products from non-active vendors
   const { draftedCount } = await enforceVendorStatusGate(
     productModuleService,
@@ -1541,6 +1652,7 @@ export default async function gpConfigSyncCatalog({ container, args }: ExecArgs)
     categories: categoryCounts,
     collections: collectionCounts,
     products: productCounts,
+    orphan_reconcile: { drafted: orphanDraftedCount },
     vendor_gate: { drafted: draftedCount },
     warnings,
     timestamp: new Date().toISOString(),

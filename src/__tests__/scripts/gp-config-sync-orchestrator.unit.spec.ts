@@ -15,6 +15,7 @@ describe("parseOrchestratorArgs", () => {
     delete process.env.GP_MARKET_ID
     delete process.env.GP_CONFIG_ROOT
     delete process.env.GP_DRY_RUN
+    delete process.env.GP_OVERWRITE
   })
 
   afterAll(() => {
@@ -38,6 +39,7 @@ describe("parseOrchestratorArgs", () => {
     process.env.GP_MARKET_ID = "bonbeauty"
     process.env.GP_CONFIG_ROOT = "/config"
     process.env.GP_DRY_RUN = "true"
+    process.env.GP_OVERWRITE = "true"
 
     const result = parseOrchestratorArgs(undefined)
 
@@ -45,6 +47,19 @@ describe("parseOrchestratorArgs", () => {
     expect(result.marketId).toBe("bonbeauty")
     expect(result.configRoot).toBe("/config")
     expect(result.dryRun).toBe(true)
+    expect(result.overwrite).toBe(true)
+  })
+
+  it("parses overwrite flag from args", () => {
+    const result = parseOrchestratorArgs(["gp-stage", "mercur", "--overwrite"])
+
+    expect(result).toEqual(
+      expect.objectContaining({
+        instanceId: "gp-stage",
+        marketId: "mercur",
+        overwrite: true,
+      })
+    )
   })
 })
 

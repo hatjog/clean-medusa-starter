@@ -8,6 +8,7 @@ import * as yaml from "js-yaml"
 
 import scryptKdf from "scrypt-kdf"
 
+import { parseDryRunFlag } from "./gp-sync-dry-run"
 import { GP_CORE_MODULE } from "../modules/gp-core"
 import GpCoreService from "../modules/gp-core/service"
 import { scopeCustomerEmail, mergeCustomerMarketMetadata } from "../lib/customer-scoped-email"
@@ -78,16 +79,22 @@ type SyncSummary = {
 function parseArgs(args: string[] | undefined): {
   instanceId: string
   configRoot: string
+  dryRun: boolean
 } {
   const instanceId = (args?.[0] ?? process.env.GP_INSTANCE_ID ?? "gp-dev").trim()
   const configRoot = (
     process.env.GP_CONFIG_ROOT ?? path.resolve(process.cwd(), "../config")
   ).trim()
+  const dryRun = parseDryRunFlag(args)
 
   if (!instanceId) throw new Error("instanceId is required (args[0] or GP_INSTANCE_ID)")
   if (!configRoot) throw new Error("configRoot is required (GP_CONFIG_ROOT)")
 
-  return { instanceId, configRoot }
+  return { instanceId, configRoot, dryRun }
+}
+
+function countGroupedAccounts<T extends { accounts?: unknown[] }>(groups: T[]): number {
+  return groups.reduce((sum, group) => sum + (Array.isArray(group.accounts) ? group.accounts.length : 0), 0)
 }
 
 async function readYamlFile<T>(filePath: string): Promise<T> {
@@ -516,7 +523,7 @@ async function syncCustomerAccounts(
 // ---- Main Orchestrator ----
 
 export default async function gpConfigSyncAccounts({ container, args }: ExecArgs) {
-  const { instanceId, configRoot } = parseArgs(args)
+  const { instanceId, configRoot, dryRun } = parseArgs(args)
   const accountsPath = path.resolve(configRoot, instanceId, "accounts.yaml")
 
   // Check file exists
@@ -535,6 +542,38 @@ export default async function gpConfigSyncAccounts({ container, args }: ExecArgs
     throw new Error(
       `instance_id mismatch in ${accountsPath}: expected '${instanceId}', got '${accounts.instance_id}'`
     )
+  }
+
+  if (dryRun) {
+    console.log(`INFO: dry-run enabled for accounts sync at ${accountsPath} — skipping account mutations.`)
+
+    const summary: SyncSummary = {
+      ok: true,
+      instance_id: instanceId,
+      config_root: configRoot,
+      accounts_path: accountsPath,
+      instance_accounts: {
+        created: 0,
+        skipped: accounts.instance_accounts?.length ?? 0,
+      },
+      market_accounts: {
+        created: 0,
+        skipped: countGroupedAccounts(accounts.market_accounts ?? []),
+      },
+      vendor_accounts: {
+        created: 0,
+        skipped: countGroupedAccounts(accounts.vendor_accounts ?? []),
+      },
+      customer_accounts: {
+        created: 0,
+        skipped: accounts.customer_accounts?.length ?? 0,
+      },
+      warnings: [],
+      timestamp: new Date().toISOString(),
+    }
+
+    console.log("\n" + JSON.stringify(summary, null, 2))
+    return
   }
 
   console.log(`Syncing accounts for instance '${instanceId}' (version ${accounts.version})...`)

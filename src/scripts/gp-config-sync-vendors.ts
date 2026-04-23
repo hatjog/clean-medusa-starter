@@ -6,7 +6,12 @@ import path from "node:path"
 
 import * as yaml from "js-yaml"
 
-import { computeFieldDiffs, DryRunCollector, parseDryRunFlag } from "./gp-sync-dry-run"
+import {
+  computeFieldDiffs,
+  DryRunCollector,
+  parseDryRunFlag,
+  parseOverwriteFlag,
+} from "./gp-sync-dry-run"
 
 // ---- Types ----
 
@@ -123,17 +128,19 @@ function parseArgs(args: string[] | undefined): {
   marketId: string
   configRoot: string
   dryRun: boolean
+  overwrite: boolean
 } {
   const instanceId = (args?.[0] ?? process.env.GP_INSTANCE_ID ?? "gp-dev").trim()
   const marketId = (args?.[1] ?? process.env.GP_MARKET_ID ?? "bonbeauty").trim()
   const configRoot = (process.env.GP_CONFIG_ROOT ?? path.resolve(process.cwd(), "../config")).trim()
   const dryRun = parseDryRunFlag(args)
+  const overwrite = parseOverwriteFlag(args)
 
   if (!instanceId) throw new Error("instanceId is required (args[0] or GP_INSTANCE_ID)")
   if (!marketId) throw new Error("marketId is required (args[1] or GP_MARKET_ID)")
   if (!configRoot) throw new Error("configRoot is required (GP_CONFIG_ROOT)")
 
-  return { instanceId, marketId, configRoot, dryRun }
+  return { instanceId, marketId, configRoot, dryRun, overwrite }
 }
 
 async function readYamlFile<T>(filePath: string): Promise<T> {
@@ -157,6 +164,51 @@ function resolveService(container: any, keysToTry: string[]): any {
   throw new Error(
     `Cannot resolve service. Tried keys: ${keysToTry.join(", ")}. Errors: ${errors.join(" | ")}`
   )
+}
+
+function readSellerMarketId(value: unknown): string | null {
+  if (!value || typeof value !== "object") {
+    return null
+  }
+
+  const marketId = (value as { metadata?: { gp?: { market_id?: unknown } } }).metadata?.gp?.market_id
+  return typeof marketId === "string" && marketId.trim() ? marketId.trim() : null
+}
+
+function selectSellerMatch(matches: any[], marketId: string): { match?: any; reason?: string } {
+  if (!Array.isArray(matches) || matches.length === 0) {
+    return {}
+  }
+
+  const exactMatches = matches.filter((match) => readSellerMarketId(match) === marketId)
+  if (exactMatches.length === 1) {
+    return { match: exactMatches[0] }
+  }
+
+  if (exactMatches.length > 1) {
+    return {
+      reason: `multiple sellers found for market '${marketId}' and handle collision prevents safe update`,
+    }
+  }
+
+  const untaggedMatches = matches.filter((match) => readSellerMarketId(match) === null)
+  if (untaggedMatches.length === 1) {
+    return { match: untaggedMatches[0] }
+  }
+
+  if (untaggedMatches.length > 1) {
+    return {
+      reason: "multiple untagged sellers found for the same handle; manual cleanup required",
+    }
+  }
+
+  const knownMarkets = [...new Set(matches.map((match) => readSellerMarketId(match)).filter(Boolean))]
+  return {
+    reason:
+      knownMarkets.length > 0
+        ? `cross-market guard — entity belongs to '${knownMarkets.join(", ")}'`
+        : "no eligible seller match found",
+  }
 }
 
 function resolveProductListFn(productModuleService: any): (filters: any) => Promise<any[]> {
@@ -367,10 +419,15 @@ function resolveSeedIfEmpty(
   fieldName: string,
   configValue: unknown,
   dbValue: unknown,
-  seededFields: string[]
+  seededFields: string[],
+  overwrite = false
 ): SeedIfEmptyResult {
   const isSeeded = seededFields.includes(fieldName)
   const dbEmpty = dbValue === null || dbValue === undefined || dbValue === ""
+
+  if (overwrite) {
+    return { value: configValue, shouldWrite: true, isNewSeed: !isSeeded }
+  }
 
   if (isSeeded) {
     // Case 1: field tracked AND current DB == config value → apply (config changed, vendor still on config)
@@ -399,7 +456,8 @@ export async function upsertSeller(
   sellerModuleService: any,
   vendor: VendorFixture,
   dryRun: boolean,
-  marketId: string
+  marketId: string,
+  overwrite = false
 ): Promise<SellerSyncResult> {
   const handle = vendor.slug.trim()
 
@@ -411,8 +469,12 @@ export async function upsertSeller(
     existingSellers = (await sellerModuleService.listSellers({ handle })) ?? []
   }
 
-  const existingSeller = existingSellers[0] ?? null
+  const { match: existingSeller, reason: matchReason } = selectSellerMatch(existingSellers, marketId)
   const storeStatus = vendorStatusToStoreStatus(vendor.status)
+
+  if (matchReason) {
+    return { sellerId: null, action: "skipped", note: matchReason }
+  }
 
   if (!existingSeller) {
     // ---- CREATE: fresh vendor ----
@@ -492,7 +554,13 @@ export async function upsertSeller(
 
   // name
   if (vendor.display_name !== undefined) {
-    const r = resolveSeedIfEmpty("name", vendor.display_name, existingGp.name ?? existingSeller.name, seededFields)
+    const r = resolveSeedIfEmpty(
+      "name",
+      vendor.display_name,
+      existingGp.name ?? existingSeller.name,
+      seededFields,
+      overwrite
+    )
     if (r.shouldWrite) {
       gpMetaUpdate.name = r.value
       if (r.isNewSeed) newlySeededFields.push("name")
@@ -501,7 +569,13 @@ export async function upsertSeller(
 
   // description
   if (vendor.description !== undefined) {
-    const r = resolveSeedIfEmpty("description", vendor.description, existingGp.description ?? existingSeller.description, seededFields)
+    const r = resolveSeedIfEmpty(
+      "description",
+      vendor.description,
+      existingGp.description ?? existingSeller.description,
+      seededFields,
+      overwrite
+    )
     if (r.shouldWrite) {
       gpMetaUpdate.description = r.value
       if (r.isNewSeed) newlySeededFields.push("description")
@@ -510,7 +584,13 @@ export async function upsertSeller(
 
   // photo_url
   if (vendor.photo_url !== undefined) {
-    const r = resolveSeedIfEmpty("photo_url", vendor.photo_url, existingGp.photo_url, seededFields)
+    const r = resolveSeedIfEmpty(
+      "photo_url",
+      vendor.photo_url,
+      existingGp.photo_url,
+      seededFields,
+      overwrite
+    )
     if (r.shouldWrite) {
       gpMetaUpdate.photo_url = r.value
       if (r.isNewSeed) newlySeededFields.push("photo_url")
@@ -519,7 +599,13 @@ export async function upsertSeller(
 
   // gallery
   if (vendor.gallery_urls !== undefined) {
-    const r = resolveSeedIfEmpty("gallery", vendor.gallery_urls, existingGp.gallery, seededFields)
+    const r = resolveSeedIfEmpty(
+      "gallery",
+      vendor.gallery_urls,
+      existingGp.gallery,
+      seededFields,
+      overwrite
+    )
     if (r.shouldWrite) {
       gpMetaUpdate.gallery = r.value
       if (r.isNewSeed) newlySeededFields.push("gallery")
@@ -578,7 +664,7 @@ export async function upsertSeller(
 // ---- Default export: Medusa script entrypoint ----
 
 export default async function gpConfigSyncVendors({ container, args }: ExecArgs) {
-  const { instanceId, marketId, configRoot, dryRun } = parseArgs(args)
+  const { instanceId, marketId, configRoot, dryRun, overwrite } = parseArgs(args)
   const collector = dryRun ? new DryRunCollector() : undefined
 
   const marketYamlPath = path.resolve(
@@ -672,7 +758,7 @@ export default async function gpConfigSyncVendors({ container, args }: ExecArgs)
     }
 
     try {
-      const result = await upsertSeller(sellerModuleService, vendor, dryRun, marketId)
+      const result = await upsertSeller(sellerModuleService, vendor, dryRun, marketId, overwrite)
 
       if (result.action === "created") vendorCounts.created++
       else if (result.action === "updated") vendorCounts.updated++

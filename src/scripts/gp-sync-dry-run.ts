@@ -13,6 +13,13 @@ export type FieldDiff = {
   incoming: string
 }
 
+function parseCliBooleanFlag(args: string[] | undefined, flag: string, envVar: string): boolean {
+  if (args?.includes(flag)) return true
+
+  const envValue = (process.env[envVar] ?? "").trim().toLowerCase()
+  return envValue === "true" || envValue === "1" || envValue === "yes" || envValue === "on"
+}
+
 const HTML_ENTITY_MAP: Record<string, string> = {
   amp: "&",
   lt: "<",
@@ -92,10 +99,11 @@ export function computeFieldDiffs(
 }
 
 export function parseDryRunFlag(args?: string[]): boolean {
-  if (args?.includes("--dry-run")) return true
+  return parseCliBooleanFlag(args, "--dry-run", "GP_DRY_RUN")
+}
 
-  const envValue = (process.env.GP_DRY_RUN ?? "").trim().toLowerCase()
-  return envValue === "true" || envValue === "1" || envValue === "yes" || envValue === "on"
+export function parseOverwriteFlag(args?: string[]): boolean {
+  return parseCliBooleanFlag(args, "--overwrite", "GP_OVERWRITE")
 }
 
 export class DryRunCollector {

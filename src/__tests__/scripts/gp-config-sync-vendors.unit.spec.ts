@@ -37,6 +37,75 @@ describe('upsertSeller dry-run', () => {
     expect(result.note).not.toContain('description:')
     expect(sellerModuleService.update).not.toHaveBeenCalled()
   })
+
+  it('forces config-owned overwrite for seeded fields when overwrite=true', async () => {
+    const sellerModuleService = {
+      list: jest.fn().mockResolvedValue([
+        {
+          id: 'seller-1',
+          handle: 'city-beauty',
+          name: 'City Beauty',
+          metadata: {
+            gp: {
+              market_id: 'bonbeauty',
+              seeded_fields: ['description'],
+              description: 'Vendor custom description',
+            },
+          },
+        },
+      ]),
+      update: jest.fn(),
+    }
+
+    const result = await upsertSeller(
+      sellerModuleService,
+      {
+        vendor_id: 'city-beauty',
+        slug: 'city-beauty',
+        description: 'Canonical config description',
+      },
+      true,
+      'bonbeauty',
+      true
+    )
+
+    expect(result.action).toBe('updated')
+    expect(result.note).toContain('description: Vendor custom description -> Canonical config description')
+    expect(sellerModuleService.update).not.toHaveBeenCalled()
+  })
+
+  it('skips seller update when the existing handle belongs to another market', async () => {
+    const sellerModuleService = {
+      list: jest.fn().mockResolvedValue([
+        {
+          id: 'seller-foreign',
+          handle: 'city-beauty',
+          metadata: {
+            gp: {
+              market_id: 'mercur',
+            },
+          },
+        },
+      ]),
+      update: jest.fn(),
+    }
+
+    const result = await upsertSeller(
+      sellerModuleService,
+      {
+        vendor_id: 'city-beauty',
+        slug: 'city-beauty',
+        description: 'Canonical config description',
+      },
+      true,
+      'bonbeauty',
+      true
+    )
+
+    expect(result.action).toBe('skipped')
+    expect(result.note).toContain("cross-market guard")
+    expect(sellerModuleService.update).not.toHaveBeenCalled()
+  })
 })
 
 describe('resolveProductByFixture', () => {

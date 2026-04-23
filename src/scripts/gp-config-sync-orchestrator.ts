@@ -7,8 +7,11 @@ import path from "node:path"
 
 import * as yaml from "js-yaml"
 
+import { parseDryRunFlag, parseOverwriteFlag } from "./gp-sync-dry-run"
+import gpConfigSyncAccounts from "./gp-config-sync-accounts"
 import gpConfigSyncBlog from "./gp-config-sync-blog"
 import gpConfigSyncCatalog from "./gp-config-sync-catalog"
+import gpConfigSyncMedia from "./gp-config-sync-media"
 import gpConfigSyncPayments from "./gp-config-sync-payments"
 import gpConfigSyncShipping from "./gp-config-sync-shipping"
 import gpConfigSyncVendors from "./gp-config-sync-vendors"
@@ -21,6 +24,7 @@ type OrchestratorArgs = {
   marketId: string
   configRoot: string
   dryRun: boolean
+  overwrite: boolean
 }
 
 type StageRunResult = {
@@ -60,6 +64,7 @@ type OrchestratorSummary = {
   instance_id: string
   market_id: string
   dry_run: boolean
+  overwrite: boolean
   stages: StageRunResult[]
   health: HealthReport
   changed_entity_ids: string[]
@@ -84,14 +89,14 @@ export function parseOrchestratorArgs(args: string[] | undefined): OrchestratorA
   const configRoot = (
     process.env.GP_CONFIG_ROOT ?? path.resolve(process.cwd(), "../config")
   ).trim()
-  const dryRun =
-    args?.includes("--dry-run") === true || process.env.GP_DRY_RUN === "true"
+  const dryRun = parseDryRunFlag(args)
+  const overwrite = parseOverwriteFlag(args)
 
   if (!instanceId) throw new Error("instanceId is required (args[0] or GP_INSTANCE_ID)")
   if (!marketId) throw new Error("marketId is required (args[1] or GP_MARKET_ID)")
   if (!configRoot) throw new Error("configRoot is required (GP_CONFIG_ROOT)")
 
-  return { instanceId, marketId, configRoot, dryRun }
+  return { instanceId, marketId, configRoot, dryRun, overwrite }
 }
 
 function resolveProductModuleService(container: any): any {
@@ -261,6 +266,9 @@ function buildStageArgs(orchestratorArgs: OrchestratorArgs): string[] {
   if (orchestratorArgs.dryRun) {
     args.push("--dry-run")
   }
+  if (orchestratorArgs.overwrite) {
+    args.push("--overwrite")
+  }
   return args
 }
 
@@ -273,12 +281,14 @@ async function withStageEnv<T>(
     GP_DRY_RUN: process.env.GP_DRY_RUN,
     GP_INSTANCE_ID: process.env.GP_INSTANCE_ID,
     GP_MARKET_ID: process.env.GP_MARKET_ID,
+    GP_OVERWRITE: process.env.GP_OVERWRITE,
   }
 
   process.env.GP_CONFIG_ROOT = orchestratorArgs.configRoot
   process.env.GP_DRY_RUN = orchestratorArgs.dryRun ? "true" : "false"
   process.env.GP_INSTANCE_ID = orchestratorArgs.instanceId
   process.env.GP_MARKET_ID = orchestratorArgs.marketId
+  process.env.GP_OVERWRITE = orchestratorArgs.overwrite ? "true" : "false"
 
   try {
     return await action()
@@ -294,6 +304,9 @@ async function withStageEnv<T>(
 
     if (previous.GP_MARKET_ID === undefined) delete process.env.GP_MARKET_ID
     else process.env.GP_MARKET_ID = previous.GP_MARKET_ID
+
+    if (previous.GP_OVERWRITE === undefined) delete process.env.GP_OVERWRITE
+    else process.env.GP_OVERWRITE = previous.GP_OVERWRITE
   }
 }
 
@@ -538,6 +551,16 @@ export default async function gpConfigSyncOrchestrator({ container, args }: Exec
         },
       },
       {
+        name: "sync-media",
+        required: true,
+        execute: async () => {
+          await withStageEnv(orchestratorArgs, async () => {
+            await invokeStageEntrypoint(gpConfigSyncMedia, container, stageArgs)
+          })
+          return orchestratorArgs.dryRun ? "media dry-run completed" : "media sync completed"
+        },
+      },
+      {
         name: "sync-vendors",
         required: true,
         execute: async () => {
@@ -545,6 +568,16 @@ export default async function gpConfigSyncOrchestrator({ container, args }: Exec
             await invokeStageEntrypoint(gpConfigSyncVendors, container, stageArgs)
           })
           return orchestratorArgs.dryRun ? "vendor dry-run completed" : "vendor sync completed"
+        },
+      },
+      {
+        name: "sync-accounts",
+        required: true,
+        execute: async () => {
+          await withStageEnv(orchestratorArgs, async () => {
+            await invokeStageEntrypoint(gpConfigSyncAccounts, container, stageArgs)
+          })
+          return orchestratorArgs.dryRun ? "accounts dry-run completed" : "accounts sync completed"
         },
       },
       {
@@ -639,6 +672,7 @@ export default async function gpConfigSyncOrchestrator({ container, args }: Exec
       instance_id: orchestratorArgs.instanceId,
       market_id: orchestratorArgs.marketId,
       dry_run: orchestratorArgs.dryRun,
+      overwrite: orchestratorArgs.overwrite,
       stages,
       health,
       changed_entity_ids: changedEntityIds,

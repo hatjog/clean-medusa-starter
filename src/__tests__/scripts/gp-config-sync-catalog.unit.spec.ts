@@ -23,6 +23,7 @@ import {
   evaluateQualityGate,
   isPlaceholderUrl,
   enforceVendorStatusGate,
+  draftOrphanMarketProducts,
   buildVendorPricingMap,
 } from "../../scripts/gp-config-sync-catalog"
 import { DryRunCollector } from "../../scripts/gp-sync-dry-run"
@@ -236,6 +237,92 @@ describe("validatePrerequisites", () => {
     const warnings: string[] = []
     await expect(validatePrerequisites(container, "bonbeauty", "PLN", warnings)).rejects.toThrow(
       /No shipping profile/i
+    )
+  })
+})
+
+// ---------------------------------------------------------------------------
+// draftOrphanMarketProducts
+// ---------------------------------------------------------------------------
+
+describe("draftOrphanMarketProducts", () => {
+  it("drafts only market-scoped products missing from configured fixture ids", async () => {
+    const svc = makeProductModuleService({
+      listProducts: jest.fn().mockResolvedValue([
+        {
+          id: "prod-keep",
+          handle: "keep-me",
+          status: "published",
+          metadata: { gp: { market_id: "bonbeauty", fixture_id: "prod-001" } },
+        },
+        {
+          id: "prod-orphan",
+          handle: "orphan-me",
+          status: "published",
+          metadata: { gp: { market_id: "bonbeauty", fixture_id: "prod-999" } },
+        },
+        {
+          id: "prod-other-market",
+          handle: "other-market",
+          status: "published",
+          metadata: { gp: { market_id: "mercur", fixture_id: "prod-999" } },
+        },
+        {
+          id: "prod-already-draft",
+          handle: "already-draft",
+          status: "draft",
+          metadata: { gp: { market_id: "bonbeauty", fixture_id: "prod-998" } },
+        },
+      ]),
+    })
+    const warnings: string[] = []
+
+    const result = await draftOrphanMarketProducts(
+      svc,
+      new Set(["prod-001"]),
+      "bonbeauty",
+      warnings
+    )
+
+    expect(result).toEqual({ draftedCount: 1 })
+    expect(svc.updateProducts).toHaveBeenCalledTimes(1)
+    expect(svc.updateProducts).toHaveBeenCalledWith("prod-orphan", { status: "draft" })
+    expect(warnings).toHaveLength(0)
+  })
+
+  it("records dry-run draft operations without touching the DB", async () => {
+    const svc = makeProductModuleService({
+      listProducts: jest.fn().mockResolvedValue([
+        {
+          id: "prod-orphan",
+          handle: "orphan-me",
+          status: "published",
+          metadata: { gp: { market_id: "bonbeauty", fixture_id: "prod-999" } },
+        },
+      ]),
+    })
+    const warnings: string[] = []
+    const collector = new DryRunCollector()
+
+    const result = await draftOrphanMarketProducts(
+      svc,
+      new Set(["prod-001"]),
+      "bonbeauty",
+      warnings,
+      collector
+    )
+
+    expect(result).toEqual({ draftedCount: 1 })
+    expect(svc.updateProducts).not.toHaveBeenCalled()
+    expect(collector.getEntries()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          entityType: "product",
+          handle: "orphan-me",
+          action: "update",
+          note: "status=draft (missing from gp-config)",
+        }),
+      ])
     )
   })
 })
@@ -521,7 +608,11 @@ describe("syncCollections", () => {
 
 describe("syncProducts", () => {
   const prereqs = { salesChannelId: "sc-bonbeauty", shippingProfileId: "sp-default" }
-  const emptyMaps = { categoryMap: new Map<string, string>(), collectionMap: new Map<string, string>() }
+  const emptyMaps = {
+    categoryMap: new Map<string, string>(),
+    collectionMap: new Map<string, string>(),
+    tagIdMap: new Map<string, string>(),
+  }
 
   function makeContainer2() {
     return {
@@ -540,6 +631,7 @@ describe("syncProducts", () => {
       prereqs,
       emptyMaps.categoryMap,
       emptyMaps.collectionMap,
+      emptyMaps.tagIdMap,
       "bonbeauty",
       warnings
     )
@@ -559,6 +651,7 @@ describe("syncProducts", () => {
       prereqs,
       emptyMaps.categoryMap,
       emptyMaps.collectionMap,
+      emptyMaps.tagIdMap,
       "bonbeauty",
       warnings
     )
@@ -578,6 +671,7 @@ describe("syncProducts", () => {
       prereqs,
       emptyMaps.categoryMap,
       emptyMaps.collectionMap,
+      emptyMaps.tagIdMap,
       "bonbeauty",
       warnings
     )
@@ -601,6 +695,7 @@ describe("syncProducts", () => {
       prereqs,
       emptyMaps.categoryMap,
       emptyMaps.collectionMap,
+      emptyMaps.tagIdMap,
       "mercur", // different market
       warnings
     )
@@ -620,6 +715,7 @@ describe("syncProducts", () => {
       prereqs,
       emptyMaps.categoryMap, // empty map — category unresolved
       emptyMaps.collectionMap,
+      emptyMaps.tagIdMap,
       "bonbeauty",
       warnings
     )
@@ -648,6 +744,7 @@ describe("syncProducts", () => {
       prereqs,
       emptyMaps.categoryMap,
       emptyMaps.collectionMap,
+      emptyMaps.tagIdMap,
       "bonbeauty",
       warnings
     )
@@ -678,6 +775,7 @@ describe("syncProducts", () => {
       prereqs,
       emptyMaps.categoryMap,
       emptyMaps.collectionMap,
+      emptyMaps.tagIdMap,
       "bonbeauty",
       warnings
     )
@@ -717,6 +815,7 @@ describe("syncProducts", () => {
       prereqs,
       emptyMaps.categoryMap,
       emptyMaps.collectionMap,
+      emptyMaps.tagIdMap,
       "bonbeauty",
       warnings
     )
@@ -754,6 +853,7 @@ describe("syncProducts", () => {
       prereqs,
       emptyMaps.categoryMap,
       emptyMaps.collectionMap,
+      emptyMaps.tagIdMap,
       "bonbeauty",
       warnings
     )
@@ -789,6 +889,7 @@ describe("syncProducts", () => {
       prereqs,
       emptyMaps.categoryMap,
       emptyMaps.collectionMap,
+      emptyMaps.tagIdMap,
       "bonbeauty",
       warnings
     )
@@ -821,6 +922,7 @@ describe("syncProducts", () => {
       prereqs,
       emptyMaps.categoryMap,
       emptyMaps.collectionMap,
+      emptyMaps.tagIdMap,
       "bonbeauty",
       warnings,
       undefined,
