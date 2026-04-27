@@ -1,0 +1,49 @@
+{
+  "schema_version": "2",
+  "event_type": "gp.commerce.order_placed.v2",
+  "event_id": "01J_FIX_V2_001",
+  "occurred_at": "2026-04-26T10:15:42Z",
+  "actor": "end_customer",
+  "scope": {
+    "instance_id": "gp-prod",
+    "market_id": "bonbeauty-pl",
+    "vendor_id": null,
+    "location_id": null
+  },
+  "idempotency_key": "order:v2-fixture-001",
+  "payload": {
+    "order_id": "v2-fixture-001",
+    "currency": "PLN",
+    "total_amount_minor": 35000,
+    "placed_at": "2026-04-26T10:15:40Z",
+    "line_items": [
+      {
+        "line_item_id": "li_001",
+        "offer_id": "offer_voucher_spa_day",
+        "offer_version": "1.4.0",
+        "voucher_kind": "MPV",
+        "pricing_snapshot": {
+          "currency": "PLN",
+          "unit_amount_minor": 35000,
+          "quantity": 1,
+          "total_amount_minor": 35000
+        }
+      }
+    ],
+    "mor": {
+      "sale_mor": "operator",
+      "service_mor": "vendor",
+      "mor_policy_version": "1.0.0",
+      "voucher_kind": "MPV",
+      "breakage_policy_snapshot": {
+        "policy_id": "breakage.bonbeauty-pl.operator_full",
+        "policy_version": "0.1.0",
+        "recognition_mode": "operator_full",
+        "expiry_grace_days": 30
+      }
+    },
+    "recipient_locale": "pl-PL",
+    "message_locale": null,
+    "is_gift": true
+  }
+}

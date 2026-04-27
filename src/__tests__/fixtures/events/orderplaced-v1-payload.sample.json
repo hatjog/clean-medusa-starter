@@ -1,0 +1,31 @@
+{
+  "schema_version": "1",
+  "event_type": "gp.commerce.order_placed.v1",
+  "event_id": "01J_FIX_V1_001",
+  "occurred_at": "2026-04-01T09:00:00Z",
+  "actor": "end_customer",
+  "scope": {
+    "instance_id": "gp-prod",
+    "market_id": "bonbeauty-pl"
+  },
+  "idempotency_key": "order:v1-fixture-001",
+  "payload": {
+    "order_id": "v1-fixture-001",
+    "currency": "PLN",
+    "total_amount_minor": 19900,
+    "placed_at": "2026-04-01T08:59:55Z",
+    "line_items": [
+      {
+        "line_item_id": "li_001",
+        "offer_id": "offer_voucher_manicure_classic",
+        "offer_version": "1.0.0",
+        "pricing_snapshot": {
+          "currency": "PLN",
+          "unit_amount_minor": 19900,
+          "quantity": 1,
+          "total_amount_minor": 19900
+        }
+      }
+    ]
+  }
+}
