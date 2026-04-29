@@ -19,3 +19,16 @@ export type {
 } from "./types"
 export { MorEvaluationError } from "./types"
 export { StubMorPolicyEvaluator } from "./stub"
+
+// D-69 / ADR-074 — tri-state flag resolver runtime (v1.5.0).
+// `MorFlagResolver` is server-only; runtime callers MUST resolve via Medusa container
+// DI (see PAT-5 Hexagonal-light) — direct construction is reserved for tests + per-port
+// adapters in `src/api/admin/sellers/[id]/pause/route.ts`.
+export type {
+  FlagFlagsPort,
+  MorFlagPrecedence,
+  MorFlagResolution,
+  MorFlagStatus,
+  SellerStatusPort,
+} from "./MorFlagResolver"
+export { MorFlagResolver } from "./MorFlagResolver"
