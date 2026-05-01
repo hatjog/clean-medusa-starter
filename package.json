@@ -31,26 +31,34 @@
     "test:unit": "TEST_TYPE=unit NODE_OPTIONS=--experimental-vm-modules jest --silent --runInBand --forceExit"
   },
   "dependencies": {
-    "@medusajs/admin-sdk": "2.11.3",
-    "@medusajs/cli": "2.11.3",
-    "@medusajs/framework": "2.11.3",
-    "@medusajs/icons": "2.11.3",
-    "@medusajs/medusa": "2.11.3",
+    "@medusajs/admin-sdk": "^2.13.0",
+    "@medusajs/cli": "^2.13.0",
+    "@medusajs/framework": "^2.13.0",
+    "@medusajs/icons": "^2.13.0",
+    "@medusajs/medusa": "^2.13.0",
     "@medusajs/ui": "4.0.25",
+    "@mercurjs/admin": "2.1.1",
     "@mercurjs/b2c-core": "^1.5.3",
+    "@mercurjs/cli": "2.1.1",
+    "@mercurjs/client": "2.1.1",
     "@mercurjs/commission": "^1.5.3",
+    "@mercurjs/core": "2.1.1",
+    "@mercurjs/dashboard-sdk": "2.1.1",
+    "@mercurjs/dashboard-shared": "2.1.1",
     "@mercurjs/framework": "^1.5.3",
     "@mercurjs/requests": "^1.5.3",
     "@mercurjs/resend": "^1.5.3",
     "@mercurjs/reviews": "^1.5.3",
+    "@mercurjs/types": "2.1.1",
+    "@mercurjs/vendor": "2.1.1",
+    "@sentry/node": "^9.0.0",
     "awilix": "^8.0.1",
     "posthog-node": "^5.11.0",
     "resend": "^4.1.2",
-    "@sentry/node": "^9.0.0",
     "zod": "^3.25.76"
   },
   "devDependencies": {
-    "@medusajs/test-utils": "2.11.3",
+    "@medusajs/test-utils": "^2.13.0",
     "@swc/core": "1.5.7",
     "@swc/jest": "^0.2.36",
     "@types/jest": "^29.5.13",
@@ -67,7 +75,7 @@
     "yalc": "^1.0.0-pre.53"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22.17.0"
   },
   "packageManager": "yarn@1.22.22+sha512.a6b2f7906b721bba3d67d4aff083df04dad64c399707841b7acf00f6b133b7ac24255f2652fa22ae3534329dc6180534e98d17432037ff6fd140556e2bb3137e"
 }
