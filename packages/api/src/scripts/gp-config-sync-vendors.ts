@@ -1,3 +1,12 @@
+/**
+ * gp-config-sync-vendors.ts — vendor sync from gp-config to backend (v1.5.0).
+ *
+ * TODO Story v160-1-7.1 (post-1.8 smoke verification): DROP custom PAT-17 —
+ * `vendorStatusToStoreStatus()` mapping currently bridges custom 3-status model
+ * (active/paused/archived) to store status. Replace with native Mercur 2 seller
+ * status (pending_approval/open/suspended/terminated) per ADR-090 §PAT-17.
+ * Deferred until story v160-1-8 confirms native status enum at runtime.
+ */
 import { ExecArgs } from "@medusajs/framework/types"
 import { ContainerRegistrationKeys } from "@medusajs/framework/utils"
 

@@ -1,0 +1,8 @@
+# GP/backend sub-monorepo workspace (story v160-1-4).
+# Per Mercur 2.1.1 monorepo convention: backend app lives in packages/api/.
+# Currently the workspace root (this dir) carries name "@gp/api" with all
+# Medusa deps and serves as the runnable package; "packages/*" glob is
+# reserved for future sub-package extraction (e.g. shared types, vendor SDK
+# splits) without forcing immediate over-decomposition.
+packages:
+  - "packages/*"
