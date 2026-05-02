@@ -1,0 +1,73 @@
+diff --git a/.medusa/server/src/api/store/products/middlewares.js b/.medusa/server/src/api/store/products/middlewares.js
+index 16832022edcf42233f25a1a49251775a359d8d28..bac2c1d376f7ef22c6ce33bd32a9250f90b221f4 100644
+--- a/.medusa/server/src/api/store/products/middlewares.js
++++ b/.medusa/server/src/api/store/products/middlewares.js
+@@ -2,20 +2,53 @@
+ Object.defineProperty(exports, "__esModule", { value: true });
+ exports.storeProductsMiddlewares = void 0;
+ const types_1 = require("@mercurjs/types");
++const utils_1 = require("@medusajs/framework/utils");
+ /**
+  * Restrict storefront product listings and detail lookups to products
+  * belonging to sellers that are currently OPEN and not within an active
+- * time-off window. Applied after Medusa's built-in validators so the
+- * generated filterableFields are already populated.
++ * time-off window.
++ *
++ * GP v1.6.0 patch (Story 1.7.1 Layer B — Mercur 2.1.1 upstream bug):
++ * Original middleware injected `filterableFields.seller.status` directly,
++ * which Medusa core's product GET handler passes to `query.graph` →
++ * MikroORM `findAndCount` → CriteriaNode crash because `Product.seller` is
++ * a module link (cross-module pivot table), NOT a direct ORM relation.
++ *
++ * Fix: pre-fetch open seller IDs through `query.graph` (which handles the
++ * link traversal correctly), then filter products by the linked
++ * `seller.id $in [...]` — a format the link layer can resolve.
+  */
+-function applySellerVisibilityFilter(req, _res, next) {
+-    const now = new Date();
+-    const filterableFields = (req.filterableFields ??= {});
+-    const sellerFilter = (filterableFields.seller ??= {});
+-    sellerFilter.status = types_1.SellerStatus.OPEN;
+-    const sellerAnd = (sellerFilter.$and ??= []);
+-    sellerAnd.push({ $or: [{ closed_from: null }, { closed_from: { $gt: now } }] }, { $or: [{ closed_to: null }, { closed_to: { $lt: now } }] });
+-    next();
++async function applySellerVisibilityFilter(req, _res, next) {
++    try {
++        const now = new Date();
++        const query = req.scope.resolve(utils_1.ContainerRegistrationKeys.QUERY);
++        const { data: openSellers } = await query.graph({
++            entity: "seller",
++            fields: ["id"],
++            filters: {
++                status: types_1.SellerStatus.OPEN,
++                $and: [
++                    { $or: [{ closed_from: null }, { closed_from: { $gt: now } }] },
++                    { $or: [{ closed_to: null }, { closed_to: { $lt: now } }] },
++                ],
++            },
++            pagination: { take: null, skip: 0 },
++        });
++        const openSellerIds = openSellers.map((s) => s.id);
++        const filterableFields = (req.filterableFields ??= {});
++        if (openSellerIds.length === 0) {
++            // No open sellers → guarantee empty product list without hitting
++            // MikroORM with an unsatisfiable seller relation filter.
++            filterableFields.id = { $in: ["__no_open_sellers__"] };
++        }
++        else {
++            filterableFields.seller_id = { $in: openSellerIds };
++        }
++        next();
++    }
++    catch (err) {
++        next(err);
++    }
+ }
+ exports.storeProductsMiddlewares = [
+     {
+@@ -29,4 +62,3 @@ exports.storeProductsMiddlewares = [
+         middlewares: [applySellerVisibilityFilter],
+     },
+ ];
+-//# sourceMappingURL=data:application/json;base64,eyJ2ZXJzaW9uIjozLCJmaWxlIjoibWlkZGxld2FyZXMuanMiLCJzb3VyY2VSb290IjoiIiwic291cmNlcyI6WyIuLi8uLi8uLi8uLi8uLi8uLi9zcmMvYXBpL3N0b3JlL3Byb2R1Y3RzL21pZGRsZXdhcmVzLnRzIl0sIm5hbWVzIjpbXSwibWFwcGluZ3MiOiI7OztBQU1BLDJDQUE4QztBQUU5Qzs7Ozs7R0FLRztBQUNILFNBQVMsMkJBQTJCLENBQ2xDLEdBQWtCLEVBQ2xCLElBQW9CLEVBQ3BCLElBQXdCO0lBRXhCLE1BQU0sR0FBRyxHQUFHLElBQUksSUFBSSxFQUFFLENBQUE7SUFFdEIsTUFBTSxnQkFBZ0IsR0FBRyxDQUFDLEdBQUcsQ0FBQyxnQkFBZ0IsS0FBSyxFQUdsRCxDQUFDLENBQUE7SUFFRixNQUFNLFlBQVksR0FBRyxDQUFDLGdCQUFnQixDQUFDLE1BQU0sS0FBSyxFQUFFLENBQXdCLENBQUE7SUFDNUUsWUFBWSxDQUFDLE1BQU0sR0FBRyxvQkFBWSxDQUFDLElBQUksQ0FBQTtJQUV2QyxNQUFNLFNBQVMsR0FBRyxDQUFDLFlBQVksQ0FBQyxJQUFJLEtBQUssRUFBRSxDQUFVLENBQUE7SUFDckQsU0FBUyxDQUFDLElBQUksQ0FDWixFQUFFLEdBQUcsRUFBRSxDQUFDLEVBQUUsV0FBVyxFQUFFLElBQUksRUFBRSxFQUFFLEVBQUUsV0FBVyxFQUFFLEVBQUUsR0FBRyxFQUFFLEdBQUcsRUFBRSxFQUFFLENBQUMsRUFBRSxFQUMvRCxFQUFFLEdBQUcsRUFBRSxDQUFDLEVBQUUsU0FBUyxFQUFFLElBQUksRUFBRSxFQUFFLEVBQUUsU0FBUyxFQUFFLEVBQUUsR0FBRyxFQUFFLEdBQUcsRUFBRSxFQUFFLENBQUMsRUFBRSxDQUM1RCxDQUFBO0lBRUQsSUFBSSxFQUFFLENBQUE7QUFDUixDQUFDO0FBRVksUUFBQSx3QkFBd0IsR0FBc0I7SUFDekQ7UUFDRSxNQUFNLEVBQUUsQ0FBQyxLQUFLLENBQUM7UUFDZixPQUFPLEVBQUUsaUJBQWlCO1FBQzFCLFdBQVcsRUFBRSxDQUFDLDJCQUEyQixDQUFDO0tBQzNDO0lBQ0Q7UUFDRSxNQUFNLEVBQUUsQ0FBQyxLQUFLLENBQUM7UUFDZixPQUFPLEVBQUUscUJBQXFCO1FBQzlCLFdBQVcsRUFBRSxDQUFDLDJCQUEyQixDQUFDO0tBQzNDO0NBQ0YsQ0FBQSJ9

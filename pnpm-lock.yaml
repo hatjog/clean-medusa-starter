@@ -4,6 +4,11 @@ settings:
   autoInstallPeers: true
   excludeLinksFromLockfile: false
 
+patchedDependencies:
+  '@mercurjs/core@2.1.1':
+    hash: 9db8484ff8378117224e7c36465571dcdd01521cce6860b92b08b7a1c313c499
+    path: patches/@mercurjs__core@2.1.1.patch
+
 importers:
 
   .:
@@ -31,7 +36,7 @@ importers:
         version: 2.1.1(@medusajs/cli@2.13.6(@types/node@22.19.17))(@types/node@22.19.17)(@types/react-dom@18.3.7(@types/react@18.3.28))(@types/react@18.3.28)(esbuild@0.21.5)(ioredis@5.10.1)(picomatch@4.0.4)
       '@mercurjs/core':
         specifier: 2.1.1
-        version: 2.1.1(@medusajs/admin-sdk@2.13.6)(@medusajs/cli@2.13.6(@types/node@22.19.17))(@medusajs/framework@2.13.6(@medusajs/cli@2.13.6(@types/node@22.19.17))(@types/node@22.19.17)(ioredis@5.10.1)(vite@5.4.21(@types/node@22.19.17))(zod@3.25.76))(@medusajs/icons@2.13.6(react@18.3.1))(@medusajs/medusa@2.13.6)(@medusajs/test-utils@2.13.6)(express@4.22.1)
+        version: 2.1.1(patch_hash=9db8484ff8378117224e7c36465571dcdd01521cce6860b92b08b7a1c313c499)(@medusajs/admin-sdk@2.13.6)(@medusajs/cli@2.13.6(@types/node@22.19.17))(@medusajs/framework@2.13.6(@medusajs/cli@2.13.6(@types/node@22.19.17))(@types/node@22.19.17)(ioredis@5.10.1)(vite@5.4.21(@types/node@22.19.17))(zod@3.25.76))(@medusajs/icons@2.13.6(react@18.3.1))(@medusajs/medusa@2.13.6)(@medusajs/test-utils@2.13.6)(express@4.22.1)
       '@mercurjs/types':
         specifier: 2.1.1
         version: 2.1.1(ioredis@5.10.1)(vite@5.4.21(@types/node@22.19.17))
@@ -9560,7 +9565,7 @@ snapshots:
       - tsx
       - yaml
 
-  '@mercurjs/core@2.1.1(@medusajs/admin-sdk@2.13.6)(@medusajs/cli@2.13.6(@types/node@22.19.17))(@medusajs/framework@2.13.6(@medusajs/cli@2.13.6(@types/node@22.19.17))(@types/node@22.19.17)(ioredis@5.10.1)(vite@5.4.21(@types/node@22.19.17))(zod@3.25.76))(@medusajs/icons@2.13.6(react@18.3.1))(@medusajs/medusa@2.13.6)(@medusajs/test-utils@2.13.6)(express@4.22.1)':
+  '@mercurjs/core@2.1.1(patch_hash=9db8484ff8378117224e7c36465571dcdd01521cce6860b92b08b7a1c313c499)(@medusajs/admin-sdk@2.13.6)(@medusajs/cli@2.13.6(@types/node@22.19.17))(@medusajs/framework@2.13.6(@medusajs/cli@2.13.6(@types/node@22.19.17))(@types/node@22.19.17)(ioredis@5.10.1)(vite@5.4.21(@types/node@22.19.17))(zod@3.25.76))(@medusajs/icons@2.13.6(react@18.3.1))(@medusajs/medusa@2.13.6)(@medusajs/test-utils@2.13.6)(express@4.22.1)':
     dependencies:
       '@medusajs/admin-sdk': 2.13.6
       '@medusajs/cli': 2.13.6(@types/node@22.19.17)
