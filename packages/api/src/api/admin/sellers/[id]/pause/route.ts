@@ -1,6 +1,14 @@
 /**
  * POST /admin/sellers/:id/pause — D-69 atomic admin pause flow.
  *
+ * TODO Story v160-1-7.1 (post-1.8 smoke verification): DROP custom PAT-17 —
+ * replace with native Mercur 2 seller status workflow (4 statuses:
+ * pending_approval/open/suspended/terminated) per ADR-090 §PAT-17 row.
+ * Physical drop deferred until story v160-1-8 (DB drop+reload + medusa develop)
+ * confirms native Mercur 2 admin endpoints preserve atomic semantics + B12 fire
+ * drill SLA + flag-propagation T1/T2/T3 telemetry. Removing this file before
+ * runtime verification re-introduces FM-9 risk (multi-vendor checkout race).
+ *
  * Atomic transaction shape (per architecture.md L450-464 + ADR-074):
  *
  *   BEGIN;
