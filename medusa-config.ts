@@ -56,6 +56,19 @@ module.exports = defineConfig({
     rbac: {
       resolve: "@medusajs/medusa/rbac",
     },
+    // Story v160-1-10: Mercur 2 admin_ui + vendor_ui dashboard modules disabled
+    // dla Phase A1. Frontend panels (admin/vendor) są Sprint 2 territory; bez
+    // disable=true Mercur 2 dashboardMiddleware próbuje `service.getApp()` →
+    // app_ jest undefined → "TypeError: app is not a function" na każdym
+    // GET request. Re-enable w Sprint 2 gdy admin/vendor UIs będą built.
+    admin_ui: {
+      resolve: "@mercurjs/core/modules/admin-ui",
+      options: { disable: true },
+    },
+    vendor_ui: {
+      resolve: "@mercurjs/core/modules/vendor-ui",
+      options: { disable: true },
+    },
     event_bus: {
       resolve: "@medusajs/event-bus-redis",
       options: {
