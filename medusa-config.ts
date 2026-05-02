@@ -1,6 +1,14 @@
+import path from "node:path";
 import { loadEnv, defineConfig } from "@medusajs/framework/utils";
 
 loadEnv(process.env.NODE_ENV || "development", process.cwd());
+
+// Story v160-1-8: Medusa 2.13.x module loader prepends `src/` to relative
+// resolve paths by default. Post-restructure (story v160-1-4) our modules
+// live at packages/api/src/, so we resolve absolute paths from this config
+// file's directory to bypass the implicit `src/` base.
+const moduleRoot = (subpath: string) =>
+  path.resolve(__dirname, "packages/api/src/modules", subpath);
 
 // Story v160-1-7 — Mercur 2 native mechanisms wire-up. We skip the
 // `@mercurjs/core/with-mercur` wrapper because it forces an array-shaped
@@ -39,7 +47,7 @@ module.exports = defineConfig({
   ],
   modules: {
     gp_core: {
-      resolve: "./packages/api/src/modules/gp-core",
+      resolve: moduleRoot("gp-core"),
       options: {
         databaseUrl: process.env.GP_CORE_DATABASE_URL,
         mercurDatabaseUrl: process.env.GP_MERCUR_DATABASE_URL || process.env.DATABASE_URL,
