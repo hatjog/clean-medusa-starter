@@ -32,11 +32,11 @@
     "test:unit": "TEST_TYPE=unit NODE_OPTIONS=--experimental-vm-modules jest --silent --runInBand --forceExit"
   },
   "dependencies": {
-    "@medusajs/admin-sdk": "2.11.3",
-    "@medusajs/cli": "2.11.3",
-    "@medusajs/framework": "2.11.3",
-    "@medusajs/icons": "2.11.3",
-    "@medusajs/medusa": "2.11.3",
+    "@medusajs/admin-sdk": "2.13.6",
+    "@medusajs/cli": "2.13.6",
+    "@medusajs/framework": "2.13.6",
+    "@medusajs/icons": "2.13.6",
+    "@medusajs/medusa": "2.13.6",
     "@medusajs/ui": "4.0.25",
     "@mercurjs/b2c-core": "^1.5.3",
     "@mercurjs/commission": "^1.5.3",
@@ -51,7 +51,7 @@
     "zod": "^3.25.76"
   },
   "devDependencies": {
-    "@medusajs/test-utils": "2.11.3",
+    "@medusajs/test-utils": "2.13.6",
     "@swc/core": "1.5.7",
     "@swc/jest": "^0.2.36",
     "@types/jest": "^29.5.13",
