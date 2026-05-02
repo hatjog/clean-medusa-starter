@@ -1,30 +1,31 @@
 import path from "node:path";
-import { loadEnv, defineConfig } from "@medusajs/framework/utils";
+import { loadEnv } from "@medusajs/framework/utils";
+// Story v160-1-7-1: real `withMercur(defineConfig(...))` wrapper. Replaces
+// the manual withMercur-equivalent introduced w story v160-1-7 (Opcja B
+// sharpened). Story v160-1-10 SMOKE GATE attempt confirmed manual approach
+// nie odtwarza pełnej Mercur 2 plugin lifecycle (Signals 3+4 — Product.seller
+// MikroORM relation missing; module links nie loaded). Real wrapper handles
+// plugin registration + module links + entity extensions per Mercur 2
+// upstream convention.
+//
+// Required: modules ARRAY form (wrapper iterates `.some()` on config.modules).
+// Conversion z record → array w tej commit.
+import { withMercur } from "@mercurjs/core/with-mercur";
 
 loadEnv(process.env.NODE_ENV || "development", process.cwd());
 
-// Story v160-1-8: Medusa 2.13.x module loader prepends `src/` to relative
-// resolve paths by default. Post-restructure (story v160-1-4) our modules
-// live at packages/api/src/, so we resolve absolute paths from this config
-// file's directory to bypass the implicit `src/` base.
+// Medusa 2.13.x module loader prepends `src/` to relative resolve paths.
+// Post-restructure (story v160-1-4) modules live at packages/api/src/, so we
+// resolve absolute via `path.resolve(__dirname, ...)` to bypass implicit
+// `src/` base (story v160-1-8 Patch #2).
 const moduleRoot = (subpath: string) =>
   path.resolve(__dirname, "packages/api/src/modules", subpath);
 
-// Story v160-1-7 — Mercur 2 native mechanisms wire-up. We skip the
-// `@mercurjs/core/with-mercur` wrapper because it forces an array-shaped
-// `modules` config; our existing record-shaped form is still valid in Medusa
-// 2.13.6 and avoids a config-shape migration mid-rebase. Wrapper-equivalent
-// effects are preserved manually: the `@mercurjs/core` plugin is added to
-// `plugins[]`, the `@medusajs/medusa/rbac` module is registered, and
-// `featureFlags.rbac` is set to `true`. If a future Medusa minor drops record
-// modules support, swap to `withMercur({...})` and convert modules to array form.
-
-module.exports = defineConfig({
+module.exports = withMercur({
+  // admin.disable defaults to true via withMercur wrapper (still set explicit
+  // for clarity); admin Vite/static panel is Sprint 2 territory.
   admin: {
     disable: true,
-  },
-  featureFlags: {
-    rbac: true,
   },
   projectConfig: {
     databaseUrl: process.env.DATABASE_URL,
@@ -32,50 +33,55 @@ module.exports = defineConfig({
     http: {
       storeCors: process.env.STORE_CORS!,
       adminCors: process.env.ADMIN_CORS!,
-      // @ts-expect-error: vendorCors is not part of the typed config yet, but is supported by MercurJS.
       vendorCors: process.env.VENDOR_CORS!,
       authCors: process.env.AUTH_CORS!,
       jwtSecret: process.env.JWT_SECRET || "supersecret",
       cookieSecret: process.env.COOKIE_SECRET || "supersecret",
     },
   },
+  // withMercur auto-adds `@mercurjs/core` plugin if not present — explicit
+  // entry retained for visibility.
   plugins: [
     {
       resolve: "@mercurjs/core",
       options: {},
     },
   ],
-  modules: {
-    gp_core: {
+  // Modules ARRAY form (Mercur 2 convention). withMercur auto-appends
+  // `@medusajs/medusa/rbac` if not in the array (we omit explicit rbac entry
+  // and let wrapper handle it).
+  modules: [
+    {
+      key: "gp_core",
       resolve: moduleRoot("gp-core"),
       options: {
         databaseUrl: process.env.GP_CORE_DATABASE_URL,
         mercurDatabaseUrl: process.env.GP_MERCUR_DATABASE_URL || process.env.DATABASE_URL,
       },
     },
-    rbac: {
-      resolve: "@medusajs/medusa/rbac",
-    },
-    // Story v160-1-10: Mercur 2 admin_ui + vendor_ui dashboard modules disabled
-    // dla Phase A1. Frontend panels (admin/vendor) są Sprint 2 territory; bez
-    // disable=true Mercur 2 dashboardMiddleware próbuje `service.getApp()` →
-    // app_ jest undefined → "TypeError: app is not a function" na każdym
-    // GET request. Re-enable w Sprint 2 gdy admin/vendor UIs będą built.
-    admin_ui: {
+    // Mercur 2 admin_ui + vendor_ui dashboard modules disabled dla Phase A1
+    // (frontend panels = Sprint 2 territory; bez disable Mercur 2
+    // dashboardMiddleware crashes na "TypeError: app is not a function").
+    {
+      key: "admin_ui",
       resolve: "@mercurjs/core/modules/admin-ui",
       options: { disable: true },
     },
-    vendor_ui: {
+    {
+      key: "vendor_ui",
       resolve: "@mercurjs/core/modules/vendor-ui",
       options: { disable: true },
     },
-    event_bus: {
+    {
+      key: "event_bus",
       resolve: "@medusajs/event-bus-redis",
       options: {
         redisUrl: process.env.REDIS_URL,
       },
     },
-    locking: {
+    {
+      key: "locking",
+      resolve: "@medusajs/medusa/locking",
       options: {
         providers: [
           {
@@ -89,5 +95,5 @@ module.exports = defineConfig({
         ],
       },
     },
-  },
+  ],
 });
