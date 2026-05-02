@@ -19,28 +19,7 @@ module.exports = defineConfig({
       cookieSecret: process.env.COOKIE_SECRET || "supersecret",
     },
   },
-  plugins: [
-    {
-      resolve: "@mercurjs/b2c-core",
-      options: {},
-    },
-    {
-      resolve: "@mercurjs/commission",
-      options: {},
-    },
-    {
-      resolve: "@mercurjs/reviews",
-      options: {},
-    },
-    {
-      resolve: "@mercurjs/requests",
-      options: {},
-    },
-    {
-      resolve: "@mercurjs/resend",
-      options: {},
-    },
-  ],
+  plugins: [],
   modules: {
     gp_core: {
       resolve: "./packages/api/src/modules/gp-core",
