@@ -11,6 +11,7 @@ import {
   buildVoucherPdfPayload,
   dispatchMultiVendorPdfs,
   groupLineItemsByVendor,
+  renderDirectionsSection,
   renderVoucherPdfStub,
   buildVoucherPdfStorageKey,
   type CartLineItemForVoucher,
@@ -166,6 +167,87 @@ describe("voucher-delivery/multi-vendor-pdf", () => {
         vendors_by_id: {},
       })
       expect(dispatches.length).toBe(0)
+    })
+  })
+
+  // Story v160-6-5: post-claim directions section
+  describe("renderDirectionsSection — Story v160-6-5", () => {
+    const vendor_with_coords: VendorRecord = {
+      ...vendor_a,
+      lat: 52.2297,
+      lng: 21.0122,
+    }
+
+    it("renders title + address + Google + Apple deeplinks + privacy notice when coords present", () => {
+      const payload = buildVoucherPdfPayload({
+        voucher_code: "ABC-123",
+        locale: "pl",
+        vendor: vendor_with_coords,
+        line_items: [line_items[0]!],
+      })
+      const lines = renderDirectionsSection(payload)
+      const text = lines.join("\n")
+
+      expect(text).toContain("Jak dojechać")
+      expect(text).toContain("Adres:")
+      expect(text).toContain(vendor_a.address)
+      expect(text).toContain("Google Maps:")
+      expect(text).toContain("Apple Maps:")
+      expect(text).toContain("https://www.google.com/maps/dir/?api=1")
+      expect(text).toContain("https://maps.apple.com/")
+      expect(text).toContain("opuszczasz BonBeauty")
+    })
+
+    it("falls back to search-query deeplinks when coords absent but address present", () => {
+      const payload = buildVoucherPdfPayload({
+        voucher_code: "ABC-123",
+        locale: "en",
+        vendor: vendor_a, // no lat/lng
+        line_items: [line_items[0]!],
+      })
+      const lines = renderDirectionsSection(payload)
+      const text = lines.join("\n")
+
+      expect(text).toContain("How to get there")
+      expect(text).toContain("https://www.google.com/maps/search/?api=1&query=")
+      expect(text).toContain("https://maps.apple.com/?q=")
+      expect(text).toContain("Coordinates not available")
+      expect(text).toContain("BonBeauty does not share")
+    })
+
+    it("returns empty array when neither coords nor address present (defensive skip)", () => {
+      const payload = buildVoucherPdfPayload({
+        voucher_code: "ABC-123",
+        locale: "pl",
+        vendor: { id: "ven_x", name: "Salon X", handle: "salon-x" },
+        line_items: [line_items[0]!],
+      })
+      expect(renderDirectionsSection(payload)).toEqual([])
+    })
+
+    it("AR45: rendered text contains zero buyer/recipient PII substrings", () => {
+      const payload = buildVoucherPdfPayload({
+        voucher_code: "ABC-123",
+        locale: "pl",
+        vendor: vendor_with_coords,
+        line_items: [line_items[0]!],
+        buyer_note: "Wesołych urodzin Aniu!",
+      })
+      const pdf = renderVoucherPdfStub(payload)
+      const text = pdf.toString("utf-8")
+
+      // Positive — directions section present (AC1).
+      expect(text).toContain("Jak dojechać")
+      expect(text).toContain("https://www.google.com/maps/dir/?api=1")
+
+      // Negative AR45 — no buyer-side identifiers leak into the artifact.
+      expect(text).not.toMatch(/recipient_email/i)
+      expect(text).not.toMatch(/recipient_name/i)
+      expect(text).not.toMatch(/recipient_phone/i)
+      expect(text).not.toMatch(/buyer_email/i)
+      expect(text).not.toMatch(/buyer_phone/i)
+      expect(text).not.toMatch(/buyer_address/i)
+      expect(text).not.toMatch(/gift_message/i)
     })
   })
 })

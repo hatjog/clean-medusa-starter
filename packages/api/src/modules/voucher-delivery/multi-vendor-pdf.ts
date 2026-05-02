@@ -21,7 +21,19 @@
  * `renderVoucherPdfStub()` with the real engine; the multi-vendor isolation
  * contract + payload shape remain stable (additive-MINOR per ports.ts
  * versioning convention).
+ *
+ * Story v160-6-5 extension: post-claim directions section appended between
+ * the voucher card + footer. Reuses `maps-deeplink.ts` helpers (ported from
+ * storefront Story 4.5) for Google + Apple Maps deeplink URLs. Defensive
+ * fallback to search-query mode when coordinates are absent. Privacy notice
+ * mandatory (always rendered when section renders).
  */
+
+import {
+  buildAppleMapsDeeplink,
+  buildGoogleMapsDeeplink,
+  buildSearchFallbackDeeplink,
+} from "./maps-deeplink"
 
 export interface CartLineItemForVoucher {
   id: string
@@ -41,6 +53,9 @@ export interface VendorRecord {
   handle: string
   address?: string | null
   photo_url?: string | null
+  /** Optional geo coordinates for Story v160-6-5 directions section. */
+  lat?: number | null
+  lng?: number | null
 }
 
 export interface VoucherPdfPayload {
@@ -55,6 +70,9 @@ export interface VoucherPdfPayload {
     handle: string
     address?: string | null
     photo_url?: string | null
+    /** Optional geo coordinates (Story v160-6-5 directions section). */
+    lat?: number | null
+    lng?: number | null
   }
   /** Service / product description (recipient-facing display copy). */
   service_description: string
@@ -78,6 +96,14 @@ const T30_PDF_COPY = {
     validity_period_label: "Ważność",
     voucher_value_label: "Wartość vouchera",
     service_description_label: "Usługa",
+    directions_title: "Jak dojechać",
+    directions_address_label: "Adres",
+    directions_google_label: "Google Maps",
+    directions_apple_label: "Apple Maps",
+    directions_no_coords_helper:
+      "Współrzędne nie są dostępne — link wyszukuje adres",
+    directions_privacy_notice:
+      "Klikając linki map zewnętrznych, opuszczasz BonBeauty. BonBeauty nie udostępnia Twoich danych zewnętrznym dostawcom map.",
   },
   en: {
     title: "BonBeauty voucher",
@@ -86,6 +112,14 @@ const T30_PDF_COPY = {
     validity_period_label: "Valid until",
     voucher_value_label: "Voucher value",
     service_description_label: "Service",
+    directions_title: "How to get there",
+    directions_address_label: "Address",
+    directions_google_label: "Google Maps",
+    directions_apple_label: "Apple Maps",
+    directions_no_coords_helper:
+      "Coordinates not available — link searches address",
+    directions_privacy_notice:
+      "Clicking external map links, you leave BonBeauty. BonBeauty does not share your data with external map providers.",
   },
 }
 
@@ -145,6 +179,8 @@ export function buildVoucherPdfPayload(args: {
       handle: args.vendor.handle,
       address: args.vendor.address ?? null,
       photo_url: args.vendor.photo_url ?? null,
+    lat: typeof args.vendor.lat === "number" ? args.vendor.lat : null,
+    lng: typeof args.vendor.lng === "number" ? args.vendor.lng : null,
     },
     service_description,
     value_minor,
@@ -190,7 +226,78 @@ export function renderVoucherPdfStub(payload: VoucherPdfPayload): Buffer {
   if (payload.buyer_note) {
     lines.push("", `> ${payload.buyer_note}`)
   }
+
+  // Story v160-6-5: appended directions section (per-vendor; AR45-safe).
+  const directions = renderDirectionsSection(payload)
+  if (directions.length > 0) {
+    lines.push("", ...directions)
+  }
+
   return Buffer.from(lines.join("\n"), "utf-8")
+}
+
+/**
+ * Story v160-6-5: Renders the post-claim directions section as text lines
+ * appended to the PDF document. Returns an empty array when the section
+ * should be skipped entirely (no coords AND no address — defensive).
+ *
+ * Privacy invariant (AR45): only seller-side fields (name, address, coords)
+ * are ever rendered. Voucher code is included by the parent stub already.
+ * NO buyer-side fields are read here — type system + payload shape enforce.
+ */
+export function renderDirectionsSection(payload: VoucherPdfPayload): string[] {
+  const copy = T30_PDF_COPY[payload.locale] ?? T30_PDF_COPY.pl
+  const { vendor } = payload
+  const hasCoords =
+    typeof vendor.lat === "number" && typeof vendor.lng === "number"
+  const hasAddress =
+    typeof vendor.address === "string" && vendor.address.trim().length > 0
+
+  // Skip section entirely if zero data — preserves clean layout.
+  if (!hasCoords && !hasAddress) return []
+
+  const lines: string[] = [`--- ${copy.directions_title} ---`]
+
+  if (hasAddress) {
+    lines.push(`${copy.directions_address_label}: ${vendor.address}`)
+  }
+
+  if (hasCoords) {
+    const googleUrl = buildGoogleMapsDeeplink({
+      lat: vendor.lat as number,
+      lng: vendor.lng as number,
+      name: vendor.name,
+    })
+    const appleUrl = buildAppleMapsDeeplink({
+      lat: vendor.lat as number,
+      lng: vendor.lng as number,
+      name: vendor.name,
+    })
+    lines.push(`${copy.directions_google_label}: ${googleUrl}`)
+    lines.push(`${copy.directions_apple_label}: ${appleUrl}`)
+  } else if (hasAddress) {
+    // Search-query fallback when coordinates absent — link still resolves
+    // to user's preferred maps app via address text geocoding.
+    const googleUrl = buildSearchFallbackDeeplink({
+      provider: "google",
+      name: vendor.name,
+      address: vendor.address as string,
+    })
+    const appleUrl = buildSearchFallbackDeeplink({
+      provider: "apple",
+      name: vendor.name,
+      address: vendor.address as string,
+    })
+    lines.push(`${copy.directions_google_label}: ${googleUrl}`)
+    lines.push(`${copy.directions_apple_label}: ${appleUrl}`)
+    lines.push(copy.directions_no_coords_helper)
+  }
+
+  // Privacy notice mandatory whenever section renders (AR45 + Story 4.5
+  // web parity — leaving BonBeauty boundary disclosure).
+  lines.push("", copy.directions_privacy_notice)
+
+  return lines
 }
 
 /**
