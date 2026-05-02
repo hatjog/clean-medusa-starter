@@ -6,3 +6,5 @@
 # splits) without forcing immediate over-decomposition.
 packages:
   - "packages/*"
+patchedDependencies:
+  '@mercurjs/core@2.1.1': patches/@mercurjs__core@2.1.1.patch
