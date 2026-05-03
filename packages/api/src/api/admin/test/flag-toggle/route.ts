@@ -6,10 +6,14 @@
  *   Headers: X-Test-Mode: true (required)
  *
  * SECURITY CONTROLS:
- *   1. Hard-rejects in production: NODE_ENV === 'production' → 403
+ *   1. Hard-rejects unless ALLOW_TEST_ENDPOINTS=true AND NODE_ENV !== 'production'
  *   2. Requires X-Test-Mode: true header → 403 if absent
  *   3. Bypasses smoke-gate guard (purpose: 'e2e_test' — audit log marks this)
  *   4. Audit log entry written with purpose: 'e2e_test'
+ *
+ * ISOLATION WARNING: flag state is an in-memory singleton shared with all
+ * live requests in the same process. Run E2E only against a dedicated staging
+ * instance — never against a process handling real traffic.
  *
  * This endpoint exists solely for E2E test setup/teardown. It MUST NOT be
  * used in production workflows.
@@ -28,18 +32,25 @@ import {
   type MultiVendorFlagState,
 } from "../../../../lib/feature-flag-tri-state"
 
+// Disable Medusa's default admin auth middleware — this route uses its own guards.
+export const AUTHENTICATE = false
+
 const ALLOWED_STATES: ReadonlySet<string> = new Set(["off", "shadow", "on"])
 
 export async function POST(
   req: MedusaRequest,
   res: MedusaResponse,
 ): Promise<void> {
-  // Guard 1: Hard-reject in production
-  if (process.env.NODE_ENV === "production") {
+  // Guard 1: Hard-reject unless ALLOW_TEST_ENDPOINTS=true and not production.
+  // ALLOW_TEST_ENDPOINTS must be explicitly set per environment (opt-in, not opt-out).
+  if (
+    process.env.NODE_ENV === "production" ||
+    process.env.ALLOW_TEST_ENDPOINTS !== "true"
+  ) {
     res.status(403).json({
-      error: "test_endpoint_disabled_in_production",
+      error: "test_endpoint_disabled",
       detail:
-        "POST /admin/test/flag-toggle is not available in production. " +
+        "POST /admin/test/flag-toggle requires ALLOW_TEST_ENDPOINTS=true and NODE_ENV !== 'production'. " +
         "Use POST /admin/operator/flag-flip for production flag transitions.",
     })
     return
@@ -120,8 +131,11 @@ export async function GET(
   req: MedusaRequest,
   res: MedusaResponse,
 ): Promise<void> {
-  if (process.env.NODE_ENV === "production") {
-    res.status(403).json({ error: "test_endpoint_disabled_in_production" })
+  if (
+    process.env.NODE_ENV === "production" ||
+    process.env.ALLOW_TEST_ENDPOINTS !== "true"
+  ) {
+    res.status(403).json({ error: "test_endpoint_disabled" })
     return
   }
 
