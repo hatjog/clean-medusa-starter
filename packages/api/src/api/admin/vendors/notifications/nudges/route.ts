@@ -1,5 +1,6 @@
 /**
  * Story v160-7-2: Nudge cadence admin route — POST trigger.
+ * cleanup-3: phantom-actor fallback removed (fail-closed actor resolution).
  *
  * POST /admin/vendors/notifications/nudges
  *   Body: { step: 't21' | 't14' | 't7' | 't3'; dry_run?: boolean; vendor_ids?: string[] }
@@ -61,9 +62,19 @@ function resolveFlagFlipDate(): { iso: string | null } {
   return { iso: raw }
 }
 
+/**
+ * cleanup-3: Fail-closed actor resolution.
+ * operatorAuthMiddleware on /admin/vendors/* guarantees actor_id is present
+ * before reaching this handler. Missing actor_id throws instead of attributing
+ * actions to a phantom actor string.
+ */
 function extractActorId(req: MedusaRequest): string {
   const ctx = (req as { auth_context?: { actor_id?: string } }).auth_context
-  return ctx?.actor_id ?? "unknown_admin"
+  const actorId = ctx?.actor_id
+  if (!actorId) {
+    throw new Error("actor_id missing from auth_context — request must be authenticated")
+  }
+  return actorId
 }
 
 /**

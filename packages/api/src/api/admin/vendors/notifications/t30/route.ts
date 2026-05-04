@@ -68,9 +68,19 @@ function isWindowOpen(flagFlipDate: Date | null): boolean {
   return Date.now() + thirtyDaysMs >= flagFlipDate.getTime()
 }
 
+/**
+ * cleanup-3: Fail-closed actor resolution — phantom-actor fallback removed.
+ * Middleware guarantees actor_id is present before reaching this point;
+ * if somehow missing, throw so caller sees 500 rather than silently
+ * attributing actions to a phantom actor.
+ */
 function extractActorId(req: MedusaRequest): string {
   const ctx = (req as { auth_context?: { actor_id?: string } }).auth_context
-  return ctx?.actor_id ?? "unknown_admin"
+  const actorId = ctx?.actor_id
+  if (!actorId) {
+    throw new Error("actor_id missing from auth_context — request must be authenticated")
+  }
+  return actorId
 }
 
 /**
