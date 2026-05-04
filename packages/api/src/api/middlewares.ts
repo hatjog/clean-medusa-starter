@@ -11,6 +11,7 @@ import {
   ContainerRegistrationKeys,
   Modules,
 } from "@medusajs/framework/utils";
+import { vendorMetaMiddleware } from "./store/products/vendor-meta-middleware";
 import {
   CUSTOMER_MARKET_FORBIDDEN_MESSAGE,
   isScopedToMarket,
@@ -601,6 +602,19 @@ export default defineMiddlewares({
       method: "ALL",
       matcher: "/store/carts*",
       middlewares: [cartMarketGuardMiddleware, customerResponseSanitizerMiddleware],
+    },
+    // Multi-vendor metadata augmentation (story v160-cleanup-12a).
+    // Runs on /store/products (list) and /store/products/:id (detail).
+    // Short-circuits immediately when MULTI_VENDOR_PRICING_ENABLED !== 'true'.
+    {
+      method: ["GET"],
+      matcher: "/store/products",
+      middlewares: [vendorMetaMiddleware],
+    },
+    {
+      method: ["GET"],
+      matcher: "/store/products/:id",
+      middlewares: [vendorMetaMiddleware],
     },
   ],
 });
