@@ -1,6 +1,13 @@
 /**
  * Story v160-7-4: POST /admin/vendors/[id]/lifecycle-status — transition vendor lifecycle.
  *
+ * cleanup-15a: State machine bypass closure (Batch A H5):
+ *   - REJECT `current_metadata` from request body (400) — state should be read
+ *     from DB, not supplied by the caller (anti-spoofing guard).
+ *   - Gate `override=true` via `checkLifecycleOverrideCapability` — non-admin
+ *     callers receive 403.
+ *   - Emit `policy_override` alert when override is granted.
+ *
  * Validates transition via state machine + writes vendor.metadata.lifecycle_status
  * + appends audit log entry. Real Mercur 2 vendor table writes DEFERRED (shared
  * production wiring across Stories 7.1-7.6).
@@ -12,12 +19,18 @@ import {
   type LifecycleStatus,
   type VendorMetadataSnapshot,
 } from "../../../../../lib/vendor-lifecycle-state-machine"
+import {
+  checkLifecycleOverrideCapability,
+  extractActorIdOrThrow,
+} from "../../../../../lib/capability-check"
+import { emitStructuredAlert } from "../../../../../lib/alert-emit"
 
 type TransitionBody = {
   to_status: LifecycleStatus
   admin_note?: string
   override?: boolean
-  // For dev fixture support — production reads vendor metadata from DB.
+  // current_metadata is REJECTED (see bypass closure below).
+  // Keep type definition for TS-correct rejection error message.
   current_metadata?: VendorMetadataSnapshot
 }
 
@@ -40,9 +53,50 @@ export async function POST(
     return
   }
 
-  // Real impl: load vendor.metadata from Mercur 2 vendor table.
-  // Dev impl: client provides current_metadata via body (or default).
-  const meta: VendorMetadataSnapshot = body.current_metadata ?? {
+  // AC4 — State machine bypass closure: reject current_metadata in request body.
+  // All state must be authoritative from DB; caller-supplied metadata is an
+  // anti-pattern that allows actors to fabricate valid transition starting points.
+  if (body.current_metadata !== undefined && body.current_metadata !== null) {
+    res.status(400).json({
+      error: "current_metadata in request body is not allowed — vendor state is resolved server-side",
+    })
+    return
+  }
+
+  // AC4 — Capability gate on override=true.
+  // Non-admin callers (or unauthenticated) receive 403.
+  if (body.override === true) {
+    const hasCapability = await checkLifecycleOverrideCapability(req)
+    if (!hasCapability) {
+      res.status(403).json({
+        error: "lifecycle.override capability required for override=true transitions",
+      })
+      return
+    }
+
+    // Emit policy_override alert for audit trail
+    let actorId = "unknown"
+    try {
+      actorId = extractActorIdOrThrow(req)
+    } catch {
+      // Auth context may be absent in fixture mode — log as unknown
+    }
+    emitStructuredAlert({
+      severity: "WARN",
+      code: "policy_override",
+      message: `Admin override transition: vendor ${id} → ${body.to_status}`,
+      context: {
+        vendor_id: id,
+        to_status: body.to_status,
+        actor_id: actorId,
+        admin_note: body.admin_note ?? null,
+      },
+    })
+  }
+
+  // v1.6.0 dev impl: read from fixture defaults (real DB read deferred).
+  // current_metadata has been rejected above — use safe default.
+  const meta: VendorMetadataSnapshot = {
     lifecycle_status: "pending_approval",
   }
 

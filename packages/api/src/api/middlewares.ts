@@ -556,6 +556,17 @@ export default defineMiddlewares({
         operatorAuthMiddleware,
       ],
     },
+    // cleanup-15a: apply admin AuthN to all /admin/vendors/** POST routes.
+    // Matcher "/admin/vendors/*" covers the actual Medusa 2 route paths
+    // (NOT "/v1/admin/*" which covers the legacy v1 API prefix).
+    {
+      method: ["POST", "PATCH", "PUT", "DELETE"],
+      matcher: "/admin/vendors/*",
+      middlewares: [
+        authenticate("user", ["session", "bearer"]),
+        operatorAuthMiddleware,
+      ],
+    },
     {
       method: ["POST"],
       matcher: "/auth/customer/emailpass/register",
