@@ -30,7 +30,7 @@ import {
   getCurrentState,
   setState,
   type MultiVendorFlagState,
-} from "../../../../lib/feature-flag-tri-state"
+} from "../../../lib/feature-flag-tri-state"
 
 // Disable Medusa's default admin auth middleware — this route uses its own guards.
 export const AUTHENTICATE = false
