@@ -6,6 +6,9 @@
  * @see FR41 / FR42 / NFR-REL-2 / NFR-REL-10
  */
 
+import * as cacheInvalidateModule from "./cache-invalidate-on-flag-flip"
+import * as phaseBAggregator from "./phase-b-smoke-gate-aggregator"
+
 export type MultiVendorFlagState = "off" | "shadow" | "on"
 
 export const ALLOWED_TRANSITIONS: Record<
@@ -104,8 +107,8 @@ export async function setState(
     }
   }
 
-  // Cache invalidate (lazy import to avoid cycles).
-  const { invalidateOnFlip } = await import("./cache-invalidate-on-flag-flip")
+  // Cache invalidate (static import — type-only cycle, safe).
+  const { invalidateOnFlip } = cacheInvalidateModule
   const cache_invalidate_outcome = await invalidateOnFlip(from, to)
 
   _currentState = to
@@ -144,8 +147,7 @@ async function readSmokeGateRatifiedVerdict(): Promise<
 > {
   // Read from in-memory ratification store (Story 8.7).
   try {
-    const mod = await import("./phase-b-smoke-gate-aggregator")
-    const r = mod.getLastRatification()
+    const r = phaseBAggregator.getLastRatification()
     return r ? r.verdict : null
   } catch {
     return null
