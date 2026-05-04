@@ -555,6 +555,14 @@ export default defineMiddlewares({
         operatorAuthMiddleware,
       ],
     },
+    // cleanup-3: enforce admin AuthN on all /admin/vendors/** routes (CRIT-7.1)
+    {
+      matcher: "/admin/vendors/*",
+      middlewares: [
+        authenticate("user", ["session", "bearer"]),
+        operatorAuthMiddleware,
+      ],
+    },
     {
       method: ["POST"],
       matcher: "/auth/customer/emailpass/register",

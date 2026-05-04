@@ -78,13 +78,17 @@ type Logger = {
 }
 
 /**
- * Minimal authn/authz extraction. Real Mercur admin auth middleware writes the
- * actor into `req.auth_context`; we fall back to `'unknown_admin'` only in
- * test environments where auth middleware is bypassed.
+ * cleanup-3: Fail-closed actor resolution — phantom-actor fallback removed.
+ * operatorAuthMiddleware on /admin/sellers/* guarantees actor_id is present.
+ * Throwing here makes missing-actor visible as 500 rather than a phantom attribution.
  */
 const extractActorId = (req: MedusaRequest): string => {
   const ctx = (req as { auth_context?: { actor_id?: string } }).auth_context
-  return ctx?.actor_id ?? "unknown_admin"
+  const actorId = ctx?.actor_id
+  if (!actorId) {
+    throw new Error("actor_id missing from auth_context — request must be authenticated")
+  }
+  return actorId
 }
 
 const extractMarketId = (req: MedusaRequest): string => {
