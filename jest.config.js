@@ -35,4 +35,8 @@ if (process.env.TEST_TYPE === "integration:http") {
     "**/packages/api/src/**/__tests__/**/*.idempotency.spec.[jt]s",
     "**/packages/api/src/**/__tests__/**/*.test.[jt]s",
   ];
+} else if (process.env.TEST_TYPE === "patches") {
+  // Patch regression tests — no live DB required, mock-based, fast.
+  // Run with: pnpm test:patches
+  module.exports.testMatch = ["**/__tests__/patches/**/*.spec.[jt]s"];
 }
