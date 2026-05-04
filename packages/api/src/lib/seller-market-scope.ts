@@ -1,5 +1,9 @@
 import type { Knex } from "knex";
 
+// Mercur 2 uses `product_seller` link table (product_id, seller_id).
+// The old Mercur 1.5 junction `seller_seller_product_product` does NOT exist in Mercur 2 schema.
+const PRODUCT_SELLER_TABLE = "product_seller";
+
 type SellerIdRow = {
   id: string;
 };
@@ -8,11 +12,11 @@ function buildScopedSellerIdQuery(db: Knex, salesChannelId: string) {
   return db("seller as seller")
     .distinct("seller.id")
     .innerJoin(
-      "seller_seller_product_product as sspp",
+      `${PRODUCT_SELLER_TABLE} as ps`,
       "seller.id",
-      "sspp.seller_id"
+      "ps.seller_id"
     )
-    .innerJoin("product as product", "sspp.product_id", "product.id")
+    .innerJoin("product as product", "ps.product_id", "product.id")
     .innerJoin(
       "product_sales_channel as psc",
       "product.id",
@@ -21,7 +25,7 @@ function buildScopedSellerIdQuery(db: Knex, salesChannelId: string) {
     .where("psc.sales_channel_id", salesChannelId)
     .where("seller.store_status", "ACTIVE")
     .whereNull("seller.deleted_at")
-    .whereNull("sspp.deleted_at")
+    .whereNull("ps.deleted_at")
     .whereNull("product.deleted_at")
     .whereNull("psc.deleted_at");
 }

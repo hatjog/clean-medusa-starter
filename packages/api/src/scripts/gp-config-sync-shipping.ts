@@ -153,18 +153,19 @@ async function listMarketShippingProfiles(db: Knex, marketId: string): Promise<s
 }
 
 async function listMarketSellers(db: Knex, marketId: string): Promise<MarketSellerRow[]> {
+  // Mercur 2: `product_seller` link table (replaces Mercur 1.5 `seller_seller_product_product`)
   const result = await db.raw(
     `
       SELECT DISTINCT
-        sspp.seller_id,
+        ps.seller_id,
         s.name AS seller_name,
         s.handle AS seller_handle
       FROM product p
-      INNER JOIN seller_seller_product_product sspp
-        ON sspp.product_id = p.id
-       AND sspp.deleted_at IS NULL
+      INNER JOIN product_seller ps
+        ON ps.product_id = p.id
+       AND ps.deleted_at IS NULL
       INNER JOIN seller s
-        ON s.id = sspp.seller_id
+        ON s.id = ps.seller_id
        AND s.deleted_at IS NULL
       WHERE p.deleted_at IS NULL
         AND p.metadata->'gp'->>'market_id' = ?

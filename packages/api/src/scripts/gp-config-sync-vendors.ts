@@ -232,17 +232,18 @@ function buildSellerProductLinkId(sellerId: string, productId: string): string {
   return `spl_${sellerId.slice(-8)}_${productId.slice(-8)}_${ts}_${entropy}`
 }
 
+// Mercur 2 link table is `product_seller` (not Mercur 1.5 `seller_seller_product_product`).
 async function upsertSellerProductLinkViaDb(
   db: any,
   sellerId: string,
   productId: string
 ): Promise<DbLinkOutcome> {
-  const existing = await db("seller_seller_product_product")
+  const existing = await db("product_seller")
     .where({ seller_id: sellerId, product_id: productId })
     .first()
 
   if (!existing) {
-    await db("seller_seller_product_product").insert({
+    await db("product_seller").insert({
       id: buildSellerProductLinkId(sellerId, productId),
       seller_id: sellerId,
       product_id: productId,
@@ -251,7 +252,7 @@ async function upsertSellerProductLinkViaDb(
   }
 
   if (existing.deleted_at) {
-    await db("seller_seller_product_product")
+    await db("product_seller")
       .where({ id: existing.id })
       .update({ deleted_at: null })
     return "restored"
@@ -314,12 +315,13 @@ export async function inactivateStaleMarketSellers(
 ): Promise<{ inactivated: number; skipped: number }> {
   const scopedSellers = await db("seller as seller")
     .distinct("seller.id", "seller.handle", "seller.store_status")
-    .innerJoin("seller_seller_product_product as sspp", "seller.id", "sspp.seller_id")
-    .innerJoin("product as product", "sspp.product_id", "product.id")
+    // Mercur 2: product_seller link table (not Mercur 1.5 seller_seller_product_product)
+    .innerJoin("product_seller as ps", "seller.id", "ps.seller_id")
+    .innerJoin("product as product", "ps.product_id", "product.id")
     .innerJoin("product_sales_channel as psc", "product.id", "psc.product_id")
     .where("psc.sales_channel_id", salesChannelId)
     .whereNull("seller.deleted_at")
-    .whereNull("sspp.deleted_at")
+    .whereNull("ps.deleted_at")
     .whereNull("product.deleted_at")
     .whereNull("psc.deleted_at")
 

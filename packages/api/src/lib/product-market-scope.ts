@@ -94,16 +94,17 @@ export async function filterProductIdsByFilters(
 
   // LEFT JOIN seller chain so we can:
   //  (a) filter out SUSPENDED sellers
-  //  (b) optionally filter by city / seller rating (via review subquery)
+  //  (b) optionally filter by seller rating (via review subquery)
   // Soft-deleted links / sellers are excluded via ON clause to preserve LEFT JOIN semantics.
+  // NOTE: Mercur 2 uses `product_seller` link table (not Mercur 1.5 `seller_seller_product_product`).
   query = query
-    .leftJoin("seller_seller_product_product as sspp", function () {
-      this.on("product.id", "=", "sspp.product_id").andOnNull(
-        "sspp.deleted_at"
+    .leftJoin("product_seller as ps", function () {
+      this.on("product.id", "=", "ps.product_id").andOnNull(
+        "ps.deleted_at"
       );
     })
     .leftJoin("seller", function () {
-      this.on("sspp.seller_id", "=", "seller.id").andOnNull(
+      this.on("ps.seller_id", "=", "seller.id").andOnNull(
         "seller.deleted_at"
       );
     })
@@ -145,9 +146,16 @@ export async function filterProductIdsByFilters(
       .whereIn("pcp.product_category_id", filters.category_id);
   }
 
-  // city: WHERE on seller.city — products without a seller naturally have NULL city and are excluded
+  // city: Mercur 2 seller entity has no `city` column (dropped in Mercur 2 schema migration).
+  // City filtering via seller is no longer supported at DB level.
+  // TODO(v1.7.0): implement city filter via address join or market config if needed.
+  // Callers passing filters.city will receive unfiltered results (safe degradation).
   if (filters.city?.length) {
-    query = query.whereIn("seller.city", filters.city);
+    // No-op: city column does not exist in Mercur 2 seller table.
+    // eslint-disable-next-line no-console
+    console.warn(
+      "[product-market-scope] city filter requested but seller.city does not exist in Mercur 2; filter ignored"
+    );
   }
 
   // duration: INNER JOIN product_variant with regex guard before ::int cast (non-numeric metadata values are skipped)

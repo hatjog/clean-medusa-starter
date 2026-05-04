@@ -178,9 +178,15 @@ export async function GET(req: MedusaRequest, res: MedusaResponse) {
   // NOTE: SET LOCAL applies per-statement. The pipeline executes 2 queries (COUNT + IDs),
   // so worst-case wall time is 2 × 3s = 6s. Keep per-statement limit low to catch runaway queries.
   const { productIds, count } = await db.transaction(async (trx) => {
-    // Re-apply RLS context inside the transaction connection. The pool hook sets
-    // context on ordinary acquired connections, but Knex transactions can use a
-    // separate connection where ALS-derived session state is not present.
+    // AC5 audit (story v160-cleanup-1): set_config inside transaction is INTENTIONAL.
+    // The pool hook sets RLS context on individual acquired connections via afterCreate/
+    // AsyncLocalStorage. However, Knex `.transaction()` acquires a dedicated connection
+    // that may not pass through the afterCreate hook, and ALS context is not propagated
+    // across async boundaries into Knex's internal transaction runner.
+    // Decision: keep manual set_config here — pool-hook alone is unreliable for transactions.
+    // Follow-up: v1.7.0 — investigate whether using a custom transaction runner that
+    // explicitly propagates ALS state would allow removing this manual set_config.
+    // See: specs/architecture/rls-als-contract.md (if exists) or open follow-up story.
     if (marketId) {
       await trx.raw("SET LOCAL ROLE medusa_store");
       await trx.raw("SELECT set_config('app.gp_market_id', ?, true)", [marketId]);
