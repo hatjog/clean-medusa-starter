@@ -13,7 +13,9 @@ type ProductCountRow = {
   product_count: string;
 };
 
-const SELLER_LIST_FIELDS = ["id", "name", "handle", "photo", "city"] as const;
+// Note: `city` removed — Mercur 2 seller entity has no `city` column.
+// TODO(v1.7.0): add address-based city lookup if the UI requires it.
+const SELLER_LIST_FIELDS = ["id", "name", "handle", "photo"] as const;
 
 export async function GET(req: MedusaRequest, res: MedusaResponse) {
   const salesChannelId = marketContextStorage.getStore()?.sales_channel_id;
@@ -59,17 +61,20 @@ export async function GET(req: MedusaRequest, res: MedusaResponse) {
     },
   });
 
-  const productCountRows = await db<ProductCountRow>("seller_seller_product_product as sspp")
-    .select("sspp.seller_id")
-    .countDistinct<ProductCountRow>({ product_count: "sspp.product_id" })
-    .innerJoin("product as p", "sspp.product_id", "p.id")
+  // Mercur 2 link table is `product_seller` (not the old Mercur 1.5 `seller_seller_product_product`).
+  // Note: cast to ProductCountRow[] required — Knex countDistinct generic is single-row but
+  // groupBy returns multiple rows.
+  const productCountRows = (await db("product_seller as ps")
+    .select("ps.seller_id")
+    .countDistinct({ product_count: "ps.product_id" })
+    .innerJoin("product as p", "ps.product_id", "p.id")
     .innerJoin("product_sales_channel as psc", "p.id", "psc.product_id")
     .where("psc.sales_channel_id", salesChannelId)
-    .whereIn("sspp.seller_id", sellerIds)
+    .whereIn("ps.seller_id", sellerIds)
     .whereNull("p.deleted_at")
     .whereNull("psc.deleted_at")
-    .whereNull("sspp.deleted_at")
-    .groupBy("sspp.seller_id");
+    .whereNull("ps.deleted_at")
+    .groupBy("ps.seller_id")) as ProductCountRow[];
 
   const productCountBySellerId = new Map(
     productCountRows.map((row) => [row.seller_id, Number(row.product_count)])
