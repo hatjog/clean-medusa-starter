@@ -51,7 +51,7 @@ async function probeRateLimiting(): Promise<GateResult> {
   // In a real probe we'd hit /store/products 200x; here we return pass
   // if the rate-limit module is loadable.
   try {
-    await import("./rate-limit-token-bucket.js")
+    await import("./rate-limit-token-bucket")
     return {
       gate: "rate_limiting",
       status: "pass",

@@ -105,7 +105,7 @@ export async function setState(
   }
 
   // Cache invalidate (lazy import to avoid cycles).
-  const { invalidateOnFlip } = await import("./cache-invalidate-on-flag-flip.js")
+  const { invalidateOnFlip } = await import("./cache-invalidate-on-flag-flip")
   const cache_invalidate_outcome = await invalidateOnFlip(from, to)
 
   _currentState = to
@@ -144,7 +144,7 @@ async function readSmokeGateRatifiedVerdict(): Promise<
 > {
   // Read from in-memory ratification store (Story 8.7).
   try {
-    const mod = await import("./phase-b-smoke-gate-aggregator.js")
+    const mod = await import("./phase-b-smoke-gate-aggregator")
     const r = mod.getLastRatification()
     return r ? r.verdict : null
   } catch {
