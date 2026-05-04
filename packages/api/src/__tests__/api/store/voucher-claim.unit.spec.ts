@@ -128,6 +128,7 @@ beforeEach(() => {
 
 afterEach(() => {
   delete process.env.JWT_SECRET
+  delete process.env.GP_VOUCHER_CLAIM_HMAC_SECRET
 })
 
 // ---------------------------------------------------------------------------
@@ -306,6 +307,20 @@ describe("POST /store/vouchers/:code/claim", () => {
     await POST(req2 as never, res2 as never)
     expect(res2._status).toBe(409)
     expect((res2._body as Record<string, unknown>).type).toBe("replay_mismatch")
+  })
+
+  it("AC3 — first request with arbitrary idempotency key → 409 replay_mismatch", async () => {
+    const req = makeReq(IDLE_FIXTURE.code, {
+      recipient_session: "session-abc",
+      claimed_at: "2026-05-04T12:00:00Z",
+      idempotency_key: "550e8400-e29b-41d4-a716-446655440000",
+    })
+    const res = makeRes()
+
+    await POST(req as never, res as never)
+
+    expect(res._status).toBe(409)
+    expect((res._body as Record<string, unknown>).type).toBe("replay_mismatch")
   })
 
   it("AC3 — audit log records replay_tampered outcome", async () => {

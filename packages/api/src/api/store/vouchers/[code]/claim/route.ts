@@ -156,6 +156,22 @@ export async function POST(
     return
   }
 
+  if (!verifyBinding(idempotencyKey, expectedBinding)) {
+    await padToFloor(startedAt)
+    _auditLog.push({
+      idempotency_key: idempotencyKey,
+      code,
+      ip,
+      outcome: "replay_tampered",
+      occurred_at: new Date().toISOString(),
+    })
+    res.status(409).json({
+      type: "replay_mismatch",
+      message: "Idempotency binding mismatch — replay rejected.",
+    })
+    return
+  }
+
   // --- Idempotency binding check ---
   const existingBinding = _bindingStore.get(idempotencyKey)
 
