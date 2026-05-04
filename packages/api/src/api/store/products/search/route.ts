@@ -37,13 +37,21 @@ function buildEmptyResponse(body: SearchBody, processingTimeMS = 0) {
 
 export async function POST(req: MedusaRequest, res: MedusaResponse) {
   const salesChannelId = marketContextStorage.getStore()?.sales_channel_id;
-  const raw = req.validatedBody as SearchBody;
+  const raw = ((req.validatedBody ?? req.body ?? {}) as Partial<SearchBody>);
   const page = typeof raw.page === "number" && !isNaN(raw.page) && raw.page >= 0 ? raw.page : 0;
   const hitsPerPage =
     typeof raw.hitsPerPage === "number" && !isNaN(raw.hitsPerPage) && raw.hitsPerPage > 0
       ? raw.hitsPerPage
       : 20;
-  const body: SearchBody = { ...raw, page, hitsPerPage };
+  const body: SearchBody = {
+    query: typeof raw.query === "string" ? raw.query : "",
+    page,
+    hitsPerPage,
+    ...(raw.currency_code ? { currency_code: raw.currency_code } : {}),
+    ...(raw.region_id ? { region_id: raw.region_id } : {}),
+    ...(raw.customer_id ? { customer_id: raw.customer_id } : {}),
+    ...(raw.customer_group_id ? { customer_group_id: raw.customer_group_id } : {}),
+  };
   const startedAt = Date.now();
 
   if (!salesChannelId) {
