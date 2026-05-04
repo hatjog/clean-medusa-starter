@@ -20,11 +20,11 @@ filed for tracking).
 | **Target** | `@mercurjs/core@2.1.1` |
 | **Author** | GP Sprint 1 (Story 1.10 Robert Opcja 1, 2026-05-02) |
 | **Story** | `v160-1-7-1-mercur-1-2-schema-port-physical-drops` (Layer B) |
-| **Bug surface** | Storefront `/store/products` returns 500 (MikroORM CriteriaNode crash) when `applySellerVisibilityFilter` injects `filterableFields.seller.status` because `Product.seller` is a module link, not direct ORM relation |
-| **Fix** | Rewrite middleware async: pre-fetch open seller IDs via `query.graph` link traversal, then filter by `seller.id $in [...]` |
+| **Bug surface** | Storefront `/store/products` returns 500 (MikroORM CriteriaNode crash) when `applySellerVisibilityFilter` injects `filterableFields.seller.status` (or even `seller_id`) because `Product.seller` is a module link, not direct ORM relation |
+| **Fix** | Rewrite middleware async: pre-fetch open seller IDs + their products via `query.graph` link traversal, collect visible product IDs, filter by `Product.id $in [...]`. Refined in cleanup-11 (Story 8.8 AC6) — earlier seller_id filter still crashed CriteriaNode. |
 | **Upstream issue** | TODO — to be filed at `mercurjs/mercur` (story `v160-cleanup-2`) |
 | **Expiry condition** | Remove when Mercur ≥ 2.2.0 ships native fix; verify by reverting patch + running `__tests__/patches/mercur-core-visibility-filter.integration.spec.ts` |
-| **Last verified** | 2026-05-04 (story v160-cleanup-2 docs phase) |
+| **Last verified** | 2026-05-04 (story v160-8-8 AC6 live E2E — `/store/products` returns 10 products via patched filter) |
 | **Regression test** | `__tests__/patches/mercur-core-visibility-filter.integration.spec.ts` (TODO — author in cleanup-2 execution phase) |
 
 ---

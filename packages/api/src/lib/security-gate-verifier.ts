@@ -8,6 +8,8 @@
  * @see FR42 / FR43 / AR45 / AR46
  */
 
+import * as rateLimitModule from "./rate-limit-token-bucket"
+
 export type SecurityGate =
   | "rate_limiting"
   | "captcha"
@@ -51,7 +53,7 @@ async function probeRateLimiting(): Promise<GateResult> {
   // In a real probe we'd hit /store/products 200x; here we return pass
   // if the rate-limit module is loadable.
   try {
-    await import("./rate-limit-token-bucket")
+    void rateLimitModule
     return {
       gate: "rate_limiting",
       status: "pass",
