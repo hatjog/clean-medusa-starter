@@ -5,6 +5,9 @@
  */
 
 import type { MedusaRequest, MedusaResponse } from "@medusajs/framework/http"
+import { ContainerRegistrationKeys } from "@medusajs/framework/utils"
+import type { Knex } from "knex"
+
 import {
   ALLOWED_TRANSITIONS,
   getAuditTrail,
@@ -45,11 +48,13 @@ export async function POST(
   const triggered_by =
     (req as unknown as { auth_context?: { actor_id?: string } }).auth_context
       ?.actor_id ?? "admin"
+  const db = req.scope.resolve(ContainerRegistrationKeys.PG_CONNECTION) as Knex
   try {
     const result = await setState(body.to_state, {
       triggered_by,
       admin_note: body.admin_note,
       bypass_smoke_gate: body.override_gate === true,
+      db,
     })
     res.json(result)
   } catch (err) {

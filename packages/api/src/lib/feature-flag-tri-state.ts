@@ -96,6 +96,13 @@ export type SetStateContext = {
   admin_note?: string
   smoke_gate_ref?: string
   bypass_smoke_gate?: boolean
+  /**
+   * Story v160-cleanup-15f — pass Knex instance from req.scope so smoke-gate
+   * ratification verdict is read from DB (durable) instead of process-local
+   * memory. When omitted AND bypass_smoke_gate=false AND transition requires
+   * gate, setState throws SmokeGateBlocked.
+   */
+  db?: import("knex").Knex | null
 }
 
 export type SetStateResult = {
@@ -126,7 +133,7 @@ export async function setState(
     (from === "off" && to === "shadow") ||
     (from === "shadow" && to === "on")
   if (requiresGate && !ctx.bypass_smoke_gate) {
-    const ratified = await readSmokeGateRatifiedVerdict()
+    const ratified = await readSmokeGateRatifiedVerdict(ctx.db ?? null)
     if (ratified !== "pass") {
       throw new Error(
         `SmokeGateBlocked: Phase B smoke gate verdict=${ratified ?? "unratified"}; transition ${from}->${to} blocked`,
@@ -169,12 +176,15 @@ export function getLastTransitionInfo(): {
   return { last_transitioned_at: _lastTransitionAt, last_admin: _lastAdmin }
 }
 
-async function readSmokeGateRatifiedVerdict(): Promise<
-  "pass" | "fail" | null
-> {
-  // Read from in-memory ratification store (Story 8.7).
+async function readSmokeGateRatifiedVerdict(
+  db: import("knex").Knex | null,
+): Promise<"pass" | "fail" | null> {
+  // Story v160-cleanup-15f — AC2: read from DB (durable). When db is null
+  // (no caller passed it), return null → transition blocks unless caller
+  // sets bypass_smoke_gate=true.
+  if (!db) return null
   try {
-    const r = phaseBAggregator.getLastRatification()
+    const r = await phaseBAggregator.getLastRatification(db)
     return r ? r.verdict : null
   } catch {
     return null
