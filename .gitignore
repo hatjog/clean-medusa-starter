@@ -24,3 +24,11 @@ build
 !.yarn/versions
 
 .medusa
+
+# Root-level symlinks created by some IDE/tool setups (canonical symlinks live in src/)
+/api
+/jobs
+/lib
+/modules
+/subscribers
+/workflows
