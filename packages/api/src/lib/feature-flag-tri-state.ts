@@ -1,5 +1,7 @@
 /**
  * Story v160-8-3: Multi-vendor feature flag tri-state OFF/SHADOW/ON.
+ * Story v160-cleanup-15e: Single flag oracle — ALL backend flag readers
+ *   route through this module. No env-literal reads outside this file.
  *
  * @see specs/adr/ADR-070-feature-flag-tri-state.md
  * @see specs/operator/flag-flip-runbook.md
@@ -46,6 +48,31 @@ export async function getCurrentState(): Promise<MultiVendorFlagState> {
     return envOverride
   }
   return "off"
+}
+
+/**
+ * Single flag oracle — Story v160-cleanup-15e (CRIT-1 fix).
+ *
+ * Returns "on" | "off" | "unknown" mapped from the tri-state singleton.
+ * Replaces all env-literal `process.env.MULTI_VENDOR_PRICING_ENABLED` reads
+ * in backend production code. Callers treat "shadow" as "on" for gating.
+ *
+ * "unknown" is returned only when getCurrentState() throws unexpectedly;
+ * callers MUST treat "unknown" as "off" (fail-closed).
+ *
+ * v1.7.0 note: upgrade singleton to DB-backed pubsub for multi-instance
+ * deployments; this function signature stays stable.
+ */
+export async function getFlagState(
+  _name: "multi_vendor_pdp",
+): Promise<"on" | "off" | "unknown"> {
+  try {
+    const state = await getCurrentState()
+    if (state === "on" || state === "shadow") return "on"
+    return "off"
+  } catch {
+    return "unknown"
+  }
 }
 
 export function validateTransition(
