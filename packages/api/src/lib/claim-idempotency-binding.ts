@@ -21,10 +21,13 @@
 import { createHmac, timingSafeEqual } from "node:crypto"
 
 function getSecret(): Buffer {
-  const s = process.env.JWT_SECRET ?? ""
+  const s =
+    process.env.GP_VOUCHER_CLAIM_HMAC_SECRET ??
+    process.env.JWT_SECRET ??
+    ""
   if (!s) {
     throw new Error(
-      "claim-idempotency-binding: JWT_SECRET env var is required but not set"
+      "claim-idempotency-binding: GP_VOUCHER_CLAIM_HMAC_SECRET or JWT_SECRET env var is required but not set"
     )
   }
   return Buffer.from(s, "utf8")
