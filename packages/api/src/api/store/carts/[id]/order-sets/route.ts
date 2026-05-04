@@ -2,12 +2,14 @@
  * GET /store/carts/:id/order-sets
  *
  * Story v160-cleanup-12e — order_set projector on read boundary (AR45).
+ * Story v160-cleanup-15e — CRIT-1 fix: replaced env-literal flag read with
+ *   singleton `getFlagState` from feature-flag-tri-state (single oracle).
  *
- * When MULTI_VENDOR_PRICING_ENABLED=true, returns per-vendor line-item splits
- * computed from the cart's line items using `metadata.selected_seller_id`.
- * This is a pure read projection — no DB write occurs. Write-side order_set
- * rows are created by Mercur's `completeCartWithSplitOrdersWorkflow` at
- * cart completion.
+ * When multi_vendor_pdp flag is "on" or "shadow", returns per-vendor
+ * line-item splits computed from the cart's line items using
+ * `metadata.selected_seller_id`. This is a pure read projection — no DB
+ * write occurs. Write-side order_set rows are created by Mercur's
+ * `completeCartWithSplitOrdersWorkflow` at cart completion.
  *
  * Flag OFF or single-vendor cart: returns empty splits array (AC4 compliance).
  *
@@ -30,7 +32,7 @@ import type { MedusaRequest, MedusaResponse } from "@medusajs/framework/http"
 import { ContainerRegistrationKeys } from "@medusajs/framework/utils"
 import type { Knex } from "knex"
 
-import { isMultiVendorPricingEnabled } from "../../../../../lib/multi-vendor-resolver"
+import { getFlagState } from "../../../../../lib/feature-flag-tri-state"
 
 type CartLineItemRow = {
   id: string
@@ -66,7 +68,9 @@ export async function GET(
 ): Promise<void> {
   const cartId = (req.params as Record<string, string>).id
 
-  if (!isMultiVendorPricingEnabled()) {
+  // Uses singleton oracle (feature-flag-tri-state) NOT env literal — CRIT-1 fix.
+  const flagState = await getFlagState("multi_vendor_pdp")
+  if (flagState !== "on") {
     res.json({ order_set_splits: [] })
     return
   }

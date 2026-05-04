@@ -2,9 +2,11 @@
  * Multi-vendor metadata middleware for /store/products and /store/products/:id
  *
  * Story: v160-cleanup-12a — backend /store/products multi-vendor resolver
+ * Story: v160-cleanup-15e — CRIT-1 fix: replaced env-literal flag read with
+ *   singleton `getFlagState` from feature-flag-tri-state (single oracle).
  *
- * When MULTI_VENDOR_PRICING_ENABLED=true, this middleware intercepts the
- * outgoing JSON response and augments each product with:
+ * When multi_vendor_pdp flag is "on" or "shadow", this middleware intercepts
+ * the outgoing JSON response and augments each product with:
  *   - vendor_count: number (open sellers count)
  *   - lowest_price_pln: number | null
  *   - vendor_offers: VendorOfferOption[]
@@ -14,15 +16,14 @@
  *
  * @see src/api/middlewares.ts — customerResponseSanitizerMiddleware for pattern reference
  * @see src/lib/multi-vendor-resolver.ts — resolver implementation
+ * @see src/lib/feature-flag-tri-state.ts — single flag oracle (CRIT-1)
  */
 
 import type { MedusaNextFunction, MedusaRequest, MedusaResponse } from "@medusajs/framework/http"
 import { ContainerRegistrationKeys } from "@medusajs/framework/utils"
 import type { Knex } from "knex"
-import {
-  augmentProductsWithVendorMeta,
-  isMultiVendorPricingEnabled,
-} from "../../../lib/multi-vendor-resolver"
+import { augmentProductsWithVendorMeta } from "../../../lib/multi-vendor-resolver"
+import { getFlagState } from "../../../lib/feature-flag-tri-state"
 
 type ProductsResponseBody = {
   products?: Array<Record<string, unknown>>
@@ -43,8 +44,10 @@ export async function vendorMetaMiddleware(
   res: MedusaResponse,
   next: MedusaNextFunction,
 ): Promise<void> {
-  // Short-circuit: flag OFF → pass through, zero overhead
-  if (!isMultiVendorPricingEnabled()) {
+  // Short-circuit: flag OFF/unknown → pass through, zero overhead.
+  // Uses singleton oracle (feature-flag-tri-state) NOT env literal — CRIT-1 fix.
+  const flagState = await getFlagState("multi_vendor_pdp")
+  if (flagState !== "on") {
     return next()
   }
 
