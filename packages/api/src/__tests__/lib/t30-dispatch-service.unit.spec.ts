@@ -13,6 +13,7 @@ import {
   fetchEligibleVendors,
   isFixtureMode,
   isWindowOpen,
+  NotificationProviderNotReadyError,
   resolveFlagFlipDate,
   T30DispatcherFixtureModeError,
 } from "../../lib/t30-dispatch-service"
@@ -22,6 +23,14 @@ describe("t30-dispatch-service", () => {
     delete process.env.GP_T30_DEV_FIXTURE_VENDORS_JSON
     delete process.env.GP_T30_REAL_VENDOR_SOURCE_ENABLED
     delete process.env.GP_FLAG_FLIP_DATE
+    delete process.env.GP_VENDOR_NOTIFICATIONS_ENFORCE_PROVIDER_READY
+    delete process.env.GP_VENDOR_NOTIFICATIONS_PROVIDER_READY
+    delete process.env.RESEND_API_KEY
+    delete process.env.SENDGRID_API_KEY
+    delete process.env.SMTP_URL
+    delete process.env.SMTP_HOST
+    delete process.env.SMTP_USER
+    delete process.env.SMTP_PASS
     delete process.env.NODE_ENV
   })
 
@@ -177,9 +186,34 @@ describe("t30-dispatch-service", () => {
     it("AC3: does NOT throw in production when real source enabled", async () => {
       process.env.NODE_ENV = "production"
       process.env.GP_T30_REAL_VENDOR_SOURCE_ENABLED = "true"
+      process.env.RESEND_API_KEY = "re_live_123"
 
       const result = await dispatchT30Notifications({
         triggered_by: "admin_prod_real",
+        flag_flip_iso: "2026-06-01",
+        logger: silentLogger,
+      })
+      expect(result.triggered).toBe(0)
+    })
+
+    it("throws NotificationProviderNotReadyError when enforcement is enabled without provider", async () => {
+      process.env.GP_VENDOR_NOTIFICATIONS_ENFORCE_PROVIDER_READY = "true"
+
+      await expect(
+        dispatchT30Notifications({
+          triggered_by: "admin_stage",
+          flag_flip_iso: "2026-06-01",
+          logger: silentLogger,
+        }),
+      ).rejects.toThrow(NotificationProviderNotReadyError)
+    })
+
+    it("does not throw when enforcement is enabled and provider is configured", async () => {
+      process.env.GP_VENDOR_NOTIFICATIONS_ENFORCE_PROVIDER_READY = "true"
+      process.env.RESEND_API_KEY = "re_stage_123"
+
+      const result = await dispatchT30Notifications({
+        triggered_by: "admin_stage_ready",
         flag_flip_iso: "2026-06-01",
         logger: silentLogger,
       })

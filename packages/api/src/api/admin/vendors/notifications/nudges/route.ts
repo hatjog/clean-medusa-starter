@@ -25,6 +25,10 @@ import {
   type NudgeCadenceStep,
 } from "../../../../../modules/vendor-notifications/email-templates/nudge-cadence/i18n"
 import { extractActorIdOrThrow } from "../../../../../lib/capability-check"
+import {
+  assertNotificationProviderReady,
+  NotificationProviderNotReadyError,
+} from "../../../../../lib/vendor-notification-provider-readiness"
 
 type TriggerRequestBody = {
   step?: NudgeCadenceStep
@@ -157,6 +161,19 @@ export async function POST(
       vendors: eligible,
     })
     return
+  }
+
+  try {
+    assertNotificationProviderReady()
+  } catch (err) {
+    if (err instanceof NotificationProviderNotReadyError) {
+      res.status(503).json({
+        code: err.code,
+        message: err.message,
+      })
+      return
+    }
+    throw err
   }
 
   const auditLogIds: string[] = []
