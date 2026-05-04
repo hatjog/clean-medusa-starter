@@ -44,6 +44,7 @@ import { ContainerRegistrationKeys } from "@medusajs/framework/utils"
 import { randomUUID } from "node:crypto"
 
 import { emitFlagPropagationT1, emitFlagPropagationT2 } from "../../../../../lib/instrumentation/flag-propagation"
+import { extractActorIdOrThrow } from "../../../../../lib/capability-check"
 
 type PauseRequestBody = {
   reason?: string
@@ -77,16 +78,6 @@ type Logger = {
   error?: (message: string, meta?: Record<string, unknown>) => void
 }
 
-/**
- * Minimal authn/authz extraction. Real Mercur admin auth middleware writes the
- * actor into `req.auth_context`; we fall back to `'unknown_admin'` only in
- * test environments where auth middleware is bypassed.
- */
-const extractActorId = (req: MedusaRequest): string => {
-  const ctx = (req as { auth_context?: { actor_id?: string } }).auth_context
-  return ctx?.actor_id ?? "unknown_admin"
-}
-
 const extractMarketId = (req: MedusaRequest): string => {
   // Mercur convention: market id is supplied via `X-Gp-Market-Id` header (Step 5
   // Supplement L1721) OR derived from the seller row in the same tx (fallback).
@@ -113,7 +104,13 @@ export async function POST(req: MedusaRequest, res: MedusaResponse): Promise<voi
     return
   }
 
-  const actorId = extractActorId(req)
+  let actorId: string
+  try {
+    actorId = extractActorIdOrThrow(req)
+  } catch {
+    res.status(401).json({ code: "UNAUTHORIZED", message: "Valid admin session required" })
+    return
+  }
   const marketId = extractMarketId(req)
   const logger = (req.scope.resolve(ContainerRegistrationKeys.LOGGER) as Logger | undefined) ?? {}
 

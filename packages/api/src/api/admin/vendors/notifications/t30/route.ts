@@ -24,15 +24,12 @@ import {
   T30DispatcherFixtureModeError,
   type T30Logger,
 } from "../../../../../lib/t30-dispatch-service"
+import { extractActorIdOrThrow } from "../../../../../lib/capability-check"
 
 type TriggerRequestBody = {
   dry_run?: boolean
   vendor_ids?: string[]
-}
-
-function extractActorId(req: MedusaRequest): string {
-  const ctx = (req as { auth_context?: { actor_id?: string } }).auth_context
-  return ctx?.actor_id ?? "unknown_admin"
+  override?: boolean
 }
 
 export async function POST(
@@ -41,7 +38,14 @@ export async function POST(
 ): Promise<void> {
   const body = (req.body ?? {}) as TriggerRequestBody
   const dryRun = body.dry_run === true
-  const triggeredBy = extractActorId(req)
+
+  let triggeredBy: string
+  try {
+    triggeredBy = extractActorIdOrThrow(req)
+  } catch {
+    res.status(401).json({ code: "UNAUTHORIZED", message: "Valid admin session required" })
+    return
+  }
 
   const logger =
     (req.scope.resolve(ContainerRegistrationKeys.LOGGER) as T30Logger | undefined) ??

@@ -24,11 +24,13 @@ import {
   type NudgeCadenceLocale,
   type NudgeCadenceStep,
 } from "../../../../../modules/vendor-notifications/email-templates/nudge-cadence/i18n"
+import { extractActorIdOrThrow } from "../../../../../lib/capability-check"
 
 type TriggerRequestBody = {
   step?: NudgeCadenceStep
   dry_run?: boolean
   vendor_ids?: string[]
+  override?: boolean
 }
 
 type Logger = {
@@ -59,11 +61,6 @@ function resolveFlagFlipDate(): { iso: string | null } {
   const d = new Date(raw)
   if (Number.isNaN(d.getTime())) return { iso: null }
   return { iso: raw }
-}
-
-function extractActorId(req: MedusaRequest): string {
-  const ctx = (req as { auth_context?: { actor_id?: string } }).auth_context
-  return ctx?.actor_id ?? "unknown_admin"
 }
 
 /**
@@ -121,7 +118,14 @@ export async function POST(
   const body = (req.body ?? {}) as TriggerRequestBody
   const step = body.step
   const dryRun = body.dry_run === true
-  const triggeredBy = extractActorId(req)
+
+  let triggeredBy: string
+  try {
+    triggeredBy = extractActorIdOrThrow(req)
+  } catch {
+    res.status(401).json({ code: "UNAUTHORIZED", message: "Valid admin session required" })
+    return
+  }
 
   if (!step || !VALID_STEPS.has(step)) {
     res.status(400).json({
