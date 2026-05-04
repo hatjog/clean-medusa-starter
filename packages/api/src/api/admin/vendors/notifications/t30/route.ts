@@ -20,6 +20,7 @@ import {
   dispatchT30Notifications,
   fetchEligibleVendors,
   isWindowOpen,
+  NotificationProviderNotReadyError,
   resolveFlagFlipDate,
   T30DispatcherFixtureModeError,
   type T30Logger,
@@ -92,7 +93,10 @@ export async function POST(
       audit_log_ids: result.audit_log_ids,
     })
   } catch (err) {
-    if (err instanceof T30DispatcherFixtureModeError) {
+    if (
+      err instanceof T30DispatcherFixtureModeError ||
+      err instanceof NotificationProviderNotReadyError
+    ) {
       res.status(503).json({
         code: err.code,
         message: err.message,

@@ -27,6 +27,10 @@ import {
   type VendorNotificationLogEntry,
   type T30EmailLocale,
 } from "../modules/vendor-notifications"
+import {
+  assertNotificationProviderReady,
+  NotificationProviderNotReadyError,
+} from "./vendor-notification-provider-readiness"
 
 // ---------------------------------------------------------------------------
 // Shared types
@@ -71,6 +75,8 @@ export class T30DispatcherFixtureModeError extends Error {
     this.name = "T30DispatcherFixtureModeError"
   }
 }
+
+export { NotificationProviderNotReadyError }
 
 // ---------------------------------------------------------------------------
 // Internal helpers (also exported for use in the admin route)
@@ -176,6 +182,8 @@ export async function dispatchT30Notifications(
   if (process.env.NODE_ENV === "production" && isFixtureMode()) {
     throw new T30DispatcherFixtureModeError()
   }
+
+  assertNotificationProviderReady()
 
   const eligible = await fetchEligibleVendors(vendor_ids)
 
