@@ -19,7 +19,7 @@
 import knex, { Knex } from "knex";
 import { listSellerIdsForSalesChannel } from "../../lib/seller-market-scope";
 
-const PRODUCT_SELLER_TABLE = "product_seller";
+const PRODUCT_SELLER_LINK_TABLE = "product_product_seller_seller";
 const DATABASE_URL =
   process.env.DATABASE_URL ||
   "postgres://postgres:postgres@localhost:5432/gp_mercur";
@@ -92,9 +92,9 @@ describe("concurrent market isolation (AC4 — RLS cross-market leakage preventi
         id: sellerId,
         name: "Concurrent Test Seller",
         handle: sellerHandle,
-        store_status: "ACTIVE",
+        status: "open",
       });
-      await db(PRODUCT_SELLER_TABLE).insert({
+      await db(PRODUCT_SELLER_LINK_TABLE).insert({
         id: linkId,
         seller_id: sellerId,
         product_id: bonbeauty.productId,
@@ -159,7 +159,7 @@ describe("concurrent market isolation (AC4 — RLS cross-market leakage preventi
         // Confirm we actually ran MIN_CONCURRENT requests
         expect(results).toHaveLength(MIN_CONCURRENT);
       } finally {
-        await db(PRODUCT_SELLER_TABLE).where({ id: linkId }).delete();
+        await db(PRODUCT_SELLER_LINK_TABLE).where({ id: linkId }).delete();
         await db("seller").where({ id: sellerId }).delete();
       }
     },
@@ -177,10 +177,10 @@ describe("concurrent market isolation (AC4 — RLS cross-market leakage preventi
     const linkB = uid("mkt_b_link");
 
     await db("seller").insert([
-      { id: sellerA, name: "Market A Seller", handle: uid("mkt_a"), store_status: "ACTIVE" },
-      { id: sellerB, name: "Market B Seller", handle: uid("mkt_b"), store_status: "ACTIVE" },
+      { id: sellerA, name: "Market A Seller", handle: uid("mkt_a"), status: "open" },
+      { id: sellerB, name: "Market B Seller", handle: uid("mkt_b"), status: "open" },
     ]);
-    await db(PRODUCT_SELLER_TABLE).insert([
+    await db(PRODUCT_SELLER_LINK_TABLE).insert([
       { id: linkA, seller_id: sellerA, product_id: bonbeauty.productId },
       { id: linkB, seller_id: sellerB, product_id: bonevent.productId },
     ]);
@@ -212,7 +212,7 @@ describe("concurrent market isolation (AC4 — RLS cross-market leakage preventi
         }
       }
     } finally {
-      await db(PRODUCT_SELLER_TABLE).whereIn("id", [linkA, linkB]).delete();
+      await db(PRODUCT_SELLER_LINK_TABLE).whereIn("id", [linkA, linkB]).delete();
       await db("seller").whereIn("id", [sellerA, sellerB]).delete();
     }
   });

@@ -4,10 +4,7 @@ import {
   listSellerIdsForSalesChannel,
 } from "../../lib/seller-market-scope";
 
-// Mercur 2 uses `product_seller` link table.
-// Old Mercur 1.5 junction `seller_seller_product_product` does NOT exist in Mercur 2 schema.
-// Story v160-cleanup-1, AC3: fixtures ported to Mercur 2 link API.
-const PRODUCT_SELLER_TABLE = "product_seller";
+const PRODUCT_SELLER_LINK_TABLE = "product_product_seller_seller";
 
 const DATABASE_URL =
   process.env.DATABASE_URL ||
@@ -75,10 +72,9 @@ describe("seller market scoping", () => {
         id: sellerId,
         name: "Scoped Seller",
         handle: sellerHandle,
-        store_status: "ACTIVE",
+        status: "open",
       });
-      // Mercur 2: insert into product_seller (not seller_seller_product_product)
-      await db(PRODUCT_SELLER_TABLE).insert({
+      await db(PRODUCT_SELLER_LINK_TABLE).insert({
         id: linkId,
         seller_id: sellerId,
         product_id: bonbeauty.productId,
@@ -100,7 +96,7 @@ describe("seller market scoping", () => {
       expect(ownMarket.sellerIds).toContain(sellerId);
       expect(otherMarket.sellerIds).not.toContain(sellerId);
     } finally {
-      await db(PRODUCT_SELLER_TABLE).where({ id: linkId }).delete();
+      await db(PRODUCT_SELLER_LINK_TABLE).where({ id: linkId }).delete();
       await db("seller").where({ id: sellerId }).delete();
     }
   });
@@ -117,10 +113,9 @@ describe("seller market scoping", () => {
         id: sellerId,
         name: "Scoped Handle Seller",
         handle: sellerHandle,
-        store_status: "ACTIVE",
+        status: "open",
       });
-      // Mercur 2: insert into product_seller (not seller_seller_product_product)
-      await db(PRODUCT_SELLER_TABLE).insert({
+      await db(PRODUCT_SELLER_LINK_TABLE).insert({
         id: linkId,
         seller_id: sellerId,
         product_id: bonbeauty.productId,
@@ -141,7 +136,7 @@ describe("seller market scoping", () => {
         )
       ).resolves.toBeNull();
     } finally {
-      await db(PRODUCT_SELLER_TABLE).where({ id: linkId }).delete();
+      await db(PRODUCT_SELLER_LINK_TABLE).where({ id: linkId }).delete();
       await db("seller").where({ id: sellerId }).delete();
     }
   });
@@ -157,10 +152,9 @@ describe("seller market scoping", () => {
         id: sellerId,
         name: "Inactive Scoped Seller",
         handle: sellerHandle,
-        store_status: "INACTIVE",
+        status: "suspended",
       });
-      // Mercur 2: insert into product_seller (not seller_seller_product_product)
-      await db(PRODUCT_SELLER_TABLE).insert({
+      await db(PRODUCT_SELLER_LINK_TABLE).insert({
         id: linkId,
         seller_id: sellerId,
         product_id: bonbeauty.productId,
@@ -182,7 +176,7 @@ describe("seller market scoping", () => {
         )
       ).resolves.toBeNull();
     } finally {
-      await db(PRODUCT_SELLER_TABLE).where({ id: linkId }).delete();
+      await db(PRODUCT_SELLER_LINK_TABLE).where({ id: linkId }).delete();
       await db("seller").where({ id: sellerId }).delete();
     }
   });

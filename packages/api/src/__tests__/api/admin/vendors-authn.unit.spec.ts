@@ -23,7 +23,9 @@
 
 import { POST as lifecycleStatusPOST } from "../../../api/admin/vendors/[id]/lifecycle-status/route"
 import { POST as decisionPost } from "../../../api/admin/vendors/[id]/decision/route"
+import { GET as pauseGateDetailGET } from "../../../api/admin/vendors/[id]/pause-gate/route"
 import { GET as decisionsGet } from "../../../api/admin/vendors/decisions/route"
+import { GET as pauseGateListGET } from "../../../api/admin/vendors/pause-gate/route"
 import { POST as t30POST } from "../../../api/admin/vendors/notifications/t30/route"
 import { POST as nudgesPost } from "../../../api/admin/vendors/notifications/nudges/route"
 import { _resetRingBuffer, getRingBuffer } from "../../../lib/alert-emit"
@@ -133,21 +135,8 @@ describe("admin vendors AuthN — fail-closed extractActorIdOrThrow", () => {
 
     await lifecycleStatusPOST(req, res as any)
 
-    // With no auth_context: checkLifecycleOverrideCapability returns false
-    // and extractActorIdOrThrow would throw — but lifecycle-status only calls
-    // extractActorIdOrThrow inside the override=true path. Without override,
-    // it reads from DB fixture (pending_approval) and the transition may succeed
-    // or fail based on state machine. The 401 guard is at middleware layer.
-    // To test the extractActorIdOrThrow guard, we need override=true.
-    // This test verifies that override=true without auth_context → 403 (no capability).
-    const req2 = createReq({
-      authContext: undefined,
-      body: { to_status: "open", override: true },
-    })
-    const res2 = createRes()
-    await lifecycleStatusPOST(req2, res2 as any)
-    expect(res2.statusCode).toBe(403)
-    expect(res2.body).toMatchObject({ error: expect.stringContaining("capability") })
+    expect(res.statusCode).toBe(401)
+    expect(res.body).toMatchObject({ error: expect.stringContaining("Valid admin session") })
   })
 
   // AC5 test 2 — 401 invalid token (actor_id empty string)
@@ -418,10 +407,25 @@ describe("admin vendors AuthN — fail-closed extractActorIdOrThrow", () => {
   // AC5 test 4 — 200 admin happy path (lifecycle-status transition by valid admin)
   // pending_approval → suspended has no completeness requirement
   it("POST lifecycle-status → 200 for valid admin user (pending_approval → suspended)", async () => {
+    const sellerModuleService = createSellerModuleService([
+      {
+        id: "vendor_01",
+        handle: "salon-pending",
+        email: "pending@example.com",
+        status: "pending_approval",
+        metadata: {
+          gp: {
+            lifecycle_status: "pending_approval",
+          },
+        },
+      },
+    ])
+
     const req = createReq({
       authContext: { actor_id: "user_admin_01", actor_type: "user" },
       body: { to_status: "suspended" },
       params: { id: "vendor_01" },
+      scopeOverrides: { sellerModuleService },
     })
     const res = createRes()
 
@@ -434,6 +438,59 @@ describe("admin vendors AuthN — fail-closed extractActorIdOrThrow", () => {
       from_status: "pending_approval",
       to_status: "suspended",
     })
+    expect(sellerModuleService.update).toHaveBeenCalledWith(
+      "vendor_01",
+      expect.objectContaining({ status: "suspended" }),
+    )
+  })
+
+  it("POST lifecycle-status → 200 for suspended → open when current seller metadata is complete", async () => {
+    const sellerModuleService = createSellerModuleService([
+      {
+        id: "vendor_ready_01",
+        handle: "salon-ready",
+        email: "ready@example.com",
+        status: "suspended",
+        metadata: {
+          gp: {
+            lifecycle_status: "suspended",
+            lifecycle_decision: { decision: "opted_in" },
+            t30_sent_at: "2026-05-01T10:00:00.000Z",
+            nudges_completed: true,
+            jca_signed_at: "2026-05-02T10:00:00.000Z",
+            training_verified: true,
+          },
+        },
+      },
+    ])
+
+    const req = createReq({
+      authContext: { actor_id: "user_admin_01", actor_type: "user" },
+      body: { to_status: "open", admin_note: "resume after verification" },
+      params: { id: "vendor_ready_01" },
+      scopeOverrides: { sellerModuleService },
+    })
+    const res = createRes()
+
+    await lifecycleStatusPOST(req, res as any)
+
+    expect(res.statusCode).toBe(200)
+    expect(res.body).toMatchObject({
+      vendor_id: "vendor_ready_01",
+      from_status: "suspended",
+      to_status: "open",
+    })
+    expect(sellerModuleService.update).toHaveBeenCalledWith(
+      "vendor_ready_01",
+      expect.objectContaining({
+        status: "open",
+        metadata: expect.objectContaining({
+          gp: expect.objectContaining({
+            lifecycle_status: "open",
+          }),
+        }),
+      }),
+    )
   })
 
   // AC5 test 5 — 400 state machine bypass via current_metadata in body
@@ -469,10 +526,25 @@ describe("admin vendors AuthN — fail-closed extractActorIdOrThrow", () => {
 
   // AC5 test 7 — 200 override=true accepted for admin + alert emitted
   it("POST lifecycle-status override=true → 200 for admin + emits policy_override alert", async () => {
+    const sellerModuleService = createSellerModuleService([
+      {
+        id: "vendor_override_01",
+        handle: "salon-override",
+        email: "override@example.com",
+        status: "pending_approval",
+        metadata: {
+          gp: {
+            lifecycle_status: "pending_approval",
+          },
+        },
+      },
+    ])
+
     const req = createReq({
       authContext: { actor_id: "user_admin_01", actor_type: "user" },
       body: { to_status: "open", override: true, admin_note: "manual fix" },
       params: { id: "vendor_override_01" },
+      scopeOverrides: { sellerModuleService },
     })
     const res = createRes()
 
@@ -491,6 +563,88 @@ describe("admin vendors AuthN — fail-closed extractActorIdOrThrow", () => {
     expect(alert).toBeDefined()
     expect(alert?.severity).toBe("WARN")
     expect(alert?.context?.actor_id).toBe("user_admin_01")
+  })
+
+  it("GET /admin/vendors/pause-gate → 200 from live seller metadata with completeness", async () => {
+    const sellerModuleService = createSellerModuleService([
+      {
+        id: "vendor_pg_01",
+        handle: "salon-pg",
+        email: "pg@example.com",
+        status: "suspended",
+        metadata: {
+          gp: {
+            lifecycle_status: "suspended",
+            lifecycle_decision: { decision: "opted_in" },
+            t30_sent_at: "2026-05-01T10:00:00.000Z",
+            nudges_completed: true,
+            jca_signed_at: "2026-05-02T10:00:00.000Z",
+            training_verified: false,
+          },
+        },
+      },
+    ])
+
+    const req = createReq({
+      authContext: { actor_id: "user_admin_01", actor_type: "user" },
+      scopeOverrides: { sellerModuleService },
+    })
+    const res = createRes()
+
+    await pauseGateListGET(req, res as any)
+
+    expect(res.statusCode).toBe(200)
+    expect(res.body).toMatchObject({
+      total: 1,
+      vendors: [
+        expect.objectContaining({
+          id: "vendor_pg_01",
+          lifecycle_status: "suspended",
+          decision_status: "opted_in",
+          completeness: { complete: 4, total: 5 },
+        }),
+      ],
+    })
+  })
+
+  it("GET /admin/vendors/:id/pause-gate → 200 with allowed transitions from live status", async () => {
+    const sellerModuleService = createSellerModuleService([
+      {
+        id: "vendor_pg_detail_01",
+        handle: "salon-detail",
+        email: "detail@example.com",
+        status: "suspended",
+        metadata: {
+          gp: {
+            lifecycle_status: "suspended",
+            lifecycle_decision: { decision: "opted_in" },
+            t30_sent_at: "2026-05-01T10:00:00.000Z",
+            nudges_completed: true,
+            jca_signed_at: "2026-05-02T10:00:00.000Z",
+            training_verified: true,
+          },
+        },
+      },
+    ])
+
+    const req = createReq({
+      authContext: { actor_id: "user_admin_01", actor_type: "user" },
+      params: { id: "vendor_pg_detail_01" },
+      scopeOverrides: { sellerModuleService },
+    })
+    const res = createRes()
+
+    await pauseGateDetailGET(req, res as any)
+
+    expect(res.statusCode).toBe(200)
+    expect(res.body).toMatchObject({
+      vendor: expect.objectContaining({
+        id: "vendor_pg_detail_01",
+        lifecycle_status: "suspended",
+      }),
+      completeness: { complete: 5, total: 5 },
+      allowed_transitions: ["open", "terminated"],
+    })
   })
 })
 

@@ -93,24 +93,23 @@ export async function filterProductIdsByFilters(
   );
 
   // LEFT JOIN seller chain so we can:
-  //  (a) filter out SUSPENDED sellers
+  //  (a) filter out non-open sellers
   //  (b) optionally filter by seller rating (via review subquery)
   // Soft-deleted links / sellers are excluded via ON clause to preserve LEFT JOIN semantics.
-  // NOTE: Mercur 2 uses `product_seller` link table (not Mercur 1.5 `seller_seller_product_product`).
   query = query
-    .leftJoin("product_seller as ps", function () {
-      this.on("product.id", "=", "ps.product_id").andOnNull(
-        "ps.deleted_at"
+    .leftJoin("product_product_seller_seller as ppss", function () {
+      this.on("product.id", "=", "ppss.product_id").andOnNull(
+        "ppss.deleted_at"
       );
     })
     .leftJoin("seller", function () {
-      this.on("ps.seller_id", "=", "seller.id").andOnNull(
+      this.on("ppss.seller_id", "=", "seller.id").andOnNull(
         "seller.deleted_at"
       );
     })
     .where((builder) => {
       builder
-        .where("seller.store_status", "ACTIVE")
+        .where("seller.status", "open")
         .orWhereNull("seller.id");
     });
 
