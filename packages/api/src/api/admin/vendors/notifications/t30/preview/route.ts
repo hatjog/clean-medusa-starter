@@ -9,13 +9,7 @@
  */
 
 import type { MedusaRequest, MedusaResponse } from "@medusajs/framework/http"
-
-interface VendorRow {
-  id: string
-  handle: string
-  email: string
-  preferred_locale: "pl" | "en" | null
-}
+import { fetchEligibleVendors } from "../../../../../../lib/t30-dispatch-service"
 
 interface PreviewResponse {
   window_opens: string
@@ -46,20 +40,8 @@ function computeWindowOpens(flagFlipIso: string): string {
   return d.toISOString().slice(0, 10)
 }
 
-async function fetchEligibleVendors(): Promise<VendorRow[]> {
-  const fixture = process.env.GP_T30_DEV_FIXTURE_VENDORS_JSON
-  if (fixture) {
-    try {
-      return JSON.parse(fixture) as VendorRow[]
-    } catch {
-      return []
-    }
-  }
-  return []
-}
-
 export async function GET(
-  _req: MedusaRequest,
+  req: MedusaRequest,
   res: MedusaResponse,
 ): Promise<void> {
   const { iso, valid } = resolveFlagFlipDate()
@@ -73,7 +55,10 @@ export async function GET(
     return
   }
 
-  const vendors = await fetchEligibleVendors()
+  const vendors = await fetchEligibleVendors(
+    undefined,
+    req.scope as { resolve: (key: string) => unknown },
+  )
   const response: PreviewResponse = {
     window_opens: computeWindowOpens(iso),
     flag_flip_date: iso,

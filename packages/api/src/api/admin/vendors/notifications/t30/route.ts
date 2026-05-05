@@ -70,7 +70,10 @@ export async function POST(
   }
 
   if (dryRun) {
-    const eligible = await fetchEligibleVendors(body.vendor_ids)
+    const eligible = await fetchEligibleVendors(
+      body.vendor_ids,
+      req.scope as { resolve: (key: string) => unknown },
+    )
     res.status(200).json({
       dry_run: true,
       eligible_count: eligible.length,

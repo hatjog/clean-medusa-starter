@@ -31,6 +31,7 @@ import {
   _getAuditLog,
   POST,
 } from "../../../api/store/vouchers/[code]/claim/route"
+import { Modules } from "@medusajs/framework/utils"
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -39,18 +40,21 @@ import {
 function makeReq(
   code: string,
   body: Record<string, unknown> = {},
-  ip = "127.0.0.1"
+  ip = "127.0.0.1",
+  scope?: { resolve: (key: string) => unknown },
 ): {
   params: { code: string }
   body: Record<string, unknown>
   headers: Record<string, string>
   socket: { remoteAddress: string }
+  scope?: { resolve: (key: string) => unknown }
 } {
   return {
     params: { code },
     body,
     headers: {},
     socket: { remoteAddress: ip },
+    scope,
   }
 }
 
@@ -242,6 +246,36 @@ describe("POST /store/vouchers/:code/claim", () => {
     expect((res._body as Record<string, unknown>).seller_handle).toBe(
       IDLE_FIXTURE.seller_handle
     )
+  })
+
+  it("emits voucher.claimed after successful first claim", async () => {
+    const emit = jest.fn().mockResolvedValue(undefined)
+    const req = makeReq(
+      IDLE_FIXTURE.code,
+      validBody(),
+      "127.0.0.1",
+      {
+        resolve: (key: string) => {
+          if (key === Modules.EVENT_BUS) {
+            return { emit }
+          }
+          throw new Error(`unexpected resolve: ${key}`)
+        },
+      },
+    )
+    const res = makeRes()
+
+    await POST(req as never, res as never)
+
+    expect(emit).toHaveBeenCalledTimes(1)
+    expect(emit).toHaveBeenCalledWith({
+      name: "voucher.claimed",
+      data: {
+        voucher_id: IDLE_FIXTURE.code,
+        voucher_code: IDLE_FIXTURE.code,
+        claimed_at: (res._body as Record<string, unknown>).claimed_at,
+      },
+    })
   })
 
   it("AC1 — response does NOT expose recipient PII", async () => {
