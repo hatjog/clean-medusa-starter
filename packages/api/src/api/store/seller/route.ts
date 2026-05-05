@@ -61,20 +61,19 @@ export async function GET(req: MedusaRequest, res: MedusaResponse) {
     },
   });
 
-  // Mercur 2 link table is `product_seller` (not the old Mercur 1.5 `seller_seller_product_product`).
   // Note: cast to ProductCountRow[] required — Knex countDistinct generic is single-row but
   // groupBy returns multiple rows.
-  const productCountRows = (await db("product_seller as ps")
-    .select("ps.seller_id")
-    .countDistinct({ product_count: "ps.product_id" })
-    .innerJoin("product as p", "ps.product_id", "p.id")
+  const productCountRows = (await db("product_product_seller_seller as ppss")
+    .select("ppss.seller_id")
+    .countDistinct({ product_count: "ppss.product_id" })
+    .innerJoin("product as p", "ppss.product_id", "p.id")
     .innerJoin("product_sales_channel as psc", "p.id", "psc.product_id")
     .where("psc.sales_channel_id", salesChannelId)
-    .whereIn("ps.seller_id", sellerIds)
+    .whereIn("ppss.seller_id", sellerIds)
     .whereNull("p.deleted_at")
     .whereNull("psc.deleted_at")
-    .whereNull("ps.deleted_at")
-    .groupBy("ps.seller_id")) as ProductCountRow[];
+    .whereNull("ppss.deleted_at")
+    .groupBy("ppss.seller_id")) as ProductCountRow[];
 
   const productCountBySellerId = new Map(
     productCountRows.map((row) => [row.seller_id, Number(row.product_count)])

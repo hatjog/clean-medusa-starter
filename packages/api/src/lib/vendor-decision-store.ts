@@ -11,6 +11,7 @@ export type SellerRecord = {
   handle?: string | null
   email?: string | null
   name?: string | null
+  status?: string | null
   store_status?: string | null
   preferred_locale?: string | null
   metadata?: unknown
@@ -213,6 +214,19 @@ export function resolveLifecycleStatus(seller: SellerRecord): LifecycleStatus {
     return rawLifecycle
   }
 
+  const rawNativeStatus = typeof seller.status === "string"
+    ? seller.status.trim().toLowerCase()
+    : ""
+
+  if (
+    rawNativeStatus === "pending_approval" ||
+    rawNativeStatus === "open" ||
+    rawNativeStatus === "suspended" ||
+    rawNativeStatus === "terminated"
+  ) {
+    return rawNativeStatus
+  }
+
   const rawStoreStatus = typeof seller.store_status === "string"
     ? seller.store_status.trim().toUpperCase()
     : ""
@@ -263,6 +277,26 @@ export function resolvePreferredLocale(
   }
 
   return "pl"
+}
+
+export function buildLifecycleMetadataSnapshot(
+  seller: SellerRecord,
+): VendorMetadataSnapshot {
+  const gp = readSellerGpMetadata(seller)
+  const lifecycleDecision = readLifecycleDecision(seller)
+
+  return {
+    lifecycle_status: resolveLifecycleStatus(seller),
+    lifecycle_decision: lifecycleDecision
+      ? { decision: lifecycleDecision.decision }
+      : null,
+    jca_signed_at:
+      typeof gp.jca_signed_at === "string" ? gp.jca_signed_at : null,
+    training_verified: gp.training_verified === true,
+    t30_sent_at:
+      typeof gp.t30_sent_at === "string" ? gp.t30_sent_at : null,
+    nudges_completed: gp.nudges_completed === true,
+  }
 }
 
 export function buildDecisionListEntry(seller: SellerRecord): {

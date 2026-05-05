@@ -20,6 +20,12 @@ import {
   type VendorMetadataSnapshot,
 } from "../../../../../lib/vendor-lifecycle-state-machine"
 import {
+  buildLifecycleMetadataSnapshot,
+  getSellerById,
+  mergeSellerGpMetadata,
+  updateSeller,
+} from "../../../../../lib/vendor-decision-store"
+import {
   checkLifecycleOverrideCapability,
   extractActorIdOrThrow,
 } from "../../../../../lib/capability-check"
@@ -48,6 +54,14 @@ export async function POST(
   const { id } = req.params as { id: string }
   const body = (req.body ?? {}) as Partial<TransitionBody>
 
+  let actorId: string
+  try {
+    actorId = extractActorIdOrThrow(req)
+  } catch {
+    res.status(401).json({ error: "Valid admin session required" })
+    return
+  }
+
   if (!body.to_status) {
     res.status(400).json({ error: "to_status is required" })
     return
@@ -75,12 +89,6 @@ export async function POST(
     }
 
     // Emit policy_override alert for audit trail
-    let actorId = "unknown"
-    try {
-      actorId = extractActorIdOrThrow(req)
-    } catch {
-      // Auth context may be absent in fixture mode — log as unknown
-    }
     emitStructuredAlert({
       severity: "WARN",
       code: "policy_override",
@@ -94,11 +102,17 @@ export async function POST(
     })
   }
 
-  // v1.6.0 dev impl: read from fixture defaults (real DB read deferred).
-  // current_metadata has been rejected above — use safe default.
-  const meta: VendorMetadataSnapshot = {
-    lifecycle_status: "pending_approval",
+  const seller = await getSellerById(
+    req.scope as { resolve: (key: string) => unknown },
+    id,
+  )
+
+  if (!seller) {
+    res.status(404).json({ error: `Vendor ${id} was not found` })
+    return
   }
+
+  const meta: VendorMetadataSnapshot = buildLifecycleMetadataSnapshot(seller)
 
   const fromStatus = meta.lifecycle_status
   const toStatus = body.to_status
@@ -110,6 +124,29 @@ export async function POST(
       .json({ error: result.reason ?? "Invalid transition" })
     return
   }
+
+  const changedAt = new Date().toISOString()
+  const metadata = mergeSellerGpMetadata(seller, {
+    lifecycle_status: toStatus,
+    lifecycle_last_action_at: changedAt,
+    lifecycle_last_transition: {
+      from_status: fromStatus,
+      to_status: toStatus,
+      changed_at: changedAt,
+      changed_by: actorId,
+      admin_note: body.admin_note?.trim() ?? null,
+      override: body.override === true,
+    },
+  })
+
+  await updateSeller(
+    req.scope as { resolve: (key: string) => unknown },
+    id,
+    {
+      status: toStatus,
+      metadata,
+    },
+  )
 
   const auditLogId = `lifecycle_transition_${id}_${Date.now()}`
 

@@ -6,8 +6,13 @@ import type { MedusaRequest, MedusaResponse } from "@medusajs/framework/http"
 import {
   getCompletenessChecklist,
   type LifecycleStatus,
-  type VendorMetadataSnapshot,
 } from "../../../../lib/vendor-lifecycle-state-machine"
+import { extractActorIdOrThrow } from "../../../../lib/capability-check"
+import {
+  buildDecisionListEntry,
+  buildLifecycleMetadataSnapshot,
+  listSellers,
+} from "../../../../lib/vendor-decision-store"
 
 type PauseGateVendor = {
   id: string
@@ -26,24 +31,22 @@ type ListResponse = {
   limit: number
 }
 
-function loadDevFixtureVendors(): Array<
-  PauseGateVendor & { _meta: VendorMetadataSnapshot }
-> {
-  const raw = process.env.GP_PAUSE_GATE_DEV_FIXTURE_VENDORS_JSON
-  if (!raw) return []
-  try {
-    const parsed = JSON.parse(raw)
-    if (!Array.isArray(parsed)) return []
-    return parsed
-  } catch {
-    return []
-  }
-}
-
 export async function GET(
   req: MedusaRequest,
   res: MedusaResponse<ListResponse>,
 ): Promise<void> {
+  try {
+    extractActorIdOrThrow(req)
+  } catch {
+    res.status(401).json({
+      vendors: [],
+      total: 0,
+      page: 1,
+      limit: 25,
+    })
+    return
+  }
+
   const { status, completeness, search, page, limit } = req.query as {
     status?: LifecycleStatus | "all"
     completeness?: "complete" | "incomplete"
@@ -58,10 +61,16 @@ export async function GET(
     Math.max(1, Number.parseInt(limit ?? "25", 10) || 25),
   )
 
-  let vendors = loadDevFixtureVendors().map((v) => {
-    const checklist = getCompletenessChecklist(v._meta)
+  let vendors = (await listSellers(
+    req.scope as { resolve: (key: string) => unknown },
+  )).map((seller) => {
+    const entry = buildDecisionListEntry(seller)
+    const checklist = getCompletenessChecklist(
+      buildLifecycleMetadataSnapshot(seller),
+    )
+
     return {
-      ...v,
+      ...entry,
       completeness: { complete: checklist.complete, total: checklist.total },
     }
   })
@@ -91,13 +100,7 @@ export async function GET(
 
   const total = vendors.length
   const offset = (pageNum - 1) * limitNum
-  const paged = vendors.slice(offset, offset + limitNum).map((v) => {
-    const { _meta: _omit, ...rest } = v as PauseGateVendor & {
-      _meta: VendorMetadataSnapshot
-    }
-    void _omit
-    return rest
-  })
+  const paged = vendors.slice(offset, offset + limitNum)
 
   res.json({
     vendors: paged,

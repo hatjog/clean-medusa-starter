@@ -48,7 +48,7 @@ describe('upsertSeller — initial seed (fresh vendor)', () => {
     // config_wins fields present
     expect(createArg.handle).toBe('kremidotyk')
     expect(createArg.email).toBe('kontakt@kremidotyk.pl')
-    expect(createArg.store_status).toBe('ACTIVE')
+    expect(createArg.status).toBe('open')
 
     // seed_if_empty fields written
     expect(createArg.metadata.gp.description).toBe('Masaże ciała')

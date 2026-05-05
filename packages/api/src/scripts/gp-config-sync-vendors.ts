@@ -109,7 +109,7 @@ type VendorProductsFile = {
 type MarketScopedSellerRow = {
   id: string
   handle: string | null
-  store_status: string | null
+  status: string | null
 }
 
 // ---- Utilities ----
@@ -232,18 +232,17 @@ function buildSellerProductLinkId(sellerId: string, productId: string): string {
   return `spl_${sellerId.slice(-8)}_${productId.slice(-8)}_${ts}_${entropy}`
 }
 
-// Mercur 2 link table is `product_seller` (not Mercur 1.5 `seller_seller_product_product`).
 async function upsertSellerProductLinkViaDb(
   db: any,
   sellerId: string,
   productId: string
 ): Promise<DbLinkOutcome> {
-  const existing = await db("product_seller")
+  const existing = await db("product_product_seller_seller")
     .where({ seller_id: sellerId, product_id: productId })
     .first()
 
   if (!existing) {
-    await db("product_seller").insert({
+    await db("product_product_seller_seller").insert({
       id: buildSellerProductLinkId(sellerId, productId),
       seller_id: sellerId,
       product_id: productId,
@@ -252,7 +251,7 @@ async function upsertSellerProductLinkViaDb(
   }
 
   if (existing.deleted_at) {
-    await db("product_seller")
+    await db("product_product_seller_seller")
       .where({ id: existing.id })
       .update({ deleted_at: null })
     return "restored"
@@ -314,14 +313,13 @@ export async function inactivateStaleMarketSellers(
   collector?: DryRunCollector
 ): Promise<{ inactivated: number; skipped: number }> {
   const scopedSellers = await db("seller as seller")
-    .distinct("seller.id", "seller.handle", "seller.store_status")
-    // Mercur 2: product_seller link table (not Mercur 1.5 seller_seller_product_product)
-    .innerJoin("product_seller as ps", "seller.id", "ps.seller_id")
-    .innerJoin("product as product", "ps.product_id", "product.id")
+    .distinct("seller.id", "seller.handle", "seller.status")
+    .innerJoin("product_product_seller_seller as ppss", "seller.id", "ppss.seller_id")
+    .innerJoin("product as product", "ppss.product_id", "product.id")
     .innerJoin("product_sales_channel as psc", "product.id", "psc.product_id")
     .where("psc.sales_channel_id", salesChannelId)
     .whereNull("seller.deleted_at")
-    .whereNull("ps.deleted_at")
+    .whereNull("ppss.deleted_at")
     .whereNull("product.deleted_at")
     .whereNull("psc.deleted_at")
 
@@ -335,7 +333,7 @@ export async function inactivateStaleMarketSellers(
       continue
     }
 
-    if (seller.store_status && seller.store_status !== "ACTIVE") {
+    if (seller.status && seller.status !== "open") {
       skipped++
       continue
     }
@@ -345,13 +343,13 @@ export async function inactivateStaleMarketSellers(
         entityType: "seller",
         handle,
         action: "update",
-        note: "store_status=INACTIVE (missing from market config)",
+        note: "status=suspended (missing from market config)",
       })
     } else {
-      await updateSellerRecord(sellerModuleService, seller.id, { store_status: "INACTIVE" })
+      await updateSellerRecord(sellerModuleService, seller.id, { status: "suspended" })
     }
 
-    console.log(`Seller '${handle}': set to INACTIVE (missing from market config)`)
+    console.log(`Seller '${handle}': set to suspended (missing from market config)`)
     inactivated++
   }
 
@@ -395,16 +393,16 @@ export async function resolveProductByFixture(
   }
 }
 
-function vendorStatusToStoreStatus(status: string | undefined): string {
+function vendorStatusToSellerStatus(status: string | undefined): string {
   switch (status) {
     case "onboarded":
     case "active":
-      return "ACTIVE"
+      return "open"
     case "suspended":
     case "inactive":
-      return "SUSPENDED"
+      return "suspended"
     default:
-      return "ACTIVE"
+      return "open"
   }
 }
 
@@ -481,7 +479,7 @@ export async function upsertSeller(
   }
 
   const { match: existingSeller, reason: matchReason } = selectSellerMatch(existingSellers, marketId)
-  const storeStatus = vendorStatusToStoreStatus(vendor.status)
+  const sellerStatus = vendorStatusToSellerStatus(vendor.status)
 
   if (matchReason) {
     return { sellerId: null, action: "skipped", note: matchReason }
@@ -525,7 +523,7 @@ export async function upsertSeller(
       email: vendor.email,
       phone: vendor.phone,
       tax_id: vendor.tax_id,
-      store_status: storeStatus,
+      status: sellerStatus,
       metadata: { gp: gpMeta },
     }
 
@@ -547,7 +545,7 @@ export async function upsertSeller(
     : []
 
   // config_wins fields — always overwrite (only include defined values to avoid clearing existing data)
-  const configWinsPayload: Record<string, unknown> = { handle, store_status: storeStatus }
+  const configWinsPayload: Record<string, unknown> = { handle, status: sellerStatus }
   if (vendor.email !== undefined) configWinsPayload.email = vendor.email
   if (vendor.phone !== undefined) configWinsPayload.phone = vendor.phone
   if (vendor.tax_id !== undefined) configWinsPayload.tax_id = vendor.tax_id
@@ -790,7 +788,7 @@ export default async function gpConfigSyncVendors({ container, args }: ExecArgs)
       }
 
       // SellerProductLink sync — skip for suspended vendors
-      const isSuspended = vendorStatusToStoreStatus(vendor.status) === "SUSPENDED"
+      const isSuspended = vendorStatusToSellerStatus(vendor.status) === "suspended"
       if (isSuspended) {
         warnings.push(`Vendor '${vendor.vendor_id}': suspended; skipping seller-product linking`)
       }
