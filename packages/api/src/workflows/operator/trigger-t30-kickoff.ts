@@ -19,8 +19,17 @@ import {
   T30DispatcherFixtureModeError,
   type T30Logger,
 } from "../../lib/t30-dispatch-service"
+import {
+  appendOperatorT30Kickoff,
+  getLastOperatorT30Kickoff,
+  type OperatorT30KickoffRecord,
+} from "../../lib/operator-kickoff-store"
 
 const T30_WINDOW_DAYS = 30
+
+type ScopeResolver = {
+  resolve: (key: string) => unknown
+}
 
 type KickoffState = {
   started_at: string
@@ -43,6 +52,17 @@ export type KickoffContext = {
   admin_note?: string
   override?: boolean
   logger?: T30Logger
+  scope?: ScopeResolver
+}
+
+function mapKickoffRecord(record: OperatorT30KickoffRecord): KickoffState {
+  return {
+    started_at: record.started_at,
+    t0_target: record.t0_target,
+    triggered_by: record.triggered_by,
+    vendor_count: record.vendor_count,
+    admin_note: record.admin_note ?? undefined,
+  }
 }
 
 /**
@@ -61,14 +81,15 @@ export type KickoffContext = {
 export async function triggerT30Kickoff(
   ctx: KickoffContext,
 ): Promise<KickoffResult> {
-  if (_kickoffState && !ctx.override) {
+  const existingKickoff = await getKickoffState(ctx.scope)
+  if (existingKickoff && !ctx.override) {
     const err = new Error("AlreadyTriggered")
     ;(err as Error & { code?: number }).code = 409
     throw err
   }
 
   // AC3: Hard-block in production when dispatcher is in fixture/stub mode.
-  if (process.env.NODE_ENV === "production" && isFixtureMode()) {
+  if (process.env.NODE_ENV === "production" && isFixtureMode(ctx.scope)) {
     const err = new T30DispatcherFixtureModeError()
     ;(err as unknown as { httpCode?: number }).httpCode = 503
     throw err
@@ -87,6 +108,7 @@ export async function triggerT30Kickoff(
       triggered_by: ctx.triggered_by,
       flag_flip_iso: flagFlipIso,
       logger: ctx.logger,
+      scope: ctx.scope,
     })
     vendorCount = dispatchResult.triggered
   } catch (err) {
@@ -98,7 +120,7 @@ export async function triggerT30Kickoff(
     throw err
   }
 
-  _kickoffState = {
+  const kickoffState: KickoffState = {
     started_at: now.toISOString(),
     t0_target: t0.toISOString(),
     triggered_by: ctx.triggered_by,
@@ -106,20 +128,49 @@ export async function triggerT30Kickoff(
     admin_note: ctx.admin_note,
   }
 
+  if (ctx.scope) {
+    const persisted = await appendOperatorT30Kickoff(ctx.scope, {
+      started_at: kickoffState.started_at,
+      t0_target: kickoffState.t0_target,
+      triggered_by: kickoffState.triggered_by,
+      vendor_count: kickoffState.vendor_count,
+      admin_note: kickoffState.admin_note ?? null,
+      override: ctx.override === true,
+    })
+
+    return {
+      kickoff_at: persisted.started_at,
+      t0_target: persisted.t0_target,
+      vendors_notified: persisted.vendor_count,
+    }
+  }
+
+  _kickoffState = kickoffState
+
   return {
-    kickoff_at: _kickoffState.started_at,
-    t0_target: _kickoffState.t0_target,
+    kickoff_at: kickoffState.started_at,
+    t0_target: kickoffState.t0_target,
     vendors_notified: vendorCount,
   }
 }
 
-export function getKickoffState(): KickoffState | null {
+export async function getKickoffState(
+  scope?: ScopeResolver,
+): Promise<KickoffState | null> {
+  if (scope) {
+    const record = await getLastOperatorT30Kickoff(scope)
+    return record ? mapKickoffRecord(record) : null
+  }
+
   return _kickoffState
 }
 
-export function getDaysRemaining(): number | null {
-  if (!_kickoffState) return null
-  const ms = Date.parse(_kickoffState.t0_target) - Date.now()
+export async function getDaysRemaining(
+  scope?: ScopeResolver,
+): Promise<number | null> {
+  const kickoffState = await getKickoffState(scope)
+  if (!kickoffState) return null
+  const ms = Date.parse(kickoffState.t0_target) - Date.now()
   return Math.max(0, Math.ceil(ms / (24 * 60 * 60 * 1000)))
 }
 

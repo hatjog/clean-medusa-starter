@@ -122,12 +122,19 @@ export function isWindowOpen(flagFlipDate: Date | null): boolean {
  * Fixture mode = `GP_T30_DEV_FIXTURE_VENDORS_JSON` is set OR no real DB
  * vendor source is configured.
  *
- * Currently always true because real Mercur 2 vendor query is deferred to
- * v1.7.0+. The flag lets `triggerT30Kickoff` hard-block in production.
+ * Fixture mode is active when the explicit JSON fixture is present.
+ * When a real request scope is provided, the dispatcher can query sellers
+ * directly and is no longer considered fixture-only.
  */
-export function isFixtureMode(): boolean {
-  // When real vendor query is implemented this should return false.
-  // For now: fixture mode is active unless explicitly overridden by test env.
+export function isFixtureMode(scope?: ScopeResolver): boolean {
+  if (process.env.GP_T30_DEV_FIXTURE_VENDORS_JSON) {
+    return true
+  }
+
+  if (scope) {
+    return false
+  }
+
   return !process.env.GP_T30_REAL_VENDOR_SOURCE_ENABLED
 }
 
@@ -258,7 +265,7 @@ export async function dispatchT30Notifications(
   const { triggered_by, vendor_ids, flag_flip_iso, logger = {}, scope } = opts
 
   // AC3: hard-block in production when fixture mode active.
-  if (process.env.NODE_ENV === "production" && isFixtureMode()) {
+  if (process.env.NODE_ENV === "production" && isFixtureMode(scope)) {
     throw new T30DispatcherFixtureModeError()
   }
 
