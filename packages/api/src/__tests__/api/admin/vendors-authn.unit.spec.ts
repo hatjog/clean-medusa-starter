@@ -22,9 +22,12 @@
  */
 
 import { POST as lifecycleStatusPOST } from "../../../api/admin/vendors/[id]/lifecycle-status/route"
+import { POST as decisionPost } from "../../../api/admin/vendors/[id]/decision/route"
+import { GET as decisionsGet } from "../../../api/admin/vendors/decisions/route"
 import { POST as t30POST } from "../../../api/admin/vendors/notifications/t30/route"
 import { POST as nudgesPost } from "../../../api/admin/vendors/notifications/nudges/route"
 import { _resetRingBuffer, getRingBuffer } from "../../../lib/alert-emit"
+import { Modules } from "@medusajs/framework/utils"
 
 // ---- helpers ----------------------------------------------------------------
 
@@ -32,22 +35,58 @@ function createReq(opts: {
   authContext?: { actor_id?: string; actor_type?: string }
   body?: Record<string, unknown>
   params?: Record<string, string>
+  query?: Record<string, unknown>
+  scopeOverrides?: Record<string, unknown>
 }) {
+  const logger = {
+    warn: jest.fn(),
+    info: jest.fn(),
+    error: jest.fn(),
+  }
+
   return {
     auth_context: opts.authContext,
     body: opts.body ?? {},
     params: opts.params ?? { id: "vendor_01" },
+    query: opts.query ?? {},
     scope: {
-      resolve: (_key: string) => {
-        // Return a minimal logger mock
-        return {
-          warn: jest.fn(),
-          info: jest.fn(),
-          error: jest.fn(),
+      resolve: (key: string) => {
+        if (opts.scopeOverrides && key in opts.scopeOverrides) {
+          return opts.scopeOverrides[key]
         }
+
+        return logger
       },
     },
   } as any
+}
+
+function createSellerModuleService(initialSellers: any[]) {
+  const sellers = initialSellers.map((seller) => JSON.parse(JSON.stringify(seller)))
+
+  return {
+    sellers,
+    list: jest.fn(async (filters: { id?: string } = {}) => {
+      if (filters.id) {
+        return sellers.filter((seller) => seller.id === filters.id)
+      }
+
+      return sellers
+    }),
+    update: jest.fn(async (id: string, payload: any) => {
+      const index = sellers.findIndex((seller) => seller.id === id)
+      if (index === -1) {
+        throw new Error(`seller ${id} not found`)
+      }
+
+      sellers[index] = {
+        ...sellers[index],
+        ...payload,
+      }
+
+      return sellers[index]
+    }),
+  }
 }
 
 function createRes() {
@@ -123,6 +162,243 @@ describe("admin vendors AuthN — fail-closed extractActorIdOrThrow", () => {
 
     expect(res.statusCode).toBe(401)
     expect(res.body).toMatchObject({ code: "UNAUTHORIZED" })
+  })
+
+  it("GET /admin/vendors/decisions → 401 when no auth_context", async () => {
+    const req = createReq({ authContext: undefined })
+    const res = createRes()
+
+    await decisionsGet(req, res as any)
+
+    expect(res.statusCode).toBe(401)
+    expect(res.body).toMatchObject({ code: "UNAUTHORIZED" })
+  })
+
+  it("POST /admin/vendors/:id/decision → 401 when no auth_context", async () => {
+    const req = createReq({
+      authContext: undefined,
+      body: { decision: "opted_in", reason: "Vendor accepted migration." },
+    })
+    const res = createRes()
+
+    await decisionPost(req, res as any)
+
+    expect(res.statusCode).toBe(401)
+    expect(res.body).toMatchObject({ code: "UNAUTHORIZED" })
+  })
+
+  it("GET /admin/vendors/decisions → 200 in production from live seller metadata", async () => {
+    const previousNodeEnv = process.env.NODE_ENV
+    process.env.NODE_ENV = "production"
+
+    try {
+      const sellerModuleService = createSellerModuleService([
+        {
+          id: "vendor_open_01",
+          handle: "salon-open",
+          email: "open@example.com",
+          store_status: "ACTIVE",
+          metadata: {
+            gp: {
+              lifecycle_status: "open",
+              decision_status: "forced",
+              lifecycle_decision: {
+                decision: "opted_in",
+                captured_at: "2026-02-03T10:00:00.000Z",
+              },
+            },
+          },
+        },
+        {
+          id: "vendor_pending_01",
+          handle: "salon-pending",
+          email: "pending@example.com",
+          store_status: "ACTIVE",
+          metadata: { gp: { lifecycle_status: "open" } },
+        },
+      ])
+
+      const req = createReq({
+        authContext: { actor_id: "user_admin_01", actor_type: "user" },
+        query: { status: "opted_in", search: "open" },
+        scopeOverrides: { sellerModuleService },
+      })
+      const res = createRes()
+
+      await decisionsGet(req, res as any)
+
+      expect(res.statusCode).toBe(200)
+      expect(res.body).toMatchObject({
+        total: 1,
+        vendors: [
+          {
+            id: "vendor_open_01",
+            handle: "salon-open",
+            email: "open@example.com",
+            lifecycle_status: "open",
+            decision_status: "opted_in",
+            last_action_at: "2026-02-03T10:00:00.000Z",
+          },
+        ],
+      })
+    } finally {
+      process.env.NODE_ENV = previousNodeEnv
+    }
+  })
+
+  it("POST /admin/vendors/:id/decision → 200 in production and persists lifecycle_decision", async () => {
+    const previousNodeEnv = process.env.NODE_ENV
+    const previousResendApiKey = process.env.RESEND_API_KEY
+    process.env.NODE_ENV = "production"
+    process.env.RESEND_API_KEY = "re_live_123"
+
+    try {
+      const notificationService = {
+        createNotifications: jest.fn().mockResolvedValue({ id: "notif_decision_01" }),
+      }
+      const sellerModuleService = createSellerModuleService([
+        {
+          id: "vendor_01",
+          handle: "salon-open",
+          name: "Salon Open",
+          email: "open@example.com",
+          preferred_locale: "en",
+          store_status: "ACTIVE",
+          metadata: {
+            gp: {
+              lifecycle_status: "open",
+            },
+          },
+        },
+      ])
+
+      const req = createReq({
+        authContext: { actor_id: "user_admin_01", actor_type: "user" },
+        body: { decision: "opted_out", reason: "Vendor declined migration." },
+        scopeOverrides: {
+          sellerModuleService,
+          [Modules.NOTIFICATION]: notificationService,
+        },
+      })
+      const res = createRes()
+
+      await decisionPost(req, res as any)
+
+      expect(res.statusCode).toBe(200)
+      expect(res.body).toMatchObject({
+        vendor_id: "vendor_01",
+        decision: "opted_out",
+        audit_log_id: "notif_decision_01",
+        email_dispatched: true,
+      })
+      expect(notificationService.createNotifications).toHaveBeenCalledTimes(1)
+      expect(notificationService.createNotifications).toHaveBeenCalledWith(
+        expect.objectContaining({
+          to: "open@example.com",
+          channel: "email",
+          template: "vendor-decision-confirmation",
+          metadata: expect.objectContaining({
+            vendor_id: "vendor_01",
+            decision: "opted_out",
+            notification_type: "decision_capture",
+            triggered_by: "user_admin_01",
+          }),
+        }),
+      )
+      expect(sellerModuleService.update).toHaveBeenCalledTimes(2)
+      expect(sellerModuleService.sellers[0].metadata.gp.decision_status).toBe("opted_out")
+      expect(sellerModuleService.sellers[0].metadata.gp.lifecycle_decision).toMatchObject({
+        decision: "opted_out",
+        reason: "Vendor declined migration.",
+        admin_note: null,
+        captured_by: "user_admin_01",
+      })
+      expect(
+        sellerModuleService.sellers[0].metadata.gp.lifecycle_decision_confirmation,
+      ).toMatchObject({
+        audit_log_id: "notif_decision_01",
+        recipient_email: "open@example.com",
+        template: "vendor-decision-confirmation",
+        dispatched_by: "user_admin_01",
+        status: "sent",
+      })
+    } finally {
+      process.env.NODE_ENV = previousNodeEnv
+      process.env.RESEND_API_KEY = previousResendApiKey
+    }
+  })
+
+  it("POST /admin/vendors/:id/decision → 503 in production when notification module is unavailable", async () => {
+    const previousNodeEnv = process.env.NODE_ENV
+    const previousResendApiKey = process.env.RESEND_API_KEY
+    process.env.NODE_ENV = "production"
+    process.env.RESEND_API_KEY = "re_live_123"
+
+    try {
+      const sellerModuleService = createSellerModuleService([
+        {
+          id: "vendor_01",
+          handle: "salon-open",
+          name: "Salon Open",
+          email: "open@example.com",
+          preferred_locale: "en",
+          store_status: "ACTIVE",
+          metadata: {
+            gp: {
+              lifecycle_status: "open",
+            },
+          },
+        },
+      ])
+
+      const req = createReq({
+        authContext: { actor_id: "user_admin_01", actor_type: "user" },
+        body: { decision: "opted_out", reason: "Vendor declined migration." },
+        scopeOverrides: { sellerModuleService },
+      })
+      const res = createRes()
+
+      await decisionPost(req, res as any)
+
+      expect(res.statusCode).toBe(503)
+      expect(res.body).toMatchObject({
+        code: "VENDOR_NOTIFICATION_MODULE_UNAVAILABLE",
+      })
+    } finally {
+      process.env.NODE_ENV = previousNodeEnv
+      process.env.RESEND_API_KEY = previousResendApiKey
+    }
+  })
+
+  it("POST /admin/vendors/:id/decision → 400 when vendor is not open", async () => {
+    const sellerModuleService = createSellerModuleService([
+      {
+        id: "vendor_01",
+        handle: "salon-suspended",
+        email: "suspended@example.com",
+        store_status: "INACTIVE",
+        metadata: {
+          gp: {
+            lifecycle_status: "suspended",
+          },
+        },
+      },
+    ])
+
+    const req = createReq({
+      authContext: { actor_id: "user_admin_01", actor_type: "user" },
+      body: { decision: "opted_in", reason: "Vendor wants to migrate now." },
+      scopeOverrides: { sellerModuleService },
+    })
+    const res = createRes()
+
+    await decisionPost(req, res as any)
+
+    expect(res.statusCode).toBe(400)
+    expect(res.body).toMatchObject({
+      error: expect.stringContaining("lifecycle_status='open'"),
+    })
+    expect(sellerModuleService.update).not.toHaveBeenCalled()
   })
 
   // AC5 test 3 — 403 non-admin (lifecycle override capability denied for seller token)
