@@ -20,9 +20,16 @@
  * @see FR42 / FR43 / AR45 / AR46
  */
 
-import * as crypto from "crypto"
-
+import {
+  buildPublicKeyKid,
+  verifyEd25519Signature,
+} from "./gp-config-signing"
 import { InMemoryTokenBucketAdapter } from "./rate-limit-token-bucket"
+import {
+  deriveCsrfProbeToken,
+  resolveCsrfProbeAllowedOrigin,
+  resolveCsrfProbeUrl,
+} from "./security-gate-csrf-probe"
 
 export type SecurityGate =
   | "rate_limiting"
@@ -46,7 +53,125 @@ export type AllGatesResult = {
   verified_at: string
 }
 
+type HttpProbeRequestFixture = {
+  url: string
+  method?: string
+  headers?: Record<string, string>
+  body?: unknown
+}
+
+type TwoPhaseHttpProbeFixture = {
+  negative: HttpProbeRequestFixture
+  positive: HttpProbeRequestFixture
+  expect_negative_statuses?: number[]
+  expect_positive_statuses?: number[]
+}
+
 const NOW = (): string => new Date().toISOString()
+
+async function loadJsonFixture<T>(fixturePath: string): Promise<T> {
+  const fs = await import("node:fs/promises")
+  return JSON.parse(await fs.readFile(fixturePath, "utf8")) as T
+}
+
+function normalizeBody(body: unknown): string | undefined {
+  if (body === undefined || body === null) {
+    return undefined
+  }
+  if (typeof body === "string") {
+    return body
+  }
+  return JSON.stringify(body)
+}
+
+async function runFixtureRequest(
+  request: HttpProbeRequestFixture,
+): Promise<{ status: number }> {
+  const headers = new Headers(request.headers ?? {})
+  if (
+    request.body !== undefined &&
+    request.body !== null &&
+    typeof request.body === "object" &&
+    !headers.has("Content-Type")
+  ) {
+    headers.set("Content-Type", "application/json")
+  }
+
+  const response = await fetch(request.url, {
+    method: request.method ?? "POST",
+    headers,
+    body: normalizeBody(request.body),
+  })
+
+  return { status: response.status }
+}
+
+function matchesExpectedStatus(
+  status: number,
+  expected: number[] | undefined,
+  fallback: (status: number) => boolean,
+): boolean {
+  return expected && expected.length > 0 ? expected.includes(status) : fallback(status)
+}
+
+async function runFixtureBackedHttpProbe(args: {
+  gate: "captcha" | "csrf"
+  fixturePath: string
+  negativeFallback: (status: number) => boolean
+  positiveFallback: (status: number) => boolean
+  successDetail: string
+}): Promise<GateResult> {
+  try {
+    const fixture = await loadJsonFixture<TwoPhaseHttpProbeFixture>(args.fixturePath)
+    const negative = await runFixtureRequest(fixture.negative)
+    const positive = await runFixtureRequest(fixture.positive)
+
+    const negativeOk = matchesExpectedStatus(
+      negative.status,
+      fixture.expect_negative_statuses,
+      args.negativeFallback,
+    )
+    const positiveOk = matchesExpectedStatus(
+      positive.status,
+      fixture.expect_positive_statuses,
+      args.positiveFallback,
+    )
+
+    if (negativeOk && positiveOk) {
+      return {
+        gate: args.gate,
+        status: "pass",
+        detail: args.successDetail,
+        last_verified_at: NOW(),
+        evidence: {
+          fixture_path: args.fixturePath,
+          negative_status: negative.status,
+          positive_status: positive.status,
+        },
+      }
+    }
+
+    return {
+      gate: args.gate,
+      status: "fail",
+      detail:
+        `fixture probe mismatch: negative_status=${negative.status} positive_status=${positive.status}`,
+      last_verified_at: NOW(),
+      evidence: {
+        fixture_path: args.fixturePath,
+        negative_status: negative.status,
+        positive_status: positive.status,
+      },
+    }
+  } catch (err) {
+    return {
+      gate: args.gate,
+      status: "fail",
+      detail: `fixture probe threw: ${(err as Error).message}`,
+      last_verified_at: NOW(),
+    }
+  }
+}
 
 /**
  * Behavior probe — drain a fresh in-memory bucket; assert N+1th consume
@@ -113,16 +238,28 @@ async function probeRateLimiting(): Promise<GateResult> {
  * absent, returns `skip` (counts as fail in cleanup-15f AC3 aggregate).
  */
 async function probeCaptcha(): Promise<GateResult> {
+  const fixturePath = process.env.GP_SEC_GATE_CAPTCHA_FIXTURE_PATH
   const provider = process.env.GP_RECIPIENT_CLAIM_CAPTCHA_PROVIDER
   const recaptchaSecret = process.env.RECAPTCHA_SECRET_KEY
   const hcaptchaSecret = process.env.HCAPTCHA_SECRET
+
+  if (fixturePath) {
+    return runFixtureBackedHttpProbe({
+      gate: "captcha",
+      fixturePath,
+      negativeFallback: (status) => [400, 401, 403, 422].includes(status),
+      positiveFallback: (status) => status >= 200 && status < 300,
+      successDetail:
+        "fixture-backed CAPTCHA probe confirmed both rejection without token and acceptance with staging stub token",
+    })
+  }
 
   if (!provider || (!recaptchaSecret && !hcaptchaSecret)) {
     return {
       gate: "captcha",
       status: "skip",
       detail:
-        "CAPTCHA provider env not configured (set GP_RECIPIENT_CLAIM_CAPTCHA_PROVIDER + RECAPTCHA_SECRET_KEY|HCAPTCHA_SECRET to enable behavior probe).",
+        "CAPTCHA probe not configured (set GP_SEC_GATE_CAPTCHA_FIXTURE_PATH or provider env to enable behavior probe).",
       last_verified_at: NOW(),
     }
   }
@@ -174,19 +311,34 @@ async function probeCaptcha(): Promise<GateResult> {
  * set, returns `skip`.
  */
 async function probeCsrf(): Promise<GateResult> {
-  const probeUrl = process.env.GP_SEC_GATE_CSRF_PROBE_URL
-  if (!probeUrl) {
+  const fixturePath = process.env.GP_SEC_GATE_CSRF_FIXTURE_PATH
+  const probeUrl = resolveCsrfProbeUrl(process.env)
+  const allowedOrigin = resolveCsrfProbeAllowedOrigin(process.env)
+  const probeToken = deriveCsrfProbeToken(process.env)
+
+  if (fixturePath) {
+    return runFixtureBackedHttpProbe({
+      gate: "csrf",
+      fixturePath,
+      negativeFallback: (status) => [400, 401, 403, 419].includes(status),
+      positiveFallback: (status) => status !== 403 && status < 500,
+      successDetail:
+        "fixture-backed CSRF probe confirmed cross-origin rejection and same-origin/token acceptance",
+    })
+  }
+
+  if (!probeUrl || !allowedOrigin || !probeToken) {
     return {
       gate: "csrf",
       status: "skip",
       detail:
-        "CSRF probe URL not configured (set GP_SEC_GATE_CSRF_PROBE_URL=<admin-mutating-route-url> to enable).",
+        "CSRF probe not configured (set GP_SEC_GATE_CSRF_FIXTURE_PATH or configure STOREFRONT_URL/STORE_CORS + JWT_SECRET/COOKIE_SECRET, or override GP_SEC_GATE_CSRF_PROBE_URL|GP_SEC_GATE_CSRF_ALLOWED_ORIGIN|GP_SEC_GATE_CSRF_PROBE_TOKEN).",
       last_verified_at: NOW(),
     }
   }
 
   try {
-    const response = await fetch(probeUrl, {
+    const negative = await fetch(probeUrl, {
       method: "POST",
       headers: {
         Origin: "https://attacker.example.invalid",
@@ -195,19 +347,37 @@ async function probeCsrf(): Promise<GateResult> {
       body: JSON.stringify({}),
     })
 
-    if (response.status >= 400 && response.status < 500) {
+    const positive = await fetch(probeUrl, {
+      method: "POST",
+      headers: {
+        Origin: allowedOrigin,
+        "Content-Type": "application/json",
+        "x-csrf-token": probeToken,
+      },
+      body: JSON.stringify({}),
+    })
+
+    const negativeOk = negative.status >= 400 && negative.status < 500
+    const positiveOk = positive.status >= 200 && positive.status < 300
+
+    if (negativeOk && positiveOk) {
       return {
         gate: "csrf",
         status: "pass",
-        detail: `mismatched-origin POST returned ${response.status} — CSRF guard rejecting cross-origin requests as expected`,
+        detail: `cross-origin POST returned ${negative.status} and same-origin/token POST returned ${positive.status} — CSRF guard behavior verified`,
         last_verified_at: NOW(),
-        evidence: { http_status: response.status },
+        evidence: {
+          negative_status: negative.status,
+          positive_status: positive.status,
+          probe_url: probeUrl,
+          allowed_origin: allowedOrigin,
+        },
       }
     }
     return {
       gate: "csrf",
       status: "fail",
-      detail: `mismatched-origin POST returned ${response.status} (expected 4xx) — CSRF guard not enforcing`,
+      detail: `CSRF probe mismatch: negative_status=${negative.status} positive_status=${positive.status}`,
       last_verified_at: NOW(),
     }
   } catch (err) {
@@ -244,29 +414,29 @@ async function probeGpConfigSigning(): Promise<GateResult> {
   }
 
   try {
-    const fs = await import("node:fs/promises")
-    const fixtureRaw = await fs.readFile(fixturePath, "utf8")
-    const fixture = JSON.parse(fixtureRaw) as {
+    const fixture = await loadJsonFixture<{
       canonical_bytes_base64: string
       signature_base64: string
-    }
+    }>(fixturePath)
 
     const canonical = Buffer.from(fixture.canonical_bytes_base64, "base64")
     const signature = Buffer.from(fixture.signature_base64, "base64")
-    const pubkeyBuf = Buffer.from(pubkey, "base64")
 
-    const keyObject = crypto.createPublicKey({
-      key: pubkeyBuf,
-      format: "der",
-      type: "spki",
-    })
+    if (canonical.length === 0) {
+      return {
+        gate: "gp_config_signing",
+        status: "fail",
+        detail: "gp_config_signing fixture canonical bytes are empty",
+        last_verified_at: NOW(),
+      }
+    }
 
-    const validVerify = crypto.verify(null, canonical, keyObject, signature)
+    const validVerify = verifyEd25519Signature(canonical, signature, pubkey)
 
     // Tamper test: flip a byte; expect verification to fail.
     const tampered = Buffer.from(canonical)
     tampered[0] = (tampered[0] ?? 0) ^ 0x01
-    const tamperedVerify = crypto.verify(null, tampered, keyObject, signature)
+    const tamperedVerify = verifyEd25519Signature(tampered, signature, pubkey)
 
     if (validVerify && !tamperedVerify) {
       return {
@@ -275,7 +445,10 @@ async function probeGpConfigSigning(): Promise<GateResult> {
         detail:
           "Ed25519 verify behavior confirmed: valid pair verifies, tampered bytes fail to verify",
         last_verified_at: NOW(),
-        evidence: { pubkey_kid: pubkey.slice(0, 16) + "…", fixture_path: fixturePath },
+        evidence: {
+          pubkey_kid: buildPublicKeyKid(pubkey),
+          fixture_path: fixturePath,
+        },
       }
     }
     return {

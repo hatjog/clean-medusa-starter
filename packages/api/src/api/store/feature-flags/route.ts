@@ -20,15 +20,24 @@
  */
 
 import type { MedusaRequest, MedusaResponse } from "@medusajs/framework/http"
+import { ContainerRegistrationKeys } from "@medusajs/framework/utils"
+import type { Knex } from "knex"
 import { getCurrentState } from "../../../lib/feature-flag-tri-state"
 
 export const AUTHENTICATE = false
 
 export async function GET(
-  _req: MedusaRequest,
+  req: MedusaRequest,
   res: MedusaResponse,
 ): Promise<void> {
-  const state = await getCurrentState()
+  let db: Knex | null = null
+  try {
+    db = req.scope.resolve(ContainerRegistrationKeys.PG_CONNECTION) as Knex
+  } catch {
+    db = null
+  }
+
+  const state = await getCurrentState(db)
   res.status(200).json({
     multi_vendor_pdp: state,
   })

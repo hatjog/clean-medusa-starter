@@ -67,15 +67,14 @@ export async function GET(
   res: MedusaResponse,
 ): Promise<void> {
   const cartId = (req.params as Record<string, string>).id
+  const db = req.scope.resolve(ContainerRegistrationKeys.PG_CONNECTION) as Knex
 
   // Uses singleton oracle (feature-flag-tri-state) NOT env literal — CRIT-1 fix.
-  const flagState = await getFlagState("multi_vendor_pdp")
+  const flagState = await getFlagState("multi_vendor_pdp", db)
   if (flagState !== "on") {
     res.json({ order_set_splits: [] })
     return
   }
-
-  const db = req.scope.resolve(ContainerRegistrationKeys.PG_CONNECTION) as Knex
 
   // Load cart line items with metadata
   const lineItems = await db<CartLineItemRow>("cart_line_item")

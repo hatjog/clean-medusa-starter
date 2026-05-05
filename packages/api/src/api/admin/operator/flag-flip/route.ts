@@ -13,22 +13,25 @@ import {
   getAuditTrail,
   getCurrentState,
   getLastTransitionInfo,
+  getPersistedAuditTrail,
+  getPersistedLastTransitionInfo,
   setState,
   type MultiVendorFlagState,
 } from "../../../../lib/feature-flag-tri-state"
 
 export async function GET(
-  _req: MedusaRequest,
+  req: MedusaRequest,
   res: MedusaResponse,
 ): Promise<void> {
-  const current = await getCurrentState()
-  const info = getLastTransitionInfo()
+  const db = req.scope.resolve(ContainerRegistrationKeys.PG_CONNECTION) as Knex
+  const current = await getCurrentState(db)
+  const info = await getPersistedLastTransitionInfo(db)
   res.json({
     current_state: current,
     allowed_transitions: ALLOWED_TRANSITIONS[current],
     last_transitioned_at: info.last_transitioned_at,
     last_admin: info.last_admin,
-    audit_trail: getAuditTrail(20),
+    audit_trail: await getPersistedAuditTrail(db, 20),
   })
 }
 

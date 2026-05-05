@@ -145,16 +145,25 @@ export async function filterProductIdsByFilters(
       .whereIn("pcp.product_category_id", filters.category_id);
   }
 
-  // city: Mercur 2 seller entity has no `city` column (dropped in Mercur 2 schema migration).
-  // City filtering via seller is no longer supported at DB level.
-  // TODO(v1.7.0): implement city filter via address join or market config if needed.
-  // Callers passing filters.city will receive unfiltered results (safe degradation).
+  // city: Mercur 2 seller entity has no `city` column.
+  // We scope location filtering through seller.metadata.gp.locations[].city,
+  // which is the canonical write-path populated by gp-config vendor sync.
   if (filters.city?.length) {
-    // No-op: city column does not exist in Mercur 2 seller table.
-    // eslint-disable-next-line no-console
-    console.warn(
-      "[product-market-scope] city filter requested but seller.city does not exist in Mercur 2; filter ignored"
-    );
+    const normalizedCities = filters.city
+      .map((city) => city.trim().toLocaleLowerCase("pl-PL"))
+      .filter(Boolean);
+
+    if (normalizedCities.length) {
+      const placeholders = normalizedCities.map(() => "?").join(", ");
+      query = query.whereRaw(
+        `EXISTS (
+          SELECT 1
+          FROM jsonb_array_elements(COALESCE(seller.metadata->'gp'->'locations', '[]'::jsonb)) AS location
+          WHERE lower(location->>'city') IN (${placeholders})
+        )`,
+        normalizedCities
+      );
+    }
   }
 
   // duration: INNER JOIN product_variant with regex guard before ::int cast (non-numeric metadata values are skipped)

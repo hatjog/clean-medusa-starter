@@ -26,6 +26,8 @@
  */
 
 import type { MedusaRequest, MedusaResponse } from "@medusajs/framework/http"
+import { ContainerRegistrationKeys } from "@medusajs/framework/utils"
+import type { Knex } from "knex"
 import {
   getCurrentState,
   setState,
@@ -41,6 +43,13 @@ export async function POST(
   req: MedusaRequest,
   res: MedusaResponse,
 ): Promise<void> {
+  let db: Knex | null = null
+  try {
+    db = req.scope.resolve(ContainerRegistrationKeys.PG_CONNECTION) as Knex
+  } catch {
+    db = null
+  }
+
   // Guard 1: Hard-reject unless ALLOW_TEST_ENDPOINTS=true and not production.
   // ALLOW_TEST_ENDPOINTS must be explicitly set per environment (opt-in, not opt-out).
   if (
@@ -81,7 +90,7 @@ export async function POST(
   const typedToState = toState as MultiVendorFlagState
 
   // Read current state
-  const fromState = await getCurrentState()
+  const fromState = await getCurrentState(db)
 
   // If already in target state, return immediately (idempotent)
   if (fromState === typedToState) {
@@ -100,6 +109,7 @@ export async function POST(
       triggered_by: "e2e_test_runner",
       admin_note: "Automated E2E test setup/teardown via Story v160-8-8",
       bypass_smoke_gate: true,
+      db,
     })
 
     res.status(200).json({
@@ -131,6 +141,13 @@ export async function GET(
   req: MedusaRequest,
   res: MedusaResponse,
 ): Promise<void> {
+  let db: Knex | null = null
+  try {
+    db = req.scope.resolve(ContainerRegistrationKeys.PG_CONNECTION) as Knex
+  } catch {
+    db = null
+  }
+
   if (
     process.env.NODE_ENV === "production" ||
     process.env.ALLOW_TEST_ENDPOINTS !== "true"
@@ -145,6 +162,6 @@ export async function GET(
     return
   }
 
-  const current = await getCurrentState()
+  const current = await getCurrentState(db)
   res.status(200).json({ current_state: current, purpose: "e2e_test" })
 }

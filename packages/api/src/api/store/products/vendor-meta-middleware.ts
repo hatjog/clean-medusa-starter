@@ -44,14 +44,14 @@ export async function vendorMetaMiddleware(
   res: MedusaResponse,
   next: MedusaNextFunction,
 ): Promise<void> {
+  const db = req.scope.resolve(ContainerRegistrationKeys.PG_CONNECTION) as Knex
+
   // Short-circuit: flag OFF/unknown → pass through, zero overhead.
   // Uses singleton oracle (feature-flag-tri-state) NOT env literal — CRIT-1 fix.
-  const flagState = await getFlagState("multi_vendor_pdp")
+  const flagState = await getFlagState("multi_vendor_pdp", db)
   if (flagState !== "on") {
     return next()
   }
-
-  const db = req.scope.resolve(ContainerRegistrationKeys.PG_CONNECTION) as Knex
   const originalJson = res.json.bind(res)
 
   // Replace res.json with an async interceptor.

@@ -7,10 +7,13 @@
  */
 
 import {
+  getAuditTrail,
   getCurrentState,
+  getPersistedAuditTrail,
   setState,
   type MultiVendorFlagState,
 } from "./feature-flag-tri-state"
+import type { Knex } from "knex"
 
 export type RollbackResult = {
   rolled_back: boolean
@@ -21,19 +24,27 @@ export type RollbackResult = {
   alert_id: string
 }
 
+export type RollbackHistoryEntry = {
+  audit_log_id: string
+  alert_id: string | null
+  at: string
+  reason: string | null
+}
+
 const _idempotencyCache = new Map<string, { at: number; result: RollbackResult }>()
 const IDEMPOTENCY_WINDOW_MS = 5 * 60 * 1000
 
 export async function triggerRollback(
   alert_id: string,
   reason: string,
+  db?: Knex | null,
 ): Promise<RollbackResult> {
   const cached = _idempotencyCache.get(alert_id)
   if (cached && Date.now() - cached.at < IDEMPOTENCY_WINDOW_MS) {
     return cached.result
   }
 
-  const from = await getCurrentState()
+  const from = await getCurrentState(db ?? null)
   if (from !== "on") {
     const result: RollbackResult = {
       rolled_back: false,
@@ -52,6 +63,7 @@ export async function triggerRollback(
     reason,
     alert_id,
     bypass_smoke_gate: true,
+    db,
   })
 
   const result: RollbackResult = {
@@ -64,4 +76,26 @@ export async function triggerRollback(
   }
   _idempotencyCache.set(alert_id, { at: Date.now(), result })
   return result
+}
+
+export async function getRollbackHistory24h(
+  db?: Knex | null,
+): Promise<RollbackHistoryEntry[]> {
+  const cutoff = Date.now() - 24 * 60 * 60 * 1000
+  const entries = db
+    ? await getPersistedAuditTrail(db, 200)
+    : getAuditTrail(200)
+
+  return entries
+    .filter(
+      (entry) =>
+        entry.triggered_by === "automated_rollback" &&
+        Date.parse(entry.at) >= cutoff,
+    )
+    .map((entry) => ({
+      audit_log_id: entry.audit_log_id,
+      alert_id: entry.alert_id ?? null,
+      at: entry.at,
+      reason: entry.reason ?? null,
+    }))
 }

@@ -175,6 +175,15 @@ function resolveService(container: any, keysToTry: string[]): any {
   )
 }
 
+function pushUniqueWarning(warnings: string[], seenWarnings: Set<string>, warning: string): void {
+  if (seenWarnings.has(warning)) {
+    return
+  }
+
+  seenWarnings.add(warning)
+  warnings.push(warning)
+}
+
 function readSellerMarketId(value: unknown): string | null {
   if (!value || typeof value !== "object") {
     return null
@@ -734,6 +743,7 @@ export default async function gpConfigSyncVendors({ container, args }: ExecArgs)
     try {
       splService = resolveService(container, [
         "sellerProductLink",
+          "seller_product",
         "seller_product_link",
         "ISellerProductLinkService",
       ])
@@ -743,6 +753,7 @@ export default async function gpConfigSyncVendors({ container, args }: ExecArgs)
   }
 
   const warnings: string[] = []
+  const seenWarnings = new Set<string>()
   const vendorCounts = { created: 0, updated: 0, skipped: 0 }
   const splCounts = { created: 0, skipped: 0, missing_products: 0 }
   const staleSellerCounts = { inactivated: 0, skipped: 0 }
@@ -750,12 +761,12 @@ export default async function gpConfigSyncVendors({ container, args }: ExecArgs)
 
   const vendors = marketConfig.vendors ?? []
   if (vendors.length === 0) {
-    warnings.push(`No vendors found in market config for market_id='${marketId}'`)
+    pushUniqueWarning(warnings, seenWarnings, `No vendors found in market config for market_id='${marketId}'`)
   }
 
   for (const vendor of vendors) {
     if (!vendor.slug) {
-      warnings.push(`Vendor '${vendor.vendor_id}': missing slug; skipping`)
+      pushUniqueWarning(warnings, seenWarnings, `Vendor '${vendor.vendor_id}': missing slug; skipping`)
       collector?.add({
         entityType: "seller",
         handle: vendor.vendor_id,
@@ -790,11 +801,19 @@ export default async function gpConfigSyncVendors({ container, args }: ExecArgs)
       // SellerProductLink sync — skip for suspended vendors
       const isSuspended = vendorStatusToSellerStatus(vendor.status) === "suspended"
       if (isSuspended) {
-        warnings.push(`Vendor '${vendor.vendor_id}': suspended; skipping seller-product linking`)
+        pushUniqueWarning(
+          warnings,
+          seenWarnings,
+          `Vendor '${vendor.vendor_id}': suspended; skipping seller-product linking`
+        )
       }
 
       if (!result.sellerId) {
-        warnings.push(`Vendor '${vendor.vendor_id}': missing sellerId after upsert; skipping seller-product linking`)
+        pushUniqueWarning(
+          warnings,
+          seenWarnings,
+          `Vendor '${vendor.vendor_id}': missing sellerId after upsert; skipping seller-product linking`
+        )
       }
 
       if (!isSuspended && result.sellerId) {
@@ -812,7 +831,9 @@ export default async function gpConfigSyncVendors({ container, args }: ExecArgs)
         try {
           vendorProducts = await readYamlFile(vendorProductsPath)
         } catch (e: any) {
-          warnings.push(
+          pushUniqueWarning(
+            warnings,
+            seenWarnings,
             `Vendor '${vendor.vendor_id}': cannot read products.yaml for linking (${e?.message ?? String(e)})`
           )
           // Keep flow running so other vendors can still sync.
@@ -821,7 +842,11 @@ export default async function gpConfigSyncVendors({ container, args }: ExecArgs)
         for (const vp of vendorProducts.products ?? []) {
           const fixtureId = (vp.product_id ?? "").trim()
           if (!fixtureId) {
-            warnings.push(`Vendor '${vendor.vendor_id}': product row with empty product_id; skipping SPL`)
+            pushUniqueWarning(
+              warnings,
+              seenWarnings,
+              `Vendor '${vendor.vendor_id}': product row with empty product_id; skipping SPL`
+            )
             splCounts.skipped++
             splDetails.push({
               vendor_id: vendor.vendor_id,
@@ -837,7 +862,9 @@ export default async function gpConfigSyncVendors({ container, args }: ExecArgs)
           const product = resolved.product
           if (!product?.id) {
             const reason = resolved.error ?? "not found by fixture_id and fallback handle"
-            warnings.push(
+            pushUniqueWarning(
+              warnings,
+              seenWarnings,
               `Vendor '${vendor.vendor_id}': product fixture_id='${fixtureId}' not found in DB; skipping SPL (${reason})`
             )
             splCounts.missing_products++
@@ -851,7 +878,9 @@ export default async function gpConfigSyncVendors({ container, args }: ExecArgs)
           }
 
           if (resolved.strategy === "handle") {
-            warnings.push(
+            pushUniqueWarning(
+              warnings,
+              seenWarnings,
               `Vendor '${vendor.vendor_id}': linked fixture_id='${fixtureId}' using fallback handle='${fallbackHandle}'`
             )
           }
@@ -887,12 +916,18 @@ export default async function gpConfigSyncVendors({ container, args }: ExecArgs)
                 product_db_id: product.id,
                 reason: `db-fallback:${outcome}`,
               })
-              warnings.push(
+              pushUniqueWarning(
+                warnings,
+                seenWarnings,
                 `Vendor '${vendor.vendor_id}': ${reason}; linked via DB fallback (${outcome})`
               )
             } catch (dbError: any) {
               const dbReason = dbError?.message ?? String(dbError)
-              warnings.push(`Vendor '${vendor.vendor_id}': ${reason}; DB fallback failed - ${dbReason}`)
+              pushUniqueWarning(
+                warnings,
+                seenWarnings,
+                `Vendor '${vendor.vendor_id}': ${reason}; DB fallback failed - ${dbReason}`
+              )
               splCounts.skipped++
               splDetails.push({
                 vendor_id: vendor.vendor_id,
@@ -927,12 +962,16 @@ export default async function gpConfigSyncVendors({ container, args }: ExecArgs)
                 product_db_id: product.id,
                 reason: `service-upsert-failed + db-fallback:${outcome}`,
               })
-              warnings.push(
+              pushUniqueWarning(
+                warnings,
+                seenWarnings,
                 `Vendor '${vendor.vendor_id}': seller-product upsert failed for fixture_id='${fixtureId}' (product='${product.id}') - ${reason}; linked via DB fallback (${outcome})`
               )
             } catch (dbError: any) {
               const dbReason = dbError?.message ?? String(dbError)
-              warnings.push(
+              pushUniqueWarning(
+                warnings,
+                seenWarnings,
                 `Vendor '${vendor.vendor_id}': seller-product upsert failed for fixture_id='${fixtureId}' (product='${product.id}') - ${reason}; DB fallback failed - ${dbReason}`
               )
               splCounts.skipped++
@@ -948,7 +987,11 @@ export default async function gpConfigSyncVendors({ container, args }: ExecArgs)
         }
       }
     } catch (err: any) {
-      warnings.push(`Vendor '${vendor.vendor_id}': ${err?.message ?? String(err)}`)
+      pushUniqueWarning(
+        warnings,
+        seenWarnings,
+        `Vendor '${vendor.vendor_id}': ${err?.message ?? String(err)}`
+      )
       vendorCounts.skipped++
     }
   }
