@@ -85,6 +85,7 @@ export async function POST(
       vendor_ids: body.vendor_ids,
       flag_flip_iso: flagFlipIso,
       logger,
+      scope: req.scope as { resolve: (key: string) => unknown },
     })
     res.status(200).json({
       triggered: result.triggered,

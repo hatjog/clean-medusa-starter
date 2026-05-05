@@ -46,6 +46,10 @@ export interface VendorNotificationLogEntry {
     | "training_cert_uploaded"
     | "training_cert_approved"
     | "training_cert_rejected"
+    | "nudge_t21"
+    | "nudge_t14"
+    | "nudge_t7"
+    | "nudge_t3"
   sent_at: string // ISO 8601
   locale: "pl" | "en"
   recipient_email: string

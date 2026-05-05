@@ -29,6 +29,8 @@ import {
   assertNotificationProviderReady,
   NotificationProviderNotReadyError,
 } from "../../../../../lib/vendor-notification-provider-readiness"
+import { appendNotificationLogBestEffort } from "../../../../../lib/vendor-notification-log"
+import type { VendorNotificationLogEntry } from "../../../../../modules/vendor-notifications"
 
 type TriggerRequestBody = {
   step?: NudgeCadenceStep
@@ -198,23 +200,38 @@ export async function POST(
       logger,
     )
     const id = randomUUID()
-    auditLogIds.push(id)
     if (result.ok) {
       triggered += 1
     } else {
       failed += 1
     }
-    logger.info?.("[nudge] audit entry", {
-      id,
-      vendor_id: vendor.id,
-      vendor_handle: vendor.handle,
-      notification_type: `nudge_${step}`,
-      sent_at: new Date().toISOString(),
-      locale,
-      recipient_email: vendor.email,
-      status: result.ok ? "sent" : "failed",
-      triggered_by: triggeredBy,
-    })
+    const notificationType =
+      `nudge_${step}` as VendorNotificationLogEntry["notification_type"]
+    const persisted = await appendNotificationLogBestEffort(
+      req.scope as { resolve: (key: string) => unknown },
+      {
+        id,
+        vendor_id: vendor.id,
+        vendor_handle: vendor.handle ?? null,
+        notification_type: notificationType,
+        sent_at: new Date().toISOString(),
+        locale,
+        recipient_email: vendor.email,
+        status: result.ok ? "sent" : "failed",
+        triggered_by: triggeredBy,
+      },
+    )
+    auditLogIds.push(persisted.entry.id)
+    logger.info?.(
+      `[nudge] audit entry${persisted.persisted ? "" : " (in-memory)"}`,
+      persisted.entry as unknown as Record<string, unknown>,
+    )
+    if (!persisted.persisted) {
+      logger.warn?.("[nudge] audit persist failed", {
+        error: persisted.error,
+        audit_id: id,
+      })
+    }
   }
 
   res.status(200).json({
