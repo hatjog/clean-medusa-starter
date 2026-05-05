@@ -110,6 +110,66 @@ describe("t30-dispatch-service", () => {
       process.env.GP_T30_DEV_FIXTURE_VENDORS_JSON = "not-json"
       expect(await fetchEligibleVendors()).toEqual([])
     })
+
+    it("returns runtime sellers when scope is available", async () => {
+      const scope = {
+        resolve: (key: string) => {
+          if (key === "sellerModuleService") {
+            return {
+              list: jest.fn().mockResolvedValue([
+                {
+                  id: "sel_open_pl",
+                  handle: "salon-open-pl",
+                  email: "open-pl@example.com",
+                  store_status: "ACTIVE",
+                  preferred_locale: "pl",
+                },
+                {
+                  id: "sel_open_en",
+                  handle: "salon-open-en",
+                  email: "open-en@example.com",
+                  store_status: "ACTIVE",
+                  preferred_locale: "en",
+                },
+                {
+                  id: "sel_no_email",
+                  handle: "salon-no-email",
+                  email: "",
+                  store_status: "ACTIVE",
+                  preferred_locale: "pl",
+                },
+                {
+                  id: "sel_suspended",
+                  handle: "salon-suspended",
+                  email: "suspended@example.com",
+                  store_status: "INACTIVE",
+                  preferred_locale: "pl",
+                },
+              ]),
+            }
+          }
+
+          throw new Error(`unexpected resolve: ${key}`)
+        },
+      }
+
+      const vendors = await fetchEligibleVendors(undefined, scope)
+
+      expect(vendors).toEqual([
+        {
+          id: "sel_open_pl",
+          handle: "salon-open-pl",
+          email: "open-pl@example.com",
+          preferred_locale: "pl",
+        },
+        {
+          id: "sel_open_en",
+          handle: "salon-open-en",
+          email: "open-en@example.com",
+          preferred_locale: "en",
+        },
+      ])
+    })
   })
 
   // -------------------------------------------------------------------------

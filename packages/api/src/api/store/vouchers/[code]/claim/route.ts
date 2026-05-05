@@ -17,6 +17,7 @@
  */
 
 import type { MedusaRequest, MedusaResponse } from "@medusajs/framework/http"
+import { Modules } from "@medusajs/framework/utils"
 import { consumeClaimToken } from "../../../../../lib/voucher-claim-rate-limit"
 import {
   computeBinding,
@@ -89,6 +90,24 @@ interface ClaimBody {
   recipient_session?: unknown
   idempotency_key?: unknown
   claimed_at?: unknown
+}
+
+type EventBusLike = {
+  emit?: (message: { name: string; data: Record<string, unknown> }) => Promise<unknown>
+}
+
+async function emitVoucherClaimedEvent(
+  req: MedusaRequest,
+  payload: { voucher_id: string; voucher_code: string; claimed_at: string },
+): Promise<void> {
+  try {
+    const eventBus = req.scope?.resolve?.(Modules.EVENT_BUS) as EventBusLike | undefined
+    if (eventBus && typeof eventBus.emit === "function") {
+      await eventBus.emit({ name: "voucher.claimed", data: payload })
+    }
+  } catch {
+    // Claim success is not rolled back by notification fan-out issues.
+  }
 }
 
 export async function POST(
@@ -287,6 +306,12 @@ export async function POST(
     ip,
     outcome: "ok",
     occurred_at: claimedAtIso,
+  })
+
+  await emitVoucherClaimedEvent(req, {
+    voucher_id: updatedFx.code,
+    voucher_code: updatedFx.code,
+    claimed_at: claimedAtIso,
   })
 
   // AR45: response MUST NOT expose recipient PII.

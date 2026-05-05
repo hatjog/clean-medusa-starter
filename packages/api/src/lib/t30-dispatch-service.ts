@@ -33,6 +33,11 @@ import {
 } from "./vendor-notification-provider-readiness"
 import { dispatchVendorEmail } from "./vendor-notification-dispatch"
 import { appendNotificationLogBestEffort } from "./vendor-notification-log"
+import {
+  listSellers,
+  resolveLifecycleStatus,
+  resolvePreferredLocale,
+} from "./vendor-decision-store"
 
 // ---------------------------------------------------------------------------
 // Shared types
@@ -43,6 +48,10 @@ export interface VendorRow {
   handle: string
   email: string
   preferred_locale: T30EmailLocale | null
+}
+
+type ScopeResolver = {
+  resolve: (key: string) => unknown
 }
 
 export interface T30DispatchResult {
@@ -65,7 +74,7 @@ export interface T30DispatchOptions {
    * Pass `req.scope` (or `triggerT30Kickoff()` scope) for durable audit.
    * When omitted, audit stays in-memory only (test/CLI paths).
    */
-  scope?: { resolve: (key: string) => unknown }
+  scope?: ScopeResolver
 }
 
 export type T30Logger = {
@@ -122,23 +131,56 @@ export function isFixtureMode(): boolean {
   return !process.env.GP_T30_REAL_VENDOR_SOURCE_ENABLED
 }
 
+function filterFixtureVendors(
+  vendors: VendorRow[],
+  vendor_ids?: string[],
+): VendorRow[] {
+  if (!vendor_ids || vendor_ids.length === 0) {
+    return vendors
+  }
+
+  const allowed = new Set(vendor_ids)
+  return vendors.filter((vendor) => allowed.has(vendor.id))
+}
+
 /**
  * Fetch eligible vendors.
  * Production: queries Mercur 2 vendor table (deferred to v1.7.0+).
  * Dev/test: reads `GP_T30_DEV_FIXTURE_VENDORS_JSON` or returns [].
  */
 export async function fetchEligibleVendors(
-  _vendor_ids?: string[],
+  vendor_ids?: string[],
+  scope?: ScopeResolver,
 ): Promise<VendorRow[]> {
   const fixture = process.env.GP_T30_DEV_FIXTURE_VENDORS_JSON
   if (fixture) {
     try {
-      return JSON.parse(fixture) as VendorRow[]
+      return filterFixtureVendors(JSON.parse(fixture) as VendorRow[], vendor_ids)
     } catch {
       return []
     }
   }
-  return []
+
+  if (!scope) {
+    return []
+  }
+
+  const sellers = await listSellers(scope)
+  const allowed = vendor_ids && vendor_ids.length > 0 ? new Set(vendor_ids) : null
+
+  return sellers
+    .filter((seller) => !allowed || allowed.has(seller.id))
+    .filter((seller) => resolveLifecycleStatus(seller) === "open")
+    .filter((seller) => typeof seller.email === "string" && seller.email.trim().length > 0)
+    .map((seller) => ({
+      id: seller.id,
+      handle:
+        typeof seller.handle === "string" && seller.handle.trim().length > 0
+          ? seller.handle
+          : seller.id,
+      email: seller.email!.trim(),
+      preferred_locale: resolvePreferredLocale(seller),
+    }))
 }
 
 async function dispatchEmailStub(
@@ -146,7 +188,7 @@ async function dispatchEmailStub(
   locale: T30EmailLocale,
   flagFlipIso: string,
   logger: T30Logger,
-  scope?: { resolve: (key: string) => unknown },
+  scope?: ScopeResolver,
 ): Promise<{ ok: boolean; error?: string }> {
   const ctx = {
     vendor_name: vendor.handle,
@@ -222,7 +264,7 @@ export async function dispatchT30Notifications(
 
   assertNotificationProviderReady()
 
-  const eligible = await fetchEligibleVendors(vendor_ids)
+  const eligible = await fetchEligibleVendors(vendor_ids, scope)
 
   const auditLogIds: string[] = []
   const auditEntries: VendorNotificationLogEntry[] = []
