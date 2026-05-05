@@ -31,6 +31,7 @@ import {
   assertNotificationProviderReady,
   NotificationProviderNotReadyError,
 } from "./vendor-notification-provider-readiness"
+import { dispatchVendorEmail } from "./vendor-notification-dispatch"
 import { appendNotificationLogBestEffort } from "./vendor-notification-log"
 
 // ---------------------------------------------------------------------------
@@ -145,6 +146,7 @@ async function dispatchEmailStub(
   locale: T30EmailLocale,
   flagFlipIso: string,
   logger: T30Logger,
+  scope?: { resolve: (key: string) => unknown },
 ): Promise<{ ok: boolean; error?: string }> {
   const ctx = {
     vendor_name: vendor.handle,
@@ -155,8 +157,35 @@ async function dispatchEmailStub(
   const html = renderT30Html(locale, ctx)
   const text = renderT30Text(locale, ctx)
 
-  // Real Medusa notification module dispatch deferred to Story 7.1 follow-up.
-  // Dev no-op: log + breadcrumb so smoke testing exercises the audit log path.
+  if (scope) {
+    try {
+      const result = await dispatchVendorEmail({
+        scope,
+        to: vendor.email,
+        subject,
+        text,
+        html,
+        template: "t30_migration",
+        triggerBy: "system",
+        metadata: {
+          vendor_id: vendor.id,
+          vendor_handle: vendor.handle,
+          locale,
+          flag_flip_date: flagFlipIso,
+        },
+      })
+
+      logger.info?.("[t30] notification sent", {
+        vendor_id: vendor.id,
+        locale,
+        notification_id: result.notificationId,
+      })
+      return { ok: true }
+    } catch (e: any) {
+      return { ok: false, error: e?.message ?? String(e) }
+    }
+  }
+
   logger.info?.("[t30] would send notification", {
     vendor_id: vendor.id,
     locale,
@@ -208,6 +237,7 @@ export async function dispatchT30Notifications(
       locale,
       flag_flip_iso,
       logger,
+      scope,
     )
     const entryInput = {
       id: randomUUID(),
