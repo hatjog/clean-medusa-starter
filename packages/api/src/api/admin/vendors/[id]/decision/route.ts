@@ -1,16 +1,8 @@
 /**
  * Story v160-7-3: POST /admin/vendors/[id]/decision — capture vendor opt-in/opt-out decision.
  *
- * Workflow steps:
- *  1. Validate input (decision in {opted_in, opted_out}, reason min 10 chars)
- *  2. Write vendor.metadata.lifecycle_decision (Path A per Story 7.2)
- *  3. Write audit log entry (notification_type: 'decision_capture')
- *  4. Dispatch confirmation email via vendor-notifications module
- *
- * Per Sprint 4 Wave 15: vendor table write + Medusa notification dispatch wiring
- * is DEFERRED (shared with Stories 7.1/7.2/7.5/7.6 production wiring). This
- * route renders the confirmation email payload for QA + logs the audit entry
- * shape via console (dev mode) — replace with real persistence in Phase B.
+ * Writes durable seller metadata (`metadata.gp.lifecycle_decision`) and keeps
+ * confirmation email dispatch as a visible no-op until delivery wiring lands.
  */
 
 import type { MedusaRequest, MedusaResponse } from "@medusajs/framework/http"
@@ -18,9 +10,22 @@ import {
   renderDecisionConfirmationHtml,
   renderDecisionConfirmationSubject,
   renderDecisionConfirmationText,
-  type DecisionType,
   type DecisionConfirmationLocale,
+  type DecisionType,
 } from "../../../../../modules/vendor-notifications/email-templates/decision-confirmation/i18n"
+import { extractActorIdOrThrow } from "../../../../../lib/capability-check"
+import {
+  dispatchVendorEmail,
+  NotificationModuleUnavailableError,
+} from "../../../../../lib/vendor-notification-dispatch"
+import { NotificationProviderNotReadyError } from "../../../../../lib/vendor-notification-provider-readiness"
+import {
+  getSellerById,
+  mergeSellerGpMetadata,
+  resolveLifecycleStatus,
+  resolvePreferredLocale,
+  updateSeller,
+} from "../../../../../lib/vendor-decision-store"
 
 type CaptureBody = {
   decision: DecisionType
@@ -35,14 +40,31 @@ type CaptureResponse = {
   email_dispatched: boolean
 }
 
+type ErrorResponse = {
+  error?: string
+  code?: string
+  message?: string
+}
+
 const VALID_DECISIONS: DecisionType[] = ["opted_in", "opted_out"]
 
 export async function POST(
   req: MedusaRequest<CaptureBody>,
-  res: MedusaResponse<CaptureResponse | { error: string }>,
+  res: MedusaResponse<CaptureResponse | ErrorResponse>,
 ): Promise<void> {
   const { id } = req.params as { id: string }
   const body = (req.body ?? {}) as Partial<CaptureBody>
+
+  let actorId: string
+  try {
+    actorId = extractActorIdOrThrow(req)
+  } catch {
+    res.status(401).json({
+      code: "UNAUTHORIZED",
+      message: "Valid admin session required",
+    })
+    return
+  }
 
   if (!body.decision || !VALID_DECISIONS.includes(body.decision)) {
     res.status(400).json({
@@ -61,15 +83,57 @@ export async function POST(
   const decision = body.decision
   const reason = body.reason.trim()
   const adminNote = body.admin_note?.trim() ?? null
+  const seller = await getSellerById(
+    req.scope as { resolve: (key: string) => unknown },
+    id,
+  )
+
+  if (!seller) {
+    res.status(404).json({
+      code: "VENDOR_NOT_FOUND",
+      message: `Vendor ${id} was not found`,
+    })
+    return
+  }
+
+  const lifecycleStatus = resolveLifecycleStatus(seller)
+  if (lifecycleStatus !== "open") {
+    res.status(400).json({
+      error: `Decision capture requires lifecycle_status='open' (current: '${lifecycleStatus}')`,
+    })
+    return
+  }
+
+  if (!seller.email || seller.email.trim().length === 0) {
+    res.status(409).json({
+      code: "VENDOR_EMAIL_NOT_CONFIGURED",
+      message: `Vendor ${id} does not have an email address configured for confirmation delivery`,
+    })
+    return
+  }
+
   const capturedAt = new Date().toISOString()
-  const auditLogId = `decision_capture_${id}_${Date.now()}`
+  const metadata = mergeSellerGpMetadata(seller, {
+    lifecycle_status: lifecycleStatus,
+    decision_status: decision,
+    lifecycle_decision: {
+      decision,
+      reason,
+      admin_note: adminNote,
+      captured_at: capturedAt,
+      captured_by: actorId,
+    },
+  })
 
-  // Locale resolution — placeholder; real impl reads vendor.preferred_locale.
-  const locale: DecisionConfirmationLocale = "pl"
+  await updateSeller(
+    req.scope as { resolve: (key: string) => unknown },
+    id,
+    { metadata },
+  )
 
-  // Render confirmation email (dev — log; prod — dispatch via Medusa notification).
+  const locale: DecisionConfirmationLocale = resolvePreferredLocale(seller)
   const ctx = {
-    vendor_name: id,
+    vendor_name: seller.name ?? seller.handle ?? id,
     captured_at: capturedAt,
     reason,
     contact_email: process.env.ADMIN_NOTIFICATION_EMAIL ?? "admin@bonbeauty.example",
@@ -78,22 +142,73 @@ export async function POST(
   const html = renderDecisionConfirmationHtml(locale, decision, ctx)
   const text = renderDecisionConfirmationText(locale, decision, ctx)
 
+  let auditLogId: string | null = null
+  try {
+    const dispatchResult = await dispatchVendorEmail({
+      scope: req.scope as { resolve: (key: string) => unknown },
+      to: seller.email,
+      subject,
+      text,
+      html,
+      template: "vendor-decision-confirmation",
+      triggerBy: actorId,
+      metadata: {
+        vendor_id: id,
+        decision,
+        notification_type: "decision_capture",
+      },
+    })
+    auditLogId =
+      dispatchResult.notificationId ?? `decision_capture_${id}_${Date.now()}`
+  } catch (err) {
+    if (
+      err instanceof NotificationProviderNotReadyError ||
+      err instanceof NotificationModuleUnavailableError
+    ) {
+      res.status(503).json({
+        code: err.code,
+        message: err.message,
+      })
+      return
+    }
+    throw err
+  }
+
+  const updatedSeller = {
+    ...seller,
+    metadata,
+  }
+  const persistedMetadata = mergeSellerGpMetadata(updatedSeller, {
+    lifecycle_decision_confirmation: {
+      audit_log_id: auditLogId,
+      dispatched_at: capturedAt,
+      recipient_email: seller.email,
+      locale,
+      template: "vendor-decision-confirmation",
+      dispatched_by: actorId,
+      status: "sent",
+    },
+  })
+
+  await updateSeller(
+    req.scope as { resolve: (key: string) => unknown },
+    id,
+    { metadata: persistedMetadata },
+  )
+
   if (process.env.NODE_ENV !== "test") {
     // eslint-disable-next-line no-console
     console.info(
-      `[decision_capture] vendor_id=${id} decision=${decision} reason=${reason.slice(0, 60)}... admin_note=${adminNote ?? "—"}`,
+      `[decision_capture] actor_id=${actorId} vendor_id=${id} decision=${decision} reason=${reason.slice(0, 60)}... admin_note=${adminNote ?? "—"}`,
     )
     // eslint-disable-next-line no-console
-    console.info(`[decision_capture] would email subject="${subject}"`)
-    // Discard html/text from prod logs — included here only to ensure reachable.
-    void html
-    void text
+    console.info(`[decision_capture] dispatched notification audit_log_id="${auditLogId}" subject="${subject}"`)
   }
 
   res.json({
     vendor_id: id,
     decision,
     audit_log_id: auditLogId,
-    email_dispatched: process.env.NODE_ENV !== "test",
+    email_dispatched: true,
   })
 }
