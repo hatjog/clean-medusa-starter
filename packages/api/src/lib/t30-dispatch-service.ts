@@ -31,6 +31,7 @@ import {
   assertNotificationProviderReady,
   NotificationProviderNotReadyError,
 } from "./vendor-notification-provider-readiness"
+import { appendNotificationLogBestEffort } from "./vendor-notification-log"
 
 // ---------------------------------------------------------------------------
 // Shared types
@@ -57,6 +58,13 @@ export interface T30DispatchOptions {
   vendor_ids?: string[]
   flag_flip_iso: string
   logger?: T30Logger
+  /**
+   * Story v160-cleanup-7-followup — when provided, audit entries are
+   * persisted to vendor_notification_log via appendNotificationLogBestEffort.
+   * Pass `req.scope` (or `triggerT30Kickoff()` scope) for durable audit.
+   * When omitted, audit stays in-memory only (test/CLI paths).
+   */
+  scope?: { resolve: (key: string) => unknown }
 }
 
 export type T30Logger = {
@@ -176,7 +184,7 @@ async function dispatchEmailStub(
 export async function dispatchT30Notifications(
   opts: T30DispatchOptions,
 ): Promise<T30DispatchResult> {
-  const { triggered_by, vendor_ids, flag_flip_iso, logger = {} } = opts
+  const { triggered_by, vendor_ids, flag_flip_iso, logger = {}, scope } = opts
 
   // AC3: hard-block in production when fixture mode active.
   if (process.env.NODE_ENV === "production" && isFixtureMode()) {
@@ -201,18 +209,30 @@ export async function dispatchT30Notifications(
       flag_flip_iso,
       logger,
     )
-    const entry: VendorNotificationLogEntry = {
+    const entryInput = {
       id: randomUUID(),
       vendor_id: vendor.id,
       vendor_handle: vendor.handle,
-      notification_type: "t30_migration",
+      notification_type: "t30_migration" as const,
       sent_at: new Date().toISOString(),
       locale,
       recipient_email: vendor.email,
-      status: dispatchResult.ok ? "sent" : "failed",
+      status: dispatchResult.ok ? ("sent" as const) : ("failed" as const),
       error_message: dispatchResult.error ?? null,
       triggered_by,
     }
+
+    let entry: VendorNotificationLogEntry = entryInput
+    let persisted = false
+    if (scope) {
+      const result = await appendNotificationLogBestEffort(scope, entryInput)
+      entry = result.entry
+      persisted = result.persisted
+      if (!persisted) {
+        logger.warn?.("[t30] audit persist failed", { error: result.error, audit_id: entry.id })
+      }
+    }
+
     auditLogIds.push(entry.id)
     auditEntries.push(entry)
     if (dispatchResult.ok) {
@@ -220,7 +240,10 @@ export async function dispatchT30Notifications(
     } else {
       failed += 1
     }
-    logger.info?.("[t30] audit entry", entry as unknown as Record<string, unknown>)
+    logger.info?.(
+      `[t30] audit entry${persisted ? "" : " (in-memory)"}`,
+      entry as unknown as Record<string, unknown>,
+    )
   }
 
   return { triggered, skipped, failed, audit_log_ids: auditLogIds, audit_entries: auditEntries }

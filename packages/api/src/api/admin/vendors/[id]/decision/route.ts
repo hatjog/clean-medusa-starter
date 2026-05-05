@@ -26,6 +26,7 @@ import {
   resolvePreferredLocale,
   updateSeller,
 } from "../../../../../lib/vendor-decision-store"
+import { appendNotificationLogBestEffort } from "../../../../../lib/vendor-notification-log"
 
 type CaptureBody = {
   decision: DecisionType
@@ -143,6 +144,8 @@ export async function POST(
   const text = renderDecisionConfirmationText(locale, decision, ctx)
 
   let auditLogId: string | null = null
+  let dispatchStatus: "sent" | "failed" = "sent"
+  let dispatchError: string | null = null
   try {
     const dispatchResult = await dispatchVendorEmail({
       scope: req.scope as { resolve: (key: string) => unknown },
@@ -173,6 +176,27 @@ export async function POST(
     }
     throw err
   }
+
+  // Story v160-cleanup-7-followup — durable audit row (AC4 closure).
+  // Best-effort persist: dispatch already succeeded; surfacing 5xx here would
+  // mislead the operator. Persistence failure is captured in `metadata.persisted`.
+  const audit = await appendNotificationLogBestEffort(
+    req.scope as { resolve: (key: string) => unknown },
+    {
+      id: auditLogId ?? undefined,
+      vendor_id: id,
+      vendor_handle: seller.handle ?? null,
+      notification_type: "decision_capture",
+      sent_at: capturedAt,
+      locale,
+      recipient_email: seller.email,
+      status: dispatchStatus,
+      error_message: dispatchError,
+      triggered_by: actorId,
+      metadata: { decision, reason_length: reason.length, admin_note_present: Boolean(adminNote) },
+    },
+  )
+  auditLogId = audit.entry.id
 
   const updatedSeller = {
     ...seller,
