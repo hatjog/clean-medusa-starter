@@ -10,9 +10,8 @@ import { Migration } from "@medusajs/framework/mikro-orm/migrations";
  *   CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_variant_metadata_duration
  *     ON product_variant (((metadata->>'duration')::int))
  *     WHERE metadata->>'duration' IS NOT NULL AND metadata->>'duration' ~ '^\d+$';
- *   CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_seller_city ON seller (city);
  *   (idx_seller_avg_rating removed — column does not exist, see Migration20260312100000)
- *   CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_sspp_product_id ON seller_seller_product_product (product_id);
+ *   CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_ppss_product_id ON product_product_seller_seller (product_id);
  *   CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_product_tags_tag_id ON product_tags (product_tag_id);
  */
 export class Migration20260312000000 extends Migration {
@@ -24,17 +23,12 @@ export class Migration20260312000000 extends Migration {
         WHERE metadata->>'duration' IS NOT NULL
           AND metadata->>'duration' ~ '^\\d+$'
     `);
-
-    // Seller filter fields
-    this.addSql(
-      `CREATE INDEX IF NOT EXISTS idx_seller_city ON seller (city)`
-    );
     // idx_seller_avg_rating removed — seller.avg_rating column does not exist.
     // Replaced by idx_ssrr_seller_id in Migration20260312100000.
 
     // Junction table lookup indexes
     this.addSql(
-      `CREATE INDEX IF NOT EXISTS idx_sspp_product_id ON seller_seller_product_product (product_id)`
+      `CREATE INDEX IF NOT EXISTS idx_ppss_product_id ON product_product_seller_seller (product_id)`
     );
     this.addSql(
       `CREATE INDEX IF NOT EXISTS idx_product_tags_tag_id ON product_tags (product_tag_id)`
@@ -45,9 +39,8 @@ export class Migration20260312000000 extends Migration {
     this.addSql(
       `DROP INDEX IF EXISTS idx_variant_metadata_duration`
     );
-    this.addSql(`DROP INDEX IF EXISTS idx_seller_city`);
     // idx_seller_avg_rating removed — see Migration20260312100000
-    this.addSql(`DROP INDEX IF EXISTS idx_sspp_product_id`);
+    this.addSql(`DROP INDEX IF EXISTS idx_ppss_product_id`);
     this.addSql(`DROP INDEX IF EXISTS idx_product_tags_tag_id`);
   }
 }

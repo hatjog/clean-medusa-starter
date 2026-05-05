@@ -1,0 +1,26 @@
+{
+  "negative": {
+    "url": "https://staging.example.invalid/store/recipient-claim/init",
+    "method": "POST",
+    "headers": {
+      "Content-Type": "application/json"
+    },
+    "body": {
+      "recipient_email": "probe@example.com"
+    }
+  },
+  "positive": {
+    "url": "https://staging.example.invalid/store/recipient-claim/init",
+    "method": "POST",
+    "headers": {
+      "Content-Type": "application/json",
+      "x-captcha-token": "REPLACE_WITH_STAGING_STUB_TOKEN"
+    },
+    "body": {
+      "recipient_email": "probe@example.com",
+      "captcha_token": "REPLACE_WITH_STAGING_STUB_TOKEN"
+    }
+  },
+  "expect_negative_statuses": [400, 403, 422],
+  "expect_positive_statuses": [200, 201, 202]
+}

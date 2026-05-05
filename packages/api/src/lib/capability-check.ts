@@ -60,7 +60,7 @@ export async function checkCapability(
 /**
  * extractActorIdOrThrow — fail-closed actor extraction.
  *
- * Replaces `?? "unknown_admin"` pattern. Throws if auth_context is missing
+ * Replaces the legacy phantom-admin fallback pattern. Throws if auth_context is missing
  * or actor_id is absent — callers receive a 401 response from error boundary.
  * Must only be called after authenticate() + operatorAuthMiddleware have run.
  *
