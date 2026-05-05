@@ -8,6 +8,7 @@
 
 import type { MedusaRequest, MedusaResponse } from "@medusajs/framework/http"
 import { ContainerRegistrationKeys } from "@medusajs/framework/utils"
+import { extractActorIdOrThrow } from "../../../../lib/capability-check"
 import { T30DispatcherFixtureModeError } from "../../../../lib/t30-dispatch-service"
 import {
   getDaysRemaining,
@@ -17,13 +18,24 @@ import {
 import type { T30Logger } from "../../../../lib/t30-dispatch-service"
 
 export async function GET(
-  _req: MedusaRequest,
+  req: MedusaRequest,
   res: MedusaResponse,
 ): Promise<void> {
-  const state = getKickoffState()
+  try {
+    extractActorIdOrThrow(req)
+  } catch {
+    res.status(401).json({
+      code: "UNAUTHORIZED",
+      message: "Valid admin session required",
+    })
+    return
+  }
+
+  const scope = req.scope as { resolve: (key: string) => unknown }
+  const state = await getKickoffState(scope)
   res.json({
     state,
-    days_remaining: getDaysRemaining(),
+    days_remaining: await getDaysRemaining(scope),
   })
 }
 
@@ -40,9 +52,17 @@ export async function POST(
     res.status(400).json({ error: "confirm: true required" })
     return
   }
-  const triggered_by =
-    (req as unknown as { auth_context?: { actor_id?: string } }).auth_context
-      ?.actor_id ?? "admin"
+
+  let triggered_by = ""
+  try {
+    triggered_by = extractActorIdOrThrow(req)
+  } catch {
+    res.status(401).json({
+      code: "UNAUTHORIZED",
+      message: "Valid admin session required",
+    })
+    return
+  }
 
   const logger =
     (req.scope.resolve(ContainerRegistrationKeys.LOGGER) as T30Logger | undefined) ??
@@ -54,6 +74,7 @@ export async function POST(
       admin_note: body.admin_note,
       override: body.override === true,
       logger,
+      scope: req.scope as { resolve: (key: string) => unknown },
     })
     res.json(result)
   } catch (err) {

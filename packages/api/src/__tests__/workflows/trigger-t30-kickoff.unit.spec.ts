@@ -137,4 +137,5 @@ describe("triggerT30Kickoff — CRIT-7.4 phantom coupling fix", () => {
     })
     expect(result.vendors_notified).toBeGreaterThanOrEqual(0)
   })
+
 })
