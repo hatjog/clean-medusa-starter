@@ -4,6 +4,7 @@ import {
   deriveCsrfProbeToken,
   resolveCsrfProbeAllowedOrigin,
 } from "../../../lib/security-gate-csrf-probe"
+import { marketContextStorage } from "../../../lib/market-context"
 
 let acceptedProbeRuns = 0
 let lastAcceptedAt: string | null = null
@@ -36,8 +37,10 @@ export async function GET(
   res: MedusaResponse,
 ): Promise<void> {
   setProbeHeaders(res)
+  const marketContext = marketContextStorage.getStore()
 
   res.json({
+    market_id: marketContext?.market_id ?? null,
     configured: Boolean(
       resolveCsrfProbeAllowedOrigin(process.env) &&
         deriveCsrfProbeToken(process.env),
@@ -52,6 +55,7 @@ export async function POST(
   res: MedusaResponse,
 ): Promise<void> {
   setProbeHeaders(res)
+  const marketContext = marketContextStorage.getStore()
 
   const expectedOrigin = resolveCsrfProbeAllowedOrigin(process.env)
   const expectedToken = deriveCsrfProbeToken(process.env)
@@ -82,6 +86,7 @@ export async function POST(
 
   res.status(200).json({
     ok: true,
+    market_id: marketContext?.market_id ?? null,
     accepted_probe_runs: acceptedProbeRuns,
     last_accepted_at: lastAcceptedAt,
   })

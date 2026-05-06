@@ -11,7 +11,9 @@ import {
   buildDecisionListEntry,
   buildLifecycleMetadataSnapshot,
   getSellerById,
+  readSellerGpMetadata,
 } from "../../../../../lib/vendor-decision-store"
+import { marketContextStorage } from "../../../../../lib/market-context"
 
 type PauseGateDetailResponse = {
   vendor: {
@@ -37,6 +39,7 @@ export async function GET(
     res.status(401).json({ error: "Valid admin session required" })
     return
   }
+  const marketContext = marketContextStorage.getStore()
 
   const id = (req.params as { id?: string }).id
   if (!id) {
@@ -50,6 +53,15 @@ export async function GET(
   )
 
   if (!seller) {
+    res.status(404).json({ error: `Vendor ${id} was not found` })
+    return
+  }
+  const sellerMarketId = readSellerGpMetadata(seller).market_id
+  if (
+    marketContext?.market_id &&
+    typeof sellerMarketId === "string" &&
+    sellerMarketId !== marketContext.market_id
+  ) {
     res.status(404).json({ error: `Vendor ${id} was not found` })
     return
   }
