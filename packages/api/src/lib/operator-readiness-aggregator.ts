@@ -8,6 +8,11 @@
 
 import { verifyAllGates } from "./security-gate-verifier"
 import { listConfiguredAlerts } from "./alert-evaluator"
+import {
+  listSellers,
+  readSellerGpMetadata,
+  resolveLifecycleStatus,
+} from "./vendor-decision-store"
 
 export type ReadinessStatus = "green" | "yellow" | "red" | "unknown"
 
@@ -28,13 +33,151 @@ export type ReadinessResult = {
   computed_at: string
 }
 
+type ScopeResolver = {
+  resolve: (key: string) => unknown
+}
+
+type AdrTrack = "A" | "B"
+
 function aggregateOverall(items: ReadinessItem[]): ReadinessOverall {
   if (items.some((i) => i.status === "red")) return "red"
   if (items.every((i) => i.status === "green")) return "green"
   return "yellow"
 }
 
-export async function computeReadiness(): Promise<ReadinessResult> {
+function normalizeAdrTrack(value: unknown): AdrTrack | null {
+  if (typeof value !== "string") {
+    return null
+  }
+
+  const normalized = value.trim().toLowerCase()
+
+  if (normalized === "a" || normalized === "track_a" || normalized === "track-a") {
+    return "A"
+  }
+
+  if (normalized === "b" || normalized === "track_b" || normalized === "track-b") {
+    return "B"
+  }
+
+  return null
+}
+
+async function buildLifecycleReadiness(
+  scope?: ScopeResolver,
+): Promise<ReadinessItem> {
+  if (!scope) {
+    return {
+      key: "vendor_lifecycle_distribution",
+      label: "Vendor lifecycle distribution",
+      status: "unknown",
+      value: "Seller scope unavailable",
+      threshold: "≥ 80% terminal (open/suspended/terminated)",
+      remediation_url: "/app/vendors/pause-gate",
+    }
+  }
+
+  const sellers = await listSellers(scope)
+  const counts = {
+    pending_approval: 0,
+    open: 0,
+    suspended: 0,
+    terminated: 0,
+  }
+
+  for (const seller of sellers) {
+    counts[resolveLifecycleStatus(seller)] += 1
+  }
+
+  const total = sellers.length
+  if (total === 0) {
+    return {
+      key: "vendor_lifecycle_distribution",
+      label: "Vendor lifecycle distribution",
+      status: "unknown",
+      value: "0/0 vendors available",
+      threshold: "≥ 80% terminal (open/suspended/terminated)",
+      remediation_url: "/app/vendors/pause-gate",
+    }
+  }
+
+  const terminal = counts.open + counts.suspended + counts.terminated
+  const terminalRatio = terminal / total
+  const status: ReadinessStatus =
+    terminalRatio >= 0.8 ? "green" : terminalRatio >= 0.5 ? "yellow" : "red"
+
+  return {
+    key: "vendor_lifecycle_distribution",
+    label: "Vendor lifecycle distribution",
+    status,
+    value:
+      `${terminal}/${total} terminal ` +
+      `(open=${counts.open}, suspended=${counts.suspended}, ` +
+      `terminated=${counts.terminated}, pending=${counts.pending_approval})`,
+    threshold: "≥ 80% terminal (open/suspended/terminated)",
+    remediation_url: "/app/vendors/pause-gate",
+  }
+}
+
+async function buildAdr097Readiness(
+  scope?: ScopeResolver,
+): Promise<ReadinessItem> {
+  if (!scope) {
+    return {
+      key: "adr_097_capacity_posture",
+      label: "ADR-097 capacity posture",
+      status: "unknown",
+      value: "Seller scope unavailable",
+      threshold: "Track A/B documented + balanced",
+      remediation_url:
+        "/specs/adr/2026-05-01-adr-097-sprint-0-capacity-rebalance-hybrid-d.md",
+    }
+  }
+
+  const sellers = await listSellers(scope)
+  const total = sellers.length
+  let trackA = 0
+  let trackB = 0
+
+  for (const seller of sellers) {
+    const gp = readSellerGpMetadata(seller)
+    const track = normalizeAdrTrack(gp.adr_097_track)
+
+    if (track === "A") {
+      trackA += 1
+    } else if (track === "B") {
+      trackB += 1
+    }
+  }
+
+  const documented = trackA + trackB
+  const dominantShare = documented === 0 ? 1 : Math.max(trackA, trackB) / documented
+
+  let status: ReadinessStatus = "unknown"
+  if (documented > 0) {
+    status =
+      documented === total && trackA > 0 && trackB > 0 && dominantShare <= 0.6
+        ? "green"
+        : "yellow"
+  }
+
+  return {
+    key: "adr_097_capacity_posture",
+    label: "ADR-097 capacity posture",
+    status,
+    value:
+      documented === 0
+        ? `0/${total} vendors documented`
+        : `${documented}/${total} documented (A=${trackA}, B=${trackB})`,
+    threshold: "Track A/B documented + balanced",
+    remediation_url:
+      "/specs/adr/2026-05-01-adr-097-sprint-0-capacity-rebalance-hybrid-d.md",
+  }
+}
+
+export async function computeReadiness(
+  scope?: ScopeResolver,
+): Promise<ReadinessResult> {
   const phase_a1: ReadinessItem = {
     key: "phase_a1_gate",
     label: "Phase A1 SMOKE GATE (AR53)",
@@ -56,24 +199,8 @@ export async function computeReadiness(): Promise<ReadinessResult> {
       "/_bmad-output/implementation-artifacts/v160/v160-2-9-phase-a2-smoke-test-gate.md",
   }
 
-  const lifecycle: ReadinessItem = {
-    key: "vendor_lifecycle_distribution",
-    label: "Vendor lifecycle distribution",
-    status: "yellow",
-    value: "Sprint 4 baseline; awaiting kickoff decisions",
-    threshold: "≥ 80% terminal (open/suspended/terminated)",
-    remediation_url: "/app/vendors/pause-gate",
-  }
-
-  const adr097: ReadinessItem = {
-    key: "adr_097_capacity_posture",
-    label: "ADR-097 capacity posture",
-    status: "green",
-    value: "Hybrid D dual-track ratified",
-    threshold: "Track A/B documented + balanced",
-    remediation_url:
-      "/specs/adr/2026-05-01-adr-097-sprint-0-capacity-rebalance-hybrid-d.md",
-  }
+  const lifecycle = await buildLifecycleReadiness(scope)
+  const adr097 = await buildAdr097Readiness(scope)
 
   const alertingConfigured = listConfiguredAlerts().length >= 8
   const alerting: ReadinessItem = {
