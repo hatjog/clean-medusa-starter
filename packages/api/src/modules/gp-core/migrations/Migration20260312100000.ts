@@ -11,9 +11,15 @@ import { Migration } from "@medusajs/framework/mikro-orm/migrations";
  */
 export class Migration20260312100000 extends Migration {
   async up(): Promise<void> {
-    this.addSql(
-      `CREATE INDEX IF NOT EXISTS idx_ssrr_seller_id ON seller_seller_review_review (seller_id) WHERE deleted_at IS NULL`
-    );
+    this.addSql(`
+      DO $$ BEGIN
+        IF to_regclass('public.seller_seller_review_review') IS NOT NULL THEN
+          CREATE INDEX IF NOT EXISTS idx_ssrr_seller_id
+            ON seller_seller_review_review (seller_id)
+            WHERE deleted_at IS NULL;
+        END IF;
+      END $$
+    `);
   }
 
   async down(): Promise<void> {

@@ -1,11 +1,10 @@
 /**
  * gp-config-sync-vendors.ts — vendor sync from gp-config to backend (v1.5.0).
  *
- * TODO Story v160-1-7.1 (post-1.8 smoke verification): DROP custom PAT-17 —
- * `vendorStatusToStoreStatus()` mapping currently bridges custom 3-status model
- * (active/paused/archived) to store status. Replace with native Mercur 2 seller
- * status (pending_approval/open/suspended/terminated) per ADR-090 §PAT-17.
- * Deferred until story v160-1-8 confirms native status enum at runtime.
+ * Story v160-1-7.1: gp-config vendor status now maps directly onto the
+ * Mercur 2 seller lifecycle enum (`pending_approval`, `open`, `suspended`,
+ * `terminated`). Legacy GP `active` / `inactive` / `archived` values are kept
+ * only as input aliases for older market fixtures.
  */
 import { ExecArgs } from "@medusajs/framework/types"
 import { ContainerRegistrationKeys } from "@medusajs/framework/utils"
@@ -62,6 +61,7 @@ type VendorFixture = {
 
 type MarketConfig = {
   market_id: string
+  currency?: string
   vendors?: VendorFixture[]
 }
 
@@ -308,7 +308,7 @@ async function resolveSalesChannelId(db: any, marketId: string): Promise<string 
     .select("id")
     .whereRaw("metadata->>'gp_market_id' = ?", [marketId])
     .whereNull("deleted_at")
-    .first<{ id: string }>()
+    .first() as { id: string } | undefined
 
   return row?.id ?? null
 }
@@ -404,15 +404,29 @@ export async function resolveProductByFixture(
 
 function vendorStatusToSellerStatus(status: string | undefined): string {
   switch (status) {
+    case "pending_approval":
+    case "pending":
+      return "pending_approval"
+    case "open":
     case "onboarded":
     case "active":
       return "open"
     case "suspended":
+    case "paused":
     case "inactive":
       return "suspended"
+    case "terminated":
+    case "archived":
+    case "disabled":
+      return "terminated"
     default:
       return "open"
   }
+}
+
+function normalizeCurrencyCode(currency: string | undefined): string {
+  const normalized = currency?.trim().toLowerCase()
+  return normalized || "pln"
 }
 
 // ---- FR-56 seeded_fields logic ----
@@ -475,6 +489,7 @@ export async function upsertSeller(
   vendor: VendorFixture,
   dryRun: boolean,
   marketId: string,
+  currencyCode: string,
   overwrite = false
 ): Promise<SellerSyncResult> {
   const handle = vendor.slug.trim()
@@ -532,6 +547,7 @@ export async function upsertSeller(
       email: vendor.email,
       phone: vendor.phone,
       tax_id: vendor.tax_id,
+      currency_code: currencyCode,
       status: sellerStatus,
       metadata: { gp: gpMeta },
     }
@@ -554,7 +570,11 @@ export async function upsertSeller(
     : []
 
   // config_wins fields — always overwrite (only include defined values to avoid clearing existing data)
-  const configWinsPayload: Record<string, unknown> = { handle, status: sellerStatus }
+  const configWinsPayload: Record<string, unknown> = {
+    handle,
+    currency_code: currencyCode,
+    status: sellerStatus,
+  }
   if (vendor.email !== undefined) configWinsPayload.email = vendor.email
   if (vendor.phone !== undefined) configWinsPayload.phone = vendor.phone
   if (vendor.tax_id !== undefined) configWinsPayload.tax_id = vendor.tax_id
@@ -699,6 +719,7 @@ export default async function gpConfigSyncVendors({ container, args }: ExecArgs)
       `market_id mismatch in ${marketYamlPath}: expected '${marketId}', got '${marketConfig.market_id}'`
     )
   }
+  const currencyCode = normalizeCurrencyCode(marketConfig.currency)
 
   const marketProductsPath = path.resolve(
     configRoot,
@@ -778,7 +799,14 @@ export default async function gpConfigSyncVendors({ container, args }: ExecArgs)
     }
 
     try {
-      const result = await upsertSeller(sellerModuleService, vendor, dryRun, marketId, overwrite)
+      const result = await upsertSeller(
+        sellerModuleService,
+        vendor,
+        dryRun,
+        marketId,
+        currencyCode,
+        overwrite
+      )
 
       if (result.action === "created") vendorCounts.created++
       else if (result.action === "updated") vendorCounts.updated++

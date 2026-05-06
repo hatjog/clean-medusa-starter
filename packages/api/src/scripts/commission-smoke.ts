@@ -20,14 +20,55 @@ type CommissionCountRow = {
 
 type CommissionLineRow = Record<string, unknown>
 
-function readCount(rows: CommissionCountRow[] | undefined): number {
+async function ensureSmokeCommissionRate(db: Knex, currencyCode: string): Promise<void> {
+  const payload = {
+    is_enabled: true,
+    priority: 0,
+    currency_code: currencyCode,
+    name: "GP commission smoke default",
+    code: "gp_commission_smoke_default",
+    type: "percentage",
+    target: "item",
+    value: 15,
+    min_amount: null,
+    include_tax: false,
+    raw_value: JSON.stringify({ value: "15", precision: 20 }),
+    raw_min_amount: null,
+    deleted_at: null,
+  }
+
+  const existing = await db("commission_rate")
+    .select("id")
+    .where({ code: payload.code })
+    .first()
+
+  if (existing?.id) {
+    await db("commission_rate")
+      .where({ id: existing.id })
+      .update({
+        ...payload,
+        updated_at: db.fn.now(),
+      })
+    return
+  }
+
+  await db("commission_rate").insert({
+    id: "comrate_gp_commission_smoke_default",
+    ...payload,
+  })
+}
+
+function readCount(rows: unknown): number {
+  if (!Array.isArray(rows)) {
+    return 0
+  }
   const row = rows?.[0]
   const value = row?.count ?? row?.rows ?? 0
   return Number(value)
 }
 
 async function selectProductCandidates(db: Knex): Promise<ProductCandidate[]> {
-  const result = await db.raw<ProductCandidate[]>(`
+  const result = await db.raw(`
     with ranked_products as (
       select
         pps.product_id,
@@ -52,7 +93,7 @@ async function selectProductCandidates(db: Knex): Promise<ProductCandidate[]> {
     limit 2
   `)
 
-  return result.rows
+  return result.rows as ProductCandidate[]
 }
 
 function extractRows<T>(value: unknown): T[] {
@@ -90,7 +131,9 @@ export default async function commissionSmoke({ container }: ExecArgs) {
     throw new Error("No seller-linked product variants found for commission smoke")
   }
 
-  const beforeCountResult = await db<CommissionCountRow>("commission_line").count<{ count: string }>("* as count")
+  await ensureSmokeCommissionRate(db, region.currency_code)
+
+  const beforeCountResult = await db<CommissionCountRow>("commission_line").count("* as count")
   const beforeCount = readCount(beforeCountResult)
 
   const orderItems = candidates.map((candidate, index) => ({
@@ -161,7 +204,7 @@ export default async function commissionSmoke({ container }: ExecArgs) {
     throw new Error(`refreshOrderCommissionLinesWorkflow failed: ${JSON.stringify(refreshRun.errors)}`)
   }
 
-  const lineIdColumnResult = await db.raw<{ column_name: string }[]>(`
+  const lineIdColumnResult = await db.raw(`
     select column_name
     from information_schema.columns
     where table_schema = 'public' and table_name = 'commission_line'
@@ -186,7 +229,7 @@ export default async function commissionSmoke({ container }: ExecArgs) {
         .whereIn(commissionLineKey, trackedIds)
         .orderBy("created_at", "asc")
 
-  const afterCountResult = await db<CommissionCountRow>("commission_line").count<{ count: string }>("* as count")
+  const afterCountResult = await db<CommissionCountRow>("commission_line").count("* as count")
   const afterCount = readCount(afterCountResult)
 
   if (afterCount <= beforeCount || commissionLines.length === 0) {

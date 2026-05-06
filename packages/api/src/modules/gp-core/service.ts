@@ -1,10 +1,9 @@
 /**
  * gp-core/service.ts — GP core module service.
  *
- * TODO Story v160-1-7.1 (post-1.8 smoke verification): DROP PAT-17 vendor_status
- * field reads (lines 59, 110, 343) — replace with native Mercur 2 seller.status
- * enum per ADR-090 §PAT-17. Deferred until story v160-1-8 confirms native enum
- * shape at runtime against drop+reload schema.
+ * Story v160-1-7.1: vendor status values use the Mercur 2 seller lifecycle
+ * enum (`pending_approval`, `open`, `suspended`, `terminated`). The SQL alias
+ * remains `vendor_status` only to preserve the existing DTO shape.
  */
 import { Modules } from "@medusajs/framework/utils"
 import { createHash } from "node:crypto"
@@ -64,10 +63,12 @@ type MarketRow = GpCoreMarketRecord
 type AssignmentRow = GpCoreVendorMarketAssignment & {
   vendor_instance_id: string
   vendor_name: string
-  vendor_status: string
+  vendor_status: MercurSellerStatus
   vendor_created_at: Date | string
   vendor_updated_at: Date | string
 }
+
+type MercurSellerStatus = "pending_approval" | "open" | "suspended" | "terminated"
 
 function replaceDatabaseName(databaseUrl: string, databaseName: string): string {
   const parsed = new URL(databaseUrl)

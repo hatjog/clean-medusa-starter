@@ -27,12 +27,22 @@ export class Migration20260312000000 extends Migration {
     // Replaced by idx_ssrr_seller_id in Migration20260312100000.
 
     // Junction table lookup indexes
-    this.addSql(
-      `CREATE INDEX IF NOT EXISTS idx_ppss_product_id ON product_product_seller_seller (product_id)`
-    );
-    this.addSql(
-      `CREATE INDEX IF NOT EXISTS idx_product_tags_tag_id ON product_tags (product_tag_id)`
-    );
+    this.addSql(`
+      DO $$ BEGIN
+        IF to_regclass('public.product_product_seller_seller') IS NOT NULL THEN
+          CREATE INDEX IF NOT EXISTS idx_ppss_product_id
+            ON product_product_seller_seller (product_id);
+        END IF;
+      END $$
+    `);
+    this.addSql(`
+      DO $$ BEGIN
+        IF to_regclass('public.product_tags') IS NOT NULL THEN
+          CREATE INDEX IF NOT EXISTS idx_product_tags_tag_id
+            ON product_tags (product_tag_id);
+        END IF;
+      END $$
+    `);
   }
 
   async down(): Promise<void> {

@@ -1,9 +1,9 @@
 /**
  * gp-config-sync-catalog.ts — catalog sync from gp-config to backend (v1.5.0).
  *
- * TODO Story v160-1-7.1 (post-1.8 smoke verification): DROP PAT-17 vendor_status
- * field reads — replace with native Mercur 2 seller.status enum per ADR-090.
- * Deferred until story v160-1-8 confirms native enum at runtime.
+ * Story v160-1-7.1: catalog sync reads Mercur 2 native `seller.status`
+ * values. Legacy gp-config status names are normalized by
+ * `gp-config-sync-vendors.ts` before catalog linking runs.
  */
 import { ExecArgs } from "@medusajs/framework/types"
 import { createProductsWorkflow, linkProductsToSalesChannelWorkflow, upsertVariantPricesWorkflow } from "@medusajs/core-flows"

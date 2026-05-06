@@ -1,24 +1,20 @@
 /**
- * POST /admin/sellers/:id/pause — D-69 atomic admin pause flow.
+ * POST /admin/sellers/:id/pause — compatibility proxy for Mercur 2 seller suspension.
  *
- * TODO Story v160-1-7.1 (post-1.8 smoke verification): DROP custom PAT-17 —
- * replace with native Mercur 2 seller status workflow (4 statuses:
- * pending_approval/open/suspended/terminated) per ADR-090 §PAT-17 row.
- * Physical drop deferred until story v160-1-8 (DB drop+reload + medusa develop)
- * confirms native Mercur 2 admin endpoints preserve atomic semantics + B12 fire
- * drill SLA + flag-propagation T1/T2/T3 telemetry. Removing this file before
- * runtime verification re-introduces FM-9 risk (multi-vendor checkout race).
+ * Story v160-1-7.1 keeps this route as a thin telemetry-preserving proxy while
+ * replacing the legacy GP `paused` / `disabled` states with Mercur 2 native
+ * `suspended` / `terminated`.
  *
  * Atomic transaction shape (per architecture.md L450-464 + ADR-074):
  *
  *   BEGIN;
  *   SELECT id, status, version FROM seller WHERE id = $1 FOR UPDATE;
- *   UPDATE seller SET status = 'paused', version = version + 1 WHERE id = $1;
+ *   UPDATE seller SET status = 'suspended', version = version + 1 WHERE id = $1;
  *   INSERT INTO seller_status_change_audit (
  *     id, market_id, seller_id, prev_status, new_status,
  *     affected_orders, runtime_context, reason, changed_by, changed_at
  *   ) VALUES (
- *     $uuid, $market_id, $seller_id, $prev_status, 'paused',
+ *     $uuid, $market_id, $seller_id, $prev_status, 'suspended',
  *     (SELECT COALESCE(jsonb_agg(o.id ORDER BY o.created_at ASC), '[]'::jsonb)
  *        FROM orders o WHERE o.seller_id = $seller_id AND o.status = 'in_flight'),
  *     $runtime_context, $reason, $actor_id, transaction_timestamp()
@@ -112,7 +108,7 @@ export async function POST(req: MedusaRequest, res: MedusaResponse): Promise<voi
     return
   }
   const marketId = extractMarketId(req)
-  const logger = (req.scope.resolve(ContainerRegistrationKeys.LOGGER) as Logger | undefined) ?? {}
+  const logger = (req.scope.resolve(ContainerRegistrationKeys.LOGGER) as unknown as Logger | undefined) ?? {}
 
   // Resolve PG pool + Redis client from the Medusa container. The keys below
   // match the convention used by `gp-core` (see `src/modules/gp-core/service.ts`).
@@ -158,19 +154,19 @@ export async function POST(req: MedusaRequest, res: MedusaResponse): Promise<voi
     prevStatus = sellerRow.status
     const effectiveMarketId = marketId || sellerRow.market_id
 
-    if (prevStatus === "paused") {
+    if (prevStatus === "suspended") {
       // Idempotent — abort silently, do not re-emit propagation event.
       await client.query("ROLLBACK")
-      res.status(200).json({ ok: true, idempotent: true, status: "paused" })
+      res.status(200).json({ ok: true, idempotent: true, status: "suspended" })
       return
     }
 
-    if (prevStatus === "disabled") {
-      // ADR-074: `disabled` is terminal — admin pause is a no-op.
+    if (prevStatus === "terminated") {
+      // ADR-074: `terminated` is terminal — admin suspension is a no-op.
       await client.query("ROLLBACK")
       res.status(409).json({
-        code: "DISABLED_TERMINAL",
-        message: "ADR-074 forbids paused→active OR disabled→paused without manual re-enable workflow",
+        code: "TERMINATED_TERMINAL",
+        message: "ADR-074 forbids suspended→open OR terminated→suspended without manual re-enable workflow",
       })
       return
     }
@@ -178,7 +174,7 @@ export async function POST(req: MedusaRequest, res: MedusaResponse): Promise<voi
     // 2) Flip status + bump optimistic-lock `version`.
     await client.query(
       'UPDATE seller SET status = $1, version = version + 1 WHERE id = $2',
-      ["paused", sellerId]
+      ["suspended", sellerId]
     )
 
     // 3) Audit row — `affected_orders` populated via subselect for atomicity.
@@ -191,7 +187,7 @@ export async function POST(req: MedusaRequest, res: MedusaResponse): Promise<voi
          id, market_id, seller_id, prev_status, new_status,
          affected_orders, runtime_context, reason, changed_by, changed_at
        ) VALUES (
-         $1, $2, $3, $4, 'paused',
+         $1, $2, $3, $4, 'suspended',
          COALESCE(
            (SELECT jsonb_agg(o.id ORDER BY o.created_at ASC)
               FROM orders o
@@ -251,7 +247,7 @@ export async function POST(req: MedusaRequest, res: MedusaResponse): Promise<voi
           market_id: marketId,
           seller_id: sellerId,
           prior_status: prevStatus,
-          new_status: "paused",
+          new_status: "suspended",
           actor_id: actorId,
           timestamp_t1_db_commit: t1DbCommit?.toISOString(),
           affected_orders: affectedOrders,
@@ -284,7 +280,7 @@ export async function POST(req: MedusaRequest, res: MedusaResponse): Promise<voi
     ok: true,
     seller_id: sellerId,
     prev_status: prevStatus,
-    new_status: "paused",
+    new_status: "suspended",
     affected_orders: affectedOrders,
     audit_id: auditId,
     t1_db_commit: t1DbCommit?.toISOString(),

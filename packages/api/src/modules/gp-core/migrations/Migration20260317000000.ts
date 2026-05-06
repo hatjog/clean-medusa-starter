@@ -13,6 +13,8 @@ import { Migration } from "@medusajs/framework/mikro-orm/migrations";
  */
 export class Migration20260317000000 extends Migration {
   async up(): Promise<void> {
+    this.addSql(`CREATE SCHEMA IF NOT EXISTS gp_core`);
+
     // --- ENUM types ---
     // PostgreSQL has no CREATE TYPE IF NOT EXISTS, use exception handler
     this.addSql(`
