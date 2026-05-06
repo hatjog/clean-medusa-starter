@@ -145,16 +145,47 @@ describe("security-gate-verifier (cleanup-15f AC4)", () => {
   })
 
   it("csrf probe returns skip when probe URL absent", async () => {
-    const probeUrl = process.env.GP_SEC_GATE_CSRF_PROBE_URL
+    const prior = {
+      fixturePath: process.env.GP_SEC_GATE_CSRF_FIXTURE_PATH,
+      probeUrl: process.env.GP_SEC_GATE_CSRF_PROBE_URL,
+      allowedOrigin: process.env.GP_SEC_GATE_CSRF_ALLOWED_ORIGIN,
+      probeToken: process.env.GP_SEC_GATE_CSRF_PROBE_TOKEN,
+      probeSecret: process.env.GP_SEC_GATE_CSRF_PROBE_SECRET,
+      storefrontUrl: process.env.STOREFRONT_URL,
+      storeCors: process.env.STORE_CORS,
+      jwtSecret: process.env.JWT_SECRET,
+      cookieSecret: process.env.COOKIE_SECRET,
+      port: process.env.PORT,
+    }
+    delete process.env.GP_SEC_GATE_CSRF_FIXTURE_PATH
     delete process.env.GP_SEC_GATE_CSRF_PROBE_URL
+    delete process.env.GP_SEC_GATE_CSRF_ALLOWED_ORIGIN
+    delete process.env.GP_SEC_GATE_CSRF_PROBE_TOKEN
+    delete process.env.GP_SEC_GATE_CSRF_PROBE_SECRET
+    delete process.env.STOREFRONT_URL
+    delete process.env.STORE_CORS
+    delete process.env.JWT_SECRET
+    delete process.env.COOKIE_SECRET
+    delete process.env.PORT
     try {
       const result = await verifyGate("csrf")
       expect(result.gate).toBe("csrf")
       expect(result.status).toBe("skip")
     } finally {
-      if (probeUrl) {
-        process.env.GP_SEC_GATE_CSRF_PROBE_URL = probeUrl
+      if (prior.fixturePath) process.env.GP_SEC_GATE_CSRF_FIXTURE_PATH = prior.fixturePath
+      if (prior.probeUrl) process.env.GP_SEC_GATE_CSRF_PROBE_URL = prior.probeUrl
+      if (prior.allowedOrigin) {
+        process.env.GP_SEC_GATE_CSRF_ALLOWED_ORIGIN = prior.allowedOrigin
       }
+      if (prior.probeToken) process.env.GP_SEC_GATE_CSRF_PROBE_TOKEN = prior.probeToken
+      if (prior.probeSecret) {
+        process.env.GP_SEC_GATE_CSRF_PROBE_SECRET = prior.probeSecret
+      }
+      if (prior.storefrontUrl) process.env.STOREFRONT_URL = prior.storefrontUrl
+      if (prior.storeCors) process.env.STORE_CORS = prior.storeCors
+      if (prior.jwtSecret) process.env.JWT_SECRET = prior.jwtSecret
+      if (prior.cookieSecret) process.env.COOKIE_SECRET = prior.cookieSecret
+      if (prior.port) process.env.PORT = prior.port
     }
   })
 

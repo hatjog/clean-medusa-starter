@@ -79,16 +79,11 @@ export type WindowStats = {
   window_end_ms: number
 }
 
-/**
- * Compute p95 latency + 5xx error-rate over a time window.
- * Returns nulls when sample_size === 0 (caller maps to `unknown` status).
- */
-export function computeWindowStats(
-  windowMs: number,
+export function computeRangeStats(
+  sinceMs: number,
+  nowMs: number,
   cohort?: string,
-  nowMs: number = Date.now(),
 ): WindowStats {
-  const sinceMs = nowMs - windowMs
   let samples = _aggregator.range(sinceMs, nowMs)
   if (cohort) {
     samples = samples.filter((s) => s.cohort === cohort)
@@ -115,6 +110,19 @@ export function computeWindowStats(
     window_start_ms: sinceMs,
     window_end_ms: nowMs,
   }
+}
+
+/**
+ * Compute p95 latency + 5xx error-rate over a time window.
+ * Returns nulls when sample_size === 0 (caller maps to `unknown` status).
+ */
+export function computeWindowStats(
+  windowMs: number,
+  cohort?: string,
+  nowMs: number = Date.now(),
+): WindowStats {
+  const sinceMs = nowMs - windowMs
+  return computeRangeStats(sinceMs, nowMs, cohort)
 }
 
 /** Test helper — clear the in-process buffer. */

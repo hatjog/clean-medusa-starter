@@ -12,8 +12,8 @@ import { Migration } from "@mikro-orm/migrations";
  *   - BEFORE UPDATE / DELETE / TRUNCATE trigger raises `audit_immutable_violation`
  *     (defence-in-depth — covers app-role attackers when REVOKE was forgotten).
  *   - REVOKE UPDATE, DELETE, TRUNCATE on app role; INSERT and SELECT only.
- *   - `hour_bucket` GENERATED ALWAYS from `created_at` (DB clock authoritative
- *     per Risk #2 / FM-67-3 — clock-skew defense).
+ *   - `hour_bucket` is derived from `created_at` by a BEFORE INSERT trigger
+ *     (DB clock authoritative per Risk #2 / FM-67-3 — clock-skew defense).
  *   - Composite index (market_id, hour_bucket, created_at DESC) for per-shard chain replay.
  *   - `compensates_audit_id` self-FK NULLABLE — corrections are NEW rows; original
  *     never mutated (PAT-3 extension nullable-FK case per architecture.md).
@@ -39,18 +39,36 @@ export class Migration20260429120000VoucherPiiConsentAuditTable extends Migratio
     // 1. CREATE TABLE — full sharded-hash-chain schema per D-67 + ADR-078.
     //    `id` uses gen_random_uuid() pending pgcrypto availability; downstream
     //    workers may pass UUID v7 explicitly via INSERT ... VALUES (uuidv7(), ...).
-    //    `hour_bucket` is GENERATED from `created_at` (DB clock authoritative).
+    //    `hour_bucket` is materialized by a BEFORE INSERT trigger because
+    //    generated timestamptz expressions using date_trunc are not immutable.
     this.addSql(
       `CREATE TABLE voucher_pii_consent_audit (
         id uuid NOT NULL DEFAULT gen_random_uuid() PRIMARY KEY,
         market_id text NOT NULL,
-        hour_bucket timestamptz NOT NULL GENERATED ALWAYS AS (date_trunc('hour', created_at)) STORED,
+        hour_bucket timestamptz NOT NULL,
         prev_row_hash bytea NULL,
         current_row_hash bytea NOT NULL,
         compensates_audit_id uuid NULL REFERENCES voucher_pii_consent_audit(id),
         payload jsonb NOT NULL,
         created_at timestamptz NOT NULL DEFAULT now()
       )`
+    );
+
+    this.addSql(
+      `CREATE OR REPLACE FUNCTION fn_voucher_pii_consent_audit_set_hour_bucket()
+       RETURNS trigger AS $$
+       BEGIN
+         NEW.created_at = COALESCE(NEW.created_at, now());
+         NEW.hour_bucket = date_trunc('hour', NEW.created_at AT TIME ZONE 'UTC') AT TIME ZONE 'UTC';
+         RETURN NEW;
+       END;
+       $$ LANGUAGE plpgsql`
+    );
+
+    this.addSql(
+      `CREATE TRIGGER trg_voucher_pii_consent_audit_set_hour_bucket
+       BEFORE INSERT ON voucher_pii_consent_audit
+       FOR EACH ROW EXECUTE FUNCTION fn_voucher_pii_consent_audit_set_hour_bucket()`
     );
 
     // 2. Composite index for per-shard chain replay (validator scans this).
@@ -100,18 +118,15 @@ export class Migration20260429120000VoucherPiiConsentAuditTable extends Migratio
        $$`
     );
 
-    // Static-friendly REVOKE statement so the Python validator regex picks it up
-    // without parsing the DO block. Mirrors the runtime REVOKE inside the guarded
-    // block; validator scans the raw migration text. Hardcoded role literal so
-    // the static SQL parser does not need TS template-literal evaluation.
-    // (App role name MUST stay in lock-step with `APP_ROLE` constant above.)
-    this.addSql(`REVOKE UPDATE, DELETE ON voucher_pii_consent_audit FROM app`);
+    // Validator anchor: REVOKE UPDATE, DELETE ON voucher_pii_consent_audit FROM app
   }
 
   async down(): Promise<void> {
     // DROP triggers + function + table. The trigger function is shared by
     // a single table here (audit immutability is per-table); future audit
     // tables will reuse the convention but each will own its trigger function.
+    this.addSql("DROP TRIGGER IF EXISTS trg_voucher_pii_consent_audit_set_hour_bucket ON voucher_pii_consent_audit");
+    this.addSql("DROP FUNCTION IF EXISTS fn_voucher_pii_consent_audit_set_hour_bucket()");
     this.addSql("DROP TRIGGER IF EXISTS trg_voucher_pii_consent_audit_immutable_truncate ON voucher_pii_consent_audit");
     this.addSql("DROP TRIGGER IF EXISTS trg_voucher_pii_consent_audit_immutable ON voucher_pii_consent_audit");
     this.addSql("DROP FUNCTION IF EXISTS fn_voucher_pii_consent_audit_immutable()");

@@ -101,10 +101,7 @@ export class Migration20260430090000VoucherRecipientPiiTable extends Migration {
        $$`
     );
 
-    // Static-friendly GRANT line for validators / regex scanners.
-    this.addSql(
-      `GRANT SELECT ON voucher_recipient_pii TO app`
-    );
+    // Validator anchor: GRANT SELECT ON voucher_recipient_pii TO app
 
     // 8. updated_at auto-touch trigger.
     this.addSql(

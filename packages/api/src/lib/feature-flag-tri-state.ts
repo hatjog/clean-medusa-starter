@@ -31,6 +31,15 @@ let _lastAdmin: string | null = null
 
 const FLAG_AUDIT_TABLE = "operator_multi_vendor_flag_audit"
 
+function isMissingRelationError(err: unknown, tableName: string): boolean {
+  const message = err instanceof Error ? err.message : String(err)
+  return (
+    message.includes(`relation \"${tableName}\" does not exist`) ||
+    message.includes(`relation '${tableName}' does not exist`) ||
+    message.includes(`relation ${tableName} does not exist`)
+  )
+}
+
 type AuditTrailEntry = {
   audit_log_id: string
   from: MultiVendorFlagState
@@ -77,13 +86,20 @@ function mapPersistedAuditRow(row: PersistedAuditRow): AuditTrailEntry {
 async function getLatestPersistedAuditRow(
   db: Knex,
 ): Promise<PersistedAuditRow | null> {
-  const row = await db<PersistedAuditRow>(FLAG_AUDIT_TABLE)
-    .select("*")
-    .orderBy("at", "desc")
-    .orderBy("id", "desc")
-    .first()
+  try {
+    const row = await db<PersistedAuditRow>(FLAG_AUDIT_TABLE)
+      .select("*")
+      .orderBy("at", "desc")
+      .orderBy("id", "desc")
+      .first()
 
-  return row ?? null
+    return row ?? null
+  } catch (err) {
+    if (isMissingRelationError(err, FLAG_AUDIT_TABLE)) {
+      return null
+    }
+    throw err
+  }
 }
 
 export async function getCurrentState(
@@ -269,13 +285,20 @@ export async function getPersistedAuditTrail(
   db: Knex,
   limit = 50,
 ): Promise<AuditTrailEntry[]> {
-  const rows = await db<PersistedAuditRow>(FLAG_AUDIT_TABLE)
-    .select("*")
-    .orderBy("at", "desc")
-    .orderBy("id", "desc")
-    .limit(limit)
+  try {
+    const rows = await db<PersistedAuditRow>(FLAG_AUDIT_TABLE)
+      .select("*")
+      .orderBy("at", "desc")
+      .orderBy("id", "desc")
+      .limit(limit)
 
-  return rows.map(mapPersistedAuditRow)
+    return rows.map(mapPersistedAuditRow)
+  } catch (err) {
+    if (isMissingRelationError(err, FLAG_AUDIT_TABLE)) {
+      return []
+    }
+    throw err
+  }
 }
 
 export function getLastTransitionInfo(): {
