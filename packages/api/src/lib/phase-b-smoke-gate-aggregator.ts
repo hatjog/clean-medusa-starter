@@ -50,6 +50,15 @@ export type RatificationRecord = {
 
 const RATIFICATIONS_TABLE = "phase_b_smoke_gate_ratifications"
 
+function isMissingRelationError(err: unknown, tableName: string): boolean {
+  const message = err instanceof Error ? err.message : String(err)
+  return (
+    message.includes(`relation \"${tableName}\" does not exist`) ||
+    message.includes(`relation '${tableName}' does not exist`) ||
+    message.includes(`relation ${tableName} does not exist`)
+  )
+}
+
 const CHECKLIST: Omit<SmokeGateItem, "status">[] = [
   {
     key: "e1_phase_a1_smoke_gate",
@@ -72,7 +81,7 @@ const CHECKLIST: Omit<SmokeGateItem, "status">[] = [
     label: "E3 Sellers list page baseline live",
     nfr_ref: "FR12-FR16",
     evidence_url:
-      "_bmad-output/implementation-artifacts/v160/v160-3-0-storefront-route-migration-sellers.md",
+      "_bmad-output/implementation-artifacts/v160/v160-3-0-sellers-list-page-baseline.md",
     source: "story_close_out",
   },
   {
@@ -186,21 +195,35 @@ export async function computeSmokeGateState(
 export async function getLastRatification(
   db: Knex,
 ): Promise<RatificationRecord | null> {
-  const row = await db<RatificationRecord>(RATIFICATIONS_TABLE)
-    .select("*")
-    .orderBy("ratified_at", "desc")
-    .first()
-  return row ?? null
+  try {
+    const row = await db<RatificationRecord>(RATIFICATIONS_TABLE)
+      .select("*")
+      .orderBy("ratified_at", "desc")
+      .first()
+    return row ?? null
+  } catch (err) {
+    if (isMissingRelationError(err, RATIFICATIONS_TABLE)) {
+      return null
+    }
+    throw err
+  }
 }
 
 export async function getRatificationHistory(
   db: Knex,
   limit = 100,
 ): Promise<RatificationRecord[]> {
-  return db<RatificationRecord>(RATIFICATIONS_TABLE)
-    .select("*")
-    .orderBy("ratified_at", "desc")
-    .limit(limit)
+  try {
+    return await db<RatificationRecord>(RATIFICATIONS_TABLE)
+      .select("*")
+      .orderBy("ratified_at", "desc")
+      .limit(limit)
+  } catch (err) {
+    if (isMissingRelationError(err, RATIFICATIONS_TABLE)) {
+      return []
+    }
+    throw err
+  }
 }
 
 export type RatifyInput = {
@@ -234,7 +257,7 @@ export async function ratifyVerdict(
 
   const insertRow = {
     verdict: input.verdict,
-    items_json: input.items,
+    items_json: JSON.stringify(input.items),
     admin_id: input.admin_id,
     admin_note: input.admin_note ?? null,
     force_override: input.force_override ?? false,

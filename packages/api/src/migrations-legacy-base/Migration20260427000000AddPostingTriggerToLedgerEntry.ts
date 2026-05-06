@@ -3,6 +3,11 @@ import { Migration } from "@mikro-orm/migrations";
 /**
  * STORY-MIG-C — D-47 ledger_entry.posting_trigger column + backfill.
  *
+ * Legacy base-runtime migration surface.
+ * This migration augments an existing `ledger_entry` base table and is kept
+ * outside the canonical app migration ledger because some local GP runtimes do
+ * not materialize that table in the active `DATABASE_URL`.
+ *
  * v1.4.0 scope (this migration):
  *   - C1: ALTER TABLE ledger_entry ADD COLUMN posting_trigger text NULL.
  *         No NOT NULL, no DEFAULT, no CHECK, no index.

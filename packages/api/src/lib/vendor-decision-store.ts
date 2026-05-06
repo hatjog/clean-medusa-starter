@@ -1,3 +1,6 @@
+import { ContainerRegistrationKeys } from "@medusajs/framework/utils"
+import type { Knex } from "knex"
+
 import type {
   DecisionConfirmationLocale,
   DecisionType,
@@ -20,6 +23,11 @@ export type SellerRecord = {
 type ScopeResolver = {
   resolve: (key: string) => unknown
 }
+
+type SellerDbRow = Pick<
+  SellerRecord,
+  "id" | "handle" | "email" | "name" | "status" | "metadata"
+>
 
 type SellerModuleService = {
   list?: (filters: Record<string, unknown>) => Promise<unknown>
@@ -88,6 +96,33 @@ function resolveSellerModuleService(scope: ScopeResolver): SellerModuleService {
   throw new Error("Seller module service is not available in the request scope")
 }
 
+function resolveSellerDb(scope: ScopeResolver): Knex | null {
+  try {
+    return scope.resolve(ContainerRegistrationKeys.PG_CONNECTION) as Knex
+  } catch {
+    return null
+  }
+}
+
+async function listSellerRecordsFromDb(
+  db: Knex,
+  filters: Record<string, unknown>,
+): Promise<SellerRecord[]> {
+  let query = db("seller")
+    .select<SellerDbRow[]>("id", "handle", "email", "name", "status", "metadata")
+    .whereNull("deleted_at")
+
+  if (typeof filters.id === "string" && filters.id.trim().length > 0) {
+    query = query.where("id", filters.id)
+  }
+
+  if (typeof filters.handle === "string" && filters.handle.trim().length > 0) {
+    query = query.where("handle", filters.handle)
+  }
+
+  return (await query) as SellerRecord[]
+}
+
 async function listSellerRecords(
   service: SellerModuleService,
   filters: Record<string, unknown>,
@@ -107,8 +142,16 @@ export async function listSellers(
   scope: ScopeResolver,
   filters: Record<string, unknown> = {},
 ): Promise<SellerRecord[]> {
-  const service = resolveSellerModuleService(scope)
-  return listSellerRecords(service, filters)
+  try {
+    const service = resolveSellerModuleService(scope)
+    return listSellerRecords(service, filters)
+  } catch (error) {
+    const db = resolveSellerDb(scope)
+    if (!db) {
+      throw error
+    }
+    return listSellerRecordsFromDb(db, filters)
+  }
 }
 
 export async function getSellerById(

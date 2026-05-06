@@ -75,6 +75,15 @@ type SyncSummary = {
   timestamp: string
 }
 
+function warningsAreErrors(): boolean {
+  const raw = process.env.GP_SYNC_ACCOUNTS_WARNINGS_ARE_ERRORS?.trim().toLowerCase()
+  if (!raw) {
+    return true
+  }
+
+  return !["0", "false", "no", "off"].includes(raw)
+}
+
 function resolveAdminRbacRoles(role?: string): string[] | undefined {
   if (role === "instance_admin") {
     return ["role_super_admin"]
@@ -919,8 +928,8 @@ export default async function gpConfigSyncAccounts({ container, args }: ExecArgs
 
   console.log("\n" + JSON.stringify(summary, null, 2))
 
-  // Signal warnings via exit code (non-destructive — lets event loop drain)
-  if (warnings.length > 0) {
+  // By default, keep warning-level findings visible to strict callers.
+  if (warnings.length > 0 && warningsAreErrors()) {
     process.exitCode = 1
   }
 

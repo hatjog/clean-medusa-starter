@@ -4,6 +4,7 @@ import {
   getAuditTrail,
   getCurrentState,
   getFlagState,
+  getPersistedAuditTrail,
   setState,
   validateTransition,
 } from "../feature-flag-tri-state"
@@ -22,6 +23,24 @@ async function forceOff(): Promise<void> {
 }
 
 describe("feature-flag-tri-state", () => {
+  it("falls back to an empty persisted audit trail when the operator audit table is missing", async () => {
+    const db = (() => ({
+      select: () => ({
+        orderBy: () => ({
+          orderBy: () => ({
+            limit: async () => {
+              throw new Error(
+                'select * from "operator_multi_vendor_flag_audit" - relation "operator_multi_vendor_flag_audit" does not exist'
+              )
+            },
+          }),
+        }),
+      }),
+    })) as never
+
+    await expect(getPersistedAuditTrail(db, 10)).resolves.toEqual([])
+  })
+
   it("rejects direct OFF -> ON transitions and same-state requests", () => {
     expect(validateTransition("off", "on")).toMatchObject({
       valid: false,

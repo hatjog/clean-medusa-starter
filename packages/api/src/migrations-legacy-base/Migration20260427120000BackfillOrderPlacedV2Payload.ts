@@ -3,6 +3,12 @@ import { Migration } from "@medusajs/framework/mikro-orm/migrations"
 /**
  * STORY-MIG-B — OrderPlaced.v2 payload backfill (D-50 + D-58 + P-09).
  *
+ * Legacy base-runtime migration surface.
+ * This migration augments existing `event_store` and `market_runtime_config`
+ * base tables and is kept outside the canonical app migration ledger because
+ * some local GP runtimes do not materialize those tables in the active
+ * `DATABASE_URL`.
+ *
  * Adds a derived `payload_v2 jsonb` column to `event_store` and backfills it
  * from historical `gp.commerce.order_placed.v1` rows. The canonical `payload`
  * column is immutable history (per AC #6 of STORY-MIG-B); we never mutate it.

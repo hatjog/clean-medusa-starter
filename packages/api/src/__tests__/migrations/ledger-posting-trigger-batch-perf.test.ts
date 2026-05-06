@@ -15,7 +15,7 @@
  * via generateLedgerRows()).
  */
 
-import { Migration20260427000000AddPostingTriggerToLedgerEntry } from "../../migrations/Migration20260427000000AddPostingTriggerToLedgerEntry";
+import { Migration20260427000000AddPostingTriggerToLedgerEntry } from "../../migrations-legacy-base/Migration20260427000000AddPostingTriggerToLedgerEntry";
 
 const SENTINEL = "legacy-pre-v1.4.0";
 const BATCH_SIZE = Migration20260427000000AddPostingTriggerToLedgerEntry.BACKFILL_BATCH_SIZE;

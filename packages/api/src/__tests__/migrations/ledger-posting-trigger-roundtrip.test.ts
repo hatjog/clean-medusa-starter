@@ -19,7 +19,7 @@
  *   5. up → down → up is row-count + checksum invariant on every other column.
  */
 
-import { Migration20260427000000AddPostingTriggerToLedgerEntry } from "../../migrations/Migration20260427000000AddPostingTriggerToLedgerEntry";
+import { Migration20260427000000AddPostingTriggerToLedgerEntry } from "../../migrations-legacy-base/Migration20260427000000AddPostingTriggerToLedgerEntry";
 
 const SENTINEL = "legacy-pre-v1.4.0";
 

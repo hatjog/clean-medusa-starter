@@ -4,6 +4,11 @@ import { Migration } from "@medusajs/framework/mikro-orm/migrations";
  * STORY-MIG-A — adds the optional `locales` JSONB column to the
  * `market_runtime_config` table per D-61 + D-55 + D-40 (additive minor v1.3 → v1.4).
  *
+ * Legacy base-runtime migration surface.
+ * This migration augments an existing `market_runtime_config` base table and is
+ * kept outside the canonical app migration ledger because some local GP runtimes
+ * do not materialize that table in the active `DATABASE_URL`.
+ *
  * up():
  *   1. ADD COLUMN `locales jsonb NULL` (nullable during transition; v1.3 consumers
  *      keep working, forward-compat shim `getMarketLocales()` handles absence).

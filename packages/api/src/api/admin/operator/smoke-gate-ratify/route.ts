@@ -36,7 +36,7 @@ export async function POST(
   }
 
   const db = req.scope.resolve(ContainerRegistrationKeys.PG_CONNECTION) as Knex
-  const cohortMetrics = await computeCohortMetrics()
+  const cohortMetrics = await computeCohortMetrics({ db })
   const state = await computeSmokeGateState(db, cohortMetrics)
 
   // AC3: any non-pass item blocks PASS verdict unless force=true+reason.

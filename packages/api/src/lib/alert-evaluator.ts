@@ -129,7 +129,7 @@ export async function evaluateAlertsWithOptions(
 
   const [cohortMetrics, currentState, sellers, persistedAudit, smokeGateState] =
     await Promise.all([
-      cohortMetricsModule.computeCohortMetrics(),
+      cohortMetricsModule.computeCohortMetrics({ db: options.db ?? null }),
       flagModule.getCurrentState(options.db ?? null),
       options.scope ? listSellers(options.scope) : Promise.resolve([]),
       options.db
@@ -211,11 +211,19 @@ export async function evaluateAlertsWithOptions(
       case "nfr_alert_4_conversion_drop":
         if (
           typeof first24h.conversion.value === "number" &&
-          first24h.conversion.value > 20
+          typeof cohortMetrics.cohorts.pre_flip_baseline.conversion.value === "number"
         ) {
-          firing.push(
-            buildFiringAlert(alert, computed_at, first24h.conversion.value),
-          )
+          const baselineConversion = cohortMetrics.cohorts.pre_flip_baseline.conversion.value
+          const dropPct =
+            baselineConversion > 0
+              ? Number(
+                  (((baselineConversion - first24h.conversion.value) / baselineConversion) * 100).toFixed(2),
+                )
+              : 0
+
+          if (dropPct > 20) {
+            firing.push(buildFiringAlert(alert, computed_at, dropPct))
+          }
         }
         break
       case "nfr_alert_5_cache_invalidate_failures":
