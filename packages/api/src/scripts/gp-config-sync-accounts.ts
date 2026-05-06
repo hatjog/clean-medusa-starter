@@ -1,5 +1,6 @@
 import { ExecArgs } from "@medusajs/framework/types"
-import { Modules } from "@medusajs/framework/utils"
+import { ContainerRegistrationKeys, Modules } from "@medusajs/framework/utils"
+import { SellerRole } from "@mercurjs/types"
 
 import fs from "node:fs/promises"
 import path from "node:path"
@@ -74,6 +75,14 @@ type SyncSummary = {
   timestamp: string
 }
 
+function resolveAdminRbacRoles(role?: string): string[] | undefined {
+  if (role === "instance_admin") {
+    return ["role_super_admin"]
+  }
+
+  return undefined
+}
+
 // ---- Utilities (pattern from gp-config-sync-catalog) ----
 
 function parseArgs(args: string[] | undefined): {
@@ -141,6 +150,22 @@ type CustomerModuleService = {
   updateCustomers: (id: string, data: any) => Promise<any>
 }
 
+type SellerModuleService = {
+  list?: (filters?: Record<string, unknown>, config?: Record<string, unknown>) => Promise<any[]>
+  listSellers?: (filters?: Record<string, unknown>, config?: Record<string, unknown>) => Promise<any[]>
+  upsertMembers: (data: any[], sharedContext?: Record<string, unknown>) => Promise<any[]>
+  listSellerMembers: (
+    filters?: Record<string, unknown>,
+    config?: Record<string, unknown>,
+    sharedContext?: Record<string, unknown>
+  ) => Promise<any[]>
+  createSellerMembers: (data: any[], sharedContext?: Record<string, unknown>) => Promise<any[]>
+}
+
+type LinkService = {
+  create: (data: Record<string, unknown>) => Promise<unknown>
+}
+
 // ---- Sync helpers ----
 
 async function findUserByEmail(
@@ -189,6 +214,10 @@ async function findAuthIdentityByEntityId(
   return cache.get(entityId) ?? null
 }
 
+export function resetAuthIdentityCacheForTests(): void {
+  _authIdentityCache = null
+}
+
 const SCRYPT_HASH_CONFIG = { logN: 15, r: 8, p: 1 }
 
 async function hashPassword(password: string): Promise<string> {
@@ -235,7 +264,7 @@ async function ensureAuthIdentity(
 async function linkAuthIdentityToActor(
   authService: AuthModuleService,
   authIdentityId: string,
-  actorType: "user" | "customer",
+  actorType: "user" | "customer" | "member",
   actorId: string,
   warnings: string[],
   context: string
@@ -257,13 +286,201 @@ async function linkAuthIdentityToActor(
   }
 }
 
+async function ensureUserRbacRoles(
+  link: LinkService,
+  userId: string,
+  roleIds: string[] | undefined,
+  warnings: string[],
+  context: string
+): Promise<void> {
+  for (const roleId of roleIds ?? []) {
+    try {
+      await link.create({
+        [Modules.USER]: {
+          user_id: userId,
+        },
+        [Modules.RBAC]: {
+          rbac_role_id: roleId,
+        },
+      })
+    } catch (e: any) {
+      const message = e?.message ?? String(e)
+      if (/already exists|duplicate|unique/i.test(message)) {
+        continue
+      }
+
+      warnings.push(`${context}: RBAC role link failed (${roleId}) — ${message}`)
+    }
+  }
+}
+
+function readSellerMarketId(value: unknown): string | null {
+  if (!value || typeof value !== "object") {
+    return null
+  }
+
+  const marketId = (value as { metadata?: { gp?: { market_id?: unknown } } }).metadata?.gp?.market_id
+  return typeof marketId === "string" && marketId.trim() ? marketId.trim() : null
+}
+
+function selectSellerMatch(matches: any[], marketId: string): { match?: any; reason?: string } {
+  if (!Array.isArray(matches) || matches.length === 0) {
+    return {}
+  }
+
+  const exactMatches = matches.filter((match) => readSellerMarketId(match) === marketId)
+  if (exactMatches.length === 1) {
+    return { match: exactMatches[0] }
+  }
+
+  if (exactMatches.length > 1) {
+    return {
+      reason: `multiple sellers found for market '${marketId}' and handle collision prevents safe account linking`,
+    }
+  }
+
+  const untaggedMatches = matches.filter((match) => readSellerMarketId(match) === null)
+  if (untaggedMatches.length === 1) {
+    return { match: untaggedMatches[0] }
+  }
+
+  if (untaggedMatches.length > 1) {
+    return {
+      reason: "multiple untagged sellers found for the same handle; manual cleanup required",
+    }
+  }
+
+  const knownMarkets = [...new Set(matches.map((match) => readSellerMarketId(match)).filter(Boolean))]
+  return {
+    reason:
+      knownMarkets.length > 0
+        ? `cross-market guard — entity belongs to '${knownMarkets.join(", ")}'`
+        : "no eligible seller match found",
+  }
+}
+
+async function listSellersByHandle(
+  sellerService: SellerModuleService,
+  handle: string
+): Promise<any[]> {
+  if (typeof sellerService.list === "function") {
+    return (await sellerService.list({ handle })) ?? []
+  }
+
+  if (typeof sellerService.listSellers === "function") {
+    return (await sellerService.listSellers({ handle })) ?? []
+  }
+
+  throw new Error("Seller service does not expose a supported list method")
+}
+
+async function resolveSellerForVendorAccount(
+  sellerService: SellerModuleService,
+  marketId: string,
+  vendorKey: string
+): Promise<{ seller?: any; reason?: string }> {
+  const handle = vendorKey.trim()
+  if (!handle) {
+    return { reason: "vendor handle is empty" }
+  }
+
+  const matches = await listSellersByHandle(sellerService, handle)
+  const { match, reason } = selectSellerMatch(matches, marketId)
+  return match ? { seller: match } : { reason: reason ?? `seller '${handle}' not found` }
+}
+
+export async function ensureVendorSellerAccess(
+  sellerService: SellerModuleService,
+  authService: AuthModuleService,
+  account: AccountBase,
+  marketId: string,
+  vendorKey: string,
+  warnings: string[],
+  context: string
+): Promise<void> {
+  let seller: any
+  try {
+    const resolved = await resolveSellerForVendorAccount(sellerService, marketId, vendorKey)
+    if (!resolved.seller) {
+      warnings.push(`${context}: seller auth provisioning skipped — ${resolved.reason}`)
+      return
+    }
+    seller = resolved.seller
+  } catch (e: any) {
+    warnings.push(`${context}: seller lookup failed — ${e?.message ?? String(e)}`)
+    return
+  }
+
+  const authIdentityId = await ensureAuthIdentity(
+    authService,
+    account.email,
+    account.password,
+    warnings,
+    context
+  )
+  if (!authIdentityId) {
+    return
+  }
+
+  let member: any
+  try {
+    const members = await sellerService.upsertMembers([
+      {
+        email: account.email,
+        first_name: account.display_name,
+      },
+    ])
+    member = members?.[0]
+  } catch (e: any) {
+    warnings.push(`${context}: seller member upsert failed — ${e?.message ?? String(e)}`)
+    return
+  }
+
+  if (!member?.id) {
+    warnings.push(`${context}: seller member upsert returned no member id`)
+    return
+  }
+
+  await linkAuthIdentityToActor(authService, authIdentityId, "member", member.id, warnings, context)
+
+  try {
+    const existingSellerMembers = await sellerService.listSellerMembers(
+      { seller_id: [seller.id], member_id: [member.id] },
+      { take: 1 }
+    )
+    if (existingSellerMembers?.[0]) {
+      return
+    }
+
+    const sellerMembersForSeller = await sellerService.listSellerMembers(
+      { seller_id: [seller.id] },
+      { select: ["id", "is_owner"], take: 50 }
+    )
+    const hasOwner = (sellerMembersForSeller ?? []).some((sellerMember) => sellerMember?.is_owner)
+
+    await sellerService.createSellerMembers([
+      {
+        seller_id: seller.id,
+        member_id: member.id,
+        role_id: SellerRole.SELLER_ADMINISTRATION,
+        is_owner: !hasOwner,
+      },
+    ])
+  } catch (e: any) {
+    warnings.push(`${context}: seller membership creation failed — ${e?.message ?? String(e)}`)
+  }
+}
+
 async function ensureAdminUser(
   userService: UserModuleService,
   authService: AuthModuleService,
+  link: LinkService,
   account: AccountBase & { role?: string },
   warnings: string[],
   context: string
 ): Promise<{ userId: string; created: boolean } | null> {
+  const rbacRoles = resolveAdminRbacRoles(account.role)
+
   let existingUser: any | null
   try {
     existingUser = await findUserByEmail(userService, account.email)
@@ -286,6 +503,7 @@ async function ensureAdminUser(
     if (existingAuthId) {
       await linkAuthIdentityToActor(authService, existingAuthId, "user", existingUser.id, warnings, context)
     }
+    await ensureUserRbacRoles(link, existingUser.id, rbacRoles, warnings, context)
     return { userId: existingUser.id, created: false }
   }
 
@@ -310,6 +528,7 @@ async function ensureAdminUser(
 
     // Link auth identity → user (sets app_metadata.user_id)
     await linkAuthIdentityToActor(authService, authIdentityId, "user", user.id, warnings, context)
+    await ensureUserRbacRoles(link, user.id, rbacRoles, warnings, context)
 
     return { userId: user.id, created: true }
   } catch (e: any) {
@@ -324,6 +543,7 @@ async function syncInstanceAccounts(
   accounts: InstanceAccount[],
   userService: UserModuleService,
   authService: AuthModuleService,
+  link: LinkService,
   warnings: string[]
 ): Promise<OpCounts> {
   const counts: OpCounts = { created: 0, skipped: 0 }
@@ -332,6 +552,7 @@ async function syncInstanceAccounts(
     const result = await ensureAdminUser(
       userService,
       authService,
+      link,
       account,
       warnings,
       `instance_accounts[${account.email}]`
@@ -353,6 +574,7 @@ async function syncMarketAccounts(
   gpCoreService: GpCoreService,
   userService: UserModuleService,
   authService: AuthModuleService,
+  link: LinkService,
   warnings: string[]
 ): Promise<OpCounts> {
   const counts: OpCounts = { created: 0, skipped: 0 }
@@ -366,7 +588,7 @@ async function syncMarketAccounts(
 
     for (const account of group.accounts) {
       const context = `market_accounts[${group.market_id}/${account.email}]`
-      const result = await ensureAdminUser(userService, authService, account, warnings, context)
+      const result = await ensureAdminUser(userService, authService, link, account, warnings, context)
       if (!result) continue
 
       if (result.created) {
@@ -402,6 +624,8 @@ async function syncVendorAccounts(
   gpCoreService: GpCoreService,
   userService: UserModuleService,
   authService: AuthModuleService,
+  link: LinkService,
+  sellerService: SellerModuleService,
   warnings: string[]
 ): Promise<OpCounts> {
   const counts: OpCounts = { created: 0, skipped: 0 }
@@ -418,7 +642,7 @@ async function syncVendorAccounts(
 
     for (const account of group.accounts) {
       const context = `vendor_accounts[${group.market_id}/${group.vendor_id}/${account.email}]`
-      const result = await ensureAdminUser(userService, authService, account, warnings, context)
+      const result = await ensureAdminUser(userService, authService, link, account, warnings, context)
       if (!result) continue
 
       if (result.created) {
@@ -438,6 +662,16 @@ async function syncVendorAccounts(
       } catch (e: any) {
         warnings.push(`${context}: membership upsert failed — ${e?.message ?? String(e)}`)
       }
+
+      await ensureVendorSellerAccess(
+        sellerService,
+        authService,
+        account,
+        group.market_id,
+        group.vendor_id,
+        warnings,
+        context
+      )
 
       console.log(
         `  Vendor admin '${account.email}' → ${group.vendor_id} (${account.role}): ${result.created ? "CREATED" : "EXISTS (membership upserted)"}`
@@ -595,6 +829,8 @@ export default async function gpConfigSyncAccounts({ container, args }: ExecArgs
     "auth_module",
   ]) as AuthModuleService
 
+  const link = container.resolve(ContainerRegistrationKeys.LINK) as LinkService
+
   const customerService = resolveService(container, [
     Modules.CUSTOMER,
     "customer",
@@ -609,12 +845,20 @@ export default async function gpConfigSyncAccounts({ container, args }: ExecArgs
       mercurDatabaseUrl: process.env.GP_MERCUR_DATABASE_URL,
     })
 
+  const sellerService = resolveService(container, [
+    "seller",
+    "sellerModuleService",
+    "seller_module",
+    "ISellerModuleService",
+  ]) as SellerModuleService
+
   // L1: Instance accounts
   console.log("\n--- L1: Instance accounts ---")
   const instanceCounts = await syncInstanceAccounts(
     accounts.instance_accounts ?? [],
     userService,
     authService,
+    link,
     warnings
   )
 
@@ -626,6 +870,7 @@ export default async function gpConfigSyncAccounts({ container, args }: ExecArgs
     gpCoreService,
     userService,
     authService,
+    link,
     warnings
   )
 
@@ -637,6 +882,8 @@ export default async function gpConfigSyncAccounts({ container, args }: ExecArgs
     gpCoreService,
     userService,
     authService,
+    link,
+    sellerService,
     warnings
   )
 

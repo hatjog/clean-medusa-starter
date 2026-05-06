@@ -34,6 +34,9 @@ importers:
       '@mercurjs/cli':
         specifier: 2.1.1
         version: 2.1.1(@medusajs/cli@2.13.6(@types/node@22.19.17))(@types/node@22.19.17)(@types/react-dom@18.3.7(@types/react@18.3.28))(@types/react@18.3.28)(esbuild@0.21.5)(ioredis@5.10.1)(picomatch@4.0.4)
+      '@mercurjs/commission':
+        specifier: 1.5.3
+        version: 1.5.3(@medusajs/admin-sdk@2.13.6)(@medusajs/cli@2.13.6(@types/node@22.19.17))(@medusajs/framework@2.13.6(@medusajs/cli@2.13.6(@types/node@22.19.17))(@types/node@22.19.17)(ioredis@5.10.1)(vite@5.4.21(@types/node@22.19.17))(zod@3.25.76))(@medusajs/icons@2.13.6(react@18.3.1))(@medusajs/medusa@2.13.6)(@medusajs/test-utils@2.13.6)(@medusajs/ui@4.0.25(@types/react-dom@18.3.7(@types/react@18.3.28))(@types/react@18.3.28)(react-dom@18.3.1(react@18.3.1))(react@18.3.1)(typescript@5.9.3))(@mercurjs/framework@1.5.3(@medusajs/framework@2.13.6(@medusajs/cli@2.13.6(@types/node@22.19.17))(@types/node@22.19.17)(ioredis@5.10.1)(vite@5.4.21(@types/node@22.19.17))(zod@3.25.76)))
       '@mercurjs/core':
         specifier: 2.1.1
         version: 2.1.1(patch_hash=ab3f3406a2d2a7b2a39bebb876b7a049f781d714216660c77d2565fd0f5eca82)(@medusajs/admin-sdk@2.13.6)(@medusajs/cli@2.13.6(@types/node@22.19.17))(@medusajs/framework@2.13.6(@medusajs/cli@2.13.6(@types/node@22.19.17))(@types/node@22.19.17)(ioredis@5.10.1)(vite@5.4.21(@types/node@22.19.17))(zod@3.25.76))(@medusajs/icons@2.13.6(react@18.3.1))(@medusajs/medusa@2.13.6)(@medusajs/test-utils@2.13.6)(express@4.22.1)
@@ -1534,6 +1537,19 @@ packages:
     resolution: {integrity: sha512-IfvDnTeTcoNKb6uVKbdnLjnyaL9XqzOhwba7Kmqol2US1Yl8olP5UsKSg4nu5HVr23N3erVGbk4kSjvmccGbHw==}
     hasBin: true
 
+  '@mercurjs/commission@1.5.3':
+    resolution: {integrity: sha512-nZ/l9WIcaqabY14LC+g04YlF7DvCcQY7F3tLu8eRgADGx4jg35mYRpTFjA7HyvYObWe3uDseEpyGmJ0uMBHyyg==}
+    engines: {node: '>=20'}
+    peerDependencies:
+      '@medusajs/admin-sdk': 2.11.3
+      '@medusajs/cli': 2.11.3
+      '@medusajs/framework': 2.11.3
+      '@medusajs/icons': 2.11.3
+      '@medusajs/medusa': 2.11.3
+      '@medusajs/test-utils': 2.11.3
+      '@medusajs/ui': 4.0.25
+      '@mercurjs/framework': '*'
+
   '@mercurjs/core@2.1.1':
     resolution: {integrity: sha512-q2SG2Yr83dNAjqxJq3SRgoXySGBltXb0u28uenYstH/lzcafOV3SsOZM8fqtSLg96tsVq/tkNKLZv27AQsPcKA==}
     engines: {node: '>=20'}
@@ -1548,6 +1564,12 @@ packages:
 
   '@mercurjs/dashboard-sdk@2.1.1':
     resolution: {integrity: sha512-hcMJpb4iQVBszACxz0BQiIhPIWKDxLWfH6hzEL1YY/sqsBwYxmwUtp9usdosVnhyimglmEFtB2Zz3E1P/JFopQ==}
+
+  '@mercurjs/framework@1.5.3':
+    resolution: {integrity: sha512-X2KTd4kxW4/taEkRznCuheTySGLHrqsaLBtqkCR6kIb/bUyAoOrTpJpD/3Q3LqaaZ2zf6p5wrflrxDw74IlhLg==}
+    engines: {node: '>=20'}
+    peerDependencies:
+      '@medusajs/framework': 2.11.3
 
   '@mercurjs/types@2.1.1':
     resolution: {integrity: sha512-fyJR6crqFD4Q7I6PX+KHwHekAscuwLjI53jYoDMDKWdBP/A2IewIQqPUaSgur+wvLloHSwl/ShZhi55QvepNeQ==}
@@ -9568,6 +9590,17 @@ snapshots:
       - tsx
       - yaml
 
+  '@mercurjs/commission@1.5.3(@medusajs/admin-sdk@2.13.6)(@medusajs/cli@2.13.6(@types/node@22.19.17))(@medusajs/framework@2.13.6(@medusajs/cli@2.13.6(@types/node@22.19.17))(@types/node@22.19.17)(ioredis@5.10.1)(vite@5.4.21(@types/node@22.19.17))(zod@3.25.76))(@medusajs/icons@2.13.6(react@18.3.1))(@medusajs/medusa@2.13.6)(@medusajs/test-utils@2.13.6)(@medusajs/ui@4.0.25(@types/react-dom@18.3.7(@types/react@18.3.28))(@types/react@18.3.28)(react-dom@18.3.1(react@18.3.1))(react@18.3.1)(typescript@5.9.3))(@mercurjs/framework@1.5.3(@medusajs/framework@2.13.6(@medusajs/cli@2.13.6(@types/node@22.19.17))(@types/node@22.19.17)(ioredis@5.10.1)(vite@5.4.21(@types/node@22.19.17))(zod@3.25.76)))':
+    dependencies:
+      '@medusajs/admin-sdk': 2.13.6
+      '@medusajs/cli': 2.13.6(@types/node@22.19.17)
+      '@medusajs/framework': 2.13.6(@medusajs/cli@2.13.6(@types/node@22.19.17))(@types/node@22.19.17)(ioredis@5.10.1)(vite@5.4.21(@types/node@22.19.17))(zod@3.25.76)
+      '@medusajs/icons': 2.13.6(react@18.3.1)
+      '@medusajs/medusa': 2.13.6(@medusajs/admin-sdk@2.13.6)(@medusajs/cli@2.13.6(@types/node@22.19.17))(@medusajs/framework@2.13.6(@medusajs/cli@2.13.6(@types/node@22.19.17))(@types/node@22.19.17)(ioredis@5.10.1)(vite@5.4.21(@types/node@22.19.17))(zod@3.25.76))(@medusajs/icons@2.13.6(react@18.3.1))(@medusajs/test-utils@2.13.6)(@medusajs/ui@4.0.25(@types/react-dom@18.3.7(@types/react@18.3.28))(@types/react@18.3.28)(react-dom@18.3.1(react@18.3.1))(react@18.3.1)(typescript@5.9.3))(@swc/core@1.5.7(@swc/helpers@0.5.21))(@types/node@22.19.17)(@types/react-dom@18.3.7(@types/react@18.3.28))(@types/react@18.3.28)(awilix@8.0.1)(picomatch@4.0.4)(posthog-node@5.32.1(rxjs@7.8.2))(react-dom@18.3.1(react@18.3.1))(react-router-dom@6.30.3(react-dom@18.3.1(react@18.3.1))(react@18.3.1))(react@18.3.1)(typescript@5.9.3)(yalc@1.0.0-pre.53)
+      '@medusajs/test-utils': 2.13.6(@medusajs/core-flows@2.13.6(@medusajs/framework@2.13.6(@medusajs/cli@2.13.6(@types/node@22.19.17))(@types/node@22.19.17)(ioredis@5.10.1)(vite@5.4.21(@types/node@22.19.17))(zod@3.25.76)))(@medusajs/framework@2.13.6(@medusajs/cli@2.13.6(@types/node@22.19.17))(@types/node@22.19.17)(ioredis@5.10.1)(vite@5.4.21(@types/node@22.19.17))(zod@3.25.76))(@medusajs/medusa@2.13.6)
+      '@medusajs/ui': 4.0.25(@types/react-dom@18.3.7(@types/react@18.3.28))(@types/react@18.3.28)(react-dom@18.3.1(react@18.3.1))(react@18.3.1)(typescript@5.9.3)
+      '@mercurjs/framework': 1.5.3(@medusajs/framework@2.13.6(@medusajs/cli@2.13.6(@types/node@22.19.17))(@types/node@22.19.17)(ioredis@5.10.1)(vite@5.4.21(@types/node@22.19.17))(zod@3.25.76))
+
   '@mercurjs/core@2.1.1(patch_hash=ab3f3406a2d2a7b2a39bebb876b7a049f781d714216660c77d2565fd0f5eca82)(@medusajs/admin-sdk@2.13.6)(@medusajs/cli@2.13.6(@types/node@22.19.17))(@medusajs/framework@2.13.6(@medusajs/cli@2.13.6(@types/node@22.19.17))(@types/node@22.19.17)(ioredis@5.10.1)(vite@5.4.21(@types/node@22.19.17))(zod@3.25.76))(@medusajs/icons@2.13.6(react@18.3.1))(@medusajs/medusa@2.13.6)(@medusajs/test-utils@2.13.6)(express@4.22.1)':
     dependencies:
       '@medusajs/admin-sdk': 2.13.6
@@ -9587,6 +9620,10 @@ snapshots:
     transitivePeerDependencies:
       - esbuild
       - supports-color
+
+  '@mercurjs/framework@1.5.3(@medusajs/framework@2.13.6(@medusajs/cli@2.13.6(@types/node@22.19.17))(@types/node@22.19.17)(ioredis@5.10.1)(vite@5.4.21(@types/node@22.19.17))(zod@3.25.76))':
+    dependencies:
+      '@medusajs/framework': 2.13.6(@medusajs/cli@2.13.6(@types/node@22.19.17))(@types/node@22.19.17)(ioredis@5.10.1)(vite@5.4.21(@types/node@22.19.17))(zod@3.25.76)
 
   '@mercurjs/types@2.1.1(ioredis@5.10.1)(vite@5.4.21(@types/node@22.19.17))':
     dependencies:
