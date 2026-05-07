@@ -40,7 +40,14 @@ import { ContainerRegistrationKeys } from "@medusajs/framework/utils"
 import { randomUUID } from "node:crypto"
 
 import { emitFlagPropagationT1, emitFlagPropagationT2 } from "../../../../../lib/instrumentation/flag-propagation"
-import { extractActorIdOrThrow } from "../../../../../lib/capability-check"
+import { extractActorIdOrThrow, requireCapability } from "../../../../../lib/capability-check"
+
+/**
+ * Minimum character length for an override reason (AC4).
+ * Enforce non-trivial justification — a single word is insufficient for
+ * audit purposes given the high-risk nature of the capability.
+ */
+const OVERRIDE_REASON_MIN_LENGTH = 10
 
 type PauseRequestBody = {
   reason?: string
@@ -50,6 +57,12 @@ type PauseRequestBody = {
    * downstream PostHog dashboards can isolate drill noise from real ops events.
    */
   drill_id?: string
+  /**
+   * When true, the caller is invoking the FR54 training-cert gate override
+   * path. Requires capability `vendor.lifecycle.override_training_cert` and
+   * a non-empty reason of at least 10 characters (AC1/AC4).
+   */
+  override?: boolean
 }
 
 type PgClient = {
@@ -91,8 +104,35 @@ export async function POST(req: MedusaRequest, res: MedusaResponse): Promise<voi
   }
 
   const body = (req.body ?? {}) as PauseRequestBody
+
+  // [AI-Review][MEDIUM fix] Reject truthy non-boolean override values so operators
+  // do not believe the override path was invoked when the client mis-serialised the
+  // field (e.g. "true" string or 1 instead of true). Strict-equality below remains
+  // the gate decision; this guard turns silent path-skip into an explicit error.
+  if (body.override !== undefined && typeof body.override !== "boolean") {
+    res.status(400).json({
+      code: "INVALID_OVERRIDE_TYPE",
+      message:
+        "`override` must be a JSON boolean (true/false) — string/number values are rejected to avoid silent path skips",
+    })
+    return
+  }
+  const isOverride = body.override === true
   const reason = body.reason?.trim()
-  if (!reason) {
+
+  // [AI-Review][HIGH fix] AC4 contract: when override=true ALL three failure
+  // modes (missing, blank-after-trim, < min length) MUST return
+  // OVERRIDE_REASON_REQUIRED. The non-override path keeps REASON_REQUIRED
+  // unchanged (AC5 regression guard).
+  if (isOverride) {
+    if (!reason || reason.length < OVERRIDE_REASON_MIN_LENGTH) {
+      res.status(400).json({
+        code: "OVERRIDE_REASON_REQUIRED",
+        message: `Override reason must be at least ${OVERRIDE_REASON_MIN_LENGTH} characters after trimming, per FR54 training-cert override audit obligation`,
+      })
+      return
+    }
+  } else if (!reason) {
     res.status(400).json({
       code: "REASON_REQUIRED",
       message: "ADR-074 mandates an audit `reason` for every status transition",
@@ -107,8 +147,30 @@ export async function POST(req: MedusaRequest, res: MedusaResponse): Promise<voi
     res.status(401).json({ code: "UNAUTHORIZED", message: "Valid admin session required" })
     return
   }
+
   const marketId = extractMarketId(req)
   const logger = (req.scope.resolve(ContainerRegistrationKeys.LOGGER) as unknown as Logger | undefined) ?? {}
+
+  // AC1/AC2 — capability gate for the override path.
+  // Must be evaluated BEFORE any DB write or audit row is emitted.
+  if (isOverride) {
+    const cap = await requireCapability(req, "vendor.lifecycle.override_training_cert")
+    if (!cap.ok) {
+      // [AI-Review][MEDIUM fix] Emit a structured warn-level audit log on
+      // capability denial so SecOps can detect repeated failed override
+      // attempts (signal class TF-91 was filed for). When cleanup-42 lands
+      // the real grants table, this is the canonical baseline for alerting
+      // on misconfigured grants.
+      logger.warn?.("seller.pause override capability denied", {
+        sellerId,
+        actorId,
+        capability: "vendor.lifecycle.override_training_cert",
+        route: "POST /admin/sellers/:id/pause",
+      })
+      res.status(cap.status).json(cap.body)
+      return
+    }
+  }
 
   // Resolve PG pool + Redis client from the Medusa container. The keys below
   // match the convention used by `gp-core` (see `src/modules/gp-core/service.ts`).
@@ -202,7 +264,14 @@ export async function POST(req: MedusaRequest, res: MedusaResponse): Promise<voi
         effectiveMarketId,
         sellerId,
         prevStatus,
-        JSON.stringify({ vendor_mor_enabled: true, drill_id: body.drill_id ?? null }),
+        // AC3 — when override=true, extend runtime_context with override flag
+        // and override_reason so the audit trail captures the justification.
+        // No schema change required: runtime_context is a JSONB column.
+        JSON.stringify({
+          vendor_mor_enabled: true,
+          drill_id: body.drill_id ?? null,
+          ...(isOverride ? { override: true, override_reason: reason } : {}),
+        }),
         reason,
         actorId,
       ]

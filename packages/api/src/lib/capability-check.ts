@@ -15,7 +15,19 @@
  */
 import type { MedusaRequest } from "@medusajs/framework/http"
 
-export type Capability = "lifecycle.override" | "alerts.read" | "policy.bypass"
+export type Capability =
+  | "lifecycle.override"
+  | "alerts.read"
+  | "policy.bypass"
+  /**
+   * vendor.lifecycle.override_training_cert — allows pausing a seller while
+   * bypassing the FR54 training-cert pre-condition.
+   *
+   * v1.6.0: any admin user (actor_type="user") is granted this capability.
+   * TODO(cleanup-42 / TF-102): replace this "any admin" grant with a lookup
+   * against the capability_grants table keyed by this capability string.
+   */
+  | "vendor.lifecycle.override_training_cert"
 
 type AuthContext = {
   actor_id?: string
@@ -55,6 +67,51 @@ export async function checkCapability(
   _capability: Capability
 ): Promise<boolean> {
   return checkLifecycleOverrideCapability(req)
+}
+
+/**
+ * Structured 403 payload shape shared by all capability-gated endpoints.
+ * TF-92/93/108/111 siblings should import and use this type to avoid drift.
+ */
+export type CapabilityDeniedPayload = {
+  code: "CAPABILITY_REQUIRED"
+  capability: Capability
+  message: string
+}
+
+/**
+ * requireCapability — enforces that the caller holds `capability`.
+ *
+ * Returns `{ ok: true }` when granted. Returns a structured 403 payload when
+ * denied. No exception is thrown — callers can pattern-match on `ok` and short-
+ * circuit without try/catch:
+ *
+ *   const cap = await requireCapability(req, "vendor.lifecycle.override_training_cert");
+ *   if (!cap.ok) { res.status(403).json(cap.body); return; }
+ *
+ * This centralised shape is intentional: the rest of the auth-bypass cluster
+ * (TF-92/93/108/111) will import from here to guarantee a consistent wire format.
+ *
+ * @param req        MedusaRequest with auth_context populated by middleware
+ * @param capability Capability key to verify
+ */
+export async function requireCapability(
+  req: MedusaRequest,
+  capability: Capability
+): Promise<{ ok: true } | { ok: false; status: 403; body: CapabilityDeniedPayload }> {
+  const granted = await checkCapability(req, capability)
+  if (granted) {
+    return { ok: true }
+  }
+  return {
+    ok: false,
+    status: 403,
+    body: {
+      code: "CAPABILITY_REQUIRED",
+      capability,
+      message: `Caller does not hold the required capability: ${capability}`,
+    },
+  }
 }
 
 /**

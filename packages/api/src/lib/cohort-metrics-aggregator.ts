@@ -3,8 +3,21 @@
  * Story v160-cleanup-15f — AC1 fix: p95 latency + 5xx rate now read from
  *   request-log-aggregator (real in-process samples) and apply AR55/AR56
  *   thresholds to produce real `green`/`yellow`/`red`/`unknown` status.
- *   NPS + conversion remain `unknown` (need real data sources — separate
- *   v1.7.0 backlog).
+ * Story v160-cleanup-22 — NPS + conversion honesty refinement:
+ *   - NPS uses `review` table AVG(rating) → normalizeRatingToSatisfactionScore
+ *     as a PROXY for NPS survey scores (OQ#1 decision: Opcja A — rating proxy
+ *     with threshold disclosure; real survey ingestion deferred to v1.10.0+).
+ *     Sample-size gate: MIN_REVIEWS_FOR_NPS=5; below → `unknown` + reason
+ *     "insufficient_sample". Threshold label includes "(review-rating proxy)"
+ *     disclosure per AR37.
+ *   - Conversion uses request-log aggregator sample_size as a PROXY for
+ *     visits/denominator (OQ#2 decision: no `gp.commerce.pdp_view` events in
+ *     event_store; fallback to request-log sample_size with proxy flag).
+ *     Sample-size gates: MIN_ORDERS_FOR_CONVERSION=3,
+ *     MIN_VISITS_FOR_CONVERSION=50; below → `unknown` + reason
+ *     "insufficient_sample". PostHog production wiring deferred (UX-DR108/
+ *     ADR-066 staging-free constraint; planned v1.10.0+).
+ *   - KPIMeasurement gains optional `reason?: string` field (backward-compat).
  *
  * @see specs/operator/cohort-definitions.md
  * @see FR53 / FR55 / FR56 / FR57 / AR37 / AR40 / AR55 / AR56
@@ -30,6 +43,8 @@ export type KPIMeasurement = {
   sample_size: number
   threshold: string
   status: KPIStatus
+  /** Optional reason for `unknown` status (e.g. "insufficient_sample", "missing_db"). */
+  reason?: string
 }
 
 export type CohortMetricsResult = {
@@ -47,7 +62,7 @@ const COHORTS: Cohort[] = [
 const KPIS: KPI[] = ["nps", "conversion", "p95_latency_ms", "error_rate_pct"]
 
 const THRESHOLDS: Record<KPI, string> = {
-  nps: "≥ 40 (AR37)",
+  nps: "≥ 40 (AR37; review-rating proxy)",
   conversion: "≥ 90% baseline (AR40)",
   p95_latency_ms: "≤ 500ms (AR55)",
   error_rate_pct: "≤ 1.0% (AR56)",
@@ -64,6 +79,13 @@ const NPS_GREEN_MIN = 40
 const NPS_YELLOW_MIN = 30
 const CONVERSION_RATIO_GREEN_MIN = 0.9
 const CONVERSION_RATIO_YELLOW_MIN = 0.75
+
+// Sample-size honesty thresholds (cleanup-22 policy).
+// NPS: below this → insufficient evidence for review-rating proxy.
+const MIN_REVIEWS_FOR_NPS = 5
+// Conversion: below either threshold → noisy/unreliable classification.
+const MIN_ORDERS_FOR_CONVERSION = 3
+const MIN_VISITS_FOR_CONVERSION = 50
 
 // Cohort time windows (ms) — used to slice the request-log aggregator.
 const WINDOW_MS_BY_COHORT: Record<Cohort, number> = {
@@ -92,8 +114,12 @@ type OrderStats = {
   order_count: number
 }
 
-function unknown(): KPIMeasurement {
-  return { value: null, sample_size: 0, threshold: "", status: "unknown" }
+function unknown(reason?: string): KPIMeasurement {
+  const m: KPIMeasurement = { value: null, sample_size: 0, threshold: "", status: "unknown" }
+  if (reason !== undefined) {
+    m.reason = reason
+  }
+  return m
 }
 
 function classifyP95(p95Ms: number): KPIStatus {
@@ -275,6 +301,11 @@ export async function computeCohortMetrics(
   const cohortWindows = await resolveCohortWindows(options.db, nowMs)
   const cohorts: Partial<Record<Cohort, Record<KPI, KPIMeasurement>>> = {}
   const conversionRates: Partial<Record<Cohort, number | null>> = {}
+  // cleanup-21 review-fix [MEDIUM]: track raw computed conversion rate
+  // (may be non-null even when sample-size gate fails) so we can surface
+  // it in the unknown measurement instead of dropping signal silently.
+  const rawConversionRates: Partial<Record<Cohort, number | null>> = {}
+  const visitsSampleSizes: Partial<Record<Cohort, number>> = {}
   for (const cohort of COHORTS) {
     const window = cohortWindows[cohort]
     const stats = window
@@ -289,37 +320,62 @@ export async function computeCohortMetrics(
         : Promise.resolve(null),
     ])
 
-    const normalizedNps =
-      reviewStats && reviewStats.sample_size > 0 && reviewStats.avg_rating !== null
-        ? normalizeRatingToSatisfactionScore(reviewStats.avg_rating)
-        : null
+    // NPS: apply review-rating proxy with sample-size gate (cleanup-22).
+    const reviewSampleSize = reviewStats?.sample_size ?? 0
+    const npsHasSufficientSample =
+      reviewStats !== null &&
+      reviewSampleSize >= MIN_REVIEWS_FOR_NPS &&
+      reviewStats.avg_rating !== null
+    const normalizedNps = npsHasSufficientSample
+      ? normalizeRatingToSatisfactionScore(reviewStats!.avg_rating!)
+      : null
+
+    // Conversion: use request-log sample_size as visits proxy (OQ#2 decision:
+    // no pdp_view events in event_store; proxy with disclosure — cleanup-22).
+    const visitsSampleSize = stats.sample_size
+    const orderCount = orderStats?.order_count ?? 0
+    const conversionHasSufficientSample =
+      orderStats !== null &&
+      orderCount >= MIN_ORDERS_FOR_CONVERSION &&
+      visitsSampleSize >= MIN_VISITS_FOR_CONVERSION
     const conversionRate =
-      orderStats && stats.sample_size > 0
-        ? Number(((orderStats.order_count / stats.sample_size) * 100).toFixed(2))
+      orderStats !== null && visitsSampleSize > 0
+        ? Number(((orderCount / visitsSampleSize) * 100).toFixed(2))
         : null
 
-    conversionRates[cohort] = conversionRate
+    conversionRates[cohort] = conversionHasSufficientSample ? conversionRate : null
+    rawConversionRates[cohort] = conversionRate
+    visitsSampleSizes[cohort] = visitsSampleSize
     const kpis: Partial<Record<KPI, KPIMeasurement>> = {}
     for (const kpi of KPIS) {
       if (kpi === "nps") {
         if (normalizedNps === null) {
-          kpis[kpi] = { ...unknown(), threshold: THRESHOLDS[kpi] }
+          const reason =
+            reviewStats === null ? "missing_db" : "insufficient_sample"
+          kpis[kpi] = { ...unknown(reason), threshold: THRESHOLDS[kpi] }
         } else {
           kpis[kpi] = {
             value: normalizedNps,
-            sample_size: reviewStats?.sample_size ?? 0,
+            sample_size: reviewSampleSize,
             threshold: THRESHOLDS[kpi],
             status: classifyNps(normalizedNps),
           }
         }
       } else if (kpi === "conversion") {
+        // Placeholder — resolved in post-loop conversion pass below.
         kpis[kpi] = {
           ...unknown(),
           threshold: THRESHOLDS[kpi],
         }
       } else if (kpi === "p95_latency_ms") {
         if (stats.sample_size === 0 || stats.p95_latency_ms === null) {
-          kpis[kpi] = { ...unknown(), threshold: THRESHOLDS[kpi] }
+          // cleanup-21 review-fix [HIGH]: emit reason on unknown so the
+          // smoke-gate aggregator's DEV_MODE_UNKNOWN_REASON_WHITELIST can
+          // map AR55 unknown → pass in dev/local docker-compose context
+          // where request-log telemetry has not accumulated samples yet.
+          const reason =
+            stats.sample_size === 0 ? "insufficient_sample" : "no_data"
+          kpis[kpi] = { ...unknown(reason), threshold: THRESHOLDS[kpi] }
         } else {
           kpis[kpi] = {
             value: stats.p95_latency_ms,
@@ -330,7 +386,11 @@ export async function computeCohortMetrics(
         }
       } else if (kpi === "error_rate_pct") {
         if (stats.sample_size === 0 || stats.error_rate_5xx_pct === null) {
-          kpis[kpi] = { ...unknown(), threshold: THRESHOLDS[kpi] }
+          // cleanup-21 review-fix [HIGH]: emit reason on unknown so AR56
+          // unknown can be whitelisted by smoke-gate aggregator in dev.
+          const reason =
+            stats.sample_size === 0 ? "insufficient_sample" : "no_data"
+          kpis[kpi] = { ...unknown(reason), threshold: THRESHOLDS[kpi] }
         } else {
           kpis[kpi] = {
             value: stats.error_rate_5xx_pct,
@@ -348,9 +408,21 @@ export async function computeCohortMetrics(
   for (const cohort of COHORTS) {
     const conversionRate = conversionRates[cohort] ?? null
     if (conversionRate === null || baselineConversion === null || baselineConversion <= 0) {
+      // Determine a descriptive reason for cleanup-21 whitelisting.
+      const reason =
+        conversionRate === null ? "insufficient_sample" : "no_baseline"
+      // cleanup-21 review-fix [MEDIUM]: surface the raw computed rate even
+      // when sample-size gate failed, so operators can see "value=10.2%,
+      // status=unknown" rather than silent null. Threshold disclosure
+      // includes proxy label unconditionally (cleanup-21 review-fix [LOW]).
+      const rawRate = rawConversionRates[cohort] ?? null
+      const visitsSize = visitsSampleSizes[cohort] ?? 0
       cohorts[cohort]!.conversion = {
-        ...unknown(),
-        threshold: THRESHOLDS.conversion,
+        value: rawRate,
+        sample_size: visitsSize,
+        threshold: `${THRESHOLDS.conversion} (request-log proxy)`,
+        status: "unknown",
+        reason,
       }
       continue
     }
@@ -358,8 +430,11 @@ export async function computeCohortMetrics(
     const ratioToBaseline = cohort === "pre_flip_baseline" ? 1 : conversionRate / baselineConversion
     cohorts[cohort]!.conversion = {
       value: conversionRate,
-      sample_size: cohorts[cohort]!.p95_latency_ms.sample_size,
-      threshold: `${THRESHOLDS.conversion}; baseline=${baselineConversion.toFixed(2)}%`,
+      // cleanup-21 review-fix [LOW]: visits sample size is the request-log
+      // sample (proxy denominator); decoupled from p95 latency sample for
+      // future-proofing if visits source migrates to PDP-view event stream.
+      sample_size: visitsSampleSizes[cohort] ?? cohorts[cohort]!.p95_latency_ms.sample_size,
+      threshold: `${THRESHOLDS.conversion}; baseline=${baselineConversion.toFixed(2)}% (request-log proxy)`,
       status: classifyConversionRatio(ratioToBaseline),
     }
   }

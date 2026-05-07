@@ -50,14 +50,21 @@ export function resolveNudgeCooldownHours(
   step: NudgeCadenceStep,
   overrides?: Partial<Record<NudgeCadenceStep, number>>,
 ): number {
-  if (overrides && typeof overrides[step] === "number") {
+  // Review F3: validate finite + positive; reject NaN/Infinity/negative/zero.
+  // Invalid values fall through to next priority tier so the dedup gate
+  // cannot be silently disabled by a misconfigured env (TF-94 P0 fail-open
+  // prevention — a negative cooldown would produce a future `since` and
+  // miss every prior row, defeating the gate).
+  const isValidHours = (v: unknown): v is number =>
+    typeof v === "number" && Number.isFinite(v) && v > 0
+  if (overrides && isValidHours(overrides[step])) {
     return overrides[step] as number
   }
   const envRaw = process.env.GP_NUDGE_DEDUP_COOLDOWN_JSON
   if (envRaw) {
     try {
       const parsed = JSON.parse(envRaw) as Partial<Record<NudgeCadenceStep, number>>
-      if (typeof parsed[step] === "number") return parsed[step] as number
+      if (isValidHours(parsed[step])) return parsed[step] as number
     } catch {
       // ignore malformed env — fall through to default
     }
@@ -237,8 +244,13 @@ export async function findRecentNotificationLog(
 
 /**
  * Probe that vendor_notification_log table is accessible. Throws
- * NotificationLogTableUnavailableError when the table is missing (migration
- * not yet run). Route uses this for fail-closed 503 before dispatching (AC7).
+ * NotificationLogTableUnavailableError ONLY when the underlying error indicates
+ * a missing table (Postgres SQLSTATE 42P01 / `undefined_table`, or message
+ * matching `relation .* does not exist`). All other errors (connection
+ * timeout, auth failure, lock contention) are re-thrown so the global
+ * error handler returns a 500 with the real cause — operators paging on
+ * NUDGE_DEDUP_UNAVAILABLE can trust that the migration is genuinely
+ * missing rather than chasing a transient network blip (Review F2).
  */
 export async function assertNotificationLogTableReady(scope: Scope): Promise<void> {
   const db = resolveDb(scope)
@@ -246,7 +258,22 @@ export async function assertNotificationLogTableReady(scope: Scope): Promise<voi
     // Bounded probe — no full seq scan
     await db<VendorNotificationLogEntry>(TABLE).select("id").limit(1)
   } catch (err) {
-    const msg = (err as Error).message ?? ""
-    throw new NotificationLogTableUnavailableError(msg)
+    if (isMissingTableError(err)) {
+      throw new NotificationLogTableUnavailableError((err as Error).message ?? "")
+    }
+    throw err
   }
+}
+
+/**
+ * Identify a Postgres "relation does not exist" condition. Matches both
+ * SQLSTATE 42P01 (preferred — pg driver populates `code` on PostgresError)
+ * and the message-string fallback for drivers that omit the code.
+ */
+function isMissingTableError(err: unknown): boolean {
+  if (!err) return false
+  const e = err as { code?: string; message?: string }
+  if (e.code === "42P01") return true
+  const msg = (e.message ?? "").toLowerCase()
+  return /relation\s+.*does not exist/.test(msg) || msg.includes("undefined_table")
 }

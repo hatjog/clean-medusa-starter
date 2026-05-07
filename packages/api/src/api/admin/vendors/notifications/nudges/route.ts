@@ -26,7 +26,7 @@ import {
   type NudgeCadenceLocale,
   type NudgeCadenceStep,
 } from "../../../../../modules/vendor-notifications/email-templates/nudge-cadence/i18n"
-import { extractActorIdOrThrow } from "../../../../../lib/capability-check"
+import { extractActorIdOrThrow, checkCapability } from "../../../../../lib/capability-check"
 import {
   assertNotificationProviderReady,
   NotificationProviderNotReadyError,
@@ -149,6 +149,23 @@ export async function POST(
     return
   }
 
+  // Review F1: force=true is a vendor-impacting capability (bypasses TF-94 P0
+  // dedup gate). Require explicit capability grant — currently `lifecycle.override`
+  // (v1.6.0: any admin user → granted; v1.7.0 will switch to capability_grants
+  // table per capability-check.ts JSDoc). Authorization decision is logged to
+  // the audit row via `triggered_by` + `forced=true` flag.
+  if (body.force === true) {
+    const allowed = await checkCapability(req, "lifecycle.override")
+    if (!allowed) {
+      res.status(403).json({
+        code: "NUDGE_FORCE_NOT_PERMITTED",
+        message:
+          "force=true requires the lifecycle.override capability. Re-issue without force, or escalate to an authorized operator.",
+      })
+      return
+    }
+  }
+
   if (!step || !VALID_STEPS.has(step)) {
     res.status(400).json({
       code: "INVALID_STEP",
@@ -243,7 +260,13 @@ export async function POST(
     const priorSentRow = recentRows[0] // most recent first (ORDER BY sent_at DESC)
 
     if (priorSentRow && !force) {
-      // AC2 — deduplicate: append audit row, do NOT dispatch
+      // AC2 — deduplicate: append audit row, do NOT dispatch.
+      // Review F4: dedup audit row MUST be durable. Unlike the dispatch
+      // path (where best-effort is acceptable because the email already
+      // landed), losing the dedup row means losing the only evidence
+      // that TF-94 P0 protection fired. If persistence fails, hard-throw
+      // → global handler returns 500 and the suppression is NOT silently
+      // recorded as success.
       const dedupId = randomUUID()
       const dedupPersisted = await appendNotificationLogBestEffort(scope, {
         id: dedupId,
@@ -257,6 +280,17 @@ export async function POST(
         triggered_by: triggeredBy,
         metadata: { dedup_of: priorSentRow.id },
       })
+      if (!dedupPersisted.persisted) {
+        logger.warn?.("[nudge] dedup audit persist FAILED — refusing to silently suppress", {
+          vendor_id: vendor.id,
+          step,
+          dedup_id: dedupId,
+          error: dedupPersisted.error,
+        })
+        throw new Error(
+          `dedup audit row failed to persist for vendor=${vendor.id} step=${step}: ${dedupPersisted.error ?? "unknown error"}`,
+        )
+      }
       auditLogIds.push(dedupPersisted.entry.id)
       dedupEntries.push({
         vendor_id: vendor.id,
@@ -289,11 +323,19 @@ export async function POST(
       failed += 1
     }
 
-    // AC4 — forced bypass: record forced audit metadata
+    // AC4 — forced bypass: record bypass evidence in audit row.
+    // Review F5: drop metadata.forced_by — `triggered_by` is the canonical
+    // actor column; duplicating it in JSONB invites schema drift.
+    // Review F6: when body.force === true but no prior row exists, the
+    // operator's INTENT to force is captured via metadata.force_requested
+    // (audit-friendly), while the row-level `forced` column remains the
+    // strict "an actual bypass occurred" signal.
     const isForced = priorSentRow !== undefined && force
-    const metadata: Record<string, unknown> | undefined = isForced
-      ? { forced: true, forced_by: triggeredBy }
-      : undefined
+    const metadataParts: Record<string, unknown> = {}
+    if (isForced) metadataParts.forced = true
+    if (force) metadataParts.force_requested = true
+    const metadata: Record<string, unknown> | undefined =
+      Object.keys(metadataParts).length > 0 ? metadataParts : undefined
 
     if (isForced) {
       forcedCount += 1

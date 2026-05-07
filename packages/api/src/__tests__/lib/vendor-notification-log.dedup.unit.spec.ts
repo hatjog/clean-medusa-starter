@@ -268,4 +268,78 @@ describe("assertNotificationLogTableReady", () => {
     expect(caughtErr).toBeInstanceOf(NotificationLogTableUnavailableError)
     expect((caughtErr as NotificationLogTableUnavailableError).code).toBe("NUDGE_DEDUP_UNAVAILABLE")
   })
+
+  // -------------------------------------------------------------------------
+  // Review F2 — only reclassify "missing table" errors; rethrow transient/auth
+  // -------------------------------------------------------------------------
+
+  it("rethrows non-missing-table errors so global handler surfaces them as 500 (Review F2)", async () => {
+    const transientErr = new Error("connection terminated unexpectedly") as Error & { code?: string }
+    transientErr.code = "ECONNRESET"
+    const { knex } = makeKnexStub(transientErr)
+    const scope = makeScope(knex)
+
+    await expect(assertNotificationLogTableReady(scope)).rejects.toThrow(
+      "connection terminated unexpectedly",
+    )
+    await expect(assertNotificationLogTableReady(scope)).rejects.not.toBeInstanceOf(
+      NotificationLogTableUnavailableError,
+    )
+  })
+
+  it("identifies missing table via SQLSTATE 42P01 (Review F2)", async () => {
+    const pgErr = new Error("relation \"vendor_notification_log\" does not exist") as Error & { code?: string }
+    pgErr.code = "42P01"
+    const { knex } = makeKnexStub(pgErr)
+    const scope = makeScope(knex)
+
+    await expect(assertNotificationLogTableReady(scope)).rejects.toBeInstanceOf(
+      NotificationLogTableUnavailableError,
+    )
+  })
+
+  it("does NOT misclassify auth failure as missing table (Review F2)", async () => {
+    const authErr = new Error("password authentication failed for user \"medusa\"") as Error & { code?: string }
+    authErr.code = "28P01"
+    const { knex } = makeKnexStub(authErr)
+    const scope = makeScope(knex)
+
+    await expect(assertNotificationLogTableReady(scope)).rejects.not.toBeInstanceOf(
+      NotificationLogTableUnavailableError,
+    )
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Review F3 — resolveNudgeCooldownHours rejects invalid values
+// ---------------------------------------------------------------------------
+
+describe("resolveNudgeCooldownHours — Review F3 invalid value handling", () => {
+  afterEach(() => {
+    delete process.env.GP_NUDGE_DEDUP_COOLDOWN_JSON
+  })
+
+  it("falls through to default when env override is negative", () => {
+    process.env.GP_NUDGE_DEDUP_COOLDOWN_JSON = JSON.stringify({ t21: -1 })
+    expect(resolveNudgeCooldownHours("t21")).toBe(NUDGE_DEDUP_COOLDOWN_HOURS_DEFAULT)
+  })
+
+  it("falls through to default when env override is zero", () => {
+    process.env.GP_NUDGE_DEDUP_COOLDOWN_JSON = JSON.stringify({ t21: 0 })
+    expect(resolveNudgeCooldownHours("t21")).toBe(NUDGE_DEDUP_COOLDOWN_HOURS_DEFAULT)
+  })
+
+  it("falls through to default when env override is non-finite (Infinity)", () => {
+    // JSON.stringify turns Infinity into null, so simulate by writing raw
+    process.env.GP_NUDGE_DEDUP_COOLDOWN_JSON = '{"t21": null}'
+    expect(resolveNudgeCooldownHours("t21")).toBe(NUDGE_DEDUP_COOLDOWN_HOURS_DEFAULT)
+  })
+
+  it("falls through to default when caller-supplied override is negative", () => {
+    expect(resolveNudgeCooldownHours("t21", { t21: -5 })).toBe(NUDGE_DEDUP_COOLDOWN_HOURS_DEFAULT)
+  })
+
+  it("falls through to default when caller-supplied override is NaN", () => {
+    expect(resolveNudgeCooldownHours("t21", { t21: NaN })).toBe(NUDGE_DEDUP_COOLDOWN_HOURS_DEFAULT)
+  })
 })
