@@ -6,6 +6,7 @@
  * `gp-config-sync-vendors.ts` before catalog linking runs.
  */
 import { ExecArgs } from "@medusajs/framework/types"
+import { ContainerRegistrationKeys } from "@medusajs/framework/utils"
 import { createProductsWorkflow, linkProductsToSalesChannelWorkflow, upsertVariantPricesWorkflow } from "@medusajs/core-flows"
 
 import fs from "node:fs/promises"
@@ -402,7 +403,9 @@ export type VendorPricingInfo = {
 
 export async function buildVendorPricingMap(
   marketConfigPath: string,
-  warnings: string[]
+  warnings: string[],
+  db?: any,
+  marketIdForRuntime?: string
 ): Promise<Map<string, VendorPricingInfo>> {
   const map = new Map<string, VendorPricingInfo>()
   const marketDir = path.dirname(marketConfigPath)
@@ -414,9 +417,22 @@ export async function buildVendorPricingMap(
     return map
   }
 
-  const activeVendors = (marketConfig.vendors ?? []).filter(
-    (v) => ACTIVE_VENDOR_STATUSES.has(v.status)
-  )
+  const vendors = marketConfig.vendors ?? []
+  const runtimeStateMap =
+    db && marketIdForRuntime
+      ? await resolveVendorRuntimeStateMap(db, marketIdForRuntime, vendors, warnings)
+      : new Map<string, { slug: string; store_status: string | null }>()
+
+  const activeVendors = vendors.filter((vendor) => {
+    const slug = vendor.slug?.trim() ?? ""
+    const runtime = slug ? runtimeStateMap.get(slug) : undefined
+
+    if (runtime) {
+      return isRuntimeSellerActive(runtime.store_status)
+    }
+
+    return ACTIVE_VENDOR_STATUSES.has(vendor.status)
+  })
 
   for (const vendor of activeVendors) {
     const vendorProductsPath = path.resolve(
@@ -1283,6 +1299,7 @@ const ACTIVE_VENDOR_STATUSES = new Set(["active", "onboarded"])
 
 type MarketVendor = {
   vendor_id: string
+  slug?: string
   status: string
 }
 
@@ -1305,7 +1322,72 @@ function isVendorProductSellable(product: { status?: string; available?: boolean
   return product.status !== "inactive" && product.available !== false
 }
 
+/**
+ * Returns true when a Mercur 2 seller's runtime `store_status` indicates the seller is active.
+ *
+ * Prod-vs-config drift rationale: gp-config YAML `vendor.status` is a bootstrap/fallback.
+ * The runtime DB (`seller` table, Mercur 2) is the source of truth for seller activity.
+ * This helper is case-insensitive to guard against mixed-case enum values in early migrations.
+ *
+ * Scope limit: no reverse-flow (writing back to gp-config), no real-time push.
+ * Eventual consistency per sync run is sufficient for v1.6.0. Full ratification deferred to v1.10.0.
+ */
+function isRuntimeSellerActive(storeStatus: string | null | undefined): boolean {
+  return (storeStatus ?? "").trim().toUpperCase() === "ACTIVE"
+}
+
+/**
+ * Reads `seller.store_status` for the given market from the Mercur 2 DB (Knex handle).
+ *
+ * Best-effort: if the DB query throws, a warning is pushed and an empty Map is returned
+ * so that the caller falls back to config-only filtering without crashing the sync run.
+ *
+ * Filter: `metadata->'gp'->>'market_id' = marketId AND deleted_at IS NULL`.
+ * Slug-only matching: vendors without `slug` in gp-config are skipped and fall back to config status.
+ */
+async function resolveVendorRuntimeStateMap(
+  db: any,
+  marketId: string,
+  vendors: MarketVendor[],
+  warnings: string[]
+): Promise<Map<string, { slug: string; store_status: string | null }>> {
+  const slugs = Array.from(
+    new Set(
+      vendors
+        .map((vendor) => vendor.slug?.trim())
+        .filter((slug): slug is string => Boolean(slug))
+    )
+  )
+
+  if (slugs.length === 0) {
+    return new Map()
+  }
+
+  let rows: Array<{ handle: string; store_status: string | null }> = []
+  try {
+    rows = await db("seller")
+      .select("handle", "store_status")
+      .whereIn("handle", slugs)
+      .whereRaw("metadata->'gp'->>'market_id' = ?", [marketId])
+      .whereNull("deleted_at")
+  } catch (e: any) {
+    warnings.push(`Vendor status gate: cannot resolve runtime seller states — ${e?.message ?? String(e)}`)
+    return new Map()
+  }
+
+  const runtimeStateMap = new Map<string, { slug: string; store_status: string | null }>()
+  for (const row of rows) {
+    runtimeStateMap.set(row.handle, {
+      slug: row.handle,
+      store_status: row.store_status ?? null,
+    })
+  }
+
+  return runtimeStateMap
+}
+
 export async function enforceVendorStatusGate(
+  db: any,
   productModuleService: any,
   marketConfigPath: string,
   marketId: string,
@@ -1321,17 +1403,47 @@ export async function enforceVendorStatusGate(
   }
 
   const vendors = marketConfig.vendors ?? []
-  const nonActiveVendors = vendors.filter((v) => !ACTIVE_VENDOR_STATUSES.has(v.status))
+  const runtimeStateMap = await resolveVendorRuntimeStateMap(db, marketId, vendors, warnings)
+
+  const vendorsWithRuntimeState = vendors.map((vendor) => {
+    const slug = vendor.slug?.trim() ?? ""
+    const runtime = slug ? runtimeStateMap.get(slug) : undefined
+    const isActive = runtime
+      ? isRuntimeSellerActive(runtime.store_status)
+      : ACTIVE_VENDOR_STATUSES.has(vendor.status)
+
+    if (!runtime) {
+      warnings.push(
+        `Vendor status gate: runtime seller missing for vendor '${vendor.vendor_id}'` +
+          (slug ? ` slug='${slug}'` : "") +
+          `; falling back to config status='${vendor.status}'`
+      )
+    }
+
+    return {
+      ...vendor,
+      slug,
+      runtimeStoreStatus: runtime?.store_status ?? null,
+      isActive,
+    }
+  })
+
+  const nonActiveVendors = vendorsWithRuntimeState.filter((vendor) => !vendor.isActive)
 
   if (nonActiveVendors.length === 0) {
     return { draftedCount: 0 }
   }
 
   console.log(
-    `Vendor status gate: ${nonActiveVendors.length} non-active vendor(s): ${nonActiveVendors.map((v) => `${v.vendor_id}=${v.status}`).join(", ")}`
+    `Vendor status gate: ${nonActiveVendors.length} non-active vendor(s): ${nonActiveVendors
+      .map((vendor) => {
+        const runtime = vendor.runtimeStoreStatus ? `runtime=${vendor.runtimeStoreStatus}` : "runtime=missing"
+        return `${vendor.vendor_id}(${runtime}, config=${vendor.status})`
+      })
+      .join(", ")}`
   )
 
-  const activeVendors = vendors.filter((v) => ACTIVE_VENDOR_STATUSES.has(v.status))
+  const activeVendors = vendorsWithRuntimeState.filter((vendor) => vendor.isActive)
 
   // Build sets of fixture product_ids belonging to active and non-active vendors
   // by reading vendor product catalog files (vendors/{vendor_id}/products.yaml)
@@ -1548,6 +1660,9 @@ export default async function gpConfigSyncCatalog({ container, args }: ExecArgs)
   const activeCurrency = allCurrencies[0]
 
   const warnings: string[] = []
+  // Resolve Knex handle for runtime seller status lookups (best-effort; resolveVendorRuntimeStateMap
+  // is try/catch so sync continues even if PG_CONNECTION is unavailable in this context).
+  const db = container.resolve(ContainerRegistrationKeys.PG_CONNECTION) as any
 
   // Prerequisites (fail-fast on critical) — validate region for each currency
   console.log(`Validating prerequisites for market '${marketId}'...`)
@@ -1597,11 +1712,16 @@ export default async function gpConfigSyncCatalog({ container, args }: ExecArgs)
     collector
   )
 
-  // Build vendor pricing map before product sync
+  // Build vendor pricing map before product sync (now wired to real seller store_status)
   const marketConfigPath = path.resolve(configRoot, instanceId, "markets", marketId, "market.yaml")
-  const vendorPricingMap = await buildVendorPricingMap(marketConfigPath, warnings)
-  if (vendorPricingMap.size > 0) {
-    console.log(`Vendor pricing: ${vendorPricingMap.size} product(s) have active vendor prices`)
+  const resolvedVendorPricingMap = await buildVendorPricingMap(
+    marketConfigPath,
+    warnings,
+    db,
+    marketId
+  )
+  if (resolvedVendorPricingMap.size > 0) {
+    console.log(`Vendor pricing: ${resolvedVendorPricingMap.size} product(s) have active vendor prices`)
   }
 
   // Sync products
@@ -1615,7 +1735,7 @@ export default async function gpConfigSyncCatalog({ container, args }: ExecArgs)
     tagIdMap,
     marketId,
     warnings,
-    vendorPricingMap,
+    resolvedVendorPricingMap,
     dryRun,
     collector
   )
@@ -1638,6 +1758,7 @@ export default async function gpConfigSyncCatalog({ container, args }: ExecArgs)
 
   // Vendor status enforcement — draft products from non-active vendors
   const { draftedCount } = await enforceVendorStatusGate(
+    db,
     productModuleService,
     marketConfigPath,
     marketId,
