@@ -1,15 +1,17 @@
 /**
  * Story v160-7-2: Nudge cadence admin route — POST trigger.
+ * Story v160-cleanup-40-nudge-dedup: Dedup gate before dispatch (TF-94 P0).
  *
  * POST /admin/vendors/notifications/nudges
- *   Body: { step: 't21' | 't14' | 't7' | 't3'; dry_run?: boolean; vendor_ids?: string[] }
- *   Response: { step, triggered, skipped, failed, audit_log_ids }
+ *   Body: { step, dry_run?, vendor_ids?, override?, force? }
+ *   Response: { step, triggered, skipped, deduplicated, forced, failed, audit_log_ids, deduplicated_entries }
  *
- * Stub-tier per Sprint 4 Wave 14 batch (matches Story 7.1 pattern):
- *   - Reads `GP_FLAG_FLIP_DATE` env var (ISO YYYY-MM-DD)
- *   - Returns deterministic dry-run payload + audit log skeleton
- *   - Real vendor list fetch + Medusa notification dispatch deferred to
- *     Phase B activation (workflow/cron infra).
+ * Dedup logic (AC1-AC7):
+ *   1. After assertNotificationProviderReady(), BEFORE dispatch loop,
+ *      call assertNotificationLogTableReady() — 503 NUDGE_DEDUP_UNAVAILABLE on fail.
+ *   2. Per vendor: query findRecentNotificationLog(vendor_id, "nudge_<step>", since=now-cooldown).
+ *   3. If prior 'sent' row found AND force !== true: skip dispatch, append 'deduplicated' row.
+ *   4. If force === true AND prior row: dispatch anyway, audit row has forced=true + metadata.forced_by.
  */
 
 import type { MedusaRequest, MedusaResponse } from "@medusajs/framework/http"
@@ -29,7 +31,13 @@ import {
   assertNotificationProviderReady,
   NotificationProviderNotReadyError,
 } from "../../../../../lib/vendor-notification-provider-readiness"
-import { appendNotificationLogBestEffort } from "../../../../../lib/vendor-notification-log"
+import {
+  appendNotificationLogBestEffort,
+  assertNotificationLogTableReady,
+  findRecentNotificationLog,
+  resolveNudgeCooldownHours,
+  NotificationLogTableUnavailableError,
+} from "../../../../../lib/vendor-notification-log"
 import type { VendorNotificationLogEntry } from "../../../../../modules/vendor-notifications"
 
 type TriggerRequestBody = {
@@ -37,6 +45,8 @@ type TriggerRequestBody = {
   dry_run?: boolean
   vendor_ids?: string[]
   override?: boolean
+  /** force=true bypasses cooldown dedup gate — operator escape hatch (AC4) */
+  force?: boolean
 }
 
 type Logger = {
@@ -50,6 +60,12 @@ interface NudgeEligibleVendor {
   email: string
   preferred_locale: NudgeCadenceLocale | null
   decision_status: "open" | "opted_in" | "opted_out"
+}
+
+type DedupEntry = {
+  vendor_id: string
+  existing_log_id: string
+  reason: "deduplicated"
 }
 
 const VALID_STEPS: ReadonlySet<NudgeCadenceStep> = new Set([
@@ -71,9 +87,8 @@ function resolveFlagFlipDate(): { iso: string | null } {
 
 /**
  * Stub eligible-vendor fetcher — production swap-in queries Mercur 2 vendors
- * by lifecycle_status='open' AND decision_status NOT IN ('opted_in','opted_out')
- * AND audit log dedup (no prior nudge_<step> entry). Until Phase B activation,
- * reads from `process.env.GP_NUDGE_DEV_FIXTURE_VENDORS_JSON` for tests.
+ * by lifecycle_status='open' AND decision_status NOT IN ('opted_in','opted_out').
+ * Until Phase B activation, reads from GP_NUDGE_DEV_FIXTURE_VENDORS_JSON for tests.
  */
 async function fetchEligibleVendors(
   _step: NudgeCadenceStep,
@@ -124,6 +139,7 @@ export async function POST(
   const body = (req.body ?? {}) as TriggerRequestBody
   const step = body.step
   const dryRun = body.dry_run === true
+  const force = body.force === true
 
   let triggeredBy: string
   try {
@@ -155,6 +171,7 @@ export async function POST(
 
   const eligible = await fetchEligibleVendors(step, body.vendor_ids)
 
+  // Dry-run exits early — no dedup checks, no audit rows (AC5.d backward compat)
   if (dryRun) {
     res.status(200).json({
       dry_run: true,
@@ -165,6 +182,7 @@ export async function POST(
     return
   }
 
+  // Provider readiness check (AC from cleanup-6e)
   try {
     assertNotificationProviderReady()
   } catch (err) {
@@ -178,10 +196,32 @@ export async function POST(
     throw err
   }
 
+  // Fail-closed dedup infra check (AC7) — BEFORE dispatch loop
+  const scope = req.scope as { resolve: (key: string) => unknown }
+  try {
+    await assertNotificationLogTableReady(scope)
+  } catch (err) {
+    if (err instanceof NotificationLogTableUnavailableError) {
+      res.status(503).json({
+        code: err.code,
+        message: err.message,
+      })
+      return
+    }
+    throw err
+  }
+
   const auditLogIds: string[] = []
+  const dedupEntries: DedupEntry[] = []
   let triggered = 0
   let skipped = 0
   let failed = 0
+  let deduplicated = 0
+  let forcedCount = 0
+
+  const cooldownHours = resolveNudgeCooldownHours(step)
+  const notificationType =
+    `nudge_${step}` as VendorNotificationLogEntry["notification_type"]
 
   for (const vendor of eligible) {
     if (
@@ -191,6 +231,49 @@ export async function POST(
       skipped += 1
       continue
     }
+
+    // Dedup gate — AC1: query recent 'sent' rows inside cooldown window
+    const since = new Date(Date.now() - cooldownHours * 60 * 60 * 1000)
+    const recentRows = await findRecentNotificationLog(scope, {
+      vendor_id: vendor.id,
+      notification_type: notificationType,
+      since_iso: since.toISOString(),
+    })
+
+    const priorSentRow = recentRows[0] // most recent first (ORDER BY sent_at DESC)
+
+    if (priorSentRow && !force) {
+      // AC2 — deduplicate: append audit row, do NOT dispatch
+      const dedupId = randomUUID()
+      const dedupPersisted = await appendNotificationLogBestEffort(scope, {
+        id: dedupId,
+        vendor_id: vendor.id,
+        vendor_handle: vendor.handle ?? null,
+        notification_type: notificationType,
+        sent_at: new Date().toISOString(),
+        locale: vendor.preferred_locale ?? "pl",
+        recipient_email: vendor.email,
+        status: "deduplicated",
+        triggered_by: triggeredBy,
+        metadata: { dedup_of: priorSentRow.id },
+      })
+      auditLogIds.push(dedupPersisted.entry.id)
+      dedupEntries.push({
+        vendor_id: vendor.id,
+        existing_log_id: priorSentRow.id,
+        reason: "deduplicated",
+      })
+      deduplicated += 1
+      logger.info?.("[nudge] deduplicated — prior sent row within cooldown", {
+        vendor_id: vendor.id,
+        step,
+        existing_log_id: priorSentRow.id,
+        cooldown_hours: cooldownHours,
+      })
+      continue
+    }
+
+    // Dispatch (either no prior row, or force=true bypass)
     const locale: NudgeCadenceLocale = vendor.preferred_locale ?? "pl"
     const result = await dispatchNudgeStub(
       vendor,
@@ -205,22 +288,30 @@ export async function POST(
     } else {
       failed += 1
     }
-    const notificationType =
-      `nudge_${step}` as VendorNotificationLogEntry["notification_type"]
-    const persisted = await appendNotificationLogBestEffort(
-      req.scope as { resolve: (key: string) => unknown },
-      {
-        id,
-        vendor_id: vendor.id,
-        vendor_handle: vendor.handle ?? null,
-        notification_type: notificationType,
-        sent_at: new Date().toISOString(),
-        locale,
-        recipient_email: vendor.email,
-        status: result.ok ? "sent" : "failed",
-        triggered_by: triggeredBy,
-      },
-    )
+
+    // AC4 — forced bypass: record forced audit metadata
+    const isForced = priorSentRow !== undefined && force
+    const metadata: Record<string, unknown> | undefined = isForced
+      ? { forced: true, forced_by: triggeredBy }
+      : undefined
+
+    if (isForced) {
+      forcedCount += 1
+    }
+
+    const persisted = await appendNotificationLogBestEffort(scope, {
+      id,
+      vendor_id: vendor.id,
+      vendor_handle: vendor.handle ?? null,
+      notification_type: notificationType,
+      sent_at: new Date().toISOString(),
+      locale,
+      recipient_email: vendor.email,
+      status: result.ok ? "sent" : "failed",
+      triggered_by: triggeredBy,
+      forced: isForced,
+      metadata,
+    })
     auditLogIds.push(persisted.entry.id)
     logger.info?.(
       `[nudge] audit entry${persisted.persisted ? "" : " (in-memory)"}`,
@@ -238,7 +329,10 @@ export async function POST(
     step,
     triggered,
     skipped,
+    deduplicated,
+    forced: forcedCount,
     failed,
     audit_log_ids: auditLogIds,
+    deduplicated_entries: dedupEntries,
   })
 }
