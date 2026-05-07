@@ -274,11 +274,18 @@ export function resolveLifecycleStatus(seller: SellerRecord): LifecycleStatus {
     ? seller.store_status.trim().toUpperCase()
     : ""
 
-  if (rawStoreStatus === "ACTIVE") {
+  // Legacy Mercur 1.5 store_status normalization bridge: converts uppercase
+  // Mercur 1.5 DB values ("ACTIVE"/"INACTIVE") to Mercur 2 SellerStatus lowercase.
+  // This shim MUST retain the stale literals to read pre-migration DB rows correctly.
+  // Remove once all DB rows have been migrated to seller.status (Mercur 2 native field).
+  // noqa: mercur15-drift — Mercur 1.5 bridge
+  if (rawStoreStatus === "ACTIVE") { // noqa: mercur15-drift
     return "open"
   }
 
-  if (rawStoreStatus === "INACTIVE") {
+  // noqa: mercur15-drift — Mercur 1.5 bridge (also covers "INACTIVE" if validator
+  // regex is later extended to flag that literal; today validator covers only ACTIVE/SUSPENDED).
+  if (rawStoreStatus === "INACTIVE") { // noqa: mercur15-drift
     return "suspended"
   }
 
