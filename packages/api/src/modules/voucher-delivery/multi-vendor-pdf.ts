@@ -27,6 +27,12 @@
  * storefront Story 4.5) for Google + Apple Maps deeplink URLs. Defensive
  * fallback to search-query mode when coordinates are absent. Privacy notice
  * mandatory (always rendered when section renders).
+ *
+ * Story v160-cleanup-35: i18n shared source refactor (TF-81).
+ * T30_PDF_COPY (hardcoded pl/en literals) replaced by shared JSON bundles
+ * under i18n/ — single canonical source synced with storefront voucher.pdf.*
+ * sub-namespace. 4-locale parity: pl/en/ua/de. lookupCopy() throws fail-fast
+ * on missing or empty key (no silent fallback to EN or undefined).
  */
 
 import {
@@ -34,6 +40,47 @@ import {
   buildGoogleMapsDeeplink,
   buildSearchFallbackDeeplink,
 } from "./maps-deeplink"
+
+// ---------------------------------------------------------------------------
+// Shared i18n bundles (canonical source — synced with storefront voucher.pdf.*)
+// These JSON files are the single source of truth for voucher PDF copy.
+// The validator _grow/tools/validate_i18n_parity.py --surface=voucher-pdf
+// asserts parity between these bundles and storefront messages/{locale}.json.
+// ---------------------------------------------------------------------------
+import voucherPdfPl from "./i18n/voucher-pdf.pl.json"
+import voucherPdfEn from "./i18n/voucher-pdf.en.json"
+import voucherPdfUa from "./i18n/voucher-pdf.ua.json"
+import voucherPdfDe from "./i18n/voucher-pdf.de.json"
+
+/** Tracked keys for voucher PDF i18n — must match voucher_pdf_tracked_keys.yaml */
+export type VoucherPdfCopyKey = keyof typeof voucherPdfPl
+
+/** Supported locales for voucher PDF generation (4-locale parity, cleanup-19). */
+export type VoucherPdfLocale = "pl" | "en" | "ua" | "de"
+
+/** Shared voucher PDF copy bundles keyed by locale. */
+export const VOUCHER_PDF_COPY: Record<VoucherPdfLocale, Record<string, string>> = {
+  pl: voucherPdfPl as Record<string, string>,
+  en: voucherPdfEn as Record<string, string>,
+  ua: voucherPdfUa as Record<string, string>,
+  de: voucherPdfDe as Record<string, string>,
+}
+
+/**
+ * Lookup a voucher PDF i18n copy string for the given locale and key.
+ *
+ * Throws a typed error if the key is missing or empty for the locale —
+ * NO silent fallback to EN, NO return of `undefined` or empty string.
+ * This is the fail-fast contract for Story v160-cleanup-35 AC5.
+ */
+export function lookupCopy(locale: VoucherPdfLocale, key: VoucherPdfCopyKey): string {
+  const bundle = VOUCHER_PDF_COPY[locale]
+  const value = bundle?.[key as string]
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw new Error(`missing voucher PDF i18n key: ${key} for locale ${locale}`)
+  }
+  return value
+}
 
 export interface CartLineItemForVoucher {
   id: string
@@ -61,8 +108,8 @@ export interface VendorRecord {
 export interface VoucherPdfPayload {
   /** Public voucher code (recipient-facing). */
   voucher_code: string
-  /** Locale for backend-side translation lookup. */
-  locale: "pl" | "en"
+  /** Locale for backend-side translation lookup (4-locale: pl/en/ua/de). */
+  locale: VoucherPdfLocale
   /** Single vendor context (per-vendor PDF isolation invariant). */
   vendor: {
     id: string
@@ -86,41 +133,6 @@ export interface VoucherPdfPayload {
   valid_until?: string | null
   /** Optional buyer note (non-PII per Story 5.6 contract). */
   buyer_note?: string | null
-}
-
-const T30_PDF_COPY = {
-  pl: {
-    title: "Voucher BonBeauty",
-    salon_section_title: "Salon",
-    redemption_code_label: "Kod realizacji",
-    validity_period_label: "Ważność",
-    voucher_value_label: "Wartość vouchera",
-    service_description_label: "Usługa",
-    directions_title: "Jak dojechać",
-    directions_address_label: "Adres",
-    directions_google_label: "Google Maps",
-    directions_apple_label: "Apple Maps",
-    directions_no_coords_helper:
-      "Współrzędne nie są dostępne — link wyszukuje adres",
-    directions_privacy_notice:
-      "Klikając linki map zewnętrznych, opuszczasz BonBeauty. BonBeauty nie udostępnia Twoich danych zewnętrznym dostawcom map.",
-  },
-  en: {
-    title: "BonBeauty voucher",
-    salon_section_title: "Salon",
-    redemption_code_label: "Redemption code",
-    validity_period_label: "Valid until",
-    voucher_value_label: "Voucher value",
-    service_description_label: "Service",
-    directions_title: "How to get there",
-    directions_address_label: "Address",
-    directions_google_label: "Google Maps",
-    directions_apple_label: "Apple Maps",
-    directions_no_coords_helper:
-      "Coordinates not available — link searches address",
-    directions_privacy_notice:
-      "Clicking external map links, you leave BonBeauty. BonBeauty does not share your data with external map providers.",
-  },
 }
 
 /**
@@ -153,7 +165,7 @@ export function groupLineItemsByVendor(
  */
 export function buildVoucherPdfPayload(args: {
   voucher_code: string
-  locale: "pl" | "en"
+  locale: VoucherPdfLocale
   vendor: VendorRecord
   line_items: CartLineItemForVoucher[]
   currency_code?: string
@@ -179,8 +191,8 @@ export function buildVoucherPdfPayload(args: {
       handle: args.vendor.handle,
       address: args.vendor.address ?? null,
       photo_url: args.vendor.photo_url ?? null,
-    lat: typeof args.vendor.lat === "number" ? args.vendor.lat : null,
-    lng: typeof args.vendor.lng === "number" ? args.vendor.lng : null,
+      lat: typeof args.vendor.lat === "number" ? args.vendor.lat : null,
+      lng: typeof args.vendor.lng === "number" ? args.vendor.lng : null,
     },
     service_description,
     value_minor,
@@ -201,27 +213,29 @@ export function buildVoucherPdfPayload(args: {
  * test (Story 6.2 AC4) can extract via `Buffer.toString('utf-8')` instead of
  * the real `pdf-parse` lib. When the real engine lands, this function gets
  * swapped; AC4 test should also gain the real `pdf-parse` extraction path.
+ *
+ * Uses lookupCopy() for all i18n strings — throws fail-fast on missing key.
  */
 export function renderVoucherPdfStub(payload: VoucherPdfPayload): Buffer {
-  const copy = T30_PDF_COPY[payload.locale] ?? T30_PDF_COPY.pl
+  const locale = payload.locale
   const lines: string[] = [
-    `=== ${copy.title} ===`,
+    `=== ${lookupCopy(locale, "title")} ===`,
     "",
-    `${copy.redemption_code_label}: ${payload.voucher_code}`,
+    `${lookupCopy(locale, "redemption_code_label")}: ${payload.voucher_code}`,
     "",
-    `--- ${copy.salon_section_title} ---`,
+    `--- ${lookupCopy(locale, "salon_section_title")} ---`,
     `${payload.vendor.name}`,
     `@${payload.vendor.handle}`,
   ]
   if (payload.vendor.address) {
     lines.push(payload.vendor.address)
   }
-  lines.push("", `${copy.service_description_label}: ${payload.service_description}`)
+  lines.push("", `${lookupCopy(locale, "service_description_label")}: ${payload.service_description}`)
   lines.push(
-    `${copy.voucher_value_label}: ${(payload.value_minor / 100).toFixed(2)} ${payload.currency_code}`,
+    `${lookupCopy(locale, "voucher_value_label")}: ${(payload.value_minor / 100).toFixed(2)} ${payload.currency_code}`,
   )
   if (payload.valid_until) {
-    lines.push(`${copy.validity_period_label}: ${payload.valid_until}`)
+    lines.push(`${lookupCopy(locale, "validity_period_label")}: ${payload.valid_until}`)
   }
   if (payload.buyer_note) {
     lines.push("", `> ${payload.buyer_note}`)
@@ -244,10 +258,11 @@ export function renderVoucherPdfStub(payload: VoucherPdfPayload): Buffer {
  * Privacy invariant (AR45): only seller-side fields (name, address, coords)
  * are ever rendered. Voucher code is included by the parent stub already.
  * NO buyer-side fields are read here — type system + payload shape enforce.
+ *
+ * Uses lookupCopy() for all i18n strings — throws fail-fast on missing key.
  */
 export function renderDirectionsSection(payload: VoucherPdfPayload): string[] {
-  const copy = T30_PDF_COPY[payload.locale] ?? T30_PDF_COPY.pl
-  const { vendor } = payload
+  const { locale, vendor } = payload
   const hasCoords =
     typeof vendor.lat === "number" && typeof vendor.lng === "number"
   const hasAddress =
@@ -256,10 +271,10 @@ export function renderDirectionsSection(payload: VoucherPdfPayload): string[] {
   // Skip section entirely if zero data — preserves clean layout.
   if (!hasCoords && !hasAddress) return []
 
-  const lines: string[] = [`--- ${copy.directions_title} ---`]
+  const lines: string[] = [`--- ${lookupCopy(locale, "directions_title")} ---`]
 
   if (hasAddress) {
-    lines.push(`${copy.directions_address_label}: ${vendor.address}`)
+    lines.push(`${lookupCopy(locale, "directions_address_label")}: ${vendor.address}`)
   }
 
   if (hasCoords) {
@@ -273,8 +288,8 @@ export function renderDirectionsSection(payload: VoucherPdfPayload): string[] {
       lng: vendor.lng as number,
       name: vendor.name,
     })
-    lines.push(`${copy.directions_google_label}: ${googleUrl}`)
-    lines.push(`${copy.directions_apple_label}: ${appleUrl}`)
+    lines.push(`${lookupCopy(locale, "directions_google_label")}: ${googleUrl}`)
+    lines.push(`${lookupCopy(locale, "directions_apple_label")}: ${appleUrl}`)
   } else if (hasAddress) {
     // Search-query fallback when coordinates absent — link still resolves
     // to user's preferred maps app via address text geocoding.
@@ -288,14 +303,14 @@ export function renderDirectionsSection(payload: VoucherPdfPayload): string[] {
       name: vendor.name,
       address: vendor.address as string,
     })
-    lines.push(`${copy.directions_google_label}: ${googleUrl}`)
-    lines.push(`${copy.directions_apple_label}: ${appleUrl}`)
-    lines.push(copy.directions_no_coords_helper)
+    lines.push(`${lookupCopy(locale, "directions_google_label")}: ${googleUrl}`)
+    lines.push(`${lookupCopy(locale, "directions_apple_label")}: ${appleUrl}`)
+    lines.push(lookupCopy(locale, "directions_no_coords_helper"))
   }
 
   // Privacy notice mandatory whenever section renders (AR45 + Story 4.5
   // web parity — leaving BonBeauty boundary disclosure).
-  lines.push("", copy.directions_privacy_notice)
+  lines.push("", lookupCopy(locale, "directions_privacy_notice"))
 
   return lines
 }
@@ -331,7 +346,7 @@ export interface MultiVendorPdfDispatch {
 export function dispatchMultiVendorPdfs(args: {
   voucher_id: string
   voucher_code: string
-  locale: "pl" | "en"
+  locale: VoucherPdfLocale
   line_items: CartLineItemForVoucher[]
   vendors_by_id: Record<string, VendorRecord>
   currency_code?: string

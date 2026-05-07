@@ -1,0 +1,14 @@
+{
+  "title": "BonBeauty voucher",
+  "salon_section_title": "Salon",
+  "redemption_code_label": "Redemption code",
+  "validity_period_label": "Valid until",
+  "voucher_value_label": "Voucher value",
+  "service_description_label": "Service",
+  "directions_title": "How to get there",
+  "directions_address_label": "Address",
+  "directions_google_label": "Google Maps",
+  "directions_apple_label": "Apple Maps",
+  "directions_no_coords_helper": "Coordinates not available — link searches address",
+  "directions_privacy_notice": "Clicking external map links, you leave BonBeauty. BonBeauty does not share your data with external map providers."
+}

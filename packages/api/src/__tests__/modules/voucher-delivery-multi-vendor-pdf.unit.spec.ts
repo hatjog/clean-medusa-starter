@@ -14,8 +14,11 @@ import {
   renderDirectionsSection,
   renderVoucherPdfStub,
   buildVoucherPdfStorageKey,
+  lookupCopy,
+  VOUCHER_PDF_COPY,
   type CartLineItemForVoucher,
   type VendorRecord,
+  type VoucherPdfLocale,
 } from "../../modules/voucher-delivery/multi-vendor-pdf"
 
 describe("voucher-delivery/multi-vendor-pdf", () => {
@@ -248,6 +251,212 @@ describe("voucher-delivery/multi-vendor-pdf", () => {
       expect(text).not.toMatch(/buyer_phone/i)
       expect(text).not.toMatch(/buyer_address/i)
       expect(text).not.toMatch(/gift_message/i)
+    })
+  })
+
+  // ---------------------------------------------------------------------------
+  // Story v160-cleanup-35: i18n 4-locale parity + fail-fast missing-key guard
+  // AC5: per-locale rendering + missing-key throws
+  // ---------------------------------------------------------------------------
+  describe("i18n 4-locale parity — Story v160-cleanup-35 (AC5)", () => {
+    const TRACKED_KEYS = [
+      "title",
+      "salon_section_title",
+      "redemption_code_label",
+      "validity_period_label",
+      "voucher_value_label",
+      "service_description_label",
+      "directions_title",
+      "directions_address_label",
+      "directions_google_label",
+      "directions_apple_label",
+      "directions_no_coords_helper",
+      "directions_privacy_notice",
+    ] as const
+
+    const LOCALES: VoucherPdfLocale[] = ["pl", "en", "ua", "de"]
+
+    it.each(LOCALES)("lookupCopy returns non-empty string for all tracked keys in locale %s", (locale) => {
+      for (const key of TRACKED_KEYS) {
+        const value = lookupCopy(locale, key)
+        expect(typeof value).toBe("string")
+        expect(value.trim().length).toBeGreaterThan(0)
+      }
+    })
+
+    it.each(LOCALES)("renderVoucherPdfStub renders locale %s without throwing", (locale) => {
+      const payload = buildVoucherPdfPayload({
+        voucher_code: "TEST-" + locale.toUpperCase(),
+        locale,
+        vendor: {
+          id: "ven_test",
+          name: "Test Salon",
+          handle: "test-salon",
+          address: "ul. Testowa 1, 00-001 Warszawa",
+        },
+        line_items: [
+          {
+            id: "li_test",
+            product_title: "Test service",
+            service_description: "Test service 60 min",
+            metadata: { selected_seller_id: "ven_test", selected_seller_name: "Test Salon" },
+            unit_price: 10000,
+            quantity: 1,
+          },
+        ],
+        valid_until: "2027-12-31",
+      })
+      const pdf = renderVoucherPdfStub(payload)
+      const text = pdf.toString("utf-8")
+
+      // Each locale PDF must contain the voucher code (locale-agnostic data).
+      expect(text).toContain("TEST-" + locale.toUpperCase())
+      // Each locale must have non-empty content (not a blank stub).
+      expect(text.length).toBeGreaterThan(50)
+    })
+
+    it.each(LOCALES)(
+      "renderVoucherPdfStub for locale %s includes locale-specific strings (not EN fallback)",
+      (locale) => {
+        const payload = buildVoucherPdfPayload({
+          voucher_code: "LOCALE-CHECK",
+          locale,
+          vendor: {
+            id: "ven_locale",
+            name: "Locale Salon",
+            handle: "locale-salon",
+            address: "ul. Lokalna 1",
+          },
+          line_items: [
+            {
+              id: "li_lc",
+              product_title: "Service",
+              service_description: "Service",
+              metadata: { selected_seller_id: "ven_locale", selected_seller_name: "Locale Salon" },
+              unit_price: 5000,
+              quantity: 1,
+            },
+          ],
+        })
+        const pdf = renderVoucherPdfStub(payload)
+        const text = pdf.toString("utf-8")
+
+        // Assert locale-specific title (not hardcoded EN)
+        const expectedTitle = VOUCHER_PDF_COPY[locale]["title"]
+        expect(text).toContain(expectedTitle)
+
+        // Assert locale-specific voucher value label
+        const expectedValueLabel = VOUCHER_PDF_COPY[locale]["voucher_value_label"]
+        expect(text).toContain(expectedValueLabel)
+
+        // Regression guard: UA and DE must not contain EN-only strings (no silent fallback)
+        if (locale === "ua") {
+          expect(text).not.toContain("BonBeauty voucher")  // EN title
+          expect(text).not.toContain("Voucher value")       // EN value label
+        }
+        if (locale === "de") {
+          expect(text).not.toContain("BonBeauty voucher")  // EN title
+          expect(text).not.toContain("Voucher value")       // EN value label
+        }
+      },
+    )
+
+    it("lookupCopy throws fail-fast for missing key — no silent fallback to EN or undefined", () => {
+      // Patch VOUCHER_PDF_COPY.pl to simulate a missing key scenario
+      const originalPl = { ...VOUCHER_PDF_COPY.pl }
+      // @ts-expect-error: intentionally corrupting for test
+      delete VOUCHER_PDF_COPY.pl["voucher_value_label"]
+
+      try {
+        expect(() => lookupCopy("pl", "voucher_value_label")).toThrow(
+          /missing voucher PDF i18n key: voucher_value_label for locale pl/,
+        )
+      } finally {
+        // Restore to avoid polluting other tests
+        VOUCHER_PDF_COPY.pl["voucher_value_label"] = originalPl["voucher_value_label"]!
+      }
+    })
+
+    it("lookupCopy throws fail-fast for empty string value — regression guard", () => {
+      // Temporarily set a key to empty string to simulate empty translation
+      const originalEn = VOUCHER_PDF_COPY.en["title"]
+      VOUCHER_PDF_COPY.en["title"] = "   "  // whitespace-only = empty after trim
+
+      try {
+        expect(() => lookupCopy("en", "title")).toThrow(
+          /missing voucher PDF i18n key: title for locale en/,
+        )
+      } finally {
+        VOUCHER_PDF_COPY.en["title"] = originalEn
+      }
+    })
+
+    it("renderDirectionsSection uses locale-specific strings for ua locale", () => {
+      const payload = buildVoucherPdfPayload({
+        voucher_code: "UA-DIR-TEST",
+        locale: "ua",
+        vendor: {
+          id: "ven_ua",
+          name: "Ukrainian Salon",
+          handle: "ukrainian-salon",
+          address: "вул. Тестова 1, Київ",
+          lat: 50.4501,
+          lng: 30.5234,
+        },
+        line_items: [
+          {
+            id: "li_ua",
+            product_title: "Service",
+            service_description: "Service",
+            metadata: { selected_seller_id: "ven_ua" },
+            unit_price: 5000,
+            quantity: 1,
+          },
+        ],
+      })
+      const lines = renderDirectionsSection(payload)
+      const text = lines.join("\n")
+
+      // UA directions title in Cyrillic
+      expect(text).toContain(VOUCHER_PDF_COPY["ua"]["directions_title"])
+      // UA address label in Cyrillic
+      expect(text).toContain(VOUCHER_PDF_COPY["ua"]["directions_address_label"])
+      // Must NOT contain EN fallback strings
+      expect(text).not.toContain("How to get there")
+    })
+
+    it("renderDirectionsSection uses locale-specific strings for de locale", () => {
+      const payload = buildVoucherPdfPayload({
+        voucher_code: "DE-DIR-TEST",
+        locale: "de",
+        vendor: {
+          id: "ven_de",
+          name: "German Salon",
+          handle: "german-salon",
+          address: "Musterstraße 1, Berlin",
+          // no coords — test search fallback
+        },
+        line_items: [
+          {
+            id: "li_de",
+            product_title: "Service",
+            service_description: "Service",
+            metadata: { selected_seller_id: "ven_de" },
+            unit_price: 5000,
+            quantity: 1,
+          },
+        ],
+      })
+      const lines = renderDirectionsSection(payload)
+      const text = lines.join("\n")
+
+      // DE directions title
+      expect(text).toContain(VOUCHER_PDF_COPY["de"]["directions_title"])
+      // DE no-coords helper
+      expect(text).toContain(VOUCHER_PDF_COPY["de"]["directions_no_coords_helper"])
+      // Must NOT contain EN fallback strings
+      expect(text).not.toContain("How to get there")
+      expect(text).not.toContain("Coordinates not available")
     })
   })
 })
