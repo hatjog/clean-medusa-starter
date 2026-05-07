@@ -11,6 +11,7 @@ import { computeZeroOptInCascade } from "../../../../lib/cohort-metrics-aggregat
 import { getCurrentState } from "../../../../lib/feature-flag-tri-state"
 import {
   countOptedInVendors,
+  type Scope,
   SellerModuleUnavailableError,
 } from "../../../../lib/operator-consent-report"
 
@@ -23,14 +24,28 @@ export async function GET(
 
   let opted_in_count: number
   try {
-    opted_in_count = await countOptedInVendors(
-      req.scope as { resolve: (key: string) => unknown },
-    )
+    opted_in_count = await countOptedInVendors(req.scope as unknown as Scope)
   } catch (err) {
     if (err instanceof SellerModuleUnavailableError) {
-      res
-        .status(503)
-        .json({ code: "SELLER_MODULE_UNAVAILABLE", message: err.message })
+      // Structured server-side log so operator alerting can detect outages
+      // (review MEDIUM finding: alerting blind spot). The underlying cause
+      // is preserved on `err.cause` and intentionally NOT echoed to the
+      // client (review HIGH finding: information leakage).
+      // eslint-disable-next-line no-console
+      console.error(
+        JSON.stringify({
+          event: "zero_opt_in_cascade_seller_unavailable",
+          code: err.code,
+          cause:
+            err.cause instanceof Error
+              ? { name: err.cause.name, message: err.cause.message }
+              : null,
+        }),
+      )
+      res.status(503).json({
+        code: "SELLER_MODULE_UNAVAILABLE",
+        message: SellerModuleUnavailableError.PUBLIC_MESSAGE,
+      })
       return
     }
     throw err

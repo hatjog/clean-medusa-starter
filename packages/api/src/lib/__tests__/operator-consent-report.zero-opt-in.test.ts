@@ -21,12 +21,17 @@ import { beforeEach, describe, expect, it, jest } from "@jest/globals"
 function buildSeller(
   id: string,
   decisionStatus: "opted_in" | "opted_out" | "pending",
+  lifecycleStatus:
+    | "open"
+    | "suspended"
+    | "terminated"
+    | "pending_approval" = "open",
 ) {
   return {
     id,
     handle: `vendor-${id}`,
     email: `${id}@example.com`,
-    status: "open",
+    status: lifecycleStatus,
     metadata: {
       gp: { decision_status: decisionStatus },
     },
@@ -173,6 +178,60 @@ describe("countOptedInVendors", () => {
       "SELLER_MODULE_UNAVAILABLE",
     )
   })
+
+  it("(f) excludes suspended/terminated/pending sellers even when decision_status=opted_in (review MEDIUM finding)", async () => {
+    const scope = buildScope([
+      buildSeller("v1", "opted_in", "open"),
+      buildSeller("v2", "opted_in", "suspended"),
+      buildSeller("v3", "opted_in", "terminated"),
+      buildSeller("v4", "opted_in", "pending_approval"),
+      buildSeller("v5", "opted_in", "open"),
+    ])
+
+    const count = await countOptedInVendors(scope)
+    // Only v1 and v5 (lifecycle "open") should be counted; v2/v3/v4 excluded.
+    expect(count).toBe(2)
+  })
+
+  it("(g) wraps seller-module list() throw into SellerModuleUnavailableError (review LOW finding: DB-fallback path)", async () => {
+    const throwingScope = {
+      resolve: (key: string) => {
+        if (key === "sellerModuleService") {
+          return {
+            list: async () => {
+              throw new Error("simulated module failure")
+            },
+          }
+        }
+        // No PG_CONNECTION → DB fallback also fails → original error rethrown.
+        throw new Error(`missing: ${key}`)
+      },
+    }
+
+    const err = await countOptedInVendors(throwingScope).catch((e) => e)
+    expect(err).toBeInstanceOf(SellerModuleUnavailableError)
+    expect((err as SellerModuleUnavailableError).code).toBe(
+      "SELLER_MODULE_UNAVAILABLE",
+    )
+  })
+
+  it("(h) does NOT echo internal cause message into the public error message (review HIGH finding: information leakage)", async () => {
+    const leakyScope = {
+      resolve: (key: string) => {
+        throw new Error(
+          `INTERNAL: postgres connection refused at db.example.local:5432 user=secret_user (key=${key})`,
+        )
+      },
+    }
+    const err = (await countOptedInVendors(leakyScope).catch(
+      (e) => e,
+    )) as SellerModuleUnavailableError
+    expect(err.message).toBe(SellerModuleUnavailableError.PUBLIC_MESSAGE)
+    expect(err.message).not.toContain("postgres")
+    expect(err.message).not.toContain("secret_user")
+    // Internal cause is preserved on .cause for server-side logging only.
+    expect(err.cause).toBeDefined()
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -253,7 +312,12 @@ describe("zero-opt-in-cascade route — SellerModule 503 path (AC3d / AC6)", () 
     expect(mockRes._status).toBe(503)
     expect(mockRes._body).toMatchObject({
       code: "SELLER_MODULE_UNAVAILABLE",
+      message: SellerModuleUnavailableError.PUBLIC_MESSAGE,
     })
+    // Review HIGH finding: 503 body must NOT echo internal cause text.
+    const body = mockRes._body as { message?: string }
+    expect(body.message).not.toMatch(/key=/)
+    expect(body.message).not.toMatch(/scope/)
   })
 
   it("returns cascade JSON (AC6 contract) when module is available", async () => {
