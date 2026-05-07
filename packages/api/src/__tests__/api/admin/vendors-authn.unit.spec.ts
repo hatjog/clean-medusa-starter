@@ -41,20 +41,30 @@ import { Modules, ContainerRegistrationKeys } from "@medusajs/framework/utils"
  *   - persistIdempotencyRecord → returns a synthetic persisted row
  */
 function makeDefaultIdempotencyKnex(idempotencyKey = "a1b2c3d4-e5f6-4a7b-b8c9-d0e1f2a3b4c5") {
-  const firstMock = jest.fn().mockResolvedValue(undefined) // no existing row
-  const whereMock = jest.fn(() => ({ first: firstMock }))
-  const returningMock = jest.fn().mockResolvedValue([
-    {
-      id: "idem-default",
-      idempotency_key: idempotencyKey,
-      vendor_id: "vendor_01",
-      request_hash: "default-hash",
-      status_code: 200,
-      response_body: {},
-      created_at: new Date().toISOString(),
-    },
-  ])
-  const ignoreMock = jest.fn(() => ({ returning: returningMock }))
+  const synthRow = {
+    id: "idem-default",
+    idempotency_key: idempotencyKey,
+    vendor_id: "vendor_01",
+    request_hash: "default-hash",
+    status_code: 200,
+    response_body: {},
+    created_at: new Date().toISOString(),
+  }
+  // .where().first() — race-loss path (returns nothing on default flow).
+  const firstMock = jest.fn().mockResolvedValue(undefined)
+  // .where().update().returning('*') — finalize path (review fix H1).
+  const updateReturningMock = jest.fn().mockResolvedValue([synthRow])
+  const updateMock = jest.fn(() => ({ returning: updateReturningMock }))
+  // .where().delete() — releaseReservation (review fix M1).
+  const deleteMock = jest.fn().mockResolvedValue(0)
+  const whereMock = jest.fn(() => ({
+    first: firstMock,
+    update: updateMock,
+    delete: deleteMock,
+  }))
+  // .insert(...).onConflict('idempotency_key').ignore().returning('*') — reserve.
+  const insertReturningMock = jest.fn().mockResolvedValue([synthRow])
+  const ignoreMock = jest.fn(() => ({ returning: insertReturningMock }))
   const onConflictMock = jest.fn(() => ({ ignore: ignoreMock }))
   const insertMock = jest.fn(() => ({ onConflict: onConflictMock }))
   return jest.fn(() => ({ where: whereMock, insert: insertMock }))

@@ -31,7 +31,8 @@ export class Migration20260507000000VendorDecisionIdempotencyTable extends Migra
         request_hash text NOT NULL,
         status_code integer NOT NULL,
         response_body jsonb NOT NULL,
-        created_at timestamptz NOT NULL DEFAULT now()
+        created_at timestamptz NOT NULL DEFAULT now(),
+        CONSTRAINT vendor_decision_idempotency_key_len_chk CHECK (char_length(idempotency_key) <= 255)
       )`
     )
 

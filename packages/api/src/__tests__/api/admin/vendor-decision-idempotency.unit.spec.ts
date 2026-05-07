@@ -1,5 +1,7 @@
 /**
  * Story v160-cleanup-36 — vendor decision idempotency route unit tests.
+ * Updated post review (H1, H2, H3, M1, M2): route now uses the
+ * reserve-then-finalise pattern and rejects cross-vendor key reuse.
  *
  * Covers the 5 scenarios from AC6:
  *   (a) First POST happy path — Idempotency-Key K1, decision=opted_in, vendor pending → 200
@@ -8,12 +10,16 @@
  *   (d) Same key + different body (AC3.1) — K1 reuse with different decision → 422
  *   (e) Missing key fallback — strict policy → 400 MISSING_IDEMPOTENCY_KEY
  *
- * Also covers: override=true reversal allowed (opted_out → opted_in with override).
+ * Plus review-driven additions:
+ *   - override=true reversal allowed (opted_out → opted_in with override)
+ *   - cross-vendor key collision → 422 IDEMPOTENCY_KEY_REUSED_DIFFERENT_VENDOR (H2)
+ *   - in-flight reservation observed by race-loser → 409 IDEMPOTENT_REQUEST_IN_PROGRESS (H1)
  */
 
 import { describe, it, expect, beforeEach } from "@jest/globals"
 import { ContainerRegistrationKeys } from "@medusajs/framework/utils"
 import { POST } from "../../../api/admin/vendors/[id]/decision/route"
+import { PENDING_HASH, PENDING_STATUS } from "../../../lib/vendor-decision-idempotency"
 
 // ── Shared test key ────────────────────────────────────────────────────────────
 const KEY_K1 = "a1b2c3d4-e5f6-4a7b-b8c9-d0e1f2a3b4c5"
@@ -57,42 +63,75 @@ function makeOptedOutSeller() {
   }
 }
 
+/**
+ * Mock state describing what the idempotency table currently contains.
+ *  - reserveResult: 'win' (returning row), 'loss' (returning empty + existing in DB)
+ *  - existingRow: row visible to subsequent .where().first() calls
+ *  - finalizeRow: row returned by .where().update().returning()
+ */
 type MockKnexState = {
+  reserveResult: "win" | "loss"
   existingRow: Record<string, unknown> | null
-  insertedRow: Record<string, unknown> | null
+  finalizeRow: Record<string, unknown> | null
 }
 
 function makeKnexMock(state: MockKnexState) {
-  // Simulate the idempotency table queries
+  // .where().first() — used both by reservation race-loss re-read and by
+  // legacy findIdempotencyRecord (unused on the new path).
   const firstMock = jest.fn().mockImplementation(() => {
     return Promise.resolve(state.existingRow)
   })
-  const whereFindMock = jest.fn(() => ({ first: firstMock }))
 
-  // Simulate insert with ON CONFLICT DO NOTHING
-  const returningMock = jest.fn().mockImplementation(() => {
-    if (state.insertedRow) {
-      return Promise.resolve([state.insertedRow])
+  // .where().update().returning('*') — finalize path.
+  const updateReturningMock = jest.fn().mockImplementation(() => {
+    return Promise.resolve(state.finalizeRow ? [state.finalizeRow] : [])
+  })
+  const updateMock = jest.fn(() => ({ returning: updateReturningMock }))
+
+  // .where().delete() — releaseReservation path.
+  const deleteMock = jest.fn().mockResolvedValue(0)
+
+  const whereMock = jest.fn(() => ({
+    first: firstMock,
+    update: updateMock,
+    delete: deleteMock,
+  }))
+
+  // .insert(...).onConflict('idempotency_key').ignore().returning('*')
+  const insertReturningMock = jest.fn().mockImplementation(() => {
+    if (state.reserveResult === "win") {
+      // The reservation row content is whatever was inserted; tests don't read it.
+      return Promise.resolve([
+        {
+          id: "rsv-1",
+          idempotency_key: KEY_K1,
+          vendor_id: VENDOR_ID,
+          request_hash: PENDING_HASH,
+          status_code: PENDING_STATUS,
+          response_body: {},
+          created_at: "2026-05-07T00:00:00Z",
+        },
+      ])
     }
     return Promise.resolve([])
   })
-  const ignoreMock = jest.fn(() => ({ returning: returningMock }))
+  const ignoreMock = jest.fn(() => ({ returning: insertReturningMock }))
   const onConflictMock = jest.fn(() => ({ ignore: ignoreMock }))
   const insertMock = jest.fn(() => ({ onConflict: onConflictMock }))
 
   const tableFn = jest.fn(() => ({
-    where: whereFindMock,
+    where: whereMock,
     insert: insertMock,
   }))
 
   return {
     knex: tableFn,
     firstMock,
-    whereFindMock,
+    whereMock,
     insertMock,
-    onConflictMock,
-    ignoreMock,
-    returningMock,
+    updateMock,
+    updateReturningMock,
+    deleteMock,
   }
 }
 
@@ -101,17 +140,6 @@ function makeSellerServiceMock(seller: Record<string, unknown> | null) {
     list: jest.fn().mockResolvedValue(seller ? [seller] : []),
     update: jest.fn().mockResolvedValue(undefined),
   }
-}
-
-function makeDispatchMock() {
-  return jest.fn().mockResolvedValue({ notificationId: "audit-log-id-1" })
-}
-
-function makeNotificationLogMock() {
-  return jest.fn().mockResolvedValue({
-    entry: { id: "audit-log-id-1" },
-    persisted: true,
-  })
 }
 
 type AnyFn = (...args: unknown[]) => unknown
@@ -211,7 +239,11 @@ describe("POST /admin/vendors/[id]/decision — idempotency (cleanup-36 AC6)", (
   it("(e) returns 400 MISSING_IDEMPOTENCY_KEY when Idempotency-Key header is absent", async () => {
     const seller = makePendingSeller()
     const sellerService = makeSellerServiceMock(seller)
-    const knexState: MockKnexState = { existingRow: null, insertedRow: null }
+    const knexState: MockKnexState = {
+      reserveResult: "win",
+      existingRow: null,
+      finalizeRow: null,
+    }
     const { knex } = makeKnexMock(knexState)
     const scope = makeScope({ knex, sellerService })
 
@@ -227,7 +259,6 @@ describe("POST /admin/vendors/[id]/decision — idempotency (cleanup-36 AC6)", (
 
     expect(res._statusCode).toBe(400)
     expect((res._body as Record<string, unknown>).error_code).toBe("MISSING_IDEMPOTENCY_KEY")
-    // Workflow must NOT have been called
     expect(dispatchVendorEmail).not.toHaveBeenCalled()
   })
 
@@ -236,21 +267,22 @@ describe("POST /admin/vendors/[id]/decision — idempotency (cleanup-36 AC6)", (
     const seller = makePendingSeller()
     const sellerService = makeSellerServiceMock(seller)
 
-    const persistedIdempRow = {
+    const finalizedRow = {
       id: "idem-rec-1",
       idempotency_key: KEY_K1,
       vendor_id: VENDOR_ID,
-      request_hash: "will-be-computed",
+      request_hash: "computed",
       status_code: 200,
       response_body: { vendor_id: VENDOR_ID, decision: "opted_in", audit_log_id: "audit-log-id-1", email_dispatched: true },
       created_at: "2026-05-07T10:00:00Z",
     }
 
     const knexState: MockKnexState = {
-      existingRow: null, // no existing row → first call
-      insertedRow: persistedIdempRow,
+      reserveResult: "win",
+      existingRow: null,
+      finalizeRow: finalizedRow,
     }
-    const { knex, insertMock } = makeKnexMock(knexState)
+    const { knex, insertMock, updateMock } = makeKnexMock(knexState)
     const scope = makeScope({ knex, sellerService })
 
     const req = makeReq({
@@ -269,14 +301,12 @@ describe("POST /admin/vendors/[id]/decision — idempotency (cleanup-36 AC6)", (
     expect(body.decision).toBe("opted_in")
     expect(body.email_dispatched).toBe(true)
 
-    // Workflow invoked once
     expect(dispatchVendorEmail).toHaveBeenCalledTimes(1)
-
-    // Seller state updated
     expect(sellerService.update).toHaveBeenCalled()
 
-    // Idempotency row persisted
+    // Reservation INSERT happened, then finalise UPDATE.
     expect(insertMock).toHaveBeenCalled()
+    expect(updateMock).toHaveBeenCalled()
   })
 
   // ── (b) Duplicate POST same key + same body → cached response ────────────────
@@ -284,14 +314,10 @@ describe("POST /admin/vendors/[id]/decision — idempotency (cleanup-36 AC6)", (
     const seller = makePendingSeller()
     const sellerService = makeSellerServiceMock(seller)
 
-    // Pre-compute request hash for {decision:"opted_in",reason:"vendor confirmed migration"}
-    // We use the same body as (a) to get a cached hit.
     const { hashRequestBody } = await import("../../../lib/vendor-decision-idempotency")
     const cachedHash = hashRequestBody({
       decision: "opted_in",
       reason: "vendor confirmed migration",
-      admin_note: undefined,
-      override: undefined,
     })
 
     const cachedResponse = {
@@ -311,9 +337,11 @@ describe("POST /admin/vendors/[id]/decision — idempotency (cleanup-36 AC6)", (
       created_at: "2026-05-07T10:00:00Z",
     }
 
+    // Reservation race-loss: insert returns empty, .where().first() returns existingRow.
     const knexState: MockKnexState = {
+      reserveResult: "loss",
       existingRow,
-      insertedRow: null,
+      finalizeRow: null,
     }
     const { knex } = makeKnexMock(knexState)
     const scope = makeScope({ knex, sellerService })
@@ -328,11 +356,10 @@ describe("POST /admin/vendors/[id]/decision — idempotency (cleanup-36 AC6)", (
 
     await POST(req, res)
 
-    // Cached response returned
     expect(res._statusCode).toBe(200)
     expect(res._body).toEqual(cachedResponse)
 
-    // Workflow NOT re-invoked (no side effects)
+    // No side effects.
     expect(dispatchVendorEmail).not.toHaveBeenCalled()
     expect(sellerService.update).not.toHaveBeenCalled()
     expect(appendNotificationLogBestEffort).not.toHaveBeenCalled()
@@ -343,7 +370,7 @@ describe("POST /admin/vendors/[id]/decision — idempotency (cleanup-36 AC6)", (
     const seller = makeOptedOutSeller()
     const sellerService = makeSellerServiceMock(seller)
 
-    const persistedConflictRow = {
+    const finalizedConflict = {
       id: "idem-rec-2",
       idempotency_key: KEY_K2,
       vendor_id: VENDOR_ID,
@@ -359,10 +386,11 @@ describe("POST /admin/vendors/[id]/decision — idempotency (cleanup-36 AC6)", (
     }
 
     const knexState: MockKnexState = {
-      existingRow: null, // new key K2 — no existing row
-      insertedRow: persistedConflictRow,
+      reserveResult: "win",
+      existingRow: null,
+      finalizeRow: finalizedConflict,
     }
-    const { knex, insertMock } = makeKnexMock(knexState)
+    const { knex, updateMock } = makeKnexMock(knexState)
     const scope = makeScope({ knex, sellerService })
 
     const req = makeReq({
@@ -381,12 +409,10 @@ describe("POST /admin/vendors/[id]/decision — idempotency (cleanup-36 AC6)", (
     expect(body.current_state).toBe("opted_out")
     expect(body.attempted).toBe("opted_in")
 
-    // No side effects
     expect(dispatchVendorEmail).not.toHaveBeenCalled()
     expect(sellerService.update).not.toHaveBeenCalled()
-
-    // 409 response persisted for deterministic replay
-    expect(insertMock).toHaveBeenCalled()
+    // 409 finalised so replay is deterministic.
+    expect(updateMock).toHaveBeenCalled()
   })
 
   // ── (d) Same key + different body → 422 IDEMPOTENCY_KEY_REUSED ───────────────
@@ -394,28 +420,26 @@ describe("POST /admin/vendors/[id]/decision — idempotency (cleanup-36 AC6)", (
     const seller = makePendingSeller()
     const sellerService = makeSellerServiceMock(seller)
 
-    // Existing row was created with decision=opted_in; now trying opted_out
     const { hashRequestBody } = await import("../../../lib/vendor-decision-idempotency")
     const originalHash = hashRequestBody({
       decision: "opted_in",
       reason: "vendor confirmed migration",
-      admin_note: undefined,
-      override: undefined,
     })
 
     const existingRow = {
       id: "idem-rec-1",
       idempotency_key: KEY_K1,
       vendor_id: VENDOR_ID,
-      request_hash: originalHash, // hash of opted_in body
+      request_hash: originalHash,
       status_code: 200,
       response_body: { vendor_id: VENDOR_ID, decision: "opted_in", audit_log_id: "audit-log-id-1", email_dispatched: true },
       created_at: "2026-05-07T10:00:00Z",
     }
 
     const knexState: MockKnexState = {
+      reserveResult: "loss",
       existingRow,
-      insertedRow: null,
+      finalizeRow: null,
     }
     const { knex } = makeKnexMock(knexState)
     const scope = makeScope({ knex, sellerService })
@@ -423,7 +447,7 @@ describe("POST /admin/vendors/[id]/decision — idempotency (cleanup-36 AC6)", (
     const req = makeReq({
       vendorId: VENDOR_ID,
       idempotencyKey: KEY_K1,
-      body: { decision: "opted_out", reason: "vendor changed their mind" }, // different body
+      body: { decision: "opted_out", reason: "vendor changed their mind" },
       scope,
     })
     const res = makeRes()
@@ -434,7 +458,6 @@ describe("POST /admin/vendors/[id]/decision — idempotency (cleanup-36 AC6)", (
     const body = res._body as Record<string, unknown>
     expect(body.error_code).toBe("IDEMPOTENCY_KEY_REUSED_WITH_DIFFERENT_PAYLOAD")
 
-    // No side effects
     expect(dispatchVendorEmail).not.toHaveBeenCalled()
     expect(sellerService.update).not.toHaveBeenCalled()
   })
@@ -444,7 +467,7 @@ describe("POST /admin/vendors/[id]/decision — idempotency (cleanup-36 AC6)", (
     const seller = makeOptedOutSeller()
     const sellerService = makeSellerServiceMock(seller)
 
-    const persistedIdempRow = {
+    const finalizedRow = {
       id: "idem-rec-3",
       idempotency_key: KEY_K2,
       vendor_id: VENDOR_ID,
@@ -455,8 +478,9 @@ describe("POST /admin/vendors/[id]/decision — idempotency (cleanup-36 AC6)", (
     }
 
     const knexState: MockKnexState = {
+      reserveResult: "win",
       existingRow: null,
-      insertedRow: persistedIdempRow,
+      finalizeRow: finalizedRow,
     }
     const { knex } = makeKnexMock(knexState)
     const scope = makeScope({ knex, sellerService })
@@ -479,8 +503,90 @@ describe("POST /admin/vendors/[id]/decision — idempotency (cleanup-36 AC6)", (
     const body = res._body as Record<string, unknown>
     expect(body.decision).toBe("opted_in")
 
-    // Workflow invoked for the reversal
     expect(dispatchVendorEmail).toHaveBeenCalledTimes(1)
     expect(sellerService.update).toHaveBeenCalled()
+  })
+
+  // ── H2 — cross-vendor key reuse → 422 ─────────────────────────────────────────
+  it("(H2) reusing key bound to a different vendor returns 422 IDEMPOTENCY_KEY_REUSED_DIFFERENT_VENDOR", async () => {
+    const seller = makePendingSeller()
+    const sellerService = makeSellerServiceMock(seller)
+
+    // Existing row owned by another vendor.
+    const existingRow = {
+      id: "idem-rec-x",
+      idempotency_key: KEY_K1,
+      vendor_id: "vendor-OTHER",
+      request_hash: "some-other-hash",
+      status_code: 200,
+      response_body: { vendor_id: "vendor-OTHER", decision: "opted_in" },
+      created_at: "2026-05-07T08:00:00Z",
+    }
+
+    const knexState: MockKnexState = {
+      reserveResult: "loss",
+      existingRow,
+      finalizeRow: null,
+    }
+    const { knex } = makeKnexMock(knexState)
+    const scope = makeScope({ knex, sellerService })
+
+    const req = makeReq({
+      vendorId: VENDOR_ID,
+      idempotencyKey: KEY_K1,
+      body: { decision: "opted_in", reason: "another vendor request" },
+      scope,
+    })
+    const res = makeRes()
+
+    await POST(req, res)
+
+    expect(res._statusCode).toBe(422)
+    const body = res._body as Record<string, unknown>
+    expect(body.error_code).toBe("IDEMPOTENCY_KEY_REUSED_DIFFERENT_VENDOR")
+
+    expect(dispatchVendorEmail).not.toHaveBeenCalled()
+    expect(sellerService.update).not.toHaveBeenCalled()
+  })
+
+  // ── H1 — race-loser sees PENDING reservation → 409 IN_PROGRESS ────────────────
+  it("(H1) race-loser observing in-flight PENDING reservation returns 409 IDEMPOTENT_REQUEST_IN_PROGRESS", async () => {
+    const seller = makePendingSeller()
+    const sellerService = makeSellerServiceMock(seller)
+
+    const pendingRow = {
+      id: "idem-rec-pending",
+      idempotency_key: KEY_K1,
+      vendor_id: VENDOR_ID,
+      request_hash: PENDING_HASH,
+      status_code: PENDING_STATUS,
+      response_body: {},
+      created_at: "2026-05-07T09:00:00Z",
+    }
+
+    const knexState: MockKnexState = {
+      reserveResult: "loss",
+      existingRow: pendingRow,
+      finalizeRow: null,
+    }
+    const { knex } = makeKnexMock(knexState)
+    const scope = makeScope({ knex, sellerService })
+
+    const req = makeReq({
+      vendorId: VENDOR_ID,
+      idempotencyKey: KEY_K1,
+      body: { decision: "opted_in", reason: "concurrent retry" },
+      scope,
+    })
+    const res = makeRes()
+
+    await POST(req, res)
+
+    expect(res._statusCode).toBe(409)
+    const body = res._body as Record<string, unknown>
+    expect(body.error_code).toBe("IDEMPOTENT_REQUEST_IN_PROGRESS")
+
+    expect(dispatchVendorEmail).not.toHaveBeenCalled()
+    expect(sellerService.update).not.toHaveBeenCalled()
   })
 })
