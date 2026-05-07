@@ -77,7 +77,7 @@ export async function GET(
   const voucher = await voucherService.getByCode(code)
 
   // Cross-market isolation: if ALS market context is set and voucher market differs, 404.
-  if (voucher && market_id && voucher.market_id !== null && voucher.market_id !== market_id) {
+  if (voucher && market_id && voucher.market_id !== market_id) {
     res.status(404).json({
       type: "not_found",
       message: "Voucher not found",

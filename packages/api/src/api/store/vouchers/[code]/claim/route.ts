@@ -173,9 +173,10 @@ export async function POST(
   // --- Lookup voucher early for market isolation check (constant-time path) ---
   const voucherForCheck = await voucherService.getByCode(code)
 
-  // Cross-market isolation (DPIA R-12): if ALS market context is set and voucher market
-  // differs, return 404 — do NOT return 403 (existence must not leak across markets).
-  if (voucherForCheck && market_id && voucherForCheck.market_id !== null && voucherForCheck.market_id !== market_id) {
+  // Cross-market isolation (DPIA R-12, cleanup-27 M2 fail-CLOSED): if ALS market
+  // context is set, voucher must declare a matching market_id. NULL market_id is
+  // treated as "not in this market" (404 — do NOT 403, existence must not leak).
+  if (voucherForCheck && market_id && voucherForCheck.market_id !== market_id) {
     await padToFloor(startedAt)
     res.status(404).json({
       type: "not_found",
