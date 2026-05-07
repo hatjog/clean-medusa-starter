@@ -1110,6 +1110,11 @@ import * as yaml from "js-yaml"
 describe("enforceVendorStatusGate", () => {
   const mockReadFile = fs.readFile as jest.Mock
 
+  // Stub db — vendors in these existing tests have no slug, so resolveVendorRuntimeStateMap
+  // returns an empty Map immediately (slugs.length === 0) without calling the db handle.
+  // Passing null satisfies the updated signature; the stub is never invoked in config-only path.
+  const noOpDb = null as any
+
   beforeEach(() => {
     mockReadFile.mockReset()
   })
@@ -1156,13 +1161,16 @@ describe("enforceVendorStatusGate", () => {
     }
     const warnings: string[] = []
 
-    const result = await enforceVendorStatusGate(svc, "/config/bonbeauty/market.yaml", "bonbeauty", warnings)
+    const result = await enforceVendorStatusGate(noOpDb, svc, "/config/bonbeauty/market.yaml", "bonbeauty", warnings)
 
     expect(result.draftedCount).toBe(2)
     expect(svc.updateProducts).toHaveBeenCalledTimes(2)
     expect(svc.updateProducts).toHaveBeenCalledWith("p1", { status: "draft" })
     expect(svc.updateProducts).toHaveBeenCalledWith("p2", { status: "draft" })
-    expect(warnings).toHaveLength(0)
+    // F2/F3 fix: aggregated warning about legacy vendors without slug (config-only path
+    // because noOpDb is null). Assert warning IS emitted (non-vacuous) AND content shape.
+    expect(warnings.length).toBeGreaterThan(0)
+    expect(warnings.some((w) => w.includes("legacy vendor(s) without slug"))).toBe(true)
   })
 
   it("does not draft a shared product when an active vendor still offers it", async () => {
@@ -1196,11 +1204,13 @@ describe("enforceVendorStatusGate", () => {
     }
     const warnings: string[] = []
 
-    const result = await enforceVendorStatusGate(svc, "/config/bonbeauty/market.yaml", "bonbeauty", warnings)
+    const result = await enforceVendorStatusGate(noOpDb, svc, "/config/bonbeauty/market.yaml", "bonbeauty", warnings)
 
     expect(result.draftedCount).toBe(0)
     expect(svc.updateProducts).not.toHaveBeenCalled()
-    expect(warnings).toHaveLength(0)
+    // F2/F3 fix: aggregated warning about legacy vendors without slug — assert non-vacuous.
+    expect(warnings.length).toBeGreaterThan(0)
+    expect(warnings.some((w) => w.includes("legacy vendor(s) without slug"))).toBe(true)
   })
 
   it("skips products already in draft status", async () => {
@@ -1226,7 +1236,7 @@ describe("enforceVendorStatusGate", () => {
     }
     const warnings: string[] = []
 
-    const result = await enforceVendorStatusGate(svc, "/config/bonbeauty/market.yaml", "bonbeauty", warnings)
+    const result = await enforceVendorStatusGate(noOpDb, svc, "/config/bonbeauty/market.yaml", "bonbeauty", warnings)
 
     expect(result.draftedCount).toBe(0)
     expect(svc.updateProducts).not.toHaveBeenCalled()
@@ -1247,7 +1257,7 @@ describe("enforceVendorStatusGate", () => {
     }
     const warnings: string[] = []
 
-    const result = await enforceVendorStatusGate(svc, "/config/bonbeauty/market.yaml", "bonbeauty", warnings)
+    const result = await enforceVendorStatusGate(noOpDb, svc, "/config/bonbeauty/market.yaml", "bonbeauty", warnings)
 
     expect(result.draftedCount).toBe(0)
     expect(svc.listProducts).not.toHaveBeenCalled()
@@ -1276,7 +1286,7 @@ describe("enforceVendorStatusGate", () => {
     }
     const warnings: string[] = []
 
-    const result = await enforceVendorStatusGate(svc, "/config/bonbeauty/market.yaml", "bonbeauty", warnings)
+    const result = await enforceVendorStatusGate(noOpDb, svc, "/config/bonbeauty/market.yaml", "bonbeauty", warnings)
 
     expect(result.draftedCount).toBe(0)
     expect(svc.updateProducts).not.toHaveBeenCalled()
@@ -1288,7 +1298,7 @@ describe("enforceVendorStatusGate", () => {
     const svc = { listProducts: jest.fn(), updateProducts: jest.fn() }
     const warnings: string[] = []
 
-    const result = await enforceVendorStatusGate(svc, "/missing/market.yaml", "bonbeauty", warnings)
+    const result = await enforceVendorStatusGate(noOpDb, svc, "/missing/market.yaml", "bonbeauty", warnings)
 
     expect(result.draftedCount).toBe(0)
     expect(warnings.some((w) => w.includes("cannot read market.yaml"))).toBe(true)
@@ -1308,7 +1318,7 @@ describe("enforceVendorStatusGate", () => {
     const svc = { listProducts: jest.fn(), updateProducts: jest.fn() }
     const warnings: string[] = []
 
-    const result = await enforceVendorStatusGate(svc, "/config/bonbeauty/market.yaml", "bonbeauty", warnings)
+    const result = await enforceVendorStatusGate(noOpDb, svc, "/config/bonbeauty/market.yaml", "bonbeauty", warnings)
 
     expect(result.draftedCount).toBe(0)
     expect(warnings.some((w) => w.includes("ghost-vendor"))).toBe(true)
@@ -1337,7 +1347,7 @@ describe("enforceVendorStatusGate", () => {
     }
     const warnings: string[] = []
 
-    const result = await enforceVendorStatusGate(svc, "/config/bonbeauty/market.yaml", "bonbeauty", warnings)
+    const result = await enforceVendorStatusGate(noOpDb, svc, "/config/bonbeauty/market.yaml", "bonbeauty", warnings)
 
     expect(result.draftedCount).toBe(0)
     expect(svc.updateProducts).not.toHaveBeenCalled()
@@ -1368,6 +1378,7 @@ describe("enforceVendorStatusGate", () => {
     const collector = new DryRunCollector()
 
     const result = await enforceVendorStatusGate(
+      noOpDb,
       svc,
       "/config/bonbeauty/market.yaml",
       "bonbeauty",
@@ -1484,5 +1495,333 @@ describe("buildVendorPricingMap", () => {
     const map = await buildVendorPricingMap("/missing/market.yaml", warnings)
 
     expect(map.size).toBe(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// buildVendorPricingMap — runtime-state-map scenarios (AC4 a-e)
+// Story v160-cleanup-60: TF-170 — real seller store_status via runtimeStateMap
+// ---------------------------------------------------------------------------
+
+describe("buildVendorPricingMap — runtime-state-map", () => {
+  const mockReadFile = fs.readFile as jest.Mock
+
+  beforeEach(() => {
+    mockReadFile.mockReset()
+  })
+
+  function setupMarketFile(marketYaml: object, vendorFiles: Record<string, object> = {}) {
+    mockReadFile.mockImplementation(async (filePath: string) => {
+      if (filePath.endsWith("market.yaml")) {
+        return yaml.dump(marketYaml)
+      }
+      for (const [vendorId, data] of Object.entries(vendorFiles)) {
+        if (filePath.includes(`vendors/${vendorId}/products.yaml`)) {
+          return yaml.dump(data)
+        }
+      }
+      throw new Error(`File not found: ${filePath}`)
+    })
+  }
+
+  /**
+   * Build a Knex-stub that returns fixed rows from
+   * db("seller").select(...).whereIn(...).whereRaw(...).whereNull(...).
+   *
+   * F7 fix: dead `chainEnd` / first `whereNull` removed.
+   * F9 fix: returns the inner spies so tests can assert query-parameter contracts
+   *         (especially `whereRaw` bindings — locks cross-market isolation).
+   */
+  function makeDbStub(rows: Array<{ handle: string; store_status: string | null }>) {
+    const whereNull = jest.fn().mockResolvedValue(rows)
+    const whereRaw = jest.fn().mockReturnValue({ whereNull })
+    const whereIn = jest.fn().mockReturnValue({ whereRaw })
+    const select = jest.fn().mockReturnValue({ whereIn })
+    const db = jest.fn().mockReturnValue({ select })
+    return { db, select, whereIn, whereRaw, whereNull }
+  }
+
+  // AC4 (a) — Mixed-status happy path
+  it("(a) includes only ACTIVE sellers when runtime rows provided", async () => {
+    const dbRows = [
+      { handle: "seller-a", store_status: "ACTIVE" },
+      { handle: "seller-b", store_status: "ACTIVE" },
+      { handle: "seller-c", store_status: "ACTIVE" },
+      { handle: "seller-d", store_status: "SUSPENDED" },
+      { handle: "seller-e", store_status: "CLOSED" },
+    ]
+    const { db, whereIn, whereRaw, select } = makeDbStub(dbRows)
+
+    setupMarketFile(
+      {
+        market_id: "bonbeauty",
+        vendors: [
+          { vendor_id: "seller-a", slug: "seller-a", status: "active" },
+          { vendor_id: "seller-b", slug: "seller-b", status: "active" },
+          { vendor_id: "seller-c", slug: "seller-c", status: "active" },
+          { vendor_id: "seller-d", slug: "seller-d", status: "active" },
+          { vendor_id: "seller-e", slug: "seller-e", status: "active" },
+        ],
+      },
+      {
+        "seller-a": { products: [{ product_id: "p-a1", status: "active", vendor_price: { amount: 100, currency: "PLN" } }] },
+        "seller-b": { products: [{ product_id: "p-b1", status: "active", vendor_price: { amount: 200, currency: "PLN" } }] },
+        "seller-c": { products: [{ product_id: "p-c1", status: "active", vendor_price: { amount: 300, currency: "PLN" } }] },
+        "seller-d": { products: [{ product_id: "p-d1", status: "active", vendor_price: { amount: 400, currency: "PLN" } }] },
+        "seller-e": { products: [{ product_id: "p-e1", status: "active", vendor_price: { amount: 500, currency: "PLN" } }] },
+      }
+    )
+
+    const warnings: string[] = []
+    const map = await buildVendorPricingMap("/config/bonbeauty/market.yaml", warnings, db, "bonbeauty")
+
+    // Only 3 ACTIVE sellers should have pricing entries
+    expect(map.has("p-a1")).toBe(true)
+    expect(map.has("p-b1")).toBe(true)
+    expect(map.has("p-c1")).toBe(true)
+    expect(map.has("p-d1")).toBe(false) // SUSPENDED
+    expect(map.has("p-e1")).toBe(false) // CLOSED
+    expect(warnings).toHaveLength(0)
+
+    // F9 fix: assert the seller query was scoped correctly — locks cross-market
+    // isolation contract and verifies marketIdForRuntime is actually parameterised.
+    expect(select).toHaveBeenCalledWith("handle", "store_status")
+    expect(whereIn).toHaveBeenCalledWith(
+      "handle",
+      expect.arrayContaining(["seller-a", "seller-b", "seller-c", "seller-d", "seller-e"])
+    )
+    expect(whereRaw).toHaveBeenCalledWith(
+      "metadata->'gp'->>'market_id' = ?",
+      ["bonbeauty"]
+    )
+  })
+
+  // AC4 (b) — Runtime DB query throws
+  it("(b) falls back to config status and pushes warning when db throws", async () => {
+    const db = jest.fn().mockReturnValue({
+      select: jest.fn().mockReturnValue({
+        whereIn: jest.fn().mockReturnValue({
+          whereRaw: jest.fn().mockReturnValue({
+            whereNull: jest.fn().mockRejectedValue(new Error("connection refused")),
+          }),
+        }),
+      }),
+    })
+
+    setupMarketFile(
+      {
+        market_id: "bonbeauty",
+        vendors: [
+          { vendor_id: "seller-x", slug: "seller-x", status: "active" },
+        ],
+      },
+      {
+        "seller-x": { products: [{ product_id: "p-x1", status: "active", vendor_price: { amount: 150, currency: "PLN" } }] },
+      }
+    )
+
+    const warnings: string[] = []
+    const map = await buildVendorPricingMap("/config/bonbeauty/market.yaml", warnings, db, "bonbeauty")
+
+    // Fallback to config status "active" — pricing map still built
+    expect(map.has("p-x1")).toBe(true)
+    expect(warnings.some((w) => w.includes("cannot resolve runtime seller states"))).toBe(true)
+    expect(warnings.some((w) => w.includes("connection refused"))).toBe(true)
+  })
+
+  // AC4 (c) — Missing runtime row for 1 of 3 vendors
+  it("(c) falls back to config status for vendor with no runtime row", async () => {
+    // DB returns rows for seller-1 and seller-2 only; seller-3 has no runtime row
+    const dbRows = [
+      { handle: "seller-1", store_status: "ACTIVE" },
+      { handle: "seller-2", store_status: "SUSPENDED" },
+    ]
+    const { db } = makeDbStub(dbRows)
+
+    setupMarketFile(
+      {
+        market_id: "bonbeauty",
+        vendors: [
+          { vendor_id: "seller-1", slug: "seller-1", status: "active" },
+          { vendor_id: "seller-2", slug: "seller-2", status: "active" },
+          { vendor_id: "seller-3", slug: "seller-3", status: "active" }, // no runtime row → config fallback
+        ],
+      },
+      {
+        "seller-1": { products: [{ product_id: "p1", status: "active", vendor_price: { amount: 100, currency: "PLN" } }] },
+        "seller-2": { products: [{ product_id: "p2", status: "active", vendor_price: { amount: 200, currency: "PLN" } }] },
+        "seller-3": { products: [{ product_id: "p3", status: "active", vendor_price: { amount: 300, currency: "PLN" } }] },
+      }
+    )
+
+    const warnings: string[] = []
+    const map = await buildVendorPricingMap("/config/bonbeauty/market.yaml", warnings, db, "bonbeauty")
+
+    expect(map.has("p1")).toBe(true)  // runtime ACTIVE
+    expect(map.has("p2")).toBe(false) // runtime SUSPENDED
+    expect(map.has("p3")).toBe(true)  // no runtime row → config "active" → included
+
+    // F4 fix: aggregated drift warning is emitted for slugged vendors lacking runtime row
+    // (real prod-vs-config drift signal). Single warning, not one per vendor.
+    expect(
+      warnings.some(
+        (w) =>
+          w.includes("Vendor pricing:") &&
+          w.includes("lack runtime row") &&
+          w.includes("seller-3")
+      )
+    ).toBe(true)
+  })
+
+  // AC4 (d) — No db / no marketIdForRuntime → config-only, no DB query
+  it("(d) behaves identically to pre-stash when db/marketIdForRuntime omitted", async () => {
+    setupMarketFile(
+      {
+        market_id: "bonbeauty",
+        vendors: [
+          { vendor_id: "ok-vendor", slug: "ok-vendor", status: "active" },
+          { vendor_id: "bad-vendor", slug: "bad-vendor", status: "suspended" },
+        ],
+      },
+      {
+        "ok-vendor": { products: [{ product_id: "p-ok", status: "active", vendor_price: { amount: 100, currency: "PLN" } }] },
+        "bad-vendor": { products: [{ product_id: "p-bad", status: "active", vendor_price: { amount: 200, currency: "PLN" } }] },
+      }
+    )
+
+    const warnings: string[] = []
+    // Called WITHOUT db and marketIdForRuntime — config-only path
+    const map = await buildVendorPricingMap("/config/bonbeauty/market.yaml", warnings)
+
+    expect(map.has("p-ok")).toBe(true)   // config "active"
+    expect(map.has("p-bad")).toBe(false) // config "suspended" — excluded by ACTIVE_VENDOR_STATUSES
+    expect(warnings).toHaveLength(0)
+  })
+
+  // AC4 (e) — Slug missing on config vendor → fallback to config status, no crash
+  it("(e) handles vendors with missing slug gracefully — falls back to config status", async () => {
+    const dbRows = [{ handle: "slug-vendor", store_status: "ACTIVE" }]
+    const { db } = makeDbStub(dbRows)
+
+    setupMarketFile(
+      {
+        market_id: "bonbeauty",
+        vendors: [
+          { vendor_id: "no-slug-vendor", status: "active" }, // no slug field
+          { vendor_id: "slug-vendor", slug: "slug-vendor", status: "active" },
+        ],
+      },
+      {
+        "no-slug-vendor": { products: [{ product_id: "p-ns", status: "active", vendor_price: { amount: 100, currency: "PLN" } }] },
+        "slug-vendor": { products: [{ product_id: "p-sv", status: "active", vendor_price: { amount: 200, currency: "PLN" } }] },
+      }
+    )
+
+    const warnings: string[] = []
+    const map = await buildVendorPricingMap("/config/bonbeauty/market.yaml", warnings, db, "bonbeauty")
+
+    // no-slug-vendor has no slug → falls back to config "active" → included
+    expect(map.has("p-ns")).toBe(true)
+    // slug-vendor has runtime ACTIVE → included
+    expect(map.has("p-sv")).toBe(true)
+    // No crash
+    expect(warnings).toHaveLength(0)
+  })
+
+  // F5 fix: forward-compat across Mercur 2 enum variants — `OPEN` must also count as active.
+  it("(f) treats OPEN store_status as active (Mercur 2 enum forward-compat)", async () => {
+    const dbRows = [
+      { handle: "seller-open", store_status: "OPEN" },
+      { handle: "seller-open-lc", store_status: "open" }, // case-insensitive
+      { handle: "seller-suspended", store_status: "SUSPENDED" },
+    ]
+    const { db } = makeDbStub(dbRows)
+
+    setupMarketFile(
+      {
+        market_id: "bonbeauty",
+        vendors: [
+          { vendor_id: "seller-open", slug: "seller-open", status: "active" },
+          { vendor_id: "seller-open-lc", slug: "seller-open-lc", status: "active" },
+          { vendor_id: "seller-suspended", slug: "seller-suspended", status: "active" },
+        ],
+      },
+      {
+        "seller-open": { products: [{ product_id: "p-open", status: "active", vendor_price: { amount: 100, currency: "PLN" } }] },
+        "seller-open-lc": { products: [{ product_id: "p-open-lc", status: "active", vendor_price: { amount: 110, currency: "PLN" } }] },
+        "seller-suspended": { products: [{ product_id: "p-susp", status: "active", vendor_price: { amount: 200, currency: "PLN" } }] },
+      }
+    )
+
+    const warnings: string[] = []
+    const map = await buildVendorPricingMap("/config/bonbeauty/market.yaml", warnings, db, "bonbeauty")
+
+    expect(map.has("p-open")).toBe(true)
+    expect(map.has("p-open-lc")).toBe(true)
+    expect(map.has("p-susp")).toBe(false)
+  })
+
+  // F1 fix: db = null with slugged vendors must NOT crash — guarded path returns config-only.
+  it("(g) does not crash when db is null even if vendors have slug (F1 guard)", async () => {
+    setupMarketFile(
+      {
+        market_id: "bonbeauty",
+        vendors: [
+          { vendor_id: "ok", slug: "ok", status: "active" },
+          { vendor_id: "bad", slug: "bad", status: "suspended" },
+        ],
+      },
+      {
+        "ok": { products: [{ product_id: "p-ok", status: "active", vendor_price: { amount: 100, currency: "PLN" } }] },
+        "bad": { products: [{ product_id: "p-bad", status: "active", vendor_price: { amount: 200, currency: "PLN" } }] },
+      }
+    )
+
+    const warnings: string[] = []
+    // db = null + marketIdForRuntime present → outer guard short-circuits, no crash.
+    const map = await buildVendorPricingMap(
+      "/config/bonbeauty/market.yaml",
+      warnings,
+      null as any,
+      "bonbeauty"
+    )
+
+    expect(map.has("p-ok")).toBe(true)   // config "active"
+    expect(map.has("p-bad")).toBe(false) // config "suspended"
+  })
+
+  // F11 fix: pin NULL/undefined/empty-string semantics for isRuntimeSellerActive helper.
+  it("(h) excludes sellers whose runtime store_status is NULL", async () => {
+    const dbRows = [
+      { handle: "seller-null", store_status: null },
+      { handle: "seller-empty", store_status: "" },
+      { handle: "seller-active", store_status: "ACTIVE" },
+    ]
+    const { db } = makeDbStub(dbRows)
+
+    setupMarketFile(
+      {
+        market_id: "bonbeauty",
+        vendors: [
+          { vendor_id: "seller-null", slug: "seller-null", status: "active" },
+          { vendor_id: "seller-empty", slug: "seller-empty", status: "active" },
+          { vendor_id: "seller-active", slug: "seller-active", status: "active" },
+        ],
+      },
+      {
+        "seller-null": { products: [{ product_id: "p-null", status: "active", vendor_price: { amount: 100, currency: "PLN" } }] },
+        "seller-empty": { products: [{ product_id: "p-empty", status: "active", vendor_price: { amount: 110, currency: "PLN" } }] },
+        "seller-active": { products: [{ product_id: "p-active", status: "active", vendor_price: { amount: 120, currency: "PLN" } }] },
+      }
+    )
+
+    const warnings: string[] = []
+    const map = await buildVendorPricingMap("/config/bonbeauty/market.yaml", warnings, db, "bonbeauty")
+
+    // NULL/empty store_status counts as "not yet onboarded" → excluded (runtime row IS present
+    // but value is NULL — authoritative "not active" signal, no config fallback).
+    expect(map.has("p-null")).toBe(false)
+    expect(map.has("p-empty")).toBe(false)
+    expect(map.has("p-active")).toBe(true)
   })
 })
