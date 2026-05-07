@@ -237,9 +237,43 @@ describe("v160-cleanup-27 AC6: store/vouchers cross-market isolation (DPIA R-12)
     clearFixturesForTest()
   })
 
-  it("store/vouchers cross-market isolation: voucher seeded in market A is NOT found from market B context", () => {
-    // Seed voucher in market A
-    const voucherA: VoucherFixture = {
+  // Review fix H2: tests now exercise the actual route handlers under a real ALS
+  // context (via `marketContextStorage.run`) rather than asserting tautological
+  // string comparisons. Each test calls the route's exported handler with mocked
+  // req/res and asserts the HTTP status code emitted by the handler.
+
+  type MockRes = {
+    statusCode: number | null
+    body: unknown
+    headers: Record<string, string>
+    status: (code: number) => MockRes
+    json: (payload: unknown) => MockRes
+    setHeader: (k: string, v: string) => void
+  }
+  function makeRes(): MockRes {
+    const r: Partial<MockRes> = {
+      statusCode: null,
+      body: undefined,
+      headers: {},
+    }
+    r.status = function (code: number) {
+      this.statusCode = code
+      return this as MockRes
+    }
+    r.json = function (payload: unknown) {
+      this.body = payload
+      return this as MockRes
+    }
+    r.setHeader = function (k: string, v: string) {
+      ;(this.headers as Record<string, string>)[k] = v
+    }
+    return r as MockRes
+  }
+
+  it("store/vouchers GET: voucher seeded in market A returns 404 from market B ALS context (route handler)", async () => {
+    const { GET } = await import("../api/store/vouchers/[code]/route")
+
+    upsertFixture({
       code: "VOUCHER-MARKET-A-001",
       market_id: MARKET_A,
       seller_id: "sel_bonbeauty_001",
@@ -251,26 +285,26 @@ describe("v160-cleanup-27 AC6: store/vouchers cross-market isolation (DPIA R-12)
       status: "idle",
       expires_at: "2027-12-31T23:59:59Z",
       events: [],
-    }
-    upsertFixture(voucherA)
+    })
 
-    // From market A context — fixture IS found
-    const fxFromA = getFixtureByCode("VOUCHER-MARKET-A-001")
-    expect(fxFromA).not.toBeNull()
-    expect(fxFromA?.market_id).toBe(MARKET_A)
+    const req = { params: { code: "VOUCHER-MARKET-A-001" } } as unknown as Parameters<typeof GET>[0]
+    const res = makeRes()
 
-    // Cross-market isolation: market B context must NOT see market A voucher
-    // (simulates the route handler behaviour added in cleanup-27g)
-    const fxFound = getFixtureByCode("VOUCHER-MARKET-A-001")
-    const crossMarketBlocked = fxFound !== null &&
-      "market_id" in fxFound &&
-      fxFound.market_id !== MARKET_B
-    expect(crossMarketBlocked).toBe(true)
-    // If blocked, route returns 404 — existence must NOT leak (not 403)
+    await marketContextStorage.run(
+      { market_id: MARKET_B, sales_channel_id: "sc_b" },
+      async () => {
+        await GET(req, res as unknown as Parameters<typeof GET>[1])
+      }
+    )
+
+    expect(res.statusCode).toBe(404)
+    expect((res.body as { type?: string })?.type).toBe("not_found")
   })
 
-  it("store/vouchers cross-market isolation: market B request for market A voucher → 404 not 403 (existence must not leak)", () => {
-    const voucherA: VoucherFixture = {
+  it("store/vouchers GET: market B ALS context against market A voucher → 404 NOT 403 (existence must not leak)", async () => {
+    const { GET } = await import("../api/store/vouchers/[code]/route")
+
+    upsertFixture({
       code: "VOUCHER-DPIA-R12-001",
       market_id: MARKET_A,
       seller_id: "sel_001",
@@ -282,52 +316,26 @@ describe("v160-cleanup-27 AC6: store/vouchers cross-market isolation (DPIA R-12)
       status: "idle",
       expires_at: null,
       events: [],
-    }
-    upsertFixture(voucherA)
+    })
 
-    // Simulate route handler logic: ALS context = market B, voucher belongs to market A
-    const alsMarketId = MARKET_B
-    const fx = getFixtureByCode("VOUCHER-DPIA-R12-001")
+    const req = { params: { code: "VOUCHER-DPIA-R12-001" } } as unknown as Parameters<typeof GET>[0]
+    const res = makeRes()
 
-    // Route returns 404 if ALS market_id differs from voucher market_id
-    const shouldReturn404 = fx !== null &&
-      "market_id" in fx &&
-      fx.market_id !== alsMarketId
+    await marketContextStorage.run(
+      { market_id: MARKET_B, sales_channel_id: "sc_b" },
+      async () => {
+        await GET(req, res as unknown as Parameters<typeof GET>[1])
+      }
+    )
 
-    expect(shouldReturn404).toBe(true)
-    // NOT 403 — the status code must be 404 to avoid leaking existence
+    expect(res.statusCode).toBe(404)
+    expect(res.statusCode).not.toBe(403)
   })
 
-  it("store/vouchers cross-market isolation: ALS context absent → no market filter applied (backward compat)", () => {
-    const voucher: VoucherFixture = {
-      code: "VOUCHER-NO-MARKET-001",
-      // No market_id set
-      seller_id: "sel_001",
-      seller_name: "Seller",
-      seller_handle: "seller",
-      product_title: "Product",
-      value_minor: 1000,
-      currency_code: "PLN",
-      status: "idle",
-      expires_at: null,
-      events: [],
-    }
-    upsertFixture(voucher)
+  it("store/vouchers GET: same-market ALS context returns 200 with voucher view", async () => {
+    const { GET } = await import("../api/store/vouchers/[code]/route")
 
-    // When ALS market context is null (no middleware), voucher is accessible
-    const alsMarketId: string | null = null
-    const fx = getFixtureByCode("VOUCHER-NO-MARKET-001")
-    const blocked = fx !== null &&
-      alsMarketId !== null &&
-      "market_id" in fx &&
-      fx.market_id !== alsMarketId
-
-    expect(blocked).toBe(false)
-    expect(fx).not.toBeNull()
-  })
-
-  it("store/vouchers cross-market isolation: same market context → voucher accessible", () => {
-    const voucherB: VoucherFixture = {
+    upsertFixture({
       code: "VOUCHER-MARKET-B-001",
       market_id: MARKET_B,
       seller_id: "sel_b_001",
@@ -339,17 +347,79 @@ describe("v160-cleanup-27 AC6: store/vouchers cross-market isolation (DPIA R-12)
       status: "idle",
       expires_at: null,
       events: [],
-    }
-    upsertFixture(voucherB)
+    })
 
-    // ALS context = market B (same as voucher) → NOT blocked
-    const alsMarketId = MARKET_B
-    const fx = getFixtureByCode("VOUCHER-MARKET-B-001")
-    const blocked = fx !== null &&
-      "market_id" in fx &&
-      fx.market_id !== alsMarketId
+    const req = { params: { code: "VOUCHER-MARKET-B-001" } } as unknown as Parameters<typeof GET>[0]
+    const res = makeRes()
 
-    expect(blocked).toBe(false)
-    expect(fx?.market_id).toBe(MARKET_B)
+    await marketContextStorage.run(
+      { market_id: MARKET_B, sales_channel_id: "sc_b" },
+      async () => {
+        await GET(req, res as unknown as Parameters<typeof GET>[1])
+      }
+    )
+
+    expect(res.statusCode).toBe(200)
+  })
+
+  it("store/vouchers GET: fixture missing market_id is fail-CLOSED 404 under ALS context (review fix M2)", async () => {
+    const { GET } = await import("../api/store/vouchers/[code]/route")
+
+    upsertFixture({
+      code: "VOUCHER-NO-MARKET-001",
+      // intentionally omit market_id
+      seller_id: "sel_001",
+      seller_name: "Seller",
+      seller_handle: "seller",
+      product_title: "Product",
+      value_minor: 1000,
+      currency_code: "PLN",
+      status: "idle",
+      expires_at: null,
+      events: [],
+    } as VoucherFixture)
+
+    const req = { params: { code: "VOUCHER-NO-MARKET-001" } } as unknown as Parameters<typeof GET>[0]
+    const res = makeRes()
+
+    await marketContextStorage.run(
+      { market_id: MARKET_B, sales_channel_id: "sc_b" },
+      async () => {
+        await GET(req, res as unknown as Parameters<typeof GET>[1])
+      }
+    )
+
+    // Review fix M2: missing market_id under ALS context = fail-CLOSED 404.
+    expect(res.statusCode).toBe(404)
+  })
+
+  it("store/vouchers/[code]/events GET: cross-market request → 404 (route handler)", async () => {
+    const { GET } = await import("../api/store/vouchers/[code]/events/route")
+
+    upsertFixture({
+      code: "VOUCHER-EVT-MARKET-A",
+      market_id: MARKET_A,
+      seller_id: "sel_001",
+      seller_name: "Seller A",
+      seller_handle: "seller-a",
+      product_title: "Product",
+      value_minor: 1000,
+      currency_code: "PLN",
+      status: "idle",
+      expires_at: null,
+      events: [],
+    })
+
+    const req = { params: { code: "VOUCHER-EVT-MARKET-A" } } as unknown as Parameters<typeof GET>[0]
+    const res = makeRes()
+
+    await marketContextStorage.run(
+      { market_id: MARKET_B, sales_channel_id: "sc_b" },
+      async () => {
+        await GET(req, res as unknown as Parameters<typeof GET>[1])
+      }
+    )
+
+    expect(res.statusCode).toBe(404)
   })
 })

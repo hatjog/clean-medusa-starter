@@ -75,8 +75,11 @@ export async function GET(
   }
 
   const fx = getFixtureByCode(code)
-  // Cross-market isolation: if ALS market context is set and voucher market differs, 404.
-  if (fx && market_id && "market_id" in fx && fx.market_id !== market_id) {
+  // Cross-market isolation (DPIA R-12): if ALS market context is set, voucher must
+  // declare a matching market_id. Fail-CLOSED: a fixture missing market_id is treated
+  // as "not in this market" (404). Review fix M2 — prevents legacy/unscoped fixtures
+  // from leaking across markets when ALS context is present.
+  if (fx && market_id && fx.market_id !== market_id) {
     res.status(404).json({
       type: "not_found",
       message: "Voucher not found",

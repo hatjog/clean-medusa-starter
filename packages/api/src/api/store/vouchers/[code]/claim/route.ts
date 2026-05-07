@@ -167,9 +167,10 @@ export async function POST(
   // --- Lookup voucher (constant-time path — always check fixture first) ---
   const fx = getFixtureByCode(code)
 
-  // Cross-market isolation (DPIA R-12): if ALS market context is set and voucher market
-  // differs, return 404 — do NOT return 403 (existence must not leak across markets).
-  if (fx && market_id && "market_id" in fx && fx.market_id !== market_id) {
+  // Cross-market isolation (DPIA R-12, review fix M2): if ALS market context is set,
+  // voucher must declare a matching market_id. Fail-CLOSED: missing market_id is treated
+  // as "not in this market" (404 — do NOT 403, existence must not leak).
+  if (fx && market_id && fx.market_id !== market_id) {
     await padToFloor(startedAt)
     res.status(404).json({
       type: "not_found",

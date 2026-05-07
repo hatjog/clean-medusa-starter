@@ -33,8 +33,11 @@ export async function GET(
 ): Promise<void> {
   // story v160-cleanup-27f: extract market context via ALS so future per-market
   // flag overrides can drop in without route changes (AC5 / TF-45).
-  // Global tri-state behaviour is unchanged for v1.6.0.
+  // Global tri-state behaviour is unchanged for v1.6.0. Review fix L1: do NOT
+  // emit market_id in the response — response shape stays single-key for
+  // backward-compat with current storefront SDK consumer.
   const market_id = marketContextStorage.getStore()?.market_id ?? null
+  void market_id
 
   let db: Knex | null = null
   try {
@@ -46,6 +49,5 @@ export async function GET(
   const state = await getCurrentState(db)
   res.status(200).json({
     multi_vendor_pdp: state,
-    ...(market_id ? { market_id } : {}),
   })
 }
