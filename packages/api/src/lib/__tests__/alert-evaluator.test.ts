@@ -13,7 +13,7 @@ describe("alert-evaluator", () => {
     delete process.env.GP_ALERTING_CONFIG_PATH
     delete process.env.GP_FLAG_FLIP_DATE
     delete process.env.GP_MV_FLAG_STATE
-    const requestLog = await import("../request-log-aggregator.js")
+    const requestLog = await import("../request-log-aggregator")
     requestLog._resetForTest()
     jest.resetModules()
   })
@@ -21,7 +21,7 @@ describe("alert-evaluator", () => {
   it("loads the v1.6.0 alerting config with eight thresholds", async () => {
     process.env.GP_ALERTING_CONFIG_PATH = ALERTING_CONFIG_PATH
 
-    const { listConfiguredAlerts } = await import("../alert-evaluator.js")
+    const { listConfiguredAlerts } = await import("../alert-evaluator")
 
     const alerts = listConfiguredAlerts()
 
@@ -43,7 +43,7 @@ describe("alert-evaluator", () => {
     process.env.GP_ALERT_FORCE_FIRE =
       "nfr_alert_2_5xx_error_rate,nfr_alert_5_cache_invalidate_failures"
 
-    const { evaluateAlerts } = await import("../alert-evaluator.js")
+    const { evaluateAlerts } = await import("../alert-evaluator")
     const result = await evaluateAlerts()
 
     expect(result.firing).toHaveLength(2)
@@ -59,7 +59,7 @@ describe("alert-evaluator", () => {
     process.env.GP_FLAG_FLIP_DATE = new Date(Date.now() + 2 * 24 * 60 * 60 * 1000).toISOString()
     process.env.GP_MV_FLAG_STATE = "shadow"
 
-    const requestLog = await import("../request-log-aggregator.js")
+    const requestLog = await import("../request-log-aggregator")
     const now = Date.now()
     ;[100, 200, 300, 400, 620].forEach((duration_ms, index) => {
       requestLog.recordRequest({
@@ -69,7 +69,7 @@ describe("alert-evaluator", () => {
       })
     })
 
-    const { evaluateAlerts } = await import("../alert-evaluator.js")
+    const { evaluateAlerts } = await import("../alert-evaluator")
     const result = await evaluateAlerts({
       scope: {
         resolve: () => ({
