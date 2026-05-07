@@ -18,6 +18,11 @@ module.exports = {
       },
     ],
   },
+  // @noble/ed25519 v2 is ESM-only and cannot be required() in Jest CJS mode.
+  // Map it to a manual CJS mock backed by Node built-in crypto (test env only).
+  moduleNameMapper: {
+    "^@noble/ed25519$": "<rootDir>/__mocks__/@noble/ed25519.js",
+  },
   testEnvironment: "node",
   // Prefer TS sources over generated JS when tests reach into sibling packages.
   moduleFileExtensions: ["ts", "js", "json"],
