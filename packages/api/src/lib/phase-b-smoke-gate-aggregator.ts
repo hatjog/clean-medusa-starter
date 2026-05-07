@@ -159,25 +159,59 @@ const CHECKLIST: Omit<SmokeGateItem, "status">[] = [
   },
 ]
 
+const ADR_097_RELATIVE = "specs/adr/2026-05-08-adr-097-sprint-0-capacity-rebalance-hybrid-d.md"
+
 /**
  * ADR-097 detection: resolve project-root relative path and verify the ADR
- * file exists with `status: ACCEPTED` (case-insensitive line match).
+ * file exists with required structural anchors (status: ACCEPTED, a non-empty
+ * Decision section, and a date/ratified field).
  * Works in local docker-compose context; no staging URL required (ADR-066).
+ *
+ * cleanup-21 review-fix [MEDIUM]: extended candidate list with __dirname-based
+ * resolution for robustness across cwd variations (test runner, container,
+ * monorepo packaging) and added GP_ADR_097_PATH env override for ops escape.
+ * Integrity check upgraded from status-only regex to multi-anchor.
  */
 export function detectAdr097Pass(): boolean {
-  // Resolve relative to the backend src dir (cwd is GP/backend at runtime).
-  const candidates = [
-    path.resolve(process.cwd(), "../../specs/adr/2026-05-08-adr-097-sprint-0-capacity-rebalance-hybrid-d.md"),
-    path.resolve(process.cwd(), "../../../specs/adr/2026-05-08-adr-097-sprint-0-capacity-rebalance-hybrid-d.md"),
-    path.resolve(process.cwd(), "specs/adr/2026-05-08-adr-097-sprint-0-capacity-rebalance-hybrid-d.md"),
-  ]
+  const envOverride = process.env.GP_ADR_097_PATH
+  let candidates: string[]
+  if (envOverride) {
+    // Env override is exclusive — caller has explicitly pinned the path
+    // (used by ops escape hatch and tests for negative-path fixtures).
+    candidates = [envOverride]
+  } else {
+    // __dirname at runtime is .../packages/api/src/lib (or compiled equivalent).
+    // Build a layered candidate list defensively across cwd values.
+    const fromDirname: string[] = []
+    try {
+      const here = __dirname
+      fromDirname.push(
+        path.resolve(here, "../../../../../../", ADR_097_RELATIVE),
+        path.resolve(here, "../../../../../", ADR_097_RELATIVE),
+        path.resolve(here, "../../../../", ADR_097_RELATIVE),
+      )
+    } catch {
+      // __dirname not available in some bundler contexts — skip.
+    }
+    candidates = [
+      ...fromDirname,
+      path.resolve(process.cwd(), "../../", ADR_097_RELATIVE),
+      path.resolve(process.cwd(), "../../../", ADR_097_RELATIVE),
+      path.resolve(process.cwd(), ADR_097_RELATIVE),
+    ]
+  }
   for (const adrPath of candidates) {
-    if (fs.existsSync(adrPath)) {
-      const content = fs.readFileSync(adrPath, "utf-8")
-      // Match `status: ACCEPTED` (with or without surrounding quotes/spaces).
-      if (/status:\s*['"]?ACCEPTED['"]?/i.test(content)) {
-        return true
-      }
+    if (!fs.existsSync(adrPath)) continue
+    const content = fs.readFileSync(adrPath, "utf-8")
+    // Multi-anchor integrity check (cleanup-21 AC3 review-fix):
+    //   1. status: ACCEPTED line
+    //   2. a Decision section header with non-empty content
+    //   3. a ratified_at / decided_at / date field
+    const hasAccepted = /status:\s*['"]?ACCEPTED['"]?/i.test(content)
+    const hasDecision = /^##+\s*Decision\b[\s\S]+?\S/im.test(content)
+    const hasDate = /^(?:ratified_at|decided_at|date):\s*\S+/im.test(content)
+    if (hasAccepted && hasDecision && hasDate) {
+      return true
     }
   }
   return false

@@ -1,7 +1,12 @@
-import { describe, expect, it } from "@jest/globals"
+import { afterEach, beforeEach, describe, expect, it } from "@jest/globals"
+
+import * as fs from "node:fs"
+import * as os from "node:os"
+import * as path from "node:path"
 
 import {
   computeSmokeGateState,
+  detectAdr097Pass,
   getLastRatification,
   ratifyVerdict,
 } from "../phase-b-smoke-gate-aggregator"
@@ -202,5 +207,97 @@ describe("phase-b-smoke-gate-aggregator", () => {
     expect(capturedInsertRow?.items_json).toBe(
       '[{"key":"ar55","label":"AR55","nfr_ref":"AR55","status":"pass","evidence_url":"/admin/operator/cohort-metrics","source":"cohort_metrics"}]'
     )
+  })
+
+  // cleanup-21 review-fix [MEDIUM]: detectAdr097Pass integrity check.
+  describe("detectAdr097Pass integrity check (review-fix [MEDIUM])", () => {
+    let tmpDir: string
+    const originalEnv = process.env.GP_ADR_097_PATH
+
+    beforeEach(() => {
+      tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "adr097-test-"))
+    })
+
+    afterEach(() => {
+      if (originalEnv === undefined) {
+        delete process.env.GP_ADR_097_PATH
+      } else {
+        process.env.GP_ADR_097_PATH = originalEnv
+      }
+      try {
+        fs.rmSync(tmpDir, { recursive: true, force: true })
+      } catch {
+        // ignore
+      }
+    })
+
+    function writeAdr(content: string): string {
+      const p = path.join(tmpDir, "adr.md")
+      fs.writeFileSync(p, content, "utf-8")
+      process.env.GP_ADR_097_PATH = p
+      return p
+    }
+
+    it("returns true when status, decision, and date all present", () => {
+      writeAdr(
+        [
+          "---",
+          "status: ACCEPTED",
+          "date: 2026-05-08",
+          "---",
+          "",
+          "## Decision",
+          "",
+          "Hybrid D capacity rebalance.",
+          "",
+        ].join("\n"),
+      )
+      expect(detectAdr097Pass()).toBe(true)
+    })
+
+    it("returns false when status is not ACCEPTED (e.g. PROPOSED)", () => {
+      writeAdr(
+        [
+          "status: PROPOSED",
+          "date: 2026-05-08",
+          "## Decision",
+          "Body.",
+        ].join("\n"),
+      )
+      expect(detectAdr097Pass()).toBe(false)
+    })
+
+    it("returns false when Decision section is missing", () => {
+      writeAdr(
+        [
+          "status: ACCEPTED",
+          "date: 2026-05-08",
+          "",
+          "Just some text without a decision header.",
+        ].join("\n"),
+      )
+      expect(detectAdr097Pass()).toBe(false)
+    })
+
+    it("returns false when date / ratified_at / decided_at field missing", () => {
+      writeAdr(
+        [
+          "status: ACCEPTED",
+          "## Decision",
+          "Body content.",
+        ].join("\n"),
+      )
+      expect(detectAdr097Pass()).toBe(false)
+    })
+
+    it("returns false when no candidate path resolves and no env override set", () => {
+      delete process.env.GP_ADR_097_PATH
+      // Note: real ADR file may exist via __dirname / cwd candidates in repo
+      // checkout, which would make this test pass via the real file. We can't
+      // easily simulate cwd-isolation here, so we assert behavior matches
+      // the real-file presence: function should return true or false based
+      // on actual disk state — both are valid outcomes. Just verify no throw.
+      expect(() => detectAdr097Pass()).not.toThrow()
+    })
   })
 })

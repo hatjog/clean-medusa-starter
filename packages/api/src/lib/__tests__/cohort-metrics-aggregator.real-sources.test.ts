@@ -30,6 +30,16 @@ type PersistedAuditRow = {
   at: string
 }
 
+/**
+ * IMPORTANT (cleanup-21 review-fix [LOW]): reviewRows / orderRows are dispensed
+ * in array index order, one per `db.raw` call. This implicitly relies on
+ * `computeCohortMetrics` iterating cohorts sequentially in COHORTS declaration
+ * order: [pre_flip_baseline, shadow_window, first_24h_on, sustained_on].
+ * If the aggregator ever changes iteration order or parallelizes the per-cohort
+ * DB calls, tests using cohort-specific row positions (e.g. test (e) below)
+ * will silently shift their expected reasons. Refactor to a Record<Cohort, …>
+ * keyed mock if that happens.
+ */
 function buildDb(
   auditRows: PersistedAuditRow[],
   reviewRows: Array<{ review_count: number; avg_rating: number | null }>,
@@ -237,8 +247,12 @@ describe("cohort-metrics-aggregator — real-sources (cleanup-22)", () => {
     const { computeCohortMetrics } = await import("../cohort-metrics-aggregator")
     const result = await computeCohortMetrics({ db, nowMs: NOW })
 
+    // cleanup-21 review-fix [MEDIUM]: raw computed rate (1/50 = 2%) is now
+    // surfaced even when sample-size gate fails — operators see honest
+    // numerator/denominator, status remains unknown to preserve gate semantics.
     expect(result.cohorts.pre_flip_baseline.conversion).toMatchObject({
-      value: null,
+      value: 2,
+      sample_size: 50,
       status: "unknown",
       reason: "insufficient_sample",
     })
@@ -357,5 +371,28 @@ describe("cohort-metrics-aggregator — real-sources (cleanup-22)", () => {
     expect(threshold).toBeDefined()
     expect(status).toBeDefined()
     expect(reason).toBeUndefined()
+  })
+
+  // cleanup-21 review-fix [HIGH]: AR55/AR56 unknown branches MUST emit
+  // reason field so the smoke-gate aggregator's reason-whitelist applies
+  // to real cohort metrics (not just hand-crafted test fixtures).
+  it("cleanup-21 review-fix [HIGH]: p95/error_rate unknown branches emit reason: insufficient_sample on zero samples", async () => {
+    const reviewRows = Array.from({ length: 4 }, () => ({ review_count: 0, avg_rating: null }))
+    const orderRows = Array.from({ length: 4 }, () => ({ order_count: 0 }))
+    const db = buildDb(BASE_AUDIT_ROWS, reviewRows, orderRows)
+
+    const { computeCohortMetrics } = await import("../cohort-metrics-aggregator")
+    const result = await computeCohortMetrics({ db, nowMs: NOW })
+
+    expect(result.cohorts.pre_flip_baseline.p95_latency_ms).toMatchObject({
+      value: null,
+      status: "unknown",
+      reason: "insufficient_sample",
+    })
+    expect(result.cohorts.pre_flip_baseline.error_rate_pct).toMatchObject({
+      value: null,
+      status: "unknown",
+      reason: "insufficient_sample",
+    })
   })
 })

@@ -301,6 +301,11 @@ export async function computeCohortMetrics(
   const cohortWindows = await resolveCohortWindows(options.db, nowMs)
   const cohorts: Partial<Record<Cohort, Record<KPI, KPIMeasurement>>> = {}
   const conversionRates: Partial<Record<Cohort, number | null>> = {}
+  // cleanup-21 review-fix [MEDIUM]: track raw computed conversion rate
+  // (may be non-null even when sample-size gate fails) so we can surface
+  // it in the unknown measurement instead of dropping signal silently.
+  const rawConversionRates: Partial<Record<Cohort, number | null>> = {}
+  const visitsSampleSizes: Partial<Record<Cohort, number>> = {}
   for (const cohort of COHORTS) {
     const window = cohortWindows[cohort]
     const stats = window
@@ -339,6 +344,8 @@ export async function computeCohortMetrics(
         : null
 
     conversionRates[cohort] = conversionHasSufficientSample ? conversionRate : null
+    rawConversionRates[cohort] = conversionRate
+    visitsSampleSizes[cohort] = visitsSampleSize
     const kpis: Partial<Record<KPI, KPIMeasurement>> = {}
     for (const kpi of KPIS) {
       if (kpi === "nps") {
@@ -362,7 +369,13 @@ export async function computeCohortMetrics(
         }
       } else if (kpi === "p95_latency_ms") {
         if (stats.sample_size === 0 || stats.p95_latency_ms === null) {
-          kpis[kpi] = { ...unknown(), threshold: THRESHOLDS[kpi] }
+          // cleanup-21 review-fix [HIGH]: emit reason on unknown so the
+          // smoke-gate aggregator's DEV_MODE_UNKNOWN_REASON_WHITELIST can
+          // map AR55 unknown → pass in dev/local docker-compose context
+          // where request-log telemetry has not accumulated samples yet.
+          const reason =
+            stats.sample_size === 0 ? "insufficient_sample" : "no_data"
+          kpis[kpi] = { ...unknown(reason), threshold: THRESHOLDS[kpi] }
         } else {
           kpis[kpi] = {
             value: stats.p95_latency_ms,
@@ -373,7 +386,11 @@ export async function computeCohortMetrics(
         }
       } else if (kpi === "error_rate_pct") {
         if (stats.sample_size === 0 || stats.error_rate_5xx_pct === null) {
-          kpis[kpi] = { ...unknown(), threshold: THRESHOLDS[kpi] }
+          // cleanup-21 review-fix [HIGH]: emit reason on unknown so AR56
+          // unknown can be whitelisted by smoke-gate aggregator in dev.
+          const reason =
+            stats.sample_size === 0 ? "insufficient_sample" : "no_data"
+          kpis[kpi] = { ...unknown(reason), threshold: THRESHOLDS[kpi] }
         } else {
           kpis[kpi] = {
             value: stats.error_rate_5xx_pct,
@@ -394,9 +411,18 @@ export async function computeCohortMetrics(
       // Determine a descriptive reason for cleanup-21 whitelisting.
       const reason =
         conversionRate === null ? "insufficient_sample" : "no_baseline"
+      // cleanup-21 review-fix [MEDIUM]: surface the raw computed rate even
+      // when sample-size gate failed, so operators can see "value=10.2%,
+      // status=unknown" rather than silent null. Threshold disclosure
+      // includes proxy label unconditionally (cleanup-21 review-fix [LOW]).
+      const rawRate = rawConversionRates[cohort] ?? null
+      const visitsSize = visitsSampleSizes[cohort] ?? 0
       cohorts[cohort]!.conversion = {
-        ...unknown(reason),
-        threshold: THRESHOLDS.conversion,
+        value: rawRate,
+        sample_size: visitsSize,
+        threshold: `${THRESHOLDS.conversion} (request-log proxy)`,
+        status: "unknown",
+        reason,
       }
       continue
     }
@@ -404,7 +430,10 @@ export async function computeCohortMetrics(
     const ratioToBaseline = cohort === "pre_flip_baseline" ? 1 : conversionRate / baselineConversion
     cohorts[cohort]!.conversion = {
       value: conversionRate,
-      sample_size: cohorts[cohort]!.p95_latency_ms.sample_size,
+      // cleanup-21 review-fix [LOW]: visits sample size is the request-log
+      // sample (proxy denominator); decoupled from p95 latency sample for
+      // future-proofing if visits source migrates to PDP-view event stream.
+      sample_size: visitsSampleSizes[cohort] ?? cohorts[cohort]!.p95_latency_ms.sample_size,
       threshold: `${THRESHOLDS.conversion}; baseline=${baselineConversion.toFixed(2)}% (request-log proxy)`,
       status: classifyConversionRatio(ratioToBaseline),
     }

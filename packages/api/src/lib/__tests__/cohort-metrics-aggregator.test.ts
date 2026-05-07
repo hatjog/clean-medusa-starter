@@ -259,9 +259,13 @@ describe("cohort-metrics-aggregator", () => {
       status: "unknown",
       reason: "insufficient_sample",
     })
-    // Conversion: < MIN_VISITS_FOR_CONVERSION (2 requests) → unknown
+    // Conversion: < MIN_VISITS_FOR_CONVERSION (2 requests) → unknown.
+    // cleanup-21 review-fix [MEDIUM]: raw computed rate (2 orders / 2 requests
+    // = 100%) is now surfaced even when sample-size gate fails — operators
+    // see honest numerator/denominator with status=unknown preserving gate.
     expect(result.cohorts.pre_flip_baseline.conversion).toMatchObject({
-      value: null,
+      value: 100,
+      sample_size: 2,
       status: "unknown",
       reason: "insufficient_sample",
     })
