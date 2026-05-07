@@ -33,7 +33,7 @@ export class Migration20260507400000AdminCapabilityGrantsTable extends Migration
     // 1. Create the grants table.
     this.addSql(`
       CREATE TABLE IF NOT EXISTS admin_capability_grants (
-        id            text        NOT NULL DEFAULT gen_random_uuid()::text PRIMARY KEY,
+        id            uuid        NOT NULL DEFAULT gen_random_uuid() PRIMARY KEY,
         actor_id      text        NOT NULL,
         capability    text        NOT NULL,
         granted_at    timestamptz NOT NULL DEFAULT now(),
