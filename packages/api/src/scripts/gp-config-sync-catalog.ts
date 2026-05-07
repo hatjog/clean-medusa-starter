@@ -423,6 +423,23 @@ export async function buildVendorPricingMap(
       ? await resolveVendorRuntimeStateMap(db, marketIdForRuntime, vendors, warnings)
       : new Map<string, { slug: string; store_status: string | null }>()
 
+  // Aggregated drift signal (matches enforceVendorStatusGate semantics, F4): when runtime
+  // lookup was attempted (db + marketId both provided) but some configured vendors with
+  // slugs lack a runtime row, surface a single summary warning rather than spamming N
+  // entries. Vendors without a slug are silent (legacy config path — already documented).
+  if (db && marketIdForRuntime) {
+    const slugged = vendors
+      .map((v) => v.slug?.trim())
+      .filter((s): s is string => Boolean(s))
+    const missing = slugged.filter((slug) => !runtimeStateMap.has(slug))
+    if (missing.length > 0) {
+      warnings.push(
+        `Vendor pricing: ${missing.length} of ${slugged.length} sellers with slug lack runtime row; ` +
+          `falling back to config status (slugs: ${missing.join(", ")})`
+      )
+    }
+  }
+
   const activeVendors = vendors.filter((vendor) => {
     const slug = vendor.slug?.trim() ?? ""
     const runtime = slug ? runtimeStateMap.get(slug) : undefined
@@ -1323,17 +1340,49 @@ function isVendorProductSellable(product: { status?: string; available?: boolean
 }
 
 /**
+ * Set of `seller.store_status` enum values (uppercased) that count as active for catalog
+ * pricing/visibility purposes. Mercur 2 baseline ships `ACTIVE`; future enum variants
+ * (`OPEN` per draft spec) included for forward-compat across migrations. Extending this
+ * set is the localised escape hatch when Mercur enum drifts (per F5 review).
+ */
+export const ACTIVE_RUNTIME_STORE_STATUSES = new Set(["ACTIVE", "OPEN"])
+
+/**
+ * Minimal Knex-shaped contract for the seller-status query chain. Keeps `db: any` escape
+ * hatch out of the helper signatures while avoiding a hard `@types/knex` dependency.
+ */
+export type SellerStatusRow = { handle: string; store_status: string | null }
+export type KnexSellerQuery = {
+  select: (...cols: string[]) => {
+    whereIn: (col: string, vals: string[]) => {
+      whereRaw: (sql: string, bindings: unknown[]) => {
+        whereNull: (col: string) => Promise<SellerStatusRow[]>
+      }
+    }
+  }
+}
+export type KnexLikeDb = (table: string) => KnexSellerQuery
+
+/**
  * Returns true when a Mercur 2 seller's runtime `store_status` indicates the seller is active.
  *
  * Prod-vs-config drift rationale: gp-config YAML `vendor.status` is a bootstrap/fallback.
  * The runtime DB (`seller` table, Mercur 2) is the source of truth for seller activity.
  * This helper is case-insensitive to guard against mixed-case enum values in early migrations.
  *
+ * NULL semantics: `null`/`undefined`/empty string → NOT active (treated as "not yet onboarded").
+ * Callers fall back to config status only when the runtime row itself is absent — once a row
+ * exists with NULL `store_status`, that is an authoritative "not active" signal.
+ *
  * Scope limit: no reverse-flow (writing back to gp-config), no real-time push.
  * Eventual consistency per sync run is sufficient for v1.6.0. Full ratification deferred to v1.10.0.
  */
-function isRuntimeSellerActive(storeStatus: string | null | undefined): boolean {
-  return (storeStatus ?? "").trim().toUpperCase() === "ACTIVE"
+export function isRuntimeSellerActive(storeStatus: string | null | undefined): boolean {
+  const normalized = (storeStatus ?? "").trim().toUpperCase()
+  if (!normalized) {
+    return false
+  }
+  return ACTIVE_RUNTIME_STORE_STATUSES.has(normalized)
 }
 
 /**
@@ -1346,11 +1395,19 @@ function isRuntimeSellerActive(storeStatus: string | null | undefined): boolean 
  * Slug-only matching: vendors without `slug` in gp-config are skipped and fall back to config status.
  */
 async function resolveVendorRuntimeStateMap(
-  db: any,
+  db: KnexLikeDb | null | undefined | any,
   marketId: string,
   vendors: MarketVendor[],
   warnings: string[]
 ): Promise<Map<string, { slug: string; store_status: string | null }>> {
+  // Defense-in-depth: caller sites guard `db && marketId`, but mirror that here so any
+  // future caller (or a degraded container.resolve path) cannot accidentally invoke
+  // `db("seller")` on null/undefined and crash. Empty marketId is also rejected to avoid
+  // silent empty-result queries that look like "no sellers active" (catastrophic regression).
+  if (!db || typeof db !== "function" || !marketId?.trim()) {
+    return new Map()
+  }
+
   const slugs = Array.from(
     new Set(
       vendors
@@ -1403,7 +1460,20 @@ export async function enforceVendorStatusGate(
   }
 
   const vendors = marketConfig.vendors ?? []
-  const runtimeStateMap = await resolveVendorRuntimeStateMap(db, marketId, vendors, warnings)
+  // F1 fix: mirror buildVendorPricingMap's guard so a null/undefined db (or empty marketId)
+  // never reaches db("seller"). resolveVendorRuntimeStateMap also guards internally; this
+  // outer guard skips an unnecessary call entirely and keeps semantics symmetric.
+  const runtimeStateMap =
+    db && marketId
+      ? await resolveVendorRuntimeStateMap(db, marketId, vendors, warnings)
+      : new Map<string, { slug: string; store_status: string | null }>()
+
+  // F3 fix: aggregate "runtime seller missing" warnings into a single summary instead of
+  // emitting one per vendor (warning spam on legacy configs). Distinguish vendors that
+  // SHOULD have a runtime row (slug present but row absent — real drift signal) from
+  // legacy vendors with no slug (silent config-only path).
+  const missingRuntimeWithSlug: string[] = []
+  const missingRuntimeNoSlug: string[] = []
 
   const vendorsWithRuntimeState = vendors.map((vendor) => {
     const slug = vendor.slug?.trim() ?? ""
@@ -1413,11 +1483,11 @@ export async function enforceVendorStatusGate(
       : ACTIVE_VENDOR_STATUSES.has(vendor.status)
 
     if (!runtime) {
-      warnings.push(
-        `Vendor status gate: runtime seller missing for vendor '${vendor.vendor_id}'` +
-          (slug ? ` slug='${slug}'` : "") +
-          `; falling back to config status='${vendor.status}'`
-      )
+      if (slug) {
+        missingRuntimeWithSlug.push(`${vendor.vendor_id}(slug=${slug}, config=${vendor.status})`)
+      } else {
+        missingRuntimeNoSlug.push(`${vendor.vendor_id}(config=${vendor.status})`)
+      }
     }
 
     return {
@@ -1427,6 +1497,19 @@ export async function enforceVendorStatusGate(
       isActive,
     }
   })
+
+  if (missingRuntimeWithSlug.length > 0) {
+    warnings.push(
+      `Vendor status gate: ${missingRuntimeWithSlug.length} slugged vendor(s) lack runtime seller row; ` +
+        `falling back to config status — ${missingRuntimeWithSlug.join(", ")}`
+    )
+  }
+  if (missingRuntimeNoSlug.length > 0) {
+    warnings.push(
+      `Vendor status gate: ${missingRuntimeNoSlug.length} legacy vendor(s) without slug; ` +
+        `runtime check skipped, using config status — ${missingRuntimeNoSlug.join(", ")}`
+    )
+  }
 
   const nonActiveVendors = vendorsWithRuntimeState.filter((vendor) => !vendor.isActive)
 
@@ -1660,9 +1743,20 @@ export default async function gpConfigSyncCatalog({ container, args }: ExecArgs)
   const activeCurrency = allCurrencies[0]
 
   const warnings: string[] = []
-  // Resolve Knex handle for runtime seller status lookups (best-effort; resolveVendorRuntimeStateMap
-  // is try/catch so sync continues even if PG_CONNECTION is unavailable in this context).
-  const db = container.resolve(ContainerRegistrationKeys.PG_CONNECTION) as any
+  // Resolve Knex handle for runtime seller status lookups. Wrap in try/catch (F10): if
+  // PG_CONNECTION is not registered in this container (e.g. CLI-only context, degraded
+  // boot), fall back to config-only filtering with a single warning instead of crashing
+  // the entire sync. resolveVendorRuntimeStateMap also handles null/undefined defensively.
+  let db: any
+  try {
+    db = container.resolve(ContainerRegistrationKeys.PG_CONNECTION) as any
+  } catch (e: any) {
+    warnings.push(
+      `Runtime seller lookup: PG_CONNECTION unresolved — ${e?.message ?? String(e)}; ` +
+        `falling back to config-only vendor status filtering`
+    )
+    db = undefined
+  }
 
   // Prerequisites (fail-fast on critical) — validate region for each currency
   console.log(`Validating prerequisites for market '${marketId}'...`)
