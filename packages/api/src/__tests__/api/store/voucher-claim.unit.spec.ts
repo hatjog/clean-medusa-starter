@@ -1,14 +1,15 @@
 /**
- * Story v160-cleanup-15c — voucher claim route unit tests.
+ * Story v160-cleanup-25 — voucher claim route unit tests (re-targeted).
  *
- * Covers all ACs from the story:
+ * Covers all ACs from stories v160-cleanup-15c and v160-cleanup-25:
  *   AC1 — Real backend route (happy path, already-claimed, invalid code)
  *   AC2 — Constant-time anti-enumeration (latency floor enforced)
  *   AC3 — HMAC-bound idempotency (tampered binding → 409)
  *   AC6 — Rate-limit: 11th request → 429 with Retry-After
  *
- * Uses Jest fake timers to avoid real 200 ms floor in unit tests,
- * and direct function imports to test logic in isolation.
+ * v160-cleanup-25: route now resolves VoucherService from req.scope instead
+ * of importing from voucher-fixture-store.ts (deleted). Tests mock the
+ * VoucherService methods directly via jest.fn().
  */
 
 import {
@@ -21,17 +22,36 @@ import {
   _setClock,
 } from "../../../lib/voucher-claim-rate-limit"
 import {
-  clearFixturesForTest,
-  upsertFixture,
-  type VoucherFixture,
-} from "../../../lib/voucher-fixture-store"
-import {
   _clearAuditLog,
   _clearBindingStore,
   _getAuditLog,
   POST,
 } from "../../../api/store/vouchers/[code]/claim/route"
 import { Modules } from "@medusajs/framework/utils"
+import type { VoucherWithEvents } from "../../../modules/voucher"
+
+// ---------------------------------------------------------------------------
+// VoucherService mock factory
+// ---------------------------------------------------------------------------
+
+type MockVoucherService = {
+  getByCode: jest.Mock
+  claim: jest.Mock
+}
+
+function makeMockVoucherService(defaults?: {
+  voucher?: VoucherWithEvents | null
+}): MockVoucherService {
+  const voucher = defaults?.voucher ?? null
+  return {
+    getByCode: jest.fn().mockResolvedValue(voucher),
+    claim: jest.fn().mockResolvedValue(
+      voucher
+        ? { status: "claimed", voucher: { ...voucher, status: "claimed" } }
+        : { status: "not_found", voucher: null }
+    ),
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -41,14 +61,22 @@ function makeReq(
   code: string,
   body: Record<string, unknown> = {},
   ip = "127.0.0.1",
-  scope?: { resolve: (key: string) => unknown },
+  voucherService?: MockVoucherService,
+  extraScope?: { resolve: (key: string) => unknown },
 ): {
   params: { code: string }
   body: Record<string, unknown>
   headers: Record<string, string>
   socket: { remoteAddress: string }
-  scope?: { resolve: (key: string) => unknown }
+  scope: { resolve: (key: string) => unknown }
 } {
+  const scope = {
+    resolve: (key: string): unknown => {
+      if (key === "voucher" && voucherService) return voucherService
+      if (extraScope) return extraScope.resolve(key)
+      throw new Error(`unexpected resolve: ${key}`)
+    },
+  }
   return {
     params: { code },
     body,
@@ -88,8 +116,13 @@ function makeRes(): {
   return res
 }
 
-const IDLE_FIXTURE: VoucherFixture = {
+// ---------------------------------------------------------------------------
+// Fixture vouchers (matching the canonical E2E fixture codes)
+// ---------------------------------------------------------------------------
+
+const IDLE_VOUCHER: VoucherWithEvents = {
   code: "TEST-IDLE-AAA",
+  market_id: null,
   seller_id: "sel_test",
   seller_name: "Test Seller",
   seller_handle: "test-seller",
@@ -97,22 +130,46 @@ const IDLE_FIXTURE: VoucherFixture = {
   value_minor: 10000,
   currency_code: "PLN",
   status: "idle",
-  expires_at: "2099-12-31T23:59:59Z",
+  expires_at: new Date("2099-12-31T23:59:59Z"),
+  created_at: new Date("2026-05-04T00:00:00Z"),
+  updated_at: new Date("2026-05-04T00:00:00Z"),
   events: [
-    { id: "evt-1", event_type: "created", occurred_at: "2026-05-04T00:00:00Z" },
+    {
+      id: "evt-1",
+      voucher_code: "TEST-IDLE-AAA",
+      event_type: "created",
+      occurred_at: new Date("2026-05-04T00:00:00Z"),
+      created_at: new Date("2026-05-04T00:00:00Z"),
+    },
   ],
 }
 
-const CLAIMED_FIXTURE: VoucherFixture = {
-  ...IDLE_FIXTURE,
+const CLAIMED_VOUCHER: VoucherWithEvents = {
+  ...IDLE_VOUCHER,
   code: "TEST-CLAIMED-BBB",
   status: "claimed",
+  events: [
+    {
+      id: "evt-2",
+      voucher_code: "TEST-CLAIMED-BBB",
+      event_type: "created",
+      occurred_at: new Date("2026-05-04T00:00:00Z"),
+      created_at: new Date("2026-05-04T00:00:00Z"),
+    },
+    {
+      id: "evt-3",
+      voucher_code: "TEST-CLAIMED-BBB",
+      event_type: "claimed",
+      occurred_at: new Date("2026-05-04T01:00:00Z"),
+      created_at: new Date("2026-05-04T01:00:00Z"),
+    },
+  ],
 }
 
-const EXPIRED_FIXTURE: VoucherFixture = {
-  ...IDLE_FIXTURE,
+const EXPIRED_VOUCHER: VoucherWithEvents = {
+  ...IDLE_VOUCHER,
   code: "TEST-EXPIRED-CCC",
-  expires_at: "2020-01-01T00:00:00Z",
+  expires_at: new Date("2020-01-01T00:00:00Z"),
 }
 
 // ---------------------------------------------------------------------------
@@ -120,14 +177,10 @@ const EXPIRED_FIXTURE: VoucherFixture = {
 // ---------------------------------------------------------------------------
 
 beforeEach(() => {
-  clearFixturesForTest()
   _clearAuditLog()
   _clearBindingStore()
   _resetBuckets()
   process.env.JWT_SECRET = "test-secret-for-unit-tests"
-  upsertFixture(IDLE_FIXTURE)
-  upsertFixture(CLAIMED_FIXTURE)
-  upsertFixture(EXPIRED_FIXTURE)
 })
 
 afterEach(() => {
@@ -230,7 +283,7 @@ describe("voucher-claim-rate-limit", () => {
 // ---------------------------------------------------------------------------
 
 describe("POST /store/vouchers/:code/claim", () => {
-  function validBody(code = IDLE_FIXTURE.code) {
+  function validBody(code = IDLE_VOUCHER.code) {
     const session = "session-abc"
     const claimedAt = "2026-05-04T12:00:00Z"
     const idempotencyKey = computeBinding(code, session, claimedAt)
@@ -238,22 +291,25 @@ describe("POST /store/vouchers/:code/claim", () => {
   }
 
   it("AC1 happy path — idle code returns 200 with state=claimed", async () => {
-    const req = makeReq(IDLE_FIXTURE.code, validBody())
+    const svc = makeMockVoucherService({ voucher: IDLE_VOUCHER })
+    const req = makeReq(IDLE_VOUCHER.code, validBody(), "127.0.0.1", svc)
     const res = makeRes()
     await POST(req as never, res as never)
     expect(res._status).toBe(200)
     expect((res._body as Record<string, unknown>).state).toBe("claimed")
     expect((res._body as Record<string, unknown>).seller_handle).toBe(
-      IDLE_FIXTURE.seller_handle
+      IDLE_VOUCHER.seller_handle
     )
   })
 
   it("emits voucher.claimed after successful first claim", async () => {
     const emit = jest.fn().mockResolvedValue(undefined)
+    const svc = makeMockVoucherService({ voucher: IDLE_VOUCHER })
     const req = makeReq(
-      IDLE_FIXTURE.code,
+      IDLE_VOUCHER.code,
       validBody(),
       "127.0.0.1",
+      svc,
       {
         resolve: (key: string) => {
           if (key === Modules.EVENT_BUS) {
@@ -271,15 +327,16 @@ describe("POST /store/vouchers/:code/claim", () => {
     expect(emit).toHaveBeenCalledWith({
       name: "voucher.claimed",
       data: {
-        voucher_id: IDLE_FIXTURE.code,
-        voucher_code: IDLE_FIXTURE.code,
+        voucher_id: IDLE_VOUCHER.code,
+        voucher_code: IDLE_VOUCHER.code,
         claimed_at: (res._body as Record<string, unknown>).claimed_at,
       },
     })
   })
 
   it("AC1 — response does NOT expose recipient PII", async () => {
-    const req = makeReq(IDLE_FIXTURE.code, validBody())
+    const svc = makeMockVoucherService({ voucher: IDLE_VOUCHER })
+    const req = makeReq(IDLE_VOUCHER.code, validBody(), "127.0.0.1", svc)
     const res = makeRes()
     await POST(req as never, res as never)
     const body = JSON.stringify(res._body)
@@ -288,14 +345,16 @@ describe("POST /store/vouchers/:code/claim", () => {
   })
 
   it("AC1 — invalid code returns 404 (constant-time)", async () => {
-    const req = makeReq("NOT-EXIST-999", validBody("NOT-EXIST-999"))
+    const svc = makeMockVoucherService({ voucher: null })
+    const req = makeReq("NOT-EXIST-999", validBody("NOT-EXIST-999"), "127.0.0.1", svc)
     const res = makeRes()
     await POST(req as never, res as never)
     expect(res._status).toBe(404)
   })
 
   it("AC1 — already claimed code returns 409 already_claimed", async () => {
-    const req = makeReq(CLAIMED_FIXTURE.code, validBody(CLAIMED_FIXTURE.code))
+    const svc = makeMockVoucherService({ voucher: CLAIMED_VOUCHER })
+    const req = makeReq(CLAIMED_VOUCHER.code, validBody(CLAIMED_VOUCHER.code), "127.0.0.1", svc)
     const res = makeRes()
     await POST(req as never, res as never)
     expect(res._status).toBe(409)
@@ -303,7 +362,8 @@ describe("POST /store/vouchers/:code/claim", () => {
   })
 
   it("AC1 — expired code returns 410", async () => {
-    const req = makeReq(EXPIRED_FIXTURE.code, validBody(EXPIRED_FIXTURE.code))
+    const svc = makeMockVoucherService({ voucher: EXPIRED_VOUCHER })
+    const req = makeReq(EXPIRED_VOUCHER.code, validBody(EXPIRED_VOUCHER.code), "127.0.0.1", svc)
     const res = makeRes()
     await POST(req as never, res as never)
     expect(res._status).toBe(410)
@@ -311,13 +371,15 @@ describe("POST /store/vouchers/:code/claim", () => {
 
   it("AC3 — idempotent replay with same binding returns 200", async () => {
     const body = validBody()
-    const req1 = makeReq(IDLE_FIXTURE.code, body)
+    const svc = makeMockVoucherService({ voucher: IDLE_VOUCHER })
+    const req1 = makeReq(IDLE_VOUCHER.code, body, "127.0.0.1", svc)
     const res1 = makeRes()
     await POST(req1 as never, res1 as never)
     expect(res1._status).toBe(200)
 
     // Replay with identical body
-    const req2 = makeReq(IDLE_FIXTURE.code, body)
+    const svc2 = makeMockVoucherService({ voucher: IDLE_VOUCHER })
+    const req2 = makeReq(IDLE_VOUCHER.code, body, "127.0.0.1", svc2)
     const res2 = makeRes()
     await POST(req2 as never, res2 as never)
     expect(res2._status).toBe(200)
@@ -326,7 +388,8 @@ describe("POST /store/vouchers/:code/claim", () => {
 
   it("AC3 — replay with tampered session → 409 replay_mismatch", async () => {
     const body = validBody()
-    const req1 = makeReq(IDLE_FIXTURE.code, body)
+    const svc1 = makeMockVoucherService({ voucher: IDLE_VOUCHER })
+    const req1 = makeReq(IDLE_VOUCHER.code, body, "127.0.0.1", svc1)
     const res1 = makeRes()
     await POST(req1 as never, res1 as never)
     expect(res1._status).toBe(200)
@@ -336,7 +399,8 @@ describe("POST /store/vouchers/:code/claim", () => {
       ...body,
       recipient_session: "TAMPERED-SESSION",
     }
-    const req2 = makeReq(IDLE_FIXTURE.code, tamperedBody)
+    const svc2 = makeMockVoucherService({ voucher: IDLE_VOUCHER })
+    const req2 = makeReq(IDLE_VOUCHER.code, tamperedBody, "127.0.0.1", svc2)
     const res2 = makeRes()
     await POST(req2 as never, res2 as never)
     expect(res2._status).toBe(409)
@@ -344,11 +408,12 @@ describe("POST /store/vouchers/:code/claim", () => {
   })
 
   it("AC3 — first request with arbitrary idempotency key → 409 replay_mismatch", async () => {
-    const req = makeReq(IDLE_FIXTURE.code, {
+    const svc = makeMockVoucherService({ voucher: IDLE_VOUCHER })
+    const req = makeReq(IDLE_VOUCHER.code, {
       recipient_session: "session-abc",
       claimed_at: "2026-05-04T12:00:00Z",
       idempotency_key: "550e8400-e29b-41d4-a716-446655440000",
-    })
+    }, "127.0.0.1", svc)
     const res = makeRes()
 
     await POST(req as never, res as never)
@@ -359,33 +424,36 @@ describe("POST /store/vouchers/:code/claim", () => {
 
   it("AC3 — audit log records replay_tampered outcome", async () => {
     const body = validBody()
-    await POST(makeReq(IDLE_FIXTURE.code, body) as never, makeRes() as never)
+    const svc1 = makeMockVoucherService({ voucher: IDLE_VOUCHER })
+    await POST(makeReq(IDLE_VOUCHER.code, body, "127.0.0.1", svc1) as never, makeRes() as never)
 
     const tamperedBody = { ...body, recipient_session: "TAMPERED" }
-    await POST(makeReq(IDLE_FIXTURE.code, tamperedBody) as never, makeRes() as never)
+    const svc2 = makeMockVoucherService({ voucher: IDLE_VOUCHER })
+    await POST(makeReq(IDLE_VOUCHER.code, tamperedBody, "127.0.0.1", svc2) as never, makeRes() as never)
 
     const log = _getAuditLog()
     const tamperRow = log.find((r) => r.outcome === "replay_tampered")
     expect(tamperRow).toBeDefined()
-    expect(tamperRow?.code).toBe(IDLE_FIXTURE.code)
+    expect(tamperRow?.code).toBe(IDLE_VOUCHER.code)
   })
 
   it("AC6 — 11th request from same IP → 429 with Retry-After header", async () => {
     _resetBuckets()
     const ip = "192.168.1.1"
     for (let i = 0; i < 10; i++) {
-      const req = makeReq(IDLE_FIXTURE.code, validBody(), ip)
-      // Use fresh fixture for each claim
-      upsertFixture({ ...IDLE_FIXTURE, code: `RATE-CODE-${i}`, status: "idle" })
+      const rateCode = `RATE-CODE-${i}`
+      const rateVoucher: VoucherWithEvents = { ...IDLE_VOUCHER, code: rateCode }
+      const svc = makeMockVoucherService({ voucher: rateVoucher })
+      const body = validBody(rateCode)
+      const req = makeReq(rateCode, body, ip, svc)
       const res = makeRes()
-      await POST(
-        { ...req, params: { code: `RATE-CODE-${i}` } } as never,
-        res as never
-      )
+      await POST(req as never, res as never)
     }
     // 11th request
-    upsertFixture({ ...IDLE_FIXTURE, code: "RATE-CODE-10", status: "idle" })
-    const req11 = makeReq("RATE-CODE-10", validBody("RATE-CODE-10"), ip)
+    const rateCode10 = "RATE-CODE-10"
+    const rateVoucher10: VoucherWithEvents = { ...IDLE_VOUCHER, code: rateCode10 }
+    const svc11 = makeMockVoucherService({ voucher: rateVoucher10 })
+    const req11 = makeReq(rateCode10, validBody(rateCode10), ip, svc11)
     const res11 = makeRes()
     await POST(req11 as never, res11 as never)
     expect(res11._status).toBe(429)
@@ -393,7 +461,8 @@ describe("POST /store/vouchers/:code/claim", () => {
   })
 
   it("AC1 — missing required fields → 400", async () => {
-    const req = makeReq(IDLE_FIXTURE.code, {})
+    const svc = makeMockVoucherService({ voucher: IDLE_VOUCHER })
+    const req = makeReq(IDLE_VOUCHER.code, {}, "127.0.0.1", svc)
     const res = makeRes()
     await POST(req as never, res as never)
     expect(res._status).toBe(400)

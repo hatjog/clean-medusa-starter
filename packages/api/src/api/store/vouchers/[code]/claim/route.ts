@@ -1,7 +1,7 @@
 /**
- * POST /store/vouchers/:code/claim — Story v160-cleanup-15c.
+ * POST /store/vouchers/:code/claim — Story v160-cleanup-25.
  *
- * Security contract:
+ * Security contract (preserved from v160-cleanup-15c):
  *   - Public-key gated (publishable API key header, handled by Medusa middleware).
  *   - IP-based token-bucket rate limit: 10 burst / 5 per-minute sustained → 429.
  *   - Constant-time response for unknown vs known code (anti-enumeration oracle).
@@ -10,6 +10,13 @@
  *     Replay with mismatched binding → 409 `replay_mismatch`.
  *   - Audit log row per attempt with outcome.
  *   - AR45 PII allowlist: no recipient PII in response body.
+ *
+ * v160-cleanup-25 changes:
+ *   - Voucher lookup/mutation via VoucherService (PG-backed) instead of
+ *     getFixtureByCode / upsertFixture from the deleted lib module.
+ *   - Claim state transition delegated to voucherService.claim(code) for
+ *     atomic DB transaction (status update + event append).
+ *   - ALS market-scope isolation (cleanup-27) preserved.
  *
  * @see packages/api/src/lib/voucher-claim-rate-limit.ts
  * @see packages/api/src/lib/claim-idempotency-binding.ts
@@ -24,11 +31,7 @@ import {
   computeBinding,
   verifyBinding,
 } from "../../../../../lib/claim-idempotency-binding"
-import {
-  getFixtureByCode,
-  upsertFixture,
-  type VoucherFixture,
-} from "../../../../../lib/voucher-fixture-store"
+import { VOUCHER_MODULE, type VoucherService } from "../../../../../modules/voucher"
 
 // Disable Medusa's default admin auth — public store endpoint.
 export const AUTHENTICATE = false
@@ -39,7 +42,7 @@ const RESPONSE_FLOOR_MS = 200
 /** In-memory idempotency binding store: idempotency_key → hex binding. */
 const _bindingStore = new Map<string, string>()
 
-/** In-memory audit log (appended in-process; v1.7.0 will flush to PG). */
+/** In-memory audit log (appended in-process). */
 export interface ClaimAuditRow {
   idempotency_key: string
   code: string
@@ -164,13 +167,16 @@ export async function POST(
     return
   }
 
-  // --- Lookup voucher (constant-time path — always check fixture first) ---
-  const fx = getFixtureByCode(code)
+  // --- Resolve voucher service ---
+  const voucherService = req.scope.resolve(VOUCHER_MODULE) as VoucherService
 
-  // Cross-market isolation (DPIA R-12, review fix M2): if ALS market context is set,
-  // voucher must declare a matching market_id. Fail-CLOSED: missing market_id is treated
-  // as "not in this market" (404 — do NOT 403, existence must not leak).
-  if (fx && market_id && fx.market_id !== market_id) {
+  // --- Lookup voucher early for market isolation check (constant-time path) ---
+  const voucherForCheck = await voucherService.getByCode(code)
+
+  // Cross-market isolation (DPIA R-12, cleanup-27 M2 fail-CLOSED): if ALS market
+  // context is set, voucher must declare a matching market_id. NULL market_id is
+  // treated as "not in this market" (404 — do NOT 403, existence must not leak).
+  if (voucherForCheck && market_id && voucherForCheck.market_id !== market_id) {
     await padToFloor(startedAt)
     res.status(404).json({
       type: "not_found",
@@ -241,7 +247,7 @@ export async function POST(
     res.status(200).json({
       state: "claimed",
       idempotent: true,
-      seller_handle: fx?.seller_handle ?? null,
+      seller_handle: voucherForCheck?.seller_handle ?? null,
     })
     return
   }
@@ -250,7 +256,7 @@ export async function POST(
   _bindingStore.set(idempotencyKey, expectedBinding)
 
   // --- Voucher existence check (constant-time: always runs this code path) ---
-  if (!fx) {
+  if (!voucherForCheck) {
     await padToFloor(startedAt)
     _auditLog.push({
       idempotency_key: idempotencyKey,
@@ -267,7 +273,7 @@ export async function POST(
   }
 
   // --- Server-side expiry pre-check ---
-  if (fx.expires_at && new Date(fx.expires_at) < new Date()) {
+  if (voucherForCheck.expires_at && voucherForCheck.expires_at < new Date()) {
     await padToFloor(startedAt)
     _auditLog.push({
       idempotency_key: idempotencyKey,
@@ -284,7 +290,7 @@ export async function POST(
   }
 
   // --- Already claimed check ---
-  if (fx.status === "claimed") {
+  if (voucherForCheck.status === "claimed") {
     await padToFloor(startedAt)
     _auditLog.push({
       idempotency_key: idempotencyKey,
@@ -301,21 +307,35 @@ export async function POST(
     return
   }
 
-  // --- State transition: idle → claimed ---
+  // --- State transition: idle → claimed (atomic via voucherService.claim) ---
+  const claimResult = await voucherService.claim(code)
   const claimedAtIso = new Date().toISOString()
-  const updatedFx: VoucherFixture = {
-    ...fx,
-    status: "claimed",
-    events: [
-      ...fx.events,
-      {
-        id: `evt-${fx.code.toLowerCase()}-claimed-${Date.now()}`,
-        event_type: "claimed",
-        occurred_at: claimedAtIso,
-      },
-    ],
+
+  if (claimResult.status !== "claimed") {
+    // Unexpected result after pre-checks passed — guard defensively.
+    await padToFloor(startedAt)
+    _auditLog.push({
+      idempotency_key: idempotencyKey,
+      code,
+      ip,
+      outcome: claimResult.status === "already_claimed" ? "already_claimed" : "invalid_code",
+      occurred_at: claimedAtIso,
+    })
+    if (claimResult.status === "already_claimed") {
+      res.status(409).json({
+        type: "already_claimed",
+        message: "Voucher has already been claimed.",
+        state: "claimed",
+      })
+    } else if (claimResult.status === "expired") {
+      res.status(410).json({ type: "expired", message: "Voucher has expired." })
+    } else {
+      res.status(404).json({ type: "not_found", message: "Voucher not found." })
+    }
+    return
   }
-  upsertFixture(updatedFx)
+
+  const updatedVoucher = claimResult.voucher
 
   _auditLog.push({
     idempotency_key: idempotencyKey,
@@ -326,8 +346,8 @@ export async function POST(
   })
 
   await emitVoucherClaimedEvent(req, {
-    voucher_id: updatedFx.code,
-    voucher_code: updatedFx.code,
+    voucher_id: updatedVoucher.code,
+    voucher_code: updatedVoucher.code,
     claimed_at: claimedAtIso,
   })
 
@@ -337,6 +357,6 @@ export async function POST(
   res.status(200).json({
     state: "claimed",
     claimed_at: claimedAtIso,
-    seller_handle: updatedFx.seller_handle,
+    seller_handle: updatedVoucher.seller_handle,
   })
 }

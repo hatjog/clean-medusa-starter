@@ -1,13 +1,12 @@
 /**
- * Story v160-cleanup-13b — GET /store/vouchers/:code
+ * Story v160-cleanup-25 — GET /store/vouchers/:code
  *
  * Public storefront endpoint backing the recipient claim page
- * (`/voucher/[code]`). Returns the public projection of a voucher fixture
+ * (`/voucher/[code]`). Returns the public projection of a voucher
  * (AR45 PII allowlist applied — only listed fields cross the boundary).
  *
- * v1.6.0 backed by an in-memory fixture store (see
- * `src/lib/voucher-fixture-store.ts`). v1.7.0 will swap to Mercur 2 native
- * voucher entity or a PG-backed table without changing this contract.
+ * Backed by Medusa 2 voucher module (PG-persistent) replacing the former
+ * in-memory voucher-fixture-store.ts.
  *
  * @see GP/storefront/src/lib/data/voucher.ts (consumer)
  * @see specs/constitution/AR45-pii.md
@@ -16,7 +15,7 @@
 
 import type { MedusaRequest, MedusaResponse } from "@medusajs/framework/http"
 import { marketContextStorage } from "../../../../lib/market-context"
-import { getFixtureByCode } from "../../../../lib/voucher-fixture-store"
+import { VOUCHER_MODULE, type VoucherService, type VoucherWithEvents } from "../../../../modules/voucher"
 
 // Disable Medusa's default admin auth — this is a public store endpoint
 // gated by publishable-api-key middleware (handled upstream).
@@ -35,24 +34,24 @@ interface VoucherPublicView {
 }
 
 /**
- * AR45 allowlist projection. Defensive — even if upstream fixture grows new
+ * AR45 allowlist projection. Defensive — even if upstream model grows new
  * fields, only the listed keys leave this boundary. NEVER replace with a
  * deny-list (whitelist preserves invariant under future schema additions).
  */
 function projectAllowlist(
-  fx: ReturnType<typeof getFixtureByCode>,
+  voucher: VoucherWithEvents | null,
 ): VoucherPublicView | null {
-  if (!fx) return null
+  if (!voucher) return null
   return {
-    code: fx.code,
-    seller_id: fx.seller_id,
-    seller_name: fx.seller_name,
-    seller_handle: fx.seller_handle,
-    product_title: fx.product_title,
-    value_minor: fx.value_minor,
-    currency_code: fx.currency_code,
-    status: fx.status,
-    expires_at: fx.expires_at,
+    code: voucher.code,
+    seller_id: voucher.seller_id,
+    seller_name: voucher.seller_name,
+    seller_handle: voucher.seller_handle,
+    product_title: voucher.product_title,
+    value_minor: voucher.value_minor,
+    currency_code: voucher.currency_code,
+    status: voucher.status,
+    expires_at: voucher.expires_at ? voucher.expires_at.toISOString() : null,
   }
 }
 
@@ -74,19 +73,19 @@ export async function GET(
     return
   }
 
-  const fx = getFixtureByCode(code)
-  // Cross-market isolation (DPIA R-12): if ALS market context is set, voucher must
-  // declare a matching market_id. Fail-CLOSED: a fixture missing market_id is treated
-  // as "not in this market" (404). Review fix M2 — prevents legacy/unscoped fixtures
-  // from leaking across markets when ALS context is present.
-  if (fx && market_id && fx.market_id !== market_id) {
+  const voucherService = req.scope.resolve(VOUCHER_MODULE) as VoucherService
+  const voucher = await voucherService.getByCode(code)
+
+  // Cross-market isolation: if ALS market context is set and voucher market differs, 404.
+  if (voucher && market_id && voucher.market_id !== market_id) {
     res.status(404).json({
       type: "not_found",
       message: "Voucher not found",
     })
     return
   }
-  const view = projectAllowlist(fx)
+
+  const view = projectAllowlist(voucher)
   if (!view) {
     res.status(404).json({
       type: "not_found",
