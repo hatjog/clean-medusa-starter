@@ -67,12 +67,38 @@ const E2E_FIXTURES: FixtureSeed[] = [
   },
 ]
 
-export default async function voucherSeedFixturesLoader(): Promise<void> {
+/**
+ * Medusa 2 module loaders receive `({ container, options, ... })`. We accept
+ * the arg loosely and ignore it — the seeder owns its own raw pg connection
+ * to keep the contract explicit (no MikroORM coupling) and to remain
+ * independent of MedusaService bootstrap order.
+ *
+ * Env guards (post-review F3 + F8):
+ *   - production            → skip (never seed prod)
+ *   - test (NODE_ENV=test)  → skip unless GP_VOUCHER_SEED_E2E=1 explicitly opt-in
+ *   - dev / undefined       → seed
+ *   - strict mode           → re-throw on error when GP_VOUCHER_SEED_STRICT=1
+ *                             OR when running under NODE_ENV=test (so CI catches drift)
+ */
+export default async function voucherSeedFixturesLoader(
+  _container?: unknown,
+): Promise<void> {
   if (process.env.NODE_ENV === "production") return
+
+  const isTest = process.env.NODE_ENV === "test"
+  const optInE2E = process.env.GP_VOUCHER_SEED_E2E === "1"
+  if (isTest && !optInE2E) {
+    // Tests own their own DB state; never auto-seed.
+    return
+  }
+
+  const strict = process.env.GP_VOUCHER_SEED_STRICT === "1" || isTest
 
   const databaseUrl = process.env.DATABASE_URL
   if (!databaseUrl) {
-    console.warn("[voucher/seed-fixtures] DATABASE_URL not set — skipping fixture seed")
+    const msg = "[voucher/seed-fixtures] DATABASE_URL not set — skipping fixture seed"
+    if (strict) throw new Error(msg)
+    console.warn(msg)
     return
   }
 
@@ -107,8 +133,12 @@ export default async function voucherSeedFixturesLoader(): Promise<void> {
     }
     console.log("[voucher/seed-fixtures] E2E fixtures seeded (idempotent)")
   } catch (err) {
-    console.error("[voucher/seed-fixtures] Seed error (non-fatal in dev):", err)
+    console.error("[voucher/seed-fixtures] Seed error:", err)
+    if (strict) {
+      await pool.end().catch(() => {})
+      throw err
+    }
   } finally {
-    await pool.end()
+    await pool.end().catch(() => {})
   }
 }

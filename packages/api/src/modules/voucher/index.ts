@@ -11,6 +11,7 @@
 
 import { Module } from "@medusajs/framework/utils"
 import VoucherService from "./service"
+import voucherSeedFixturesLoader from "./loaders/seed-fixtures"
 
 export const VOUCHER_MODULE = "voucher"
 
@@ -29,4 +30,5 @@ export type {
 
 export default Module(VOUCHER_MODULE, {
   service: VoucherService,
+  loaders: [voucherSeedFixturesLoader],
 })

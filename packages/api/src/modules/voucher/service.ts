@@ -204,20 +204,50 @@ export class VoucherService {
       return { status: "expired", voucher }
     }
 
-    // Atomic status transition + event append in a transaction
+    // F2 fix: Atomic status transition + event append in a transaction.
+    // Use SELECT ... FOR UPDATE to lock the row, then conditional UPDATE
+    // gated on status<>'claimed' so concurrent callers cannot double-fire
+    // the `claimed` event.
     const client = await pool.connect()
+    let didTransition = false
     try {
       await client.query("BEGIN")
-      await client.query(
-        `UPDATE voucher SET status = 'claimed', updated_at = NOW() WHERE code = $1`,
+      const lockRes = await client.query<{ status: string; expires_at: Date | null }>(
+        `SELECT status, expires_at FROM voucher WHERE code = $1 FOR UPDATE`,
         [code]
       )
-      const eventId = randomUUID()
-      await client.query(
-        `INSERT INTO voucher_event (id, voucher_code, event_type, occurred_at, created_at)
-         VALUES ($1, $2, 'claimed', $3, NOW())`,
-        [eventId, code, now]
+      if (lockRes.rows.length === 0) {
+        await client.query("ROLLBACK")
+        return { status: "not_found", voucher: null }
+      }
+      const lockedStatus = lockRes.rows[0].status
+      const lockedExpires = lockRes.rows[0].expires_at
+        ? new Date(lockRes.rows[0].expires_at)
+        : null
+      if (lockedStatus === "claimed") {
+        await client.query("ROLLBACK")
+        const current = await this.getByCode(code)
+        return { status: "already_claimed", voucher: current ?? voucher }
+      }
+      if (lockedExpires && lockedExpires < now) {
+        await client.query("ROLLBACK")
+        const current = await this.getByCode(code)
+        return { status: "expired", voucher: current ?? voucher }
+      }
+      const updRes = await client.query(
+        `UPDATE voucher SET status = 'claimed', updated_at = NOW()
+         WHERE code = $1 AND status <> 'claimed'`,
+        [code]
       )
+      if ((updRes.rowCount ?? 0) > 0) {
+        const eventId = randomUUID()
+        await client.query(
+          `INSERT INTO voucher_event (id, voucher_code, event_type, occurred_at, created_at)
+           VALUES ($1, $2, 'claimed', $3, NOW())`,
+          [eventId, code, now]
+        )
+        didTransition = true
+      }
       await client.query("COMMIT")
     } catch (err) {
       await client.query("ROLLBACK")
@@ -228,6 +258,10 @@ export class VoucherService {
 
     const updated = await this.getByCode(code)
     if (!updated) throw new Error(`VoucherService.claim: failed to read back ${code}`)
+    if (!didTransition) {
+      // Race lost — a concurrent caller already transitioned to claimed.
+      return { status: "already_claimed", voucher: updated }
+    }
     return { status: "claimed", voucher: updated }
   }
 }

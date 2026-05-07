@@ -15,8 +15,7 @@
 
 import type { MedusaRequest, MedusaResponse } from "@medusajs/framework/http"
 import { marketContextStorage } from "../../../../lib/market-context"
-import type { VoucherService } from "../../../../modules/voucher"
-import type { VoucherWithEvents } from "../../../../modules/voucher"
+import { VOUCHER_MODULE, type VoucherService, type VoucherWithEvents } from "../../../../modules/voucher"
 
 // Disable Medusa's default admin auth — this is a public store endpoint
 // gated by publishable-api-key middleware (handled upstream).
@@ -74,7 +73,7 @@ export async function GET(
     return
   }
 
-  const voucherService = req.scope.resolve("voucher") as VoucherService
+  const voucherService = req.scope.resolve(VOUCHER_MODULE) as VoucherService
   const voucher = await voucherService.getByCode(code)
 
   // Cross-market isolation: if ALS market context is set and voucher market differs, 404.

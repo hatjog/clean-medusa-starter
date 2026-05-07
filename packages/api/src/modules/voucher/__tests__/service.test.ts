@@ -222,12 +222,13 @@ describe("VoucherService", () => {
           { rows: [claimedRow] },
           { rows: claimedEvents },
         ],
-        // Transaction client: BEGIN / UPDATE / INSERT / COMMIT
+        // F2: Transaction client: BEGIN / SELECT FOR UPDATE / UPDATE / INSERT / COMMIT
         clientQueryResponses: [
-          { rows: [] },
-          { rows: [] },
-          { rows: [] },
-          { rows: [] },
+          { rows: [] },                                                    // BEGIN
+          { rows: [{ status: "idle", expires_at: IDLE_ROW.expires_at }] }, // SELECT FOR UPDATE
+          { rows: [], rowCount: 1 } as unknown as { rows: QueryRow[] },    // UPDATE
+          { rows: [] },                                                    // INSERT event
+          { rows: [] },                                                    // COMMIT
         ],
       })
       const svc = makeService(pool)

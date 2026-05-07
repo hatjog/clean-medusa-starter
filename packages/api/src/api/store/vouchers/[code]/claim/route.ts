@@ -31,7 +31,7 @@ import {
   computeBinding,
   verifyBinding,
 } from "../../../../../lib/claim-idempotency-binding"
-import type { VoucherService } from "../../../../../modules/voucher"
+import { VOUCHER_MODULE, type VoucherService } from "../../../../../modules/voucher"
 
 // Disable Medusa's default admin auth — public store endpoint.
 export const AUTHENTICATE = false
@@ -168,7 +168,7 @@ export async function POST(
   }
 
   // --- Resolve voucher service ---
-  const voucherService = req.scope.resolve("voucher") as VoucherService
+  const voucherService = req.scope.resolve(VOUCHER_MODULE) as VoucherService
 
   // --- Lookup voucher early for market isolation check (constant-time path) ---
   const voucherForCheck = await voucherService.getByCode(code)

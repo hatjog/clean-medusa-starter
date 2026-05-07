@@ -13,6 +13,9 @@ export class Migration20260507000000 extends Migration {
     this.addSql(`
       CREATE TABLE IF NOT EXISTS voucher (
         code            text PRIMARY KEY,
+        -- F7: market_id NULL = global voucher (E2E fixtures only).
+        -- Production vouchers MUST set market_id explicitly to enforce
+        -- DPIA R-12 cross-market isolation at the route layer (cleanup-27 ALS).
         market_id       text NULL,
         seller_id       text NOT NULL,
         seller_name     text NOT NULL,
@@ -32,6 +35,13 @@ export class Migration20260507000000 extends Migration {
     this.addSql(`
       CREATE INDEX IF NOT EXISTS voucher_market_id_idx ON voucher (market_id)
         WHERE market_id IS NOT NULL
+    `)
+    // F4: partial index on expires_at for upcoming expiry-sweeper queries
+    // (cleanup-44 / cleanup-55 expiry processing). NULL expires_at rows
+    // (non-expiring vouchers) excluded — index stays small.
+    this.addSql(`
+      CREATE INDEX IF NOT EXISTS voucher_expires_at_idx ON voucher (expires_at)
+        WHERE expires_at IS NOT NULL
     `)
 
     this.addSql(`

@@ -15,7 +15,7 @@
 
 import type { MedusaRequest, MedusaResponse } from "@medusajs/framework/http"
 import { marketContextStorage } from "../../../../../lib/market-context"
-import type { VoucherService, VoucherEventType } from "../../../../../modules/voucher"
+import { VOUCHER_MODULE, type VoucherService, type VoucherEventType } from "../../../../../modules/voucher"
 
 export const AUTHENTICATE = false
 
@@ -49,7 +49,7 @@ export async function GET(
     return
   }
 
-  const voucherService = req.scope.resolve("voucher") as VoucherService
+  const voucherService = req.scope.resolve(VOUCHER_MODULE) as VoucherService
   const voucher = await voucherService.getByCode(code)
 
   // Cross-market isolation: if ALS market context is set and voucher market differs, 404.
