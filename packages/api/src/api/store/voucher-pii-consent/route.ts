@@ -84,8 +84,8 @@ function setSecurityHeaders(res: MedusaResponse): void {
 }
 
 function resolveService(req: MedusaRequest): VoucherPiiService | null {
-  // Medusa container resolution. Service is registered via loader at boot
-  // (TODO(MEDUSA-CONTAINER): wire `voucher_pii` key in src/loaders).
+  // Medusa container resolution. Service is registered via loader at boot.
+  // Wired by packages/api/src/loaders/voucher-pii.ts (cleanup-44 / TF-105).
   const scope = (req as unknown as { scope?: { resolve?: (k: string) => unknown } })
     .scope;
   try {
