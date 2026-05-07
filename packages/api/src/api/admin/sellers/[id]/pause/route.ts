@@ -96,6 +96,10 @@ const extractMarketId = (req: MedusaRequest): string => {
   return ""
 }
 
+// @ar45-admin-exclusion: admin seller pause is cross-market by design per AR44
+// §admin-exclusion. market_id is resolved from `x-gp-market-id` header OR
+// `seller.market_id` from the DB row in-tx (effectiveMarketId), NOT from ALS.
+// Story v160-cleanup-61 review fix M4 — replaces baseline FP suppression.
 export async function POST(req: MedusaRequest, res: MedusaResponse): Promise<void> {
   const sellerId = (req.params as { id?: string }).id
   if (!sellerId) {
