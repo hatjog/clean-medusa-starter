@@ -30,10 +30,16 @@ export async function GET(
     scope: req.scope as { resolve: (key: string) => unknown },
   })
   const tick_history_24h = await getTickHistory24h(db)
+
+  // Parse ?rollback_limit=<N> — clamp [1, 500], fallback to default 50 on invalid input.
+  const rawLimit = Number.parseInt(String(req.query?.rollback_limit ?? ""), 10)
+  const rollback_limit =
+    Number.isFinite(rawLimit) && rawLimit >= 1 && rawLimit <= 500 ? rawLimit : 50
+
   res.json({
     firing: current.firing,
     history_24h: await getFiringHistory24h(db),
-    auto_rollback_history: await getRollbackHistory24h(db),
+    auto_rollback_history: await getRollbackHistory24h(db, { limit: rollback_limit }),
     configured: listConfiguredAlerts(),
     computed_at: current.computed_at,
     tick_history_24h,

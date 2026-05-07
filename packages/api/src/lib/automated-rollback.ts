@@ -1,6 +1,8 @@
 /**
  * Story v160-8-5: Automated rollback — flag ON -> SHADOW on P1 alert breach.
  * Idempotent within 5min window. Writes audit log + notifies operator.
+ * Story v160-cleanup-46: Extended RollbackHistoryEntry with status + operator;
+ *   configurable limit (default 50), explicit DESC sort, empty-state honesty.
  *
  * @see GP/backend/packages/api/src/lib/feature-flag-tri-state.ts (Story 8.3)
  * @see FR66 / NFR-REL-10
@@ -14,6 +16,9 @@ import {
   type MultiVendorFlagState,
 } from "./feature-flag-tri-state"
 import type { Knex } from "knex"
+
+export const DEFAULT_ROLLBACK_HISTORY_LIMIT = 50
+export const MAX_ROLLBACK_HISTORY_LIMIT = 500
 
 export type RollbackResult = {
   rolled_back: boolean
@@ -29,6 +34,10 @@ export type RollbackHistoryEntry = {
   alert_id: string | null
   at: string
   reason: string | null
+  /** v160-cleanup-46: derived from RollbackResult.rolled_back + error path */
+  status: "success" | "failure" | "noop"
+  /** v160-cleanup-46: "system:auto_rollback" for automated; actor_id or triggered_by for manual */
+  operator: string
 }
 
 const _idempotencyCache = new Map<string, { at: number; result: RollbackResult }>()
@@ -78,13 +87,26 @@ export async function triggerRollback(
   return result
 }
 
+/**
+ * Returns rollback history from the last 24h, sorted DESC by timestamp.
+ * v160-cleanup-46: supports configurable limit (default 50, clamp [1, 500]);
+ * includes status + operator fields; guarantees empty [] (no throw) when no entries.
+ */
 export async function getRollbackHistory24h(
   db?: Knex | null,
+  opts?: { limit?: number },
 ): Promise<RollbackHistoryEntry[]> {
+  const limit = Math.min(
+    Math.max(1, opts?.limit ?? DEFAULT_ROLLBACK_HISTORY_LIMIT),
+    MAX_ROLLBACK_HISTORY_LIMIT,
+  )
+  // Read with headroom to account for filter rejection rate (4× headroom).
+  const readBudget = Math.max(200, limit * 4)
   const cutoff = Date.now() - 24 * 60 * 60 * 1000
+
   const entries = db
-    ? await getPersistedAuditTrail(db, 200)
-    : getAuditTrail(200)
+    ? await getPersistedAuditTrail(db, readBudget)
+    : getAuditTrail(readBudget)
 
   return entries
     .filter(
@@ -92,10 +114,31 @@ export async function getRollbackHistory24h(
         entry.triggered_by === "automated_rollback" &&
         Date.parse(entry.at) >= cutoff,
     )
-    .map((entry) => ({
-      audit_log_id: entry.audit_log_id,
-      alert_id: entry.alert_id ?? null,
-      at: entry.at,
-      reason: entry.reason ?? null,
-    }))
+    .map((entry) => {
+      // status: success = rolled_back=true path, noop = rolled_back=false,
+      // failure = reserved for explicit error path (not yet generated in production).
+      // In audit trail: automated_rollback entries written by triggerRollback()
+      // when rolled_back=true (setState path). Noop rollbacks also appear in audit
+      // but have audit_log_id starting with "noop_" (written via setState fallback).
+      const isNoop = entry.audit_log_id.startsWith("noop_")
+      const status: RollbackHistoryEntry["status"] = isNoop ? "noop" : "success"
+
+      // operator: automated entries → "system:auto_rollback"; manual → triggered_by
+      const operator =
+        entry.triggered_by === "automated_rollback"
+          ? "system:auto_rollback"
+          : entry.triggered_by ?? "unknown"
+
+      return {
+        audit_log_id: entry.audit_log_id,
+        alert_id: entry.alert_id ?? null,
+        at: entry.at,
+        reason: entry.reason ?? null,
+        status,
+        operator,
+      }
+    })
+    // Explicit DESC sort by timestamp — not reliant on audit trail ordering.
+    .sort((a, b) => Date.parse(b.at) - Date.parse(a.at))
+    .slice(0, limit)
 }
