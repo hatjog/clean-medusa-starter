@@ -29,9 +29,36 @@ import { GET as pauseGateListGET } from "../../../api/admin/vendors/pause-gate/r
 import { POST as t30POST } from "../../../api/admin/vendors/notifications/t30/route"
 import { POST as nudgesPost } from "../../../api/admin/vendors/notifications/nudges/route"
 import { _resetRingBuffer, getRingBuffer } from "../../../lib/alert-emit"
-import { Modules } from "@medusajs/framework/utils"
+import { Modules, ContainerRegistrationKeys } from "@medusajs/framework/utils"
 
 // ---- helpers ----------------------------------------------------------------
+
+/**
+ * Minimal Knex mock for the vendor_decision_idempotency table.
+ * cleanup-36: decision route now requires a DB connection for idempotency
+ * lookups. The default behaviour here:
+ *   - findIdempotencyRecord → no existing row (first call path)
+ *   - persistIdempotencyRecord → returns a synthetic persisted row
+ */
+function makeDefaultIdempotencyKnex(idempotencyKey = "a1b2c3d4-e5f6-4a7b-b8c9-d0e1f2a3b4c5") {
+  const firstMock = jest.fn().mockResolvedValue(undefined) // no existing row
+  const whereMock = jest.fn(() => ({ first: firstMock }))
+  const returningMock = jest.fn().mockResolvedValue([
+    {
+      id: "idem-default",
+      idempotency_key: idempotencyKey,
+      vendor_id: "vendor_01",
+      request_hash: "default-hash",
+      status_code: 200,
+      response_body: {},
+      created_at: new Date().toISOString(),
+    },
+  ])
+  const ignoreMock = jest.fn(() => ({ returning: returningMock }))
+  const onConflictMock = jest.fn(() => ({ ignore: ignoreMock }))
+  const insertMock = jest.fn(() => ({ onConflict: onConflictMock }))
+  return jest.fn(() => ({ where: whereMock, insert: insertMock }))
+}
 
 function createReq(opts: {
   authContext?: { actor_id?: string; actor_type?: string }
@@ -39,6 +66,11 @@ function createReq(opts: {
   params?: Record<string, string>
   query?: Record<string, unknown>
   scopeOverrides?: Record<string, unknown>
+  /**
+   * Extra HTTP headers. Defaults include `idempotency-key` for decision
+   * endpoints (cleanup-36: strict policy requires UUIDv4 header).
+   */
+  headers?: Record<string, string>
 }) {
   const logger = {
     warn: jest.fn(),
@@ -51,10 +83,24 @@ function createReq(opts: {
     body: opts.body ?? {},
     params: opts.params ?? { id: "vendor_01" },
     query: opts.query ?? {},
+    // cleanup-36: decision route requires Idempotency-Key; provide a stable
+    // default so existing tests don't need to change their expectations.
+    headers: {
+      "idempotency-key": "a1b2c3d4-e5f6-4a7b-b8c9-d0e1f2a3b4c5",
+      ...opts.headers,
+    },
     scope: {
       resolve: (key: string) => {
         if (opts.scopeOverrides && key in opts.scopeOverrides) {
           return opts.scopeOverrides[key]
+        }
+
+        // cleanup-36: decision route needs PG_CONNECTION for idempotency table.
+        if (key === ContainerRegistrationKeys.PG_CONNECTION) {
+          return makeDefaultIdempotencyKnex(
+            (opts.headers?.["idempotency-key"] as string | undefined) ??
+              "a1b2c3d4-e5f6-4a7b-b8c9-d0e1f2a3b4c5",
+          )
         }
 
         return logger
