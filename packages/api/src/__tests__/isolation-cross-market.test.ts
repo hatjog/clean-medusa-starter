@@ -7,22 +7,19 @@
  * AC6 (TF-46): store/vouchers routes with ALS market_id = B must return 404 when
  *   the voucher belongs to market A (existence must NOT leak across markets — 404 not 403).
  *
- * These are unit-level isolation tests using in-memory ports and the fixture store.
- * Full integration (live Postgres) is covered by docker-compose stack per STAGING-FREE
- * policy (ADR-066 / UX-DR108).
+ * These are unit-level isolation tests using in-memory ports and VoucherWithEvents
+ * objects. Full integration (live Postgres) is covered by docker-compose stack per
+ * STAGING-FREE policy (ADR-066 / UX-DR108).
+ *
+ * v160-cleanup-25: updated from fixture-store to VoucherService-compatible types
+ * (voucher-fixture-store.ts was deleted as part of this story).
  *
  * DPIA R-12 mitigation evidence: test names + commit SHA recorded in story completion notes.
  */
 
-import { describe, expect, it, afterEach, beforeEach } from "@jest/globals"
+import { describe, expect, it, beforeEach } from "@jest/globals"
 
 import { marketContextStorage } from "../lib/market-context"
-import {
-  clearFixturesForTest,
-  getFixtureByCode,
-  upsertFixture,
-  type VoucherFixture,
-} from "../lib/voucher-fixture-store"
 import { VoucherPiiService } from "../modules/voucher-pii/voucher-pii.service"
 import type {
   AuditChainPort,
@@ -36,6 +33,8 @@ import type {
   DeliveryOutcome,
   ConsentStateSnapshot,
 } from "../modules/voucher-pii/types"
+import type { VoucherWithEvents } from "../modules/voucher"
+import type { VoucherStatus, VoucherEventType } from "../modules/voucher"
 
 // ---------------------------------------------------------------------------
 // In-memory ports for AC4 tests
@@ -73,18 +72,18 @@ class MarketSegregatedPiiPort implements VoucherPiiPort {
     return { rows_affected: before - this.inserts.length }
   }
 
-  async purgeByMarketBefore(args: { market_id: string; cutoff: Date; batch_size: number }): Promise<{ rows_deleted: number }> {
+  async purgeByMarketBefore(_args: { market_id: string; cutoff: Date; batch_size: number }): Promise<{ rows_deleted: number }> {
     return { rows_deleted: 0 }
   }
 
-  async cleanupOrphans(args: { batch_size: number }): Promise<{ rows_deleted: number }> {
+  async cleanupOrphans(_args: { batch_size: number }): Promise<{ rows_deleted: number }> {
     return { rows_deleted: 0 }
   }
 }
 
 class FakeAuditPort implements AuditChainPort {
   private nextId = 1
-  async appendAuditRow(args: { market_id: string; payload: Record<string, unknown> }): Promise<{ audit_id: string }> {
+  async appendAuditRow(_args: { market_id: string; payload: Record<string, unknown> }): Promise<{ audit_id: string }> {
     return { audit_id: `audit_${this.nextId++}` }
   }
   async getLatestForOrder(_args: { market_id: string; order_id: string }): Promise<ConsentStateSnapshot | null> {
@@ -97,7 +96,7 @@ class FakeAuditPort implements AuditChainPort {
 
 class FakeDeliveryPort implements DeliveryDecisionPort {
   private nextId = 1
-  async insertPending(args: { consent_audit_id: string; market_id: string }): Promise<{ delivery_decision_id: string }> {
+  async insertPending(_args: { consent_audit_id: string; market_id: string }): Promise<{ delivery_decision_id: string }> {
     return { delivery_decision_id: `del_${this.nextId++}` }
   }
   async recordOutcome(_args: {
@@ -123,6 +122,47 @@ class FakeRateLimit implements RateLimitPort {
   async consume(_args: { bucket_key: string; bucket_size: number; refill_per_min: number }): Promise<{ allowed: boolean; retry_after_ms: number }> {
     return { allowed: true, retry_after_ms: 0 }
   }
+}
+
+// ---------------------------------------------------------------------------
+// Helper: make a minimal VoucherWithEvents for isolation tests
+// ---------------------------------------------------------------------------
+
+function makeVoucher(
+  code: string,
+  market_id: string | null,
+  status: VoucherStatus = "idle"
+): VoucherWithEvents {
+  return {
+    code,
+    market_id,
+    seller_id: "sel_test",
+    seller_name: "Test Seller",
+    seller_handle: "test-seller",
+    product_title: "Test Product",
+    value_minor: 10000,
+    currency_code: "PLN",
+    status,
+    expires_at: new Date("2027-12-31T23:59:59Z"),
+    created_at: new Date(),
+    updated_at: new Date(),
+    events: [],
+  }
+}
+
+/**
+ * Simulates the route handler's cross-market isolation check
+ * (cleanup-27 ALS guard — same logic as updated route.ts).
+ */
+function routeIsolationCheck(
+  voucher: VoucherWithEvents | null,
+  alsMarketId: string | null
+): { blocked: boolean } {
+  if (!voucher) return { blocked: true }
+  if (alsMarketId && voucher.market_id !== null && voucher.market_id !== alsMarketId) {
+    return { blocked: true }
+  }
+  return { blocked: false }
 }
 
 // ---------------------------------------------------------------------------
@@ -223,133 +263,50 @@ describe("v160-cleanup-27 AC4: voucher-pii cross-market isolation (DPIA R-12)", 
 
 // ---------------------------------------------------------------------------
 // AC6 — store/vouchers cross-market isolation
+// Uses VoucherWithEvents objects directly (no DB); tests the isolation
+// logic that route.ts/events/route.ts/claim/route.ts implements via
+// cleanup-27 ALS guards (TF-46).
 // ---------------------------------------------------------------------------
 
 describe("v160-cleanup-27 AC6: store/vouchers cross-market isolation (DPIA R-12)", () => {
   const MARKET_A = "bonbeauty"
   const MARKET_B = "kremidotyk"
 
-  beforeEach(() => {
-    clearFixturesForTest()
-  })
-
-  afterEach(() => {
-    clearFixturesForTest()
-  })
-
   it("store/vouchers cross-market isolation: voucher seeded in market A is NOT found from market B context", () => {
-    // Seed voucher in market A
-    const voucherA: VoucherFixture = {
-      code: "VOUCHER-MARKET-A-001",
-      market_id: MARKET_A,
-      seller_id: "sel_bonbeauty_001",
-      seller_name: "BonBeauty Seller",
-      seller_handle: "bonbeauty-seller",
-      product_title: "Test Product A",
-      value_minor: 10000,
-      currency_code: "PLN",
-      status: "idle",
-      expires_at: "2027-12-31T23:59:59Z",
-      events: [],
-    }
-    upsertFixture(voucherA)
+    const voucherA = makeVoucher("VOUCHER-MARKET-A-001", MARKET_A)
 
-    // From market A context — fixture IS found
-    const fxFromA = getFixtureByCode("VOUCHER-MARKET-A-001")
-    expect(fxFromA).not.toBeNull()
-    expect(fxFromA?.market_id).toBe(MARKET_A)
+    // From market A context — accessible
+    const checkFromA = routeIsolationCheck(voucherA, MARKET_A)
+    expect(checkFromA.blocked).toBe(false)
 
-    // Cross-market isolation: market B context must NOT see market A voucher
-    // (simulates the route handler behaviour added in cleanup-27g)
-    const fxFound = getFixtureByCode("VOUCHER-MARKET-A-001")
-    const crossMarketBlocked = fxFound !== null &&
-      "market_id" in fxFound &&
-      fxFound.market_id !== MARKET_B
-    expect(crossMarketBlocked).toBe(true)
-    // If blocked, route returns 404 — existence must NOT leak (not 403)
+    // From market B context — blocked
+    const checkFromB = routeIsolationCheck(voucherA, MARKET_B)
+    expect(checkFromB.blocked).toBe(true)
+    // Route returns 404 — existence must NOT leak (not 403)
   })
 
   it("store/vouchers cross-market isolation: market B request for market A voucher → 404 not 403 (existence must not leak)", () => {
-    const voucherA: VoucherFixture = {
-      code: "VOUCHER-DPIA-R12-001",
-      market_id: MARKET_A,
-      seller_id: "sel_001",
-      seller_name: "Seller A",
-      seller_handle: "seller-a",
-      product_title: "PII-test product",
-      value_minor: 5000,
-      currency_code: "PLN",
-      status: "idle",
-      expires_at: null,
-      events: [],
-    }
-    upsertFixture(voucherA)
+    const voucherA = makeVoucher("VOUCHER-DPIA-R12-001", MARKET_A)
 
     // Simulate route handler logic: ALS context = market B, voucher belongs to market A
-    const alsMarketId = MARKET_B
-    const fx = getFixtureByCode("VOUCHER-DPIA-R12-001")
-
-    // Route returns 404 if ALS market_id differs from voucher market_id
-    const shouldReturn404 = fx !== null &&
-      "market_id" in fx &&
-      fx.market_id !== alsMarketId
-
-    expect(shouldReturn404).toBe(true)
+    const { blocked } = routeIsolationCheck(voucherA, MARKET_B)
+    expect(blocked).toBe(true)
     // NOT 403 — the status code must be 404 to avoid leaking existence
   })
 
   it("store/vouchers cross-market isolation: ALS context absent → no market filter applied (backward compat)", () => {
-    const voucher: VoucherFixture = {
-      code: "VOUCHER-NO-MARKET-001",
-      // No market_id set
-      seller_id: "sel_001",
-      seller_name: "Seller",
-      seller_handle: "seller",
-      product_title: "Product",
-      value_minor: 1000,
-      currency_code: "PLN",
-      status: "idle",
-      expires_at: null,
-      events: [],
-    }
-    upsertFixture(voucher)
+    const voucher = makeVoucher("VOUCHER-NO-MARKET-001", null)
 
     // When ALS market context is null (no middleware), voucher is accessible
-    const alsMarketId: string | null = null
-    const fx = getFixtureByCode("VOUCHER-NO-MARKET-001")
-    const blocked = fx !== null &&
-      alsMarketId !== null &&
-      "market_id" in fx &&
-      fx.market_id !== alsMarketId
-
+    const { blocked } = routeIsolationCheck(voucher, null)
     expect(blocked).toBe(false)
-    expect(fx).not.toBeNull()
   })
 
   it("store/vouchers cross-market isolation: same market context → voucher accessible", () => {
-    const voucherB: VoucherFixture = {
-      code: "VOUCHER-MARKET-B-001",
-      market_id: MARKET_B,
-      seller_id: "sel_b_001",
-      seller_name: "Kremidotyk Seller",
-      seller_handle: "kremidotyk-seller",
-      product_title: "Product B",
-      value_minor: 8000,
-      currency_code: "PLN",
-      status: "idle",
-      expires_at: null,
-      events: [],
-    }
-    upsertFixture(voucherB)
+    const voucherB = makeVoucher("VOUCHER-MARKET-B-001", MARKET_B)
 
     // ALS context = market B (same as voucher) → NOT blocked
-    const alsMarketId = MARKET_B
-    const fx = getFixtureByCode("VOUCHER-MARKET-B-001")
-    const blocked = fx !== null &&
-      "market_id" in fx &&
-      fx.market_id !== alsMarketId
-
+    const { blocked } = routeIsolationCheck(voucherB, MARKET_B)
     expect(blocked).toBe(false)
-    expect(fx?.market_id).toBe(MARKET_B)
   })
 })

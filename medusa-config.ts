@@ -52,6 +52,12 @@ module.exports = withMercur({
   // and let wrapper handle it).
   modules: [
     {
+      // Story v160-cleanup-25: PG-backed voucher module (replaces in-memory
+      // voucher-fixture-store.ts). Registered under key "voucher" per AC1.
+      key: "voucher",
+      resolve: moduleRoot("voucher"),
+    },
+    {
       key: "gp_core",
       resolve: moduleRoot("gp-core"),
       options: {

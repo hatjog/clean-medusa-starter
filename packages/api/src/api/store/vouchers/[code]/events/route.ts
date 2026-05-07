@@ -1,10 +1,13 @@
 /**
- * Story v160-cleanup-13b — GET /store/vouchers/:code/events
+ * Story v160-cleanup-25 — GET /store/vouchers/:code/events
  *
  * Public audit-trail endpoint backing the recipient claim page
  * `audit-trail-molecule`. Returns the recipient-visible audit events with
  * AR45 allowlist applied (only id + event_type + occurred_at cross the
  * boundary — never buyer-side metadata).
+ *
+ * Backed by Medusa 2 voucher module (PG-persistent) replacing the former
+ * in-memory voucher-fixture-store.ts.
  *
  * @see GP/storefront/src/lib/data/voucher.ts (consumer — getVoucherEvents)
  * @see Story 8.8 AC6 Step 6 (audit trail molecule renders)
@@ -12,14 +15,11 @@
 
 import type { MedusaRequest, MedusaResponse } from "@medusajs/framework/http"
 import { marketContextStorage } from "../../../../../lib/market-context"
-import {
-  getFixtureByCode,
-  type VoucherAuditEventType,
-} from "../../../../../lib/voucher-fixture-store"
+import type { VoucherService, VoucherEventType } from "../../../../../modules/voucher"
 
 export const AUTHENTICATE = false
 
-const KNOWN_TYPES: ReadonlySet<VoucherAuditEventType> = new Set([
+const KNOWN_TYPES: ReadonlySet<VoucherEventType> = new Set([
   "created",
   "sent",
   "opened",
@@ -29,7 +29,7 @@ const KNOWN_TYPES: ReadonlySet<VoucherAuditEventType> = new Set([
 
 interface AuditEntry {
   id: string
-  event_type: VoucherAuditEventType
+  event_type: VoucherEventType
   occurred_at: string
 }
 
@@ -49,9 +49,11 @@ export async function GET(
     return
   }
 
-  const fx = getFixtureByCode(code)
+  const voucherService = req.scope.resolve("voucher") as VoucherService
+  const voucher = await voucherService.getByCode(code)
+
   // Cross-market isolation: if ALS market context is set and voucher market differs, 404.
-  if (!fx || (market_id && "market_id" in fx && fx.market_id !== market_id)) {
+  if (!voucher || (market_id && voucher.market_id !== null && voucher.market_id !== market_id)) {
     res.status(404).json({
       type: "not_found",
       message: "Voucher not found",
@@ -59,12 +61,14 @@ export async function GET(
     return
   }
 
-  const events: AuditEntry[] = (fx.events ?? [])
+  const events: AuditEntry[] = (voucher.events ?? [])
     .filter((e) => KNOWN_TYPES.has(e.event_type))
     .map((e) => ({
       id: e.id,
       event_type: e.event_type,
-      occurred_at: e.occurred_at,
+      occurred_at: e.occurred_at instanceof Date
+        ? e.occurred_at.toISOString()
+        : String(e.occurred_at),
     }))
     .sort((a, b) => a.occurred_at.localeCompare(b.occurred_at))
 
