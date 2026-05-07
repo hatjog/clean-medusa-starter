@@ -1,26 +1,27 @@
 /**
- * Story v160-6-2: Multi-vendor PDF voucher generator (stub-tier).
+ * Multi-vendor PDF voucher generator (cleanup-52 / TF-117: engine swap done).
  *
- * Per Sprint 4 audit (T2): no PDF engine (handlebars/react-pdf/pdfkit) is
- * present in GP/backend yet. ADR-070 PDF rendering choice is still pending
- * concrete impl. To unblock the multi-vendor extension contract WITHOUT
- * blocking on engine selection, this module ships:
+ * History:
+ *   Story v160-6-2: shipped multi-vendor isolation contract (FM-43) + AR45
+ *     privacy-boundary payload builder + renderVoucherPdfStub (text/plain).
+ *   Story v160-6-5: appended directions section (maps-deeplink.ts helpers).
+ *   cleanup-52: replaced stub with real pdfkit engine; storage layer authored
+ *     in storage/; loader in loaders/voucher-pdf-storage.ts.
  *
- *   1. The MULTI-VENDOR ISOLATION CONTRACT (FM-43): given a cart with N
- *      distinct vendors, produce N PDF outputs (one per vendor); each PDF
- *      contains exactly ONE "Salon" section (per-vendor isolation).
- *   2. A privacy-boundary-correct payload builder (AR45 + NFR-SEC-9): the
- *      payload that flows into PDF render contains ONLY public fields —
- *      voucher code, vendor name/handle/address, product, value, validity,
- *      buyer note. NO recipient/buyer email, phone, or address.
- *   3. A `renderVoucherPdfStub()` returning a minimal `text/plain` Buffer
- *      until ADR-070 engine swap-in (Story 6.x). Storage path / signed URL
- *      logic is wired but actual MinIO/S3 upload is OUT OF 6.2 scope.
+ * Multi-vendor isolation contract (FM-43): given a cart with N distinct
+ * vendors, produce N PDF outputs (one per vendor); each PDF contains exactly
+ * ONE "Salon" section (per-vendor isolation).
  *
- * When the PDF engine lands (Story 6.x backend extension), swap
- * `renderVoucherPdfStub()` with the real engine; the multi-vendor isolation
- * contract + payload shape remain stable (additive-MINOR per ports.ts
- * versioning convention).
+ * Privacy boundary (AR45 + NFR-SEC-9): payload contains ONLY public fields —
+ * voucher code, vendor name/handle/address, product, value, validity, buyer
+ * note. NO recipient/buyer email, phone, or address.
+ *
+ * Engine: pdfkit (pure JS, MIT, no native deps). Output: real PDF binary
+ * starting with %PDF- magic header (0x25 0x50 0x44 0x46).
+ *
+ * Storage layer: IVoucherPdfStorage port (storage/ports.ts); default adapter
+ * FilesystemVoucherPdfStorage (storage/adapters/filesystem-storage.ts).
+ * Loader: loaders/voucher-pdf-storage.ts registers `voucher_pdf_storage` key.
  *
  * Story v160-6-5 extension: post-claim directions section appended between
  * the voucher card + footer. Reuses `maps-deeplink.ts` helpers (ported from
@@ -28,6 +29,8 @@
  * fallback to search-query mode when coordinates are absent. Privacy notice
  * mandatory (always rendered when section renders).
  */
+
+import PDFDocument from "pdfkit"
 
 import {
   buildAppleMapsDeeplink,
@@ -195,12 +198,101 @@ export function buildVoucherPdfPayload(args: {
 }
 
 /**
- * Renders the PDF (stub-tier — text/plain Buffer until ADR-070 engine).
+ * Renders a real PDF voucher document using pdfkit (cleanup-52 / TF-117).
  *
- * Output is a deterministic, parseable text artifact that the AR45 contract
- * test (Story 6.2 AC4) can extract via `Buffer.toString('utf-8')` instead of
- * the real `pdf-parse` lib. When the real engine lands, this function gets
- * swapped; AC4 test should also gain the real `pdf-parse` extraction path.
+ * Output is a valid PDF binary starting with %PDF- magic header bytes.
+ * Multi-vendor isolation (FM-43): each call renders exactly ONE vendor's
+ * Salon section — caller is responsible for per-vendor dispatch.
+ *
+ * AR45 privacy boundary: payload contains only public/vendor-side fields.
+ * No recipient email/phone/address reaches this function.
+ *
+ * Engine: pdfkit (pure JS, MIT, no native deps, Node.js streaming Buffer).
+ */
+export function renderVoucherPdf(payload: VoucherPdfPayload): Promise<Buffer> {
+  return new Promise<Buffer>((resolve, reject) => {
+    const copy = T30_PDF_COPY[payload.locale] ?? T30_PDF_COPY.pl
+    const chunks: Buffer[] = []
+
+    const doc = new PDFDocument({ margin: 50, size: "A4" })
+
+    doc.on("data", (chunk: Buffer) => chunks.push(chunk))
+    doc.on("end", () => resolve(Buffer.concat(chunks)))
+    doc.on("error", reject)
+
+    // Title
+    doc.fontSize(18).font("Helvetica-Bold").text(copy.title, { align: "center" })
+    doc.moveDown(0.5)
+
+    // Voucher code
+    doc
+      .fontSize(12)
+      .font("Helvetica")
+      .text(`${copy.redemption_code_label}: `, { continued: true })
+      .font("Helvetica-Bold")
+      .text(payload.voucher_code)
+    doc.moveDown(0.8)
+
+    // Salon section header (FM-43: exactly ONE salon section per PDF)
+    doc
+      .fontSize(13)
+      .font("Helvetica-Bold")
+      .text(`— ${copy.salon_section_title} —`)
+    doc.font("Helvetica").fontSize(11)
+    doc.text(payload.vendor.name)
+    doc.text(`@${payload.vendor.handle}`)
+    if (payload.vendor.address) {
+      doc.text(payload.vendor.address)
+    }
+    doc.moveDown(0.5)
+
+    // Service + value
+    doc.text(`${copy.service_description_label}: ${payload.service_description}`)
+    doc.text(
+      `${copy.voucher_value_label}: ${(payload.value_minor / 100).toFixed(2)} ${payload.currency_code}`,
+    )
+
+    // Validity
+    if (payload.valid_until) {
+      doc.text(`${copy.validity_period_label}: ${payload.valid_until}`)
+    }
+
+    // Buyer note
+    if (payload.buyer_note) {
+      doc.moveDown(0.3)
+      doc.font("Helvetica-Oblique").text(`> ${payload.buyer_note}`)
+      doc.font("Helvetica")
+    }
+
+    // Directions section (Story v160-6-5; AR45-safe — vendor-side only)
+    const directions = renderDirectionsSection(payload)
+    if (directions.length > 0) {
+      doc.moveDown(0.8)
+      doc.fontSize(12).font("Helvetica-Bold").text(`— ${copy.directions_title} —`)
+      doc.fontSize(10).font("Helvetica")
+      // Skip the header line already rendered above; output remaining lines.
+      const bodyLines = directions.slice(1)
+      for (const line of bodyLines) {
+        if (line === "") {
+          doc.moveDown(0.3)
+        } else {
+          doc.text(line)
+        }
+      }
+    }
+
+    doc.end()
+  })
+}
+
+/**
+ * Synchronous wrapper kept for backwards-compat with callers that cannot
+ * await. Returns a minimal text/plain Buffer — use renderVoucherPdf() for
+ * the real PDF output.
+ *
+ * @deprecated Use renderVoucherPdf() (async, real PDF) instead.
+ *   Alias kept for v1.6.0 soft-rename window; removed in v1.7.0.
+ *   Callers relying on PDF binary output MUST migrate to renderVoucherPdf().
  */
 export function renderVoucherPdfStub(payload: VoucherPdfPayload): Buffer {
   const copy = T30_PDF_COPY[payload.locale] ?? T30_PDF_COPY.pl
@@ -234,6 +326,30 @@ export function renderVoucherPdfStub(payload: VoucherPdfPayload): Buffer {
   }
 
   return Buffer.from(lines.join("\n"), "utf-8")
+}
+
+/**
+ * Persist a generated PDF artifact via storage port.
+ *
+ * Wire point for D-60 worker and caller-side dispatch flow (cleanup-52).
+ * Caller resolves `storage` from Medusa container as `voucher_pdf_storage`.
+ */
+export async function persistDeliveryArtifact(args: {
+  storage: import("./storage/ports").IVoucherPdfStorage
+  dispatch: MultiVendorPdfDispatch
+  delivery_id: string
+  recipient_token: string
+}): Promise<import("./storage/ports").StoreOutput> {
+  return args.storage.store({
+    storage_key: args.dispatch.storage_key,
+    pdf_buffer: args.dispatch.pdf_buffer,
+    metadata: {
+      delivery_id: args.delivery_id,
+      recipient_token: args.recipient_token,
+      generated_at: new Date().toISOString(),
+      vendor_handles: [args.dispatch.payload.vendor.handle],
+    },
+  })
 }
 
 /**
@@ -316,10 +432,11 @@ export function buildVoucherPdfStorageKey(
 
 /**
  * Multi-vendor dispatch — given cart line items, produce 1 PDF payload per
- * unique vendor. AC2 + AC7 guarantee: 2 vendors → 2 distinct PDFs.
+ * unique vendor. FM-43 guarantee: 2 vendors → 2 distinct PDFs.
  *
- * The actual MinIO upload + email delivery via D-60 worker is wired by the
- * caller (workflow step) using these payloads + the storage key contract.
+ * Storage layer (cleanup-52): after dispatch, caller passes each item to
+ * persistDeliveryArtifact() with the resolved IVoucherPdfStorage port.
+ * D-60 worker integration and email dispatch are separate story scope.
  */
 export interface MultiVendorPdfDispatch {
   vendor_id: string
@@ -328,6 +445,62 @@ export interface MultiVendorPdfDispatch {
   pdf_buffer: Buffer
 }
 
+/**
+ * Async dispatch — uses real pdfkit engine (cleanup-52 / TF-117).
+ *
+ * Preferred for new callers. Returns Promise<MultiVendorPdfDispatch[]>.
+ * Legacy sync callers must migrate from dispatchMultiVendorPdfs() to this.
+ */
+export async function dispatchMultiVendorPdfsAsync(args: {
+  voucher_id: string
+  voucher_code: string
+  locale: "pl" | "en"
+  line_items: CartLineItemForVoucher[]
+  vendors_by_id: Record<string, VendorRecord>
+  currency_code?: string
+  valid_from?: string | null
+  valid_until?: string | null
+  buyer_note?: string | null
+}): Promise<MultiVendorPdfDispatch[]> {
+  const grouped = groupLineItemsByVendor(args.line_items)
+  const dispatches: MultiVendorPdfDispatch[] = []
+
+  for (const [seller_id, items] of grouped) {
+    if (seller_id === "_unassigned") {
+      continue
+    }
+    const vendor = args.vendors_by_id[seller_id]
+    if (!vendor) {
+      continue
+    }
+    const payload = buildVoucherPdfPayload({
+      voucher_code: args.voucher_code,
+      locale: args.locale,
+      vendor,
+      line_items: items,
+      currency_code: args.currency_code,
+      valid_from: args.valid_from,
+      valid_until: args.valid_until,
+      buyer_note: args.buyer_note,
+    })
+    // Use real pdfkit engine — output is valid PDF binary (%PDF-).
+    const pdf_buffer = await renderVoucherPdf(payload)
+    const storage_key = buildVoucherPdfStorageKey(args.voucher_id, seller_id)
+    dispatches.push({ vendor_id: seller_id, storage_key, payload, pdf_buffer })
+  }
+
+  return dispatches
+}
+
+/**
+ * Sync dispatch (backwards-compat wrapper).
+ *
+ * Uses renderVoucherPdfStub (text/plain Buffer) — kept for callers that cannot
+ * await. For real PDF binary output migrate to dispatchMultiVendorPdfsAsync().
+ *
+ * @deprecated Migrate to dispatchMultiVendorPdfsAsync() for real PDF output.
+ *   Removed in v1.7.0 when stub alias is dropped.
+ */
 export function dispatchMultiVendorPdfs(args: {
   voucher_id: string
   voucher_code: string
@@ -343,13 +516,10 @@ export function dispatchMultiVendorPdfs(args: {
 
   for (const [seller_id, items] of grouped) {
     if (seller_id === "_unassigned") {
-      // Backward-compat: legacy single-vendor flow falls through to caller's
-      // v1.5.0 single-vendor template path (caller decides; out of 6.2).
       continue
     }
     const vendor = args.vendors_by_id[seller_id]
     if (!vendor) {
-      // Vendor record fetch failed — skip with caller-side warning.
       continue
     }
     const payload = buildVoucherPdfPayload({
