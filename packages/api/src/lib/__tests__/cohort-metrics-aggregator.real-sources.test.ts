@@ -167,7 +167,7 @@ describe("cohort-metrics-aggregator — real-sources (cleanup-22)", () => {
     const orderRows = Array.from({ length: 4 }, () => ({ order_count: 0 }))
     const db = buildDb(BASE_AUDIT_ROWS, reviewRows, orderRows)
 
-    const { computeCohortMetrics } = await import("../cohort-metrics-aggregator.js")
+    const { computeCohortMetrics } = await import("../cohort-metrics-aggregator")
     const result = await computeCohortMetrics({ db, nowMs: NOW })
 
     expect(result.cohorts.pre_flip_baseline.nps).toMatchObject({
@@ -191,7 +191,7 @@ describe("cohort-metrics-aggregator — real-sources (cleanup-22)", () => {
     const orderRows = Array.from({ length: 4 }, () => ({ order_count: 0 }))
     const db = buildDb(BASE_AUDIT_ROWS, reviewRows, orderRows)
 
-    const { computeCohortMetrics } = await import("../cohort-metrics-aggregator.js")
+    const { computeCohortMetrics } = await import("../cohort-metrics-aggregator")
     const result = await computeCohortMetrics({ db, nowMs: NOW })
 
     expect(result.cohorts.pre_flip_baseline.nps).toMatchObject({
@@ -225,7 +225,7 @@ describe("cohort-metrics-aggregator — real-sources (cleanup-22)", () => {
     const db = buildDb(BASE_AUDIT_ROWS, reviewRows, orderRows)
     seedSufficientVisits()
 
-    const { computeCohortMetrics } = await import("../cohort-metrics-aggregator.js")
+    const { computeCohortMetrics } = await import("../cohort-metrics-aggregator")
     const result = await computeCohortMetrics({ db, nowMs: NOW })
 
     expect(result.cohorts.pre_flip_baseline.conversion).toMatchObject({
@@ -244,7 +244,7 @@ describe("cohort-metrics-aggregator — real-sources (cleanup-22)", () => {
     const db = buildDb(BASE_AUDIT_ROWS, reviewRows, orderRows)
     seedSufficientVisits()
 
-    const { computeCohortMetrics } = await import("../cohort-metrics-aggregator.js")
+    const { computeCohortMetrics } = await import("../cohort-metrics-aggregator")
     const result = await computeCohortMetrics({ db, nowMs: NOW })
 
     // cleanup-21 review-fix [MEDIUM]: raw computed rate (1/50 = 2%) is now
@@ -274,7 +274,7 @@ describe("cohort-metrics-aggregator — real-sources (cleanup-22)", () => {
     const db = buildDb(BASE_AUDIT_ROWS, reviewRows, orderRows)
     seedSufficientVisits()
 
-    const { computeCohortMetrics } = await import("../cohort-metrics-aggregator.js")
+    const { computeCohortMetrics } = await import("../cohort-metrics-aggregator")
     const result = await computeCohortMetrics({ db, nowMs: NOW })
 
     expect(result.cohorts.pre_flip_baseline.conversion).toMatchObject({
@@ -302,7 +302,7 @@ describe("cohort-metrics-aggregator — real-sources (cleanup-22)", () => {
       })
     })
 
-    const { computeCohortMetrics } = await import("../cohort-metrics-aggregator.js")
+    const { computeCohortMetrics } = await import("../cohort-metrics-aggregator")
     const result = await computeCohortMetrics()
 
     expect(result.cohorts.first_24h_on.p95_latency_ms).toMatchObject({
@@ -325,7 +325,7 @@ describe("cohort-metrics-aggregator — real-sources (cleanup-22)", () => {
     const orderRows = Array.from({ length: 4 }, () => ({ order_count: 0 }))
     const db = buildDb(BASE_AUDIT_ROWS, reviewRows, orderRows)
 
-    const { computeCohortMetrics } = await import("../cohort-metrics-aggregator.js")
+    const { computeCohortMetrics } = await import("../cohort-metrics-aggregator")
     const result = await computeCohortMetrics({ db, nowMs: NOW })
 
     const cohorts = ["pre_flip_baseline", "shadow_window", "first_24h_on", "sustained_on"] as const
@@ -356,7 +356,7 @@ describe("cohort-metrics-aggregator — real-sources (cleanup-22)", () => {
     const orderRows = Array.from({ length: 4 }, () => ({ order_count: 0 }))
     const db = buildDb(BASE_AUDIT_ROWS, reviewRows, orderRows)
 
-    const { computeCohortMetrics } = await import("../cohort-metrics-aggregator.js")
+    const { computeCohortMetrics } = await import("../cohort-metrics-aggregator")
     const result = await computeCohortMetrics({ db, nowMs: NOW })
 
     const nps = result.cohorts.pre_flip_baseline.nps
@@ -381,7 +381,7 @@ describe("cohort-metrics-aggregator — real-sources (cleanup-22)", () => {
     const orderRows = Array.from({ length: 4 }, () => ({ order_count: 0 }))
     const db = buildDb(BASE_AUDIT_ROWS, reviewRows, orderRows)
 
-    const { computeCohortMetrics } = await import("../cohort-metrics-aggregator.js")
+    const { computeCohortMetrics } = await import("../cohort-metrics-aggregator")
     const result = await computeCohortMetrics({ db, nowMs: NOW })
 
     expect(result.cohorts.pre_flip_baseline.p95_latency_ms).toMatchObject({
