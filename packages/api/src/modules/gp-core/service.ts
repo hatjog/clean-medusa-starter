@@ -366,6 +366,7 @@ export default class GpCoreService {
     }
   }
 
+  // market_id = admin-cross-market: gp_core.markets IS the market config table — no per-market ALS filter applicable (AR44 §admin-exclusion)
   async createMarket(input: CreateMarketInput, client?: Queryable): Promise<GpCoreMarketRecord> {
     if (!client) {
       return await this.withTransaction((transactionClient) => this.createMarket(input, transactionClient))
@@ -424,6 +425,8 @@ export default class GpCoreService {
    * Raw upsert without lifecycle event emission.
    * Use createMarket() / updateMarket() for event-driven flows.
    * Retained only for legacy migration paths where event emission is undesirable.
+   *
+   * market_id = admin-cross-market: operates on gp_core.markets config table — ALS filter not applicable (AR44 §admin-exclusion)
    */
   async upsertMarket(input: CreateMarketInput, client?: Queryable): Promise<GpCoreMarketRecord> {
     const market = await this.queryOne<GpCoreMarketRecord>(
@@ -474,6 +477,7 @@ export default class GpCoreService {
     return market
   }
 
+  // market_id = admin-cross-market: UPDATE gp_core.markets by id/slug selector — config table, ALS filter not applicable (AR44 §admin-exclusion)
   async updateMarket(
     selector: MarketSelector,
     update: UpdateMarketInput,
@@ -559,6 +563,7 @@ export default class GpCoreService {
     return deterministicUuid(`vendor:${instanceId}:${vendorKey}`)
   }
 
+  // market_id = admin-cross-market: gp_core.vendors is cross-market vendor config — ALS filter not applicable (AR44 §admin-exclusion)
   async createVendor(input: CreateVendorInput, client?: Queryable): Promise<GpCoreVendor> {
     const vendor = await this.queryOne<GpCoreVendor>(
       client ?? this.getCorePool(),
@@ -577,6 +582,7 @@ export default class GpCoreService {
     return vendor
   }
 
+  // market_id = admin-cross-market: vendor upsert on gp_core.vendors config table — ALS filter not applicable (AR44 §admin-exclusion)
   async upsertVendor(
     input: CreateVendorInput & { vendor_key: string },
     client?: Queryable
@@ -635,6 +641,7 @@ export default class GpCoreService {
     )
   }
 
+  // market_id = input.market_id (explicit assignment parameter — admin config operation on gp_core; ALS not applicable per AR44 §admin-exclusion)
   async assignVendorToMarket(
     input: AssignVendorToMarketInput,
     client?: Queryable
@@ -658,6 +665,7 @@ export default class GpCoreService {
     return assignment
   }
 
+  // market_id = input.market_id (explicit upsert parameter — admin config operation on gp_core; ALS not applicable per AR44 §admin-exclusion)
   async upsertVendorToMarket(
     input: AssignVendorToMarketInput,
     client?: Queryable
@@ -687,6 +695,7 @@ export default class GpCoreService {
 
   // --- User Membership Methods (accounts sync) ---
 
+  // market_id = input.market_id (explicit membership parameter — admin accounts-sync operation; ALS not applicable per AR44 §admin-exclusion)
   async upsertUserMarketMembership(
     input: UpsertUserMarketMembershipInput,
     client?: Queryable
@@ -721,6 +730,7 @@ export default class GpCoreService {
     return row
   }
 
+  // market_id = admin-cross-market: vendor membership is instance-scoped; ALS not applicable (AR44 §admin-exclusion)
   async upsertUserVendorMembership(
     input: UpsertUserVendorMembershipInput,
     client?: Queryable

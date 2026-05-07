@@ -31,6 +31,8 @@ export type VoucherAuditEventType =
 
 export interface VoucherFixture {
   code: string
+  /** story v160-cleanup-27g: market scope for DPIA R-12 cross-market isolation. Optional for backward compat. */
+  market_id?: string
   seller_id: string
   seller_name: string
   seller_handle: string
@@ -53,6 +55,9 @@ export interface VoucherFixture {
 const DEFAULT_FIXTURES: ReadonlyArray<VoucherFixture> = [
   {
     code: "E2E-IDLE-VOUCHER-001",
+    // story v160-cleanup-27 review fix M2: default seed market_id so the cross-market
+    // guard (DPIA R-12) is fail-CLOSED rather than passing-through unscoped fixtures.
+    market_id: "bonbeauty",
     seller_id: "sel_01CITYBEAUTY00000000000",
     seller_name: "City Beauty",
     seller_handle: "city-beauty",
@@ -76,6 +81,8 @@ const DEFAULT_FIXTURES: ReadonlyArray<VoucherFixture> = [
   },
   {
     code: "E2E-CLAIMED-VOUCHER-002",
+    // story v160-cleanup-27 review fix M2: see E2E-IDLE-VOUCHER-001 above.
+    market_id: "kremidotyk",
     seller_id: "sel_01KREMIDOTYK0000000000",
     seller_name: "Kremidotyk",
     seller_handle: "kremidotyk",

@@ -11,6 +11,7 @@
  */
 
 import type { MedusaRequest, MedusaResponse } from "@medusajs/framework/http"
+import { marketContextStorage } from "../../../../../lib/market-context"
 import {
   getFixtureByCode,
   type VoucherAuditEventType,
@@ -36,6 +37,9 @@ export async function GET(
   req: MedusaRequest,
   res: MedusaResponse,
 ): Promise<void> {
+  // story v160-cleanup-27g: ALS extract for DPIA R-12 cross-market isolation (TF-46).
+  const market_id = marketContextStorage.getStore()?.market_id ?? null
+
   const code = (req.params as { code?: string })?.code
   if (!code || code.length < 3) {
     res.status(400).json({
@@ -46,7 +50,9 @@ export async function GET(
   }
 
   const fx = getFixtureByCode(code)
-  if (!fx) {
+  // Cross-market isolation (DPIA R-12, review fix M2): fail-CLOSED when ALS market
+  // context is set and voucher market_id is missing or mismatched.
+  if (!fx || (market_id && fx.market_id !== market_id)) {
     res.status(404).json({
       type: "not_found",
       message: "Voucher not found",

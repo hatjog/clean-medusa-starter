@@ -32,6 +32,7 @@ import type { MedusaRequest, MedusaResponse } from "@medusajs/framework/http"
 import { ContainerRegistrationKeys } from "@medusajs/framework/utils"
 import type { Knex } from "knex"
 
+import { marketContextStorage } from "../../../../../lib/market-context"
 import { getFlagState } from "../../../../../lib/feature-flag-tri-state"
 
 type CartLineItemRow = {
@@ -66,6 +67,17 @@ export async function GET(
   req: MedusaRequest,
   res: MedusaResponse,
 ): Promise<void> {
+  // story v160-cleanup-27h: ALS extract for cart market isolation (TF-47).
+  // If ALS context is set and cart.sales_channel_id differs from ctx.sales_channel_id,
+  // return 404 fail-closed (AC7). NOTE: the `cart` table does NOT have a `market_id`
+  // column — multi-tenant cart isolation is enforced via `sales_channel_id`
+  // (see `cartMarketGuardMiddleware` in api/middlewares.ts which uses the same
+  // mapping). Review fix H1: prior code queried `cart.market_id` which would 500
+  // at runtime with `column "market_id" does not exist`.
+  const ctx = marketContextStorage.getStore()
+  const market_id = ctx?.market_id ?? null
+  const sales_channel_id = ctx?.sales_channel_id ?? null
+
   const cartId = (req.params as Record<string, string>).id
   const db = req.scope.resolve(ContainerRegistrationKeys.PG_CONNECTION) as Knex
 
@@ -75,6 +87,24 @@ export async function GET(
     res.json({ order_set_splits: [] })
     return
   }
+
+  // Cart market isolation: assert cart.sales_channel_id === ALS sales_channel_id
+  // (fail-closed 404 on mismatch). `cartMarketGuardMiddleware` already enforces
+  // this on /store/carts*; this in-handler check is defense-in-depth so the
+  // route is safe even if middleware ordering changes.
+  if (sales_channel_id) {
+    const cartRow = await db<{ sales_channel_id: string | null }>("cart")
+      .select(["sales_channel_id"])
+      .where("id", cartId)
+      .whereNull("deleted_at")
+      .first()
+    if (!cartRow || cartRow.sales_channel_id !== sales_channel_id) {
+      res.status(404).json({ type: "not_found", message: "Cart not found" })
+      return
+    }
+  }
+  // Reference market_id for diagnostics (kept in scope for future per-market logic).
+  void market_id
 
   // Load cart line items with metadata
   const lineItems = await db<CartLineItemRow>("cart_line_item")
