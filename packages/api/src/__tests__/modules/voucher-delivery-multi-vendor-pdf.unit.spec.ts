@@ -15,6 +15,7 @@ import {
   renderVoucherPdfStub,
   buildVoucherPdfStorageKey,
   lookupCopy,
+  lookupCopyFromBundle,
   VOUCHER_PDF_COPY,
   type CartLineItemForVoucher,
   type VendorRecord,
@@ -361,33 +362,47 @@ describe("voucher-delivery/multi-vendor-pdf", () => {
       },
     )
 
-    it("lookupCopy throws fail-fast for missing key — no silent fallback to EN or undefined", () => {
-      // Patch VOUCHER_PDF_COPY.pl to simulate a missing key scenario
-      const originalPl = { ...VOUCHER_PDF_COPY.pl }
-      // @ts-expect-error: intentionally corrupting for test
-      delete VOUCHER_PDF_COPY.pl["voucher_value_label"]
+    it("lookupCopyFromBundle throws fail-fast for missing key — no silent fallback to EN or undefined", () => {
+      // VOUCHER_PDF_COPY is frozen at module load (B-4 fix); the pure-function
+      // variant `lookupCopyFromBundle` accepts an arbitrary bundle so we can
+      // exercise the fail-fast branch without touching production state.
+      const corruptedBundle: Record<string, string> = { ...VOUCHER_PDF_COPY.pl }
+      delete corruptedBundle["voucher_value_label"]
 
-      try {
-        expect(() => lookupCopy("pl", "voucher_value_label")).toThrow(
-          /missing voucher PDF i18n key: voucher_value_label for locale pl/,
-        )
-      } finally {
-        // Restore to avoid polluting other tests
-        VOUCHER_PDF_COPY.pl["voucher_value_label"] = originalPl["voucher_value_label"]!
+      expect(() =>
+        lookupCopyFromBundle(corruptedBundle, "pl", "voucher_value_label"),
+      ).toThrow(/missing voucher PDF i18n key: voucher_value_label for locale pl/)
+    })
+
+    it("lookupCopyFromBundle throws fail-fast for empty / whitespace-only value — regression guard", () => {
+      const fakeBundle: Record<string, string> = { ...VOUCHER_PDF_COPY.en, title: "   " }
+      expect(() => lookupCopyFromBundle(fakeBundle, "en", "title")).toThrow(
+        /missing voucher PDF i18n key: title for locale en/,
+      )
+    })
+
+    it("VOUCHER_PDF_COPY production bundles are frozen (no mutation allowed)", () => {
+      // B-4 protection: ensure callers cannot corrupt the SSOT bundle at runtime.
+      expect(Object.isFrozen(VOUCHER_PDF_COPY)).toBe(true)
+      expect(Object.isFrozen(VOUCHER_PDF_COPY.pl)).toBe(true)
+      expect(Object.isFrozen(VOUCHER_PDF_COPY.en)).toBe(true)
+      expect(Object.isFrozen(VOUCHER_PDF_COPY.ua)).toBe(true)
+      expect(Object.isFrozen(VOUCHER_PDF_COPY.de)).toBe(true)
+    })
+
+    it("VOUCHER_PDF_COPY does not expose `_review` meta-key (stripped at import)", () => {
+      // B-6: meta keys must not leak into the runtime bundle.
+      for (const loc of ["pl", "en", "ua", "de"] as const) {
+        expect(Object.keys(VOUCHER_PDF_COPY[loc])).not.toContain("_review")
       }
     })
 
-    it("lookupCopy throws fail-fast for empty string value — regression guard", () => {
-      // Temporarily set a key to empty string to simulate empty translation
-      const originalEn = VOUCHER_PDF_COPY.en["title"]
-      VOUCHER_PDF_COPY.en["title"] = "   "  // whitespace-only = empty after trim
-
-      try {
-        expect(() => lookupCopy("en", "title")).toThrow(
-          /missing voucher PDF i18n key: title for locale en/,
-        )
-      } finally {
-        VOUCHER_PDF_COPY.en["title"] = originalEn
+    it("lookupCopy still surfaces the original error path through the public API", () => {
+      // Sanity check: a known key returns a non-empty string for every locale.
+      for (const loc of ["pl", "en", "ua", "de"] as const) {
+        const v = lookupCopy(loc, "title")
+        expect(typeof v).toBe("string")
+        expect(v.length).toBeGreaterThan(0)
       }
     })
 

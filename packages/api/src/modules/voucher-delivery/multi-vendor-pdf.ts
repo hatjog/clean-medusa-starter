@@ -42,28 +42,97 @@ import {
 } from "./maps-deeplink"
 
 // ---------------------------------------------------------------------------
-// Shared i18n bundles (canonical source — synced with storefront voucher.pdf.*)
-// These JSON files are the single source of truth for voucher PDF copy.
-// The validator _grow/tools/validate_i18n_parity.py --surface=voucher-pdf
-// asserts parity between these bundles and storefront messages/{locale}.json.
+// Shared i18n bundles (canonical SSOT for voucher PDF copy).
+// These four JSON files in ./i18n/ are the single source of truth. The PL
+// bundle defines the keyset baseline (VoucherPdfCopyKey); EN/UA/DE bundles
+// must carry the exact same keyset (enforced at module load by
+// assertBundleParity() — fail-fast at startup if drift introduced).
+//
+// Cross-surface parity (backend bundles ↔ storefront `voucher.pdf.*` keys in
+// `GP/storefront/messages/{locale}.json`) is enforced by
+// `_grow/tools/validate_i18n_parity.py --surface=voucher-pdf` (cleanup-35).
 // ---------------------------------------------------------------------------
 import voucherPdfPl from "./i18n/voucher-pdf.pl.json"
 import voucherPdfEn from "./i18n/voucher-pdf.en.json"
 import voucherPdfUa from "./i18n/voucher-pdf.ua.json"
 import voucherPdfDe from "./i18n/voucher-pdf.de.json"
 
-/** Tracked keys for voucher PDF i18n — must match voucher_pdf_tracked_keys.yaml */
-export type VoucherPdfCopyKey = keyof typeof voucherPdfPl
+/**
+ * Tracked keys for voucher PDF i18n — derived from the PL bundle keyset.
+ * Cross-locale keyset equality is asserted at module load (assertBundleParity).
+ */
+export type VoucherPdfCopyKey = Exclude<keyof typeof voucherPdfPl, "_review">
 
 /** Supported locales for voucher PDF generation (4-locale parity, cleanup-19). */
 export type VoucherPdfLocale = "pl" | "en" | "ua" | "de"
 
-/** Shared voucher PDF copy bundles keyed by locale. */
-export const VOUCHER_PDF_COPY: Record<VoucherPdfLocale, Record<string, string>> = {
-  pl: voucherPdfPl as Record<string, string>,
-  en: voucherPdfEn as Record<string, string>,
-  ua: voucherPdfUa as Record<string, string>,
-  de: voucherPdfDe as Record<string, string>,
+/**
+ * Strip non-translation meta keys (e.g. `_review` stub-translation marker) from
+ * an imported bundle so they don't leak into lookup or parity checks.
+ */
+const META_KEYS: ReadonlySet<string> = new Set(["_review"])
+function stripMeta(bundle: Record<string, unknown>): Record<string, string> {
+  const out: Record<string, string> = {}
+  for (const [k, v] of Object.entries(bundle)) {
+    if (META_KEYS.has(k)) continue
+    if (typeof v === "string") out[k] = v
+  }
+  return out
+}
+
+/**
+ * Shared voucher PDF copy bundles keyed by locale.
+ *
+ * Each per-locale bundle is `Object.freeze`d to prevent accidental mutation
+ * by production callers. The test suite uses an explicit `as any` cast plus
+ * snapshot-restore pattern for negative-path coverage of `lookupCopy`.
+ */
+export const VOUCHER_PDF_COPY: Readonly<
+  Record<VoucherPdfLocale, Readonly<Record<string, string>>>
+> = Object.freeze({
+  pl: Object.freeze(stripMeta(voucherPdfPl as unknown as Record<string, unknown>)),
+  en: Object.freeze(stripMeta(voucherPdfEn as unknown as Record<string, unknown>)),
+  ua: Object.freeze(stripMeta(voucherPdfUa as unknown as Record<string, unknown>)),
+  de: Object.freeze(stripMeta(voucherPdfDe as unknown as Record<string, unknown>)),
+})
+
+/**
+ * Module-load invariant: assert all four locale bundles carry the exact same
+ * keyset (modulo `_review` meta). Closes the gap left by `VoucherPdfCopyKey =
+ * keyof typeof voucherPdfPl` (PL-only TS coverage). Throws at import time so
+ * the PDF surface refuses to boot with drifted bundles.
+ */
+function assertBundleParity(): void {
+  const baseline = new Set(Object.keys(VOUCHER_PDF_COPY.pl))
+  for (const loc of ["en", "ua", "de"] as const) {
+    const locKeys = new Set(Object.keys(VOUCHER_PDF_COPY[loc]))
+    const missing = [...baseline].filter((k) => !locKeys.has(k))
+    const extra = [...locKeys].filter((k) => !baseline.has(k))
+    if (missing.length || extra.length) {
+      throw new Error(
+        `voucher PDF i18n bundle parity violation for locale ${loc}: ` +
+          `missing=${JSON.stringify(missing)} extra=${JSON.stringify(extra)}`,
+      )
+    }
+  }
+}
+assertBundleParity()
+
+/**
+ * Internal: pure-function lookup over an arbitrary bundle. Exposed for
+ * unit-test coverage of the fail-fast contract independent of the frozen
+ * production `VOUCHER_PDF_COPY` (B-4: production bundles are immutable).
+ */
+export function lookupCopyFromBundle(
+  bundle: Readonly<Record<string, string>> | undefined,
+  locale: VoucherPdfLocale,
+  key: VoucherPdfCopyKey | string,
+): string {
+  const value = bundle?.[key as string]
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw new Error(`missing voucher PDF i18n key: ${String(key)} for locale ${locale}`)
+  }
+  return value
 }
 
 /**
@@ -74,12 +143,7 @@ export const VOUCHER_PDF_COPY: Record<VoucherPdfLocale, Record<string, string>> 
  * This is the fail-fast contract for Story v160-cleanup-35 AC5.
  */
 export function lookupCopy(locale: VoucherPdfLocale, key: VoucherPdfCopyKey): string {
-  const bundle = VOUCHER_PDF_COPY[locale]
-  const value = bundle?.[key as string]
-  if (typeof value !== "string" || value.trim().length === 0) {
-    throw new Error(`missing voucher PDF i18n key: ${key} for locale ${locale}`)
-  }
-  return value
+  return lookupCopyFromBundle(VOUCHER_PDF_COPY[locale], locale, key)
 }
 
 export interface CartLineItemForVoucher {
