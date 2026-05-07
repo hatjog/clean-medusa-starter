@@ -193,15 +193,52 @@ describe("training-cert upload route — business logic", () => {
     expect(auditLog[0]["error_message"]).toBe("size_exceeded")
   })
 
-  // Case 5: Missing vendor token → 401 (withVendorAuth handles before handler)
-  it("case-5: missing vendor token → 401, no audit row written", () => {
-    // withVendorAuth intercepts before inner handler is called — no appendLog
-    // This is a contract assertion: 401 path must not call appendNotificationLog
+  // Case 5: Missing vendor token → 401 (real withVendorAuth gate)
+  // Verifies the inner handler is NEVER invoked when the token header is
+  // absent — therefore mockAppendLog cannot be reached.
+  it("case-5: missing vendor token → 401, no audit row written (real withVendorAuth)", async () => {
+    const { withVendorAuth } = await import("../../../../src/lib/vendor-auth")
+
+    const innerCalled = jest.fn()
+    const wrapped = withVendorAuth(async (_req, _res, _next) => {
+      innerCalled()
+      await mockAppendLog({}, { id: "must_not_run", status: "sent" })
+    })
+
+    const statusCalls: number[] = []
+    const req = { headers: {}, scope: { resolve: () => undefined } } as unknown as Parameters<typeof wrapped>[0]
+    const res = {
+      status(code: number) { statusCalls.push(code); return this },
+      json() { /* noop */ },
+    } as unknown as Parameters<typeof wrapped>[1]
+
+    await wrapped(req, res, () => {})
+
+    expect(statusCalls[0]).toBe(401)
+    expect(innerCalled).not.toHaveBeenCalled()
     expect(mockAppendLog).not.toHaveBeenCalled()
   })
 
-  // Case 6: Invalid/expired vendor token → 401 (withVendorAuth handles)
-  it("case-6: invalid/expired vendor token → 401, no audit row written", () => {
+  // Case 6: Invalid/expired vendor token → 401 (same gate, empty token)
+  it("case-6: invalid/empty vendor token → 401, no audit row written", async () => {
+    const { withVendorAuth } = await import("../../../../src/lib/vendor-auth")
+
+    const innerCalled = jest.fn()
+    const wrapped = withVendorAuth(async (_req, _res, _next) => {
+      innerCalled()
+    })
+
+    const statusCalls: number[] = []
+    const req = { headers: { "x-vendor-token": "" }, scope: { resolve: () => undefined } } as unknown as Parameters<typeof wrapped>[0]
+    const res = {
+      status(code: number) { statusCalls.push(code); return this },
+      json() { /* noop */ },
+    } as unknown as Parameters<typeof wrapped>[1]
+
+    await wrapped(req, res, () => {})
+
+    expect(statusCalls[0]).toBe(401)
+    expect(innerCalled).not.toHaveBeenCalled()
     expect(mockAppendLog).not.toHaveBeenCalled()
   })
 
