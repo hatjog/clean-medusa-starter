@@ -309,8 +309,7 @@ export async function POST(req: MedusaRequest, res: MedusaResponse): Promise<voi
   })
 
   // 5) Emit Redis pub/sub OUTSIDE the tx. T2 = first subscriber ack proxy
-  //    (Redis `PUBLISH` reply = subscriber count). True per-subscriber ack
-  //    deferred to v1.6.0 (see story implementation log).
+  //    (Redis `PUBLISH` reply = subscriber count).
   let t2SubscriberAckCount = 0
   if (redis) {
     try {
