@@ -5,17 +5,48 @@
  * - Event name contract (order.placed)
  * - Mercur payload format ({ order_ids: string[] })
  * - Retry-safe subscriber behavior
- * - withVendorAuth HOF contract (stub-safe)
+ * - withVendorAuth HOF contract (HMAC-enforced, cleanup-48)
  *
  * Does NOT duplicate tests in on-order-completed.unit.spec.ts.
  * Focus: contracts + withVendorAuth HOF shape.
+ *
+ * Updated in cleanup-48: tests now use HMAC-signed x-vendor-signature headers
+ * (VENDOR_HMAC_ENFORCED=true) to verify the new enforcement path.
  */
-import { describe, it, expect, jest, beforeEach } from "@jest/globals"
+import { describe, it, expect, jest, beforeEach, afterEach } from "@jest/globals"
 
 import { config as subscriberConfig } from "../subscribers/on-order-completed"
 import { NotImplementedError } from "../modules/gp-core/service"
 import { withVendorAuth, vendorAuthMiddleware } from "../lib/vendor-auth"
+import { buildVendorSignatureHeader } from "../lib/vendor-hmac"
 import type { VendorAuthContext } from "../lib/vendor-auth"
+
+// ---------------------------------------------------------------------------
+// Env setup — enforce HMAC mode for all smoke tests
+// ---------------------------------------------------------------------------
+
+const SMOKE_SECRET = "smoke-test-hmac-secret-32bytes-x"
+const SMOKE_SELLER = "seller-abc"
+
+const savedEnv: Record<string, string | undefined> = {}
+
+beforeEach(() => {
+  savedEnv.VENDOR_HMAC_SECRET = process.env.VENDOR_HMAC_SECRET
+  savedEnv.VENDOR_HMAC_ENFORCED = process.env.VENDOR_HMAC_ENFORCED
+  process.env.VENDOR_HMAC_SECRET = SMOKE_SECRET
+  process.env.VENDOR_HMAC_ENFORCED = "true"
+})
+
+afterEach(() => {
+  for (const [key, val] of Object.entries(savedEnv)) {
+    if (val === undefined) delete process.env[key]
+    else process.env[key] = val
+  }
+})
+
+function makeSignedHeader(sellerId = SMOKE_SELLER): string {
+  return buildVendorSignatureHeader(sellerId, SMOKE_SECRET)
+}
 
 // --- Event Contract Tests ---
 
@@ -80,7 +111,7 @@ function buildMockRes() {
 }
 
 describe("withVendorAuth HOF", () => {
-  it("returns 401 when x-vendor-token header is missing", async () => {
+  it("returns 401 when x-vendor-signature header is missing (enforced mode)", async () => {
     const handler = jest.fn()
     const wrapped = withVendorAuth(handler)
     const req = buildMockReq({})
@@ -91,18 +122,18 @@ describe("withVendorAuth HOF", () => {
 
     expect(res.status).toHaveBeenCalledWith(401)
     expect(res.body).toEqual(
-      expect.objectContaining({ header: "x-vendor-token" })
+      expect.objectContaining({ code: "VENDOR_AUTH_SIGNATURE_MISSING" })
     )
     expect(handler).not.toHaveBeenCalled()
   })
 
-  it("injects vendorAuth context when token is valid", async () => {
+  it("injects vendorAuth context when HMAC signature is valid", async () => {
     let capturedAuth: VendorAuthContext | undefined
     const handler = jest.fn(async (req: any) => {
       capturedAuth = req.vendorAuth
     })
     const wrapped = withVendorAuth(handler)
-    const req = buildMockReq({ "x-vendor-token": "seller-abc" })
+    const req = buildMockReq({ "x-vendor-signature": makeSignedHeader() })
     const res = buildMockRes()
     const next = jest.fn()
 
@@ -111,13 +142,13 @@ describe("withVendorAuth HOF", () => {
     expect(handler).toHaveBeenCalled()
     expect(capturedAuth).toBeDefined()
     expect(capturedAuth!.vendor_id).toBe("vendor-uuid-123")
-    expect(capturedAuth!.seller_id).toBe("seller-abc")
+    expect(capturedAuth!.seller_id).toBe(SMOKE_SELLER)
   })
 
   it("returns 501 when resolveVendorId is stub (NotImplementedError)", async () => {
     const handler = jest.fn()
     const wrapped = withVendorAuth(handler)
-    const req = buildMockReq({ "x-vendor-token": "seller-abc" })
+    const req = buildMockReq({ "x-vendor-signature": makeSignedHeader() })
 
     // Override gp_core to throw NotImplementedError
     req.scope.resolve = jest.fn((key: string) => {
@@ -149,7 +180,7 @@ describe("withVendorAuth HOF", () => {
   it("returns 503 when GpCoreService is not available", async () => {
     const handler = jest.fn()
     const wrapped = withVendorAuth(handler)
-    const req = buildMockReq({ "x-vendor-token": "seller-abc" })
+    const req = buildMockReq({ "x-vendor-signature": makeSignedHeader() })
 
     req.scope.resolve = jest.fn((key: string) => {
       if (key === "logger") {
@@ -170,7 +201,7 @@ describe("withVendorAuth HOF", () => {
   it("returns 500 on unexpected error from resolveVendorId", async () => {
     const handler = jest.fn()
     const wrapped = withVendorAuth(handler)
-    const req = buildMockReq({ "x-vendor-token": "seller-abc" })
+    const req = buildMockReq({ "x-vendor-signature": makeSignedHeader() })
 
     req.scope.resolve = jest.fn((key: string) => {
       if (key === "logger") {
@@ -197,7 +228,7 @@ describe("withVendorAuth HOF", () => {
 // --- vendorAuthMiddleware standalone tests ---
 
 describe("vendorAuthMiddleware", () => {
-  it("returns 401 without token", async () => {
+  it("returns 401 without signature header (enforced mode)", async () => {
     const req = buildMockReq({})
     const res = buildMockRes()
     const next = jest.fn()
@@ -208,8 +239,8 @@ describe("vendorAuthMiddleware", () => {
     expect(next).not.toHaveBeenCalled()
   })
 
-  it("calls next() and injects vendorAuth on valid token", async () => {
-    const req = buildMockReq({ "x-vendor-token": "seller-xyz" })
+  it("calls next() and injects vendorAuth on valid HMAC signature", async () => {
+    const req = buildMockReq({ "x-vendor-signature": makeSignedHeader("seller-xyz") })
     const res = buildMockRes()
     const next = jest.fn()
 
@@ -221,7 +252,7 @@ describe("vendorAuthMiddleware", () => {
   })
 
   it("returns 501 on NotImplementedError (stub-safe)", async () => {
-    const req = buildMockReq({ "x-vendor-token": "seller-xyz" })
+    const req = buildMockReq({ "x-vendor-signature": makeSignedHeader("seller-xyz") })
     req.scope.resolve = jest.fn((key: string) => {
       if (key === "logger") {
         return { info: jest.fn(), warn: jest.fn(), error: jest.fn() }

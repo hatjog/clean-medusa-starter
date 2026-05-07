@@ -2,14 +2,28 @@
  * withVendorAuth — Higher-Order Function for vendor authentication (DD-25).
  *
  * Decision: Extend Mercur seller auth (token-based federation per ADR-034).
- * - Token: `x-vendor-token` header — Mercur seller session token
- * - Flow: token -> seller_id -> resolveVendorId(seller_id) -> vendor_id -> inject
+ * - Enforced mode: `x-vendor-signature` header — HMAC-SHA256 signed payload
+ * - Legacy transition mode: `x-vendor-token` header (VENDOR_HMAC_ENFORCED=false only)
+ * - Flow: verify signature -> seller_id -> resolveVendorId(seller_id) -> vendor_id -> inject
  * - Fallback: graceful HTTP 501 when resolveVendorId is stub (NotImplementedError)
+ *
+ * v1.6.0 HMAC design notes (story: cleanup-48):
+ *   - Single shared secret (VENDOR_HMAC_SECRET env var) — simplest viable for
+ *     v1.6.0 single-API-instance topology.
+ *   - v1.7.0 ADR follow-up: per-vendor secret store (vendor-specific keys).
+ *   - Replay protection via in-process LRU (size 10k).
+ *   - v1.7.0 follow-up: Redis-backed distributed nonce cache.
+ *   - VENDOR_HMAC_ENFORCED=false enables legacy x-vendor-token path (transition
+ *     window only — this flag MUST be removed in v1.7.0 cleanup).
  *
  * References:
  * - ADR-025: Term "vendor" used in gp_core; "seller" only in Mercur auth context
  * - ADR-034: Federated sessions; HMAC backend-to-backend for service-to-service
  * - DD-25: Vendor auth decision — extend Mercur seller auth
+ * - cleanup-48: This story — full HMAC validation implementation (TF-111 P0)
+ *
+ * TODO(v1.7.0): Remove VENDOR_HMAC_ENFORCED flag + legacy x-vendor-token path.
+ * TODO(v1.7.0): Replace shared VENDOR_HMAC_SECRET with per-vendor secret store (ADR follow-up).
  *
  * @module vendor-auth
  */
@@ -20,8 +34,18 @@ import type {
 } from "@medusajs/framework/http"
 
 import { NotImplementedError } from "../modules/gp-core/service"
+import {
+  verifyVendorSignature,
+  getSharedLru,
+  VENDOR_AUTH_SIGNATURE_MISSING,
+  VENDOR_AUTH_SIGNATURE_INVALID,
+  VENDOR_AUTH_TIMESTAMP_EXPIRED,
+  VENDOR_AUTH_REPLAY_DETECTED,
+} from "./vendor-hmac"
+import { resolveVendorHmacConfig } from "./vendor-hmac-config"
 
 const VENDOR_TOKEN_HEADER = "x-vendor-token"
+const VENDOR_SIGNATURE_HEADER = "x-vendor-signature"
 
 export type VendorAuthContext = {
   vendor_id: string
@@ -64,22 +88,92 @@ function resolveGpCore(scope: MedusaRequest["scope"] | undefined): GpCoreService
 }
 
 /**
- * Extracts seller_id from Mercur seller session token.
+ * Resolves the seller_id from a request, using HMAC verification or legacy fallback.
  *
- * In production, this will validate the token via Mercur's auth module.
- * Current implementation: treats the token as the seller_id directly
- * (sufficient for dev/test; full HMAC validation deferred to Story 3.x).
+ * Returns { ok: true, sellerId } or { ok: false, status, code, message }.
  */
-function extractSellerIdFromToken(token: string): string | null {
-  if (!token || token.length === 0) return null
-  return token
+function resolveSellerFromRequest(
+  req: MedusaRequest,
+  logger: LoggerLike
+):
+  | { ok: true; sellerId: string }
+  | { ok: false; status: 401 | 503; code: string; message: string } {
+  let config: ReturnType<typeof resolveVendorHmacConfig>
+  try {
+    config = resolveVendorHmacConfig()
+  } catch (err) {
+    logger.error?.(`[vendor-auth] ${String(err)}`)
+    return {
+      ok: false,
+      status: 503,
+      code: "VENDOR_AUTH_CONFIG_ERROR",
+      message: "Vendor authentication configuration error",
+    }
+  }
+
+  if (config.enforced) {
+    // --- Enforced HMAC mode ---
+    const sigHeader = req.headers[VENDOR_SIGNATURE_HEADER]
+    const sigValue = Array.isArray(sigHeader) ? sigHeader[0] : sigHeader
+
+    const result = verifyVendorSignature(
+      sigValue,
+      config.secret,
+      Math.floor(Date.now() / 1000),
+      config.driftSeconds,
+      getSharedLru()
+    )
+
+    if (!result.ok) {
+      const messages: Record<string, string> = {
+        [VENDOR_AUTH_SIGNATURE_MISSING]: "Missing vendor signature header (x-vendor-signature)",
+        [VENDOR_AUTH_SIGNATURE_INVALID]: "Invalid vendor signature",
+        [VENDOR_AUTH_TIMESTAMP_EXPIRED]: "Vendor signature timestamp expired",
+        [VENDOR_AUTH_REPLAY_DETECTED]: "Vendor signature replay detected",
+      }
+      return {
+        ok: false,
+        status: 401,
+        code: result.code,
+        message: messages[result.code] ?? "Vendor authentication failed",
+      }
+    }
+
+    return { ok: true, sellerId: result.sellerId }
+  } else {
+    // --- Legacy transition window (VENDOR_HMAC_ENFORCED=false) ---
+    // TODO(v1.7.0): Remove this branch + VENDOR_HMAC_ENFORCED flag.
+    const vendorToken = req.headers[VENDOR_TOKEN_HEADER]
+    const tokenValue = Array.isArray(vendorToken) ? vendorToken[0] : vendorToken
+
+    if (!tokenValue) {
+      return {
+        ok: false,
+        status: 401,
+        code: "VENDOR_AUTH_SIGNATURE_MISSING",
+        message: "Missing vendor authentication (legacy x-vendor-token also absent)",
+      }
+    }
+
+    // Treat token as seller_id directly (legacy contract — insecure, transition only)
+    logger.warn?.(
+      JSON.stringify({
+        event: "vendor-auth.legacy-accept",
+        seller_id: tokenValue,
+        transition_window: true,
+      })
+    )
+
+    return { ok: true, sellerId: tokenValue }
+  }
 }
 
 /**
  * withVendorAuth — HOF middleware factory for vendor-authenticated routes.
  *
  * Wraps a route handler to inject `req.vendorAuth` context.
- * If the vendor token is missing or invalid, responds with 401.
+ * When VENDOR_HMAC_ENFORCED=true (default): validates x-vendor-signature HMAC.
+ * When VENDOR_HMAC_ENFORCED=false: accepts legacy x-vendor-token (transition window).
  * If resolveVendorId is still a stub (NotImplementedError), responds with 501.
  */
 export function withVendorAuth(
@@ -95,24 +189,17 @@ export function withVendorAuth(
     next: MedusaNextFunction
   ): Promise<void> => {
     const logger = resolveLogger(req.scope)
-    const vendorToken = req.headers[VENDOR_TOKEN_HEADER]
-    const tokenValue = Array.isArray(vendorToken) ? vendorToken[0] : vendorToken
 
-    if (!tokenValue) {
-      res.status(401).json({
-        message: "Missing vendor authentication token",
-        header: VENDOR_TOKEN_HEADER,
+    const sellerResult = resolveSellerFromRequest(req, logger)
+    if (!sellerResult.ok) {
+      res.status(sellerResult.status).json({
+        code: sellerResult.code,
+        message: sellerResult.message,
       })
       return
     }
 
-    const sellerId = extractSellerIdFromToken(tokenValue)
-    if (!sellerId) {
-      res.status(401).json({
-        message: "Invalid vendor authentication token",
-      })
-      return
-    }
+    const { sellerId } = sellerResult
 
     const gpCore = resolveGpCore(req.scope)
     if (!gpCore) {
@@ -163,24 +250,17 @@ export async function vendorAuthMiddleware(
   next: MedusaNextFunction
 ): Promise<void> {
   const logger = resolveLogger(req.scope)
-  const vendorToken = req.headers[VENDOR_TOKEN_HEADER]
-  const tokenValue = Array.isArray(vendorToken) ? vendorToken[0] : vendorToken
 
-  if (!tokenValue) {
-    res.status(401).json({
-      message: "Missing vendor authentication token",
-      header: VENDOR_TOKEN_HEADER,
+  const sellerResult = resolveSellerFromRequest(req, logger)
+  if (!sellerResult.ok) {
+    res.status(sellerResult.status).json({
+      code: sellerResult.code,
+      message: sellerResult.message,
     })
     return
   }
 
-  const sellerId = extractSellerIdFromToken(tokenValue)
-  if (!sellerId) {
-    res.status(401).json({
-      message: "Invalid vendor authentication token",
-    })
-    return
-  }
+  const { sellerId } = sellerResult
 
   const gpCore = resolveGpCore(req.scope)
   if (!gpCore) {

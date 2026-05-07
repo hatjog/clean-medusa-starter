@@ -23,7 +23,7 @@
  * same jest worker cannot leak via the module-level cache.
  */
 
-import { describe, it, expect, jest, beforeEach } from "@jest/globals"
+import { describe, it, expect, jest, beforeEach, afterEach } from "@jest/globals"
 
 import { sniffMagicBytes } from "../../../../src/lib/magic-byte-sniffer"
 import { validateCertBytes } from "../../../../src/lib/training-cert-validator"
@@ -31,6 +31,29 @@ import {
   getMaxUploadBytes,
   resetMaxUploadBytesForTests,
 } from "../../../../src/lib/training-cert-upload-config"
+import { buildVendorSignatureHeader } from "../../../../src/lib/vendor-hmac"
+
+// ---------------------------------------------------------------------------
+// HMAC env setup — cleanup-48: withVendorAuth now requires HMAC signature
+// ---------------------------------------------------------------------------
+const CERT_TEST_SECRET = "cert-upload-test-hmac-secret-xxx"
+const CERT_TEST_SELLER = "cert-seller-test-uuid"
+
+const savedCertEnv: Record<string, string | undefined> = {}
+
+beforeEach(() => {
+  savedCertEnv.VENDOR_HMAC_SECRET = process.env.VENDOR_HMAC_SECRET
+  savedCertEnv.VENDOR_HMAC_ENFORCED = process.env.VENDOR_HMAC_ENFORCED
+  process.env.VENDOR_HMAC_SECRET = CERT_TEST_SECRET
+  process.env.VENDOR_HMAC_ENFORCED = "true"
+})
+
+afterEach(() => {
+  for (const [key, val] of Object.entries(savedCertEnv)) {
+    if (val === undefined) delete process.env[key]
+    else process.env[key] = val
+  }
+})
 
 // ---------------------------------------------------------------------------
 // jest.mock the vendor-notification-log module so we can capture both
@@ -239,8 +262,10 @@ describe("training-cert upload route — real uploadHandler (review F5)", () => 
     expect(auditLog[0].input["status"]).toBe("rejected")
   })
 
-  // Case 5 — real withVendorAuth gate (no x-vendor-token header)
-  it("case-5: missing vendor token → 401, no audit row written (real withVendorAuth)", async () => {
+  // Case 5: Missing vendor signature → 401 (real withVendorAuth gate, cleanup-48 HMAC)
+  // Verifies the inner handler is NEVER invoked when the signature header is
+  // absent — therefore mockAppendLog cannot be reached.
+  it("case-5: missing vendor signature → 401, no audit row written (real withVendorAuth)", async () => {
     const { withVendorAuth } = await import("../../../../src/lib/vendor-auth")
 
     const innerCalled = jest.fn()
@@ -257,8 +282,8 @@ describe("training-cert upload route — real uploadHandler (review F5)", () => 
     expect(auditLog).toHaveLength(0)
   })
 
-  // Case 6 — invalid/empty token still gated by withVendorAuth
-  it("case-6: invalid/empty vendor token → 401, no audit row written", async () => {
+  // Case 6: Invalid vendor signature → 401 (wrong secret = HMAC mismatch)
+  it("case-6: invalid vendor signature (wrong secret) → 401, no audit row written", async () => {
     const { withVendorAuth } = await import("../../../../src/lib/vendor-auth")
 
     const innerCalled = jest.fn()
@@ -266,9 +291,12 @@ describe("training-cert upload route — real uploadHandler (review F5)", () => 
       innerCalled()
     })
 
+    // Build a header with a wrong secret — HMAC will not match
+    const badHeader = buildVendorSignatureHeader(CERT_TEST_SELLER, "wrong-secret-xxx")
+
     const { res, status } = buildResMock()
     const req = {
-      headers: { "x-vendor-token": "" },
+      headers: { "x-vendor-signature": badHeader },
       scope: { resolve: () => undefined },
     } as any
     await wrapped(req, res, () => {})
