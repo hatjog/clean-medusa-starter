@@ -26,6 +26,7 @@
 import type { MedusaRequest, MedusaResponse } from "@medusajs/framework/http"
 import { Modules } from "@medusajs/framework/utils"
 import { marketContextStorage } from "../../../../../lib/market-context"
+import { assertResourceMarket } from "../../../../../lib/assert-resource-market"
 import { consumeClaimToken } from "../../../../../lib/voucher-claim-rate-limit"
 import {
   computeBinding,
@@ -173,16 +174,22 @@ export async function POST(
   // --- Lookup voucher early for market isolation check (constant-time path) ---
   const voucherForCheck = await voucherService.getByCode(code)
 
-  // Cross-market isolation (DPIA R-12, cleanup-27 M2 fail-CLOSED): if ALS market
-  // context is set, voucher must declare a matching market_id. NULL market_id is
-  // treated as "not in this market" (404 — do NOT 403, existence must not leak).
-  if (voucherForCheck && market_id && voucherForCheck.market_id !== market_id) {
-    await padToFloor(startedAt)
-    res.status(404).json({
-      type: "not_found",
-      message: "Voucher not found",
+  // Cross-market isolation (DPIA R-12, cleanup-27 M2; cleanup-61 helper adoption
+  // — review fix H1): delegate to the shared `assertResourceMarket` helper.
+  // - Null voucher continues to constant-time anti-enumeration path below
+  //   (helper default does NOT block on null resource).
+  // - `allowMissingAls: true` preserves the prior public-store behaviour: a
+  //   client without ALS market injection (pre-middleware) is permitted.
+  // - 404 (NOT 403) on cross-market mismatch — existence must not leak.
+  if (voucherForCheck) {
+    const guard = assertResourceMarket(voucherForCheck, market_id, "Voucher", {
+      allowMissingAls: true,
     })
-    return
+    if (guard.blocked) {
+      await padToFloor(startedAt)
+      res.status(404).json(guard.body)
+      return
+    }
   }
 
   // --- Compute expected HMAC binding ---

@@ -8,25 +8,23 @@
  * AC6: Each newly-guarded write handler has at least one AR45-boundary test (positive + negative).
  *
  * Coverage:
- *   - store/ surface: `store/vouchers/[code]/claim` POST (cleanup-27 guard; write-path test)
+ *   - store/ surface: `store/vouchers/[code]/claim` POST (cleanup-27 guard + cleanup-61 helper adoption)
  *   - admin/ surface: `assertResourceMarket` helper cross-market admin FP-suppressed (intentional)
  *   - vendor/ surface: `vendor/training-cert/upload` (vendor-JWT scoped, FP-suppressed)
  *
- * These are unit-level isolation tests using in-memory stubs.
- * STAGING-FREE: ADR-066 / UX-DR108 — verification on docker-compose local stack.
+ * NOTE — review fix M3 (2026-05-07): These tests are unit-level using in-memory stubs.
+ * Side-effect ordering ("AR45 fires BEFORE audit/notification/DB") is verified at the
+ * helper level only; a real-route integration test against a docker-compose stack is
+ * deferred to a follow-up story (`cleanup-61b` integration evidence) per AC5 STAGING-FREE
+ * constraint (UX-DR108 / ADR-066). The hand-written `simulateClaimRoute` helper mirrors
+ * but does NOT invoke `claim/route.ts` POST handler. Until the integration smoke harness
+ * lands, regressions in ordering inside the real handler are NOT caught by this file.
  *
  * DPIA R-12 write-side mitigation evidence: test names + commit SHA in completion notes.
- *
- * assertResourceMarket helper unit tests (AC4 validator unit test coverage):
- *   - extract + assert → OK
- *   - extract but no assert → finding raised (validator level)
- *   - GET handler → no finding (rule write-only)
- *   - Static path write → no finding
  */
 
 import { describe, expect, it } from "@jest/globals"
 
-import { marketContextStorage } from "../lib/market-context"
 import { assertResourceMarket } from "../lib/assert-resource-market"
 import type { VoucherWithEvents } from "../modules/voucher"
 
@@ -46,21 +44,34 @@ interface ClaimRouteSimulation {
 /**
  * Simulate the write-path AR45 guard in claim/route.ts.
  *
- * The real route:
- *   1. Extracts ALS market_id
- *   2. Fetches voucher by code
- *   3. Asserts voucher.market_id === als.market_id (or both null) BEFORE mutation
- *   4. Returns 404 on mismatch (existence must not leak)
- *
- * This simulation mirrors that logic to produce observable side-effects
- * (dbMutationAttempted, auditWritten, notificationDispatched) for assertion.
+ * Mirrors the real route's behaviour after the cleanup-61 helper adoption:
+ *   1. Null voucher → constant-time path returns 404 without invoking helper
+ *      (helper would not block on null voucher anyway with default options).
+ *   2. Non-null voucher → assertResourceMarket(..., { allowMissingAls: true }):
+ *      a. cross-market mismatch → blocked, 404, no side-effects.
+ *      b. same-market or no ALS context → not blocked, mutation proceeds.
  */
 function simulateClaimRoute(
   voucherOrNull: VoucherWithEvents | null,
   alsMarketId: string | null
 ): ClaimRouteSimulation {
-  // AR45 pre-mutation assertion (mirrors real route.ts guard added by cleanup-27)
-  const guard = assertResourceMarket(voucherOrNull, alsMarketId, "Voucher")
+  // Null voucher follows the constant-time anti-enumeration path; the AR45
+  // helper is NOT invoked for it (matches real claim/route.ts behaviour).
+  if (voucherOrNull === null) {
+    return {
+      status: 404,
+      body: { type: "not_found", message: "Voucher not found" },
+      dbMutationAttempted: false,
+      auditWritten: false,
+      notificationDispatched: false,
+    }
+  }
+
+  // AR45 pre-mutation assertion — public store endpoint passes
+  // `allowMissingAls: true` so callers without ALS injection still resolve.
+  const guard = assertResourceMarket(voucherOrNull, alsMarketId, "Voucher", {
+    allowMissingAls: true,
+  })
 
   if (guard.blocked) {
     // Fail-closed: return 404 WITHOUT any DB mutation, audit, or notification
@@ -73,10 +84,10 @@ function simulateClaimRoute(
     }
   }
 
-  // Only reach here on same-market (or no ALS context) — proceed with mutation
+  // Only reach here on same-market (or allowMissingAls + no ALS) — proceed with mutation
   return {
     status: 200,
-    body: { state: "claimed", seller_handle: voucherOrNull?.seller_handle ?? null },
+    body: { state: "claimed", seller_handle: voucherOrNull.seller_handle ?? null },
     dbMutationAttempted: true,
     auditWritten: true,
     notificationDispatched: true,
@@ -131,14 +142,51 @@ describe("v160-cleanup-61 AC6: assertResourceMarket helper — AR45 boundary tes
     }
   })
 
-  it("resource not found (null) → BLOCKED 404 regardless of ALS context", () => {
+  // Review fix M2 — default is now fail-closed for missing ALS;
+  // null-resource is no longer auto-blocked (caller handles it).
+  it("[default fail-closed] resource not found (null) → NOT blocked (caller handles null-resource)", () => {
     const result = assertResourceMarket(null, "market-bonbeauty", "voucher")
+    expect(result.blocked).toBe(false)
+  })
+
+  it("resource not found (null) with blockOnMissingResource:true → BLOCKED 404", () => {
+    const result = assertResourceMarket(null, "market-bonbeauty", "voucher", {
+      blockOnMissingResource: true,
+    })
+    expect(result.blocked).toBe(true)
+    if (result.blocked) {
+      expect(result.body.type).toBe("not_found")
+    }
+  })
+
+  it("[default fail-closed] no ALS context (alsMarketId=null) → BLOCKED (middleware bug must NOT grant write access)", () => {
+    const resource = { market_id: "market-bonbeauty" }
+    const result = assertResourceMarket(resource, null, "voucher")
+    expect(result.blocked).toBe(true)
+    if (result.blocked) {
+      expect(result.body.type).toBe("not_found")
+    }
+  })
+
+  it("no ALS context (alsMarketId=null) with allowMissingAls:true → NOT blocked (admin / system-level opt-in)", () => {
+    const resource = { market_id: "market-bonbeauty" }
+    const result = assertResourceMarket(resource, null, "voucher", {
+      allowMissingAls: true,
+    })
+    expect(result.blocked).toBe(false)
+  })
+
+  it("[default fail-closed] empty alsMarketId string → BLOCKED", () => {
+    const resource = { market_id: "market-bonbeauty" }
+    const result = assertResourceMarket(resource, "", "voucher")
     expect(result.blocked).toBe(true)
   })
 
-  it("no ALS context (alsMarketId=null) → NOT blocked (admin / system-level caller)", () => {
+  it("empty alsMarketId with allowMissingAls:true → NOT blocked", () => {
     const resource = { market_id: "market-bonbeauty" }
-    const result = assertResourceMarket(resource, null, "voucher")
+    const result = assertResourceMarket(resource, "", "voucher", {
+      allowMissingAls: true,
+    })
     expect(result.blocked).toBe(false)
   })
 
@@ -148,16 +196,14 @@ describe("v160-cleanup-61 AC6: assertResourceMarket helper — AR45 boundary tes
     expect(result.blocked).toBe(false)
   })
 
-  it("resource has empty string market_id → treated as unscoped → NOT blocked", () => {
+  // Review fix L1 — empty-string market_id is a data-integrity bug, not "unscoped".
+  it("[review fix L1] resource has empty-string market_id → BLOCKED (data-integrity bug, not silently allowed)", () => {
     const resource = { market_id: "" }
     const result = assertResourceMarket(resource, "market-bonbeauty", "voucher")
-    expect(result.blocked).toBe(false)
-  })
-
-  it("empty alsMarketId string → treated as no ALS context → NOT blocked", () => {
-    const resource = { market_id: "market-bonbeauty" }
-    const result = assertResourceMarket(resource, "", "voucher")
-    expect(result.blocked).toBe(false)
+    expect(result.blocked).toBe(true)
+    if (result.blocked) {
+      expect(result.body.type).toBe("not_found")
+    }
   })
 })
 
@@ -210,8 +256,9 @@ describe("v160-cleanup-61 AC5: DPIA R-12 cross-market WRITE isolation — store/
     expect(result.dbMutationAttempted).toBe(false)
   })
 
-  it("[NEGATIVE] cross-market probe: null ALS market_id = no market context = mutation allowed (backward compat)", () => {
-    // When no ALS context is set (e.g. admin or pre-middleware path), treat as open access
+  it("[backward-compat] null ALS market_id with public-store allowMissingAls:true → mutation allowed", () => {
+    // The real claim route uses { allowMissingAls: true } so pre-middleware
+    // clients (no ALS injection) can still reach the endpoint.
     const voucherA = makeVoucher("VOUCHER-NO-ALS-CONTEXT", MARKET_A)
 
     const result = simulateClaimRoute(voucherA, null)
@@ -223,55 +270,67 @@ describe("v160-cleanup-61 AC5: DPIA R-12 cross-market WRITE isolation — store/
 
 // ---------------------------------------------------------------------------
 // AC5 — DPIA R-12 cross-market WRITE isolation — admin/ surface
-// Admin routes are cross_market_admin per AR44 §admin-exclusion.
-// Verify the assertResourceMarket helper correctly passes when alsMarketId is null
-// (admin caller has no ALS market context — intentional cross-market by design).
+// Admin routes are cross_market_admin per AR44 §admin-exclusion. They MUST
+// pass `allowMissingAls: true` (or have ALS injected explicitly) — the helper's
+// new fail-closed default protects against silent middleware regressions.
 // ---------------------------------------------------------------------------
 
 describe("v160-cleanup-61 AC5: DPIA R-12 cross-market WRITE isolation — admin/ surface (cross_market_admin exclusion)", () => {
-  it("[admin-exclusion] admin caller with no ALS context may mutate any-market resource — AR44 §admin-exclusion", () => {
-    // Admin routes use no ALS market injection — market context is null
+  it("[admin-exclusion] admin caller with allowMissingAls:true may mutate any-market resource — AR44 §admin-exclusion", () => {
+    // Admin routes use no ALS market injection — market context is null.
+    // They MUST opt into permissive behaviour explicitly via allowMissingAls.
     const sellerRow = { market_id: "market-bonbeauty" }
 
-    // assertResourceMarket with null alsMarketId → not blocked (admin-exclusion)
-    const result = assertResourceMarket(sellerRow, null, "seller")
+    const result = assertResourceMarket(sellerRow, null, "seller", {
+      allowMissingAls: true,
+    })
     expect(result.blocked).toBe(false)
   })
 
-  it("[admin-exclusion] admin seller-pause correctly resolves market from seller row when ALS header absent — AC3 annotated handler", () => {
+  it("[admin-exclusion] admin caller without allowMissingAls → BLOCKED by default (regression-protection)", () => {
+    // If an admin route forgets to pass allowMissingAls, the helper fails closed.
+    // This regression test guards against silent re-introduction of the original
+    // fail-OPEN default (review fix M2).
+    const sellerRow = { market_id: "market-bonbeauty" }
+
+    const result = assertResourceMarket(sellerRow, null, "seller")
+    expect(result.blocked).toBe(true)
+  })
+
+  it("[admin-exclusion] admin seller-pause correctly resolves market from seller row — AC3 annotated handler", () => {
     // AR45 admin-cross-market: admin/sellers/[id]/pause uses seller.market_id from DB row
     // (effectiveMarketId), not ALS context. Correct by design per AR44 §admin-exclusion.
-    // This test verifies the helper does NOT block admin paths.
     const sellerA = { market_id: "market-bonbeauty" }
     const sellerB = { market_id: "market-kremidotyk" }
 
-    // Admin caller (no ALS): both sellers accessible
-    expect(assertResourceMarket(sellerA, null, "seller").blocked).toBe(false)
-    expect(assertResourceMarket(sellerB, null, "seller").blocked).toBe(false)
+    expect(assertResourceMarket(sellerA, null, "seller", { allowMissingAls: true }).blocked).toBe(false)
+    expect(assertResourceMarket(sellerB, null, "seller", { allowMissingAls: true }).blocked).toBe(false)
   })
 })
 
 // ---------------------------------------------------------------------------
 // AC5 — DPIA R-12 cross-market WRITE isolation — vendor/ surface
 // Vendor routes use JWT vendor_id scope, not market_id ALS (OQ#5 confirmed).
-// assertResourceMarket with null alsMarketId → not blocked (vendor context pass-through).
+// They opt into `allowMissingAls: true` explicitly.
 // ---------------------------------------------------------------------------
 
 describe("v160-cleanup-61 AC5: DPIA R-12 cross-market WRITE isolation — vendor/ surface (JWT-vendor-scoped)", () => {
-  it("[vendor-jwt-exclusion] vendor training-cert upload: no ALS market_id → assertResourceMarket does NOT block", () => {
+  it("[vendor-jwt-exclusion] vendor training-cert upload: no ALS market_id with allowMissingAls:true → NOT blocked", () => {
     // Vendor routes inject JWT vendor_id, not ALS market_id.
-    // assertResourceMarket with null alsMarketId → not blocked per Rule 2.
     const vendorResource = { market_id: "market-bonbeauty", vendor_id: "vendor-abc" }
 
-    // In vendor-jwt context, alsMarketId is null → not blocked
-    const result = assertResourceMarket(vendorResource, null, "vendor-resource")
+    const result = assertResourceMarket(vendorResource, null, "vendor-resource", {
+      allowMissingAls: true,
+    })
     expect(result.blocked).toBe(false)
   })
 })
 
 // ---------------------------------------------------------------------------
 // AC5 — ALS context: cross-market write fails-closed BEFORE side-effects
-// Verifies ordering invariant: AR45 assertion fires before audit, event, notification
+// Verifies ordering invariant: AR45 assertion fires before audit, event, notification.
+// NOTE (review fix M3): ordering is verified at helper-call level only; the
+// real claim/route.ts handler is not invoked here. See file header.
 // ---------------------------------------------------------------------------
 
 describe("v160-cleanup-61 AC5: AR45 side-effect ordering — assertion fires BEFORE audit/notification/DB", () => {
