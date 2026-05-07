@@ -104,23 +104,38 @@ export async function POST(req: MedusaRequest, res: MedusaResponse): Promise<voi
   }
 
   const body = (req.body ?? {}) as PauseRequestBody
-  const reason = body.reason?.trim()
-  const isOverride = body.override === true
 
-  if (!reason) {
+  // [AI-Review][MEDIUM fix] Reject truthy non-boolean override values so operators
+  // do not believe the override path was invoked when the client mis-serialised the
+  // field (e.g. "true" string or 1 instead of true). Strict-equality below remains
+  // the gate decision; this guard turns silent path-skip into an explicit error.
+  if (body.override !== undefined && typeof body.override !== "boolean") {
     res.status(400).json({
-      code: "REASON_REQUIRED",
-      message: "ADR-074 mandates an audit `reason` for every status transition",
+      code: "INVALID_OVERRIDE_TYPE",
+      message:
+        "`override` must be a JSON boolean (true/false) — string/number values are rejected to avoid silent path skips",
     })
     return
   }
+  const isOverride = body.override === true
+  const reason = body.reason?.trim()
 
-  // AC4 — when override=true enforce a minimum-length reason that provides
-  // meaningful justification for bypassing the FR54 training-cert gate.
-  if (isOverride && reason.length < OVERRIDE_REASON_MIN_LENGTH) {
+  // [AI-Review][HIGH fix] AC4 contract: when override=true ALL three failure
+  // modes (missing, blank-after-trim, < min length) MUST return
+  // OVERRIDE_REASON_REQUIRED. The non-override path keeps REASON_REQUIRED
+  // unchanged (AC5 regression guard).
+  if (isOverride) {
+    if (!reason || reason.length < OVERRIDE_REASON_MIN_LENGTH) {
+      res.status(400).json({
+        code: "OVERRIDE_REASON_REQUIRED",
+        message: `Override reason must be at least ${OVERRIDE_REASON_MIN_LENGTH} characters after trimming, per FR54 training-cert override audit obligation`,
+      })
+      return
+    }
+  } else if (!reason) {
     res.status(400).json({
-      code: "OVERRIDE_REASON_REQUIRED",
-      message: `Override reason must be at least ${OVERRIDE_REASON_MIN_LENGTH} characters after trimming`,
+      code: "REASON_REQUIRED",
+      message: "ADR-074 mandates an audit `reason` for every status transition",
     })
     return
   }
@@ -133,17 +148,29 @@ export async function POST(req: MedusaRequest, res: MedusaResponse): Promise<voi
     return
   }
 
+  const marketId = extractMarketId(req)
+  const logger = (req.scope.resolve(ContainerRegistrationKeys.LOGGER) as unknown as Logger | undefined) ?? {}
+
   // AC1/AC2 — capability gate for the override path.
   // Must be evaluated BEFORE any DB write or audit row is emitted.
   if (isOverride) {
     const cap = await requireCapability(req, "vendor.lifecycle.override_training_cert")
     if (!cap.ok) {
+      // [AI-Review][MEDIUM fix] Emit a structured warn-level audit log on
+      // capability denial so SecOps can detect repeated failed override
+      // attempts (signal class TF-91 was filed for). When cleanup-42 lands
+      // the real grants table, this is the canonical baseline for alerting
+      // on misconfigured grants.
+      logger.warn?.("seller.pause override capability denied", {
+        sellerId,
+        actorId,
+        capability: "vendor.lifecycle.override_training_cert",
+        route: "POST /admin/sellers/:id/pause",
+      })
       res.status(cap.status).json(cap.body)
       return
     }
   }
-  const marketId = extractMarketId(req)
-  const logger = (req.scope.resolve(ContainerRegistrationKeys.LOGGER) as unknown as Logger | undefined) ?? {}
 
   // Resolve PG pool + Redis client from the Medusa container. The keys below
   // match the convention used by `gp-core` (see `src/modules/gp-core/service.ts`).

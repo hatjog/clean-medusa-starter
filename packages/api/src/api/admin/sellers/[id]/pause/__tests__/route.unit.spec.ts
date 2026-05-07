@@ -99,6 +99,7 @@ function makeReq(opts: {
   } = opts
 
   const { pool, client } = makePool()
+  const logger = { info: jest.fn(), warn: jest.fn(), error: jest.fn() }
 
   const req: Record<string, unknown> = {
     params: { id: sellerId },
@@ -106,7 +107,7 @@ function makeReq(opts: {
     headers: {},
     scope: {
       resolve: (key: string) => {
-        if (key === "logger") return { info: jest.fn(), warn: jest.fn(), error: jest.fn() }
+        if (key === "logger") return logger
         if (key === "__pg_pool__" && hasPool) return pool
         if (key === "__pg_pool__" && !hasPool) throw new Error("pg pool not registered")
         if (key === "__redis_publisher__" && hasRedis)
@@ -116,6 +117,7 @@ function makeReq(opts: {
       },
     },
     _testClient: client,
+    _testLogger: logger,
   }
 
   return req
@@ -209,9 +211,51 @@ describe("POST /admin/sellers/:id/pause — override capability gate (AC1-AC5)",
 
     await POST(req as never, res as never)
 
-    // Blank reason hits REASON_REQUIRED before OVERRIDE_REASON_REQUIRED.
+    // [AI-Review][HIGH fix] AC4 strict: blank-after-trim on override path
+    // returns OVERRIDE_REASON_REQUIRED, not REASON_REQUIRED.
     expect(res.statusCode).toBe(400)
-    expect((res.body as Record<string, unknown>).code).toBe("REASON_REQUIRED")
+    expect((res.body as Record<string, unknown>).code).toBe("OVERRIDE_REASON_REQUIRED")
+    expect(mockRequireCapability).not.toHaveBeenCalled()
+  })
+
+  it("AC4 missing override reason (override=true, no reason): returns 400 OVERRIDE_REASON_REQUIRED", async () => {
+    const { POST } = await import("../route")
+    const req = makeReq({ body: { override: true } })
+    const res = makeRes()
+
+    await POST(req as never, res as never)
+
+    // [AI-Review][HIGH fix] AC4 strict: missing reason on override path
+    // returns OVERRIDE_REASON_REQUIRED.
+    expect(res.statusCode).toBe(400)
+    expect((res.body as Record<string, unknown>).code).toBe("OVERRIDE_REASON_REQUIRED")
+    expect(mockRequireCapability).not.toHaveBeenCalled()
+  })
+
+  // -------------------------------------------------------------------------
+  // [AI-Review][MEDIUM fix] INVALID_OVERRIDE_TYPE — reject non-boolean override
+  // -------------------------------------------------------------------------
+  it("rejects override='true' (string) with 400 INVALID_OVERRIDE_TYPE; no capability check", async () => {
+    const { POST } = await import("../route")
+    const req = makeReq({ body: { override: "true", reason: "long enough reason here" } })
+    const res = makeRes()
+
+    await POST(req as never, res as never)
+
+    expect(res.statusCode).toBe(400)
+    expect((res.body as Record<string, unknown>).code).toBe("INVALID_OVERRIDE_TYPE")
+    expect(mockRequireCapability).not.toHaveBeenCalled()
+  })
+
+  it("rejects override=1 (number) with 400 INVALID_OVERRIDE_TYPE; no capability check", async () => {
+    const { POST } = await import("../route")
+    const req = makeReq({ body: { override: 1, reason: "long enough reason here" } })
+    const res = makeRes()
+
+    await POST(req as never, res as never)
+
+    expect(res.statusCode).toBe(400)
+    expect((res.body as Record<string, unknown>).code).toBe("INVALID_OVERRIDE_TYPE")
     expect(mockRequireCapability).not.toHaveBeenCalled()
   })
 
@@ -244,6 +288,7 @@ describe("POST /admin/sellers/:id/pause — override capability gate (AC1-AC5)",
     const req = makeReq({ body: { override: true, reason: "needs override justification" } })
     const res = makeRes()
     const client = (req as Record<string, unknown>)._testClient as ReturnType<typeof makeClient>
+    const logger = (req as Record<string, unknown>)._testLogger as { warn: jest.Mock }
 
     await POST(req as never, res as never)
 
@@ -257,6 +302,17 @@ describe("POST /admin/sellers/:id/pause — override capability gate (AC1-AC5)",
     // Must not emit T1/T2 propagation.
     expect(mockEmitT1).not.toHaveBeenCalled()
     expect(mockEmitT2).not.toHaveBeenCalled()
+
+    // [AI-Review][MEDIUM fix] Capability denial must emit a structured warn
+    // log so SecOps can detect repeated failed override attempts.
+    expect(logger.warn).toHaveBeenCalledWith(
+      "seller.pause override capability denied",
+      expect.objectContaining({
+        sellerId: "seller-1",
+        actorId: "admin-user-1",
+        capability: "vendor.lifecycle.override_training_cert",
+      })
+    )
   })
 
   it("AC2 capability check is called with correct capability key when override=true", async () => {
