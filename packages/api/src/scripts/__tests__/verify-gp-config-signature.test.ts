@@ -22,6 +22,7 @@ import { afterAll, beforeAll, describe, expect, it } from "@jest/globals"
 let privKey: crypto.KeyObject
 let pubKey: crypto.KeyObject
 let pubKeyHex: string
+let pubKeyPem: string
 let tmpDir: string
 
 const ARTIFACT_CONTENT = Buffer.from('{"market":"test","version":"1.0.0"}')
@@ -38,6 +39,7 @@ beforeAll(async () => {
   pubKey = kp.publicKey
   const der = pubKey.export({ format: "der", type: "spki" }) as Buffer
   pubKeyHex = der.subarray(der.length - 32).toString("hex")
+  pubKeyPem = pubKey.export({ format: "pem", type: "spki" }) as string
 })
 
 afterAll(async () => {
@@ -79,6 +81,9 @@ function runVerifierCLI(
     GP_CONFIG_SIGNING_PUBKEY: "",
     GP_CONFIG_VERIFY_PUBKEY: "",
     GP_CONFIG_SIGNING_ALLOW_SKIP: "",
+    // Defense-in-depth: scrub any operator-set artifact path so the test always
+    // exercises the explicit artifactPath argument we pass below.
+    GP_CONFIG_ARTIFACT_PATH: "",
   }
 
   for (const [k, v] of Object.entries(envOverrides)) {
@@ -121,6 +126,21 @@ describe("AC5(a): valid signature pass", () => {
 
     const { output, exitCode } = runVerifierCLI(artifactPath, {
       GP_CONFIG_SIGNING_PUBKEY: pubKeyHex,
+    })
+
+    const evidence = JSON.parse(output.trim())
+    expect(evidence.signature_status).toBe("pass")
+    expect(exitCode).toBe(0)
+  })
+
+  // F6: AC2/AC5(f) coverage at the CLI subprocess level — operator workflow uses
+  // PEM via env var (openssl pkey -pubout output is PEM by default).
+  it("emits signature_status: pass and exits 0 for PEM pubkey + valid sig", async () => {
+    const sig = signArtifact(ARTIFACT_CONTENT)
+    const artifactPath = await writeArtifactAndSig("valid-pem.json", ARTIFACT_CONTENT, sig)
+
+    const { output, exitCode } = runVerifierCLI(artifactPath, {
+      GP_CONFIG_SIGNING_PUBKEY: pubKeyPem,
     })
 
     const evidence = JSON.parse(output.trim())

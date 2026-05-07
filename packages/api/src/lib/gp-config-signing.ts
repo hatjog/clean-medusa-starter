@@ -62,6 +62,12 @@ export function createEd25519PrivateKey(privkey: string): crypto.KeyObject {
 /**
  * Extract raw 32-byte Ed25519 public key from PEM, hex, or base64-encoded input.
  * The raw key is what @noble/ed25519 expects for verification.
+ *
+ * Throws if the input cannot be unambiguously decoded to a 32-byte Ed25519
+ * public key. Accepted shapes:
+ *   - PEM SPKI block ("-----BEGIN PUBLIC KEY-----...")
+ *   - 32-byte raw key (hex or base64)
+ *   - SPKI DER (hex or base64) prefixed with the canonical Ed25519 SPKI marker
  */
 export function extractRawEd25519PublicKey(pubkey: string): Uint8Array {
   if (isPemEncoded(pubkey)) {
@@ -76,8 +82,18 @@ export function extractRawEd25519PublicKey(pubkey: string): Uint8Array {
   if (decoded.length === 32) {
     return new Uint8Array(decoded)
   }
-  // DER/SPKI encoded — strip prefix, take last 32 bytes
-  return new Uint8Array(decoded.subarray(decoded.length - 32))
+  // SPKI DER must start with the canonical Ed25519 SPKI prefix; reject other
+  // sizes/prefixes to avoid silently truncating arbitrary blobs into a key.
+  const expectedSpkiLength = ED25519_SPKI_PREFIX.length + 32
+  if (
+    decoded.length === expectedSpkiLength &&
+    decoded.subarray(0, ED25519_SPKI_PREFIX.length).equals(ED25519_SPKI_PREFIX)
+  ) {
+    return new Uint8Array(decoded.subarray(ED25519_SPKI_PREFIX.length))
+  }
+  throw new Error(
+    `extractRawEd25519PublicKey: invalid pubkey encoding (decoded ${decoded.length} bytes; expected 32 raw or ${expectedSpkiLength} SPKI-DER with Ed25519 prefix)`,
+  )
 }
 
 /**
@@ -98,9 +114,18 @@ export function verifyEd25519Signature(
 }
 
 export function buildPublicKeyKid(pubkey: string): string {
-  const decoded = decodeBinaryMaterial(pubkey)
-  const kidSource = decoded.length >= 32 ? decoded.subarray(decoded.length - 32) : decoded
-  return `${kidSource.toString("base64").slice(0, 16)}…`
+  // Route through the canonical raw-key extractor so the kid is encoding-invariant
+  // (PEM input and hex/base64 input for the same key produce the same kid).
+  // Falls back to the previous best-effort base64 prefix on extraction failure
+  // so callers get a stable string instead of a crash for diagnostic logging.
+  let raw: Uint8Array
+  try {
+    raw = extractRawEd25519PublicKey(pubkey)
+  } catch {
+    const decoded = decodeBinaryMaterial(pubkey)
+    raw = new Uint8Array(decoded.length >= 32 ? decoded.subarray(decoded.length - 32) : decoded)
+  }
+  return `${Buffer.from(raw).toString("base64").slice(0, 16)}…`
 }
 
 export function exportRawEd25519PublicKey(publicKey: crypto.KeyObject): string {

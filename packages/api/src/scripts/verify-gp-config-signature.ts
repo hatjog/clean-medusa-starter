@@ -56,6 +56,11 @@ async function main(): Promise<void> {
     path.join(defaultDistDir, "gp-config.json")
 
   const allowSkip = process.env.GP_CONFIG_SIGNING_ALLOW_SKIP === "1"
+  if (allowSkip) {
+    process.stderr.write(
+      "[gp-config-verify] WARNING: GP_CONFIG_SIGNING_ALLOW_SKIP=1 is honored — verification may be SKIPPED. Local dev only; never set in production.\n",
+    )
+  }
 
   // AC2: Load pubkey from GP_CONFIG_SIGNING_PUBKEY (primary).
   // Fallback to GP_CONFIG_VERIFY_PUBKEY (deprecated) with deprecation notice.

@@ -32,3 +32,15 @@ build
 /modules
 /subscribers
 /workflows
+
+# GP-config signing key material — never commit private or local key files
+# (super-repo .gitignore covers gp-ops/config/dist/*; this is defense-in-depth
+# for operators running scripts from the backend submodule).
+*.pem
+*.key
+*.priv
+*.pub
+!**/node_modules/**/*.pem
+!**/node_modules/**/*.key
+!**/node_modules/**/*.pub
+!__mocks__/**
