@@ -496,7 +496,6 @@ export async function setState(
   }
 
   _auditTrail.push(entry)
-  _lastTransitionAt = entry.at
 
   return {
     from,
