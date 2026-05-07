@@ -1,5 +1,7 @@
 import * as crypto from "crypto"
 
+// eslint-disable-next-line @typescript-eslint/ban-ts-comment
+// @ts-ignore -- @noble/ed25519 is ESM-only; used at runtime via bundler (Medusa handles CJS->ESM interop)
 import * as ed from "@noble/ed25519"
 import { sha512 } from "@noble/hashes/sha512"
 

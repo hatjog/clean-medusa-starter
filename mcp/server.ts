@@ -1,4 +1,8 @@
+// eslint-disable-next-line @typescript-eslint/ban-ts-comment
+// @ts-ignore -- @modelcontextprotocol/sdk installed separately for this standalone tool; run `pnpm install` in mcp/ if types missing
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+// eslint-disable-next-line @typescript-eslint/ban-ts-comment
+// @ts-ignore -- @modelcontextprotocol/sdk installed separately for this standalone tool
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 

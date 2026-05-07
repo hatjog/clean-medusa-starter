@@ -39,7 +39,8 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
     additional_data?: Record<string, unknown>;
   };
   const createPromotions = createPromotionsWorkflow(req.scope);
-  const promotionsData = [rest];
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const promotionsData = [rest] as any[];
   const { result } = await createPromotions.run({
     input: { promotionsData, additional_data },
   });

@@ -52,7 +52,8 @@ export class Migration20260427120000AddLocalesToMarketRuntimeConfig extends Migr
     //    the migration idempotent if up() is replayed after partial completion (R3-AI-06
     //    rollback-partial scenario).
     for (const [marketId, locales] of Object.entries(LOCALES_BACKFILL_SEED)) {
-      this.addSql(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      ;(this.addSql as any)(
         `UPDATE "market_runtime_config" SET "locales" = ?::jsonb WHERE "market_id" = ? AND "locales" IS NULL;`,
         [JSON.stringify(locales), marketId]
       );

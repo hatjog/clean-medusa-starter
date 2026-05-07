@@ -12,11 +12,13 @@ import {
 
 // Mock pg module to avoid real DB connections
 jest.mock("pg", () => {
-  const mockQuery = jest.fn().mockResolvedValue({ rows: [{ "?column?": 1 }] })
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const mockQuery = (jest.fn() as any).mockResolvedValue({ rows: [{ "?column?": 1 }] })
   const mockPool = jest.fn(() => ({
     query: mockQuery,
     connect: jest.fn(),
-    end: jest.fn().mockResolvedValue(undefined),
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    end: (jest.fn() as any).mockResolvedValue(undefined),
   }))
   return { Pool: mockPool }
 })

@@ -46,12 +46,14 @@ afterEach(() => {
 // ---------------------------------------------------------------------------
 
 const auditLog: Array<Record<string, unknown>> = []
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
 const mockAppendLog = jest.fn(async (_scope: unknown, input: Record<string, unknown>) => {
   auditLog.push({ ...input })
   return { id: "audit-row", ...input }
-})
+}) as any
 
-const mockResolveSnapshots = jest.fn()
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const mockResolveSnapshots = jest.fn() as any
 
 // ---------------------------------------------------------------------------
 // Route simulator
@@ -112,7 +114,7 @@ async function simulateRoute(opts: SimulateOpts): Promise<{
 
   // Aggregation (real function — no need to mock pure computation)
   const { getCompetitiveInsights } = await import(
-    "../../../../src/lib/competitive-insights-aggregator"
+    "../../../../src/lib/competitive-insights-aggregator.js"
   )
   const insightsData = getCompetitiveInsights(vendorId, snapshots)
 
@@ -162,12 +164,12 @@ describe("competitive-insights route — business logic", () => {
     mockResolveSnapshots.mockResolvedValue({
       snapshots: [SNAPSHOT_VENDOR_A_CAT1, SNAPSHOT_VENDOR_B_CAT1],
       data_source: "mercur_query",
-    })
+    } as any)
   })
 
   // C1 — Missing vendor signature → 401, no audit row, handler not invoked
   it("C1: missing vendor signature → 401, no audit row written (real withVendorAuth + HMAC)", async () => {
-    const { withVendorAuth } = await import("../../../../src/lib/vendor-auth")
+    const { withVendorAuth } = await import("../../../../src/lib/vendor-auth.js")
 
     const innerCalled = jest.fn()
     const wrapped = withVendorAuth(async (_req, _res, _next) => {
@@ -194,7 +196,7 @@ describe("competitive-insights route — business logic", () => {
 
   // C2 — Invalid vendor signature (wrong secret) → 401, no audit row
   it("C2: invalid vendor signature (wrong secret) → 401, no audit row written", async () => {
-    const { withVendorAuth } = await import("../../../../src/lib/vendor-auth")
+    const { withVendorAuth } = await import("../../../../src/lib/vendor-auth.js")
 
     const innerCalled = jest.fn()
     const wrapped = withVendorAuth(async (_req, _res, _next) => {

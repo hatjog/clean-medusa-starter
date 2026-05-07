@@ -236,7 +236,8 @@ function createLifecycleScopeKnex(lifecycleStatus: string = "pending_approval", 
     return { select: jest.fn().mockReturnThis(), where: jest.fn().mockReturnThis(), whereIn: jest.fn().mockReturnThis(), whereNull: jest.fn().mockReturnThis(), first: jest.fn().mockResolvedValue(null) as AnyFn }
   }
 
-  const knexFn = jest.fn((tableName: string) => buildTable(tableName)) as AnyFn & { transaction: AnyFn }
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const knexFn = jest.fn((tableName: string) => buildTable(tableName)) as unknown as AnyFn & { transaction: AnyFn }
   knexFn.transaction = jest.fn(async (fn: (trx: unknown) => Promise<unknown>) => {
     const trxProxy = (tableName: string) => buildTable(tableName)
     return fn(trxProxy)

@@ -266,7 +266,7 @@ describe("training-cert upload route — real uploadHandler (review F5)", () => 
   // Verifies the inner handler is NEVER invoked when the signature header is
   // absent — therefore mockAppendLog cannot be reached.
   it("case-5: missing vendor signature → 401, no audit row written (real withVendorAuth)", async () => {
-    const { withVendorAuth } = await import("../../../../src/lib/vendor-auth")
+    const { withVendorAuth } = await import("../../../../src/lib/vendor-auth.js")
 
     const innerCalled = jest.fn()
     const wrapped = withVendorAuth(async (_req, _res, _next) => {
@@ -284,7 +284,7 @@ describe("training-cert upload route — real uploadHandler (review F5)", () => 
 
   // Case 6: Invalid vendor signature → 401 (wrong secret = HMAC mismatch)
   it("case-6: invalid vendor signature (wrong secret) → 401, no audit row written", async () => {
-    const { withVendorAuth } = await import("../../../../src/lib/vendor-auth")
+    const { withVendorAuth } = await import("../../../../src/lib/vendor-auth.js")
 
     const innerCalled = jest.fn()
     const wrapped = withVendorAuth(async (_req, _res, _next) => {

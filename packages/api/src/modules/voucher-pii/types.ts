@@ -65,7 +65,11 @@ export interface RecordWithdrawalResult {
 export interface ConsentStateSnapshot {
   consent_audit_id: string;
   market_id: string;
-  recipient_pii_id: string;
+  recipient_pii_id?: string;
+  /** Order associated with the consent audit, if known. */
+  order_id?: string | null;
+  /** ISO timestamp of the consent audit record creation. */
+  created_at?: string;
   /** True iff audit row was committed AND not subsequently withdrawn. */
   audit_confirmed: boolean;
 }

@@ -66,6 +66,7 @@ describe('upsertSeller dry-run', () => {
       },
       true,
       'bonbeauty',
+      'pln',
       true
     )
 
@@ -99,6 +100,7 @@ describe('upsertSeller dry-run', () => {
       },
       true,
       'bonbeauty',
+      'pln',
       true
     )
 

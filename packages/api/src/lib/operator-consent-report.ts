@@ -242,10 +242,13 @@ export class SellerModuleUnavailableError extends Error {
   static readonly PUBLIC_MESSAGE =
     "Seller module service is not available"
   readonly code = "SELLER_MODULE_UNAVAILABLE"
+  readonly cause: Error | undefined
 
-  constructor(cause?: Error) {
-    super(SellerModuleUnavailableError.PUBLIC_MESSAGE, cause ? { cause } : undefined)
+  constructor(causeError?: Error) {
+    // super() takes 1 arg in ES2021 target; set cause manually for ES2022+ runtime compatibility
+    super(SellerModuleUnavailableError.PUBLIC_MESSAGE)
     this.name = "SellerModuleUnavailableError"
+    this.cause = causeError
   }
 }
 

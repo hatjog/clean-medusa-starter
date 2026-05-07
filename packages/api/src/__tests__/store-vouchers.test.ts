@@ -21,8 +21,9 @@ function makeMockPool(responses: QueryResponse[]): Pool {
     idx++
     return resp
   }
-  const mockClient: Partial<PoolClient> = {
-    query: async () => ({ rows: [] }),
+  const mockClient = {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    query: async (): Promise<any> => ({ rows: [] }),
     release: () => {},
   }
   return {

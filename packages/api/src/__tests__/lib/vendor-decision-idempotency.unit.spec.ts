@@ -205,7 +205,7 @@ describe("findIdempotencyRecord", () => {
 })
 
 describe("reserveIdempotencySlot (review fix H1)", () => {
-  beforeEach(() => jest.clearAllMocks())
+  beforeEach(() => { jest.clearAllMocks() })
 
   it("returns reserved=true with PENDING row on race-win", async () => {
     const reservedRow = {

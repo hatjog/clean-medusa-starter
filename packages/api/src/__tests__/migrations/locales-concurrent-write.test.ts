@@ -30,7 +30,6 @@
 import {
   Migration20260427120000AddLocalesToMarketRuntimeConfig,
   LOCALES_BACKFILL_SEED,
-} from "../../migrations/Migration20260427120000AddLocalesToMarketRuntimeConfig";
 } from "../../migrations-legacy-base/Migration20260427120000AddLocalesToMarketRuntimeConfig";
 
 type Row = {
@@ -75,7 +74,9 @@ class HarnessMigration extends Migration20260427120000AddLocalesToMarketRuntimeC
   public capturedUpdates: { marketId: string; locales: Row["locales"] }[] = [];
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  public override addSql(sql: string, params: unknown[] = []): any {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  public override addSql(sql: string, ...args: any[]): any {
+    const params: unknown[] = args[0] ?? [];
     if (/UPDATE.*market_runtime_config.*SET.*locales/i.test(sql)) {
       const [serializedLocales, marketId] = params as [string, string];
       this.capturedUpdates.push({
@@ -93,7 +94,7 @@ describe("Migration20260427120000AddLocalesToMarketRuntimeConfig — concurrent 
     const seedMarkets = Object.keys(LOCALES_BACKFILL_SEED);
     store.seed(seedMarkets);
 
-    const harness = new HarnessMigration();
+    const harness = new (HarnessMigration as any)();
     await harness.up();
 
     // Spawn N=10 concurrent writers per market hammering `version`.
@@ -144,7 +145,7 @@ describe("Migration20260427120000AddLocalesToMarketRuntimeConfig — concurrent 
       fallback_chain: ["pl", "en"],
     });
 
-    const harness = new HarnessMigration();
+    const harness = new (HarnessMigration as any)();
     await harness.up();
 
     for (const u of harness.capturedUpdates) {

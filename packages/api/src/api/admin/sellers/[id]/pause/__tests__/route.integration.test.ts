@@ -85,7 +85,7 @@ describe("POST /admin/sellers/:id/pause — REAL capability-check integration", 
   })
 
   it("denies override when auth_context lacks actor_type=user (returns real CapabilityDeniedPayload shape)", async () => {
-    const { POST } = await import("../route")
+    const { POST } = await import("../route.js")
     // auth_context has actor_id but actor_type !== "user" → real
     // checkLifecycleOverrideCapability returns false → 403.
     const req = makeReq({
@@ -107,7 +107,7 @@ describe("POST /admin/sellers/:id/pause — REAL capability-check integration", 
   })
 
   it("grants override when auth_context.actor_type=user (real path)", async () => {
-    const { POST } = await import("../route")
+    const { POST } = await import("../route.js")
     const req = makeReq({
       body: { override: true, reason: "long enough override reason" },
       authContext: { actor_id: "admin-1", actor_type: "user" },

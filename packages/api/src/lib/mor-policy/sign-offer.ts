@@ -100,7 +100,7 @@ export function readPreviousSigningKey(
 export function canonicalize(input: SignOfferInput): string {
   const sortedEntries = Object.keys(input)
     .sort()
-    .map((key) => [key, (input as Record<string, unknown>)[key]] as const)
+    .map((key) => [key, (input as unknown as Record<string, unknown>)[key]] as const)
   // Re-construct object preserving sorted order.
   const sorted: Record<string, unknown> = {}
   for (const [k, v] of sortedEntries) {

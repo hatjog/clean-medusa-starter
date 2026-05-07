@@ -12,7 +12,7 @@ import {
   _resetRlsPoolHook,
   installRlsPoolHook,
 } from "../../lib/rls-pool-hook";
-import { marketContextStorage } from "../../lib/market-context";
+import { marketContextStorage, type MarketContext } from "../../lib/market-context";
 
 const DATABASE_URL =
   process.env.DATABASE_URL ||

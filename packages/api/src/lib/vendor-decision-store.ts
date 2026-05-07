@@ -5,7 +5,7 @@ import type {
   DecisionConfirmationLocale,
   DecisionType,
 } from "../modules/vendor-notifications/email-templates/decision-confirmation/i18n"
-import type { LifecycleStatus } from "./vendor-lifecycle-state-machine"
+import type { LifecycleStatus, VendorMetadataSnapshot } from "./vendor-lifecycle-state-machine"
 
 export type DecisionStatus = "pending" | "opted_in" | "opted_out" | "forced"
 

@@ -196,7 +196,8 @@ describe("phase-b-smoke-gate-aggregator", () => {
           }
         },
       }
-    }) as never
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    }) as any
 
     await ratifyVerdict(db, {
       verdict: "pass",
@@ -204,7 +205,7 @@ describe("phase-b-smoke-gate-aggregator", () => {
       admin_id: "admin_1",
     })
 
-    expect(capturedInsertRow?.items_json).toBe(
+    expect((capturedInsertRow as Record<string, unknown> | null)?.["items_json"]).toBe(
       '[{"key":"ar55","label":"AR55","nfr_ref":"AR55","status":"pass","evidence_url":"/admin/operator/cohort-metrics","source":"cohort_metrics"}]'
     )
   })

@@ -15,7 +15,7 @@
  */
 import { describe, it, expect, jest, beforeEach, afterEach } from "@jest/globals"
 
-import { config as subscriberConfig } from "../subscribers/on-order-completed"
+import { config as subscriberConfig } from "../subscribers/on-order-completed.js"
 import { NotImplementedError } from "../modules/gp-core/service"
 import { withVendorAuth, vendorAuthMiddleware } from "../lib/vendor-auth"
 import { buildVendorSignatureHeader } from "../lib/vendor-hmac"
@@ -113,7 +113,7 @@ function buildMockRes() {
 describe("withVendorAuth HOF", () => {
   it("returns 401 when x-vendor-signature header is missing (enforced mode)", async () => {
     const handler = jest.fn()
-    const wrapped = withVendorAuth(handler)
+    const wrapped = withVendorAuth(handler as any)
     const req = buildMockReq({})
     const res = buildMockRes()
     const next = jest.fn()
@@ -132,7 +132,7 @@ describe("withVendorAuth HOF", () => {
     const handler = jest.fn(async (req: any) => {
       capturedAuth = req.vendorAuth
     })
-    const wrapped = withVendorAuth(handler)
+    const wrapped = withVendorAuth(handler as any)
     const req = buildMockReq({ "x-vendor-signature": makeSignedHeader() })
     const res = buildMockRes()
     const next = jest.fn()
@@ -147,7 +147,7 @@ describe("withVendorAuth HOF", () => {
 
   it("returns 501 when resolveVendorId is stub (NotImplementedError)", async () => {
     const handler = jest.fn()
-    const wrapped = withVendorAuth(handler)
+    const wrapped = withVendorAuth(handler as any)
     const req = buildMockReq({ "x-vendor-signature": makeSignedHeader() })
 
     // Override gp_core to throw NotImplementedError
@@ -157,7 +157,7 @@ describe("withVendorAuth HOF", () => {
       }
       if (key === "gp_core") {
         return {
-          resolveVendorId: jest.fn().mockRejectedValue(
+          resolveVendorId: (jest.fn() as any).mockRejectedValue(
             new NotImplementedError("Story 1.3")
           ),
         }
@@ -179,7 +179,7 @@ describe("withVendorAuth HOF", () => {
 
   it("returns 503 when GpCoreService is not available", async () => {
     const handler = jest.fn()
-    const wrapped = withVendorAuth(handler)
+    const wrapped = withVendorAuth(handler as any)
     const req = buildMockReq({ "x-vendor-signature": makeSignedHeader() })
 
     req.scope.resolve = jest.fn((key: string) => {
@@ -200,7 +200,7 @@ describe("withVendorAuth HOF", () => {
 
   it("returns 500 on unexpected error from resolveVendorId", async () => {
     const handler = jest.fn()
-    const wrapped = withVendorAuth(handler)
+    const wrapped = withVendorAuth(handler as any)
     const req = buildMockReq({ "x-vendor-signature": makeSignedHeader() })
 
     req.scope.resolve = jest.fn((key: string) => {
@@ -209,7 +209,7 @@ describe("withVendorAuth HOF", () => {
       }
       if (key === "gp_core") {
         return {
-          resolveVendorId: jest.fn().mockRejectedValue(new Error("DB down")),
+          resolveVendorId: (jest.fn() as any).mockRejectedValue(new Error("DB down")),
         }
       }
       return null
@@ -259,7 +259,7 @@ describe("vendorAuthMiddleware", () => {
       }
       if (key === "gp_core") {
         return {
-          resolveVendorId: jest.fn().mockRejectedValue(
+          resolveVendorId: (jest.fn() as any).mockRejectedValue(
             new NotImplementedError("Story 1.3")
           ),
         }
@@ -303,7 +303,7 @@ describe("NotImplementedError", () => {
 
 describe("subscriber retry safety", () => {
   it("subscriber export is a function (can be retried by event bus)", async () => {
-    const { default: handler } = await import("../subscribers/on-order-completed")
+    const { default: handler } = await import("../subscribers/on-order-completed.js")
 
     expect(typeof handler).toBe("function")
   })
