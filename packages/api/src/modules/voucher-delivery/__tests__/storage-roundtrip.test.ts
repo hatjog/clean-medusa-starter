@@ -74,7 +74,9 @@ function buildMockKnex() {
     };
 
     q.insert = (row: ArtifactRow) => {
-      // Return an object with onConflict().merge() chain.
+      // Review fix L6: do NOT eagerly persist on .insert(); only the
+      // onConflict().merge() chain commits, mirroring real Postgres
+      // upsert semantics so test bugs in merge logic are not masked.
       const conflictQ = {
         merge: (updates: Partial<ArtifactRow>) => {
           const existing = store.get(row.storage_key);
@@ -88,9 +90,16 @@ function buildMockKnex() {
       };
       const insertResult = {
         onConflict: (_col: string) => conflictQ,
+        // Also support bare-insert callers (none in current adapter, but
+        // future paths may use plain .insert()). Resolves once awaited.
+        then: (
+          onFulfilled?: (v: undefined) => unknown,
+          onRejected?: (e: unknown) => unknown,
+        ) => {
+          store.set(row.storage_key, row);
+          return Promise.resolve(undefined).then(onFulfilled, onRejected);
+        },
       };
-      // Also store immediately for plain inserts.
-      store.set(row.storage_key, row);
       return insertResult;
     };
 
@@ -216,6 +225,33 @@ describe("FilesystemVoucherPdfStorage — store/retrieve roundtrip", () => {
   test("verifySignedToken rejects malformed token", () => {
     expect(verifySignedToken("not-a-valid-token", "any-secret")).toBeNull();
     expect(verifySignedToken("a.b", "any-secret")).toBeNull();
+  });
+
+  test("verifySignedToken rejects token with wrong signature length (review fix I2)", () => {
+    // Build a token whose signature segment is too short to match the
+    // expected base64url-encoded HMAC digest length. The constant-time
+    // length-check branch must reject without leaking timing.
+    const storage_key = "vouchers/v_short_sig/seller-x.pdf";
+    const expires_at = Date.now() + 60_000;
+    const encodedKey = Buffer.from(storage_key).toString("base64url");
+    const shortSig = "AAAA"; // base64url, 4 chars — clearly shorter than sha256 digest
+    const token = `${encodedKey}.${expires_at}.${shortSig}`;
+    expect(verifySignedToken(token, "any-secret")).toBeNull();
+  });
+
+  test("verifySignedToken rejects token with far-future expires_at (review fix I1)", () => {
+    // Forge a far-future expiry beyond the MAX_TTL_MS upper bound (7 days).
+    // Even with a valid signature the helper must reject so a leaked-once
+    // token cannot be replayed for years.
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { createHmac } = require("node:crypto");
+    const secret = "future-test-secret";
+    const storage_key = "vouchers/v/seller-x.pdf";
+    const expires_at = Date.now() + 365 * 24 * 60 * 60 * 1_000; // 1 year
+    const payload = `${storage_key}|${expires_at}`;
+    const sig = createHmac("sha256", secret).update(payload).digest("base64url");
+    const token = `${Buffer.from(storage_key).toString("base64url")}.${expires_at}.${sig}`;
+    expect(verifySignedToken(token, secret)).toBeNull();
   });
 
   test("verifySignedToken rejects expired token", () => {

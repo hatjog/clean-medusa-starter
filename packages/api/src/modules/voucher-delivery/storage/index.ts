@@ -12,4 +12,6 @@ export type {
 } from "./ports";
 
 export { FilesystemVoucherPdfStorage, verifySignedToken } from "./adapters/filesystem-storage";
+export type { StorageLogger } from "./adapters/filesystem-storage";
 export { PgVoucherPdfStorage, ensureVoucherDeliveryArtifactTable } from "./adapters/pg-storage";
+export { buildSignedToken, getHmacSecret } from "./hmac";

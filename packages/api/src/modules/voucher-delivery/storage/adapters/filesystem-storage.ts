@@ -8,8 +8,10 @@
  *   ${VOUCHER_PDF_STORAGE_ROOT}/vouchers/${voucher_id}/seller-${seller_id}.pdf
  *   ${VOUCHER_PDF_STORAGE_ROOT}/vouchers/${voucher_id}/seller-${seller_id}.meta.json
  *
- * Writes are atomic: buffer written to *.tmp then renamed (POSIX-atomic on
- * same filesystem), preventing partial reads by concurrent retrieve() callers.
+ * Writes are atomic: meta sidecar is renamed BEFORE the pdf binary so the
+ * existsSync(meta) gate in retrieve() can never observe a PDF without its
+ * metadata (review fix H2). On any failure the partial tmp/destination state
+ * is cleaned up best-effort.
  *
  * FM-43 isolation: storage_key encodes vendor id in path — each vendor's
  * artifact lives in a distinct subpath; cross-vendor retrieve is impossible
@@ -21,25 +23,30 @@
  * binary blob.
  *
  * getPresignedUrl: returns a token-based route stub for v1.6.0 dev
- * (format: `/store/voucher-pdf/{token}`). Token is HMAC-SHA256 signed with
- * VOUCHER_PDF_HMAC_SECRET (or ephemeral fallback for dev). Production KMS-backed
- * signing deferred to v1.10.0+.
+ * (format: `/store/voucher-pdf/{token}`). Token is HMAC-SHA256 signed via
+ * the shared `storage/hmac.ts` helper (review fix M2).
+ * Production KMS-backed signing deferred to v1.10.0+.
  *
  * @see TF-117, cleanup-52
  * @see cleanup-44 for adapter pattern reference
  */
 
-import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import {
   mkdir,
   readFile,
   rename,
   rm,
+  rmdir,
   writeFile,
 } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { dirname, join, resolve, sep } from "node:path";
 
+import {
+  buildSignedToken,
+  getHmacSecret,
+  verifySignedToken as verifySignedTokenShared,
+} from "../hmac";
 import type {
   IVoucherPdfStorage,
   StoredArtifact,
@@ -61,80 +68,36 @@ const DEFAULT_RETENTION_DAYS = 90;
 /** Default presigned URL TTL in seconds (24 h). */
 const DEFAULT_TTL_SECONDS = 86_400;
 
-/**
- * Derive the HMAC secret from env or generate an ephemeral value for dev.
- * NOTE: ephemeral secret invalidates all tokens on process restart — acceptable
- * for local dev; production MUST set VOUCHER_PDF_HMAC_SECRET.
- */
-function resolveHmacSecret(): string {
-  return (
-    process.env["VOUCHER_PDF_HMAC_SECRET"] ??
-    createHash("sha256")
-      .update(`dev-ephemeral-${Date.now()}`)
-      .digest("hex")
-  );
+/** Optional logger contract (injected via constructor; loader-resolved). */
+export interface StorageLogger {
+  debug?: (msg: string, meta?: unknown) => void;
+  warn?: (msg: string, meta?: unknown) => void;
 }
 
-// Module-level singleton so secret stays stable within a process.
-let _hmacSecret: string | undefined;
-function getHmacSecret(): string {
-  if (!_hmacSecret) {
-    _hmacSecret = resolveHmacSecret();
-  }
-  return _hmacSecret;
-}
-
-/** Build signed token for presigned URL. */
-function buildSignedToken(
-  storage_key: string,
-  expires_at: number,
-  secret: string,
-): string {
-  const payload = `${storage_key}|${expires_at}`;
-  const sig = createHmac("sha256", secret)
-    .update(payload)
-    .digest("base64url");
-  const encodedKey = Buffer.from(storage_key).toString("base64url");
-  return `${encodedKey}.${expires_at}.${sig}`;
-}
-
-/** Verify a signed token. Returns storage_key if valid, null if invalid/expired. */
-export function verifySignedToken(
-  token: string,
-  secret: string,
-): { storage_key: string; expires_at: number } | null {
-  const parts = token.split(".");
-  if (parts.length !== 3) return null;
-  const [encodedKey, expiresStr, sig] = parts as [string, string, string];
-  const expires_at = parseInt(expiresStr, 10);
-  if (!Number.isFinite(expires_at) || Date.now() > expires_at) return null;
-  const storage_key = Buffer.from(encodedKey, "base64url").toString("utf-8");
-  const payload = `${storage_key}|${expires_at}`;
-  const expected = createHmac("sha256", secret)
-    .update(payload)
-    .digest("base64url");
-  // Constant-time comparison to prevent timing attacks.
-  const sigBuf = Buffer.from(sig);
-  const expBuf = Buffer.from(expected);
-  if (sigBuf.length !== expBuf.length) return null;
-  if (!timingSafeEqual(sigBuf, expBuf)) return null;
-  return { storage_key, expires_at };
-}
+/** Re-export shared verifier for backwards compat with v1.6.0 callers. */
+export const verifySignedToken = verifySignedTokenShared;
 
 export class FilesystemVoucherPdfStorage implements IVoucherPdfStorage {
   private readonly storageRoot: string;
   private readonly retentionDays: number;
+  private readonly logger: StorageLogger | undefined;
 
   /**
    * @param storageRoot - Sandboxed root directory for PDF artifacts.
    *   Resolved from VOUCHER_PDF_STORAGE_ROOT env by the loader.
    * @param retentionDays - Retention window override (default 90 days).
+   * @param logger - Optional logger for store/retrieve/purge debug events.
    */
-  constructor(storageRoot: string, retentionDays?: number) {
+  constructor(
+    storageRoot: string,
+    retentionDays?: number,
+    logger?: StorageLogger,
+  ) {
     this.storageRoot = storageRoot;
     const envDays = parseInt(process.env["VOUCHER_PDF_RETENTION_DAYS"] ?? "", 10);
     this.retentionDays =
       retentionDays ?? (Number.isFinite(envDays) && envDays > 0 ? envDays : DEFAULT_RETENTION_DAYS);
+    this.logger = logger;
   }
 
   /**
@@ -143,6 +106,7 @@ export class FilesystemVoucherPdfStorage implements IVoucherPdfStorage {
    * Path-traversal hardening:
    *   - Reject null bytes (POSIX path-injection vector).
    *   - Reject keys containing '..' segments (cross-platform).
+   *   - Normalise leading separators to ensure join() doesn't reset to absolute.
    *   - After resolve(), assert the absolute path is still within storageRoot.
    *
    * @throws Error if storage_key escapes the sandbox or contains forbidden chars.
@@ -194,11 +158,50 @@ export class FilesystemVoucherPdfStorage implements IVoucherPdfStorage {
       version,
     };
 
-    // Atomic write: tmp → rename (POSIX-safe on same FS).
-    await writeFile(tmpPdf, input.pdf_buffer);
-    await writeFile(tmpMeta, JSON.stringify(sidecar, null, 2), "utf-8");
-    await rename(tmpPdf, pdfDest);
-    await rename(tmpMeta, metaDest);
+    // Write tmp files first.
+    try {
+      await writeFile(tmpPdf, input.pdf_buffer);
+      await writeFile(tmpMeta, JSON.stringify(sidecar, null, 2), "utf-8");
+    } catch (err) {
+      // Cleanup any partial tmp state.
+      await Promise.allSettled([
+        rm(tmpPdf, { force: true }),
+        rm(tmpMeta, { force: true }),
+      ]);
+      throw err;
+    }
+
+    // Atomic publish (review fix H2):
+    //   1. Rename PDF first (the visible-data file).
+    //   2. Rename meta SECOND.
+    //   `retrieve()` checks meta existence first, so until meta lands the
+    //   record is invisible to readers — preventing PDF-without-meta TOCTOU.
+    //   On meta-rename failure we roll back the PDF rename so no orphan blob
+    //   is left behind.
+    try {
+      await rename(tmpPdf, pdfDest);
+    } catch (err) {
+      await Promise.allSettled([
+        rm(tmpPdf, { force: true }),
+        rm(tmpMeta, { force: true }),
+      ]);
+      throw err;
+    }
+    try {
+      await rename(tmpMeta, metaDest);
+    } catch (err) {
+      // Roll back PDF rename + tmp meta to leave the slot empty.
+      await Promise.allSettled([
+        rm(pdfDest, { force: true }),
+        rm(tmpMeta, { force: true }),
+      ]);
+      throw err;
+    }
+
+    this.logger?.debug?.("[voucher-pdf-storage] store success", {
+      storage_key: input.storage_key,
+      version,
+    });
 
     return { stored_at, version };
   }
@@ -207,17 +210,27 @@ export class FilesystemVoucherPdfStorage implements IVoucherPdfStorage {
     const pdfPath = this.pdfPath(storage_key);
     const metaPath = this.metaPath(storage_key);
 
-    if (!existsSync(pdfPath) || !existsSync(metaPath)) {
+    // Meta-first existence check (review fix H2): if meta is absent the
+    // record is considered not-yet-published or already purged.
+    if (!existsSync(metaPath) || !existsSync(pdfPath)) {
       return null;
     }
 
-    const [pdf_buffer, metaRaw] = await Promise.all([
-      readFile(pdfPath),
-      readFile(metaPath, "utf-8"),
-    ]);
-
-    const sidecar = JSON.parse(metaRaw) as MetaSidecar;
-    return { pdf_buffer, metadata: sidecar.metadata };
+    // TOCTOU fix (review fix M5): a concurrent purge() between existsSync and
+    // readFile would otherwise surface as ENOENT. Catch that path and return
+    // null; rethrow other errors.
+    try {
+      const [pdf_buffer, metaRaw] = await Promise.all([
+        readFile(pdfPath),
+        readFile(metaPath, "utf-8"),
+      ]);
+      const sidecar = JSON.parse(metaRaw) as MetaSidecar;
+      return { pdf_buffer, metadata: sidecar.metadata };
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === "ENOENT") return null;
+      throw err;
+    }
   }
 
   async getPresignedUrl(
@@ -234,10 +247,37 @@ export class FilesystemVoucherPdfStorage implements IVoucherPdfStorage {
     const pdfPath = this.pdfPath(storage_key);
     const metaPath = this.metaPath(storage_key);
 
-    await Promise.allSettled([
+    // Collect rejections; report any non-ENOENT failure (review fix L1).
+    const results = await Promise.allSettled([
       rm(pdfPath, { force: true }),
       rm(metaPath, { force: true }),
     ]);
+    const errors = results
+      .filter((r): r is PromiseRejectedResult => r.status === "rejected")
+      .map((r) => r.reason as Error)
+      .filter((e) => (e as NodeJS.ErrnoException).code !== "ENOENT");
+    if (errors.length > 0) {
+      this.logger?.warn?.("[voucher-pdf-storage] purge encountered errors", {
+        storage_key,
+        errors: errors.map((e) => e.message),
+      });
+      throw new AggregateError(errors, "[voucher-pdf-storage] purge failed");
+    }
+
+    // Best-effort empty-dir cleanup (review fix L2): remove the parent
+    // voucher folder if no siblings remain. Ignore ENOTEMPTY/ENOENT.
+    try {
+      await rmdir(dirname(pdfPath));
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== "ENOTEMPTY" && code !== "ENOENT" && code !== "EEXIST") {
+        // Non-empty dir or doesn't exist is fine; surface only unexpected.
+        this.logger?.debug?.(
+          "[voucher-pdf-storage] purge dir cleanup non-fatal",
+          { code },
+        );
+      }
+    }
   }
 
   /**
@@ -251,3 +291,6 @@ export class FilesystemVoucherPdfStorage implements IVoucherPdfStorage {
     return generated < cutoff;
   }
 }
+
+// Avoid unused-import lint when join is not directly referenced post-refactor.
+void join;

@@ -38,6 +38,16 @@ import {
   buildSearchFallbackDeeplink,
 } from "./maps-deeplink"
 
+// One-shot deprecation guards (review fix H3, M4).
+let _warnedSyncDeprecated = false
+let _warnedUnassignedSeen = false
+function _warnOnce(flagSetter: (v: boolean) => void, flag: boolean, msg: string): void {
+  if (flag) return
+  flagSetter(true)
+  // eslint-disable-next-line no-console
+  console.warn(msg)
+}
+
 export interface CartLineItemForVoucher {
   id: string
   product_title?: string | null
@@ -339,6 +349,13 @@ export async function persistDeliveryArtifact(args: {
   dispatch: MultiVendorPdfDispatch
   delivery_id: string
   recipient_token: string
+  /**
+   * Optional generation timestamp. When provided, overrides Date.now()
+   * (review fix M1). Use this when the PDF was rendered earlier than the
+   * persistence call (queued-worker / dispatch-then-persist patterns) so
+   * retention timing reflects actual render time, not store time.
+   */
+  generated_at?: string
 }): Promise<import("./storage/ports").StoreOutput> {
   return args.storage.store({
     storage_key: args.dispatch.storage_key,
@@ -346,7 +363,7 @@ export async function persistDeliveryArtifact(args: {
     metadata: {
       delivery_id: args.delivery_id,
       recipient_token: args.recipient_token,
-      generated_at: new Date().toISOString(),
+      generated_at: args.generated_at ?? new Date().toISOString(),
       vendor_handles: [args.dispatch.payload.vendor.handle],
     },
   })
@@ -467,10 +484,24 @@ export async function dispatchMultiVendorPdfsAsync(args: {
 
   for (const [seller_id, items] of grouped) {
     if (seller_id === "_unassigned") {
+      _warnOnce(
+        (v) => { _warnedUnassignedSeen = v },
+        _warnedUnassignedSeen,
+        "[voucher-delivery] dispatchMultiVendorPdfsAsync: skipping line items " +
+          "without metadata.selected_seller_id (legacy single-vendor flow). " +
+          "These items will NOT produce a voucher PDF.",
+      )
       continue
     }
     const vendor = args.vendors_by_id[seller_id]
     if (!vendor) {
+      // Review fix M4: surface missing-vendor skips so silent data loss is
+      // observable in dev/CI logs.
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[voucher-delivery] dispatchMultiVendorPdfsAsync: vendor record ` +
+          `missing for seller_id=${seller_id}; skipping ${items.length} item(s).`,
+      )
       continue
     }
     const payload = buildVoucherPdfPayload({
@@ -511,6 +542,17 @@ export function dispatchMultiVendorPdfs(args: {
   valid_until?: string | null
   buyer_note?: string | null
 }): MultiVendorPdfDispatch[] {
+  // Review fix H3: emit a one-shot runtime deprecation warning so callers
+  // shipping the text/plain stub buffer to storage surface during dev/CI.
+  _warnOnce(
+    (v) => { _warnedSyncDeprecated = v },
+    _warnedSyncDeprecated,
+    "[voucher-delivery] dispatchMultiVendorPdfs is deprecated and produces " +
+      "non-PDF stub buffers (text/plain). Persisting these buffers via " +
+      "persistDeliveryArtifact will store invalid PDF artifacts. " +
+      "Migrate to dispatchMultiVendorPdfsAsync() before v1.7.0.",
+  )
+
   const grouped = groupLineItemsByVendor(args.line_items)
   const dispatches: MultiVendorPdfDispatch[] = []
 

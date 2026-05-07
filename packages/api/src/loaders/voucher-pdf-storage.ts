@@ -40,12 +40,21 @@ export default async function voucherPdfStorageLoader({
   const backend =
     process.env["VOUCHER_PDF_STORAGE_BACKEND"] ?? "filesystem";
 
+  // Review fix M3: parse retention strictly; reject 0 / negatives / NaN and
+  // fall back to default (90). Adapters apply the same rule defensively.
+  const envRetention = parseInt(
+    process.env["VOUCHER_PDF_RETENTION_DAYS"] ?? "",
+    10,
+  );
   const retentionDays =
-    parseInt(process.env["VOUCHER_PDF_RETENTION_DAYS"] ?? "", 10) || 90;
+    Number.isFinite(envRetention) && envRetention > 0 ? envRetention : 90;
 
   // Resolve logger — graceful degradation if absent.
   let logger:
-    | { debug?: (msg: string, meta?: unknown) => void }
+    | {
+        debug?: (msg: string, meta?: unknown) => void;
+        warn?: (msg: string, meta?: unknown) => void;
+      }
     | undefined;
   try {
     logger = container.resolve(
@@ -75,13 +84,14 @@ export default async function voucherPdfStorageLoader({
     // Ensure the artifact table exists (idempotent).
     await ensureVoucherDeliveryArtifactTable(db);
 
-    storage = new PgVoucherPdfStorage(db, retentionDays);
+    // Review fix L7: forward logger to adapter for store/retrieve/purge debug.
+    storage = new PgVoucherPdfStorage(db, retentionDays, logger);
     logger?.debug?.("[voucher-pdf-storage loader] PgVoucherPdfStorage initialised");
   } else {
     // Default: filesystem adapter.
     const storageRoot =
       process.env["VOUCHER_PDF_STORAGE_ROOT"] ?? DEFAULT_STORAGE_ROOT;
-    storage = new FilesystemVoucherPdfStorage(storageRoot, retentionDays);
+    storage = new FilesystemVoucherPdfStorage(storageRoot, retentionDays, logger);
     logger?.debug?.(
       `[voucher-pdf-storage loader] FilesystemVoucherPdfStorage initialised at ${storageRoot}`,
     );
