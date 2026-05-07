@@ -40,6 +40,12 @@ type CompetitiveInsightsResponse = CompetitiveInsightsData & {
   data_source: "mercur_query" | "empty"
 }
 
+// Error shape for non-200 responses (403, 503) — separate from the success type.
+type ErrorResponse = {
+  code: string
+  message: string
+}
+
 /**
  * GET handler — must be exported as a named `GET` constant (not a function declaration)
  * so Medusa's file-based router picks it up correctly.
@@ -77,7 +83,7 @@ export const GET = withVendorAuth(async (
     res.status(403).json({
       code: "cross_vendor_scope_mismatch",
       message: "Requested vendor_id does not match authenticated vendor",
-    } as unknown as CompetitiveInsightsResponse)
+    } as unknown as ErrorResponse & CompetitiveInsightsResponse)
     return
   }
 
@@ -87,7 +93,7 @@ export const GET = withVendorAuth(async (
     result = await resolveInsightSnapshots(req.scope, [sellerId])
   } catch (err) {
     // DB failure → 503; do NOT write an audit row (no vendor data accessed)
-    const logger = req.scope?.resolve("logger") as
+    const logger = req.scope.resolve("logger") as
       | { error?: (m: string) => void }
       | undefined
     logger?.error?.(
@@ -96,13 +102,13 @@ export const GET = withVendorAuth(async (
     res.status(503).json({
       code: "insights_source_unavailable",
       message: "Competitive insights data temporarily unavailable",
-    } as unknown as CompetitiveInsightsResponse)
+    } as unknown as ErrorResponse & CompetitiveInsightsResponse)
     return
   }
 
   const { snapshots, data_source: dataSource } = result
 
-  // AC3 continued — aggregator computes per-vendor metrics; privacy-preserving
+  // AC4 continued — aggregator computes per-vendor metrics; privacy-preserving
   // (aggregates only, no individual competitor prices in the response).
   const insightsData = getCompetitiveInsights(vendorId, snapshots)
 
