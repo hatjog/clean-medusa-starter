@@ -42,6 +42,7 @@ jest.mock("../../../lib/vendor-notification-provider-readiness", () => ({
 
 jest.mock("../../../lib/capability-check", () => ({
   extractActorIdOrThrow: jest.fn().mockReturnValue("admin_test_user"),
+  checkCapability: jest.fn().mockResolvedValue(true),
 }))
 
 // ---------------------------------------------------------------------------
@@ -57,7 +58,10 @@ import {
   resolveNudgeCooldownHours,
 } from "../../../lib/vendor-notification-log"
 import { assertNotificationProviderReady } from "../../../lib/vendor-notification-provider-readiness"
+import { checkCapability } from "../../../lib/capability-check"
 import { POST } from "../../../api/admin/vendors/notifications/nudges/route"
+
+const mockCheckCapability = checkCapability as jest.MockedFunction<typeof checkCapability>
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -128,6 +132,7 @@ beforeEach(() => {
   mockAssertNotificationLogTableReady.mockResolvedValue(undefined)
   mockFindRecentNotificationLog.mockResolvedValue([])
   mockResolveNudgeCooldownHours.mockReturnValue(24)
+  mockCheckCapability.mockResolvedValue(true)
 
   let counter = 0
   mockAppendNotificationLogBestEffort.mockImplementation(async (_, input) => {
@@ -223,7 +228,10 @@ describe("AC4 — force=true operator override", () => {
       expect.anything(),
       expect.objectContaining({
         forced: true,
-        metadata: expect.objectContaining({ forced: true, forced_by: "admin_test_user" }),
+        // Review F5: forced_by removed — triggered_by is the canonical actor.
+        // Review F6: force_requested also recorded (operator intent).
+        triggered_by: "admin_test_user",
+        metadata: expect.objectContaining({ forced: true, force_requested: true }),
       }),
     )
   })
@@ -340,5 +348,83 @@ describe("AC1 — dedup gate called before dispatch", () => {
       expect.anything(),
       expect.objectContaining({ vendor_id: "v_1", notification_type: "nudge_t7" }),
     )
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Review F1 — force=true requires lifecycle.override capability
+// ---------------------------------------------------------------------------
+
+describe("Review F1 — force=true capability gate", () => {
+  it("returns 403 NUDGE_FORCE_NOT_PERMITTED when checkCapability returns false", async () => {
+    mockCheckCapability.mockResolvedValueOnce(false)
+    const res = makeResponse()
+    await POST(
+      makeRequest({ step: "t21", force: true }),
+      res as unknown as Parameters<typeof POST>[1],
+    )
+
+    expect(res._status).toBe(403)
+    expect((res._body as Record<string, unknown>).code).toBe("NUDGE_FORCE_NOT_PERMITTED")
+    // No dispatch attempted, no audit row, no dedup query
+    expect(mockFindRecentNotificationLog).not.toHaveBeenCalled()
+    expect(mockAppendNotificationLogBestEffort).not.toHaveBeenCalled()
+  })
+
+  it("does NOT call checkCapability when force is absent (no extra RBAC roundtrip)", async () => {
+    mockFindRecentNotificationLog.mockResolvedValueOnce([])
+    const res = makeResponse()
+    await POST(makeRequest({ step: "t21" }), res as unknown as Parameters<typeof POST>[1])
+    expect(mockCheckCapability).not.toHaveBeenCalled()
+    expect(res._status).toBe(200)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Review F4 — dedup audit row must be durable
+// ---------------------------------------------------------------------------
+
+describe("Review F4 — dedup audit persistence is mandatory", () => {
+  it("hard-throws when dedup audit row fails to persist (no silent suppression)", async () => {
+    const priorRow = makePriorRow("v_1", "t21")
+    mockFindRecentNotificationLog.mockResolvedValueOnce([priorRow])
+    mockAppendNotificationLogBestEffort.mockResolvedValueOnce({
+      entry: { id: "fallback-id" } as ReturnType<typeof makePriorRow>,
+      persisted: false,
+      error: "DB write failed",
+    })
+
+    await expect(
+      POST(makeRequest({ step: "t21" }), makeResponse() as unknown as Parameters<typeof POST>[1]),
+    ).rejects.toThrow(/dedup audit row failed to persist/)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Review F6 — force_requested intent flag (when no prior row exists)
+// ---------------------------------------------------------------------------
+
+describe("Review F6 — force_requested intent recording", () => {
+  it("records metadata.force_requested=true even when no prior row exists (forced=false)", async () => {
+    mockFindRecentNotificationLog.mockResolvedValueOnce([])
+    const res = makeResponse()
+    await POST(
+      makeRequest({ step: "t21", force: true }),
+      res as unknown as Parameters<typeof POST>[1],
+    )
+
+    expect(res._status).toBe(200)
+    expect((res._body as Record<string, unknown>).forced).toBe(0) // no actual bypass occurred
+    expect(mockAppendNotificationLogBestEffort).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        forced: false, // strict: column reserved for actual bypass
+        metadata: expect.objectContaining({ force_requested: true }),
+      }),
+    )
+    // forced flag NOT in metadata when bypass did not occur
+    const [, insertedInput] = mockAppendNotificationLogBestEffort.mock.calls[0]
+    const meta = (insertedInput as { metadata?: Record<string, unknown> }).metadata
+    expect(meta?.forced).toBeUndefined()
   })
 })
