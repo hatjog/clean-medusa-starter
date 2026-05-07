@@ -125,9 +125,23 @@ function makeKnexMock(
       }
     }
 
+    // admin_capability_grants: return a __super_admin__ row so all admins
+    // pass capability checks (matches cleanup-42 migration seed behaviour).
+    if (tableName === "admin_capability_grants") {
+      return {
+        select: jest.fn().mockReturnThis(),
+        where: jest.fn().mockReturnThis(),
+        whereIn: jest.fn().mockReturnThis(),
+        whereNull: jest.fn().mockReturnThis(),
+        limit: jest.fn().mockResolvedValue([{ capability: "__super_admin__" }]) as AnyFn,
+      }
+    }
+
     return {
       select: jest.fn().mockReturnThis(),
       where: jest.fn().mockReturnThis(),
+      whereIn: jest.fn().mockReturnThis(),
+      whereNull: jest.fn().mockReturnThis(),
       first: jest.fn().mockResolvedValue(null) as AnyFn,
     }
   }

@@ -150,10 +150,11 @@ export async function POST(
   }
 
   // Review F1: force=true is a vendor-impacting capability (bypasses TF-94 P0
-  // dedup gate). Require explicit capability grant — currently `lifecycle.override`
-  // (v1.6.0: any admin user → granted; v1.7.0 will switch to capability_grants
-  // table per capability-check.ts JSDoc). Authorization decision is logged to
-  // the audit row via `triggered_by` + `forced=true` flag.
+  // dedup gate). Require an explicit `lifecycle.override` capability grant.
+  // Post cleanup-42 (TF-102) the resolver reads from `admin_capability_grants`
+  // — admins seeded by the migration hold `__super_admin__` (implicit grant);
+  // v1.7.0 admin UI will granularise. Authorization decision is logged to the
+  // audit row via `triggered_by` + `forced=true` flag.
   if (body.force === true) {
     const allowed = await checkCapability(req, "lifecycle.override")
     if (!allowed) {
