@@ -7,7 +7,7 @@ import {
 import { listNotificationLog } from "./vendor-notification-log"
 import { getKickoffState } from "../workflows/operator/trigger-t30-kickoff"
 
-type Scope = { resolve: (key: string) => unknown }
+export type Scope = { resolve: (key: string) => unknown }
 
 const NUDGE_TYPES = new Set<VendorNotificationLogEntry["notification_type"]>([
   "nudge_t21",
@@ -224,4 +224,75 @@ export async function buildOperatorConsentReport(
     limit,
     total: vendors.length,
   }
+}
+
+/**
+ * Story v160-cleanup-45 (AC3d / TF-106): Thrown when the SellerModule + DB
+ * fallback chain cannot satisfy a vendor read. The cascade route maps this
+ * to HTTP 503 (Service Unavailable) regardless of whether the underlying
+ * cause is a missing DI registration or a downstream DB error — both are
+ * legitimate "vendor data temporarily unavailable" conditions per AR55/AR56
+ * honesty (consistent with cleanup-44 unavailable-source pattern).
+ *
+ * The public `message` is intentionally generic — internal cause detail is
+ * preserved on `error.cause` for server-side logging only and MUST NOT be
+ * echoed to client responses (review HIGH finding: information leakage).
+ */
+export class SellerModuleUnavailableError extends Error {
+  static readonly PUBLIC_MESSAGE =
+    "Seller module service is not available"
+  readonly code = "SELLER_MODULE_UNAVAILABLE"
+
+  constructor(cause?: Error) {
+    super(SellerModuleUnavailableError.PUBLIC_MESSAGE, cause ? { cause } : undefined)
+    this.name = "SellerModuleUnavailableError"
+  }
+}
+
+/**
+ * Story v160-cleanup-45 (AC1+AC2+TF-106): Lightweight count of vendors with
+ * opted_in decision status, scoped to the active vendor cohort.
+ *
+ * Uses the same DI fallback chain as `buildOperatorConsentReport` (via the
+ * already-imported `listSellers` + `buildDecisionListEntry`) but avoids the
+ * full report overhead (no pagination, sorting, or notification-log fetching).
+ *
+ * Active-cohort filter: only sellers with `lifecycle_status === "open"` are
+ * counted. Suspended / terminated / pending-approval sellers with stale
+ * `metadata.gp.decision_status === "opted_in"` are excluded so the cascade
+ * decision tree operates on live participants only (review MEDIUM finding).
+ *
+ * Throws `SellerModuleUnavailableError` when the seller module cannot be
+ * resolved from scope OR the DB fallback throws — callers should map this
+ * to HTTP 503 per AC3(d). The broad catch is intentional: any failure to
+ * read vendor state should surface as 503 rather than 500, because the
+ * cascade decision tree is undefined under partial vendor data.
+ *
+ * Cross-tenant TODO: when Story 1.9 (multi-tenant-isolation-hardening) lands,
+ * this helper must accept a market/tenant filter and pass it to `listSellers`
+ * to prevent cross-tenant count leakage.
+ *
+ * @param scope  - Medusa request scope (req.scope)
+ *
+ * Note: cohort-window scoping is deferred to a follow-up story (OQ #2). The
+ * helper is intentionally windowless until that story lands; do not add a
+ * silently-ignored argument here — callers that need a window should fail
+ * the build until the feature is implemented.
+ */
+export async function countOptedInVendors(scope: Scope): Promise<number> {
+  let sellers: Awaited<ReturnType<typeof listSellers>>
+  try {
+    sellers = await listSellers(scope)
+  } catch (err) {
+    throw new SellerModuleUnavailableError(
+      err instanceof Error ? err : new Error(String(err)),
+    )
+  }
+  return sellers.reduce((acc, seller) => {
+    const entry = buildDecisionListEntry(seller)
+    return entry.lifecycle_status === "open" &&
+      entry.decision_status === "opted_in"
+      ? acc + 1
+      : acc
+  }, 0)
 }
