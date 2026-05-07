@@ -1,8 +1,12 @@
 /**
- * Story v160-7-5: POST /admin/vendors/[id]/jca/generate — generate JCA PDF.
+ * Story v160-cleanup-41: POST /admin/vendors/[id]/jca/generate — generate JCA PDF.
  *
- * Loads template + hydrates + renders + (would) persist + (would) dispatch email.
- * Real persistence/email DEFERRED (production wiring shared with Stories 7.1+).
+ * Updated from Story 7.5 text-Buffer stub to real pdfkit-backed PDF (TF-100/TF-101).
+ * Changes:
+ *   - Uses renderJcaPdf() (async, returns real PDF Buffer) instead of renderPDF()
+ *   - Storage path changes: vendor-jca-pdfs/${id}.txt → vendor-jca-pdfs/${id}.pdf
+ *   - Content-Type: application/pdf (TF-101)
+ *   - format field added to response for backwards compat tracking (AC6 Opcja B)
  */
 
 import type { MedusaRequest, MedusaResponse } from "@medusajs/framework/http"
@@ -11,7 +15,7 @@ import {
   loadTemplate,
   type JCATemplateContext,
 } from "../../../../../../lib/jca-template-loader"
-import { renderPDF } from "../../../../../../lib/jca-pdf-renderer"
+import { renderJcaPdf } from "../../../../../../lib/jca-pdf-renderer"
 
 type GenerateBody = {
   locale?: "pl" | "en"
@@ -23,6 +27,8 @@ type GenerateResponse = {
   pdf_path: string
   bytes: number
   audit_log_id: string
+  /** format flag for backwards compat (AC6 Opcja B); new = "pdf" */
+  format: "pdf"
 }
 
 export async function POST(
@@ -56,24 +62,43 @@ export async function POST(
   try {
     const template = loadTemplate(locale)
     const hydrated = hydrateTemplate(template, ctx, locale)
-    const buffer = renderPDF(hydrated)
 
-    // Storage path (stub — real impl uploads to MinIO or writes to FS).
-    const pdfPath = `vendor-jca-pdfs/${id}.txt` // .txt because PDF deferred
+    // Real PDF generation (TF-100 resolved: pdfkit-backed Buffer, not text stub)
+    const vendorName = body.vendor?.name ?? id
+    const jcaId = `jca_${id}_${new Date().toISOString().slice(0, 10)}`
+    const generatedAt = new Date().toISOString()
+
+    const buffer = await renderJcaPdf({
+      vendorName,
+      terms: hydrated,
+      jcaId,
+      generatedAt,
+    })
+
+    // Storage path — .pdf extension (TF-101 resolved: was .txt)
+    const pdfPath = `vendor-jca-pdfs/${id}.pdf`
     const auditLogId = `jca_generated_${id}_${Date.now()}`
 
     if (process.env.NODE_ENV !== "test") {
       // eslint-disable-next-line no-console
       console.info(
-        `[jca_generated] vendor_id=${id} locale=${locale} bytes=${buffer.byteLength} path=${pdfPath}`,
+        `[jca_generated] vendor_id=${id} locale=${locale} bytes=${buffer.byteLength} path=${pdfPath} format=pdf`,
       )
     }
+
+    // Set Content-Type header for any streaming / direct-download consumers
+    res.setHeader("Content-Type", "application/pdf")
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="${id}.pdf"`,
+    )
 
     res.json({
       vendor_id: id,
       pdf_path: pdfPath,
       bytes: buffer.byteLength,
       audit_log_id: auditLogId,
+      format: "pdf",
     })
   } catch (err) {
     res.status(500).json({
