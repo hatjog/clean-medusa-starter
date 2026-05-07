@@ -202,10 +202,8 @@ describe("getRollbackHistory24h", () => {
     expect(entry).toHaveProperty("at")
     expect(entry).toHaveProperty("reason", "P1 breach")
     // New fields
-    expect(entry).toHaveProperty("status")
-    expect(["success", "failure", "noop"]).toContain(entry.status)
-    expect(entry).toHaveProperty("operator")
-    expect(typeof entry.operator).toBe("string")
+    expect(entry).toHaveProperty("status", "success")
+    expect(entry).toHaveProperty("operator", "system:auto_rollback")
   })
 
   // -------------------------------------------------------------------------
@@ -234,16 +232,21 @@ describe("getRollbackHistory24h", () => {
   })
 
   // -------------------------------------------------------------------------
-  // Status mapping: noop entry (audit_log_id starts with "noop_") → status="noop"
+  // Honesty: status is always "success" for surfaced entries — noop early-
+  // returns from triggerRollback() never persist an audit row, so the
+  // "noop_"-prefix audit_log_id pattern is unreachable in production. Even
+  // if such a row were synthesized in tests (as below), the new contract
+  // surfaces "success" because the row only reaches us via the triggered_by
+  // filter, which guarantees a successful setState transition wrote it.
   // -------------------------------------------------------------------------
-  it("maps noop_ prefixed audit_log_id to status='noop'", async () => {
+  it("status is always 'success' for surfaced entries (noop early-returns never persist)", async () => {
     const db = makeMockDb([
       makeRow({ id: "noop_12345", at: hoursAgo(1) }),
     ])
 
     const result = await getRollbackHistory24h(db)
 
-    expect(result[0].status).toBe("noop")
+    expect(result[0].status).toBe("success")
   })
 
   // -------------------------------------------------------------------------

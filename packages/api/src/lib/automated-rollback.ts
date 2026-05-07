@@ -34,10 +34,25 @@ export type RollbackHistoryEntry = {
   alert_id: string | null
   at: string
   reason: string | null
-  /** v160-cleanup-46: derived from RollbackResult.rolled_back + error path */
-  status: "success" | "failure" | "noop"
-  /** v160-cleanup-46: "system:auto_rollback" for automated; actor_id or triggered_by for manual */
-  operator: string
+  /**
+   * v160-cleanup-46: surface only the state the production audit trail actually
+   * emits. `triggerRollback()` writes audit rows ONLY on the success path
+   * (setState transition); noop early-returns and failures throw before any
+   * row is persisted, so the surface narrows to a single literal.
+   * Reserved future states (`"failure"` / `"noop"`) can be reintroduced when
+   * the audit schema grows an explicit outcome column. Honesty pattern per
+   * cleanup-22: don't advertise states the system can't deliver today.
+   */
+  status: "success"
+  /**
+   * v160-cleanup-46: identity of the rollback initiator. `auto_rollback_history`
+   * is filtered to `triggered_by === "automated_rollback"` upstream, so the
+   * surfaced value is the constant `"system:auto_rollback"`. Manual rollbacks
+   * are deliberately NOT surfaced via this field — they belong to a separate
+   * manual-rollback view that is out of scope for v1.6.0 (no production code
+   * path writes manual rollback rows in this release).
+   */
+  operator: "system:auto_rollback"
 }
 
 const _idempotencyCache = new Map<string, { at: number; result: RollbackResult }>()
@@ -114,28 +129,20 @@ export async function getRollbackHistory24h(
         entry.triggered_by === "automated_rollback" &&
         Date.parse(entry.at) >= cutoff,
     )
-    .map((entry) => {
-      // status: success = rolled_back=true path, noop = rolled_back=false,
-      // failure = reserved for explicit error path (not yet generated in production).
-      // In audit trail: automated_rollback entries written by triggerRollback()
-      // when rolled_back=true (setState path). Noop rollbacks also appear in audit
-      // but have audit_log_id starting with "noop_" (written via setState fallback).
-      const isNoop = entry.audit_log_id.startsWith("noop_")
-      const status: RollbackHistoryEntry["status"] = isNoop ? "noop" : "success"
-
-      // operator: automated entries → "system:auto_rollback"; manual → triggered_by
-      const operator =
-        entry.triggered_by === "automated_rollback"
-          ? "system:auto_rollback"
-          : entry.triggered_by ?? "unknown"
-
+    .map((entry): RollbackHistoryEntry => {
+      // Honesty: `triggerRollback()` writes an audit row only on the success
+      // path (setState transition). Noop early-returns and failures do NOT
+      // persist a row, so any entry that survives the `triggered_by` +
+      // 24h-cutoff filter above is, by construction, a successful rollback.
+      // The upstream filter also guarantees `triggered_by === "automated_rollback"`,
+      // so `operator` is the constant `"system:auto_rollback"`.
       return {
         audit_log_id: entry.audit_log_id,
         alert_id: entry.alert_id ?? null,
         at: entry.at,
         reason: entry.reason ?? null,
-        status,
-        operator,
+        status: "success",
+        operator: "system:auto_rollback",
       }
     })
     // Explicit DESC sort by timestamp — not reliant on audit trail ordering.
