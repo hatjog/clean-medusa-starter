@@ -50,7 +50,7 @@ index 16832022edcf42233f25a1a49251775a359d8d28..b68668b808d198d2585c013d46caed32
 +                    { $or: [{ closed_to: null }, { closed_to: { $lt: now } }] },
 +                ],
 +            },
-+            pagination: { take: null, skip: 0 },
++            pagination: { take: 10000, skip: 0 },
 +        });
 +        const visibleProductIds = new Set();
 +        for (const s of openSellers) {
