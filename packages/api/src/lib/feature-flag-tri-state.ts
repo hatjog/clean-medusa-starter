@@ -109,6 +109,8 @@ function emitDbUnavailableWarnOnce(error: unknown): void {
 
 /** Reset DB-unavailable warn state — for testing only. */
 export function _resetDbWarnState(): void {
+  // M4 fix: hard-gate to test environments.
+  if (process.env.NODE_ENV !== "test") return
   _dbUnavailableWarnEmitted = false
 }
 
@@ -117,16 +119,42 @@ export function _resetDbWarnState(): void {
 // ---------------------------------------------------------------------------
 
 /** @deprecated read path uses DB cache; this is a write-side hint only */
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
 let _currentState: MultiVendorFlagState | null = null
 let _lastTransitionAt: string | null = null
 let _lastAdmin: string | null = null
+
+/**
+ * One-shot warn for setState calls that omit `ctx.db` (M5 fix).
+ * Production callers MUST pass `db`; without it, the no-DB branch only updates
+ * an in-memory hint and is NOT durable nor multi-instance safe.
+ */
+let _setStateNoDbWarnEmitted = false
+
+function emitSetStateNoDbWarnOnce(): void {
+  if (_setStateNoDbWarnEmitted) return
+  _setStateNoDbWarnEmitted = true
+  logger.warn({
+    event: "flag.state.set_state_called_without_db",
+    note: "setState invoked without ctx.db; durability/multi-instance safety LOST. Production callers must pass req.scope.resolve('manager').getKnex() or equivalent.",
+  })
+}
+
+/** Reset setState-no-db warn state — for testing only. */
+export function _resetSetStateNoDbWarnState(): void {
+  if (process.env.NODE_ENV !== "test") return
+  _setStateNoDbWarnEmitted = false
+}
 
 // ---------------------------------------------------------------------------
 // Helper: relation-missing error detection
 // ---------------------------------------------------------------------------
 
 function isMissingRelationError(err: unknown, tableName: string): boolean {
+  // L2 fix: prefer SQLSTATE 42P01 (undefined_table) when available — works
+  // across locales. Fall back to substring match for non-pg drivers / wrapped
+  // errors.
+  const code = (err as { code?: string } | null | undefined)?.code
+  if (code === "42P01") return true
   const message = err instanceof Error ? err.message : String(err)
   return (
     message.includes(`relation "${tableName}" does not exist`) ||
@@ -199,6 +227,14 @@ export async function readFlagStateRow(
   const v = row?.value
   if (v && (["off", "shadow", "on"] as string[]).includes(v)) {
     return v as MultiVendorFlagState
+  }
+  if (v) {
+    // L3 fix: row exists but value is not in allow-list → warn for operator visibility.
+    logger.warn({
+      event: "flag.state.invalid_db_value",
+      flag_id: flagId,
+      value: v,
+    })
   }
   return null
 }
@@ -424,24 +460,54 @@ export async function setState(
     }
   }
 
-  // Cache invalidate (static import — type-only cycle, safe).
   const { invalidateOnFlip } = cacheInvalidateModule
-  const cache_invalidate_outcome = await invalidateOnFlip(from, to)
 
   let auditLogId: string
   let entryAt: string
+  // H1 fix: defer cache invalidation until AFTER successful DB commit so a
+  // rolled-back transaction does not bust downstream caches for a non-event.
+  let cache_invalidate_outcome: SetStateResult["cache_invalidate_outcome"] = {
+    isr_tags_revalidated: 0,
+    redis_keys_busted: 0,
+    sdk_cache_pings: 0,
+    errors: [],
+    duration_ms: 0,
+  }
+  let lockedFrom: MultiVendorFlagState = from
 
   if (ctx.db) {
     // Transactional write: UPSERT state + INSERT history + INSERT operator audit
     await ctx.db.transaction(async (trx) => {
+      // M3 fix: lock current row FOR UPDATE and re-validate against the locked
+      // value. Prevents lost-update / phantom-history under concurrent writers.
+      const lockedRow = await trx<{ value: string }>(FLAG_STATE_TABLE)
+        .select("value")
+        .where("flag_id", FLAG_ID_MULTI_VENDOR_PDP)
+        .forUpdate()
+        .first()
+      if (lockedRow?.value && (["off", "shadow", "on"] as string[]).includes(lockedRow.value)) {
+        lockedFrom = lockedRow.value as MultiVendorFlagState
+      }
+      // Re-validate against the locked row — if another writer already moved
+      // the state away from `from`, fail fast rather than write a phantom row.
+      if (lockedFrom !== from) {
+        const reValidate = validateTransition(lockedFrom, to)
+        if (!reValidate.valid) {
+          throw new Error(
+            `InvalidTransition (post-lock): ${reValidate.reason}; observed=${lockedFrom}, requested=${from}->${to}`,
+          )
+        }
+      }
+
       // (a) UPSERT feature_flag_state
       await upsertFlagState(trx, FLAG_ID_MULTI_VENDOR_PDP, to, ctx.triggered_by)
 
-      // (b) INSERT feature_flag_history
+      // (b) INSERT feature_flag_history (uses observed lockedFrom, not the
+      //     pre-transaction `from`, so history reflects the actual transition).
       await insertFlagHistory(
         trx,
         FLAG_ID_MULTI_VENDOR_PDP,
-        from,
+        lockedFrom,
         to,
         ctx.triggered_by,
         ctx.reason ?? null,
@@ -450,7 +516,7 @@ export async function setState(
       // (c) INSERT operator_multi_vendor_flag_audit (cleanup-15f preserved)
       const [auditRow] = await trx<PersistedAuditRow>(FLAG_AUDIT_TABLE)
         .insert({
-          from_state: from,
+          from_state: lockedFrom,
           to_state: to,
           triggered_by: ctx.triggered_by,
           reason: ctx.reason ?? null,
@@ -469,12 +535,24 @@ export async function setState(
       entryAt = auditRow.at
     })
 
-    // Invalidate local cache after successful DB write
-    invalidateCachedState(FLAG_ID_MULTI_VENDOR_PDP)
+    // H1 fix: invalidateOnFlip runs AFTER successful commit. Use the observed
+    // `lockedFrom` so downstream cache fan-out reflects reality.
+    cache_invalidate_outcome = await invalidateOnFlip(lockedFrom, to)
+
+    // L4 fix: write-through cache update so the next read on this instance
+    // observes the new value immediately (and no longer a stale entry from
+    // pre-write `getCurrentState`).
+    setCachedState(FLAG_ID_MULTI_VENDOR_PDP, to)
   } else {
-    // No DB — in-memory only path (backwards compat for tests without DB)
+    // No DB — in-memory only path (backwards compat for tests without DB).
+    // M5 fix: emit a one-shot warn so production code paths that forget to
+    // pass ctx.db are visible in logs.
+    emitSetStateNoDbWarnOnce()
+    cache_invalidate_outcome = await invalidateOnFlip(from, to)
     auditLogId = `mv_flag_${Date.now()}`
     entryAt = new Date().toISOString()
+    // L4 fix: keep cache consistent with the in-memory hint.
+    setCachedState(FLAG_ID_MULTI_VENDOR_PDP, to)
   }
 
   // Update write-side hint (back-compat; not used in read path)
@@ -484,7 +562,7 @@ export async function setState(
 
   const entry: AuditTrailEntry = {
     audit_log_id: auditLogId!,
-    from,
+    from: lockedFrom,
     to,
     triggered_by: ctx.triggered_by,
     reason: ctx.reason,
@@ -498,7 +576,7 @@ export async function setState(
   _auditTrail.push(entry)
 
   return {
-    from,
+    from: lockedFrom,
     to,
     audit_log_id: entry.audit_log_id,
     cache_invalidate_outcome,

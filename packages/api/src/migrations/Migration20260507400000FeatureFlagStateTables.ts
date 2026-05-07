@@ -21,29 +21,38 @@ export class Migration20260507400000FeatureFlagStateTables extends Migration {
     // pgcrypto for gen_random_uuid() — no-op if already present
     this.addSql(`CREATE EXTENSION IF NOT EXISTS pgcrypto`)
 
+    // I1 fix: IF NOT EXISTS — defensive idempotency at the base layer.
+    // M1 fix: CHECK constraint enforces tri-state at the DB level (defence in
+    // depth for direct SQL writes from operator runbooks per AC8).
     this.addSql(`
-      CREATE TABLE feature_flag_state (
+      CREATE TABLE IF NOT EXISTS feature_flag_state (
         flag_id    text         NOT NULL PRIMARY KEY,
         value      text         NOT NULL,
         updated_by text         NOT NULL,
-        updated_at timestamptz  NOT NULL DEFAULT now()
+        updated_at timestamptz  NOT NULL DEFAULT now(),
+        CONSTRAINT feature_flag_state_value_chk CHECK (value IN ('off', 'shadow', 'on'))
       )
     `)
 
+    // L1 fix: FK from history.flag_id → state.flag_id keeps history rows
+    // referentially honest (forward-compat with v1.7.0 multi-flag rollout).
+    // M1 fix: CHECK on to_value / from_value (NULL allowed for from_value).
     this.addSql(`
-      CREATE TABLE feature_flag_history (
+      CREATE TABLE IF NOT EXISTS feature_flag_history (
         id           uuid         NOT NULL DEFAULT gen_random_uuid() PRIMARY KEY,
-        flag_id      text         NOT NULL,
+        flag_id      text         NOT NULL REFERENCES feature_flag_state (flag_id) ON DELETE CASCADE,
         from_value   text         NULL,
         to_value     text         NOT NULL,
         updated_by   text         NOT NULL,
         reason       text         NULL,
-        at           timestamptz  NOT NULL DEFAULT now()
+        at           timestamptz  NOT NULL DEFAULT now(),
+        CONSTRAINT feature_flag_history_to_value_chk CHECK (to_value IN ('off', 'shadow', 'on')),
+        CONSTRAINT feature_flag_history_from_value_chk CHECK (from_value IS NULL OR from_value IN ('off', 'shadow', 'on'))
       )
     `)
 
     this.addSql(`
-      CREATE INDEX feature_flag_history_flag_id_at_idx
+      CREATE INDEX IF NOT EXISTS feature_flag_history_flag_id_at_idx
         ON feature_flag_history (flag_id, at DESC)
     `)
 

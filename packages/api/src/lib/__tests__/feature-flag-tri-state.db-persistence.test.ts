@@ -210,14 +210,9 @@ describe("(a) write-then-read round-trip", () => {
     const rawFn = async (_sql: string, bindings: unknown[]) => {
       storedValue = bindings[1] as string
     }
-    const trxTableProxy = (tableName: string) => ({
-      select: () => ({
-        where: () => ({
-          first: selectFirst,
-        }),
-      }),
-      insert: (row: MockRow) => ({
-        returning: async () => {
+    const trxTableProxy = (tableName: string) => {
+      const makeInsert = (row: MockRow) => {
+        const settle = async (): Promise<MockRow[]> => {
           if (tableName === "operator_multi_vendor_flag_audit") {
             return [{
               id: "audit-1",
@@ -232,11 +227,26 @@ describe("(a) write-then-read round-trip", () => {
               at: new Date().toISOString(),
             }]
           }
-          // feature_flag_history
           return [row]
-        },
-      }),
-    })
+        }
+        return {
+          returning: async (_c: unknown) => settle(),
+          then: (r: (v: MockRow[]) => unknown, j?: (e: unknown) => unknown) =>
+            settle().then(r, j),
+          catch: (j: (e: unknown) => unknown) => settle().catch(j),
+          finally: (cb: () => void) => settle().finally(cb),
+        }
+      }
+      return {
+        select: () => ({
+          where: () => ({
+            forUpdate: () => ({ first: selectFirst }),
+            first: selectFirst,
+          }),
+        }),
+        insert: makeInsert,
+      }
+    }
 
     const trx: never = (() => {
       const t = (tableName: string) => trxTableProxy(tableName)
@@ -446,40 +456,74 @@ describe("(e) concurrent writes serialize", () => {
       let currentStoredValue = "off"
       let auditIdCounter = 0
 
+      // H2 fix: build a Knex insert builder that is BOTH thenable
+      // (so `await trx(table).insert(row)` resolves AND records the row) AND
+      // exposes .returning() for the audit insert path. This matches the real
+      // Knex behaviour where insert is itself a thenable promise.
+      const makeInsertBuilder = (
+        tableName: string,
+        row: MockRow,
+        onAuditReturn: () => MockRow,
+      ) => {
+        let captured = false
+        const captureOnce = () => {
+          if (captured) return
+          captured = true
+          if (tableName === "feature_flag_history") {
+            historyRows.push({ ...row })
+          }
+        }
+        const settle = async (): Promise<MockRow[]> => {
+          captureOnce()
+          if (tableName === "operator_multi_vendor_flag_audit") {
+            return [onAuditReturn()]
+          }
+          return [row]
+        }
+        return {
+          returning: async (_cols: unknown) => settle(),
+          then: (
+            resolve: (v: MockRow[]) => unknown,
+            reject?: (r: unknown) => unknown,
+          ) => settle().then(resolve, reject),
+          catch: (reject: (r: unknown) => unknown) => settle().catch(reject),
+          finally: (cb: () => void) => settle().finally(cb),
+        }
+      }
+
       const buildTrxMock = (): never => {
+        const onAuditReturn = (): MockRow => {
+          auditIdCounter++
+          return {
+            id: `audit-${auditIdCounter}`,
+            from_state: "off",
+            to_state: "shadow",
+            triggered_by: "test",
+            reason: null,
+            alert_id: null,
+            smoke_gate_ref: null,
+            admin_note: null,
+            cache_invalidate_outcome: {},
+            at: new Date().toISOString(),
+          }
+        }
         const t = (tableName: string) => ({
           select: () => ({
             where: () => ({
+              // M3 lock path: real setState calls .forUpdate().first()
+              forUpdate: () => ({
+                first: async () =>
+                  tableName === "feature_flag_state"
+                    ? { value: currentStoredValue }
+                    : undefined,
+              }),
               first: async () =>
                 tableName === "feature_flag_state"
                   ? { value: currentStoredValue }
                   : undefined,
             }),
           }),
-          insert: (row: MockRow) => ({
-            returning: async () => {
-              if (tableName === "feature_flag_history") {
-                historyRows.push({ ...row })
-                return [row]
-              }
-              if (tableName === "operator_multi_vendor_flag_audit") {
-                auditIdCounter++
-                return [{
-                  id: `audit-${auditIdCounter}`,
-                  from_state: row.from_state,
-                  to_state: row.to_state,
-                  triggered_by: row.triggered_by,
-                  reason: null,
-                  alert_id: null,
-                  smoke_gate_ref: null,
-                  admin_note: null,
-                  cache_invalidate_outcome: {},
-                  at: new Date().toISOString(),
-                }]
-              }
-              return [row]
-            },
-          }),
+          insert: (row: MockRow) => makeInsertBuilder(tableName, row, onAuditReturn),
         })
         // @ts-expect-error - mock partial Knex transaction
         t.raw = async (_sql: string, bindings: unknown[]) => {
@@ -523,9 +567,12 @@ describe("(e) concurrent writes serialize", () => {
       // Final state must be one of the valid values (no corruption)
       expect(["off", "shadow", "on"]).toContain(currentStoredValue)
 
-      // No deadlock exceptions thrown (both either succeeded or got InvalidTransition)
-      // The history rows should be ≤ 2 (one per successful write)
+      // No deadlock exceptions thrown (both either succeeded or got InvalidTransition).
+      // History rows should be ≤ 2 (one per successful write). Because the
+      // mock now actually records history rows (H2 fix), at least one row is
+      // expected when both writers attempt off→shadow.
       expect(historyRows.length).toBeLessThanOrEqual(2)
+      expect(historyRows.length).toBeGreaterThanOrEqual(1)
 
       // Reset for next run
       historyRows.length = 0
@@ -624,36 +671,48 @@ describe("(g) regression guard — cleanup-15e oracle + cleanup-15f audit preser
     let storedValue = "off"
 
     const trxMock: never = (() => {
+      const stateFirst = async () =>
+        storedValue ? { value: storedValue } : undefined
+      const makeInsert = (tableName: string, row: MockRow) => {
+        const settle = async (): Promise<MockRow[]> => {
+          if (tableName === "operator_multi_vendor_flag_audit") {
+            const returnRow = {
+              id: "audit-regression",
+              from_state: row.from_state,
+              to_state: row.to_state,
+              triggered_by: row.triggered_by,
+              reason: null,
+              alert_id: null,
+              smoke_gate_ref: null,
+              admin_note: null,
+              cache_invalidate_outcome: {},
+              at: new Date().toISOString(),
+            }
+            insertedAuditRows.push(returnRow)
+            return [returnRow]
+          }
+          return [row]
+        }
+        return {
+          returning: async (_c: unknown) => settle(),
+          then: (r: (v: MockRow[]) => unknown, j?: (e: unknown) => unknown) =>
+            settle().then(r, j),
+          catch: (j: (e: unknown) => unknown) => settle().catch(j),
+          finally: (cb: () => void) => settle().finally(cb),
+        }
+      }
       const t = (tableName: string) => ({
         select: () => ({
           where: () => ({
+            forUpdate: () => ({
+              first: async () =>
+                tableName === "feature_flag_state" ? await stateFirst() : undefined,
+            }),
             first: async () =>
-              tableName === "feature_flag_state"
-                ? { value: storedValue }
-                : undefined,
+              tableName === "feature_flag_state" ? await stateFirst() : undefined,
           }),
         }),
-        insert: (row: MockRow) => ({
-          returning: async () => {
-            if (tableName === "operator_multi_vendor_flag_audit") {
-              const returnRow = {
-                id: "audit-regression",
-                from_state: row.from_state,
-                to_state: row.to_state,
-                triggered_by: row.triggered_by,
-                reason: null,
-                alert_id: null,
-                smoke_gate_ref: null,
-                admin_note: null,
-                cache_invalidate_outcome: {},
-                at: new Date().toISOString(),
-              }
-              insertedAuditRows.push(returnRow)
-              return [returnRow]
-            }
-            return [row]
-          },
-        }),
+        insert: (row: MockRow) => makeInsert(tableName, row),
       })
       // @ts-expect-error - mock partial
       t.raw = async (_sql: string, bindings: unknown[]) => {
