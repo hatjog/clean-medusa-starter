@@ -110,6 +110,10 @@ function getAuthContext(req: MedusaRequest): AuthContext | undefined {
 /**
  * getKnex - extracts the Knex/pg_connection instance from the MedusaRequest
  * container using ContainerRegistrationKeys.PG_CONNECTION.
+ *
+ * Logs a structured warning if the container resolve throws so silent
+ * misconfiguration cannot mask itself behind the fail-closed RBAC path
+ * (see capability-grants review F6).
  */
 function getKnex(req: MedusaRequest): Knex | undefined {
   try {
@@ -118,7 +122,14 @@ function getKnex(req: MedusaRequest): Knex | undefined {
     if (container?.resolve) {
       return container.resolve(ContainerRegistrationKeys.PG_CONNECTION) as Knex
     }
-  } catch {
+  } catch (err) {
+    // Container present but PG_CONNECTION resolve failed — log so operators
+    // can detect the misconfiguration. Capability check will fail-closed below.
+    // eslint-disable-next-line no-console
+    console.warn(
+      "[capability-check] PG_CONNECTION resolve failed; capability checks will deny.",
+      { error: err instanceof Error ? err.message : String(err) },
+    )
     return undefined
   }
   return undefined
@@ -146,13 +157,17 @@ function resolveKnex(req: MedusaRequest): Knex | undefined {
 /**
  * checkCapability - returns true if the authenticated actor holds `capability`.
  *
- * Resolution order:
- *  1. Short-circuit false if actor_id missing (unauthenticated).
- *  2. Resolve Knex from container (or test seam).
- *  3. Query `admin_capability_grants` for exact capability OR `__super_admin__`
- *     (single query, OR-clause). Result cached for CACHE_TTL_MS.
- *  4. If Knex is unavailable, falls back to `actor_type === "user"` for
- *     backward compat. TODO(v1.7.0): remove fallback.
+ * Resolution order (fail-closed at every step):
+ *  1. Short-circuit false if `actor_id` is missing (unauthenticated path).
+ *  2. Short-circuit false if `actor_type !== "user"` — the grants table is
+ *     admin-only by design (defence in depth even if a non-admin actor_id
+ *     ever collides with an admin id; cleanup-42 review F2).
+ *  3. Resolve Knex from container (or test seam). If unavailable, fail-closed
+ *     and return `false`. There is intentionally NO fallback to the legacy
+ *     "any admin user -> granted" behaviour: that stub is the bypass TF-102
+ *     was opened to remove (cleanup-42 review F1).
+ *  4. Query `admin_capability_grants` for the exact capability OR
+ *     `__super_admin__` (single OR-clause). Result cached for CACHE_TTL_MS.
  *
  * @param req        MedusaRequest with auth_context populated by middleware
  * @param capability Capability key to check
@@ -165,11 +180,16 @@ export async function checkCapability(
   if (!ctx?.actor_id) {
     return false
   }
+  // Defence in depth: grants table is admin-only. Reject any non-"user" actor
+  // up-front so a future actor namespace cannot accidentally inherit grants.
+  if (ctx.actor_type !== "user") {
+    return false
+  }
   const db = resolveKnex(req)
   if (!db) {
-    // Fallback: legacy "any admin user" behaviour when no DB is wired.
-    // TODO(v1.7.0): remove fallback; require DB in all paths.
-    return ctx.actor_type === "user"
+    // Fail-closed: no DB -> no grants. Operators see the warning emitted by
+    // getKnex(); capability checks deny until PG_CONNECTION is restored.
+    return false
   }
   return findActiveGrant(db, ctx.actor_id, capability)
 }
@@ -216,6 +236,11 @@ export type CapabilityDeniedPayload = {
  * Backwards compat (cleanup-37/TF-91): the `vendor.lifecycle.override_training_cert`
  * key is preserved; migration-seeded admins hold `__super_admin__` which grants
  * this capability implicitly.
+ *
+ * NOTE: Calling `requireCapability(req, "__super_admin__")` is technically
+ * supported (the literal is part of the `Capability` union for manifest
+ * symmetry) but is unusual — handlers should request the smallest capability
+ * they actually need. The bypass key is meant to be granted, not required.
  */
 export async function requireCapability(
   req: MedusaRequest,

@@ -266,6 +266,92 @@ describe("AC5-7 / AC6: Backwards compat — cleanup-37 capability", () => {
 })
 
 // ---------------------------------------------------------------------------
+// Review F1: no insecure Knex-unavailable fallback — fail-closed when DB absent
+// ---------------------------------------------------------------------------
+describe("Review F1: fail-closed when Knex is unavailable", () => {
+  it("returns false when no Knex is registered (no fallback to actor_type)", async () => {
+    // Deliberately do NOT inject a mock Knex; req.scope is undefined.
+    __setKnexForTests(undefined)
+
+    const req = makeReq("admin-no-db")
+    const granted = await checkCapability(req, "lifecycle.override")
+    expect(granted).toBe(false)
+  })
+
+  it("requireCapability returns 403 CAPABILITY_REQUIRED when no Knex is registered", async () => {
+    __setKnexForTests(undefined)
+
+    const req = makeReq("admin-no-db")
+    const result = await requireCapability(req, "vendor.lifecycle.override_training_cert")
+    expect(result.ok).toBe(false)
+    if (!result.ok) {
+      expect(result.body.code).toBe("CAPABILITY_REQUIRED")
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Review F2: defence in depth — actor_type !== "user" denied without DB hit
+// ---------------------------------------------------------------------------
+describe("Review F2: actor_type filter (admin-only grants table)", () => {
+  it("denies non-user actor types without touching the DB", async () => {
+    const dbSpy = jest.fn()
+    __setKnexForTests(makeMockKnex([{ capability: SUPER_ADMIN_CAPABILITY }], dbSpy))
+
+    const req = makeReq("cust-1", "customer")
+    const granted = await checkCapability(req, "lifecycle.override")
+    expect(granted).toBe(false)
+    expect(dbSpy).not.toHaveBeenCalled()
+  })
+
+  it("denies vendor actor type even with super_admin row in mock", async () => {
+    const dbSpy = jest.fn()
+    __setKnexForTests(makeMockKnex([{ capability: SUPER_ADMIN_CAPABILITY }], dbSpy))
+
+    const req = makeReq("vend-1", "vendor")
+    const result = await requireCapability(req, "vendor.lifecycle.override_training_cert")
+    expect(result.ok).toBe(false)
+    expect(dbSpy).not.toHaveBeenCalled()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Review F7: DB error -> fail-closed false, no cache poisoning
+// ---------------------------------------------------------------------------
+describe("Review F7: DB error fail-closed without caching the failure", () => {
+  it("returns false on DB error and does NOT cache the failure", async () => {
+    let calls = 0
+    const flakyDb = (() => {
+      const buildChain = (failOnce: boolean) => ({
+        select: () => buildChain(failOnce),
+        where: () => buildChain(failOnce),
+        whereIn: () => buildChain(failOnce),
+        whereNull: () => buildChain(failOnce),
+        limit: () =>
+          failOnce
+            ? Promise.reject(new Error("boom"))
+            : Promise.resolve([{ capability: "alerts.read" }]),
+      })
+      return jest.fn(() => {
+        calls += 1
+        return buildChain(calls === 1) as unknown as Knex
+      }) as unknown as Knex
+    })()
+
+    __setKnexForTests(flakyDb)
+
+    const req = makeReq("admin-flaky")
+    // First call hits the DB error path
+    const first = await checkCapability(req, "alerts.read")
+    expect(first).toBe(false)
+
+    // Second call must re-query (failure was NOT cached) and now succeed
+    const second = await checkCapability(req, "alerts.read")
+    expect(second).toBe(true)
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Manifest completeness — capability type must include all AC1 entries
 // ---------------------------------------------------------------------------
 describe("AC1: Capability manifest completeness", () => {

@@ -76,9 +76,9 @@ export class Migration20260507400000AdminCapabilityGrantsTable extends Migration
         u.id          AS actor_id,
         '__super_admin__' AS capability,
         NULL          AS granted_by
-      FROM "user" u
+      FROM public."user" u
       WHERE u.deleted_at IS NULL
-      ON CONFLICT DO NOTHING
+      ON CONFLICT (actor_id, capability) WHERE revoked_at IS NULL DO NOTHING
     `)
   }
 
