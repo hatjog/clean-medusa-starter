@@ -73,7 +73,8 @@ export const POST = withOperatorAuth(async (req, res) => {
   const vendor = await gpCore.createVendor({
     name: body.name,
     instance_id: body.instance_id,
-    status: body.status ?? "onboarded",
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    status: (body.status ?? "onboarded") as any,
   })
 
   await gpCore.assignVendorToMarket({

@@ -33,8 +33,9 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
   const { result } = await createReviewWorkflow.run({
     container: req.scope,
     input: {
-      ...req.validatedBody,
-      customer_id: req.auth_context.actor_id,
+      ...(req.validatedBody as Record<string, unknown>),
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      customer_id: (req as any).auth_context?.actor_id,
     },
   });
 
@@ -43,7 +44,7 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
   };
   const {
     data: [review],
-  } = await query.graph({
+  } = await (query as any).graph({
     entity: "review",
     fields: req.queryConfig.fields,
     filters: {

@@ -19,7 +19,8 @@ import { afterEach, beforeEach, describe, expect, it, jest } from "@jest/globals
 
 // Mock cache-invalidate-on-flag-flip so tests don't need Redis
 jest.mock("../cache-invalidate-on-flag-flip", () => ({
-  invalidateOnFlip: jest.fn().mockResolvedValue({
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  invalidateOnFlip: (jest.fn() as any).mockResolvedValue({
     isr_tags_revalidated: 0,
     redis_keys_busted: 0,
     sdk_cache_pings: 0,
@@ -30,7 +31,8 @@ jest.mock("../cache-invalidate-on-flag-flip", () => ({
 
 // Mock phase-b-smoke-gate-aggregator — bypass not needed in most tests
 jest.mock("../phase-b-smoke-gate-aggregator", () => ({
-  getLastRatification: jest.fn().mockResolvedValue({ verdict: "pass" }),
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  getLastRatification: (jest.fn() as any).mockResolvedValue({ verdict: "pass" }),
 }))
 
 // Mock logger to capture warn calls
@@ -156,15 +158,12 @@ function buildMockDb(options: {
   // transaction mock — executes callback with a trx that wraps the same mock
   const buildTrx = (): Record<string, unknown> => {
     const trx = (tableName: string) => buildTableProxy(tableName)
-    // @ts-expect-error - mock partial Knex transaction
     trx.raw = rawMock
     return trx as unknown as Record<string, unknown>
   }
 
   const db = (tableName: string) => buildTableProxy(tableName)
-  // @ts-expect-error - mock partial Knex
   db.raw = rawMock
-  // @ts-expect-error - mock partial Knex
   db.transaction = async (callback: (trx: unknown) => Promise<void>) => {
     const trx = buildTrx()
     await callback(trx)
@@ -250,16 +249,13 @@ describe("(a) write-then-read round-trip", () => {
 
     const trx: never = (() => {
       const t = (tableName: string) => trxTableProxy(tableName)
-      // @ts-expect-error - mock partial Knex
       t.raw = rawFn
       return t as never
     })()
 
     const db: never = (() => {
       const d = (tableName: string) => trxTableProxy(tableName)
-      // @ts-expect-error - mock partial Knex
       d.raw = rawFn
-      // @ts-expect-error - mock partial Knex
       d.transaction = async (cb: (t: never) => Promise<void>) => cb(trx)
       return d as never
     })()
@@ -309,9 +305,7 @@ describe("(b) multi-instance convergence within TTL", () => {
         }),
         insert: () => ({ returning: async () => [] }),
       })
-      // @ts-expect-error - mock partial Knex
       d.raw = async () => {}
-      // @ts-expect-error - mock partial Knex
       d.transaction = async () => {}
       return d as never
     })()
@@ -351,9 +345,7 @@ describe("(c) stale-within-TTL is acceptable", () => {
         }),
         insert: () => ({ returning: async () => [] }),
       })
-      // @ts-expect-error - mock partial Knex
       d.raw = async () => {}
-      // @ts-expect-error - mock partial Knex
       d.transaction = async () => {}
       return d as never
     })()
@@ -384,9 +376,7 @@ describe("(d) env override fallback when DB unavailable", () => {
         }),
         insert: () => ({ returning: async () => [] }),
       })
-      // @ts-expect-error - mock partial Knex
       d.raw = async () => {}
-      // @ts-expect-error - mock partial Knex
       d.transaction = async () => {}
       return d as never
     })()
@@ -428,9 +418,7 @@ describe("(d) env override fallback when DB unavailable", () => {
         }),
         insert: () => ({ returning: async () => [] }),
       })
-      // @ts-expect-error - mock partial Knex
       d.raw = async () => {}
-      // @ts-expect-error - mock partial Knex
       d.transaction = async () => {}
       return d as never
     })()
@@ -525,7 +513,6 @@ describe("(e) concurrent writes serialize", () => {
           }),
           insert: (row: MockRow) => makeInsertBuilder(tableName, row, onAuditReturn),
         })
-        // @ts-expect-error - mock partial Knex transaction
         t.raw = async (_sql: string, bindings: unknown[]) => {
           currentStoredValue = bindings[1] as string
         }
@@ -546,11 +533,9 @@ describe("(e) concurrent writes serialize", () => {
             returning: async () => [row],
           }),
         })
-        // @ts-expect-error - mock partial Knex
         d.raw = async (_sql: string, bindings: unknown[]) => {
           currentStoredValue = bindings[1] as string
         }
-        // @ts-expect-error - mock partial Knex
         d.transaction = async (cb: (t: never) => Promise<void>) => {
           await cb(buildTrxMock())
         }
@@ -600,9 +585,7 @@ describe("(f) migration seed derivation", () => {
         }),
         insert: () => ({ returning: async () => [] }),
       })
-      // @ts-expect-error - mock partial Knex
       d.raw = async () => {}
-      // @ts-expect-error - mock partial Knex
       d.transaction = async () => {}
       return d as never
     })()
@@ -627,9 +610,7 @@ describe("(f) migration seed derivation", () => {
         }),
         insert: () => ({ returning: async () => [] }),
       })
-      // @ts-expect-error - mock partial Knex
       d.raw = async () => {}
-      // @ts-expect-error - mock partial Knex
       d.transaction = async () => {}
       return d as never
     })()
@@ -714,7 +695,6 @@ describe("(g) regression guard — cleanup-15e oracle + cleanup-15f audit preser
         }),
         insert: (row: MockRow) => makeInsert(tableName, row),
       })
-      // @ts-expect-error - mock partial
       t.raw = async (_sql: string, bindings: unknown[]) => {
         storedValue = bindings[1] as string
       }
@@ -733,9 +713,7 @@ describe("(g) regression guard — cleanup-15e oracle + cleanup-15f audit preser
         }),
         insert: () => ({ returning: async () => [] }),
       })
-      // @ts-expect-error - mock partial Knex
       d.raw = async () => {}
-      // @ts-expect-error - mock partial Knex
       d.transaction = async (cb: (t: never) => Promise<void>) => cb(trxMock)
       return d as never
     })()

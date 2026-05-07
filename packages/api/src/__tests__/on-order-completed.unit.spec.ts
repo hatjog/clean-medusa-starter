@@ -14,7 +14,7 @@ function buildMockContainer(overrides: {
   }
 
   const gpCore = overrides.gpCore !== undefined ? overrides.gpCore : {
-    createEntitlement: jest.fn().mockRejectedValue(new NotImplementedError("Story 1.3")),
+    createEntitlement: (jest.fn() as any).mockRejectedValue(new NotImplementedError("Story 1.3")),
   }
 
   return {
@@ -92,7 +92,7 @@ describe("on-order-completed subscriber", () => {
   it("logs unexpected errors as error", async () => {
     const container = buildMockContainer({
       gpCore: {
-        createEntitlement: jest.fn().mockRejectedValue(new Error("DB down")),
+        createEntitlement: (jest.fn() as any).mockRejectedValue(new Error("DB down")),
       },
     })
 
@@ -107,7 +107,8 @@ describe("on-order-completed subscriber", () => {
   })
 
   it("continues processing remaining orders if one fails", async () => {
-    const createEntitlement = jest.fn()
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const createEntitlement = (jest.fn() as any)
       .mockRejectedValueOnce(new Error("temporary"))
       .mockRejectedValueOnce(new NotImplementedError("Story 1.3"))
     const container = buildMockContainer({
@@ -137,7 +138,7 @@ describe("on-order-completed subscriber", () => {
   it("does not throw — subscriber errors are caught", async () => {
     const container = buildMockContainer({
       gpCore: {
-        createEntitlement: jest.fn().mockRejectedValue(new Error("catastrophic")),
+        createEntitlement: (jest.fn() as any).mockRejectedValue(new Error("catastrophic")),
       },
     })
 

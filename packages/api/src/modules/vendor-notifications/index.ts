@@ -50,6 +50,7 @@ export interface VendorNotificationLogEntry {
     | "nudge_t14"
     | "nudge_t7"
     | "nudge_t3"
+    | `nudge_${string}`
     | "competitive_insights_query"
   sent_at: string // ISO 8601
   locale: "pl" | "en"

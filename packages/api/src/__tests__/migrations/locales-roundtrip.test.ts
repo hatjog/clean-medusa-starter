@@ -18,7 +18,6 @@
 import {
   Migration20260427120000AddLocalesToMarketRuntimeConfig,
   LOCALES_BACKFILL_SEED,
-} from "../../migrations/Migration20260427120000AddLocalesToMarketRuntimeConfig";
 } from "../../migrations-legacy-base/Migration20260427120000AddLocalesToMarketRuntimeConfig";
 
 type RecordedSql = { sql: string; params: unknown[] };
@@ -30,7 +29,9 @@ class RecordingMigration extends Migration20260427120000AddLocalesToMarketRuntim
   // instead of buffering it for a live driver. The cast to `any` is scoped to
   // the test harness only — the production class is unmodified.
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  public override addSql(sql: string, params: unknown[] = []): any {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  public override addSql(sql: string, ...args: any[]): any {
+    const params: unknown[] = args[0] ?? [];
     this.recorded.push({ sql, params });
   }
 
@@ -43,7 +44,7 @@ describe("Migration20260427120000AddLocalesToMarketRuntimeConfig — roundtrip",
   let migration: RecordingMigration;
 
   beforeEach(() => {
-    migration = new RecordingMigration();
+    migration = new (RecordingMigration as any)();
   });
 
   it("up() emits ADD COLUMN locales jsonb (nullable, idempotent)", async () => {

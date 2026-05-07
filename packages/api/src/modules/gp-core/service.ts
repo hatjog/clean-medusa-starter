@@ -863,7 +863,7 @@ export default class GpCoreService {
    *
    * Returns full EntitlementAdminView[] with redemption list + audit log.
    */
-  async adminSearchEntitlements(q: string): Promise<import("../../../lib/contracts/admin").EntitlementAdminView[]> {
+  async adminSearchEntitlements(q: string): Promise<import("@/lib/contracts/admin.js").EntitlementAdminView[]> {
     const isEmailSearch = q.includes("@")
     const startMs = Date.now()
 
@@ -877,7 +877,7 @@ export default class GpCoreService {
   private async adminSearchByEmail(
     email: string,
     startMs: number
-  ): Promise<import("../../../lib/contracts/admin").EntitlementAdminView[]> {
+  ): Promise<import("@/lib/contracts/admin.js").EntitlementAdminView[]> {
     // Step 1: Find order_ids in Mercur DB by buyer_email (ILIKE for case-insensitive)
     const orderRows = await this.queryMany<{ id: string }>(
       this.getMercurPool(),
@@ -893,7 +893,7 @@ export default class GpCoreService {
     const orderIds = orderRows.map((r) => r.id)
 
     // Step 2: Fetch entitlements from gp_core by order_id list
-    const entitlements = await this.queryMany<import("../../../lib/contracts/admin").EntitlementAdminView & { raw_id: string }>(
+    const entitlements = await this.queryMany<import("@/lib/contracts/admin.js").EntitlementAdminView & { raw_id: string }>(
       this.getCorePool(),
       `
         SELECT
@@ -927,9 +927,9 @@ export default class GpCoreService {
   private async adminSearchDirect(
     q: string,
     startMs: number
-  ): Promise<import("../../../lib/contracts/admin").EntitlementAdminView[]> {
+  ): Promise<import("@/lib/contracts/admin.js").EntitlementAdminView[]> {
     // Direct path: ILIKE on voucher_code, exact match on claim_token and order_id
-    const entitlements = await this.queryMany<import("../../../lib/contracts/admin").EntitlementAdminView>(
+    const entitlements = await this.queryMany<import("@/lib/contracts/admin.js").EntitlementAdminView>(
       this.getCorePool(),
       `
         SELECT
@@ -963,8 +963,8 @@ export default class GpCoreService {
   }
 
   private async enrichEntitlements(
-    entitlements: import("../../../lib/contracts/admin").EntitlementAdminView[]
-  ): Promise<import("../../../lib/contracts/admin").EntitlementAdminView[]> {
+    entitlements: import("@/lib/contracts/admin.js").EntitlementAdminView[]
+  ): Promise<import("@/lib/contracts/admin.js").EntitlementAdminView[]> {
     if (!entitlements.length) return []
 
     const ids = entitlements.map((e) => e.id)

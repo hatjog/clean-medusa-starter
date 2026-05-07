@@ -101,10 +101,7 @@ function emitDbUnavailableWarnOnce(error: unknown): void {
   if (_dbUnavailableWarnEmitted) return
   _dbUnavailableWarnEmitted = true
   const message = error instanceof Error ? error.message : String(error)
-  logger.warn({
-    event: "flag.state.db_unavailable_fallback_env",
-    error: message,
-  })
+  logger.warn("flag.state.db_unavailable_fallback_env", { error: message })
 }
 
 /** Reset DB-unavailable warn state — for testing only. */
@@ -133,10 +130,7 @@ let _setStateNoDbWarnEmitted = false
 function emitSetStateNoDbWarnOnce(): void {
   if (_setStateNoDbWarnEmitted) return
   _setStateNoDbWarnEmitted = true
-  logger.warn({
-    event: "flag.state.set_state_called_without_db",
-    note: "setState invoked without ctx.db; durability/multi-instance safety LOST. Production callers must pass req.scope.resolve('manager').getKnex() or equivalent.",
-  })
+  logger.warn("flag.state.set_state_called_without_db", { note: "setState invoked without ctx.db; durability/multi-instance safety LOST. Production callers must pass req.scope.resolve('manager').getKnex() or equivalent." })
 }
 
 /** Reset setState-no-db warn state — for testing only. */
@@ -230,11 +224,7 @@ export async function readFlagStateRow(
   }
   if (v) {
     // L3 fix: row exists but value is not in allow-list → warn for operator visibility.
-    logger.warn({
-      event: "flag.state.invalid_db_value",
-      flag_id: flagId,
-      value: v,
-    })
+    logger.warn("flag.state.invalid_db_value", { flag_id: flagId, value: v })
   }
   return null
 }

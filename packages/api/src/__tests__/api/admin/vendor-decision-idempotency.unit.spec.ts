@@ -19,7 +19,7 @@
 import { describe, it, expect, beforeEach } from "@jest/globals"
 import { ContainerRegistrationKeys } from "@medusajs/framework/utils"
 import { POST } from "../../../api/admin/vendors/[id]/decision/route"
-import { PENDING_HASH, PENDING_STATUS } from "../../../lib/vendor-decision-idempotency"
+import { PENDING_HASH, PENDING_STATUS } from "../../../lib/vendor-decision-idempotency.js"
 
 // ── Shared test key ────────────────────────────────────────────────────────────
 const KEY_K1 = "a1b2c3d4-e5f6-4a7b-b8c9-d0e1f2a3b4c5"
@@ -314,7 +314,7 @@ describe("POST /admin/vendors/[id]/decision — idempotency (cleanup-36 AC6)", (
     const seller = makePendingSeller()
     const sellerService = makeSellerServiceMock(seller)
 
-    const { hashRequestBody } = await import("../../../lib/vendor-decision-idempotency")
+    const { hashRequestBody } = await import("../../../lib/vendor-decision-idempotency.js")
     const cachedHash = hashRequestBody({
       decision: "opted_in",
       reason: "vendor confirmed migration",
@@ -420,7 +420,7 @@ describe("POST /admin/vendors/[id]/decision — idempotency (cleanup-36 AC6)", (
     const seller = makePendingSeller()
     const sellerService = makeSellerServiceMock(seller)
 
-    const { hashRequestBody } = await import("../../../lib/vendor-decision-idempotency")
+    const { hashRequestBody } = await import("../../../lib/vendor-decision-idempotency.js")
     const originalHash = hashRequestBody({
       decision: "opted_in",
       reason: "vendor confirmed migration",

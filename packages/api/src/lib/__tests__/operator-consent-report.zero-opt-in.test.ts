@@ -301,7 +301,7 @@ describe("zero-opt-in-cascade route — SellerModule 503 path (AC3d / AC6)", () 
 
   it("returns HTTP 503 with SELLER_MODULE_UNAVAILABLE when module unavailable", async () => {
     const { GET } = await import(
-      "../../api/admin/operator/zero-opt-in-cascade/route"
+      "../../api/admin/operator/zero-opt-in-cascade/route.js"
     )
 
     const mockReq = { scope: buildRouteScope("unavailable") }
@@ -322,7 +322,7 @@ describe("zero-opt-in-cascade route — SellerModule 503 path (AC3d / AC6)", () 
 
   it("returns cascade JSON (AC6 contract) when module is available", async () => {
     const { GET } = await import(
-      "../../api/admin/operator/zero-opt-in-cascade/route"
+      "../../api/admin/operator/zero-opt-in-cascade/route.js"
     )
 
     const mockReq = {
@@ -342,9 +342,9 @@ describe("zero-opt-in-cascade route — SellerModule 503 path (AC3d / AC6)", () 
     // applied to the seeded sellers (2 of 3 are opted_in).
     expect(mockRes._body).toMatchObject({
       opted_in_count: 2,
-      cascade_active: expect.anything() as boolean,
-      current_step: expect.anything() as string,
-      recommended_action: expect.anything() as string,
+      cascade_active: expect.anything() as unknown as boolean,
+      current_step: expect.anything() as unknown as string,
+      recommended_action: expect.anything() as unknown as string,
     })
   })
 })

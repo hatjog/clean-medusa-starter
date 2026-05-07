@@ -146,9 +146,10 @@ function makeKnexMock(
     }
   }
 
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const knexFn = jest.fn((tableName: string) =>
     buildTableMock(tableName),
-  ) as AnyFn & { transaction: AnyFn }
+  ) as unknown as AnyFn & { transaction: AnyFn }
 
   // transaction: runs callback with a proxy that also calls buildTableMock
   knexFn.transaction = jest.fn(

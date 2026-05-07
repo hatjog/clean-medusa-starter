@@ -21,7 +21,6 @@
 import {
   Migration20260427120000AddLocalesToMarketRuntimeConfig,
   LOCALES_BACKFILL_SEED,
-} from "../../migrations/Migration20260427120000AddLocalesToMarketRuntimeConfig";
 } from "../../migrations-legacy-base/Migration20260427120000AddLocalesToMarketRuntimeConfig";
 
 type RecordedSql = { sql: string; params: unknown[] };
@@ -32,7 +31,9 @@ class CrashingMigration extends Migration20260427120000AddLocalesToMarketRuntime
   private updateCount = 0;
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  public override addSql(sql: string, params: unknown[] = []): any {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  public override addSql(sql: string, ...args: any[]): any {
+    const params: unknown[] = args[0] ?? [];
     if (/UPDATE.*market_runtime_config/i.test(sql)) {
       this.updateCount++;
       if (this.updateCount > this.crashAfter) {
@@ -52,7 +53,7 @@ class CrashingMigration extends Migration20260427120000AddLocalesToMarketRuntime
 
 describe("Migration20260427120000AddLocalesToMarketRuntimeConfig — rollback after partial backfill", () => {
   it("up() partial state is recoverable via down() (DROP COLUMN unconditional)", async () => {
-    const migration = new CrashingMigration();
+    const migration = new (CrashingMigration as any)();
     const totalMarkets = Object.keys(LOCALES_BACKFILL_SEED).length;
     expect(totalMarkets).toBeGreaterThanOrEqual(5);
 
@@ -88,7 +89,7 @@ describe("Migration20260427120000AddLocalesToMarketRuntimeConfig — rollback af
   });
 
   it("down() emits no UPDATE / DELETE — pure DDL rollback (no row mutation needed)", async () => {
-    const migration = new CrashingMigration();
+    const migration = new (CrashingMigration as any)();
     await migration.down();
 
     const rowMutations = migration.recorded.filter((r) =>
@@ -98,7 +99,7 @@ describe("Migration20260427120000AddLocalesToMarketRuntimeConfig — rollback af
   });
 
   it("re-running up() after down() succeeds (idempotent recovery path)", async () => {
-    const migration = new CrashingMigration();
+    const migration = new (CrashingMigration as any)();
 
     // First up() crashes after 2.
     migration.crashAfter = 2;

@@ -19,7 +19,7 @@ type PauseGateVendor = {
   handle: string
   email: string
   lifecycle_status: LifecycleStatus
-  decision_status: "opted_in" | "opted_out" | "pending"
+  decision_status: "opted_in" | "opted_out" | "pending" | "forced"
   completeness: { complete: number; total: number }
   last_action_at: string | null
 }

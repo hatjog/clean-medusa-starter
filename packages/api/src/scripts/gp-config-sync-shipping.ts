@@ -576,6 +576,7 @@ export default async function gpConfigSyncShipping({ container, args }: ExecArgs
         if (parsedArgs.dryRun) {
           shippingOptionId = `dryrun-${shippingProfileId}-${zone.service_zone_id}`
         } else {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
           const { result } = await createShippingOptionsWorkflow(container).run({
             input: [
               {
@@ -613,7 +614,7 @@ export default async function gpConfigSyncShipping({ container, args }: ExecArgs
                     source: "gp-config-sync-shipping",
                   },
                 },
-              },
+              } as any,
             ],
           })
 

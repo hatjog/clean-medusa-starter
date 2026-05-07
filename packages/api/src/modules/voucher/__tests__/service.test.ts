@@ -57,12 +57,14 @@ function makeMockPool(config: MockPoolConfig = {}): Pool {
     release: jest.fn(),
   }
 
-  const mockConnect = jest.fn().mockResolvedValue(mockClient)
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const mockConnect = (jest.fn() as any).mockResolvedValue(mockClient)
 
   return {
     query: mockQuery,
     connect: mockConnect,
-    end: jest.fn().mockResolvedValue(undefined),
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    end: (jest.fn() as any).mockResolvedValue(undefined),
   } as unknown as Pool
 }
 

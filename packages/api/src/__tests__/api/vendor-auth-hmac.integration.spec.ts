@@ -1,7 +1,7 @@
 /**
  * Story v160-cleanup-48 — Integration tests for withVendorAuth HOF with HMAC.
  *
- * These tests invoke withVendorAuth(handler) with a real signed payload,
+ * These tests invoke withVendorAuth(handler as any) with a real signed payload,
  * exercising the full middleware chain (signature verify → resolveVendorId → inject).
  *
  * Environment: VENDOR_HMAC_SECRET and VENDOR_HMAC_ENFORCED are controlled via
@@ -125,7 +125,7 @@ describe("withVendorAuth HOF — HMAC enforced", () => {
       capturedAuth = req.vendorAuth
     })
 
-    const wrapped = withVendorAuth(handler)
+    const wrapped = withVendorAuth(handler as any)
     const req = buildMockReq({ "x-vendor-signature": makeSignedHeader() })
     const res = buildMockRes()
 
@@ -141,7 +141,7 @@ describe("withVendorAuth HOF — HMAC enforced", () => {
   // Case 2: Invalid signature → 401 VENDOR_AUTH_SIGNATURE_INVALID
   it("case-2: invalid signature → 401 VENDOR_AUTH_SIGNATURE_INVALID", async () => {
     const handler = jest.fn()
-    const wrapped = withVendorAuth(handler)
+    const wrapped = withVendorAuth(handler as any)
 
     // Build header with wrong secret
     const wrongHeader = buildVendorSignatureHeader(SELLER_ID, "wrong-secret")
@@ -158,7 +158,7 @@ describe("withVendorAuth HOF — HMAC enforced", () => {
   // Case 3: Expired timestamp (drift+1) → 401 VENDOR_AUTH_TIMESTAMP_EXPIRED
   it("case-3: expired timestamp → 401 VENDOR_AUTH_TIMESTAMP_EXPIRED", async () => {
     const handler = jest.fn()
-    const wrapped = withVendorAuth(handler)
+    const wrapped = withVendorAuth(handler as any)
 
     const expiredHeader = makeSignedHeader(SELLER_ID, -(300 + 1))
     const req = buildMockReq({ "x-vendor-signature": expiredHeader })
@@ -174,7 +174,7 @@ describe("withVendorAuth HOF — HMAC enforced", () => {
   // Case 4: Missing signature header → 401 VENDOR_AUTH_SIGNATURE_MISSING
   it("case-4: missing signature header → 401 VENDOR_AUTH_SIGNATURE_MISSING", async () => {
     const handler = jest.fn()
-    const wrapped = withVendorAuth(handler)
+    const wrapped = withVendorAuth(handler as any)
 
     const req = buildMockReq({}) // no x-vendor-signature
     const res = buildMockRes()
@@ -194,7 +194,7 @@ describe("withVendorAuth HOF — HMAC enforced", () => {
     const header = buildVendorSignatureHeader(SELLER_ID, TEST_SECRET, ts, uniqueNonce)
 
     const handler = jest.fn()
-    const wrapped = withVendorAuth(handler)
+    const wrapped = withVendorAuth(handler as any)
 
     // First call
     const req1 = buildMockReq({ "x-vendor-signature": header })
@@ -227,7 +227,7 @@ describe("withVendorAuth HOF — legacy transition window", () => {
       capturedAuth = req.vendorAuth
     })
 
-    const wrapped = withVendorAuth(handler)
+    const wrapped = withVendorAuth(handler as any)
     const warnMock = jest.fn()
     const req = buildMockReq(
       { "x-vendor-token": SELLER_ID },
@@ -253,14 +253,14 @@ describe("withVendorAuth HOF — legacy transition window", () => {
     const warnCalls = warnMock.mock.calls.map((c) => c[0])
     const legacyWarn = warnCalls.find((msg) => {
       try {
-        const parsed = JSON.parse(msg)
+        const parsed = JSON.parse(msg as string)
         return parsed.event === "vendor-auth.legacy-accept"
       } catch {
         return false
       }
     })
     expect(legacyWarn).toBeDefined()
-    const parsedWarn = JSON.parse(legacyWarn)
+    const parsedWarn = JSON.parse(legacyWarn as string)
     expect(parsedWarn.seller_id).toBe(SELLER_ID)
     expect(parsedWarn.transition_window).toBe(true)
   })
@@ -270,7 +270,7 @@ describe("withVendorAuth HOF — legacy transition window", () => {
     process.env.VENDOR_HMAC_ENFORCED = "false"
 
     const handler = jest.fn()
-    const wrapped = withVendorAuth(handler)
+    const wrapped = withVendorAuth(handler as any)
 
     const req = buildMockReq({}) // no headers
     const res = buildMockRes()
@@ -292,7 +292,7 @@ describe("withVendorAuth HOF — missing config", () => {
     process.env.VENDOR_HMAC_ENFORCED = "true"
 
     const handler = jest.fn()
-    const wrapped = withVendorAuth(handler)
+    const wrapped = withVendorAuth(handler as any)
 
     const req = buildMockReq({ "x-vendor-signature": makeSignedHeader() })
     const res = buildMockRes()

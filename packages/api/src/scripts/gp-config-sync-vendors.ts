@@ -489,7 +489,7 @@ export async function upsertSeller(
   vendor: VendorFixture,
   dryRun: boolean,
   marketId: string,
-  currencyCode: string,
+  currencyCode = "pln",
   overwrite = false
 ): Promise<SellerSyncResult> {
   const handle = vendor.slug.trim()

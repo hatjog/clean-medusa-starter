@@ -51,8 +51,9 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
   const { result } = await createWishlistEntryWorkflow.run({
     container: req.scope,
     input: {
-      ...req.validatedBody,
-      customer_id: req.auth_context.actor_id,
+      ...(req.validatedBody as Record<string, unknown>),
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      customer_id: (req as any).auth_context?.actor_id,
     },
   });
 
@@ -76,7 +77,8 @@ export async function GET(req: MedusaRequest, res: MedusaResponse) {
   const query = req.scope.resolve(ContainerRegistrationKeys.QUERY) as {
     graph: (input: Record<string, unknown>) => Promise<QueryGraphResult>;
   };
-  const customerId = req.auth_context.actor_id;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const customerId = (req as any).auth_context?.actor_id;
   const salesChannelId = marketContextStorage.getStore()?.sales_channel_id;
   const offset = req.queryConfig.pagination?.skip ?? 0;
   const limit = req.queryConfig.pagination?.take ?? 50;

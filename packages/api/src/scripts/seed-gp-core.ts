@@ -213,7 +213,8 @@ export async function seedGpCoreFromFixtures(
             instance_id: input.instanceId,
             vendor_key: vendorConfig.vendor_id,
             name: vendorConfig.display_name ?? titleize(vendorConfig.slug ?? vendorConfig.vendor_id),
-            status: vendorConfig.status ?? "onboarded",
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            status: (vendorConfig.status ?? "onboarded") as any,
           },
           client
         )

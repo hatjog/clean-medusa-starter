@@ -60,8 +60,9 @@ describe("voucher-pii loader", () => {
   beforeEach(async () => {
     // Re-import to reset module-level state between tests.
     jest.resetModules();
-    const mod = await import("../../loaders/voucher-pii");
-    loader = mod.default;
+    const mod = await import("../../loaders/voucher-pii.js");
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    loader = mod.default as any;
   });
 
   test("AC4(a): registers 'voucher_pii' key after loader runs", async () => {

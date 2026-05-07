@@ -163,7 +163,7 @@ describe("POST /admin/sellers/:id/pause — override capability gate (AC1-AC5)",
       throw new Error("actor_id missing from auth_context — unauthenticated request reached handler")
     })
 
-    const { POST } = await import("../route")
+    const { POST } = await import("../route.js")
     const req = makeReq({ body: { reason: "test reason here" } })
     const res = makeRes()
 
@@ -179,7 +179,7 @@ describe("POST /admin/sellers/:id/pause — override capability gate (AC1-AC5)",
   // AC4 — override=true without adequate reason returns 400 (no DB write)
   // -------------------------------------------------------------------------
   it("AC4 missing reason: returns 400 REASON_REQUIRED when reason absent and override=false", async () => {
-    const { POST } = await import("../route")
+    const { POST } = await import("../route.js")
     const req = makeReq({ body: { override: false } })
     const res = makeRes()
 
@@ -191,7 +191,7 @@ describe("POST /admin/sellers/:id/pause — override capability gate (AC1-AC5)",
   })
 
   it("AC4 short override reason: returns 400 OVERRIDE_REASON_REQUIRED when reason < 10 chars", async () => {
-    const { POST } = await import("../route")
+    const { POST } = await import("../route.js")
     const req = makeReq({ body: { override: true, reason: "short" } })
     const res = makeRes()
 
@@ -205,7 +205,7 @@ describe("POST /admin/sellers/:id/pause — override capability gate (AC1-AC5)",
   })
 
   it("AC4 blank override reason (trim): returns 400 OVERRIDE_REASON_REQUIRED for whitespace-only", async () => {
-    const { POST } = await import("../route")
+    const { POST } = await import("../route.js")
     const req = makeReq({ body: { override: true, reason: "   " } })
     const res = makeRes()
 
@@ -219,7 +219,7 @@ describe("POST /admin/sellers/:id/pause — override capability gate (AC1-AC5)",
   })
 
   it("AC4 missing override reason (override=true, no reason): returns 400 OVERRIDE_REASON_REQUIRED", async () => {
-    const { POST } = await import("../route")
+    const { POST } = await import("../route.js")
     const req = makeReq({ body: { override: true } })
     const res = makeRes()
 
@@ -236,7 +236,7 @@ describe("POST /admin/sellers/:id/pause — override capability gate (AC1-AC5)",
   // [AI-Review][MEDIUM fix] INVALID_OVERRIDE_TYPE — reject non-boolean override
   // -------------------------------------------------------------------------
   it("rejects override='true' (string) with 400 INVALID_OVERRIDE_TYPE; no capability check", async () => {
-    const { POST } = await import("../route")
+    const { POST } = await import("../route.js")
     const req = makeReq({ body: { override: "true", reason: "long enough reason here" } })
     const res = makeRes()
 
@@ -248,7 +248,7 @@ describe("POST /admin/sellers/:id/pause — override capability gate (AC1-AC5)",
   })
 
   it("rejects override=1 (number) with 400 INVALID_OVERRIDE_TYPE; no capability check", async () => {
-    const { POST } = await import("../route")
+    const { POST } = await import("../route.js")
     const req = makeReq({ body: { override: 1, reason: "long enough reason here" } })
     const res = makeRes()
 
@@ -260,7 +260,7 @@ describe("POST /admin/sellers/:id/pause — override capability gate (AC1-AC5)",
   })
 
   it("AC4 exactly 9-char override reason: returns 400 OVERRIDE_REASON_REQUIRED", async () => {
-    const { POST } = await import("../route")
+    const { POST } = await import("../route.js")
     const req = makeReq({ body: { override: true, reason: "123456789" } }) // 9 chars
     const res = makeRes()
 
@@ -284,7 +284,7 @@ describe("POST /admin/sellers/:id/pause — override capability gate (AC1-AC5)",
       },
     })
 
-    const { POST } = await import("../route")
+    const { POST } = await import("../route.js")
     const req = makeReq({ body: { override: true, reason: "needs override justification" } })
     const res = makeRes()
     const client = (req as Record<string, unknown>)._testClient as ReturnType<typeof makeClient>
@@ -316,7 +316,7 @@ describe("POST /admin/sellers/:id/pause — override capability gate (AC1-AC5)",
   })
 
   it("AC2 capability check is called with correct capability key when override=true", async () => {
-    const { POST } = await import("../route")
+    const { POST } = await import("../route.js")
     const req = makeReq({ body: { override: true, reason: "a valid long reason here" } })
     const res = makeRes()
 
@@ -332,7 +332,7 @@ describe("POST /admin/sellers/:id/pause — override capability gate (AC1-AC5)",
   // AC1 + AC3 — capability granted; audit row includes override context
   // -------------------------------------------------------------------------
   it("AC1+AC3 override granted: 200 with audit_id; runtime_context includes override flags", async () => {
-    const { POST } = await import("../route")
+    const { POST } = await import("../route.js")
     const overrideReason = "explicit operator override due to compliance deadline"
     const req = makeReq({ body: { override: true, reason: overrideReason } })
     const res = makeRes()
@@ -359,7 +359,7 @@ describe("POST /admin/sellers/:id/pause — override capability gate (AC1-AC5)",
   // AC5 — regression guard: default (non-override) path unchanged
   // -------------------------------------------------------------------------
   it("AC5 regression: override=false with valid reason succeeds; no capability check", async () => {
-    const { POST } = await import("../route")
+    const { POST } = await import("../route.js")
     const req = makeReq({ body: { reason: "routine suspension for policy breach" } })
     const res = makeRes()
     const client = (req as Record<string, unknown>)._testClient as ReturnType<typeof makeClient>
@@ -380,7 +380,7 @@ describe("POST /admin/sellers/:id/pause — override capability gate (AC1-AC5)",
   })
 
   it("AC5 regression: override=true with exactly 10-char reason passes validation gate", async () => {
-    const { POST } = await import("../route")
+    const { POST } = await import("../route.js")
     // Exactly 10 chars (boundary — must pass).
     const req = makeReq({ body: { override: true, reason: "1234567890" } })
     const res = makeRes()
@@ -392,7 +392,7 @@ describe("POST /admin/sellers/:id/pause — override capability gate (AC1-AC5)",
   })
 
   it("AC5 regression: idempotent re-pause on already-suspended seller returns 200 without capability check", async () => {
-    const { POST } = await import("../route")
+    const { POST } = await import("../route.js")
     const req = makeReq({
       body: { reason: "routine suspension" },
     })

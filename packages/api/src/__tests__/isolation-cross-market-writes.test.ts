@@ -101,7 +101,8 @@ function simulateClaimRoute(
 function makeVoucher(
   code: string,
   market_id: string | null,
-  status: "idle" | "claimed" | "expired" = "idle"
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  status: any = "idle"
 ): VoucherWithEvents {
   return {
     code,
