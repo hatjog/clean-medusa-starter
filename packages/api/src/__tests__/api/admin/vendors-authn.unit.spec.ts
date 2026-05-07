@@ -67,7 +67,19 @@ function makeDefaultIdempotencyKnex(idempotencyKey = "a1b2c3d4-e5f6-4a7b-b8c9-d0
   const ignoreMock = jest.fn(() => ({ returning: insertReturningMock }))
   const onConflictMock = jest.fn(() => ({ ignore: ignoreMock }))
   const insertMock = jest.fn(() => ({ onConflict: onConflictMock }))
-  return jest.fn(() => ({ where: whereMock, insert: insertMock }))
+  // admin_capability_grants: return no rows (non-admin actors have no grants).
+  // Admin capability tests that need grants use createLifecycleScopeKnex via scopeOverrides.
+  const capabilityChainMock = {
+    select: jest.fn().mockReturnThis(),
+    where: jest.fn().mockReturnThis(),
+    whereIn: jest.fn().mockReturnThis(),
+    whereNull: jest.fn().mockReturnThis(),
+    limit: jest.fn().mockResolvedValue([]),
+  }
+  return jest.fn((tableName: string) => {
+    if (tableName === "admin_capability_grants") return capabilityChainMock
+    return { where: whereMock, insert: insertMock }
+  })
 }
 
 function createReq(opts: {
@@ -210,7 +222,18 @@ function createLifecycleScopeKnex(lifecycleStatus: string = "pending_approval", 
         }),
       }
     }
-    return { select: jest.fn().mockReturnThis(), where: jest.fn().mockReturnThis(), first: jest.fn().mockResolvedValue(null) as AnyFn }
+    // admin_capability_grants: return a __super_admin__ row for all actors so
+    // capability checks pass in authn tests (cleanup-42 migration seed behaviour).
+    if (tableName === "admin_capability_grants") {
+      return {
+        select: jest.fn().mockReturnThis(),
+        where: jest.fn().mockReturnThis(),
+        whereIn: jest.fn().mockReturnThis(),
+        whereNull: jest.fn().mockReturnThis(),
+        limit: jest.fn().mockResolvedValue([{ capability: "__super_admin__" }]) as AnyFn,
+      }
+    }
+    return { select: jest.fn().mockReturnThis(), where: jest.fn().mockReturnThis(), whereIn: jest.fn().mockReturnThis(), whereNull: jest.fn().mockReturnThis(), first: jest.fn().mockResolvedValue(null) as AnyFn }
   }
 
   const knexFn = jest.fn((tableName: string) => buildTable(tableName)) as AnyFn & { transaction: AnyFn }
