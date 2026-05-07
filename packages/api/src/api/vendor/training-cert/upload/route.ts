@@ -5,7 +5,8 @@
  *
  * Guard chain (return-on-first-fail per AC4):
  *   1. withVendorAuth  — resolves vendor_id from x-vendor-token (401 on fail)
- *   2. Cross-vendor    — any client vendor identifier must match JWT vendor_id (403)
+ *   2. Cross-vendor    — any client vendor identifier (body OR query) must
+ *                        match JWT vendor_id (403)
  *   3. Size guard      — buffer.byteLength > maxBytes → 413 (cheap check first, AC3)
  *   4. Magic-byte      — sniffMagicBytes null → 415 (AC2)
  *   5. Extension check — filename ext ↔ sniffedType mismatch → 415 (AC1 depth)
@@ -14,15 +15,37 @@
  * All other outcomes (200, 403, 413, 415) write an append-only audit row (AC6).
  *
  * Client-supplied Content-Type / mimeType is NEVER used for accept/reject (AC1).
+ *
+ * Review fixes (2026-05-07):
+ *   F1 — success-path audit uses throwing appendNotificationLog (durable)
+ *   F2 — audit_log_id uses crypto.randomUUID (collision-safe)
+ *   F3 — cross-vendor reject carries real sizeBytes
+ *   F4 — query.vendor_id also cross-checked
+ *   F7 — success extension preserves caller's original (.jpeg vs .jpg)
+ *   F9 — base64 fallback rejected with 400 invalid_base64 instead of silent truncation
+ *
+ * TODO(TF-109-followup, Story 3.x): vendor-auth.ts::extractSellerIdFromToken
+ * still treats the raw header as the seller_id without HMAC/JWT signature
+ * verification. The route-level scope guard here is correct, but the
+ * underlying token authenticity check belongs to the auth-layer hardening
+ * tracked under Story 3.x. TF-109 is route-scope-closed; auth-layer-deferred.
  */
+
+import { randomUUID } from "node:crypto"
 
 import type { MedusaRequest, MedusaResponse, MedusaNextFunction } from "@medusajs/framework/http"
 
 import { withVendorAuth, type VendorAuthContext } from "../../../../lib/vendor-auth"
 import { sniffMagicBytes } from "../../../../lib/magic-byte-sniffer"
-import { getMaxUploadBytes, EXTENSION_TYPE_MAP } from "../../../../lib/training-cert-upload-config"
-import { validateCertBytes } from "../../../../lib/training-cert-validator"
-import { appendNotificationLogBestEffort } from "../../../../lib/vendor-notification-log"
+import { getMaxUploadBytes } from "../../../../lib/training-cert-upload-config"
+import {
+  validateCertBytes,
+  ALLOWED_CERT_EXTENSIONS,
+} from "../../../../lib/training-cert-validator"
+import {
+  appendNotificationLog,
+  appendNotificationLogBestEffort,
+} from "../../../../lib/vendor-notification-log"
 
 // ---------------------------------------------------------------------------
 // Types
@@ -54,11 +77,26 @@ type UploadErrorResponse = {
 // Helpers
 // ---------------------------------------------------------------------------
 
-function extractBuffer(req: RequestWithVendorAuth): {
-  buffer: Buffer | null
-  filename: string | null
-  clientMimeType: string | null
-} {
+/** Strict base64 alphabet (RFC 4648). Used to reject malformed fallback
+ * payloads with a clean 400 instead of silently coercing to a partial
+ * buffer (review F9). */
+const BASE64_RE = /^[A-Za-z0-9+/]+={0,2}$/
+
+type ExtractResult =
+  | {
+      buffer: Buffer
+      filename: string | null
+      clientMimeType: string | null
+      error?: undefined
+    }
+  | {
+      buffer: null
+      filename: string | null
+      clientMimeType: string | null
+      error: "missing_file" | "invalid_base64"
+    }
+
+function extractBuffer(req: RequestWithVendorAuth): ExtractResult {
   if (req.file?.buffer) {
     return {
       buffer: req.file.buffer,
@@ -73,35 +111,80 @@ function extractBuffer(req: RequestWithVendorAuth): {
   const clientMimeType = body.mimeType as string | undefined
 
   if (!fileData || typeof fileData !== "string") {
-    return { buffer: null, filename: filename ?? null, clientMimeType: clientMimeType ?? null }
+    return {
+      buffer: null,
+      filename: filename ?? null,
+      clientMimeType: clientMimeType ?? null,
+      error: "missing_file",
+    }
+  }
+
+  // Strip whitespace (some clients line-wrap base64 payloads) before validation.
+  const stripped = fileData.replace(/\s+/g, "")
+  if (
+    stripped.length === 0 ||
+    !BASE64_RE.test(stripped) ||
+    stripped.length % 4 !== 0
+  ) {
+    return {
+      buffer: null,
+      filename: filename ?? null,
+      clientMimeType: clientMimeType ?? null,
+      error: "invalid_base64",
+    }
   }
 
   try {
-    const buf = Buffer.from(fileData, "base64")
-    return { buffer: buf, filename: filename ?? "upload.bin", clientMimeType: clientMimeType ?? null }
+    const buf = Buffer.from(stripped, "base64")
+    if (buf.length === 0) {
+      return {
+        buffer: null,
+        filename: filename ?? null,
+        clientMimeType: clientMimeType ?? null,
+        error: "missing_file",
+      }
+    }
+    return {
+      buffer: buf,
+      filename: filename ?? "upload.bin",
+      clientMimeType: clientMimeType ?? null,
+    }
   } catch {
-    return { buffer: null, filename: filename ?? null, clientMimeType: clientMimeType ?? null }
+    return {
+      buffer: null,
+      filename: filename ?? null,
+      clientMimeType: clientMimeType ?? null,
+      error: "invalid_base64",
+    }
   }
 }
 
-async function writeAuditLog(
-  req: MedusaRequest,
-  opts: {
-    vendorId: string
-    status: "sent" | "rejected"
-    errorMessage: string | null
-    clientMimeType: string | null
-    filename: string | null
-    sizeBytes: number
-  },
-): Promise<string> {
-  const auditId = `training_cert_${opts.status}_${opts.vendorId}_${Date.now()}`
+/** Returns the storage extension preserving caller's choice (review F7).
+ * Iterates longest-first so `.jpeg` matches before `.jpg`. */
+function extractAllowedExtension(filename: string): string | null {
+  const lower = filename.toLowerCase()
+  const sorted = [...ALLOWED_CERT_EXTENSIONS].sort((a, b) => b.length - a.length)
+  for (const ext of sorted) {
+    if (lower.endsWith(ext)) return ext
+  }
+  return null
+}
 
-  await appendNotificationLogBestEffort(req.scope, {
+type AuditPayload = {
+  vendorId: string
+  status: "sent" | "rejected"
+  errorMessage: string | null
+  clientMimeType: string | null
+  filename: string | null
+  sizeBytes: number
+}
+
+function buildAuditInput(opts: AuditPayload, auditId: string) {
+  return {
     id: auditId,
     vendor_id: opts.vendorId,
-    notification_type: "training_cert_uploaded",
-    locale: "pl",
+    notification_type: "training_cert_uploaded" as const,
+    locale: "pl" as const,
     recipient_email: "system",
     status: opts.status,
     error_message: opts.errorMessage,
@@ -111,8 +194,29 @@ async function writeAuditLog(
       size_bytes: opts.sizeBytes,
       client_mime_type: opts.clientMimeType,
     },
-  })
+  }
+}
 
+/** Reject paths: best-effort write so a transient DB failure cannot mask
+ * the underlying security verdict (still return 4xx to client). */
+async function writeRejectAudit(
+  req: MedusaRequest,
+  opts: AuditPayload,
+): Promise<string> {
+  const auditId = randomUUID()
+  await appendNotificationLogBestEffort(req.scope, buildAuditInput(opts, auditId))
+  return auditId
+}
+
+/** Success path: durable write — AC6 requires every non-401 outcome to
+ * have an append-only row. A persistence failure surfaces as a 5xx so
+ * operators see it; do NOT advertise a phantom audit_log_id (F1). */
+async function writeSuccessAudit(
+  req: MedusaRequest,
+  opts: AuditPayload,
+): Promise<string> {
+  const auditId = randomUUID()
+  await appendNotificationLog(req.scope, buildAuditInput(opts, auditId))
   return auditId
 }
 
@@ -127,17 +231,28 @@ async function uploadHandler(
 ): Promise<void> {
   const vendorId = req.vendorAuth!.vendor_id
 
-  // Guard 2: Cross-vendor scope check
+  // Extract buffer up-front so audit rows for ALL reject paths carry the
+  // real sizeBytes (review F3).
+  const extracted = extractBuffer(req)
+  const { buffer, filename, clientMimeType } = extracted
+  const sizeBytes = buffer ? buffer.byteLength : 0
+
+  // Guard 2: Cross-vendor scope check — body OR query (review F4 / AC4).
   const body = (req.body ?? {}) as Record<string, unknown>
-  const bodyVendorId = body.vendor_id as string | undefined
-  if (bodyVendorId !== undefined && bodyVendorId !== vendorId) {
-    await writeAuditLog(req, {
+  const query = (req.query ?? {}) as Record<string, unknown>
+  const bodyVendorId =
+    typeof body.vendor_id === "string" ? body.vendor_id : undefined
+  const queryVendorId =
+    typeof query.vendor_id === "string" ? query.vendor_id : undefined
+  const claimedVendorId = bodyVendorId ?? queryVendorId
+  if (claimedVendorId !== undefined && claimedVendorId !== vendorId) {
+    await writeRejectAudit(req, {
       vendorId,
       status: "rejected",
       errorMessage: "cross_vendor_scope_mismatch",
-      clientMimeType: (body.mimeType as string | undefined) ?? null,
-      filename: (body.filename as string | undefined) ?? null,
-      sizeBytes: 0,
+      clientMimeType,
+      filename,
+      sizeBytes,
     })
     res.status(403).json({
       error: "Vendor scope mismatch",
@@ -146,13 +261,13 @@ async function uploadHandler(
     return
   }
 
-  // Extract file buffer
-  const { buffer, filename, clientMimeType } = extractBuffer(req)
-
   if (!buffer || buffer.length === 0) {
     res.status(400).json({
-      error: "No file data received. Send multipart/form-data or base64 fileData field.",
-      code: "missing_file",
+      error:
+        extracted.error === "invalid_base64"
+          ? "fileData is not valid base64"
+          : "No file data received. Send multipart/form-data or base64 fileData field.",
+      code: extracted.error ?? "missing_file",
     })
     return
   }
@@ -165,12 +280,10 @@ async function uploadHandler(
     return
   }
 
-  const sizeBytes = buffer.byteLength
-
   // Guard 3: Size guard before sniff (cheap first, AC3)
   const maxBytes = getMaxUploadBytes()
   if (sizeBytes > maxBytes) {
-    await writeAuditLog(req, {
+    await writeRejectAudit(req, {
       vendorId,
       status: "rejected",
       errorMessage: "size_exceeded",
@@ -187,10 +300,13 @@ async function uploadHandler(
 
   // Guard 4+5: Magic-byte sniff + extension check (AC1, AC2)
   const sniffedType = sniffMagicBytes(buffer)
-  const validation = validateCertBytes({ filename, sizeBytes, sniffedType }, maxBytes)
+  const validation = validateCertBytes(
+    { filename, sizeBytes, sniffedType },
+    maxBytes,
+  )
 
   if (!validation.valid) {
-    await writeAuditLog(req, {
+    await writeRejectAudit(req, {
       vendorId,
       status: "rejected",
       errorMessage: validation.errorCode ?? "validation_error",
@@ -212,21 +328,27 @@ async function uploadHandler(
     return
   }
 
-  // Success
-  const extEntry = Object.entries(EXTENSION_TYPE_MAP).find(
-    ([, type]) => type === sniffedType,
-  )
-  const ext = extEntry ? extEntry[0] : ".bin"
+  // Success — preserve caller's original extension (review F7).
+  const ext = extractAllowedExtension(filename) ?? ".bin"
   const filePath = `vendor-training-certs/${vendorId}/${Date.now()}${ext}`
 
-  const auditLogId = await writeAuditLog(req, {
-    vendorId,
-    status: "sent",
-    errorMessage: null,
-    clientMimeType,
-    filename,
-    sizeBytes,
-  })
+  let auditLogId: string
+  try {
+    auditLogId = await writeSuccessAudit(req, {
+      vendorId,
+      status: "sent",
+      errorMessage: null,
+      clientMimeType,
+      filename,
+      sizeBytes,
+    })
+  } catch {
+    res.status(500).json({
+      error: "Failed to persist upload audit row",
+      code: "audit_persistence_failed",
+    })
+    return
+  }
 
   res.json({
     vendor_id: vendorId,
@@ -239,3 +361,8 @@ async function uploadHandler(
 // Export the POST handler wrapped in withVendorAuth.
 // withVendorAuth handles 401 for missing / invalid tokens.
 export const POST = withVendorAuth(uploadHandler)
+
+// Export uploadHandler for unit-test direct invocation (review F5).
+// Tests inject a stub vendorAuth onto req and bypass the HOF — this proves
+// the inner handler logic (not a parallel simulator) is the one under test.
+export { uploadHandler }

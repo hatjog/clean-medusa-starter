@@ -36,8 +36,14 @@ export class Migration20260507100000ExtendVendorNotificationLogTrainingCert exte
   }
 
   async down(): Promise<void> {
-    // Restore the constraint from the previous migration (dedup extension)
-    // — rows with 'rejected' must be absent or this will fail.
+    // IRREVERSIBLE IN PRACTICE (review F11): once any row with status='rejected'
+    // has been written by the upload route, the new CHECK constraint below
+    // ('sent','failed','deduplicated') will fail to ADD. Operators MUST
+    // either (a) delete or remap rejected rows manually before running down,
+    // or (b) accept that this rollback is forward-only after first reject.
+    // We deliberately do NOT auto-delete here — that would violate the
+    // append-only audit-log invariant enforced by the cleanup-7-followup
+    // trigger.
     this.addSql(
       `ALTER TABLE vendor_notification_log
        DROP CONSTRAINT IF EXISTS vendor_notification_log_status_check`,
