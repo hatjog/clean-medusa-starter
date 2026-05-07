@@ -163,6 +163,65 @@ function createRes() {
   return res
 }
 
+/**
+ * Minimal Knex mock for lifecycle-status route tests (cleanup-47).
+ *
+ * Simulates vendor_lifecycle_state (SELECT + upsert) and
+ * vendor_notification_log (INSERT) tables inside a fake transaction.
+ */
+function createLifecycleScopeKnex(lifecycleStatus: string = "pending_approval", vendorId: string = "vendor_01") {
+  type AnyFn = (...args: unknown[]) => unknown
+
+  function buildTable(tableName: string): unknown {
+    if (tableName === "vendor_lifecycle_state") {
+      const row = {
+        id: "lc_row_test",
+        seller_id: vendorId,
+        lifecycle_status: lifecycleStatus,
+        decision_state: "opted_in",
+        opt_in_at: null,
+        opt_out_at: null,
+        last_transition_at: "2026-05-07T00:00:00.000Z",
+        last_transition_by: "system",
+        created_at: "2026-05-07T00:00:00.000Z",
+        updated_at: "2026-05-07T00:00:00.000Z",
+      }
+      return {
+        select: jest.fn().mockReturnThis(),
+        where: jest.fn().mockReturnThis(),
+        forUpdate: jest.fn().mockReturnValue({ first: jest.fn().mockResolvedValue(row) as AnyFn }),
+        first: jest.fn().mockResolvedValue(row) as AnyFn,
+        insert: jest.fn().mockReturnValue({
+          onConflict: jest.fn().mockReturnValue({
+            merge: jest.fn().mockReturnValue({
+              returning: jest.fn().mockResolvedValue([{ ...row, lifecycle_status: "open" }]) as AnyFn,
+            }),
+            ignore: jest.fn().mockReturnValue({
+              returning: jest.fn().mockResolvedValue([row]) as AnyFn,
+            }),
+          }),
+        }),
+      }
+    }
+    if (tableName === "vendor_notification_log") {
+      return {
+        insert: jest.fn().mockReturnValue({
+          returning: jest.fn().mockResolvedValue([{ id: "audit_test_row" }]) as AnyFn,
+        }),
+      }
+    }
+    return { select: jest.fn().mockReturnThis(), where: jest.fn().mockReturnThis(), first: jest.fn().mockResolvedValue(null) as AnyFn }
+  }
+
+  const knexFn = jest.fn((tableName: string) => buildTable(tableName)) as AnyFn & { transaction: AnyFn }
+  knexFn.transaction = jest.fn(async (fn: (trx: unknown) => Promise<unknown>) => {
+    const trxProxy = (tableName: string) => buildTable(tableName)
+    return fn(trxProxy)
+  }) as AnyFn
+
+  return knexFn
+}
+
 // Mock t30-dispatch-service to prevent real dispatching
 jest.mock("../../../lib/t30-dispatch-service", () => ({
   dispatchT30Notifications: jest.fn().mockResolvedValue({ triggered: 0, skipped: 0, failed: 0, audit_log_ids: [] }),
@@ -481,7 +540,10 @@ describe("admin vendors AuthN — fail-closed extractActorIdOrThrow", () => {
       authContext: { actor_id: "user_admin_01", actor_type: "user" },
       body: { to_status: "suspended" },
       params: { id: "vendor_01" },
-      scopeOverrides: { sellerModuleService },
+      scopeOverrides: {
+        sellerModuleService,
+        [ContainerRegistrationKeys.PG_CONNECTION]: createLifecycleScopeKnex("pending_approval"),
+      },
     })
     const res = createRes()
 
@@ -524,7 +586,10 @@ describe("admin vendors AuthN — fail-closed extractActorIdOrThrow", () => {
       authContext: { actor_id: "user_admin_01", actor_type: "user" },
       body: { to_status: "open", admin_note: "resume after verification" },
       params: { id: "vendor_ready_01" },
-      scopeOverrides: { sellerModuleService },
+      scopeOverrides: {
+        sellerModuleService,
+        [ContainerRegistrationKeys.PG_CONNECTION]: createLifecycleScopeKnex("suspended", "vendor_ready_01"),
+      },
     })
     const res = createRes()
 
@@ -600,7 +665,10 @@ describe("admin vendors AuthN — fail-closed extractActorIdOrThrow", () => {
       authContext: { actor_id: "user_admin_01", actor_type: "user" },
       body: { to_status: "open", override: true, admin_note: "manual fix" },
       params: { id: "vendor_override_01" },
-      scopeOverrides: { sellerModuleService },
+      scopeOverrides: {
+        sellerModuleService,
+        [ContainerRegistrationKeys.PG_CONNECTION]: createLifecycleScopeKnex("pending_approval", "vendor_override_01"),
+      },
     })
     const res = createRes()
 
