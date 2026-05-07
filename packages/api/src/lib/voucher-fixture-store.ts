@@ -31,6 +31,8 @@ export type VoucherAuditEventType =
 
 export interface VoucherFixture {
   code: string
+  /** story v160-cleanup-27g: market scope for DPIA R-12 cross-market isolation. Optional for backward compat. */
+  market_id?: string
   seller_id: string
   seller_name: string
   seller_handle: string

@@ -32,6 +32,7 @@ import type { MedusaRequest, MedusaResponse } from "@medusajs/framework/http"
 import { ContainerRegistrationKeys } from "@medusajs/framework/utils"
 import type { Knex } from "knex"
 
+import { marketContextStorage } from "../../../../../lib/market-context"
 import { getFlagState } from "../../../../../lib/feature-flag-tri-state"
 
 type CartLineItemRow = {
@@ -66,6 +67,10 @@ export async function GET(
   req: MedusaRequest,
   res: MedusaResponse,
 ): Promise<void> {
+  // story v160-cleanup-27h: ALS extract for cart market isolation (TF-47).
+  // If ALS context is set and cart.market_id differs, return 404 fail-closed (AC7).
+  const market_id = marketContextStorage.getStore()?.market_id ?? null
+
   const cartId = (req.params as Record<string, string>).id
   const db = req.scope.resolve(ContainerRegistrationKeys.PG_CONNECTION) as Knex
 
@@ -74,6 +79,19 @@ export async function GET(
   if (flagState !== "on") {
     res.json({ order_set_splits: [] })
     return
+  }
+
+  // Cart market isolation: assert cart.market_id === ALS market_id (fail-closed 404 on mismatch).
+  if (market_id) {
+    const cartRow = await db<{ market_id: string | null }>("cart")
+      .select(["market_id"])
+      .where("id", cartId)
+      .whereNull("deleted_at")
+      .first()
+    if (!cartRow || cartRow.market_id !== market_id) {
+      res.status(404).json({ type: "not_found", message: "Cart not found" })
+      return
+    }
   }
 
   // Load cart line items with metadata

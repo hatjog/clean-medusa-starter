@@ -15,6 +15,7 @@
  */
 
 import type { MedusaRequest, MedusaResponse } from "@medusajs/framework/http"
+import { marketContextStorage } from "../../../../lib/market-context"
 import { getFixtureByCode } from "../../../../lib/voucher-fixture-store"
 
 // Disable Medusa's default admin auth — this is a public store endpoint
@@ -59,6 +60,11 @@ export async function GET(
   req: MedusaRequest,
   res: MedusaResponse,
 ): Promise<void> {
+  // story v160-cleanup-27g: ALS extract for DPIA R-12 cross-market isolation (TF-46).
+  // Voucher lookup is market-scoped: if ALS context is present AND voucher.market_id
+  // differs, return 404 (do NOT leak existence across markets per AC6).
+  const market_id = marketContextStorage.getStore()?.market_id ?? null
+
   const code = (req.params as { code?: string })?.code
   if (!code || code.length < 3) {
     res.status(400).json({
@@ -69,6 +75,14 @@ export async function GET(
   }
 
   const fx = getFixtureByCode(code)
+  // Cross-market isolation: if ALS market context is set and voucher market differs, 404.
+  if (fx && market_id && "market_id" in fx && fx.market_id !== market_id) {
+    res.status(404).json({
+      type: "not_found",
+      message: "Voucher not found",
+    })
+    return
+  }
   const view = projectAllowlist(fx)
   if (!view) {
     res.status(404).json({

@@ -18,6 +18,7 @@
 
 import type { MedusaRequest, MedusaResponse } from "@medusajs/framework/http"
 import { Modules } from "@medusajs/framework/utils"
+import { marketContextStorage } from "../../../../../lib/market-context"
 import { consumeClaimToken } from "../../../../../lib/voucher-claim-rate-limit"
 import {
   computeBinding,
@@ -114,6 +115,10 @@ export async function POST(
   req: MedusaRequest,
   res: MedusaResponse
 ): Promise<void> {
+  // story v160-cleanup-27g: ALS extract for DPIA R-12 cross-market isolation (TF-46).
+  // Cross-market voucher claim attempt → 404 (do NOT 403 — existence must not leak).
+  const market_id = marketContextStorage.getStore()?.market_id ?? null
+
   const startedAt = Date.now()
   const code = (req.params as { code?: string })?.code ?? ""
   const ip = resolveIp(req)
@@ -161,6 +166,17 @@ export async function POST(
 
   // --- Lookup voucher (constant-time path — always check fixture first) ---
   const fx = getFixtureByCode(code)
+
+  // Cross-market isolation (DPIA R-12): if ALS market context is set and voucher market
+  // differs, return 404 — do NOT return 403 (existence must not leak across markets).
+  if (fx && market_id && "market_id" in fx && fx.market_id !== market_id) {
+    await padToFloor(startedAt)
+    res.status(404).json({
+      type: "not_found",
+      message: "Voucher not found",
+    })
+    return
+  }
 
   // --- Compute expected HMAC binding ---
   let expectedBinding: string

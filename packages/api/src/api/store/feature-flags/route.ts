@@ -22,6 +22,7 @@
 import type { MedusaRequest, MedusaResponse } from "@medusajs/framework/http"
 import { ContainerRegistrationKeys } from "@medusajs/framework/utils"
 import type { Knex } from "knex"
+import { marketContextStorage } from "../../../lib/market-context"
 import { getCurrentState } from "../../../lib/feature-flag-tri-state"
 
 export const AUTHENTICATE = false
@@ -30,6 +31,11 @@ export async function GET(
   req: MedusaRequest,
   res: MedusaResponse,
 ): Promise<void> {
+  // story v160-cleanup-27f: extract market context via ALS so future per-market
+  // flag overrides can drop in without route changes (AC5 / TF-45).
+  // Global tri-state behaviour is unchanged for v1.6.0.
+  const market_id = marketContextStorage.getStore()?.market_id ?? null
+
   let db: Knex | null = null
   try {
     db = req.scope.resolve(ContainerRegistrationKeys.PG_CONNECTION) as Knex
@@ -40,5 +46,6 @@ export async function GET(
   const state = await getCurrentState(db)
   res.status(200).json({
     multi_vendor_pdp: state,
+    ...(market_id ? { market_id } : {}),
   })
 }

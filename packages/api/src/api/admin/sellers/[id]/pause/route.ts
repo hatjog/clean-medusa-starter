@@ -241,6 +241,7 @@ export async function POST(req: MedusaRequest, res: MedusaResponse): Promise<voi
 
     // 3) Audit row — `affected_orders` populated via subselect for atomicity.
     //    ORDER BY created_at ASC keeps determinism for the AC-FLAG-1.3-07 contract.
+    //    market_id = effectiveMarketId (ALS-resolved via extractMarketId or seller row; admin route — AR44 §admin-exclusion)
     const auditInsert = await client.query<{
       changed_at: Date
       affected_orders: string[]
