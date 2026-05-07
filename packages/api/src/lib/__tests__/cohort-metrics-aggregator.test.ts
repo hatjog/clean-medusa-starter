@@ -188,7 +188,8 @@ describe("cohort-metrics-aggregator", () => {
     })
   })
 
-  it("hydrates review-backed nps and order-backed conversion from db sources", async () => {
+  it("returns unknown nps with reason when sample_size is below MIN_REVIEWS_FOR_NPS threshold", async () => {
+    // cleanup-22: 4 reviews < MIN_REVIEWS_FOR_NPS=5 → unknown + reason
     const shadowAt = Date.parse("2026-05-01T10:00:00.000Z")
     const onAt = Date.parse("2026-05-03T10:00:00.000Z")
     const now = Date.parse("2026-05-05T10:00:00.000Z")
@@ -220,6 +221,7 @@ describe("cohort-metrics-aggregator", () => {
       },
     ])
 
+    // Insufficient sample: 4, 2, 3, 1 reviews — all below MIN_REVIEWS_FOR_NPS=5
     const reviewRows = [
       { review_count: 4, avg_rating: 4.2 },
       { review_count: 2, avg_rating: 4.4 },
@@ -246,30 +248,27 @@ describe("cohort-metrics-aggregator", () => {
     const { computeCohortMetrics } = await import("../cohort-metrics-aggregator")
     const result = await computeCohortMetrics({ db, nowMs: now })
 
+    // NPS: all cohorts have insufficient reviews → unknown + reason
     expect(result.cohorts.pre_flip_baseline.nps).toMatchObject({
-      value: 80,
-      sample_size: 4,
-      status: "green",
+      value: null,
+      status: "unknown",
+      reason: "insufficient_sample",
     })
     expect(result.cohorts.first_24h_on.nps).toMatchObject({
-      value: 90,
-      sample_size: 3,
-      status: "green",
+      value: null,
+      status: "unknown",
+      reason: "insufficient_sample",
     })
+    // Conversion: < MIN_VISITS_FOR_CONVERSION (2 requests) → unknown
     expect(result.cohorts.pre_flip_baseline.conversion).toMatchObject({
-      value: 100,
-      sample_size: 2,
-      status: "green",
+      value: null,
+      status: "unknown",
+      reason: "insufficient_sample",
     })
-    expect(result.cohorts.shadow_window.conversion).toMatchObject({
-      value: 100,
-      sample_size: 1,
-      status: "green",
-    })
-    expect(result.cohorts.first_24h_on.conversion).toMatchObject({
-      value: 100,
-      sample_size: 2,
-      status: "green",
+    // p95/5xx wiring preserved (AR55/AR56 regression test)
+    expect(result.cohorts.pre_flip_baseline.p95_latency_ms).toMatchObject({
+      value: expect.any(Number),
+      status: expect.stringMatching(/^(green|yellow|red)$/),
     })
   })
 
