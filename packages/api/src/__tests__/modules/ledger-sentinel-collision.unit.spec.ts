@@ -15,7 +15,7 @@
  *      accidental collision with the sentinel-rejection branch).
  */
 
-import { Migration20260427000000AddPostingTriggerToLedgerEntry } from "../../migrations/Migration20260427000000AddPostingTriggerToLedgerEntry";
+import { Migration20260427000000AddPostingTriggerToLedgerEntry } from "../../migrations-legacy-base/Migration20260427000000AddPostingTriggerToLedgerEntry";
 import {
   KNOWN_POSTING_TRIGGERS,
   LEGACY_POSTING_TRIGGER_SENTINEL,

@@ -1,0 +1,24 @@
+{
+  "negative": {
+    "url": "https://staging.example.invalid/admin/orders",
+    "method": "POST",
+    "headers": {
+      "Origin": "https://attacker.example.invalid",
+      "Content-Type": "application/json"
+    },
+    "body": {}
+  },
+  "positive": {
+    "url": "https://staging.example.invalid/admin/orders",
+    "method": "POST",
+    "headers": {
+      "Origin": "https://admin.example.invalid",
+      "Content-Type": "application/json",
+      "x-csrf-token": "REPLACE_WITH_VALID_STAGING_TOKEN",
+      "Cookie": "REPLACE_WITH_VALID_STAGING_COOKIE"
+    },
+    "body": {}
+  },
+  "expect_negative_statuses": [400, 401, 403, 419],
+  "expect_positive_statuses": [200, 201, 204, 302]
+}

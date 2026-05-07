@@ -2,8 +2,8 @@
  * MorFlagResolver — TS application service that resolves the composite
  * tri-state per ADR-074 precedence:
  *
- *   1. global flag wins        → `vendor_mor_enabled = false` ⇒ `disabled` (override)
- *   2. per-vendor pause        → `seller.status = 'paused'`   ⇒ `paused`   (runtime-mutable)
+ *   1. global flag wins        → `vendor_mor_enabled = false` ⇒ `terminated` effective override
+ *   2. per-vendor suspension   → `seller.status = 'suspended'` ⇒ `suspended` (runtime-mutable)
  *   3. no auto-resume on deploy/flag flip — the persisted `seller.status` is authoritative
  *
  * @see _bmad-output/planning-artifacts/architecture.md §D-69 (L450-464)
@@ -24,12 +24,12 @@
  *     loader, not this file.
  */
 
-export type MorFlagStatus = "active" | "paused" | "disabled" | "pending"
+export type MorFlagStatus = "open" | "suspended" | "terminated" | "pending_approval"
 
 export type MorFlagPrecedence = {
-  /** True when global `vendor_mor_enabled` decided the outcome (`disabled`). */
+  /** True when global `vendor_mor_enabled` decided the outcome (`terminated`). */
   globalFlag: boolean
-  /** True when per-vendor `seller.status='paused'` decided the outcome. */
+  /** True when per-vendor `seller.status='suspended'` decided the outcome. */
   perVendorPause: boolean
   /** True when D-74 archive fallback contributed (caller flag, surfaced for audit). */
   archiveFallback: boolean
@@ -50,7 +50,7 @@ export type MorFlagResolution = {
 export interface FlagFlagsPort {
   /**
    * @returns `true` when `vendor_mor_enabled` is on for the given market.
-   *          ADR-074 row 5: `false` collapses any seller to `disabled`.
+   *          ADR-074 row 5: `false` collapses any seller to `terminated`.
    */
   isVendorMorEnabled(marketId: string): Promise<boolean>
 }
@@ -62,7 +62,7 @@ export interface FlagFlagsPort {
 export interface SellerStatusPort {
   /**
    * @returns the current `seller.status` for the given seller in the given market.
-   *          Returns `null` when seller not found in market scope (resolver maps to `pending`).
+   *          Returns `null` when seller not found in market scope (resolver maps to `pending_approval`).
    */
   getSellerStatus(marketId: string, sellerId: string): Promise<MorFlagStatus | null>
 }
@@ -100,7 +100,7 @@ export class MorFlagResolver {
     const globalFlag = await this.flagsPort.isVendorMorEnabled(marketId)
     if (!globalFlag) {
       return {
-        status: "disabled",
+        status: "terminated",
         precedence: { globalFlag: true, perVendorPause: false, archiveFallback: false },
         sourceTimestamp,
       }
@@ -109,23 +109,23 @@ export class MorFlagResolver {
     // Precedence step 2: per-vendor `seller.status` wins among remaining states.
     const sellerStatus = await this.sellerPort.getSellerStatus(marketId, sellerId)
     if (sellerStatus === null) {
-      // Unknown seller in market — treat as `pending` (DISABLED effective per ADR-074 row 4).
+      // Unknown seller in market — treat as `pending_approval`.
       return {
-        status: "pending",
+        status: "pending_approval",
         precedence: { globalFlag: false, perVendorPause: false, archiveFallback: false },
         sourceTimestamp,
       }
     }
 
-    if (sellerStatus === "paused") {
+    if (sellerStatus === "suspended") {
       return {
-        status: "paused",
+        status: "suspended",
         precedence: { globalFlag: false, perVendorPause: true, archiveFallback: false },
         sourceTimestamp,
       }
     }
 
-    if (sellerStatus === "disabled" || sellerStatus === "pending") {
+    if (sellerStatus === "terminated" || sellerStatus === "pending_approval") {
       return {
         status: sellerStatus,
         precedence: { globalFlag: false, perVendorPause: false, archiveFallback: false },
@@ -133,9 +133,9 @@ export class MorFlagResolver {
       }
     }
 
-    // active — happy path.
+    // open — happy path.
     return {
-      status: "active",
+      status: "open",
       precedence: { globalFlag: false, perVendorPause: false, archiveFallback: false },
       sourceTimestamp,
     }

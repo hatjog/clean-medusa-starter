@@ -27,6 +27,17 @@ import {
   type VendorNotificationLogEntry,
   type T30EmailLocale,
 } from "../modules/vendor-notifications"
+import {
+  assertNotificationProviderReady,
+  NotificationProviderNotReadyError,
+} from "./vendor-notification-provider-readiness"
+import { dispatchVendorEmail } from "./vendor-notification-dispatch"
+import { appendNotificationLogBestEffort } from "./vendor-notification-log"
+import {
+  listSellers,
+  resolveLifecycleStatus,
+  resolvePreferredLocale,
+} from "./vendor-decision-store"
 
 // ---------------------------------------------------------------------------
 // Shared types
@@ -37,6 +48,10 @@ export interface VendorRow {
   handle: string
   email: string
   preferred_locale: T30EmailLocale | null
+}
+
+type ScopeResolver = {
+  resolve: (key: string) => unknown
 }
 
 export interface T30DispatchResult {
@@ -53,6 +68,13 @@ export interface T30DispatchOptions {
   vendor_ids?: string[]
   flag_flip_iso: string
   logger?: T30Logger
+  /**
+   * Story v160-cleanup-7-followup — when provided, audit entries are
+   * persisted to vendor_notification_log via appendNotificationLogBestEffort.
+   * Pass `req.scope` (or `triggerT30Kickoff()` scope) for durable audit.
+   * When omitted, audit stays in-memory only (test/CLI paths).
+   */
+  scope?: ScopeResolver
 }
 
 export type T30Logger = {
@@ -71,6 +93,8 @@ export class T30DispatcherFixtureModeError extends Error {
     this.name = "T30DispatcherFixtureModeError"
   }
 }
+
+export { NotificationProviderNotReadyError }
 
 // ---------------------------------------------------------------------------
 // Internal helpers (also exported for use in the admin route)
@@ -98,13 +122,32 @@ export function isWindowOpen(flagFlipDate: Date | null): boolean {
  * Fixture mode = `GP_T30_DEV_FIXTURE_VENDORS_JSON` is set OR no real DB
  * vendor source is configured.
  *
- * Currently always true because real Mercur 2 vendor query is deferred to
- * v1.7.0+. The flag lets `triggerT30Kickoff` hard-block in production.
+ * Fixture mode is active when the explicit JSON fixture is present.
+ * When a real request scope is provided, the dispatcher can query sellers
+ * directly and is no longer considered fixture-only.
  */
-export function isFixtureMode(): boolean {
-  // When real vendor query is implemented this should return false.
-  // For now: fixture mode is active unless explicitly overridden by test env.
+export function isFixtureMode(scope?: ScopeResolver): boolean {
+  if (process.env.GP_T30_DEV_FIXTURE_VENDORS_JSON) {
+    return true
+  }
+
+  if (scope) {
+    return false
+  }
+
   return !process.env.GP_T30_REAL_VENDOR_SOURCE_ENABLED
+}
+
+function filterFixtureVendors(
+  vendors: VendorRow[],
+  vendor_ids?: string[],
+): VendorRow[] {
+  if (!vendor_ids || vendor_ids.length === 0) {
+    return vendors
+  }
+
+  const allowed = new Set(vendor_ids)
+  return vendors.filter((vendor) => allowed.has(vendor.id))
 }
 
 /**
@@ -113,17 +156,38 @@ export function isFixtureMode(): boolean {
  * Dev/test: reads `GP_T30_DEV_FIXTURE_VENDORS_JSON` or returns [].
  */
 export async function fetchEligibleVendors(
-  _vendor_ids?: string[],
+  vendor_ids?: string[],
+  scope?: ScopeResolver,
 ): Promise<VendorRow[]> {
   const fixture = process.env.GP_T30_DEV_FIXTURE_VENDORS_JSON
   if (fixture) {
     try {
-      return JSON.parse(fixture) as VendorRow[]
+      return filterFixtureVendors(JSON.parse(fixture) as VendorRow[], vendor_ids)
     } catch {
       return []
     }
   }
-  return []
+
+  if (!scope) {
+    return []
+  }
+
+  const sellers = await listSellers(scope)
+  const allowed = vendor_ids && vendor_ids.length > 0 ? new Set(vendor_ids) : null
+
+  return sellers
+    .filter((seller) => !allowed || allowed.has(seller.id))
+    .filter((seller) => resolveLifecycleStatus(seller) === "open")
+    .filter((seller) => typeof seller.email === "string" && seller.email.trim().length > 0)
+    .map((seller) => ({
+      id: seller.id,
+      handle:
+        typeof seller.handle === "string" && seller.handle.trim().length > 0
+          ? seller.handle
+          : seller.id,
+      email: seller.email!.trim(),
+      preferred_locale: resolvePreferredLocale(seller),
+    }))
 }
 
 async function dispatchEmailStub(
@@ -131,6 +195,7 @@ async function dispatchEmailStub(
   locale: T30EmailLocale,
   flagFlipIso: string,
   logger: T30Logger,
+  scope?: ScopeResolver,
 ): Promise<{ ok: boolean; error?: string }> {
   const ctx = {
     vendor_name: vendor.handle,
@@ -141,8 +206,35 @@ async function dispatchEmailStub(
   const html = renderT30Html(locale, ctx)
   const text = renderT30Text(locale, ctx)
 
-  // Real Medusa notification module dispatch deferred to Story 7.1 follow-up.
-  // Dev no-op: log + breadcrumb so smoke testing exercises the audit log path.
+  if (scope) {
+    try {
+      const result = await dispatchVendorEmail({
+        scope,
+        to: vendor.email,
+        subject,
+        text,
+        html,
+        template: "t30_migration",
+        triggerBy: "system",
+        metadata: {
+          vendor_id: vendor.id,
+          vendor_handle: vendor.handle,
+          locale,
+          flag_flip_date: flagFlipIso,
+        },
+      })
+
+      logger.info?.("[t30] notification sent", {
+        vendor_id: vendor.id,
+        locale,
+        notification_id: result.notificationId,
+      })
+      return { ok: true }
+    } catch (e: any) {
+      return { ok: false, error: e?.message ?? String(e) }
+    }
+  }
+
   logger.info?.("[t30] would send notification", {
     vendor_id: vendor.id,
     locale,
@@ -170,14 +262,16 @@ async function dispatchEmailStub(
 export async function dispatchT30Notifications(
   opts: T30DispatchOptions,
 ): Promise<T30DispatchResult> {
-  const { triggered_by, vendor_ids, flag_flip_iso, logger = {} } = opts
+  const { triggered_by, vendor_ids, flag_flip_iso, logger = {}, scope } = opts
 
   // AC3: hard-block in production when fixture mode active.
-  if (process.env.NODE_ENV === "production" && isFixtureMode()) {
+  if (process.env.NODE_ENV === "production" && isFixtureMode(scope)) {
     throw new T30DispatcherFixtureModeError()
   }
 
-  const eligible = await fetchEligibleVendors(vendor_ids)
+  assertNotificationProviderReady()
+
+  const eligible = await fetchEligibleVendors(vendor_ids, scope)
 
   const auditLogIds: string[] = []
   const auditEntries: VendorNotificationLogEntry[] = []
@@ -192,19 +286,32 @@ export async function dispatchT30Notifications(
       locale,
       flag_flip_iso,
       logger,
+      scope,
     )
-    const entry: VendorNotificationLogEntry = {
+    const entryInput = {
       id: randomUUID(),
       vendor_id: vendor.id,
       vendor_handle: vendor.handle,
-      notification_type: "t30_migration",
+      notification_type: "t30_migration" as const,
       sent_at: new Date().toISOString(),
       locale,
       recipient_email: vendor.email,
-      status: dispatchResult.ok ? "sent" : "failed",
+      status: dispatchResult.ok ? ("sent" as const) : ("failed" as const),
       error_message: dispatchResult.error ?? null,
       triggered_by,
     }
+
+    let entry: VendorNotificationLogEntry = entryInput
+    let persisted = false
+    if (scope) {
+      const result = await appendNotificationLogBestEffort(scope, entryInput)
+      entry = result.entry
+      persisted = result.persisted
+      if (!persisted) {
+        logger.warn?.("[t30] audit persist failed", { error: result.error, audit_id: entry.id })
+      }
+    }
+
     auditLogIds.push(entry.id)
     auditEntries.push(entry)
     if (dispatchResult.ok) {
@@ -212,7 +319,10 @@ export async function dispatchT30Notifications(
     } else {
       failed += 1
     }
-    logger.info?.("[t30] audit entry", entry as unknown as Record<string, unknown>)
+    logger.info?.(
+      `[t30] audit entry${persisted ? "" : " (in-memory)"}`,
+      entry as unknown as Record<string, unknown>,
+    )
   }
 
   return { triggered, skipped, failed, audit_log_ids: auditLogIds, audit_entries: auditEntries }

@@ -9,11 +9,11 @@ let _cache: Awaited<ReturnType<typeof computeReadiness>> | null = null
 let _cacheAt = 0
 
 export async function GET(
-  _req: MedusaRequest,
+  req: MedusaRequest,
   res: MedusaResponse,
 ): Promise<void> {
   if (!_cache || Date.now() - _cacheAt > 60_000) {
-    _cache = await computeReadiness()
+    _cache = await computeReadiness(req.scope as { resolve: (key: string) => unknown })
     _cacheAt = Date.now()
   }
   res.json(_cache)

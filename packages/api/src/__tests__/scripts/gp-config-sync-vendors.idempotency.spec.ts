@@ -140,7 +140,7 @@ describe('upsertSeller — idempotency: 3× runs produce identical DB state (AC 
     expect(seededAfterRun1).toContain('gallery')
   })
 
-  it('config_wins fields (email, phone, store_status) are consistently updated on every run', async () => {
+  it('config_wins fields (email, phone, status) are consistently updated on every run', async () => {
     const sellerService = makeSellerService()
 
     await upsertSeller(sellerService, TEST_VENDOR, false, 'bonbeauty')
@@ -151,7 +151,7 @@ describe('upsertSeller — idempotency: 3× runs produce identical DB state (AC 
 
     expect(run2UpdatePayload.email).toBe(TEST_VENDOR.email)
     expect(run2UpdatePayload.phone).toBe(TEST_VENDOR.phone)
-    expect(run2UpdatePayload.store_status).toBe('ACTIVE')
+    expect(run2UpdatePayload.status).toBe('open')
 
     // Run 3 update payload identical to run 2
     await upsertSeller(sellerService, TEST_VENDOR, false, 'bonbeauty')
@@ -159,7 +159,7 @@ describe('upsertSeller — idempotency: 3× runs produce identical DB state (AC 
 
     expect(run3UpdatePayload.email).toBe(run2UpdatePayload.email)
     expect(run3UpdatePayload.phone).toBe(run2UpdatePayload.phone)
-    expect(run3UpdatePayload.store_status).toBe(run2UpdatePayload.store_status)
+    expect(run3UpdatePayload.status).toBe(run2UpdatePayload.status)
   })
 })
 

@@ -1,11 +1,10 @@
 /**
  * gp-config-sync-vendors.ts — vendor sync from gp-config to backend (v1.5.0).
  *
- * TODO Story v160-1-7.1 (post-1.8 smoke verification): DROP custom PAT-17 —
- * `vendorStatusToStoreStatus()` mapping currently bridges custom 3-status model
- * (active/paused/archived) to store status. Replace with native Mercur 2 seller
- * status (pending_approval/open/suspended/terminated) per ADR-090 §PAT-17.
- * Deferred until story v160-1-8 confirms native status enum at runtime.
+ * Story v160-1-7.1: gp-config vendor status now maps directly onto the
+ * Mercur 2 seller lifecycle enum (`pending_approval`, `open`, `suspended`,
+ * `terminated`). Legacy GP `active` / `inactive` / `archived` values are kept
+ * only as input aliases for older market fixtures.
  */
 import { ExecArgs } from "@medusajs/framework/types"
 import { ContainerRegistrationKeys } from "@medusajs/framework/utils"
@@ -62,6 +61,7 @@ type VendorFixture = {
 
 type MarketConfig = {
   market_id: string
+  currency?: string
   vendors?: VendorFixture[]
 }
 
@@ -109,7 +109,7 @@ type VendorProductsFile = {
 type MarketScopedSellerRow = {
   id: string
   handle: string | null
-  store_status: string | null
+  status: string | null
 }
 
 // ---- Utilities ----
@@ -175,6 +175,15 @@ function resolveService(container: any, keysToTry: string[]): any {
   )
 }
 
+function pushUniqueWarning(warnings: string[], seenWarnings: Set<string>, warning: string): void {
+  if (seenWarnings.has(warning)) {
+    return
+  }
+
+  seenWarnings.add(warning)
+  warnings.push(warning)
+}
+
 function readSellerMarketId(value: unknown): string | null {
   if (!value || typeof value !== "object") {
     return null
@@ -232,18 +241,17 @@ function buildSellerProductLinkId(sellerId: string, productId: string): string {
   return `spl_${sellerId.slice(-8)}_${productId.slice(-8)}_${ts}_${entropy}`
 }
 
-// Mercur 2 link table is `product_seller` (not Mercur 1.5 `seller_seller_product_product`).
 async function upsertSellerProductLinkViaDb(
   db: any,
   sellerId: string,
   productId: string
 ): Promise<DbLinkOutcome> {
-  const existing = await db("product_seller")
+  const existing = await db("product_product_seller_seller")
     .where({ seller_id: sellerId, product_id: productId })
     .first()
 
   if (!existing) {
-    await db("product_seller").insert({
+    await db("product_product_seller_seller").insert({
       id: buildSellerProductLinkId(sellerId, productId),
       seller_id: sellerId,
       product_id: productId,
@@ -252,7 +260,7 @@ async function upsertSellerProductLinkViaDb(
   }
 
   if (existing.deleted_at) {
-    await db("product_seller")
+    await db("product_product_seller_seller")
       .where({ id: existing.id })
       .update({ deleted_at: null })
     return "restored"
@@ -300,7 +308,7 @@ async function resolveSalesChannelId(db: any, marketId: string): Promise<string 
     .select("id")
     .whereRaw("metadata->>'gp_market_id' = ?", [marketId])
     .whereNull("deleted_at")
-    .first<{ id: string }>()
+    .first() as { id: string } | undefined
 
   return row?.id ?? null
 }
@@ -314,14 +322,13 @@ export async function inactivateStaleMarketSellers(
   collector?: DryRunCollector
 ): Promise<{ inactivated: number; skipped: number }> {
   const scopedSellers = await db("seller as seller")
-    .distinct("seller.id", "seller.handle", "seller.store_status")
-    // Mercur 2: product_seller link table (not Mercur 1.5 seller_seller_product_product)
-    .innerJoin("product_seller as ps", "seller.id", "ps.seller_id")
-    .innerJoin("product as product", "ps.product_id", "product.id")
+    .distinct("seller.id", "seller.handle", "seller.status")
+    .innerJoin("product_product_seller_seller as ppss", "seller.id", "ppss.seller_id")
+    .innerJoin("product as product", "ppss.product_id", "product.id")
     .innerJoin("product_sales_channel as psc", "product.id", "psc.product_id")
     .where("psc.sales_channel_id", salesChannelId)
     .whereNull("seller.deleted_at")
-    .whereNull("ps.deleted_at")
+    .whereNull("ppss.deleted_at")
     .whereNull("product.deleted_at")
     .whereNull("psc.deleted_at")
 
@@ -335,7 +342,7 @@ export async function inactivateStaleMarketSellers(
       continue
     }
 
-    if (seller.store_status && seller.store_status !== "ACTIVE") {
+    if (seller.status && seller.status !== "open") {
       skipped++
       continue
     }
@@ -345,13 +352,13 @@ export async function inactivateStaleMarketSellers(
         entityType: "seller",
         handle,
         action: "update",
-        note: "store_status=INACTIVE (missing from market config)",
+        note: "status=suspended (missing from market config)",
       })
     } else {
-      await updateSellerRecord(sellerModuleService, seller.id, { store_status: "INACTIVE" })
+      await updateSellerRecord(sellerModuleService, seller.id, { status: "suspended" })
     }
 
-    console.log(`Seller '${handle}': set to INACTIVE (missing from market config)`)
+    console.log(`Seller '${handle}': set to suspended (missing from market config)`)
     inactivated++
   }
 
@@ -395,17 +402,31 @@ export async function resolveProductByFixture(
   }
 }
 
-function vendorStatusToStoreStatus(status: string | undefined): string {
+function vendorStatusToSellerStatus(status: string | undefined): string {
   switch (status) {
+    case "pending_approval":
+    case "pending":
+      return "pending_approval"
+    case "open":
     case "onboarded":
     case "active":
-      return "ACTIVE"
+      return "open"
     case "suspended":
+    case "paused":
     case "inactive":
-      return "SUSPENDED"
+      return "suspended"
+    case "terminated":
+    case "archived":
+    case "disabled":
+      return "terminated"
     default:
-      return "ACTIVE"
+      return "open"
   }
+}
+
+function normalizeCurrencyCode(currency: string | undefined): string {
+  const normalized = currency?.trim().toLowerCase()
+  return normalized || "pln"
 }
 
 // ---- FR-56 seeded_fields logic ----
@@ -468,6 +489,7 @@ export async function upsertSeller(
   vendor: VendorFixture,
   dryRun: boolean,
   marketId: string,
+  currencyCode: string,
   overwrite = false
 ): Promise<SellerSyncResult> {
   const handle = vendor.slug.trim()
@@ -481,7 +503,7 @@ export async function upsertSeller(
   }
 
   const { match: existingSeller, reason: matchReason } = selectSellerMatch(existingSellers, marketId)
-  const storeStatus = vendorStatusToStoreStatus(vendor.status)
+  const sellerStatus = vendorStatusToSellerStatus(vendor.status)
 
   if (matchReason) {
     return { sellerId: null, action: "skipped", note: matchReason }
@@ -525,7 +547,8 @@ export async function upsertSeller(
       email: vendor.email,
       phone: vendor.phone,
       tax_id: vendor.tax_id,
-      store_status: storeStatus,
+      currency_code: currencyCode,
+      status: sellerStatus,
       metadata: { gp: gpMeta },
     }
 
@@ -547,7 +570,11 @@ export async function upsertSeller(
     : []
 
   // config_wins fields — always overwrite (only include defined values to avoid clearing existing data)
-  const configWinsPayload: Record<string, unknown> = { handle, store_status: storeStatus }
+  const configWinsPayload: Record<string, unknown> = {
+    handle,
+    currency_code: currencyCode,
+    status: sellerStatus,
+  }
   if (vendor.email !== undefined) configWinsPayload.email = vendor.email
   if (vendor.phone !== undefined) configWinsPayload.phone = vendor.phone
   if (vendor.tax_id !== undefined) configWinsPayload.tax_id = vendor.tax_id
@@ -692,6 +719,7 @@ export default async function gpConfigSyncVendors({ container, args }: ExecArgs)
       `market_id mismatch in ${marketYamlPath}: expected '${marketId}', got '${marketConfig.market_id}'`
     )
   }
+  const currencyCode = normalizeCurrencyCode(marketConfig.currency)
 
   const marketProductsPath = path.resolve(
     configRoot,
@@ -736,6 +764,7 @@ export default async function gpConfigSyncVendors({ container, args }: ExecArgs)
     try {
       splService = resolveService(container, [
         "sellerProductLink",
+          "seller_product",
         "seller_product_link",
         "ISellerProductLinkService",
       ])
@@ -745,6 +774,7 @@ export default async function gpConfigSyncVendors({ container, args }: ExecArgs)
   }
 
   const warnings: string[] = []
+  const seenWarnings = new Set<string>()
   const vendorCounts = { created: 0, updated: 0, skipped: 0 }
   const splCounts = { created: 0, skipped: 0, missing_products: 0 }
   const staleSellerCounts = { inactivated: 0, skipped: 0 }
@@ -752,12 +782,12 @@ export default async function gpConfigSyncVendors({ container, args }: ExecArgs)
 
   const vendors = marketConfig.vendors ?? []
   if (vendors.length === 0) {
-    warnings.push(`No vendors found in market config for market_id='${marketId}'`)
+    pushUniqueWarning(warnings, seenWarnings, `No vendors found in market config for market_id='${marketId}'`)
   }
 
   for (const vendor of vendors) {
     if (!vendor.slug) {
-      warnings.push(`Vendor '${vendor.vendor_id}': missing slug; skipping`)
+      pushUniqueWarning(warnings, seenWarnings, `Vendor '${vendor.vendor_id}': missing slug; skipping`)
       collector?.add({
         entityType: "seller",
         handle: vendor.vendor_id,
@@ -769,7 +799,14 @@ export default async function gpConfigSyncVendors({ container, args }: ExecArgs)
     }
 
     try {
-      const result = await upsertSeller(sellerModuleService, vendor, dryRun, marketId, overwrite)
+      const result = await upsertSeller(
+        sellerModuleService,
+        vendor,
+        dryRun,
+        marketId,
+        currencyCode,
+        overwrite
+      )
 
       if (result.action === "created") vendorCounts.created++
       else if (result.action === "updated") vendorCounts.updated++
@@ -790,13 +827,21 @@ export default async function gpConfigSyncVendors({ container, args }: ExecArgs)
       }
 
       // SellerProductLink sync — skip for suspended vendors
-      const isSuspended = vendorStatusToStoreStatus(vendor.status) === "SUSPENDED"
+      const isSuspended = vendorStatusToSellerStatus(vendor.status) === "suspended"
       if (isSuspended) {
-        warnings.push(`Vendor '${vendor.vendor_id}': suspended; skipping seller-product linking`)
+        pushUniqueWarning(
+          warnings,
+          seenWarnings,
+          `Vendor '${vendor.vendor_id}': suspended; skipping seller-product linking`
+        )
       }
 
       if (!result.sellerId) {
-        warnings.push(`Vendor '${vendor.vendor_id}': missing sellerId after upsert; skipping seller-product linking`)
+        pushUniqueWarning(
+          warnings,
+          seenWarnings,
+          `Vendor '${vendor.vendor_id}': missing sellerId after upsert; skipping seller-product linking`
+        )
       }
 
       if (!isSuspended && result.sellerId) {
@@ -814,7 +859,9 @@ export default async function gpConfigSyncVendors({ container, args }: ExecArgs)
         try {
           vendorProducts = await readYamlFile(vendorProductsPath)
         } catch (e: any) {
-          warnings.push(
+          pushUniqueWarning(
+            warnings,
+            seenWarnings,
             `Vendor '${vendor.vendor_id}': cannot read products.yaml for linking (${e?.message ?? String(e)})`
           )
           // Keep flow running so other vendors can still sync.
@@ -823,7 +870,11 @@ export default async function gpConfigSyncVendors({ container, args }: ExecArgs)
         for (const vp of vendorProducts.products ?? []) {
           const fixtureId = (vp.product_id ?? "").trim()
           if (!fixtureId) {
-            warnings.push(`Vendor '${vendor.vendor_id}': product row with empty product_id; skipping SPL`)
+            pushUniqueWarning(
+              warnings,
+              seenWarnings,
+              `Vendor '${vendor.vendor_id}': product row with empty product_id; skipping SPL`
+            )
             splCounts.skipped++
             splDetails.push({
               vendor_id: vendor.vendor_id,
@@ -839,7 +890,9 @@ export default async function gpConfigSyncVendors({ container, args }: ExecArgs)
           const product = resolved.product
           if (!product?.id) {
             const reason = resolved.error ?? "not found by fixture_id and fallback handle"
-            warnings.push(
+            pushUniqueWarning(
+              warnings,
+              seenWarnings,
               `Vendor '${vendor.vendor_id}': product fixture_id='${fixtureId}' not found in DB; skipping SPL (${reason})`
             )
             splCounts.missing_products++
@@ -853,7 +906,9 @@ export default async function gpConfigSyncVendors({ container, args }: ExecArgs)
           }
 
           if (resolved.strategy === "handle") {
-            warnings.push(
+            pushUniqueWarning(
+              warnings,
+              seenWarnings,
               `Vendor '${vendor.vendor_id}': linked fixture_id='${fixtureId}' using fallback handle='${fallbackHandle}'`
             )
           }
@@ -889,12 +944,18 @@ export default async function gpConfigSyncVendors({ container, args }: ExecArgs)
                 product_db_id: product.id,
                 reason: `db-fallback:${outcome}`,
               })
-              warnings.push(
+              pushUniqueWarning(
+                warnings,
+                seenWarnings,
                 `Vendor '${vendor.vendor_id}': ${reason}; linked via DB fallback (${outcome})`
               )
             } catch (dbError: any) {
               const dbReason = dbError?.message ?? String(dbError)
-              warnings.push(`Vendor '${vendor.vendor_id}': ${reason}; DB fallback failed - ${dbReason}`)
+              pushUniqueWarning(
+                warnings,
+                seenWarnings,
+                `Vendor '${vendor.vendor_id}': ${reason}; DB fallback failed - ${dbReason}`
+              )
               splCounts.skipped++
               splDetails.push({
                 vendor_id: vendor.vendor_id,
@@ -929,12 +990,16 @@ export default async function gpConfigSyncVendors({ container, args }: ExecArgs)
                 product_db_id: product.id,
                 reason: `service-upsert-failed + db-fallback:${outcome}`,
               })
-              warnings.push(
+              pushUniqueWarning(
+                warnings,
+                seenWarnings,
                 `Vendor '${vendor.vendor_id}': seller-product upsert failed for fixture_id='${fixtureId}' (product='${product.id}') - ${reason}; linked via DB fallback (${outcome})`
               )
             } catch (dbError: any) {
               const dbReason = dbError?.message ?? String(dbError)
-              warnings.push(
+              pushUniqueWarning(
+                warnings,
+                seenWarnings,
                 `Vendor '${vendor.vendor_id}': seller-product upsert failed for fixture_id='${fixtureId}' (product='${product.id}') - ${reason}; DB fallback failed - ${dbReason}`
               )
               splCounts.skipped++
@@ -950,7 +1015,11 @@ export default async function gpConfigSyncVendors({ container, args }: ExecArgs)
         }
       }
     } catch (err: any) {
-      warnings.push(`Vendor '${vendor.vendor_id}': ${err?.message ?? String(err)}`)
+      pushUniqueWarning(
+        warnings,
+        seenWarnings,
+        `Vendor '${vendor.vendor_id}': ${err?.message ?? String(err)}`
+      )
       vendorCounts.skipped++
     }
   }

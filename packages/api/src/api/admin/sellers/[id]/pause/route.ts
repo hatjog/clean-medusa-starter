@@ -1,24 +1,20 @@
 /**
- * POST /admin/sellers/:id/pause — D-69 atomic admin pause flow.
+ * POST /admin/sellers/:id/pause — compatibility proxy for Mercur 2 seller suspension.
  *
- * TODO Story v160-1-7.1 (post-1.8 smoke verification): DROP custom PAT-17 —
- * replace with native Mercur 2 seller status workflow (4 statuses:
- * pending_approval/open/suspended/terminated) per ADR-090 §PAT-17 row.
- * Physical drop deferred until story v160-1-8 (DB drop+reload + medusa develop)
- * confirms native Mercur 2 admin endpoints preserve atomic semantics + B12 fire
- * drill SLA + flag-propagation T1/T2/T3 telemetry. Removing this file before
- * runtime verification re-introduces FM-9 risk (multi-vendor checkout race).
+ * Story v160-1-7.1 keeps this route as a thin telemetry-preserving proxy while
+ * replacing the legacy GP `paused` / `disabled` states with Mercur 2 native
+ * `suspended` / `terminated`.
  *
  * Atomic transaction shape (per architecture.md L450-464 + ADR-074):
  *
  *   BEGIN;
  *   SELECT id, status, version FROM seller WHERE id = $1 FOR UPDATE;
- *   UPDATE seller SET status = 'paused', version = version + 1 WHERE id = $1;
+ *   UPDATE seller SET status = 'suspended', version = version + 1 WHERE id = $1;
  *   INSERT INTO seller_status_change_audit (
  *     id, market_id, seller_id, prev_status, new_status,
  *     affected_orders, runtime_context, reason, changed_by, changed_at
  *   ) VALUES (
- *     $uuid, $market_id, $seller_id, $prev_status, 'paused',
+ *     $uuid, $market_id, $seller_id, $prev_status, 'suspended',
  *     (SELECT COALESCE(jsonb_agg(o.id ORDER BY o.created_at ASC), '[]'::jsonb)
  *        FROM orders o WHERE o.seller_id = $seller_id AND o.status = 'in_flight'),
  *     $runtime_context, $reason, $actor_id, transaction_timestamp()
@@ -44,6 +40,14 @@ import { ContainerRegistrationKeys } from "@medusajs/framework/utils"
 import { randomUUID } from "node:crypto"
 
 import { emitFlagPropagationT1, emitFlagPropagationT2 } from "../../../../../lib/instrumentation/flag-propagation"
+import { extractActorIdOrThrow, requireCapability } from "../../../../../lib/capability-check"
+
+/**
+ * Minimum character length for an override reason (AC4).
+ * Enforce non-trivial justification — a single word is insufficient for
+ * audit purposes given the high-risk nature of the capability.
+ */
+const OVERRIDE_REASON_MIN_LENGTH = 10
 
 type PauseRequestBody = {
   reason?: string
@@ -53,6 +57,12 @@ type PauseRequestBody = {
    * downstream PostHog dashboards can isolate drill noise from real ops events.
    */
   drill_id?: string
+  /**
+   * When true, the caller is invoking the FR54 training-cert gate override
+   * path. Requires capability `vendor.lifecycle.override_training_cert` and
+   * a non-empty reason of at least 10 characters (AC1/AC4).
+   */
+  override?: boolean
 }
 
 type PgClient = {
@@ -77,16 +87,6 @@ type Logger = {
   error?: (message: string, meta?: Record<string, unknown>) => void
 }
 
-/**
- * Minimal authn/authz extraction. Real Mercur admin auth middleware writes the
- * actor into `req.auth_context`; we fall back to `'unknown_admin'` only in
- * test environments where auth middleware is bypassed.
- */
-const extractActorId = (req: MedusaRequest): string => {
-  const ctx = (req as { auth_context?: { actor_id?: string } }).auth_context
-  return ctx?.actor_id ?? "unknown_admin"
-}
-
 const extractMarketId = (req: MedusaRequest): string => {
   // Mercur convention: market id is supplied via `X-Gp-Market-Id` header (Step 5
   // Supplement L1721) OR derived from the seller row in the same tx (fallback).
@@ -104,8 +104,35 @@ export async function POST(req: MedusaRequest, res: MedusaResponse): Promise<voi
   }
 
   const body = (req.body ?? {}) as PauseRequestBody
+
+  // [AI-Review][MEDIUM fix] Reject truthy non-boolean override values so operators
+  // do not believe the override path was invoked when the client mis-serialised the
+  // field (e.g. "true" string or 1 instead of true). Strict-equality below remains
+  // the gate decision; this guard turns silent path-skip into an explicit error.
+  if (body.override !== undefined && typeof body.override !== "boolean") {
+    res.status(400).json({
+      code: "INVALID_OVERRIDE_TYPE",
+      message:
+        "`override` must be a JSON boolean (true/false) — string/number values are rejected to avoid silent path skips",
+    })
+    return
+  }
+  const isOverride = body.override === true
   const reason = body.reason?.trim()
-  if (!reason) {
+
+  // [AI-Review][HIGH fix] AC4 contract: when override=true ALL three failure
+  // modes (missing, blank-after-trim, < min length) MUST return
+  // OVERRIDE_REASON_REQUIRED. The non-override path keeps REASON_REQUIRED
+  // unchanged (AC5 regression guard).
+  if (isOverride) {
+    if (!reason || reason.length < OVERRIDE_REASON_MIN_LENGTH) {
+      res.status(400).json({
+        code: "OVERRIDE_REASON_REQUIRED",
+        message: `Override reason must be at least ${OVERRIDE_REASON_MIN_LENGTH} characters after trimming, per FR54 training-cert override audit obligation`,
+      })
+      return
+    }
+  } else if (!reason) {
     res.status(400).json({
       code: "REASON_REQUIRED",
       message: "ADR-074 mandates an audit `reason` for every status transition",
@@ -113,9 +140,37 @@ export async function POST(req: MedusaRequest, res: MedusaResponse): Promise<voi
     return
   }
 
-  const actorId = extractActorId(req)
+  let actorId: string
+  try {
+    actorId = extractActorIdOrThrow(req)
+  } catch {
+    res.status(401).json({ code: "UNAUTHORIZED", message: "Valid admin session required" })
+    return
+  }
+
   const marketId = extractMarketId(req)
-  const logger = (req.scope.resolve(ContainerRegistrationKeys.LOGGER) as Logger | undefined) ?? {}
+  const logger = (req.scope.resolve(ContainerRegistrationKeys.LOGGER) as unknown as Logger | undefined) ?? {}
+
+  // AC1/AC2 — capability gate for the override path.
+  // Must be evaluated BEFORE any DB write or audit row is emitted.
+  if (isOverride) {
+    const cap = await requireCapability(req, "vendor.lifecycle.override_training_cert")
+    if (!cap.ok) {
+      // [AI-Review][MEDIUM fix] Emit a structured warn-level audit log on
+      // capability denial so SecOps can detect repeated failed override
+      // attempts (signal class TF-91 was filed for). When cleanup-42 lands
+      // the real grants table, this is the canonical baseline for alerting
+      // on misconfigured grants.
+      logger.warn?.("seller.pause override capability denied", {
+        sellerId,
+        actorId,
+        capability: "vendor.lifecycle.override_training_cert",
+        route: "POST /admin/sellers/:id/pause",
+      })
+      res.status(cap.status).json(cap.body)
+      return
+    }
+  }
 
   // Resolve PG pool + Redis client from the Medusa container. The keys below
   // match the convention used by `gp-core` (see `src/modules/gp-core/service.ts`).
@@ -161,19 +216,19 @@ export async function POST(req: MedusaRequest, res: MedusaResponse): Promise<voi
     prevStatus = sellerRow.status
     const effectiveMarketId = marketId || sellerRow.market_id
 
-    if (prevStatus === "paused") {
+    if (prevStatus === "suspended") {
       // Idempotent — abort silently, do not re-emit propagation event.
       await client.query("ROLLBACK")
-      res.status(200).json({ ok: true, idempotent: true, status: "paused" })
+      res.status(200).json({ ok: true, idempotent: true, status: "suspended" })
       return
     }
 
-    if (prevStatus === "disabled") {
-      // ADR-074: `disabled` is terminal — admin pause is a no-op.
+    if (prevStatus === "terminated") {
+      // ADR-074: `terminated` is terminal — admin suspension is a no-op.
       await client.query("ROLLBACK")
       res.status(409).json({
-        code: "DISABLED_TERMINAL",
-        message: "ADR-074 forbids paused→active OR disabled→paused without manual re-enable workflow",
+        code: "TERMINATED_TERMINAL",
+        message: "ADR-074 forbids suspended→open OR terminated→suspended without manual re-enable workflow",
       })
       return
     }
@@ -181,7 +236,7 @@ export async function POST(req: MedusaRequest, res: MedusaResponse): Promise<voi
     // 2) Flip status + bump optimistic-lock `version`.
     await client.query(
       'UPDATE seller SET status = $1, version = version + 1 WHERE id = $2',
-      ["paused", sellerId]
+      ["suspended", sellerId]
     )
 
     // 3) Audit row — `affected_orders` populated via subselect for atomicity.
@@ -194,7 +249,7 @@ export async function POST(req: MedusaRequest, res: MedusaResponse): Promise<voi
          id, market_id, seller_id, prev_status, new_status,
          affected_orders, runtime_context, reason, changed_by, changed_at
        ) VALUES (
-         $1, $2, $3, $4, 'paused',
+         $1, $2, $3, $4, 'suspended',
          COALESCE(
            (SELECT jsonb_agg(o.id ORDER BY o.created_at ASC)
               FROM orders o
@@ -209,7 +264,14 @@ export async function POST(req: MedusaRequest, res: MedusaResponse): Promise<voi
         effectiveMarketId,
         sellerId,
         prevStatus,
-        JSON.stringify({ vendor_mor_enabled: true, drill_id: body.drill_id ?? null }),
+        // AC3 — when override=true, extend runtime_context with override flag
+        // and override_reason so the audit trail captures the justification.
+        // No schema change required: runtime_context is a JSONB column.
+        JSON.stringify({
+          vendor_mor_enabled: true,
+          drill_id: body.drill_id ?? null,
+          ...(isOverride ? { override: true, override_reason: reason } : {}),
+        }),
         reason,
         actorId,
       ]
@@ -254,7 +316,7 @@ export async function POST(req: MedusaRequest, res: MedusaResponse): Promise<voi
           market_id: marketId,
           seller_id: sellerId,
           prior_status: prevStatus,
-          new_status: "paused",
+          new_status: "suspended",
           actor_id: actorId,
           timestamp_t1_db_commit: t1DbCommit?.toISOString(),
           affected_orders: affectedOrders,
@@ -287,7 +349,7 @@ export async function POST(req: MedusaRequest, res: MedusaResponse): Promise<voi
     ok: true,
     seller_id: sellerId,
     prev_status: prevStatus,
-    new_status: "paused",
+    new_status: "suspended",
     affected_orders: affectedOrders,
     audit_id: auditId,
     t1_db_commit: t1DbCommit?.toISOString(),

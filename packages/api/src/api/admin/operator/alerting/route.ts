@@ -4,33 +4,56 @@
  */
 
 import type { MedusaRequest, MedusaResponse } from "@medusajs/framework/http"
+import { ContainerRegistrationKeys } from "@medusajs/framework/utils"
+import type { Knex } from "knex"
 import {
   evaluateAlerts,
   listConfiguredAlerts,
 } from "../../../../lib/alert-evaluator"
 import {
+  getRollbackHistory24h,
   runAlertEvaluatorTick,
   getFiringHistory24h,
+  getLastTick,
+  getTickHistory24h,
+  SCHEDULE_CRON,
+  SCHEDULE_NAME,
 } from "../../../../jobs/alert-evaluator-cron"
 
 export async function GET(
-  _req: MedusaRequest,
+  req: MedusaRequest,
   res: MedusaResponse,
 ): Promise<void> {
-  const current = await evaluateAlerts()
+  const db = req.scope.resolve(ContainerRegistrationKeys.PG_CONNECTION) as Knex
+  const current = await evaluateAlerts({
+    db,
+    scope: req.scope as { resolve: (key: string) => unknown },
+  })
+  const tick_history_24h = await getTickHistory24h(db)
   res.json({
     firing: current.firing,
-    history_24h: getFiringHistory24h(),
-    auto_rollback_history: [], // populated by automated-rollback module via audit log; surface DEFER
+    history_24h: await getFiringHistory24h(db),
+    auto_rollback_history: await getRollbackHistory24h(db),
     configured: listConfiguredAlerts(),
     computed_at: current.computed_at,
+    tick_history_24h,
+    last_tick: tick_history_24h[0] ?? (await getLastTick(db)),
+    scheduler: {
+      name: SCHEDULE_NAME,
+      schedule: SCHEDULE_CRON,
+    },
   })
 }
 
 export async function POST(
-  _req: MedusaRequest,
+  req: MedusaRequest,
   res: MedusaResponse,
 ): Promise<void> {
-  const tick = await runAlertEvaluatorTick()
+  const db = req.scope.resolve(ContainerRegistrationKeys.PG_CONNECTION) as Knex
+  const tick = await runAlertEvaluatorTick({
+    db,
+    scope: req.scope as { resolve: (key: string) => unknown },
+    triggered_by: "manual",
+  })
   res.json(tick)
 }

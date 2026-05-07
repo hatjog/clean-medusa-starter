@@ -1,4 +1,5 @@
 export type TimestampValue = Date | string
+export type MercurSellerStatus = "pending_approval" | "open" | "suspended" | "terminated"
 
 export type GpCoreMarketRecord = {
   id: string
@@ -16,7 +17,7 @@ export type GpCoreVendor = {
   id: string
   instance_id: string
   name: string
-  status: string
+  status: MercurSellerStatus
   created_at: TimestampValue
   updated_at: TimestampValue
 }
@@ -68,7 +69,7 @@ export type CreateVendorInput = {
   id?: string
   instance_id: string
   name: string
-  status?: string
+  status?: MercurSellerStatus
 }
 
 export type AssignVendorToMarketInput = {

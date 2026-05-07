@@ -20,19 +20,17 @@ import {
   dispatchT30Notifications,
   fetchEligibleVendors,
   isWindowOpen,
+  NotificationProviderNotReadyError,
   resolveFlagFlipDate,
   T30DispatcherFixtureModeError,
   type T30Logger,
 } from "../../../../../lib/t30-dispatch-service"
+import { extractActorIdOrThrow } from "../../../../../lib/capability-check"
 
 type TriggerRequestBody = {
   dry_run?: boolean
   vendor_ids?: string[]
-}
-
-function extractActorId(req: MedusaRequest): string {
-  const ctx = (req as { auth_context?: { actor_id?: string } }).auth_context
-  return ctx?.actor_id ?? "unknown_admin"
+  override?: boolean
 }
 
 export async function POST(
@@ -41,7 +39,14 @@ export async function POST(
 ): Promise<void> {
   const body = (req.body ?? {}) as TriggerRequestBody
   const dryRun = body.dry_run === true
-  const triggeredBy = extractActorId(req)
+
+  let triggeredBy: string
+  try {
+    triggeredBy = extractActorIdOrThrow(req)
+  } catch {
+    res.status(401).json({ code: "UNAUTHORIZED", message: "Valid admin session required" })
+    return
+  }
 
   const logger =
     (req.scope.resolve(ContainerRegistrationKeys.LOGGER) as T30Logger | undefined) ??
@@ -65,7 +70,10 @@ export async function POST(
   }
 
   if (dryRun) {
-    const eligible = await fetchEligibleVendors(body.vendor_ids)
+    const eligible = await fetchEligibleVendors(
+      body.vendor_ids,
+      req.scope as { resolve: (key: string) => unknown },
+    )
     res.status(200).json({
       dry_run: true,
       eligible_count: eligible.length,
@@ -80,6 +88,7 @@ export async function POST(
       vendor_ids: body.vendor_ids,
       flag_flip_iso: flagFlipIso,
       logger,
+      scope: req.scope as { resolve: (key: string) => unknown },
     })
     res.status(200).json({
       triggered: result.triggered,
@@ -88,7 +97,10 @@ export async function POST(
       audit_log_ids: result.audit_log_ids,
     })
   } catch (err) {
-    if (err instanceof T30DispatcherFixtureModeError) {
+    if (
+      err instanceof T30DispatcherFixtureModeError ||
+      err instanceof NotificationProviderNotReadyError
+    ) {
       res.status(503).json({
         code: err.code,
         message: err.message,

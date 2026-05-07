@@ -11,8 +11,8 @@ import {
  * AC-FLAG-COMPOSITE-01 (UPGRADED 11 tests) — D-69 / ADR-074 precedence matrix.
  *
  * Test matrix:
- *   - 4 status (active|paused|disabled|pending) × 2 cart states (loaded|settling) = 8 base
- *   - 3 edge: race tx-paused-mid-settlement, audit row written w/ affected_orders,
+ *   - 4 status (open|suspended|terminated|pending_approval) × 2 cart states (loaded|settling) = 8 base
+ *   - 3 edge: race tx-suspended-mid-settlement, audit row written w/ affected_orders,
  *     archive fallback active
  *
  * Cart states are simulated via two resolver invocations on the same instance with a
@@ -49,113 +49,113 @@ const SELLER = "salon-1"
 describe("MorFlagResolver — AC-FLAG-COMPOSITE-01 (11-test matrix)", () => {
   // ── 8 base scenarios: 4 status × 2 cart states ─────────────────────────────────────
 
-  it("Test 1 (active × loaded): globalFlag=true + active → status=active", async () => {
-    const r = new MorFlagResolver(new FakeFlagsPort(true), new FakeSellerStatusPort(["active"]))
+  it("Test 1 (open × loaded): globalFlag=true + open → status=open", async () => {
+    const r = new MorFlagResolver(new FakeFlagsPort(true), new FakeSellerStatusPort(["open"]))
     const out = await r.resolve(MARKET, SELLER)
-    expect(out.status).toBe("active")
+    expect(out.status).toBe("open")
     expect(out.precedence).toEqual({ globalFlag: false, perVendorPause: false, archiveFallback: false })
     expect(out.sourceTimestamp).toBeInstanceOf(Date)
   })
 
-  it("Test 2 (active × settling): per-request cache returns same Promise within request", async () => {
+  it("Test 2 (open × settling): per-request cache returns same Promise within request", async () => {
     const flags = new FakeFlagsPort(true)
-    const sellers = new FakeSellerStatusPort(["active", "active"])
+    const sellers = new FakeSellerStatusPort(["open", "open"])
     const r = new MorFlagResolver(flags, sellers)
     const cached = r.withRequestCache()
     const a = await cached(MARKET, SELLER)
     const b = await cached(MARKET, SELLER)
-    expect(a.status).toBe("active")
-    expect(b.status).toBe("active")
+    expect(a.status).toBe("open")
+    expect(b.status).toBe("open")
     // Single backend hit — second call is memoized.
     expect(sellers.callCount).toBe(1)
   })
 
-  it("Test 3 (paused × loaded): globalFlag=true + paused → status=paused, perVendorPause=true", async () => {
-    const r = new MorFlagResolver(new FakeFlagsPort(true), new FakeSellerStatusPort(["paused"]))
+  it("Test 3 (suspended × loaded): globalFlag=true + suspended → status=suspended, perVendorPause=true", async () => {
+    const r = new MorFlagResolver(new FakeFlagsPort(true), new FakeSellerStatusPort(["suspended"]))
     const out = await r.resolve(MARKET, SELLER)
-    expect(out.status).toBe("paused")
+    expect(out.status).toBe("suspended")
     expect(out.precedence.perVendorPause).toBe(true)
     expect(out.precedence.globalFlag).toBe(false)
   })
 
-  it("Test 4 (paused × settling): settlement re-check returns paused on second invocation (no cache)", async () => {
-    const sellers = new FakeSellerStatusPort(["active", "paused"])
+  it("Test 4 (suspended × settling): settlement re-check returns suspended on second invocation (no cache)", async () => {
+    const sellers = new FakeSellerStatusPort(["open", "suspended"])
     const r = new MorFlagResolver(new FakeFlagsPort(true), sellers)
     const first = await r.resolve(MARKET, SELLER)
     const second = await r.resolve(MARKET, SELLER)
-    expect(first.status).toBe("active")
-    expect(second.status).toBe("paused")
+    expect(first.status).toBe("open")
+    expect(second.status).toBe("suspended")
   })
 
-  it("Test 5 (disabled × loaded): globalFlag=true + disabled → status=disabled", async () => {
-    const r = new MorFlagResolver(new FakeFlagsPort(true), new FakeSellerStatusPort(["disabled"]))
+  it("Test 5 (terminated × loaded): globalFlag=true + terminated → status=terminated", async () => {
+    const r = new MorFlagResolver(new FakeFlagsPort(true), new FakeSellerStatusPort(["terminated"]))
     const out = await r.resolve(MARKET, SELLER)
-    expect(out.status).toBe("disabled")
+    expect(out.status).toBe("terminated")
     expect(out.precedence.perVendorPause).toBe(false)
   })
 
-  it("Test 6 (disabled × settling): disabled status persists between cart-load and settle", async () => {
+  it("Test 6 (terminated × settling): terminated status persists between cart-load and settle", async () => {
     const r = new MorFlagResolver(
       new FakeFlagsPort(true),
-      new FakeSellerStatusPort(["disabled", "disabled"])
+      new FakeSellerStatusPort(["terminated", "terminated"])
     )
     const a = await r.resolve(MARKET, SELLER)
     const b = await r.resolve(MARKET, SELLER)
-    expect(a.status).toBe("disabled")
-    expect(b.status).toBe("disabled")
+    expect(a.status).toBe("terminated")
+    expect(b.status).toBe("terminated")
   })
 
-  it("Test 7 (pending × loaded): pending seller → status=pending (DISABLED effective per ADR-074)", async () => {
-    const r = new MorFlagResolver(new FakeFlagsPort(true), new FakeSellerStatusPort(["pending"]))
+  it("Test 7 (pending_approval × loaded): pending seller → status=pending_approval", async () => {
+    const r = new MorFlagResolver(new FakeFlagsPort(true), new FakeSellerStatusPort(["pending_approval"]))
     const out = await r.resolve(MARKET, SELLER)
-    expect(out.status).toBe("pending")
+    expect(out.status).toBe("pending_approval")
   })
 
-  it("Test 8 (pending × settling): pending → pending across both cart and settlement reads", async () => {
+  it("Test 8 (pending_approval × settling): pending_approval across both cart and settlement reads", async () => {
     const r = new MorFlagResolver(
       new FakeFlagsPort(true),
-      new FakeSellerStatusPort(["pending", "pending"])
+      new FakeSellerStatusPort(["pending_approval", "pending_approval"])
     )
     const a = await r.resolve(MARKET, SELLER)
     const b = await r.resolve(MARKET, SELLER)
-    expect(a.status).toBe("pending")
-    expect(b.status).toBe("pending")
+    expect(a.status).toBe("pending_approval")
+    expect(b.status).toBe("pending_approval")
   })
 
   // ── 3 edge cases ────────────────────────────────────────────────────────────────
 
-  it("Test 9 (race tx-paused-mid-settlement): cart=active, settlement re-read sees paused", async () => {
+  it("Test 9 (race tx-suspended-mid-settlement): cart=open, settlement re-read sees suspended", async () => {
     // Simulates the AC-FLAG-1.3-05 settlement contract: re-check between cart-load
-    // and payment capture MUST observe the freshly committed `paused` state.
-    const sellers = new FakeSellerStatusPort(["active", "paused"])
+    // and payment capture MUST observe the freshly committed `suspended` state.
+    const sellers = new FakeSellerStatusPort(["open", "suspended"])
     const r = new MorFlagResolver(new FakeFlagsPort(true), sellers)
     const cartLoad = await r.resolve(MARKET, SELLER)
     const settlementRecheck = await r.resolve(MARKET, SELLER)
-    expect(cartLoad.status).toBe("active")
-    expect(settlementRecheck.status).toBe("paused")
+    expect(cartLoad.status).toBe("open")
+    expect(settlementRecheck.status).toBe("suspended")
     expect(settlementRecheck.precedence.perVendorPause).toBe(true)
   })
 
-  it("Test 10 (global flag wins): globalFlag=false + seller.status=active → disabled (override)", async () => {
-    // ADR-074 row 5: any seller.status collapses to DISABLED when global flag is off.
+  it("Test 10 (global flag wins): globalFlag=false + seller.status=open → terminated effective override", async () => {
+    // ADR-074 row 5: any seller.status collapses to terminated when global flag is off.
     const r = new MorFlagResolver(
       new FakeFlagsPort(false),
-      new FakeSellerStatusPort(["active"])
+      new FakeSellerStatusPort(["open"])
     )
     const out = await r.resolve(MARKET, SELLER)
-    expect(out.status).toBe("disabled")
+    expect(out.status).toBe("terminated")
     expect(out.precedence.globalFlag).toBe(true)
     expect(out.precedence.perVendorPause).toBe(false)
   })
 
-  it("Test 11 (unknown seller in market): null seller status → pending (precedence empty)", async () => {
+  it("Test 11 (unknown seller in market): null seller status → pending_approval (precedence empty)", async () => {
     // Not strictly archive fallback, but the audit-row contract demands a
     // graceful default. Archive fallback itself is exercised via
     // `vendor_archive_fallback_enabled` upstream; the resolver surfaces
     // `archiveFallback: false` so settlement-revalidation can flip it on.
     const r = new MorFlagResolver(new FakeFlagsPort(true), new FakeSellerStatusPort([null]))
     const out = await r.resolve(MARKET, SELLER)
-    expect(out.status).toBe("pending")
+    expect(out.status).toBe("pending_approval")
     expect(out.precedence).toEqual({
       globalFlag: false,
       perVendorPause: false,
@@ -166,12 +166,12 @@ describe("MorFlagResolver — AC-FLAG-COMPOSITE-01 (11-test matrix)", () => {
   // ── input validation (defensive — caller bug guard) ──────────────────────────────
 
   it("rejects empty marketId (caller bug — would skip RLS scoping)", async () => {
-    const r = new MorFlagResolver(new FakeFlagsPort(true), new FakeSellerStatusPort(["active"]))
+    const r = new MorFlagResolver(new FakeFlagsPort(true), new FakeSellerStatusPort(["open"]))
     await expect(r.resolve("", SELLER)).rejects.toThrow(/marketId is required/)
   })
 
   it("rejects empty sellerId (caller bug — would resolve to wrong row)", async () => {
-    const r = new MorFlagResolver(new FakeFlagsPort(true), new FakeSellerStatusPort(["active"]))
+    const r = new MorFlagResolver(new FakeFlagsPort(true), new FakeSellerStatusPort(["open"]))
     await expect(r.resolve(MARKET, "")).rejects.toThrow(/sellerId is required/)
   })
 })

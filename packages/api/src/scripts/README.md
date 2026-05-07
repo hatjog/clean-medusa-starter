@@ -70,8 +70,28 @@ npx medusa exec ./src/scripts/my-script.ts arg1 arg2
 ## GP scripts in this repo
 
 ```bash
+pnpm run db:migrate:all
+pnpm run db:migrate:app:status
 yarn gp-config-sync-catalog gp-dev bonbeauty
 yarn gp-config-sync-vendors gp-dev bonbeauty
 yarn gp-config-sync-payments gp-dev bonbeauty
 yarn gp-config-sync-orchestrator gp-dev bonbeauty
 ```
+
+### App-level migration commands
+
+- `pnpm run db:migrate:all`
+  Runs standard Medusa/module migrations first, then the canonical GP app-level migration runner for `packages/api/src/migrations`.
+- `pnpm run db:migrate:app:status`
+  Shows the current `app_mikro_orm_migrations` ledger state and pending canonical app migrations.
+- `pnpm run db:migrate:app`
+  Adopts already-present app migration effects into `app_mikro_orm_migrations` and applies runnable canonical app migrations from `packages/api/src/migrations`.
+- `pnpm run db:migrate:legacy-base:status`
+  Shows the separate `legacy_base_mikro_orm_migrations` ledger for historical base-runtime migrations stored in `packages/api/src/migrations-legacy-base`.
+- `pnpm run db:migrate:legacy-base`
+  Runs only the separated historical base-runtime migrations. Use this surface only against databases that also contain the prerequisite base tables such as `ledger_entry`, `market_runtime_config`, and `event_store`.
+
+### Current local runtime snapshot
+
+- `pnpm run db:migrate:app:status` -> `executed=9`, `pending=0`
+- `pnpm run db:migrate:legacy-base:status` -> `executed=0`, `pending=3`

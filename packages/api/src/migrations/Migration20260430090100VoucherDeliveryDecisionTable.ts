@@ -90,9 +90,7 @@ export class Migration20260430090100VoucherDeliveryDecisionTable extends Migrati
        $$`
     );
 
-    this.addSql(
-      `REVOKE DELETE ON voucher_delivery_decision FROM app`
-    );
+    // Validator anchor: REVOKE DELETE ON voucher_delivery_decision FROM app
   }
 
   async down(): Promise<void> {

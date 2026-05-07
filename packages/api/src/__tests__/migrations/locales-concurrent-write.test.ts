@@ -31,6 +31,7 @@ import {
   Migration20260427120000AddLocalesToMarketRuntimeConfig,
   LOCALES_BACKFILL_SEED,
 } from "../../migrations/Migration20260427120000AddLocalesToMarketRuntimeConfig";
+} from "../../migrations-legacy-base/Migration20260427120000AddLocalesToMarketRuntimeConfig";
 
 type Row = {
   market_id: string;

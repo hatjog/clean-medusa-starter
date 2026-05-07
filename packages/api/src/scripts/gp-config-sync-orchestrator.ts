@@ -185,8 +185,7 @@ export async function buildHealthReport(
     return typeof metaTitle === "string" && metaTitle.trim().length > 0
   }).length
   const splCount = normalizeRawResultCount(
-    // Mercur 2: product_seller link table (replaces Mercur 1.5 seller_seller_product_product)
-    await db.raw("SELECT COUNT(*)::int AS count FROM product_seller")
+    await db.raw("SELECT COUNT(*)::int AS count FROM product_product_seller_seller")
   )
 
   return {

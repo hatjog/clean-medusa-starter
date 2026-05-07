@@ -11,6 +11,7 @@ import {
   ContainerRegistrationKeys,
   Modules,
 } from "@medusajs/framework/utils";
+import { vendorMetaMiddleware } from "./store/products/vendor-meta-middleware";
 import {
   CUSTOMER_MARKET_FORBIDDEN_MESSAGE,
   isScopedToMarket,
@@ -20,6 +21,7 @@ import {
   scopeCustomerEmail,
 } from "../lib/customer-scoped-email";
 import { marketContextStorage } from "../lib/market-context";
+import { recordRequest } from "../lib/request-log-aggregator";
 import { installRlsPoolHook, type HookLogger } from "../lib/rls-pool-hook";
 import { marketContextCache } from "../loaders/market-context-cache";
 
@@ -265,6 +267,34 @@ function setRequestValue(
 
 function failWithMarketContext(res: MedusaResponse): void {
   res.status(403).json({ message: "Market context required" });
+}
+
+export function requestLogMetricsMiddleware(
+  req: MedusaRequest,
+  res: MedusaResponse,
+  next: MedusaNextFunction
+) {
+  const startedAt = Date.now();
+  const requestPath = getRequestPath(req).split("?")[0] || "unknown";
+  let recorded = false;
+
+  const flushSample = () => {
+    if (recorded) {
+      return;
+    }
+
+    recorded = true;
+    recordRequest({
+      ts: Date.now(),
+      duration_ms: Math.max(Date.now() - startedAt, 0),
+      status_code: Number(res.statusCode ?? 0),
+      cohort: requestPath,
+    });
+  };
+
+  res.once("finish", flushSample);
+  res.once("close", flushSample);
+  next();
 }
 
 function failWithCustomerMarket(res: MedusaResponse): void {
@@ -549,7 +579,27 @@ export async function cartMarketGuardMiddleware(
 export default defineMiddlewares({
   routes: [
     {
+      method: ["POST"],
+      matcher: "/auth/user/emailpass",
+      middlewares: [requestLogMetricsMiddleware],
+    },
+    {
+      matcher: "/admin/operator/*",
+      middlewares: [requestLogMetricsMiddleware],
+    },
+    {
       matcher: "/v1/admin/*",
+      middlewares: [
+        authenticate("user", ["session", "bearer"]),
+        operatorAuthMiddleware,
+      ],
+    },
+    // cleanup-15a: apply admin AuthN to all /admin/vendors/** POST routes.
+    // Matcher "/admin/vendors/*" covers the actual Medusa 2 route paths
+    // (NOT "/v1/admin/*" which covers the legacy v1 API prefix).
+    {
+      method: ["POST", "PATCH", "PUT", "DELETE"],
+      matcher: "/admin/vendors/*",
       middlewares: [
         authenticate("user", ["session", "bearer"]),
         operatorAuthMiddleware,
@@ -573,6 +623,7 @@ export default defineMiddlewares({
     {
       matcher: "/store/*",
       middlewares: [
+        requestLogMetricsMiddleware,
         marketContextMiddleware,
         marketGuardMiddleware,
         customerMarketGuardMiddleware,
@@ -601,6 +652,19 @@ export default defineMiddlewares({
       method: "ALL",
       matcher: "/store/carts*",
       middlewares: [cartMarketGuardMiddleware, customerResponseSanitizerMiddleware],
+    },
+    // Multi-vendor metadata augmentation (story v160-cleanup-12a).
+    // Runs on /store/products (list) and /store/products/:id (detail).
+    // Short-circuits immediately when feature-flag-tri-state oracle is not "on".
+    {
+      method: ["GET"],
+      matcher: "/store/products",
+      middlewares: [vendorMetaMiddleware],
+    },
+    {
+      method: ["GET"],
+      matcher: "/store/products/:id",
+      middlewares: [vendorMetaMiddleware],
     },
   ],
 });

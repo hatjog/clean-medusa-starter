@@ -6,8 +6,12 @@
  */
 
 import type { MedusaRequest, MedusaResponse } from "@medusajs/framework/http"
-
-type DecisionStatus = "pending" | "opted_in" | "opted_out" | "forced"
+import { extractActorIdOrThrow } from "../../../../lib/capability-check"
+import {
+  buildDecisionListEntry,
+  listSellers,
+  type DecisionStatus,
+} from "../../../../lib/vendor-decision-store"
 
 type VendorDecisionListEntry = {
   id: string
@@ -25,27 +29,25 @@ type ListResponse = {
   limit: number
 }
 
-/**
- * Dev fixture support — same pattern as Story 7.1 t30 route.
- * Real vendor query via Mercur 2 vendor table is DEFERRED (vendor query wiring
- * is shared concern across 7.1/7.2/7.3 — happens in production env).
- */
-function loadDevFixtureVendors(): VendorDecisionListEntry[] {
-  const raw = process.env.GP_DECISIONS_DEV_FIXTURE_VENDORS_JSON
-  if (!raw) return []
-  try {
-    const parsed = JSON.parse(raw)
-    if (!Array.isArray(parsed)) return []
-    return parsed as VendorDecisionListEntry[]
-  } catch {
-    return []
-  }
+type ErrorResponse = {
+  code?: string
+  message?: string
 }
 
 export async function GET(
   req: MedusaRequest,
-  res: MedusaResponse<ListResponse>,
+  res: MedusaResponse<ListResponse | ErrorResponse>,
 ): Promise<void> {
+  try {
+    extractActorIdOrThrow(req)
+  } catch {
+    res.status(401).json({
+      code: "UNAUTHORIZED",
+      message: "Valid admin session required",
+    })
+    return
+  }
+
   const { status, search, page, limit } = req.query as {
     status?: DecisionStatus | "all"
     search?: string
@@ -59,7 +61,21 @@ export async function GET(
     Math.max(1, Number.parseInt(limit ?? "25", 10) || 25),
   )
 
-  let vendors = loadDevFixtureVendors()
+  let vendors = (await listSellers(
+    req.scope as { resolve: (key: string) => unknown },
+    {},
+  ))
+    .map(buildDecisionListEntry)
+    .sort((left, right) => {
+      const leftAction = left.last_action_at ?? ""
+      const rightAction = right.last_action_at ?? ""
+
+      if (leftAction !== rightAction) {
+        return rightAction.localeCompare(leftAction)
+      }
+
+      return left.handle.localeCompare(right.handle)
+    })
 
   if (status && status !== "all") {
     vendors = vendors.filter((v) => v.decision_status === status)
