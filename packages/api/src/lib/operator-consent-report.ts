@@ -225,3 +225,72 @@ export async function buildOperatorConsentReport(
     total: vendors.length,
   }
 }
+
+/**
+ * Story v160-cleanup-45 (AC3d / TF-106): Thrown when the SellerModule + DB
+ * fallback chain cannot satisfy a vendor read. The cascade route maps this
+ * to HTTP 503 (Service Unavailable) regardless of whether the underlying
+ * cause is a missing DI registration or a downstream DB error — both are
+ * legitimate "vendor data temporarily unavailable" conditions per AR55/AR56
+ * honesty (consistent with cleanup-44 unavailable-source pattern).
+ */
+export class SellerModuleUnavailableError extends Error {
+  readonly code = "SELLER_MODULE_UNAVAILABLE"
+
+  constructor(cause?: Error) {
+    super(
+      cause?.message ??
+        "Seller module service is not available in the request scope",
+    )
+    this.name = "SellerModuleUnavailableError"
+    if (cause) {
+      this.cause = cause
+    }
+  }
+}
+
+/**
+ * Story v160-cleanup-45 (AC1+AC2+TF-106): Lightweight count of vendors with
+ * opted_in decision status.
+ *
+ * Uses the same DI fallback chain as `buildOperatorConsentReport` (via the
+ * already-imported `listSellers` + `buildDecisionListEntry`) but avoids the
+ * full report overhead (no pagination, sorting, or notification-log fetching).
+ *
+ * Throws `SellerModuleUnavailableError` when the seller module cannot be
+ * resolved from scope OR the DB fallback throws — callers should map this
+ * to HTTP 503 per AC3(d). The broad catch is intentional: any failure to
+ * read vendor state should surface as 503 rather than 500, because the
+ * cascade decision tree is undefined under partial vendor data.
+ *
+ * @param scope  - Medusa request scope (req.scope)
+ * @param window - Reserved for future cohort-window scoping (story OQ #2).
+ *   Currently the cascade operates on the full active-vendor scope (no
+ *   window), matching Story 8.4 semantics. Passing a window today is a
+ *   no-op and emits a warning to surface the mismatch early.
+ */
+export async function countOptedInVendors(
+  scope: Scope,
+  window?: { startMs: number; endMs: number },
+): Promise<number> {
+  if (window) {
+    // Make the unused-window contract explicit — AC6 preserves the existing
+    // (windowless) cascade contract; future window-scoped queries land in a
+    // follow-up story per OQ #2 deferral.
+    // eslint-disable-next-line no-console
+    console.warn(
+      "[countOptedInVendors] window arg ignored — full active-vendor scope used (OQ #2 deferred).",
+    )
+  }
+  let sellers: Awaited<ReturnType<typeof listSellers>>
+  try {
+    sellers = await listSellers(scope)
+  } catch (err) {
+    throw new SellerModuleUnavailableError(
+      err instanceof Error ? err : new Error(String(err)),
+    )
+  }
+  return sellers.filter(
+    (s) => buildDecisionListEntry(s).decision_status === "opted_in",
+  ).length
+}
