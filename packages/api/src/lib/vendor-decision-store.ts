@@ -365,3 +365,160 @@ export function buildDecisionListEntry(seller: SellerRecord): {
     last_action_at: lifecycleDecision?.captured_at ?? null,
   }
 }
+
+// ---------------------------------------------------------------------------
+// Lifecycle state table helpers — Story v160-cleanup-47 (TF-108)
+// ---------------------------------------------------------------------------
+
+const LIFECYCLE_STATE_TABLE = "vendor_lifecycle_state"
+
+export type VendorLifecycleStateRow = {
+  id: string
+  seller_id: string
+  lifecycle_status: LifecycleStatus
+  decision_state: DecisionStatus
+  opt_in_at: string | null
+  opt_out_at: string | null
+  last_transition_at: string
+  last_transition_by: string
+  created_at: string
+  updated_at: string
+}
+
+export type WriteLifecycleStateInput = {
+  lifecycle_status: LifecycleStatus
+  decision_state?: DecisionStatus
+  opt_in_at?: string | null
+  opt_out_at?: string | null
+  last_transition_at: string
+  last_transition_by: string
+}
+
+/**
+ * Read the lifecycle state row for a seller.
+ * Returns null when the row does not yet exist (lazy-seed path handles this
+ * in the GET handler).
+ *
+ * Must be called with an optional trx when inside a transaction block.
+ */
+export async function getLifecycleState(
+  scope: ScopeResolver,
+  sellerId: string,
+  trx?: Knex.Transaction,
+): Promise<VendorLifecycleStateRow | null> {
+  const db = resolveSellerDb(scope)
+  if (!db) {
+    throw new Error("PG_CONNECTION is not available in the request scope")
+  }
+
+  const query = (trx ?? db)<VendorLifecycleStateRow>(LIFECYCLE_STATE_TABLE)
+    .select("*")
+    .where({ seller_id: sellerId })
+    .forUpdate() // SELECT FOR UPDATE — serializes concurrent writers (AC5)
+    .first()
+
+  const row = await query
+  return row ?? null
+}
+
+/**
+ * Write (upsert) the lifecycle state row for a seller inside a DB transaction.
+ *
+ * Uses INSERT ... ON CONFLICT (seller_id) DO UPDATE so the first call for a
+ * seller seeds the row; subsequent calls update it. The caller is responsible
+ * for wrapping this in a transaction that also appends the audit log row —
+ * both operations must succeed or both must roll back (AC4 atomicity).
+ */
+export async function writeLifecycleState(
+  trx: Knex.Transaction,
+  sellerId: string,
+  input: WriteLifecycleStateInput,
+): Promise<VendorLifecycleStateRow> {
+  const now = new Date().toISOString()
+
+  const [row] = await trx<VendorLifecycleStateRow>(LIFECYCLE_STATE_TABLE)
+    .insert({
+      seller_id: sellerId,
+      lifecycle_status: input.lifecycle_status,
+      decision_state: input.decision_state ?? "pending",
+      opt_in_at: input.opt_in_at ?? null,
+      opt_out_at: input.opt_out_at ?? null,
+      last_transition_at: input.last_transition_at,
+      last_transition_by: input.last_transition_by,
+      updated_at: now,
+    })
+    .onConflict("seller_id")
+    .merge([
+      "lifecycle_status",
+      "decision_state",
+      "opt_in_at",
+      "opt_out_at",
+      "last_transition_at",
+      "last_transition_by",
+      "updated_at",
+    ])
+    .returning("*")
+
+  if (!row) {
+    throw new Error("vendor_lifecycle_state_upsert_returned_no_row")
+  }
+
+  return row
+}
+
+/**
+ * Seed a default `pending_approval` lifecycle row for a seller (lazy-seed on
+ * first GET). Runs inside a transaction supplied by the caller.
+ */
+export async function seedDefaultLifecycleState(
+  trx: Knex.Transaction,
+  sellerId: string,
+): Promise<VendorLifecycleStateRow> {
+  const now = new Date().toISOString()
+
+  const [row] = await trx<VendorLifecycleStateRow>(LIFECYCLE_STATE_TABLE)
+    .insert({
+      seller_id: sellerId,
+      lifecycle_status: "pending_approval" as LifecycleStatus,
+      decision_state: "pending" as DecisionStatus,
+      opt_in_at: null,
+      opt_out_at: null,
+      last_transition_at: now,
+      last_transition_by: "system",
+      updated_at: now,
+    })
+    .onConflict("seller_id")
+    .ignore()
+    .returning("*")
+
+  if (!row) {
+    // Row already existed — re-read it (concurrent seed race)
+    const existing = await trx<VendorLifecycleStateRow>(LIFECYCLE_STATE_TABLE)
+      .select("*")
+      .where({ seller_id: sellerId })
+      .first()
+
+    if (!existing) {
+      throw new Error(`vendor_lifecycle_state_seed_failed for seller ${sellerId}`)
+    }
+    return existing
+  }
+
+  return row
+}
+
+/**
+ * Resolve a Knex transaction from the request scope.
+ * Throws if PG_CONNECTION is unavailable.
+ */
+export async function withLifecycleTransaction<T>(
+  scope: ScopeResolver,
+  fn: (trx: Knex.Transaction) => Promise<T>,
+): Promise<T> {
+  const db = resolveSellerDb(scope)
+  if (!db) {
+    throw new Error("PG_CONNECTION is not available in the request scope")
+  }
+
+  return db.transaction(fn)
+}

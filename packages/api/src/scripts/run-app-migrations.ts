@@ -52,6 +52,8 @@ const APP_SURFACE_CONFIG: MigrationSurfaceConfig = {
       tableExists(connection, "operator_alert_evaluator_tick_history"),
     Migration20260505190000OperatorT30KickoffTable: (connection) =>
       tableExists(connection, "operator_t30_kickoff"),
+    Migration20260507200000VendorLifecycleStateTable: (connection) =>
+      tableExists(connection, "vendor_lifecycle_state"),
   },
   prerequisites: {
     Migration20260430090100VoucherDeliveryDecisionTable: {
