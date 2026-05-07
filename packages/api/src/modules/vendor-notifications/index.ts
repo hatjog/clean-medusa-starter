@@ -53,9 +53,14 @@ export interface VendorNotificationLogEntry {
   sent_at: string // ISO 8601
   locale: "pl" | "en"
   recipient_email: string
-  status: "sent" | "failed"
+  // v160-cleanup-39: added "rejected" for training-cert upload rejection audit rows
+  status: "sent" | "failed" | "deduplicated" | "rejected"
   error_message?: string | null
   triggered_by: string // admin user id OR "system" for cron
+  /** Story v160-cleanup-40: true when force=true bypassed cooldown gate */
+  forced?: boolean
+  /** Story v160-cleanup-40: arbitrary audit metadata (dedup_of, forced_by, etc.) */
+  metadata?: Record<string, unknown> | null
 }
 
 // Story v160-7-3: decision confirmation (opt-in / opt-out)
