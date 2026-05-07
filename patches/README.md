@@ -24,8 +24,9 @@ filed for tracking).
 | **Fix** | Rewrite middleware async: pre-fetch open seller IDs + their products via `query.graph` link traversal, collect visible product IDs, filter by `Product.id $in [...]`. Refined in cleanup-11 (Story 8.8 AC6) — earlier seller_id filter still crashed CriteriaNode. |
 | **Upstream issue** | TODO — to be filed at `mercurjs/mercur` (story `v160-cleanup-2`) |
 | **Expiry condition** | Remove when Mercur ≥ 2.2.0 ships native fix; verify by reverting patch + running `__tests__/patches/mercur-core-visibility-filter.integration.spec.ts` |
-| **Last verified** | 2026-05-04 (story v160-8-8 AC6 live E2E — `/store/products` returns 10 products via patched filter) |
-| **Regression test** | `__tests__/patches/mercur-core-visibility-filter.integration.spec.ts` (TODO — author in cleanup-2 execution phase) |
+| **Last verified** | 2026-05-06 (Run 6 pre-promote smoke — `/store/products?limit=1` returns 200 with BB publishable-api-key under patched filter; see `specs/operator/pre-promote-smoke-checklist.md` §3) |
+| **Regression test** | `__tests__/patches/mercur-core-visibility-filter.integration.spec.ts` — covers cleanup-11 link-traversal shape, sentinel, both Mercur 1.x and cleanup-2 crash guards, and explicit `take: 10000` pagination cap (B-2 latent scaling fix) |
+| **Patch shape note** | Compiled `.medusa/server/.../middlewares.js` is intentionally rewritten without the trailing `//# sourceMappingURL=...` comment + final newline. Node CJS does not consume the sourcemap; preserving the omission stabilizes the patch hash. If a future upstream bump regenerates the sourcemap, regenerate the patch with the sourcemap dropped to keep `patchedDependencies` hash deterministic. |
 
 ---
 
