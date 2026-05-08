@@ -29,7 +29,7 @@ describe("security-gate-verifier", () => {
   })
 
   it("verifies real token-bucket refusal behavior for the rate-limiting gate", async () => {
-    const { verifyGate } = await import("../security-gate-verifier")
+    const { verifyGate } = await import("../security-gate-verifier.js")
     const result = await verifyGate("rate_limiting")
 
     expect(result).toMatchObject({
@@ -40,7 +40,7 @@ describe("security-gate-verifier", () => {
   })
 
   it("treats missing live probe env for captcha/csrf/signing as skip and overall fail", async () => {
-    const { verifyAllGates } = await import("../security-gate-verifier")
+    const { verifyAllGates } = await import("../security-gate-verifier.js")
     const result = await verifyAllGates()
 
     expect(result.overall).toBe("fail")
@@ -89,7 +89,7 @@ describe("security-gate-verifier", () => {
 
     process.env.GP_SEC_GATE_CAPTCHA_FIXTURE_PATH = fixturePath
 
-    const { verifyGate } = await import("../security-gate-verifier")
+    const { verifyGate } = await import("../security-gate-verifier.js")
     const result = await verifyGate("captcha")
 
     expect(result).toMatchObject({
@@ -131,7 +131,7 @@ describe("security-gate-verifier", () => {
 
     process.env.GP_SEC_GATE_CSRF_FIXTURE_PATH = fixturePath
 
-    const { verifyGate } = await import("../security-gate-verifier")
+    const { verifyGate } = await import("../security-gate-verifier.js")
     const result = await verifyGate("csrf")
 
     expect(result).toMatchObject({
@@ -151,7 +151,7 @@ describe("security-gate-verifier", () => {
       .mockResolvedValueOnce({ status: 403 } as Response)
       .mockResolvedValueOnce({ status: 200 } as Response)
 
-    const { verifyGate } = await import("../security-gate-verifier")
+    const { verifyGate } = await import("../security-gate-verifier.js")
     const result = await verifyGate("csrf")
 
     expect(result).toMatchObject({
@@ -194,7 +194,7 @@ describe("security-gate-verifier", () => {
     process.env.GP_CONFIG_VERIFY_PUBKEY = rawPublicKey.toString("base64")
     process.env.GP_SEC_GATE_GP_CONFIG_FIXTURE_PATH = fixturePath
 
-    const { verifyGate } = await import("../security-gate-verifier")
+    const { verifyGate } = await import("../security-gate-verifier.js")
     const result = await verifyGate("gp_config_signing")
 
     expect(result).toMatchObject({

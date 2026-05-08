@@ -19,7 +19,7 @@ import {
   __setKnexForTests,
   CAPABILITY_MANIFEST,
   SUPER_ADMIN_CAPABILITY,
-} from "../capability-check"
+} from "../capability-check.js"
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -205,7 +205,7 @@ describe("AC5-6: Cache invalidation", () => {
     // Document: worst-case stale grant after cache population = CACHE_TTL_MS ms.
     // Tests above confirm explicit invalidation works immediately.
     // TTL is 30_000 ms (exported from capability-grants-repo.ts).
-    const { CACHE_TTL_MS } = await import("../capability-grants-repo")
+    const { CACHE_TTL_MS } = await import("../capability-grants-repo.js")
     expect(CACHE_TTL_MS).toBe(30_000)
   })
 })

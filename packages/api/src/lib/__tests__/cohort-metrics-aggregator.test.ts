@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "@jest/globals"
 
-import { _resetForTest, recordRequest } from "../request-log-aggregator"
+import { _resetForTest, recordRequest } from "../request-log-aggregator.js"
 
 type PersistedAuditRow = {
   id: string
@@ -67,7 +67,7 @@ describe("cohort-metrics-aggregator", () => {
   })
 
   it("returns unknown KPI states when no request samples exist", async () => {
-    const { computeCohortMetrics } = await import("../cohort-metrics-aggregator")
+    const { computeCohortMetrics } = await import("../cohort-metrics-aggregator.js")
     const result = await computeCohortMetrics()
 
     expect(result.cohorts.first_24h_on.p95_latency_ms).toMatchObject({
@@ -92,7 +92,7 @@ describe("cohort-metrics-aggregator", () => {
       })
     })
 
-    const { computeCohortMetrics } = await import("../cohort-metrics-aggregator")
+    const { computeCohortMetrics } = await import("../cohort-metrics-aggregator.js")
     const result = await computeCohortMetrics()
     const cohort = result.cohorts.first_24h_on
 
@@ -163,7 +163,7 @@ describe("cohort-metrics-aggregator", () => {
       status_code: 200,
     })
 
-    const { computeCohortMetrics } = await import("../cohort-metrics-aggregator")
+    const { computeCohortMetrics } = await import("../cohort-metrics-aggregator.js")
     const result = await computeCohortMetrics({ db, nowMs: now })
 
     expect(result.cohorts.pre_flip_baseline.p95_latency_ms).toMatchObject({
@@ -245,7 +245,7 @@ describe("cohort-metrics-aggregator", () => {
     recordRequest({ ts: onAt + 2 * 60 * 60 * 1000, duration_ms: 200, status_code: 200 })
     recordRequest({ ts: onAt + 30 * 60 * 60 * 1000, duration_ms: 220, status_code: 200 })
 
-    const { computeCohortMetrics } = await import("../cohort-metrics-aggregator")
+    const { computeCohortMetrics } = await import("../cohort-metrics-aggregator.js")
     const result = await computeCohortMetrics({ db, nowMs: now })
 
     // NPS: all cohorts have insufficient reviews → unknown + reason
@@ -277,7 +277,7 @@ describe("cohort-metrics-aggregator", () => {
   })
 
   it("activates the zero-opt-in cascade for shadow/on flag states", async () => {
-    const { computeZeroOptInCascade } = await import("../cohort-metrics-aggregator")
+    const { computeZeroOptInCascade } = await import("../cohort-metrics-aggregator.js")
     const result = await computeZeroOptInCascade(0, "shadow")
 
     expect(result).toMatchObject({
