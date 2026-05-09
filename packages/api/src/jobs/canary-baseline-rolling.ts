@@ -56,6 +56,13 @@ interface QueryRunner {
   ): Promise<{ rows: Array<Record<string, unknown>> }>;
 }
 
+interface KnexRawRunner {
+  raw(
+    sql: string,
+    bindings?: unknown[]
+  ): Promise<{ rows?: Array<Record<string, unknown>> } | Array<Record<string, unknown>>>;
+}
+
 interface PosthogClient {
   capture(args: {
     distinctId: string;
@@ -111,6 +118,56 @@ const _resolveOptional = <T>(container: MedusaContainer | undefined, key: string
   } catch {
     return null;
   }
+};
+
+const _isQueryRunner = (value: unknown): value is QueryRunner =>
+  Boolean(value && typeof (value as QueryRunner).query === "function");
+
+const _isKnexRawRunner = (value: unknown): value is KnexRawRunner =>
+  Boolean(value && typeof (value as KnexRawRunner).raw === "function");
+
+const _toKnexRawSql = (
+  sql: string,
+  params: unknown[] = []
+): { sql: string; bindings: unknown[] } => {
+  const bindings: unknown[] = [];
+  const rewrittenSql = sql.replace(/\$(\d+)/g, (_match, index: string) => {
+    const paramIndex = Number(index) - 1;
+    bindings.push(params[paramIndex]);
+    return "?";
+  });
+
+  return {
+    sql: rewrittenSql,
+    bindings: bindings.length > 0 ? bindings : params,
+  };
+};
+
+const _normalizeRawRows = (
+  result: Awaited<ReturnType<KnexRawRunner["raw"]>>
+): Array<Record<string, unknown>> => {
+  if (Array.isArray(result)) return result;
+  if (Array.isArray(result.rows)) return result.rows;
+  return [];
+};
+
+export const resolveQueryRunner = (
+  container: MedusaContainer | undefined
+): QueryRunner | null => {
+  const connection = _resolveOptional<unknown>(container, "__pg_connection__");
+
+  if (_isQueryRunner(connection)) return connection;
+  if (_isKnexRawRunner(connection)) {
+    return {
+      query: async (sql: string, params?: unknown[]) => {
+        const raw = _toKnexRawSql(sql, params ?? []);
+        const result = await connection.raw(raw.sql, raw.bindings);
+        return { rows: _normalizeRawRows(result) };
+      },
+    };
+  }
+
+  return null;
 };
 
 /**
@@ -236,7 +293,7 @@ export default async function canaryBaselineRolling(
   container: MedusaContainer
 ): Promise<void> {
   const logger = _resolveLogger(container);
-  const query = _resolveOptional<QueryRunner>(container, "__pg_connection__");
+  const query = resolveQueryRunner(container);
   const posthog = _resolveOptional<PosthogClient>(container, "posthog");
   const sentry = _resolveOptional<SentryClient>(container, "sentry");
 
