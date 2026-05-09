@@ -1,4 +1,6 @@
 import { ExecArgs } from "@medusajs/framework/types"
+import { ContainerRegistrationKeys } from "@medusajs/framework/utils"
+import type { Knex } from "knex"
 
 type AnyFn = (...args: any[]) => any
 
@@ -13,6 +15,12 @@ type RegionLike = {
   name?: string
   currency_code?: string | null
   countries?: Array<{ iso_2?: string | null }> | string[] | null
+}
+
+type RegionRow = {
+  id?: string
+  currency_code?: string | null
+  country_codes?: string[] | null
 }
 
 function uniqNonEmpty(values: string[]): string[] {
@@ -179,6 +187,42 @@ async function createRegion(service: any, data: any): Promise<any> {
   ])
 }
 
+function extractRows<T>(result: any): T[] {
+  if (Array.isArray(result?.rows)) {
+    return result.rows as T[]
+  }
+
+  if (Array.isArray(result)) {
+    return result as T[]
+  }
+
+  return []
+}
+
+async function listRegionsWithCountries(db: Knex): Promise<RegionRow[]> {
+  const result = await db.raw(
+    `
+      SELECT
+        r.id,
+        lower(r.currency_code) AS currency_code,
+        COALESCE(array_remove(array_agg(DISTINCT lower(rc.iso_2)), NULL), '{}') AS country_codes
+      FROM region r
+      LEFT JOIN region_country rc
+        ON rc.region_id = r.id
+       AND rc.deleted_at IS NULL
+      WHERE r.deleted_at IS NULL
+      GROUP BY r.id, r.currency_code
+    `
+  )
+
+  return extractRows<RegionRow>(result).map((row) => ({
+    ...row,
+    country_codes: Array.isArray(row.country_codes)
+      ? row.country_codes.map((code) => String(code).toLowerCase())
+      : [],
+  }))
+}
+
 function hasCountry(region: RegionLike, countryCode: string): boolean {
   const normalized = countryCode.toLowerCase()
   return (region.countries ?? []).some((country) => {
@@ -194,9 +238,10 @@ export default async function seed({ container, args }: ExecArgs) {
   const marketIds = parseMarketIds(args)
   const salesChannelService = resolveSalesChannelService(container)
   const regionService = resolveRegionService(container)
+  const db = container.resolve(ContainerRegistrationKeys.PG_CONNECTION) as Knex
 
   const existing = await listSalesChannels(salesChannelService)
-  const existingRegions = await listRegions(regionService)
+  const existingRegions = await listRegionsWithCountries(db)
 
   const created: string[] = []
   const skipped: string[] = []
@@ -205,7 +250,7 @@ export default async function seed({ container, args }: ExecArgs) {
 
   const plnRegion = existingRegions.find((region) => {
     const currencyMatches = (region.currency_code ?? "").toLowerCase() === "pln"
-    return currencyMatches && hasCountry(region, "pl")
+    return currencyMatches && (region.country_codes ?? []).includes("pl")
   })
 
   if (plnRegion) {
