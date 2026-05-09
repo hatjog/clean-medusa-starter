@@ -163,7 +163,8 @@ export async function runAlertEvaluatorTickWithOptions(options: {
         computed_at: result.computed_at,
       }
       _firingHistory.push(row)
-      historyRows.push(row)
+      // jsonb column requires JSON-encoded text for primitive values; raw strings like "synthetic_breach" are not valid JSON.
+      historyRows.push({ ...row, evaluated_value: JSON.stringify(alert.evaluated_value) })
       if (alert.action === "auto_rollback") {
         const rb = await triggerRollback(
           alert.id,
