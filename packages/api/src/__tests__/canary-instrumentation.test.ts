@@ -33,6 +33,7 @@ import canaryBaselineRolling, {
   SCHEDULE_NAME,
   WINDOW_24H_MINUS_5MIN_SQL,
   computeWindow,
+  resolveQueryRunner,
 } from "../jobs/canary-baseline-rolling";
 
 /**
@@ -553,6 +554,32 @@ describe("canary-baseline-rolling job (AC-CANARY-1.4-02)", () => {
     expect(calls[0].sql).toContain("interval '24 hours'");
     expect(calls[0].sql).toContain("interval '5 minutes'");
     expect(result.window_end_utc).toContain("2026-04-29");
+  });
+
+  test("resolveQueryRunner adapts Medusa PG_CONNECTION Knex raw runner", async () => {
+    const rawCalls: Array<{ sql: string; bindings?: unknown[] }> = [];
+    const fakeContainer = {
+      resolve: (key: string) => {
+        if (key !== "__pg_connection__") throw new Error("not registered");
+        return {
+          raw: async (sql: string, bindings?: unknown[]) => {
+            rawCalls.push({ sql, bindings });
+            return { rows: [{ market_id: "bonbeauty" }] };
+          },
+        };
+      },
+    } as unknown as Parameters<typeof canaryBaselineRolling>[0];
+
+    const query = resolveQueryRunner(fakeContainer);
+    await expect(
+      query?.query("SELECT * FROM canary_metric_events WHERE market_id = $1", [
+        "bonbeauty",
+      ])
+    ).resolves.toEqual({ rows: [{ market_id: "bonbeauty" }] });
+    expect(rawCalls[0]).toEqual({
+      sql: "SELECT * FROM canary_metric_events WHERE market_id = ?",
+      bindings: ["bonbeauty"],
+    });
   });
 
   test("job exits cleanly when DB is not wired (test/no-DB env)", async () => {
