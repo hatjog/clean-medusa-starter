@@ -21,6 +21,7 @@ import {
   scopeCustomerEmail,
 } from "../lib/customer-scoped-email";
 import { marketContextStorage } from "../lib/market-context";
+import { filterProductIdsByFilters } from "../lib/product-market-scope";
 import { recordRequest } from "../lib/request-log-aggregator";
 import { installRlsPoolHook, type HookLogger } from "../lib/rls-pool-hook";
 import { marketContextCache } from "../loaders/market-context-cache";
@@ -46,10 +47,20 @@ type RequestExtensions = {
   validatedBody?: Record<string, unknown>;
   auth_context?: AuthContext;
   params?: Record<string, unknown>;
+  query?: Record<string, unknown>;
   path?: string;
   originalUrl?: string;
   url?: string;
   get?: (headerName: string) => unknown;
+};
+
+type ProductListResponseBody = {
+  products?: Array<Record<string, unknown>>;
+  product?: Record<string, unknown>;
+  count?: number;
+  offset?: number;
+  limit?: number;
+  [key: string]: unknown;
 };
 
 const RLS_DEBUG_ENV = "GP_RLS_DEBUG";
@@ -576,6 +587,129 @@ export async function cartMarketGuardMiddleware(
   next();
 }
 
+function productMarketId(product: Record<string, unknown>): string | null {
+  const metadata = product.metadata;
+  if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) {
+    return null;
+  }
+
+  const gp = (metadata as Record<string, unknown>).gp;
+  if (gp && typeof gp === "object" && !Array.isArray(gp)) {
+    const value = (gp as Record<string, unknown>).market_id;
+    return typeof value === "string" && value.trim() ? value : null;
+  }
+
+  const value = (metadata as Record<string, unknown>).market_id;
+  return typeof value === "string" && value.trim() ? value : null;
+}
+
+function integerQueryValue(value: unknown, fallback: number): number {
+  const raw = Array.isArray(value) ? value[0] : value;
+  const parsed =
+    typeof raw === "number"
+      ? raw
+      : typeof raw === "string"
+        ? Number.parseInt(raw, 10)
+        : Number.NaN;
+
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+function productFields(req: MedusaRequest): string[] {
+  const fields = getRequestExtensions(req).query?.fields;
+  if (typeof fields !== "string") {
+    return ["*"];
+  }
+
+  const parsed = fields
+    .split(",")
+    .map((field) => field.trim())
+    .filter(Boolean);
+
+  return parsed.length > 0 ? Array.from(new Set([...parsed, "metadata"])) : ["*"];
+}
+
+export async function productListMarketScopeMiddleware(
+  req: MedusaRequest,
+  res: MedusaResponse,
+  next: MedusaNextFunction
+): Promise<void> {
+  const originalJson = res.json.bind(res);
+
+  (res as unknown as { json: (body: unknown) => Promise<void> }).json =
+    async (body: unknown): Promise<void> => {
+      const context = marketContextStorage.getStore();
+      if (
+        !context?.market_id ||
+        !context.sales_channel_id ||
+        !body ||
+        typeof body !== "object" ||
+        Array.isArray(body)
+      ) {
+        return originalJson(body);
+      }
+
+      const typedBody = body as ProductListResponseBody;
+      if (!Array.isArray(typedBody.products)) {
+        if (
+          typedBody.product &&
+          typeof typedBody.product === "object" &&
+          !Array.isArray(typedBody.product) &&
+          productMarketId(typedBody.product) !== context.market_id
+        ) {
+          res.status(404);
+          return originalJson({ message: "Product not found" });
+        }
+        return originalJson(body);
+      }
+
+      const hasCrossMarketProducts = typedBody.products.some(
+        (product) => productMarketId(product) !== context.market_id
+      );
+      if (!hasCrossMarketProducts) {
+        return originalJson(body);
+      }
+
+      const db = req.scope.resolve(ContainerRegistrationKeys.PG_CONNECTION) as Knex;
+      const query = req.scope.resolve(ContainerRegistrationKeys.QUERY) as {
+        graph: (input: Record<string, unknown>) => Promise<{ data: Array<Record<string, unknown>> }>;
+      };
+      const request = getRequestExtensions(req);
+      const limit = integerQueryValue(request.query?.limit, Number(typedBody.limit ?? 20));
+      const offset = integerQueryValue(request.query?.offset, Number(typedBody.offset ?? 0));
+      const { productIds, count } = await filterProductIdsByFilters(
+        db,
+        context.sales_channel_id,
+        {},
+        { offset, limit }
+      );
+
+      if (productIds.length === 0) {
+        return originalJson({ ...typedBody, products: [], count, offset, limit });
+      }
+
+      const { data: products } = await query.graph({
+        entity: "product",
+        fields: productFields(req),
+        filters: { id: productIds },
+      });
+      const productsById = new Map(products.map((product) => [product.id, product]));
+      const orderedProducts = productIds
+        .map((id) => productsById.get(id))
+        .filter((product): product is Record<string, unknown> => Boolean(product));
+
+      return originalJson({
+        ...typedBody,
+        products: orderedProducts,
+        count,
+        offset,
+        limit,
+      });
+    };
+
+  next();
+}
+
 export default defineMiddlewares({
   routes: [
     {
@@ -659,7 +793,7 @@ export default defineMiddlewares({
     {
       method: ["GET"],
       matcher: "/store/products",
-      middlewares: [vendorMetaMiddleware],
+      middlewares: [productListMarketScopeMiddleware, vendorMetaMiddleware],
     },
     {
       method: ["GET"],
