@@ -5,6 +5,7 @@
 const mockInstallRlsPoolHook = jest.fn();
 const mockEnsureLoaded = jest.fn();
 const mockGet = jest.fn();
+const mockFilterProductIdsByFilters = jest.fn();
 
 jest.mock("@medusajs/framework/http", () => ({
   defineMiddlewares: (config: unknown) => config,
@@ -14,6 +15,7 @@ jest.mock("@medusajs/framework/http", () => ({
 jest.mock("@medusajs/framework/utils", () => ({
   ContainerRegistrationKeys: {
     PG_CONNECTION: "__pg_connection__",
+    QUERY: "__query__",
     LOGGER: "logger",
   },
 }));
@@ -29,9 +31,14 @@ jest.mock("../../loaders/market-context-cache", () => ({
   },
 }));
 
+jest.mock("../../lib/product-market-scope", () => ({
+  filterProductIdsByFilters: (...args: unknown[]) => mockFilterProductIdsByFilters(...args),
+}));
+
 import {
   marketContextMiddleware,
   marketGuardMiddleware,
+  productListMarketScopeMiddleware,
 } from "../../api/middlewares";
 import { marketContextStorage } from "../../lib/market-context";
 
@@ -43,6 +50,7 @@ describe("Market Context Middleware", () => {
     mockEnsureLoaded.mockReset();
     mockEnsureLoaded.mockResolvedValue(undefined);
     mockGet.mockReset();
+    mockFilterProductIdsByFilters.mockReset();
     delete process.env.GP_RLS_DEBUG;
   });
 
@@ -142,6 +150,84 @@ describe("Market Context Middleware", () => {
     await marketContextMiddleware(req, {} as any, next);
 
     expect(next).toHaveBeenCalled();
+  });
+});
+
+describe("Product List Market Scope Middleware", () => {
+  it("rehydrates native product lists when the response leaks another market", async () => {
+    mockFilterProductIdsByFilters.mockResolvedValue({
+      productIds: ["prod_evt"],
+      count: 1,
+    });
+    const db = { name: "db" };
+    const query = {
+      graph: jest.fn().mockResolvedValue({
+        data: [
+          {
+            id: "prod_evt",
+            title: "Event product",
+            status: "published",
+            metadata: { gp: { market_id: "bonevent" } },
+          },
+        ],
+      }),
+    };
+    const req = {
+      query: { limit: "3", offset: "0", fields: "id,title,status,metadata" },
+      scope: {
+        resolve: jest.fn((key: string) => {
+          if (key === "__pg_connection__") return db;
+          if (key === "__query__") return query;
+          return undefined;
+        }),
+      },
+    } as any;
+    const originalJson = jest.fn();
+    const res = { json: originalJson, status: jest.fn().mockReturnThis() } as any;
+    const next = jest.fn();
+
+    await marketContextStorage.run(
+      { market_id: "bonevent", sales_channel_id: "sc_evt" },
+      async () => {
+        await productListMarketScopeMiddleware(req, res, next);
+        await res.json({
+          products: [
+            {
+              id: "prod_bb",
+              title: "Beauty product",
+              metadata: { gp: { market_id: "bonbeauty" } },
+            },
+          ],
+          count: 115,
+          offset: 0,
+          limit: 3,
+        });
+      }
+    );
+
+    expect(next).toHaveBeenCalled();
+    expect(mockFilterProductIdsByFilters).toHaveBeenCalledWith(
+      db,
+      "sc_evt",
+      {},
+      { offset: 0, limit: 3 }
+    );
+    expect(query.graph).toHaveBeenCalledWith({
+      entity: "product",
+      fields: ["id", "title", "status", "metadata"],
+      filters: { id: ["prod_evt"] },
+    });
+    expect(originalJson).toHaveBeenCalledWith(
+      expect.objectContaining({
+        products: [
+          expect.objectContaining({
+            id: "prod_evt",
+            metadata: { gp: { market_id: "bonevent" } },
+          }),
+        ],
+        count: 1,
+      })
+    );
   });
 });
 
