@@ -24,7 +24,7 @@
  *   This route is at /webhooks/stripe (NOT /store/webhooks/stripe) to ensure
  *   it is NOT subject to the /store/* market guard middleware chain.
  *   Stripe webhooks do not carry a publishable-api-key — placing this route
- *   under /store/* would cause marketGuardMiddleware to return 403 on all events.
+ *   under /store/* would cause marketGuardMiddleware to return 401 on all events.
  *   Register `https://your-domain/webhooks/stripe` in the Stripe Dashboard.
  *
  * Raw body requirement:

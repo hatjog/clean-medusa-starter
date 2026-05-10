@@ -276,8 +276,33 @@ function setRequestValue(
   }
 }
 
+/**
+ * Story 4.4 F7 — HTTP semantics split:
+ *
+ * The publishable-key based market-context resolution can fail in two distinct
+ * scenarios on `/store/*` routes:
+ *
+ *   - Missing `x-publishable-api-key` header → unauthenticated → 401
+ *   - Header present but key unknown / revoked → unauthenticated → 401
+ *
+ * Both map to the same wire response because the runtime cannot
+ * distinguish between "no key" and "wrong key" without leaking key-existence
+ * to anonymous callers. They share status code 401 (Unauthorized).
+ *
+ * Cross-market access with a VALID publishable key (e.g. a customer in
+ * market A authenticating against market B) is enforced by
+ * `failWithCustomerMarket` (403 Forbidden) and `cartMarketGuardMiddleware`
+ * (404 to avoid leaking cart existence). Those callers are intentionally
+ * NOT routed through `failWithMarketContext`.
+ *
+ * Per HTTP semantics (RFC 7235):
+ *   - 401 = authentication required / failed
+ *   - 403 = authenticated but not authorized
+ *
+ * Story 4.4 AC3 mandates 401 for missing/invalid publishable key.
+ */
 function failWithMarketContext(res: MedusaResponse): void {
-  res.status(403).json({ message: "Market context required" });
+  res.status(401).json({ message: "Market context required" });
 }
 
 export function requestLogMetricsMiddleware(
@@ -342,7 +367,9 @@ export async function marketContextMiddleware(
 
 /**
  * Market Guard Middleware — fail-closed.
- * Store requests without market context → 403.
+ * Store requests without market context → 401 (missing/invalid publishable key).
+ * Cross-market access with a VALID key is handled separately by the customer
+ * guards (403) and cartMarketGuardMiddleware (404). See Story 4.4 AC3 / F7.
  * Runs AFTER marketContextMiddleware.
  */
 export async function marketGuardMiddleware(
@@ -718,7 +745,7 @@ export default defineMiddlewares({
     //
     // IMPORTANT: Route is at /webhooks/stripe (NOT /store/webhooks/stripe).
     // Stripe webhooks do not carry x-publishable-api-key, so placing this
-    // route under /store/* would cause marketGuardMiddleware to return 403
+    // route under /store/* would cause marketGuardMiddleware to return 401
     // on every inbound event. The /webhooks/* path is outside the /store/*
     // matcher block and receives no market guard middleware.
     {
