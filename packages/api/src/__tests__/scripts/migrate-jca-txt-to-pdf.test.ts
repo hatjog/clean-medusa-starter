@@ -17,6 +17,7 @@ import {
   parseFlags,
   helpText,
   runMigration,
+  makeKnexAdapters,
   type MigrationIO,
   type AllowedInstance,
   type LegacyRow,
@@ -308,5 +309,64 @@ describe("STAGING-FREE v1.6.0 baseline", () => {
     expect(outcome.exitCode).toBe(0)
     expect(outcome.legacyRowsFound).toBe(0)
     expect(io.stdoutOutput()).toContain("Nothing to migrate")
+  })
+})
+
+// ── makeKnexAdapters — append-only idempotency ───────────────────────────────
+
+describe("makeKnexAdapters", () => {
+  it("counts only legacy rows without an existing correction row", async () => {
+    const calls: Array<{ sql: string; params?: unknown[] }> = []
+    const db = {
+      raw: async (sql: string, params?: unknown[]) => {
+        calls.push({ sql, params })
+        return { rows: [{ count: "2" }] }
+      },
+    }
+
+    const adapters = makeKnexAdapters(db)
+    await expect(adapters.countLegacyRows("bonbeauty")).resolves.toBe(2)
+
+    expect(calls[0].sql).toContain("NOT EXISTS")
+    expect(calls[0].sql).toContain("metadata->>'original_row_id'")
+    expect(calls[0].sql).toContain("legacy.id::text")
+  })
+
+  it("propagates DB errors instead of reporting false zero rows", async () => {
+    const db = {
+      raw: async () => {
+        throw new Error("relation vendor_notification_log does not exist")
+      },
+    }
+
+    const adapters = makeKnexAdapters(db)
+    await expect(adapters.countLegacyRows("bonbeauty")).rejects.toThrow(
+      "vendor_notification_log",
+    )
+    await expect(adapters.fetchLegacyRows("bonbeauty")).rejects.toThrow(
+      "vendor_notification_log",
+    )
+  })
+
+  it("inserts corrections with an original_row_id guard for rerun safety", async () => {
+    const calls: Array<{ sql: string; params?: unknown[] }> = []
+    const db = {
+      raw: async (sql: string, params?: unknown[]) => {
+        calls.push({ sql, params })
+        return { rowCount: 1 }
+      },
+    }
+
+    const adapters = makeKnexAdapters(db)
+    await expect(
+      adapters.insertCorrectionRows("bonbeauty", SAMPLE_ROWS.slice(0, 1)),
+    ).resolves.toEqual({ rowsInserted: 1 })
+
+    expect(calls[0].sql).toContain("NOT EXISTS")
+    expect(calls[0].sql).toContain("metadata->>'original_row_id'")
+    expect(JSON.parse(String(calls[0].params?.[0]))).toMatchObject({
+      format: "pdf",
+      original_row_id: "row-1",
+    })
   })
 })
