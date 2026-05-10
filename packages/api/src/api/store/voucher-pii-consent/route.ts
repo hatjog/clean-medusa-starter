@@ -1,4 +1,5 @@
 import type { MedusaRequest, MedusaResponse } from "@medusajs/framework/http";
+import { ContainerRegistrationKeys } from "@medusajs/framework/utils";
 import { randomUUID } from "node:crypto";
 
 import { marketContextStorage } from "../../../lib/market-context";
@@ -67,7 +68,17 @@ function isKnownPauseState(v: unknown): v is PauseState {
   );
 }
 
-type GrantValidated = RecordConsentInput & { action: "grant"; token: string };
+type GrantLegacyValidated = RecordConsentInput & {
+  action: "grant";
+  token: string;
+  source: "legacy-body";
+};
+type GrantTokenValidated = {
+  action: "grant";
+  token: string;
+  locale: string;
+  source: "claim-token";
+};
 type WithdrawValidated = {
   action: "withdraw";
   token: string;
@@ -82,10 +93,27 @@ type PauseValidated = {
   market_id: string;
   request_id: string;
 };
-type ValidatedBody = GrantValidated | WithdrawValidated | PauseValidated;
+type ValidatedBody = GrantLegacyValidated | GrantTokenValidated | WithdrawValidated | PauseValidated;
 
-function validateGrantBody(body: RawBody): GrantValidated | string {
-  if (!isNonEmptyString(body.market_id)) return "market_id required";
+type EntitlementConsentSnapshot = {
+  entitlement_id: string;
+  market_id: string;
+  order_id: string;
+  buyer_email: string | null;
+  buyer_is_recipient: boolean;
+};
+
+function validateGrantBody(body: RawBody): GrantLegacyValidated | GrantTokenValidated | string {
+  if (!isNonEmptyString(body.market_id)) {
+    if (!isNonEmptyString(body.token)) return "token required for grant";
+    if (!isNonEmptyString(body.locale)) return "locale required";
+    return {
+      action: "grant",
+      token: body.token,
+      locale: body.locale,
+      source: "claim-token",
+    };
+  }
   if (!isNonEmptyString(body.order_id)) return "order_id required";
   if (!isNonEmptyString(body.entitlement_id)) return "entitlement_id required";
   if (!isNonEmptyString(body.locale)) return "locale required";
@@ -112,6 +140,7 @@ function validateGrantBody(body: RawBody): GrantValidated | string {
   return {
     action: "grant",
     token,
+    source: "legacy-body",
     market_id: body.market_id,
     order_id: body.order_id,
     entitlement_id: body.entitlement_id,
@@ -199,6 +228,72 @@ function resolveService(req: MedusaRequest): VoucherPiiService | null {
   }
 }
 
+function resolveDb(req: MedusaRequest): { raw: (sql: string, params?: unknown[]) => Promise<unknown> } | null {
+  const scope = (req as unknown as { scope?: { resolve?: (k: string) => unknown } }).scope;
+  try {
+    const resolved = scope?.resolve?.(ContainerRegistrationKeys.PG_CONNECTION) as
+      | { raw: (sql: string, params?: unknown[]) => Promise<unknown> }
+      | undefined;
+    return resolved ?? null;
+  } catch {
+    return null;
+  }
+}
+
+async function lookupEntitlementByClaimToken(
+  db: { raw: (sql: string, params?: unknown[]) => Promise<unknown> },
+  token: string
+): Promise<EntitlementConsentSnapshot | null> {
+  const sql = `
+    SELECT
+      entitlement_id::text AS entitlement_id,
+      market_id::text AS market_id,
+      order_id::text AS order_id,
+      buyer_email::text AS buyer_email,
+      COALESCE(buyer_is_recipient, false) AS buyer_is_recipient
+    FROM gp_core.entitlements
+    WHERE claim_token::text = $1
+    LIMIT 1
+  `;
+  const result = await db.raw(sql, [token]);
+  const rows = Array.isArray((result as { rows?: unknown[] })?.rows)
+    ? ((result as { rows: unknown[] }).rows)
+    : Array.isArray(result)
+      ? (result as unknown[])
+      : [];
+  const row = rows[0] as Partial<EntitlementConsentSnapshot> | undefined;
+  if (
+    !row?.entitlement_id ||
+    !row.market_id ||
+    !row.order_id
+  ) {
+    return null;
+  }
+  return {
+    entitlement_id: String(row.entitlement_id),
+    market_id: String(row.market_id),
+    order_id: String(row.order_id),
+    buyer_email: row.buyer_email == null ? null : String(row.buyer_email),
+    buyer_is_recipient: Boolean(row.buyer_is_recipient),
+  };
+}
+
+function inputFromEntitlement(
+  validation: GrantTokenValidated,
+  entitlement: EntitlementConsentSnapshot
+): RecordConsentInput {
+  return {
+    market_id: entitlement.market_id,
+    order_id: entitlement.order_id,
+    entitlement_id: entitlement.entitlement_id,
+    recipient_email: entitlement.buyer_is_recipient ? entitlement.buyer_email : null,
+    recipient_phone: null,
+    locale: validation.locale,
+    is_gift: !entitlement.buyer_is_recipient,
+    request_id: randomUUID(),
+  };
+}
+
 export async function POST(
   req: MedusaRequest,
   res: MedusaResponse
@@ -225,8 +320,39 @@ export async function POST(
 
   try {
     if (validation.action === "grant") {
-      const result = await service.recordConsentTransaction(validation);
+      let input: RecordConsentInput;
+      if (validation.source === "legacy-body") {
+        input = validation;
+      } else {
+        const db = resolveDb(req);
+        if (!db) {
+          res.status(503).json({
+            error: "service_unavailable",
+            code: "gp_core_entitlement_lookup_unavailable",
+          });
+          return;
+        }
+        const entitlement = await lookupEntitlementByClaimToken(db, validation.token);
+        if (!entitlement) {
+          res.status(404).json({
+            error: "entitlement_not_found",
+            message: "Consent token not found",
+          });
+          return;
+        }
+        if (marketId && entitlement.market_id !== marketId) {
+          res.status(404).json({
+            error: "entitlement_not_found",
+            message: "Consent token not found",
+          });
+          return;
+        }
+        input = inputFromEntitlement(validation, entitlement);
+      }
+
+      const result = await service.recordConsentTransaction(input);
       res.status(201).json({
+        audit_id: result.consent_audit_id,
         consent_audit_id: result.consent_audit_id,
         recipient_pii_id: result.recipient_pii_id,
         delivery_decision_id: result.delivery_decision_id,
