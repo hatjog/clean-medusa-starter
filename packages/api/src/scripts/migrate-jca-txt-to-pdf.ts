@@ -69,6 +69,15 @@ export function parseFlags(args: string[] | undefined): ParseFlagsResult {
     if (token === "--help" || token === "-h") {
       return { ok: false, error: "__HELP__" }
     }
+    // Review fix M-3: reject unknown tokens so typos like `--aplly` or
+    // `--Apply` do not silently mode-switch the migration.
+    return {
+      ok: false,
+      error:
+        "Unknown argument: " +
+        token +
+        ". Run with --help for the list of supported flags.",
+    }
   }
 
   if (!instance || instance.length === 0) {
@@ -113,13 +122,19 @@ export function helpText(): string {
     "",
     "Flags:",
     "  --instance <id>   Required. One of: " + ALLOWED_INSTANCES.join(", "),
+    "                    Compared against env GP_INSTANCE (when set) to guard",
+    "                    against cross-instance writes; mismatch aborts with",
+    "                    exit code 2 before any DB read.",
     "  --apply           Opt-in. Performs DB writes after operator confirmation.",
+    "                    Confirmation prompt requires the exact string 'yes'",
+    "                    (lowercase); anything else aborts with no writes.",
     "                    Without this flag the script runs in dry-run mode.",
     "  --dry-run         Default. Wins over --apply if both supplied.",
     "  --help, -h        Show this message.",
     "",
     "Note: vendor_notification_log is append-only (immutable trigger on UPDATE/",
-    "DELETE). Migration writes NEW correction rows; original rows are preserved.",
+    "DELETE). Migration writes NEW correction rows; original rows are preserved",
+    "with vendor_handle and other context fields copied forward.",
     "",
     "Expected outcome for v1.7.0: 0 legacy rows (STAGING-FREE v1.6.0 — ADR-066).",
   ].join("\n")
@@ -147,6 +162,11 @@ export type MigrationIO = {
   countLegacyRows: CountLegacyFn
   fetchLegacyRows: FetchLegacyFn
   insertCorrectionRows: InsertCorrectionFn
+  /**
+   * Optional environment lookup for cross-instance write guards (review fix
+   * M-2). Defaults to `process.env` in production. Tests inject a stub.
+   */
+  env?: { GP_INSTANCE?: string | null | undefined }
 }
 
 export type MigrationOutcome = {
@@ -174,6 +194,29 @@ export async function runMigration(
   }
 
   const { instance, apply } = parsed.flags
+
+  // Review fix M-2: guard against cross-instance writes. If GP_INSTANCE is
+  // set in the environment, it must match the --instance flag. When unset
+  // the script proceeds (logging-only label) but emits a stderr warning.
+  const envInstance = io.env?.GP_INSTANCE ?? null
+  if (envInstance && envInstance.length > 0 && envInstance !== instance) {
+    io.stderr.write(
+      "Instance mismatch: --instance=" +
+        instance +
+        " but env GP_INSTANCE=" +
+        envInstance +
+        ". Refusing to run to prevent cross-instance writes.\n",
+    )
+    return { exitCode: 2, mode: apply ? "apply" : "dry-run", instance }
+  }
+  if (!envInstance) {
+    io.stderr.write(
+      "[migrate-jca-txt-to-pdf] warning: env GP_INSTANCE is not set; " +
+        "--instance is recorded as a logging label only. Actual DB binding " +
+        "is the active Medusa container.\n",
+    )
+  }
+
   const legacyCount = await io.countLegacyRows(instance)
 
   io.stdout.write(
@@ -273,22 +316,35 @@ export async function runMigration(
 }
 
 export function defaultPrompt(question: string): Promise<string> {
+  // Review fix L-1: track settlement so SIGINT rejects with a distinct
+  // reason instead of being swallowed by the close event firing first.
   return new Promise((resolve, reject) => {
     const rl = readline.createInterface({
       input: process.stdin,
       output: process.stdout,
       terminal: false,
     })
+    let settled = false
+    const settleResolve = (value: string) => {
+      if (settled) return
+      settled = true
+      resolve(value)
+    }
+    const settleReject = (err: Error) => {
+      if (settled) return
+      settled = true
+      reject(err)
+    }
     rl.question(question, (answer) => {
       rl.close()
-      resolve(answer)
+      settleResolve(answer)
     })
     rl.on("close", () => {
-      resolve("")
+      settleResolve("")
     })
     rl.on("SIGINT", () => {
+      settleReject(new Error("SIGINT received during operator prompt"))
       rl.close()
-      reject(new Error("SIGINT received during operator prompt"))
     })
   })
 }
@@ -353,24 +409,36 @@ export function makeKnexAdapters(db: any): {
       const correctionMetadata = {
         ...(row.metadata ?? {}),
         format: "pdf",
-        migration_note:
-          "Story 4.3 v1.7.0: retired legacy .txt format; format set to pdf (renderPDF() removed by cleanup-41 code review B-8)",
+        // Review fix I-1: keep the migration note grep-friendly but short.
+        migration_note: "story-4-3:jca-txt-retired",
         migrated_at: new Date().toISOString(),
         original_row_id: row.id,
       }
+      // Review fix M-1: copy vendor_handle forward to keep the audit join
+      // between the legacy and correction rows intact.
+      // Review fix L-4: re-check the legacy predicate explicitly so a
+      // partially-migrated dataset cannot insert a correction for a row
+      // that no longer matches the legacy criteria.
       const sql = `
         INSERT INTO vendor_notification_log
-          (vendor_id, notification_type, locale, recipient_email, status, triggered_by, metadata)
+          (vendor_id, vendor_handle, notification_type, locale, recipient_email, status, triggered_by, metadata)
         SELECT
           legacy.vendor_id,
+          legacy.vendor_handle,
           'jca_generated',
           legacy.locale,
           legacy.recipient_email,
           'sent',
-          'migrate-jca-txt-to-pdf',
+          'script:migrate-jca-txt-to-pdf',
           $1::jsonb
         FROM vendor_notification_log legacy
         WHERE legacy.id = $2
+          AND legacy.notification_type = 'jca_generated'
+          AND (
+            legacy.metadata IS NULL
+            OR legacy.metadata->>'format' IS NULL
+            OR legacy.metadata->>'format' != 'pdf'
+          )
           AND NOT EXISTS (
             SELECT 1
             FROM vendor_notification_log correction
@@ -404,6 +472,7 @@ export default async function migrateJcaTxtToPdf({
     countLegacyRows: adapters.countLegacyRows,
     fetchLegacyRows: adapters.fetchLegacyRows,
     insertCorrectionRows: adapters.insertCorrectionRows,
+    env: { GP_INSTANCE: process.env.GP_INSTANCE ?? null },
   })
 
   if (outcome.exitCode !== 0) {

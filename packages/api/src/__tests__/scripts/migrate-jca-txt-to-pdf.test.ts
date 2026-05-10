@@ -54,6 +54,13 @@ function makeIO(opts: {
   rows?: LegacyRow[]
   promptAnswer?: string | Error
   insertShouldFail?: boolean
+  /**
+   * Optional env override for cross-instance guard tests. Defaults to
+   * GP_INSTANCE=bonbeauty so default-path tests do not emit the "env unset"
+   * warning. Use `null` to simulate unset env, or a different string to
+   * simulate mismatch.
+   */
+  env?: { GP_INSTANCE: string | null }
 }): MigrationIO & {
   stdoutOutput: () => string
   stderrOutput: () => string
@@ -72,6 +79,10 @@ function makeIO(opts: {
     stdout,
     stderr,
     prompt,
+    env:
+      opts.env === undefined
+        ? { GP_INSTANCE: "bonbeauty" }
+        : { GP_INSTANCE: opts.env.GP_INSTANCE ?? undefined },
     countLegacyRows: async (_inst: AllowedInstance) => opts.legacyCount ?? 0,
     fetchLegacyRows: async (_inst: AllowedInstance) => opts.rows ?? [],
     insertCorrectionRows: async (
@@ -141,6 +152,18 @@ describe("parseFlags", () => {
     const r = parseFlags(["--instance=mercur"])
     expect(r.ok).toBe(true)
     if (r.ok) expect(r.flags.instance).toBe("mercur")
+  })
+
+  it("review fix M-3: rejects unknown flags (e.g. typo --aplly)", () => {
+    const r = parseFlags(["--instance", "bonbeauty", "--aplly"])
+    expect(r.ok).toBe(false)
+    if (!r.ok) expect(r.error).toContain("Unknown argument")
+  })
+
+  it("review fix M-3: rejects --Apply (case-sensitive)", () => {
+    const r = parseFlags(["--instance", "bonbeauty", "--Apply"])
+    expect(r.ok).toBe(false)
+    if (!r.ok) expect(r.error).toContain("Unknown argument")
   })
 })
 
@@ -312,6 +335,42 @@ describe("STAGING-FREE v1.6.0 baseline", () => {
   })
 })
 
+// ── runMigration — cross-instance env guard (review fix M-2) ─────────────────
+
+describe("runMigration — cross-instance env guard", () => {
+  it("aborts with exit 2 when GP_INSTANCE env disagrees with --instance flag", async () => {
+    const io = makeIO({
+      legacyCount: 5,
+      env: { GP_INSTANCE: "testmarketb" },
+    })
+    const outcome = await runMigration(
+      ["--instance", "bonbeauty", "--apply"],
+      io,
+    )
+    expect(outcome.exitCode).toBe(2)
+    expect(io.stderrOutput()).toContain("Instance mismatch")
+    expect(io.insertCalls).toBe(0)
+  })
+
+  it("proceeds and warns to stderr when GP_INSTANCE is unset", async () => {
+    const io = makeIO({ legacyCount: 0, env: { GP_INSTANCE: null } })
+    const outcome = await runMigration(["--instance", "bonbeauty"], io)
+    expect(outcome.exitCode).toBe(0)
+    expect(io.stderrOutput()).toContain("GP_INSTANCE is not set")
+  })
+
+  it("proceeds silently when GP_INSTANCE matches --instance", async () => {
+    const io = makeIO({
+      legacyCount: 0,
+      env: { GP_INSTANCE: "bonbeauty" },
+    })
+    const outcome = await runMigration(["--instance", "bonbeauty"], io)
+    expect(outcome.exitCode).toBe(0)
+    expect(io.stderrOutput()).not.toContain("GP_INSTANCE is not set")
+    expect(io.stderrOutput()).not.toContain("Instance mismatch")
+  })
+})
+
 // ── makeKnexAdapters — append-only idempotency ───────────────────────────────
 
 describe("makeKnexAdapters", () => {
@@ -368,5 +427,46 @@ describe("makeKnexAdapters", () => {
       format: "pdf",
       original_row_id: "row-1",
     })
+  })
+
+  it("review fix M-1: INSERT carries vendor_handle from the legacy row", async () => {
+    const calls: Array<{ sql: string; params?: unknown[] }> = []
+    const db = {
+      raw: async (sql: string, params?: unknown[]) => {
+        calls.push({ sql, params })
+        return { rowCount: 1 }
+      },
+    }
+    const adapters = makeKnexAdapters(db)
+    await adapters.insertCorrectionRows("bonbeauty", SAMPLE_ROWS.slice(0, 1))
+    expect(calls[0].sql).toContain("vendor_handle")
+    expect(calls[0].sql).toContain("legacy.vendor_handle")
+  })
+
+  it("review fix L-4: INSERT re-checks the legacy predicate inside its WHERE clause", async () => {
+    const calls: Array<{ sql: string; params?: unknown[] }> = []
+    const db = {
+      raw: async (sql: string, params?: unknown[]) => {
+        calls.push({ sql, params })
+        return { rowCount: 1 }
+      },
+    }
+    const adapters = makeKnexAdapters(db)
+    await adapters.insertCorrectionRows("bonbeauty", SAMPLE_ROWS.slice(0, 1))
+    expect(calls[0].sql).toContain("legacy.notification_type = 'jca_generated'")
+    expect(calls[0].sql).toContain("metadata->>'format'")
+  })
+
+  it("review fix I-2: triggered_by is the scoped 'script:' identifier", async () => {
+    const calls: Array<{ sql: string; params?: unknown[] }> = []
+    const db = {
+      raw: async (sql: string, params?: unknown[]) => {
+        calls.push({ sql, params })
+        return { rowCount: 1 }
+      },
+    }
+    const adapters = makeKnexAdapters(db)
+    await adapters.insertCorrectionRows("bonbeauty", SAMPLE_ROWS.slice(0, 1))
+    expect(calls[0].sql).toContain("'script:migrate-jca-txt-to-pdf'")
   })
 })
