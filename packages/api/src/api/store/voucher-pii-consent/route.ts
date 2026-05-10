@@ -1,6 +1,6 @@
 import type { MedusaRequest, MedusaResponse } from "@medusajs/framework/http";
 import { ContainerRegistrationKeys } from "@medusajs/framework/utils";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 import { marketContextStorage } from "../../../lib/market-context";
 import {
@@ -9,6 +9,32 @@ import {
   type RecordConsentInput,
   type VoucherPiiService,
 } from "../../../modules/voucher-pii";
+
+/**
+ * Resolve a per-request correlation id from caller-supplied headers (Story 4.4
+ * review F9 — NFR-OBS-5 trace propagation). Preference order:
+ *   1. Idempotency-Key (collapses retries; storefront ships this).
+ *   2. x-request-id (canonical trace id header).
+ *   3. randomUUID() — last-resort fallback.
+ */
+function resolveRequestId(req: MedusaRequest): string {
+  const headers = (req as unknown as { headers?: Record<string, unknown> }).headers ?? {};
+  const idem = headers["idempotency-key"];
+  if (typeof idem === "string" && idem.length > 0 && idem.length <= 200) return idem;
+  const traceId = headers["x-request-id"];
+  if (typeof traceId === "string" && traceId.length > 0 && traceId.length <= 200) return traceId;
+  return randomUUID();
+}
+
+/**
+ * Hash a sensitive token for audit-row persistence (Story 4.4 review F5).
+ * Raw consent claim tokens are credentials — they MUST NOT land in the audit
+ * JSONB payload. We persist `sha256(token)` so the chain still binds to the
+ * token identity without storing the credential.
+ */
+function hashToken(token: string): string {
+  return `sha256:${createHash("sha256").update(token).digest("hex")}`;
+}
 
 /**
  * POST /store/voucher-pii-consent — STORY-2-2 D-66 endpoint.
@@ -68,23 +94,28 @@ function isKnownPauseState(v: unknown): v is PauseState {
   );
 }
 
+type ProvenanceFields = {
+  surface?: "js" | "no-js";
+  occurred_at?: string;
+  schema_version?: 1;
+};
 type GrantLegacyValidated = RecordConsentInput & {
   action: "grant";
   token: string;
   source: "legacy-body";
-};
+} & ProvenanceFields;
 type GrantTokenValidated = {
   action: "grant";
   token: string;
   locale: string;
   source: "claim-token";
-};
+} & ProvenanceFields;
 type WithdrawValidated = {
   action: "withdraw";
   token: string;
   compensates_audit_id: string;
   locale: string;
-};
+} & ProvenanceFields;
 type PauseValidated = {
   action: "pause";
   token: string;
@@ -92,7 +123,7 @@ type PauseValidated = {
   pause_state: PauseState;
   market_id: string;
   request_id: string;
-};
+} & ProvenanceFields;
 type ValidatedBody = GrantLegacyValidated | GrantTokenValidated | WithdrawValidated | PauseValidated;
 
 type EntitlementConsentSnapshot = {
@@ -103,7 +134,38 @@ type EntitlementConsentSnapshot = {
   buyer_is_recipient: boolean;
 };
 
+/**
+ * Validate provenance fields shipped by storefront `buildAuditPayload`
+ * (Story 4.4 review F6). All three are optional in the wire schema but must
+ * be strictly typed when present. `schema_version` must equal 1 — future
+ * versions require a new contract.
+ */
+function validateProvenance(body: RawBody): ProvenanceFields | string {
+  const out: ProvenanceFields = {};
+  if (body.surface !== undefined) {
+    if (body.surface !== "js" && body.surface !== "no-js") {
+      return "surface must be 'js' or 'no-js'";
+    }
+    out.surface = body.surface;
+  }
+  if (body.occurred_at !== undefined) {
+    if (typeof body.occurred_at !== "string" || body.occurred_at.length === 0) {
+      return "occurred_at must be ISO-8601 string";
+    }
+    const parsed = Date.parse(body.occurred_at);
+    if (Number.isNaN(parsed)) return "occurred_at must be ISO-8601 string";
+    out.occurred_at = body.occurred_at;
+  }
+  if (body.schema_version !== undefined) {
+    if (body.schema_version !== 1) return "schema_version must be 1";
+    out.schema_version = 1;
+  }
+  return out;
+}
+
 function validateGrantBody(body: RawBody): GrantLegacyValidated | GrantTokenValidated | string {
+  const prov = validateProvenance(body);
+  if (typeof prov === "string") return prov;
   if (!isNonEmptyString(body.market_id)) {
     if (!isNonEmptyString(body.token)) return "token required for grant";
     if (!isNonEmptyString(body.locale)) return "locale required";
@@ -112,6 +174,7 @@ function validateGrantBody(body: RawBody): GrantLegacyValidated | GrantTokenVali
       token: body.token,
       locale: body.locale,
       source: "claim-token",
+      ...prov,
     };
   }
   if (!isNonEmptyString(body.order_id)) return "order_id required";
@@ -149,49 +212,70 @@ function validateGrantBody(body: RawBody): GrantLegacyValidated | GrantTokenVali
     locale: body.locale,
     is_gift: body.is_gift,
     request_id: randomUUID(),
+    ...prov,
   };
 }
 
 function validateWithdrawBody(body: RawBody): WithdrawValidated | string {
+  const prov = validateProvenance(body);
+  if (typeof prov === "string") return prov;
   if (!isNonEmptyString(body.compensates_audit_id)) {
     return "compensates_audit_id required for withdraw";
   }
   if (!isNonEmptyString(body.locale)) return "locale required";
-  const token = isNonEmptyString(body.token) ? body.token : "";
+  // Review F3: withdraw MUST carry the consent token so we can prove the caller
+  // holds the credential bound to the audit row being withdrawn. Empty-token
+  // withdraws are rejected.
+  if (!isNonEmptyString(body.token)) {
+    return "token required for withdraw";
+  }
   return {
     action: "withdraw",
-    token,
+    token: body.token,
     compensates_audit_id: body.compensates_audit_id,
     locale: body.locale,
+    ...prov,
   };
 }
 
 function validatePauseBody(
   body: RawBody,
-  marketCtx: string | null
+  marketCtx: string | null,
+  request_id: string
 ): PauseValidated | string {
+  const prov = validateProvenance(body);
+  if (typeof prov === "string") return prov;
   if (!isNonEmptyString(body.token)) return "token required for pause";
   if (!isNonEmptyString(body.locale)) return "locale required";
   if (!isKnownPauseState(body.pause_state)) {
     return "pause_state must be one of: considering, paused, timeout, withdrawn";
   }
-  // market_id: prefer body field, fall back to market context resolved from publishable key.
-  const market_id = isNonEmptyString(body.market_id)
-    ? body.market_id
-    : marketCtx ?? "";
-  if (!market_id) return "market_id required for pause (or send x-publishable-api-key)";
+  // Review F4: market_id is ALWAYS derived from the publishable-key context.
+  // Body-supplied market_id is rejected when it disagrees with the key context
+  // (defence in depth against cross-market audit injection).
+  if (!marketCtx) {
+    return "market_id required for pause (or send x-publishable-api-key)";
+  }
+  if (isNonEmptyString(body.market_id) && body.market_id !== marketCtx) {
+    return "market_id in body does not match publishable-key context";
+  }
 
   return {
     action: "pause",
     token: body.token,
     locale: body.locale,
     pause_state: body.pause_state,
-    market_id,
-    request_id: randomUUID(),
+    market_id: marketCtx,
+    request_id,
+    ...prov,
   };
 }
 
-function validateBody(body: RawBody, marketCtx: string | null): ValidatedBody | string {
+function validateBody(
+  body: RawBody,
+  marketCtx: string | null,
+  request_id: string
+): ValidatedBody | string {
   const action = body.action;
 
   // Backward compat: no action field + market_id present → legacy grant path.
@@ -206,7 +290,7 @@ function validateBody(body: RawBody, marketCtx: string | null): ValidatedBody | 
 
   if (action === "grant") return validateGrantBody(body);
   if (action === "withdraw") return validateWithdrawBody(body);
-  return validatePauseBody(body, marketCtx);
+  return validatePauseBody(body, marketCtx, request_id);
 }
 
 function setSecurityHeaders(res: MedusaResponse): void {
@@ -244,6 +328,9 @@ async function lookupEntitlementByClaimToken(
   db: { raw: (sql: string, params?: unknown[]) => Promise<unknown> },
   token: string
 ): Promise<EntitlementConsentSnapshot | null> {
+  // Review F11: explicit ORDER BY makes the LIMIT 1 deterministic even if the
+  // UNIQUE invariant on claim_token is violated (tombstones, replication
+  // anomalies). Newest row wins.
   const sql = `
     SELECT
       entitlement_id::text AS entitlement_id,
@@ -253,6 +340,7 @@ async function lookupEntitlementByClaimToken(
       COALESCE(buyer_is_recipient, false) AS buyer_is_recipient
     FROM gp_core.entitlements
     WHERE claim_token::text = $1
+    ORDER BY created_at DESC NULLS LAST
     LIMIT 1
   `;
   const result = await db.raw(sql, [token]);
@@ -280,8 +368,12 @@ async function lookupEntitlementByClaimToken(
 
 function inputFromEntitlement(
   validation: GrantTokenValidated,
-  entitlement: EntitlementConsentSnapshot
+  entitlement: EntitlementConsentSnapshot,
+  request_id: string
 ): RecordConsentInput {
+  // Review F17 NOTE: when `buyer_is_recipient=false` (gift), recipient_email is
+  // null here by design — gift recipients are onboarded through a separate
+  // claim flow that captures the recipient PII outside this consent surface.
   return {
     market_id: entitlement.market_id,
     order_id: entitlement.order_id,
@@ -290,7 +382,7 @@ function inputFromEntitlement(
     recipient_phone: null,
     locale: validation.locale,
     is_gift: !entitlement.buyer_is_recipient,
-    request_id: randomUUID(),
+    request_id,
   };
 }
 
@@ -303,7 +395,12 @@ export async function POST(
   const marketCtx = marketContextStorage.getStore();
   const marketId = marketCtx?.market_id ?? null;
 
-  const validation = validateBody(req.body as RawBody, marketId);
+  // Review F9: derive a stable per-request correlation id from caller headers
+  // before validation so all downstream service calls share the same id and
+  // double-submits with the same Idempotency-Key collapse (F8).
+  const requestId = resolveRequestId(req);
+
+  const validation = validateBody(req.body as RawBody, marketId, requestId);
   if (typeof validation === "string") {
     res.status(400).json({ error: "validation_failed", message: validation });
     return;
@@ -322,7 +419,7 @@ export async function POST(
     if (validation.action === "grant") {
       let input: RecordConsentInput;
       if (validation.source === "legacy-body") {
-        input = validation;
+        input = { ...validation, request_id: requestId };
       } else {
         const db = resolveDb(req);
         if (!db) {
@@ -347,7 +444,7 @@ export async function POST(
           });
           return;
         }
-        input = inputFromEntitlement(validation, entitlement);
+        input = inputFromEntitlement(validation, entitlement, requestId);
       }
 
       const result = await service.recordConsentTransaction(input);
@@ -372,11 +469,58 @@ export async function POST(
         });
         return;
       }
+
+      // Review F2: enforce that the snapshot's market matches the caller's
+      // publishable-key-derived market. Mismatch leaks as a generic 404 to
+      // avoid disclosing audit-id existence cross-market.
+      if (marketId && snapshot.market_id !== marketId) {
+        res.status(404).json({
+          error: "consent_not_found",
+          message: "Original consent audit not found or already withdrawn",
+        });
+        return;
+      }
+
+      // Review F1: refuse to fabricate order_id from a token when the snapshot
+      // doesn't carry one. The canonical schema requires `order_id` minLength 1.
+      if (!snapshot.order_id || snapshot.order_id.length === 0) {
+        res.status(409).json({
+          error: "consent_incomplete",
+          code: "missing_order_id",
+          message: "Original consent audit has no order_id; cannot record withdrawal.",
+        });
+        return;
+      }
+
+      // Review F3: bind the withdrawal to proof of possession of the claim
+      // token. Look up the entitlement for the supplied token; reject when
+      // the resolved entitlement does not match the snapshot's market+order.
+      const db = resolveDb(req);
+      if (!db) {
+        res.status(503).json({
+          error: "service_unavailable",
+          code: "gp_core_entitlement_lookup_unavailable",
+        });
+        return;
+      }
+      const entitlement = await lookupEntitlementByClaimToken(db, validation.token);
+      if (
+        !entitlement ||
+        entitlement.market_id !== snapshot.market_id ||
+        entitlement.order_id !== snapshot.order_id
+      ) {
+        res.status(404).json({
+          error: "consent_not_found",
+          message: "Original consent audit not found or already withdrawn",
+        });
+        return;
+      }
+
       const result = await service.recordWithdrawalTransaction({
         market_id: snapshot.market_id,
-        order_id: snapshot.order_id ?? validation.token,
+        order_id: snapshot.order_id,
         consent_audit_id: validation.compensates_audit_id,
-        request_id: randomUUID(),
+        request_id: requestId,
         withdrawal_path: "immediate",
       });
       res.status(201).json({
@@ -388,7 +532,16 @@ export async function POST(
     }
 
     // action === 'pause'
-    const result = await service.recordPauseAudit(validation);
+    // Review F5: persist `token_hash` instead of the raw token; the service
+    // already accepts a `token` field that lands in the audit JSONB. We pass
+    // the hash so the audit chain cannot be used to replay the credential.
+    const result = await service.recordPauseAudit({
+      market_id: validation.market_id,
+      token: hashToken(validation.token),
+      locale: validation.locale,
+      pause_state: validation.pause_state,
+      request_id: requestId,
+    });
     res.status(201).json({
       pause_audit_id: result.pause_audit_id,
       latency_ms: result.latency_ms,
