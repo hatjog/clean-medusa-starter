@@ -712,6 +712,14 @@ export async function productListMarketScopeMiddleware(
 
 export default defineMiddlewares({
   routes: [
+    // Story 6.1: Stripe webhook — raw body required for HMAC-SHA256 signature
+    // verification (NFR24). bodyParser: false tells Medusa not to pre-parse
+    // JSON so the route handler can read the unmodified byte stream.
+    {
+      method: ["POST"],
+      matcher: "/store/webhooks/stripe",
+      bodyParser: false,
+    },
     {
       method: ["POST"],
       matcher: "/auth/user/emailpass",
