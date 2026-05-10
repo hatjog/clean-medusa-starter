@@ -1,5 +1,5 @@
 /**
- * POST /store/webhooks/stripe — Story 6.1: Payment Hardening
+ * POST /webhooks/stripe — Story 6.1: Payment Hardening
  *
  * Stripe webhook handler. Security contract:
  *   1. Signature verification (NFR24): HMAC-SHA256 of `timestamp.rawBody`
@@ -9,16 +9,29 @@
  *      tolerance; prevents replay attacks on captured requests).
  *   3. Event deduplication by `event.id` (in-memory rolling window of 1000
  *      events, TTL 10 min). Duplicate → 200 idempotent ACK, no action.
+ *      NOTE: In-memory dedup is single-process only — safe for single-replica
+ *      deployments. Multi-replica deployments should migrate to DB-backed dedup
+ *      (unique constraint on event.id) per the architectural roadmap.
  *   4. Lifecycle state resolution: maps Stripe event types to GP shared
  *      lifecycle state ids (payment + order domains). No local aliases.
  *   5. Audit record per event: { actor, scope, request_id, outcome, timestamp }
  *      written to logger per AC 3 / T4 audit contract.
+ *      NOTE: Audit records are written to application logs (logger.info).
+ *      Durable audit table writes are deferred — requires Epic 5 audit module
+ *      integration (architectural scope, beyond Story 6.1).
+ *
+ * Route placement:
+ *   This route is at /webhooks/stripe (NOT /store/webhooks/stripe) to ensure
+ *   it is NOT subject to the /store/* market guard middleware chain.
+ *   Stripe webhooks do not carry a publishable-api-key — placing this route
+ *   under /store/* would cause marketGuardMiddleware to return 403 on all events.
+ *   Register `https://your-domain/webhooks/stripe` in the Stripe Dashboard.
  *
  * Raw body requirement:
  *   Stripe signature verification REQUIRES the unmodified raw request body.
  *   This handler reads `req` as a Node.js stream when `req.body` is not
  *   pre-parsed as a Buffer. The middleware must register this route with
- *   `bodyParser: false` (see middlewares.ts registration below).
+ *   `bodyParser: false` (see middlewares.ts registration).
  *
  * Environment:
  *   STRIPE_WEBHOOK_SECRET — Stripe CLI `whsec_...` or dashboard secret.
@@ -27,7 +40,7 @@
  * Public access: no auth header required (Stripe calls this directly).
  * Security is provided solely by signature verification.
  *
- * @see GP/backend/src/api/store/orders/[id]/payment-status/route.ts (polling endpoint)
+ * @see GP/backend/packages/api/src/api/store/orders/[id]/payment-status/route.ts (polling endpoint)
  * @see specs/contracts/governance/examples/lifecycle-state-machine.v1.example.json
  * @see specs/constitution/upstream-policy.md (no upstream issue reporting)
  */
@@ -41,7 +54,9 @@ export const AUTHENTICATE = false
 /** Stripe signature timestamp tolerance in seconds (matches Stripe default). */
 const TIMESTAMP_TOLERANCE_S = 300
 
-/** Rolling dedup window: event.id → received_at timestamp. */
+/** Rolling dedup window: event.id → received_at timestamp.
+ * In-memory only — safe for single-replica deployments.
+ * Multi-replica: migrate to DB unique constraint on event.id. */
 const _seenEventIds = new Map<string, number>()
 /** Max dedup window size before LRU eviction. */
 const DEDUP_MAX = 1000
@@ -62,13 +77,34 @@ function resolveLogger(req: MedusaRequest): LoggerLike {
   }
 }
 
+/**
+ * Evict stale dedup entries.
+ *
+ * Two-pass approach:
+ *   1. Evict all entries older than DEDUP_TTL_MS.
+ *   2. If still over capacity (DEDUP_MAX), evict oldest entries by insertion order.
+ *
+ * The early-break bug from the original implementation has been fixed:
+ *   - TTL eviction iterates all entries unconditionally.
+ *   - Capacity cap is a separate subsequent trim.
+ */
 function evictStaleDedupEntries(): void {
+  // Pass 1: evict all TTL-expired entries.
   const cutoff = Date.now() - DEDUP_TTL_MS
   for (const [id, ts] of _seenEventIds) {
     if (ts < cutoff) {
       _seenEventIds.delete(id)
     }
-    if (_seenEventIds.size <= DEDUP_MAX) break
+  }
+
+  // Pass 2: cap to DEDUP_MAX by evicting oldest (Map insertion order).
+  while (_seenEventIds.size > DEDUP_MAX) {
+    const firstKey = _seenEventIds.keys().next().value
+    if (firstKey !== undefined) {
+      _seenEventIds.delete(firstKey)
+    } else {
+      break
+    }
   }
 }
 
@@ -78,12 +114,11 @@ function isSeenEvent(eventId: string): boolean {
 }
 
 function markEventSeen(eventId: string): void {
-  if (_seenEventIds.size >= DEDUP_MAX) {
-    // Evict oldest entry (Map preserves insertion order).
-    const firstKey = _seenEventIds.keys().next().value
-    if (firstKey !== undefined) _seenEventIds.delete(firstKey)
-  }
   _seenEventIds.set(eventId, Date.now())
+  // Evict only when over capacity (not on every write).
+  if (_seenEventIds.size > DEDUP_MAX) {
+    evictStaleDedupEntries()
+  }
 }
 
 /**
@@ -148,6 +183,10 @@ function verifyStripeSignature(
 /**
  * Read raw body from request stream.
  * Used when bodyParser middleware has been disabled for this route.
+ *
+ * IMPORTANT: This route MUST be placed outside /store/* (and any other
+ * middleware group that reads req.body) so the stream is unconsumed on arrival.
+ * See route placement comment at the top of this file.
  */
 async function readRawBody(req: MedusaRequest): Promise<Buffer> {
   // If Medusa/Express already parsed the body as a Buffer, use it directly.
@@ -170,8 +209,15 @@ async function readRawBody(req: MedusaRequest): Promise<Buffer> {
 /**
  * Map Stripe event type → GP lifecycle outcome label (for audit log).
  * Only order/payment domain lifecycle state ids — no local aliases.
+ *
+ * Note on `payment_intent.canceled` → `failed`:
+ *   The lifecycle contract does not include an `expired` order state as a
+ *   distinct Stripe event outcome. Per Dev Notes: "UI surface for `expired`
+ *   maps to `failed` recovery path". The webhook maps canceled to `failed`
+ *   lifecycle status, consistent with the GET endpoint which returns `expired`
+ *   as the Medusa status alias but routes it to the `failed` recovery path.
  */
-function resolveEventOutcome(eventType: string): {
+function resolveEventOutcome(eventType: string, logger?: LoggerLike): {
   lifecycle_status: string
   outcome_label: string
 } {
@@ -181,12 +227,14 @@ function resolveEventOutcome(eventType: string): {
     case "payment_intent.payment_failed":
       return { lifecycle_status: "failed", outcome_label: "payment_failed" }
     case "payment_intent.canceled":
-      return { lifecycle_status: "expired", outcome_label: "payment_canceled" }
+      // Canceled maps to failed recovery path per Dev Notes (no separate `expired` lifecycle state).
+      return { lifecycle_status: "failed", outcome_label: "payment_canceled" }
     case "payment_intent.requires_action":
       return { lifecycle_status: "pending_psp_confirmation", outcome_label: "requires_action" }
     case "charge.dispute.created":
       return { lifecycle_status: "support_required", outcome_label: "dispute_created" }
     default:
+      logger?.warn?.(`[stripe-webhook] unhandled event type: ${eventType} — mapping to pending_psp_confirmation`)
       return { lifecycle_status: "pending_psp_confirmation", outcome_label: `unhandled_event_${eventType}` }
   }
 }
@@ -271,7 +319,7 @@ export async function POST(
   markEventSeen(eventId)
 
   // Step 5: Resolve to GP lifecycle outcome.
-  const { lifecycle_status, outcome_label } = resolveEventOutcome(eventType)
+  const { lifecycle_status, outcome_label } = resolveEventOutcome(eventType, logger)
 
   // Extract order/payment context from event metadata.
   const metadataOrderId = event.data?.object?.metadata?.order_id
@@ -280,6 +328,7 @@ export async function POST(
   // Step 6: Emit audit record (AC 3 / T4 contract).
   // Format: { actor, scope, request_id, outcome, timestamp }
   // No secrets, no PII in audit record per T4 requirement.
+  // NOTE: Durable audit table writes deferred — see file-level doc comment.
   logger.info?.(JSON.stringify({
     actor: "system",
     scope: metadataOrderId ? `order:${metadataOrderId}` : `payment_intent:${paymentIntentId ?? "unknown"}`,
@@ -294,5 +343,8 @@ export async function POST(
   // Actual order status updates are driven by Medusa's payment module
   // processing the same Stripe events via its own webhook registration.
   // This handler adds GP-level dedup + audit on top.
+  // NOTE: State mutation (driving lifecycle transitions) is an architectural
+  // enhancement deferred to a follow-up story — requires Medusa workflow
+  // integration outside the scope of Story 6.1 hardening.
   res.status(200).json({ received: true })
 }

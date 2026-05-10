@@ -27,14 +27,23 @@
  *   Only values from the shared lifecycle state machine are returned:
  *   `payment` ∈ {paid, reconciled}; `order` ∈ {pending_psp_confirmation,
  *   paid, failed, support_required}.
- *   `expired` maps to the `order.failed` recovery path per Dev Notes.
+ *   `canceled` Medusa status → `failed` recovery path per Dev Notes
+ *   (no distinct `expired` lifecycle state in the shared contract).
+ *
+ * Reconciliation poke (webhook_age):
+ *   Uses `order.created_at` (not `updated_at`) as the anchor for the
+ *   webhook staleness check. `updated_at` can be reset by unrelated order
+ *   mutations (metadata writes, line-item edits), making it an unreliable
+ *   signal. `created_at` is immutable and represents the moment the order
+ *   was placed — the age since order creation is the correct proxy for
+ *   "time since PSP confirmation was expected".
  *
  * Public access: gated by publishable-api-key middleware upstream.
  * Customer JWT is forwarded by the storefront proxy (auth is handled there).
  *
  * @see GP/storefront/src/app/api/v1/orders/[id]/payment-status/route.ts (consumer proxy)
  * @see specs/contracts/governance/examples/lifecycle-state-machine.v1.example.json
- * @see GP/backend/src/api/store/webhooks/stripe/route.ts (inbound webhook handler)
+ * @see GP/backend/packages/api/src/api/webhooks/stripe/route.ts (inbound webhook handler)
  */
 
 import { randomBytes } from "crypto"
@@ -49,13 +58,14 @@ export const AUTHENTICATE = false
 /** Webhook age threshold beyond which a reconciliation poke is emitted (ms). */
 const RECONCILIATION_POKE_THRESHOLD_MS = 120_000
 
-/** GP lifecycle status ids surfaced on this endpoint. */
+/** GP lifecycle status ids surfaced on this endpoint.
+ * Per Dev Notes: `expired` is NOT a distinct lifecycle state in the shared
+ * contract. Medusa `canceled` status maps to `failed` recovery path. */
 type PaymentLifecycleStatus =
   | "paid"
   | "pending_psp_confirmation"
   | "failed"
   | "support_required"
-  | "expired"
 
 /** Single recommended action key per lifecycle status (mirrors adapter). */
 const RECOMMENDED_ACTION: Record<PaymentLifecycleStatus, string> = {
@@ -63,10 +73,12 @@ const RECOMMENDED_ACTION: Record<PaymentLifecycleStatus, string> = {
   pending_psp_confirmation: "wait",
   failed: "retry",
   support_required: "contact_support",
-  expired: "abandon",
 }
 
-function mapMedusaPaymentStatus(raw: string | null | undefined): PaymentLifecycleStatus {
+function mapMedusaPaymentStatus(
+  raw: string | null | undefined,
+  logger?: LoggerLike,
+): PaymentLifecycleStatus {
   switch (raw) {
     case "captured":
     case "partially_captured":
@@ -78,11 +90,16 @@ function mapMedusaPaymentStatus(raw: string | null | undefined): PaymentLifecycl
     case "requires_action":
       return "pending_psp_confirmation"
     case "canceled":
-      return "expired"
+      // Canceled maps to failed recovery path per Dev Notes.
+      // No distinct `expired` state in the shared lifecycle contract.
+      return "failed"
     case "refunded":
     case "partially_refunded":
       return "support_required"
     default:
+      // Unknown Medusa status variant — default safe to pending_psp_confirmation
+      // but warn so operators can detect mapping drift early.
+      logger?.warn?.(`[payment-status] unknown Medusa payment_status: "${String(raw)}" — defaulting to pending_psp_confirmation`)
       return "pending_psp_confirmation"
   }
 }
@@ -109,7 +126,7 @@ type OrderModuleLike = {
   retrieveOrder: (id: string, options?: Record<string, unknown>) => Promise<{
     id?: string
     payment_status?: string | null
-    updated_at?: string | Date | null
+    created_at?: string | Date | null
   } | null>
 }
 
@@ -130,7 +147,7 @@ export async function GET(
   try {
     const orderModule = req.scope.resolve(Modules.ORDER) as OrderModuleLike
     const order = await orderModule.retrieveOrder(orderId, {
-      select: ["id", "payment_status", "updated_at"],
+      select: ["id", "payment_status", "created_at"],
     })
 
     if (!order) {
@@ -138,28 +155,32 @@ export async function GET(
       return
     }
 
-    const status = mapMedusaPaymentStatus(order.payment_status)
+    const status = mapMedusaPaymentStatus(order.payment_status, logger)
     const last_checked_at = new Date().toISOString()
     const recommended_action_key = RECOMMENDED_ACTION[status]
 
-    // Reconciliation poke: if still pending and webhook is stale, log signal.
+    // Reconciliation poke: if still pending and order is stale, log signal.
     // This GET endpoint NEVER mutates state — poke is logging only.
     // Actual reconciliation is driven by Medusa's payment module retry job
-    // or the Stripe webhook handler (stripe/route.ts).
-    if (status === "pending_psp_confirmation" && order.updated_at) {
-      const updatedAt = order.updated_at instanceof Date
-        ? order.updated_at
-        : new Date(order.updated_at)
-      const webhookAge = Date.now() - updatedAt.getTime()
+    // or the Stripe webhook handler (webhooks/stripe/route.ts).
+    //
+    // Anchor: order.created_at (immutable) — represents the moment the order
+    // was placed. Using created_at avoids false clock resets from unrelated
+    // order mutations (line-item edits, metadata writes) that update updated_at.
+    if (status === "pending_psp_confirmation" && order.created_at) {
+      const createdAt = order.created_at instanceof Date
+        ? order.created_at
+        : new Date(order.created_at)
+      const orderAge = Date.now() - createdAt.getTime()
 
-      if (webhookAge > RECONCILIATION_POKE_THRESHOLD_MS) {
+      if (orderAge > RECONCILIATION_POKE_THRESHOLD_MS) {
         // Audit: reconciliation poke logged per AC 3 / T4 audit contract.
         logger.info?.(JSON.stringify({
           actor: "system",
           scope: `order:${orderId}`,
           request_id,
           outcome: "reconciliation_poke_logged",
-          webhook_age_ms: webhookAge,
+          order_age_ms: orderAge,
           timestamp: last_checked_at,
         }))
       }
