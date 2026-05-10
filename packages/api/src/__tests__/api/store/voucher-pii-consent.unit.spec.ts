@@ -11,7 +11,7 @@
  *   - R-NEW-6           → no silent fallback, no synthetic audit IDs
  */
 
-import { describe, it, expect, jest, beforeEach } from "@jest/globals"
+import { describe, it, expect, jest, beforeEach, afterEach } from "@jest/globals"
 
 const vi = jest
 import { POST } from "../../../api/store/voucher-pii-consent/route"
@@ -100,10 +100,21 @@ function makeRes() {
 }
 
 // ---------------------------------------------------------------------------
-// Market context mock — return null by default (override per test)
+// Market context mock — return null by default (override per test).
+// Review F12: spy is reset in beforeEach so tests don't leak state.
 // ---------------------------------------------------------------------------
 
-vi.spyOn(marketContextModule.marketContextStorage, "getStore").mockReturnValue(undefined)
+let marketContextSpy: ReturnType<typeof vi.spyOn>
+
+beforeEach(() => {
+  marketContextSpy = vi
+    .spyOn(marketContextModule.marketContextStorage, "getStore")
+    .mockReturnValue(undefined)
+})
+
+afterEach(() => {
+  marketContextSpy?.mockRestore()
+})
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -224,10 +235,10 @@ describe("POST /store/voucher-pii-consent — action='grant'", () => {
   })
 
   it("canonical grant cross-market token mismatch → 404 and no audit write", async () => {
-    vi.spyOn(marketContextModule.marketContextStorage, "getStore").mockReturnValue({
+    marketContextSpy.mockReturnValue({
       market_id: "bonbeauty",
       sales_channel_id: "sc_bonbeauty",
-    })
+    } as never)
     const service = makeService()
     const db = makeDb([
       {
@@ -243,7 +254,6 @@ describe("POST /store/voucher-pii-consent — action='grant'", () => {
     await POST(req, res)
     expect(res._calls.status).toBe(404)
     expect(service.recordConsentTransaction).not.toHaveBeenCalled()
-    vi.spyOn(marketContextModule.marketContextStorage, "getStore").mockReturnValue(undefined)
   })
 
   it("canonical grant without database lookup adapter → 503", async () => {
@@ -258,14 +268,28 @@ describe("POST /store/voucher-pii-consent — action='grant'", () => {
 })
 
 describe("POST /store/voucher-pii-consent — action='withdraw'", () => {
+  /** Default db mock that returns an entitlement matching the default snapshot. */
+  function makeDefaultEntitlementDb() {
+    return makeDb([
+      {
+        entitlement_id: "ent_001",
+        market_id: "bonbeauty",
+        order_id: "ord_abc",
+        buyer_email: "buyer@example.test",
+        buyer_is_recipient: true,
+      },
+    ])
+  }
+
   it("happy path → 201 with withdrawal_audit_id", async () => {
     const service = makeService()
+    const db = makeDefaultEntitlementDb()
     const req = makeReq({
       action: "withdraw",
       token: "tok_abc",
       compensates_audit_id: "aud_original_001",
       locale: "pl",
-    }, service)
+    }, service, db)
     const res = makeRes()
     await POST(req, res)
     expect(res._calls.status).toBe(201)
@@ -276,12 +300,25 @@ describe("POST /store/voucher-pii-consent — action='withdraw'", () => {
   })
 
   it("missing compensates_audit_id → 400", async () => {
-    const req = makeReq({ action: "withdraw", locale: "pl" })
+    const req = makeReq({ action: "withdraw", token: "tok_abc", locale: "pl" })
     const res = makeRes()
     await POST(req, res)
     expect(res._calls.status).toBe(400)
     const json = res._calls.json as Record<string, unknown>
     expect(String(json.message)).toMatch(/compensates_audit_id/)
+  })
+
+  it("review F3: missing token → 400", async () => {
+    const req = makeReq({
+      action: "withdraw",
+      compensates_audit_id: "aud_x",
+      locale: "pl",
+    })
+    const res = makeRes()
+    await POST(req, res)
+    expect(res._calls.status).toBe(400)
+    const json = res._calls.json as Record<string, unknown>
+    expect(String(json.message)).toMatch(/token/)
   })
 
   it("consent snapshot not found / not confirmed → 404", async () => {
@@ -291,7 +328,7 @@ describe("POST /store/voucher-pii-consent — action='withdraw'", () => {
       token: "tok_abc",
       compensates_audit_id: "aud_missing",
       locale: "pl",
-    }, service)
+    }, service, makeDefaultEntitlementDb())
     const res = makeRes()
     await POST(req, res)
     expect(res._calls.status).toBe(404)
@@ -308,15 +345,89 @@ describe("POST /store/voucher-pii-consent — action='withdraw'", () => {
       token: "tok_abc",
       compensates_audit_id: "aud_unconfirmed",
       locale: "pl",
-    }, service)
+    }, service, makeDefaultEntitlementDb())
     const res = makeRes()
     await POST(req, res)
     expect(res._calls.status).toBe(404)
   })
+
+  it("review F1: snapshot missing order_id → 409 consent_incomplete (no token fallback)", async () => {
+    const service = makeService({
+      lookupConsentSnapshot: vi.fn(async () => ({
+        audit_confirmed: true,
+        market_id: "bonbeauty",
+        order_id: null,
+      })),
+    })
+    const req = makeReq({
+      action: "withdraw",
+      token: "tok_abc",
+      compensates_audit_id: "aud_original_001",
+      locale: "pl",
+    }, service, makeDefaultEntitlementDb())
+    const res = makeRes()
+    await POST(req, res)
+    expect(res._calls.status).toBe(409)
+    const json = res._calls.json as Record<string, unknown>
+    expect(json.code).toBe("missing_order_id")
+    expect(service.recordWithdrawalTransaction).not.toHaveBeenCalled()
+  })
+
+  it("review F2: snapshot market_id differs from caller market context → 404", async () => {
+    marketContextSpy.mockReturnValue({
+      market_id: "bonbeauty",
+      sales_channel_id: "sc_bonbeauty",
+    } as never)
+    const service = makeService({
+      lookupConsentSnapshot: vi.fn(async () => ({
+        audit_confirmed: true,
+        market_id: "testmarketb",
+        order_id: "ord_other",
+      })),
+    })
+    const req = makeReq({
+      action: "withdraw",
+      token: "tok_abc",
+      compensates_audit_id: "aud_original_001",
+      locale: "pl",
+    }, service, makeDefaultEntitlementDb())
+    const res = makeRes()
+    await POST(req, res)
+    expect(res._calls.status).toBe(404)
+    expect(service.recordWithdrawalTransaction).not.toHaveBeenCalled()
+  })
+
+  it("review F3: token does not match snapshot's entitlement → 404", async () => {
+    const service = makeService()
+    // entitlement row for a *different* order than snapshot's ord_abc
+    const db = makeDb([
+      {
+        entitlement_id: "ent_other",
+        market_id: "bonbeauty",
+        order_id: "ord_other",
+        buyer_email: null,
+        buyer_is_recipient: true,
+      },
+    ])
+    const req = makeReq({
+      action: "withdraw",
+      token: "tok_wrong",
+      compensates_audit_id: "aud_original_001",
+      locale: "pl",
+    }, service, db)
+    const res = makeRes()
+    await POST(req, res)
+    expect(res._calls.status).toBe(404)
+    expect(service.recordWithdrawalTransaction).not.toHaveBeenCalled()
+  })
 })
 
 describe("POST /store/voucher-pii-consent — action='pause'", () => {
-  it("happy path with market_id in body → 201 with pause_audit_id", async () => {
+  it("review F4: happy path with body market_id matching publishable-key context → 201", async () => {
+    marketContextSpy.mockReturnValue({
+      market_id: "bonbeauty",
+      sales_channel_id: "sc_bonbeauty",
+    } as never)
     const service = makeService()
     const req = makeReq({
       action: "pause",
@@ -333,11 +444,32 @@ describe("POST /store/voucher-pii-consent — action='pause'", () => {
     expect(service.recordPauseAudit).toHaveBeenCalledTimes(1)
   })
 
+  it("review F4: body market_id MISMATCHES publishable-key context → 400", async () => {
+    marketContextSpy.mockReturnValue({
+      market_id: "bonbeauty",
+      sales_channel_id: "sc_bonbeauty",
+    } as never)
+    const service = makeService()
+    const req = makeReq({
+      action: "pause",
+      token: "tok_abc",
+      locale: "pl",
+      pause_state: "considering",
+      market_id: "testmarketb",
+    }, service)
+    const res = makeRes()
+    await POST(req, res)
+    expect(res._calls.status).toBe(400)
+    const json = res._calls.json as Record<string, unknown>
+    expect(String(json.message)).toMatch(/market_id/)
+    expect(service.recordPauseAudit).not.toHaveBeenCalled()
+  })
+
   it("market_id from context storage (no body market_id)", async () => {
-    vi.spyOn(marketContextModule.marketContextStorage, "getStore").mockReturnValue({
+    marketContextSpy.mockReturnValue({
       market_id: "ctx-market",
       sales_channel_id: "sc_ctx",
-    })
+    } as never)
     const service = makeService()
     const req = makeReq({
       action: "pause",
@@ -350,10 +482,34 @@ describe("POST /store/voucher-pii-consent — action='pause'", () => {
     expect(res._calls.status).toBe(201)
     const callArgs = service.recordPauseAudit.mock.calls[0][0] as Record<string, unknown>
     expect(callArgs.market_id).toBe("ctx-market")
-    vi.spyOn(marketContextModule.marketContextStorage, "getStore").mockReturnValue(undefined)
+  })
+
+  it("review F5: raw token is NOT persisted; sha256 hash lands in audit payload instead", async () => {
+    marketContextSpy.mockReturnValue({
+      market_id: "ctx-market",
+      sales_channel_id: "sc_ctx",
+    } as never)
+    const service = makeService()
+    const req = makeReq({
+      action: "pause",
+      token: "claim-token-secret-abc",
+      locale: "pl",
+      pause_state: "considering",
+    }, service)
+    const res = makeRes()
+    await POST(req, res)
+    expect(res._calls.status).toBe(201)
+    const callArgs = service.recordPauseAudit.mock.calls[0][0] as Record<string, unknown>
+    expect(typeof callArgs.token).toBe("string")
+    expect(callArgs.token).not.toBe("claim-token-secret-abc")
+    expect(String(callArgs.token).startsWith("sha256:")).toBe(true)
   })
 
   it("missing token → 400", async () => {
+    marketContextSpy.mockReturnValue({
+      market_id: "bb",
+      sales_channel_id: "sc_bb",
+    } as never)
     const req = makeReq({ action: "pause", locale: "pl", pause_state: "considering", market_id: "bb" })
     const res = makeRes()
     await POST(req, res)
@@ -363,6 +519,10 @@ describe("POST /store/voucher-pii-consent — action='pause'", () => {
   })
 
   it("invalid pause_state → 400", async () => {
+    marketContextSpy.mockReturnValue({
+      market_id: "bb",
+      sales_channel_id: "sc_bb",
+    } as never)
     const req = makeReq({ action: "pause", token: "tok", locale: "pl", pause_state: "invalid-state", market_id: "bb" })
     const res = makeRes()
     await POST(req, res)
@@ -372,13 +532,105 @@ describe("POST /store/voucher-pii-consent — action='pause'", () => {
   })
 
   it("no market_id in body and no context → 400", async () => {
-    vi.spyOn(marketContextModule.marketContextStorage, "getStore").mockReturnValue(undefined)
     const req = makeReq({ action: "pause", token: "tok", locale: "pl", pause_state: "considering" })
     const res = makeRes()
     await POST(req, res)
     expect(res._calls.status).toBe(400)
     const json = res._calls.json as Record<string, unknown>
     expect(String(json.message)).toMatch(/market_id/)
+  })
+})
+
+describe("POST /store/voucher-pii-consent — provenance fields (review F6)", () => {
+  it("invalid surface → 400", async () => {
+    const req = makeReq({
+      action: "grant",
+      market_id: "bb",
+      order_id: "o",
+      entitlement_id: "e",
+      locale: "pl",
+      is_gift: false,
+      surface: "telegram",
+    })
+    const res = makeRes()
+    await POST(req, res)
+    expect(res._calls.status).toBe(400)
+    const json = res._calls.json as Record<string, unknown>
+    expect(String(json.message)).toMatch(/surface/)
+  })
+
+  it("invalid occurred_at → 400", async () => {
+    const req = makeReq({
+      action: "grant",
+      market_id: "bb",
+      order_id: "o",
+      entitlement_id: "e",
+      locale: "pl",
+      is_gift: false,
+      occurred_at: "not-a-date",
+    })
+    const res = makeRes()
+    await POST(req, res)
+    expect(res._calls.status).toBe(400)
+    const json = res._calls.json as Record<string, unknown>
+    expect(String(json.message)).toMatch(/occurred_at/)
+  })
+
+  it("schema_version != 1 → 400", async () => {
+    const req = makeReq({
+      action: "grant",
+      market_id: "bb",
+      order_id: "o",
+      entitlement_id: "e",
+      locale: "pl",
+      is_gift: false,
+      schema_version: 2,
+    })
+    const res = makeRes()
+    await POST(req, res)
+    expect(res._calls.status).toBe(400)
+    const json = res._calls.json as Record<string, unknown>
+    expect(String(json.message)).toMatch(/schema_version/)
+  })
+
+  it("valid provenance fields accepted → 201", async () => {
+    const service = makeService()
+    const req = makeReq({
+      action: "grant",
+      market_id: "bb",
+      order_id: "o",
+      entitlement_id: "e",
+      locale: "pl",
+      is_gift: false,
+      surface: "js",
+      occurred_at: "2026-05-10T08:00:00.000Z",
+      schema_version: 1,
+    }, service)
+    const res = makeRes()
+    await POST(req, res)
+    expect(res._calls.status).toBe(201)
+  })
+})
+
+describe("POST /store/voucher-pii-consent — request-id propagation (review F9)", () => {
+  it("Idempotency-Key header propagates to service request_id", async () => {
+    const service = makeService()
+    const req = makeReq({
+      action: "grant",
+      market_id: "bb",
+      order_id: "o",
+      entitlement_id: "e",
+      locale: "pl",
+      is_gift: false,
+    }, service)
+    ;(req as unknown as { headers: Record<string, string> }).headers = {
+      "idempotency-key": "grant:tok:1715337600000",
+    }
+    const res = makeRes()
+    await POST(req, res)
+    expect(res._calls.status).toBe(201)
+    const callArgs = service.recordConsentTransaction.mock.calls[0][0] as Record<string, unknown>
+    expect(callArgs.request_id).toBe("grant:tok:1715337600000")
   })
 })
 
