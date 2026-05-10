@@ -11,7 +11,7 @@
  * Safety model (mirrors backfill-mor-snapshot.ts):
  *   - Default mode: --dry-run (no DB writes)
  *   - --apply: requires explicit operator confirmation "yes" before any writes
- *   - Idempotent: WHERE clause only touches rows still needing migration
+ *   - Idempotent: WHERE clause excludes rows already corrected by this script
  *   - Append-only table: migration writes a NEW row with format=pdf rather than
  *     mutating the immutable original (which has an UPDATE/DELETE trigger guard)
  *
@@ -107,8 +107,9 @@ export function helpText(): string {
     "Story 4.3 (v1.7.0) — JCA legacy .txt artifact retirement.",
     "",
     "Scans vendor_notification_log for jca_generated rows where",
-    "metadata->>'format' IS NULL or != 'pdf'. For each legacy row,",
-    "appends a new correction row with format='pdf' and migration_note.",
+    "metadata->>'format' IS NULL or != 'pdf', excluding rows that already",
+    "have a correction row linked by metadata.original_row_id. For each",
+    "remaining legacy row, appends a new correction row with format='pdf'.",
     "",
     "Flags:",
     "  --instance <id>   Required. One of: " + ALLOWED_INSTANCES.join(", "),
@@ -297,55 +298,51 @@ export function makeKnexAdapters(db: any): {
   fetchLegacyRows: FetchLegacyFn
   insertCorrectionRows: InsertCorrectionFn
 } {
+  const unreconciledLegacyPredicate = `
+        legacy.notification_type = 'jca_generated'
+        AND (
+          legacy.metadata IS NULL
+          OR legacy.metadata->>'format' IS NULL
+          OR legacy.metadata->>'format' != 'pdf'
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM vendor_notification_log correction
+          WHERE correction.notification_type = 'jca_generated'
+            AND correction.metadata->>'format' = 'pdf'
+            AND correction.metadata->>'original_row_id' = legacy.id::text
+        )
+  `
+
   const countLegacyRows: CountLegacyFn = async (_instance) => {
     const sql = `
       SELECT COUNT(*)::int AS count
-      FROM vendor_notification_log
-      WHERE notification_type = 'jca_generated'
-        AND (
-          metadata IS NULL
-          OR metadata->>'format' IS NULL
-          OR metadata->>'format' != 'pdf'
-        )
+      FROM vendor_notification_log legacy
+      WHERE ${unreconciledLegacyPredicate}
     `
-    try {
-      const result = await db.raw(sql)
-      const row = Array.isArray(result?.rows) ? result.rows[0] : result?.[0]
-      const count = Number(row?.count ?? 0)
-      return Number.isFinite(count) ? count : 0
-    } catch {
-      return 0
-    }
+    const result = await db.raw(sql)
+    const row = Array.isArray(result?.rows) ? result.rows[0] : result?.[0]
+    const count = Number(row?.count ?? 0)
+    return Number.isFinite(count) ? count : 0
   }
 
   const fetchLegacyRows: FetchLegacyFn = async (_instance) => {
     const sql = `
-      SELECT id, vendor_id, sent_at::text, metadata
-      FROM vendor_notification_log
-      WHERE notification_type = 'jca_generated'
-        AND (
-          metadata IS NULL
-          OR metadata->>'format' IS NULL
-          OR metadata->>'format' != 'pdf'
-        )
-      ORDER BY sent_at ASC
+      SELECT legacy.id, legacy.vendor_id, legacy.sent_at::text, legacy.metadata
+      FROM vendor_notification_log legacy
+      WHERE ${unreconciledLegacyPredicate}
+      ORDER BY legacy.sent_at ASC
     `
-    try {
-      const result = await db.raw(sql)
-      return (Array.isArray(result?.rows) ? result.rows : result ?? []).map(
-        (r: any) => ({
-          id: r.id,
-          vendor_id: r.vendor_id,
-          sent_at: r.sent_at,
-          metadata:
-            typeof r.metadata === "string"
-              ? JSON.parse(r.metadata)
-              : r.metadata,
-        }),
-      )
-    } catch {
-      return []
-    }
+    const result = await db.raw(sql)
+    return (Array.isArray(result?.rows) ? result.rows : result ?? []).map(
+      (r: any) => ({
+        id: r.id,
+        vendor_id: r.vendor_id,
+        sent_at: r.sent_at,
+        metadata:
+          typeof r.metadata === "string" ? JSON.parse(r.metadata) : r.metadata,
+      }),
+    )
   }
 
   const insertCorrectionRows: InsertCorrectionFn = async (_instance, rows) => {
@@ -365,34 +362,26 @@ export function makeKnexAdapters(db: any): {
         INSERT INTO vendor_notification_log
           (vendor_id, notification_type, locale, recipient_email, status, triggered_by, metadata)
         SELECT
-          vendor_id,
+          legacy.vendor_id,
           'jca_generated',
-          locale,
-          recipient_email,
+          legacy.locale,
+          legacy.recipient_email,
           'sent',
           'migrate-jca-txt-to-pdf',
           $1::jsonb
-        FROM vendor_notification_log
-        WHERE id = $2
+        FROM vendor_notification_log legacy
+        WHERE legacy.id = $2
+          AND NOT EXISTS (
+            SELECT 1
+            FROM vendor_notification_log correction
+            WHERE correction.notification_type = 'jca_generated'
+              AND correction.metadata->>'format' = 'pdf'
+              AND correction.metadata->>'original_row_id' = legacy.id::text
+          )
       `
-      try {
-        const result = await db.raw(sql, [
-          JSON.stringify(correctionMetadata),
-          row.id,
-        ])
-        const affected = Number(
-          result?.rowCount ?? result?.[0]?.affectedRows ?? 1,
-        )
-        inserted += affected > 0 ? 1 : 0
-      } catch (err) {
-        process.stderr.write(
-          "[migrate-jca-txt-to-pdf] WARN: failed to insert correction for row " +
-            row.id +
-            ": " +
-            ((err as Error)?.message ?? String(err)) +
-            "\n",
-        )
-      }
+      const result = await db.raw(sql, [JSON.stringify(correctionMetadata), row.id])
+      const affected = Number(result?.rowCount ?? result?.[0]?.affectedRows ?? 1)
+      inserted += affected > 0 ? 1 : 0
     }
 
     return { rowsInserted: inserted }
