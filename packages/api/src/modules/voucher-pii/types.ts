@@ -102,3 +102,19 @@ export class ConsentValidationError extends ConsentTransactionError {
     this.name = "ConsentValidationError";
   }
 }
+
+export type PauseState = "considering" | "paused" | "timeout" | "withdrawn";
+
+/** Input to `recordPauseAudit` — SC-3 ambivalence pause (UX-DR5 5-state machine). */
+export interface RecordPauseInput {
+  market_id: string;
+  token: string;
+  locale: string;
+  pause_state: PauseState;
+  request_id: string;
+}
+
+export interface RecordPauseResult {
+  pause_audit_id: string;
+  latency_ms: number;
+}

@@ -33,9 +33,12 @@ import type {
 import {
   ConsentAuditFailedError,
   type ConsentStateMachineState,
+  type ConsentStateSnapshot,
   type DeliveryOutcome,
   type RecordConsentInput,
   type RecordConsentResult,
+  type RecordPauseInput,
+  type RecordPauseResult,
   type RecordWithdrawalInput,
   type RecordWithdrawalResult,
 } from "./types";
@@ -384,6 +387,39 @@ export class VoucherPiiService {
     return {
       rows_deleted: purge.rows_deleted,
       orphans_deleted: orphans.rows_deleted,
+    };
+  }
+
+  /**
+   * Look up a consent audit snapshot by id — used by the consent route to resolve
+   * market_id/order_id before calling recordWithdrawalTransaction (TF-208 Story 4.4).
+   */
+  async lookupConsentSnapshot(
+    consent_audit_id: string
+  ): Promise<ConsentStateSnapshot | null> {
+    return this.deps.audit.readAfterWrite({ consent_audit_id });
+  }
+
+  /**
+   * SC-3 pause: appends a lightweight audit row for UX-DR5 ambivalence pause.
+   * No PII transaction; no idempotency guard (pause is UI telemetry, not legal obligation).
+   * Returns a real audit_id per R-NEW-6 (no synthetic ids). (TF-208 Story 4.4)
+   */
+  async recordPauseAudit(input: RecordPauseInput): Promise<RecordPauseResult> {
+    const start = this.deps.now();
+    const audit = await this.deps.audit.appendAuditRow({
+      market_id: input.market_id,
+      payload: {
+        action: "PAUSE",
+        token: input.token,
+        locale: input.locale,
+        pause_state: input.pause_state,
+        request_id: input.request_id,
+      },
+    });
+    return {
+      pause_audit_id: audit.audit_id,
+      latency_ms: this.deps.now() - start,
     };
   }
 
