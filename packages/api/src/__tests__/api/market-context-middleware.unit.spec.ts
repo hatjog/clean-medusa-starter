@@ -232,7 +232,13 @@ describe("Product List Market Scope Middleware", () => {
 });
 
 describe("Market Guard Middleware", () => {
-  it("blocks store request without ALS → 403", async () => {
+  /**
+   * Story 4.4 F7: missing publishable key → 401 (was 403).
+   * HTTP semantics: 401 = unauthenticated; 403 = authenticated but forbidden.
+   * The middleware cannot distinguish "missing key" vs "invalid key" without
+   * leaking key-existence; both collapse to 401.
+   */
+  it("F7: blocks store request without ALS (missing/invalid publishable key) → 401", async () => {
     process.env.GP_RLS_DEBUG = "1";
     const logger = { info: jest.fn() };
     const res = {
@@ -262,13 +268,43 @@ describe("Market Guard Middleware", () => {
       next
     );
 
-    expect(res.statusCode).toBe(403);
+    expect(res.statusCode).toBe(401);
     expect(res.body).toEqual({ message: "Market context required" });
     expect(next).not.toHaveBeenCalled();
     expect(logger.info).toHaveBeenCalledWith(
       "[rls-debug] market-guard-blocked",
       expect.objectContaining({ path: "/store/products" })
     );
+  });
+
+  it("F7: invalid/unknown publishable key (no market resolved) → 401", async () => {
+    // No ALS context = either no key sent or key not found / revoked.
+    // Both cases collapse to 401 to avoid leaking key existence.
+    const res = {
+      statusCode: 0,
+      body: null as any,
+      status(code: number) {
+        this.statusCode = code;
+        return this;
+      },
+      json(data: any) {
+        this.body = data;
+      },
+    };
+    const next = jest.fn();
+
+    await marketGuardMiddleware(
+      {
+        path: "/store/products",
+        scope: { resolve: jest.fn() },
+      } as any,
+      res as any,
+      next
+    );
+
+    expect(res.statusCode).toBe(401);
+    expect(res.body).toEqual({ message: "Market context required" });
+    expect(next).not.toHaveBeenCalled();
   });
 
   it("passes store request with ALS context", async () => {

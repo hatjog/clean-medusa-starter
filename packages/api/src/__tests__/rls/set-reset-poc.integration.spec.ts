@@ -454,8 +454,14 @@ describe("AsyncLocalStorage propagation", () => {
 
 // ---------------------------------------------------------------------------
 // Guard middleware simulation (AC-2)
+//
+// Story 4.4 F7: missing/invalid publishable key → 401 (was 403). The
+// simulated guard now mirrors the real middleware's HTTP semantics:
+//   - 401 = no/invalid publishable key (unauthenticated)
+//   - 403 = valid key but cross-market (authenticated but forbidden;
+//           enforced by separate guards, not this middleware)
 // ---------------------------------------------------------------------------
-describe("Guard middleware: store request without market context → 403", () => {
+describe("Guard middleware: store request without market context → 401", () => {
   it("simulated guard blocks request when ALS has no market context", () => {
     const als = new AsyncLocalStorage<{ market_id: string }>();
 
@@ -463,14 +469,14 @@ describe("Guard middleware: store request without market context → 403", () =>
     const guardMiddleware = (): { status: number; body?: string } => {
       const ctx = als.getStore();
       if (!ctx) {
-        return { status: 403, body: "Market context required" };
+        return { status: 401, body: "Market context required" };
       }
       return { status: 200 };
     };
 
     // Without ALS context — guard blocks
     const blocked = guardMiddleware();
-    expect(blocked.status).toBe(403);
+    expect(blocked.status).toBe(401);
     expect(blocked.body).toBe("Market context required");
 
     // With ALS context — guard passes
