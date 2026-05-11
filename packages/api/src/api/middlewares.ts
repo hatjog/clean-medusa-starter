@@ -754,6 +754,11 @@ export default defineMiddlewares({
       bodyParser: false,
     },
     {
+      method: ["GET"],
+      matcher: "/store/orders/:id/payment-status",
+      middlewares: [authenticate("customer", ["session", "bearer"])],
+    },
+    {
       method: ["POST"],
       matcher: "/auth/user/emailpass",
       middlewares: [requestLogMetricsMiddleware],

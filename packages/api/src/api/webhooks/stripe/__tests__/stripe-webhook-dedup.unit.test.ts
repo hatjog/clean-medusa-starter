@@ -117,7 +117,7 @@ function resolveEventOutcome(eventType: string): { lifecycle_status: string; out
     case "payment_intent.canceled":
       return { lifecycle_status: "failed", outcome_label: "payment_canceled" }
     case "payment_intent.requires_action":
-      return { lifecycle_status: "pending_psp_confirmation", outcome_label: "requires_action" }
+      return { lifecycle_status: "failed", outcome_label: "requires_action" }
     case "charge.dispute.created":
       return { lifecycle_status: "support_required", outcome_label: "dispute_created" }
     default:
@@ -137,15 +137,26 @@ function mapMedusaPaymentStatus(raw: string | null | undefined): string {
     case "awaiting":
     case "authorized":
     case "partially_authorized":
-    case "requires_action":
       return "pending_psp_confirmation"
-    case "canceled":
+    case "requires_action":
       return "failed"
+    case "canceled":
+      return "expired"
     case "refunded":
     case "partially_refunded":
       return "support_required"
     default:
       return "pending_psp_confirmation"
+  }
+}
+
+function mapMedusaOrderStatus(raw: string | null | undefined): string | null {
+  switch (raw) {
+    case "archived":
+    case "canceled":
+      return "expired"
+    default:
+      return null
   }
 }
 
@@ -289,7 +300,7 @@ describe("Stripe webhook — signature verification (Story 6.1 NFR24)", () => {
 
 describe("Stripe webhook — lifecycle resolution (Story 6.1 — no local aliases)", () => {
   const FORBIDDEN_ALIASES = ["processing", "held", "verifying", "done", "pending", "confirmed", "cancelled"]
-  const CANONICAL_LIFECYCLE_IDS = ["paid", "pending_psp_confirmation", "failed", "support_required"]
+  const CANONICAL_LIFECYCLE_IDS = ["paid", "pending_psp_confirmation", "failed", "support_required", "expired"]
 
   it("payment_intent.succeeded → paid (canonical lifecycle id)", () => {
     const { lifecycle_status } = resolveEventOutcome("payment_intent.succeeded")
@@ -309,9 +320,9 @@ describe("Stripe webhook — lifecycle resolution (Story 6.1 — no local aliase
     expect(lifecycle_status).not.toBe("expired")
   })
 
-  it("payment_intent.requires_action → pending_psp_confirmation", () => {
+  it("payment_intent.requires_action → failed recovery path", () => {
     const { lifecycle_status } = resolveEventOutcome("payment_intent.requires_action")
-    expect(lifecycle_status).toBe("pending_psp_confirmation")
+    expect(lifecycle_status).toBe("failed")
   })
 
   it("charge.dispute.created → support_required", () => {
@@ -352,9 +363,18 @@ describe("Stripe webhook — Medusa status mapping (Story 6.1 MEDIUM#3)", () => 
     expect(mapMedusaPaymentStatus("not_paid")).toBe("pending_psp_confirmation")
   })
 
-  it("canceled → failed (NOT expired — no distinct expired lifecycle state)", () => {
-    expect(mapMedusaPaymentStatus("canceled")).toBe("failed")
-    expect(mapMedusaPaymentStatus("canceled")).not.toBe("expired")
+  it("requires_action → failed because SCA/3DS needs customer action", () => {
+    expect(mapMedusaPaymentStatus("requires_action")).toBe("failed")
+  })
+
+  it("canceled → expired", () => {
+    expect(mapMedusaPaymentStatus("canceled")).toBe("expired")
+  })
+
+  it("order archived/canceled overrides payment status to expired", () => {
+    expect(mapMedusaOrderStatus("archived")).toBe("expired")
+    expect(mapMedusaOrderStatus("canceled")).toBe("expired")
+    expect(mapMedusaOrderStatus("completed")).toBeNull()
   })
 
   it("refunded → support_required", () => {
