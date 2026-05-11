@@ -230,7 +230,7 @@ function resolveEventOutcome(eventType: string, logger?: LoggerLike): {
       // Canceled maps to failed recovery path per Dev Notes (no separate `expired` lifecycle state).
       return { lifecycle_status: "failed", outcome_label: "payment_canceled" }
     case "payment_intent.requires_action":
-      return { lifecycle_status: "pending_psp_confirmation", outcome_label: "requires_action" }
+      return { lifecycle_status: "failed", outcome_label: "requires_action" }
     case "charge.dispute.created":
       return { lifecycle_status: "support_required", outcome_label: "dispute_created" }
     default:

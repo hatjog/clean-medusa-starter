@@ -22,13 +22,11 @@
  *   outcome=poke_logged, timestamp.
  *
  * Status mapping (lifecycle SSOT enforced):
- *   Medusa `OrderPaymentStatus` → GP lifecycle id (same mapping as the
- *   storefront proxy `/api/v1/orders/[id]/route.ts` — must stay in sync).
- *   Only values from the shared lifecycle state machine are returned:
- *   `payment` ∈ {paid, reconciled}; `order` ∈ {pending_psp_confirmation,
- *   paid, failed, support_required}.
- *   `canceled` Medusa status → `failed` recovery path per Dev Notes
- *   (no distinct `expired` lifecycle state in the shared contract).
+ *   Medusa `OrderPaymentStatus` + order `status` → GP lifecycle id. This
+ *   mirrors the storefront proxy `/api/v1/orders/[id]/route.ts` and must stay
+ *   in sync with it. Only values from the shared lifecycle state machine are
+ *   returned: `payment` ∈ {paid, pending_psp_confirmation, failed,
+ *   support_required}; `order` includes `expired`.
  *
  * Reconciliation poke (webhook_age):
  *   Uses `order.created_at` (not `updated_at`) as the anchor for the
@@ -38,8 +36,11 @@
  *   was placed — the age since order creation is the correct proxy for
  *   "time since PSP confirmation was expected".
  *
- * Public access: gated by publishable-api-key middleware upstream.
- * Customer JWT is forwarded by the storefront proxy (auth is handled there).
+ * Access:
+ *   Requires customer authentication and verifies the requested order belongs
+ *   to the authenticated customer. Publishable-key market guard alone is not
+ *   enough for an order-specific read endpoint because publishable keys are
+ *   intentionally public.
  *
  * @see GP/storefront/src/app/api/v1/orders/[id]/payment-status/route.ts (consumer proxy)
  * @see specs/contracts/governance/examples/lifecycle-state-machine.v1.example.json
@@ -50,22 +51,22 @@ import { randomBytes } from "crypto"
 
 import { Modules } from "@medusajs/framework/utils"
 import type { MedusaRequest, MedusaResponse } from "@medusajs/framework/http"
+import { marketContextStorage } from "../../../../../lib/market-context"
 
-// Disable Medusa's default admin auth — customer auth is handled by the
-// storefront proxy (Bearer JWT forwarded from _medusa_jwt cookie).
+// Customer auth is installed for this route in api/middlewares.ts. Keep the
+// route-level flag off so Medusa does not apply default admin auth semantics.
 export const AUTHENTICATE = false
 
 /** Webhook age threshold beyond which a reconciliation poke is emitted (ms). */
 const RECONCILIATION_POKE_THRESHOLD_MS = 120_000
 
-/** GP lifecycle status ids surfaced on this endpoint.
- * Per Dev Notes: `expired` is NOT a distinct lifecycle state in the shared
- * contract. Medusa `canceled` status maps to `failed` recovery path. */
+/** GP lifecycle status ids surfaced on this endpoint. */
 type PaymentLifecycleStatus =
   | "paid"
   | "pending_psp_confirmation"
   | "failed"
   | "support_required"
+  | "expired"
 
 /** Single recommended action key per lifecycle status (mirrors adapter). */
 const RECOMMENDED_ACTION: Record<PaymentLifecycleStatus, string> = {
@@ -73,6 +74,7 @@ const RECOMMENDED_ACTION: Record<PaymentLifecycleStatus, string> = {
   pending_psp_confirmation: "wait",
   failed: "retry",
   support_required: "contact_support",
+  expired: "abandon",
 }
 
 function mapMedusaPaymentStatus(
@@ -87,12 +89,12 @@ function mapMedusaPaymentStatus(
     case "awaiting":
     case "authorized":
     case "partially_authorized":
-    case "requires_action":
       return "pending_psp_confirmation"
-    case "canceled":
-      // Canceled maps to failed recovery path per Dev Notes.
-      // No distinct `expired` state in the shared lifecycle contract.
+    case "requires_action":
+      // SCA / 3DS requires customer action. Waiting or refreshing will not fix it.
       return "failed"
+    case "canceled":
+      return "expired"
     case "refunded":
     case "partially_refunded":
       return "support_required"
@@ -101,6 +103,16 @@ function mapMedusaPaymentStatus(
       // but warn so operators can detect mapping drift early.
       logger?.warn?.(`[payment-status] unknown Medusa payment_status: "${String(raw)}" — defaulting to pending_psp_confirmation`)
       return "pending_psp_confirmation"
+  }
+}
+
+function mapMedusaOrderStatus(raw: string | null | undefined): PaymentLifecycleStatus | null {
+  switch (raw) {
+    case "archived":
+    case "canceled":
+      return "expired"
+    default:
+      return null
   }
 }
 
@@ -125,9 +137,18 @@ function resolveLogger(req: MedusaRequest): LoggerLike {
 type OrderModuleLike = {
   retrieveOrder: (id: string, options?: Record<string, unknown>) => Promise<{
     id?: string
+    customer_id?: string | null
     payment_status?: string | null
+    status?: string | null
     created_at?: string | Date | null
+    sales_channel_id?: string | null
   } | null>
+}
+
+type AuthenticatedMedusaRequest = MedusaRequest & {
+  auth_context?: {
+    actor_id?: string
+  }
 }
 
 export async function GET(
@@ -143,19 +164,37 @@ export async function GET(
   }
 
   const logger = resolveLogger(req)
+  const customerId = (req as AuthenticatedMedusaRequest).auth_context?.actor_id
+
+  if (!customerId) {
+    res.status(401).json({ type: "unauthorized", message: "Customer authentication required", request_id })
+    return
+  }
 
   try {
     const orderModule = req.scope.resolve(Modules.ORDER) as OrderModuleLike
     const order = await orderModule.retrieveOrder(orderId, {
-      select: ["id", "payment_status", "created_at"],
+      select: ["id", "customer_id", "payment_status", "status", "created_at", "sales_channel_id"],
     })
 
-    if (!order) {
+    if (!order || order.customer_id !== customerId) {
       res.status(404).json({ type: "not_found", message: "Order not found", request_id })
       return
     }
 
-    const status = mapMedusaPaymentStatus(order.payment_status, logger)
+    const marketContext = marketContextStorage.getStore()
+    if (
+      marketContext?.sales_channel_id &&
+      order.sales_channel_id &&
+      order.sales_channel_id !== marketContext.sales_channel_id
+    ) {
+      res.status(404).json({ type: "not_found", message: "Order not found", request_id })
+      return
+    }
+
+    const status =
+      mapMedusaOrderStatus(order.status) ??
+      mapMedusaPaymentStatus(order.payment_status, logger)
     const last_checked_at = new Date().toISOString()
     const recommended_action_key = RECOMMENDED_ACTION[status]
 
