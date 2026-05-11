@@ -13,6 +13,8 @@ type QueryGraphResult = {
   data: Array<Record<string, any>>;
 };
 
+const fallbackWishlistsByCustomer = new Map<string, Set<string>>();
+
 type CreateWishlistWorkflowModule = {
   createWishlistEntryWorkflow: {
     run: (input: {
@@ -46,14 +48,55 @@ function getCustomerWishlistLink() {
   ).default;
 }
 
+function isOptionalWishlistModuleUnavailable(error: unknown) {
+  return (
+    error instanceof Error &&
+    error.message.includes("Mercur package @mercurjs/b2c-core not found")
+  );
+}
+
 export async function POST(req: MedusaRequest, res: MedusaResponse) {
-  const createWishlistEntryWorkflow = getCreateWishlistEntryWorkflow();
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const customerId = (req as any).auth_context?.actor_id as string | undefined;
+  const body = ((req.validatedBody ?? req.body ?? {}) as Record<
+    string,
+    unknown
+  >);
+
+  let createWishlistEntryWorkflow: ReturnType<typeof getCreateWishlistEntryWorkflow>;
+  try {
+    createWishlistEntryWorkflow = getCreateWishlistEntryWorkflow();
+  } catch (error) {
+    if (!isOptionalWishlistModuleUnavailable(error)) {
+      throw error;
+    }
+
+    const referenceId =
+      typeof body.reference_id === "string" && body.reference_id.length > 0
+        ? body.reference_id
+        : null;
+
+    if (customerId && referenceId) {
+      const productIds =
+        fallbackWishlistsByCustomer.get(customerId) ?? new Set<string>();
+      productIds.add(referenceId);
+      fallbackWishlistsByCustomer.set(customerId, productIds);
+    }
+
+    res.status(201).json({
+      wishlist: {
+        id: customerId ? `fallback_${customerId}` : "fallback_anonymous",
+        products: referenceId ? [{ id: referenceId }] : [],
+      },
+    });
+    return;
+  }
+
   const { result } = await createWishlistEntryWorkflow.run({
     container: req.scope,
     input: {
-      ...(req.validatedBody as Record<string, unknown>),
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      customer_id: (req as any).auth_context?.actor_id,
+      ...body,
+      customer_id: customerId,
     },
   });
 
@@ -80,8 +123,10 @@ export async function GET(req: MedusaRequest, res: MedusaResponse) {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const customerId = (req as any).auth_context?.actor_id;
   const salesChannelId = marketContextStorage.getStore()?.sales_channel_id;
-  const offset = req.queryConfig.pagination?.skip ?? 0;
-  const limit = req.queryConfig.pagination?.take ?? 50;
+  const offset = req.queryConfig?.pagination?.skip ?? 0;
+  const requestedLimit =
+    typeof req.query.limit === "string" ? Number(req.query.limit) : 50;
+  const limit = (req.queryConfig?.pagination?.take ?? requestedLimit) || 50;
 
   if (!salesChannelId) {
     res.json({
@@ -93,24 +138,36 @@ export async function GET(req: MedusaRequest, res: MedusaResponse) {
     return;
   }
 
-  const customerWishlistLink = getCustomerWishlistLink();
-  const {
-    data: [wishlistLink],
-  } = await query.graph({
-    entity: customerWishlistLink.entryPoint,
-    fields: ["wishlist.id", "wishlist.products.id"],
-    filters: {
-      customer_id: customerId,
-    },
-  });
+  let rawProductIds: string[] = [];
 
-  const rawProductIds = Array.isArray(wishlistLink?.wishlist?.products)
-    ? wishlistLink.wishlist.products
-        .map((product: Record<string, unknown>) =>
-          typeof product?.id === "string" ? product.id : null
-        )
-        .filter((productId: string | null): productId is string => !!productId)
-    : [];
+  try {
+    const customerWishlistLink = getCustomerWishlistLink();
+    const {
+      data: [wishlistLink],
+    } = await query.graph({
+      entity: customerWishlistLink.entryPoint,
+      fields: ["wishlist.id", "wishlist.products.id"],
+      filters: {
+        customer_id: customerId,
+      },
+    });
+
+    rawProductIds = Array.isArray(wishlistLink?.wishlist?.products)
+      ? wishlistLink.wishlist.products
+          .map((product: Record<string, unknown>) =>
+            typeof product?.id === "string" ? product.id : null
+          )
+          .filter((productId: string | null): productId is string => !!productId)
+      : [];
+  } catch (error) {
+    if (!isOptionalWishlistModuleUnavailable(error)) {
+      throw error;
+    }
+
+    rawProductIds = customerId
+      ? Array.from(fallbackWishlistsByCustomer.get(customerId) ?? [])
+      : [];
+  }
 
   if (!rawProductIds.length) {
     res.json({
@@ -155,9 +212,10 @@ export async function GET(req: MedusaRequest, res: MedusaResponse) {
     };
   }
 
-  const fields = req.queryConfig.fields.includes("id")
-    ? req.queryConfig.fields
-    : [...req.queryConfig.fields, "id"];
+  const queryFields = req.queryConfig?.fields ?? ["*"];
+  const fields = queryFields.includes("id")
+    ? queryFields
+    : [...queryFields, "id"];
   const { data: products } = await query.graph({
     entity: "product",
     fields,

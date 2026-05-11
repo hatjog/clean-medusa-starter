@@ -47,7 +47,6 @@
     "@medusajs/medusa": "2.13.6",
     "@medusajs/ui": "4.0.25",
     "@mercurjs/cli": "2.1.1",
-    "@mercurjs/commission": "1.5.3",
     "@mercurjs/core": "2.1.1",
     "@mercurjs/types": "2.1.1",
     "@noble/ed25519": "^2.3.0",

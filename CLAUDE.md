@@ -1,8 +1,9 @@
 # Backend — MedusaJS 2 (Mercur fork)
 
 ## Stack lokalny
+- Sprawdzaj faktyczne wersje w `package.json`; nie traktuj tego pliku jako SSOT wersji.
 - MedusaJS 2 (fork Mercur) + PostgreSQL 17 + Redis 7 + MinIO (S3)
-- TypeScript strict, Vitest
+- TypeScript strict, Jest 29 (+ @swc/jest)
 
 ## Struktura
 - `src/api/` — API routes
@@ -22,6 +23,8 @@
 - Migracje DB: Medusa migrations w `src/modules/<module>/migrations/`.
 
 ## Testy
-- Unit: `cd GP/backend && npx vitest run --reporter=verbose <plik>`
-- Integration: `cd GP/backend && npx jest --config integration-tests/...` (sprawdź `package.json` scripts)
+- Unit: `cd GP/backend && pnpm test:unit`
+- Integration HTTP: `cd GP/backend && pnpm test:integration:http`
+- Integration modules: `cd GP/backend && pnpm test:integration:modules`
+- Patches: `cd GP/backend && pnpm test:patches`
 - Per `bmad-code-review-fix-runner`: tests muszą przejść po fixach.

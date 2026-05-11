@@ -4,10 +4,10 @@ This directory holds GP-local upstream patches managed via `pnpm patch` /
 `pnpm patch-commit`. Patches are activated via `patchedDependencies` in
 `pnpm-workspace.yaml` and applied automatically on `pnpm install`.
 
-**Policy reference:** `~/.claude/projects/-home-robsz-prj-GP/memory/feedback_mercur_local_patches_policy.md`
-("Mercur upstream bugs ZAWSZE solved via local pnpm patch w patches/, NIGDY
-upstream issue/wait-for-fix" — but every patch SHOULD have an upstream issue
-filed for tracking).
+**Policy reference:** `specs/constitution/upstream-policy.md`.
+Mercur/Medusa bugs are solved by GP-owned fork commits or local `pnpm patch`
+records. GP does not file public Mercur/Medusa issues or block stories on
+external fixes.
 
 ---
 
@@ -22,7 +22,7 @@ filed for tracking).
 | **Story** | `v160-1-7-1-mercur-1-2-schema-port-physical-drops` (Layer B) |
 | **Bug surface** | Storefront `/store/products` returns 500 (MikroORM CriteriaNode crash) when `applySellerVisibilityFilter` injects `filterableFields.seller.status` (or even `seller_id`) because `Product.seller` is a module link, not direct ORM relation |
 | **Fix** | Rewrite middleware async: pre-fetch open seller IDs + their products via `query.graph` link traversal, collect visible product IDs, filter by `Product.id $in [...]`. Refined in cleanup-11 (Story 8.8 AC6) — earlier seller_id filter still crashed CriteriaNode. |
-| **Upstream issue** | TODO — to be filed at `mercurjs/mercur` (story `v160-cleanup-2`) |
+| **GP tracking** | Local pnpm patch record; no external Mercur/Medusa issue per `specs/constitution/upstream-policy.md`. |
 | **Expiry condition** | Remove when Mercur ≥ 2.2.0 ships native fix; verify by reverting patch + running `__tests__/patches/mercur-core-visibility-filter.integration.spec.ts` |
 | **Last verified** | 2026-05-06 (Run 6 pre-promote smoke — `/store/products?limit=1` returns 200 with BB publishable-api-key under patched filter; see `specs/operator/pre-promote-smoke-checklist.md` §3) |
 | **Regression test** | `__tests__/patches/mercur-core-visibility-filter.integration.spec.ts` — covers cleanup-11 link-traversal shape, sentinel, both Mercur 1.x and cleanup-2 crash guards, and explicit `take: 10000` pagination cap (B-2 latent scaling fix) |
@@ -34,10 +34,10 @@ filed for tracking).
 
 1. **Author** — `pnpm patch <pkg>@<version>` opens scratch dir; edit; `pnpm patch-commit <dir>`
 2. **Verify** — patch file lands in `patches/`; `patchedDependencies` entry in `pnpm-workspace.yaml` updated
-3. **Document** — add row to "Active patches" table above with: target, story, bug surface, fix summary, upstream issue URL (if filed), expiry condition, last-verified date
+3. **Document** — add row to "Active patches" table above with: target, story, bug surface, fix summary, GP tracking reference, expiry condition, last-verified date
 4. **Test** — author regression test under `__tests__/patches/<pkg>.integration.spec.ts` covering the patched semantics + edge cases
 5. **CI guard** — `pnpm install --frozen-lockfile` validates patch hash; bump CI pnpm to ≥10 for `patchedDependencies` support
-6. **Maintenance** — on upstream bump, re-verify patch applicability; if upstream fixed, remove patch + entry + close upstream issue
+6. **Maintenance** — on upstream bump, re-verify patch applicability; if the new baseline fixes the bug, remove patch + entry and record the local removal evidence
 7. **Audit cadence** — review all entries in this README at sprint close-out; flag any "last verified" > 30 days old
 
 ---

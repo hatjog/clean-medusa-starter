@@ -19,8 +19,10 @@ const SELLER_LIST_FIELDS = ["id", "name", "handle", "photo"] as const;
 
 export async function GET(req: MedusaRequest, res: MedusaResponse) {
   const salesChannelId = marketContextStorage.getStore()?.sales_channel_id;
-  const offset = req.queryConfig.pagination?.skip ?? 0;
-  const limit = req.queryConfig.pagination?.take ?? 50;
+  const offset = req.queryConfig?.pagination?.skip ?? 0;
+  const requestedLimit =
+    typeof req.query.limit === "string" ? Number(req.query.limit) : 50;
+  const limit = (req.queryConfig?.pagination?.take ?? requestedLimit) || 50;
 
   if (!salesChannelId) {
     res.json({
