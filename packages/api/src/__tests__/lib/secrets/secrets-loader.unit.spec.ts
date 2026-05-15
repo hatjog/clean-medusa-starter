@@ -84,3 +84,38 @@ describe("secretsLoader — adapter selection (Story 1.2 AC3/AC10)", () => {
     expect(first).toBe(store.secretsAdapter)
   })
 })
+
+// Review F1 — a GCP access/auth/network fault must NOT be silently
+// indistinguishable from a genuinely absent secret: the SDK error is chained
+// as `cause` while the message stays leak-free.
+describe("GcpSecretsAdapter — access fault chains cause, no leak (review F1)", () => {
+  const originalEnv = process.env
+
+  beforeEach(() => {
+    process.env = { ...originalEnv, GCP_PROJECT_ID: "test-project" }
+  })
+
+  afterAll(() => {
+    process.env = originalEnv
+  })
+
+  it("preserves the underlying SDK error as cause without leaking it into the message", async () => {
+    const sdkError = new Error(
+      "PERMISSION_DENIED: projects/test-project/secrets/stripe-secret-key-bonbeauty"
+    )
+    const fakeClient = {
+      accessSecretVersion: jest.fn().mockRejectedValue(sdkError),
+    }
+    const adapter = new GcpSecretsAdapter(fakeClient as never)
+
+    const err = await adapter
+      .getStripeKey("bonbeauty", "secret")
+      .catch((e: Error) => e)
+
+    expect((err as Error & { code?: string }).code).toBe("SECRET_NOT_CONFIGURED")
+    expect((err as Error & { cause?: unknown }).cause).toBe(sdkError)
+    // No GCP resource path / project leaked into the message.
+    expect((err as Error).message).not.toContain("PERMISSION_DENIED")
+    expect((err as Error).message).not.toContain("projects/test-project")
+  })
+})

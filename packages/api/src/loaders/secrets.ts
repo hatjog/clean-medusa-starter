@@ -39,15 +39,13 @@ export default async function secretsLoader({
   // behind NODE_ENV !== 'production': in v1.8.0 the env adapter in production
   // does NOT block, but the refusal point is present and readable for the
   // v1.10.0 owner to flip.
-  // F16 — flip w v1.10.0: replace the `if (false &&` guard below with an
-  // unconditional `throw` so production + SECRETS_ADAPTER=env is rejected.
-  if (process.env.NODE_ENV === "production" && kind === "env") {
-    // eslint-disable-next-line no-constant-condition
-    if (false /* F16 — flip w v1.10.0: remove `false &&` to arm the allowlist */) {
-      throw new Error(
-        "SECRETS_ADAPTER=env is not permitted in production from v1.10.0 (F16/F14). Use SECRETS_ADAPTER=gcp."
-      )
-    }
+  // F16 — flip w v1.10.0: remove the leading `false && ` from the guard
+  // below so production + SECRETS_ADAPTER=env is rejected unconditionally.
+  // eslint-disable-next-line no-constant-condition
+  if (false && process.env.NODE_ENV === "production" && kind === "env") {
+    throw new Error(
+      "SECRETS_ADAPTER=env is not permitted in production from v1.10.0 (F16/F14). Use SECRETS_ADAPTER=gcp."
+    )
   }
 
   let adapter: SecretsAdapter

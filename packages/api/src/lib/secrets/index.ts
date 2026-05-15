@@ -30,13 +30,25 @@ export interface SecretsAdapter {
  * established by Story 1.1's PaymentProviderNotConfiguredError
  * (Error subclass + readonly `code`). The message MUST NOT leak any env
  * values — it may name the missing key only.
+ *
+ * An optional `cause` carries the underlying failure (e.g. a GCP
+ * access/auth/network error) WITHOUT putting it in the message: this keeps
+ * the message leak-free while preserving root cause for post-mortem, so an
+ * adapter access fault is never silently indistinguishable from a genuinely
+ * absent secret (review F1 — no silent-failure anti-pattern).
  */
 export class SecretNotConfiguredError extends Error {
   readonly code = SECRET_NOT_CONFIGURED
+  // Declared locally: tsconfig target is ES2021 (no Error.cause in lib);
+  // assigned at runtime where Node supports it regardless.
+  readonly cause?: unknown
 
-  constructor(missingKeyName: string) {
+  constructor(missingKeyName: string, cause?: unknown) {
     super(`Stripe secret not configured: ${missingKeyName}`)
     this.name = "SecretNotConfiguredError"
+    if (cause !== undefined) {
+      this.cause = cause
+    }
   }
 }
 

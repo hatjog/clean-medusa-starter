@@ -82,9 +82,12 @@ export class GcpSecretsAdapter implements SecretsAdapter {
       payload =
         typeof data === "string" ? data : data ? Buffer.from(data).toString("utf8") : undefined
     } catch (err) {
-      // Do not leak the underlying GCP error detail (may contain the resource
-      // path / project). Fail-fast with the stable contract error.
-      throw new SecretNotConfiguredError(secretId)
+      // Do not leak the underlying GCP error detail in the MESSAGE (it may
+      // contain the resource path / project). But DO chain it as `cause`:
+      // an auth/network/permission fault must stay distinguishable from a
+      // genuinely absent secret for post-mortem (review F1 — fail-fast, no
+      // silent failure). The stable contract error/code is preserved.
+      throw new SecretNotConfiguredError(secretId, err)
     }
 
     if (!payload) {
