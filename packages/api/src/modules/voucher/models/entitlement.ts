@@ -275,6 +275,14 @@ export function snapshotPolicy(
  * Enforce the post-ISSUED immutability invariant: once an instance has left
  * ISSUED, its `policy_snapshot` MUST equal the value captured at issue time.
  * Throws if a caller attempts to swap the snapshot on a non-ISSUED instance.
+ *
+ * Equality is `JSON.stringify`-based and therefore key-order sensitive. This
+ * is safe by construction because every snapshot is produced by
+ * {@link snapshotPolicy} → `structuredClone`, which preserves the source key
+ * order, so equal snapshots always serialise identically. Known limitation: a
+ * future caller that hand-builds a snapshot with reordered keys would get a
+ * false immutability violation — switch to a structural deep-equal if that
+ * call pattern is introduced (Epic 1 Story 1.3 live issue/redeem workflows).
  */
 export function assertPolicySnapshotImmutable(
   state: EntitlementInstanceState,
