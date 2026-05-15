@@ -1,11 +1,14 @@
 import { EnvSecretsAdapter } from "../../../lib/secrets/env-adapter"
-import { PAYMENT_PROVIDER_NOT_CONFIGURED } from "../../../lib/secrets/index"
+import {
+  PAYMENT_PROVIDER_NOT_CONFIGURED,
+  SECRET_NOT_CONFIGURED,
+} from "../../../lib/secrets/index"
 import {
   createMarketStripeResolver,
   PaymentProviderNotConfiguredError,
 } from "../../../lib/secrets/market-resolver"
 
-describe("EnvSecretsAdapter", () => {
+describe("EnvSecretsAdapter (Story 1.2 AC2)", () => {
   const originalEnv = process.env
 
   beforeEach(() => {
@@ -30,22 +33,49 @@ describe("EnvSecretsAdapter", () => {
     expect(key).toBe("pk_test_pub")
   })
 
-  it("reads STRIPE_WEBHOOK_SECRET_BONBEAUTY for webhook type", async () => {
-    process.env.STRIPE_WEBHOOK_SECRET_BONBEAUTY = "whsec_test"
+  // AC2: uniform STRIPE_<TYPE>_KEY_<MARKET> naming — webhook is
+  // STRIPE_WEBHOOK_KEY_<MARKET> (NOT Story 1.1's STRIPE_WEBHOOK_SECRET_*;
+  // documented discrepancy — see story Dev Agent Record).
+  it("reads STRIPE_WEBHOOK_KEY_BONBEAUTY for webhook type", async () => {
+    process.env.STRIPE_WEBHOOK_KEY_BONBEAUTY = "whsec_test"
     const key = await adapter.getStripeKey("bonbeauty", "webhook")
     expect(key).toBe("whsec_test")
   })
 
-  it("throws PAYMENT_PROVIDER_NOT_CONFIGURED when env var is missing", async () => {
+  it("throws SECRET_NOT_CONFIGURED when env var is missing", async () => {
     delete process.env.STRIPE_SECRET_KEY_BONBEAUTY
-    await expect(adapter.getStripeKey("bonbeauty", "secret")).rejects.toMatchObject({
-      code: PAYMENT_PROVIDER_NOT_CONFIGURED,
-      message: "Payment is not available for this market",
-    })
+    await expect(
+      adapter.getStripeKey("bonbeauty", "secret")
+    ).rejects.toMatchObject({ code: SECRET_NOT_CONFIGURED })
+  })
+
+  it("error names the missing key but never leaks other env values", async () => {
+    delete process.env.STRIPE_SECRET_KEY_BONBEAUTY
+    process.env.SOME_OTHER_SECRET = "do-not-leak-me"
+    const err = await adapter
+      .getStripeKey("bonbeauty", "secret")
+      .catch((e: Error) => e)
+    expect((err as Error).message).toContain("STRIPE_SECRET_KEY_BONBEAUTY")
+    expect((err as Error).message).not.toContain("do-not-leak-me")
+    expect((err as Error).message).not.toContain("SOME_OTHER_SECRET")
+  })
+
+  it("does not return another market's value on a market typo", async () => {
+    // Only bonbeauty is configured; a typo'd / different market id must NOT
+    // fall back to bonbeauty's value — it must fail-fast.
+    process.env.STRIPE_SECRET_KEY_BONBEAUTY = "sk_test_secret"
+    delete process.env.STRIPE_SECRET_KEY_BONEVENT
+    await expect(
+      adapter.getStripeKey("bonevent", "secret")
+    ).rejects.toMatchObject({ code: SECRET_NOT_CONFIGURED })
   })
 })
 
-describe("createMarketStripeResolver — per-market routing", () => {
+// Story 1.1 resolver — UNCHANGED by Story 1.2. The resolver keeps its own
+// PAYMENT_PROVIDER_NOT_CONFIGURED market-gating error (distinct concern from
+// the adapter's SECRET_NOT_CONFIGURED). Preserved verbatim to prove 1.1 is
+// not broken.
+describe("createMarketStripeResolver — per-market routing (Story 1.1, preserved)", () => {
   const mockAdapter = {
     getStripeKey: jest.fn().mockResolvedValue("sk_test_key"),
   }
@@ -102,5 +132,9 @@ describe("createMarketStripeResolver — per-market routing", () => {
     await expect(resolver("unknown-market", "secret")).rejects.toThrow(
       PaymentProviderNotConfiguredError
     )
+  })
+
+  it("PAYMENT_PROVIDER_NOT_CONFIGURED code is still exported and stable", () => {
+    expect(PAYMENT_PROVIDER_NOT_CONFIGURED).toBe("PAYMENT_PROVIDER_NOT_CONFIGURED")
   })
 })
