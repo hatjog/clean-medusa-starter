@@ -179,7 +179,7 @@ export async function listEnabledPaymentProviderIds(db: Knex): Promise<string[]>
 
 export function resolvePaymentProviderId(
   configuredProviderId: string,
-  availableProviderIds: string[],
+  availableProviderIds: string[]
 ): PaymentProviderResolution {
   if (!configuredProviderId.trim()) {
     throw new Error("market.payments.psp_provider_id is required")
@@ -227,7 +227,7 @@ export default async function gpConfigSyncPayments({ container, args }: ExecArgs
   const region = selectRegionForMarket(regions, currency, countries)
   const resolution = resolvePaymentProviderId(
     configuredProviderId,
-    availableProviderIds,
+    availableProviderIds
   )
 
   if (resolution.warning) {
