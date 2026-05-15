@@ -80,8 +80,12 @@ function isStripeEnabledForMarket(market: MarketId): boolean {
 // ---------------------------------------------------------------------------
 // Mocked SecretsAdapter (Story 1.2 env-adapter behaviour).
 // `getStripeKey('bonbeauty', ...)` resolves from a mocked STRIPE_*_BONBEAUTY
-// env value; every other market resolves to "not configured" (fail-fast,
-// mirroring EnvSecretsAdapter's SecretNotConfiguredError contract).
+// env value. The non-BonBeauty `SECRET_NOT_CONFIGURED` throw branch is a
+// fixture-realism stub: in v1.8.0 the resolver's STRIPE_ENABLED_MARKETS gate
+// short-circuits BEFORE the adapter for every non-BonBeauty market, so this
+// branch is intentionally never reached by any test (the M2 "adapter not
+// consulted" assertions below prove that short-circuit holds — fail-closed,
+// no cross-market secret lookup).
 // ---------------------------------------------------------------------------
 function makeMockAdapter() {
   return {
@@ -101,6 +105,13 @@ function makeMockAdapter() {
 // Mocked Stripe SDK + the documented PaymentIntent wiring (architecture.md
 // Data Flow L3194-3209). We assert the WIRING (per-market key resolve +
 // idempotency key = payment_session.id, D8), not a live Stripe call.
+//
+// SCOPE CAVEAT (I1): `createPaymentIntentForMarket` is a SIMULATION of the
+// documented flow, not GP production code. The real D8 binding lives inside
+// third-party `@medusajs/payment-stripe@2.13.6` (provider `initiatePayment`
+// hook); no GP-owned provider wires resolver -> Stripe yet. AC2 therefore
+// proves the resolver entrypoint + the contractual idempotency-key shape, NOT
+// an end-to-end production payment. Live wiring is Story 1.10 (HG-3 / C1-C5).
 // ---------------------------------------------------------------------------
 function makeMockStripeSdk() {
   return {
@@ -200,6 +211,9 @@ describe("Story 1.9 — per-market Stripe resolver architecture validation", () 
       const resolver = createMarketStripeResolver(adapter)
       const key = await resolver("bonbeauty", "secret")
       expect(key).toBe("sk_test_BONBEAUTY_mock")
+      // Exactly one adapter consult, scoped to the requested market — no
+      // cross-market lookup (tenant isolation, architecture doc §C).
+      expect(adapter.getStripeKey).toHaveBeenCalledTimes(1)
       expect(adapter.getStripeKey).toHaveBeenCalledWith("bonbeauty", "secret")
     })
 
@@ -226,23 +240,29 @@ describe("Story 1.9 — per-market Stripe resolver architecture validation", () 
 
   describe("AC3 — 4 markets graceful reject with PAYMENT_PROVIDER_NOT_CONFIGURED", () => {
     it.each(UNCONFIGURED_MARKETS)(
-      "%s rejects with code PAYMENT_PROVIDER_NOT_CONFIGURED",
+      "%s rejects with code PAYMENT_PROVIDER_NOT_CONFIGURED and never consults the secret store",
       async (market) => {
-        const resolver = createMarketStripeResolver(makeMockAdapter())
-        await expect(resolver(market, "secret")).rejects.toBeInstanceOf(
-          PaymentProviderNotConfiguredError
-        )
+        const adapter = makeMockAdapter()
+        const resolver = createMarketStripeResolver(adapter)
+        // Single invocation (L1): capture the one rejection and assert on it.
         const err = await resolver(market, "secret").catch((e) => e)
+        expect(err).toBeInstanceOf(PaymentProviderNotConfiguredError)
         expect(err.code).toBe(PAYMENT_PROVIDER_NOT_CONFIGURED)
         expect(PAYMENT_PROVIDER_NOT_CONFIGURED).toBe("PAYMENT_PROVIDER_NOT_CONFIGURED")
+        // M2 — fail-closed proof: the gate short-circuits BEFORE the adapter,
+        // so no secret lookup is ever attempted for a non-enabled market
+        // (no cross-market credential reuse — architecture doc §C).
+        expect(adapter.getStripeKey).not.toHaveBeenCalled()
       }
     )
 
-    it("an unknown / unmapped market_id also rejects fail-closed", async () => {
-      const resolver = createMarketStripeResolver(makeMockAdapter())
+    it("an unknown / unmapped market_id also rejects fail-closed without a secret lookup", async () => {
+      const adapter = makeMockAdapter()
+      const resolver = createMarketStripeResolver(adapter)
       await expect(
         resolver("definitely-not-a-market", "secret")
       ).rejects.toBeInstanceOf(PaymentProviderNotConfiguredError)
+      expect(adapter.getStripeKey).not.toHaveBeenCalled()
     })
   })
 
@@ -265,13 +285,13 @@ describe("Story 1.9 — per-market Stripe resolver architecture validation", () 
       const message = await resolver("bonevent", "secret").catch(
         (e: Error) => e.message
       )
-      const marketTokens = [
-        ...FIXTURE_MARKETS,
-        "BONBEAUTY",
-        "BonBeauty",
-        "BonEvent",
-        "BonGarden",
-      ]
+      // Derive every case variant systematically (lower / UPPER / Title) for
+      // ALL fixture markets — no hand-picked, incomplete capitalized list (L2).
+      const marketTokens = FIXTURE_MARKETS.flatMap((m) => [
+        m,
+        m.toUpperCase(),
+        m.charAt(0).toUpperCase() + m.slice(1),
+      ])
       for (const token of marketTokens) {
         expect(message.toLowerCase()).not.toContain(token.toLowerCase())
       }
