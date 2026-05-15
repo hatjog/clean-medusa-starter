@@ -93,23 +93,21 @@ describe("gp-config-sync-payments.selectRegionForMarket", () => {
 
 describe("gp-config-sync-payments.resolvePaymentProviderId", () => {
   it("keeps the configured provider when it is available", () => {
-    expect(resolvePaymentProviderId("p24", ["p24", "pp_system_default"], "gp-dev")).toEqual({
-      providerId: "p24",
+    expect(resolvePaymentProviderId("pp_stripe", ["pp_stripe", "pp_system_default"])).toEqual({
+      providerId: "pp_stripe",
       fallbackApplied: false,
     })
   })
 
-  it("falls back to pp_system_default on gp-dev when configured provider is missing", () => {
-    const resolution = resolvePaymentProviderId("p24", ["pp_system_default"], "gp-dev")
-
-    expect(resolution.providerId).toBe("pp_system_default")
-    expect(resolution.fallbackApplied).toBe(true)
-    expect(resolution.warning).toMatch(/falling back to 'pp_system_default'/)
+  it("throws when configured provider is not in available list", () => {
+    expect(() =>
+      resolvePaymentProviderId("pp_stripe", ["pp_system_default"])
+    ).toThrow(/Configured payment provider 'pp_stripe' is not enabled in runtime/)
   })
 
-  it("throws outside gp-dev when configured provider is missing", () => {
+  it("throws with none when available list is empty", () => {
     expect(() =>
-      resolvePaymentProviderId("p24", ["pp_system_default"], "gp-prod")
-    ).toThrow(/Configured payment provider 'p24' is not enabled in runtime/)
+      resolvePaymentProviderId("pp_stripe", [])
+    ).toThrow(/Available providers: none/)
   })
 })

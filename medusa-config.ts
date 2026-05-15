@@ -52,6 +52,22 @@ module.exports = withMercur({
   // and let wrapper handle it).
   modules: [
     {
+      key: "payment",
+      resolve: "@medusajs/payment",
+      options: {
+        providers: [
+          {
+            resolve: "@medusajs/payment-stripe",
+            options: {
+              apiKey: process.env.STRIPE_SECRET_KEY_BONBEAUTY,
+              webhookSecret: process.env.STRIPE_WEBHOOK_SECRET_BONBEAUTY,
+              capture: true,
+            },
+          },
+        ],
+      },
+    },
+    {
       // Story v160-cleanup-25: PG-backed voucher module (replaces in-memory
       // voucher-fixture-store.ts). Registered under key "voucher" per AC1.
       key: "voucher",

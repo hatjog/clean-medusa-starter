@@ -38,8 +38,6 @@ type PaymentProviderResolution = {
   warning?: string
 }
 
-const DEV_FALLBACK_PROVIDER_ID = "pp_system_default"
-
 export function parseArgs(args: string[] | undefined): ParsedArgs {
   const instanceId = (args?.[0] ?? process.env.GP_INSTANCE_ID ?? "gp-dev").trim()
   const marketId = (args?.[1] ?? process.env.GP_MARKET_ID ?? "bonbeauty").trim()
@@ -182,7 +180,6 @@ export async function listEnabledPaymentProviderIds(db: Knex): Promise<string[]>
 export function resolvePaymentProviderId(
   configuredProviderId: string,
   availableProviderIds: string[],
-  instanceId: string
 ): PaymentProviderResolution {
   if (!configuredProviderId.trim()) {
     throw new Error("market.payments.psp_provider_id is required")
@@ -190,19 +187,6 @@ export function resolvePaymentProviderId(
 
   if (availableProviderIds.includes(configuredProviderId)) {
     return { providerId: configuredProviderId, fallbackApplied: false }
-  }
-
-  if (
-    instanceId === "gp-dev" &&
-    availableProviderIds.includes(DEV_FALLBACK_PROVIDER_ID)
-  ) {
-    return {
-      providerId: DEV_FALLBACK_PROVIDER_ID,
-      fallbackApplied: true,
-      warning:
-        `Configured payment provider '${configuredProviderId}' is not installed in local runtime; ` +
-        `falling back to '${DEV_FALLBACK_PROVIDER_ID}' for gp-dev checkout testing`,
-    }
   }
 
   const available = availableProviderIds.length > 0 ? availableProviderIds.join(", ") : "none"
@@ -244,7 +228,6 @@ export default async function gpConfigSyncPayments({ container, args }: ExecArgs
   const resolution = resolvePaymentProviderId(
     configuredProviderId,
     availableProviderIds,
-    parsedArgs.instanceId
   )
 
   if (resolution.warning) {
