@@ -328,6 +328,10 @@ export interface EntitlementInstanceRow {
   state: EntitlementInstanceState
   /** Immutable policy block snapshotted at ISSUED time (regulamin § 12). */
   policy_snapshot: EntitlementPolicySnapshot
+  /** Nullable only for legacy/authored rows before Story 2.2 migration apply. */
+  expires_at: Date | null
+  /** Count of free extensions used; BE-1 allows max one unpaid extension. */
+  unpaid_extension_count: number
   created_at: Date
   updated_at: Date
 }

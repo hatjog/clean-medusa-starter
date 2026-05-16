@@ -50,7 +50,7 @@ export const ENTITLEMENT_BOUNDARY = {
     extension: {
       /** Extension fee as percent of voucher value. */
       fee_pct_max: 15,
-      fee_pct_min: 0,
+      fee_pct_min: 5,
     },
     cancellation: {
       /** Minimum cancellation cutoff window (hours before appointment). */
@@ -123,7 +123,9 @@ export function checkPolicyAgainstBoundary(
   const ext = policy.extension as Record<string, unknown> | undefined
   if (ext) {
     const fee = num(ext.fee_pct)
+    const paid = ext.paid === true
     if (
+      paid &&
       fee !== undefined &&
       (fee < B.policy.extension.fee_pct_min ||
         fee > B.policy.extension.fee_pct_max)

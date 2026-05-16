@@ -30,6 +30,11 @@ import {
   ENTITLEMENT_BOUNDARY,
   checkPolicyAgainstBoundary,
 } from "../entitlement-boundary"
+import {
+  ENTITLEMENT_EXTENDED_EVENT,
+  EntitlementExtensionError,
+  VoucherService,
+} from ".."
 
 // ---------------------------------------------------------------------------
 // T1 — Layer 1 enum
@@ -167,7 +172,12 @@ describe("Layer 4 — entitlement_instance state machine", () => {
 describe("Layer 4 — policy_snapshot immutability post-ISSUED", () => {
   const policy = {
     validity_months: 12,
-    extension: { enabled: true, fee_pct: 10 },
+    extension: {
+      allowed: true,
+      paid: true,
+      fee_pct: 10,
+      max_extension_months: 6,
+    },
   }
 
   it("snapshotPolicy returns a deeply frozen clone", () => {
@@ -220,6 +230,7 @@ describe("Layer 2 — entitlement_boundary", () => {
   it("encodes the AC2 platform maxima/minima", () => {
     expect(ENTITLEMENT_BOUNDARY.validity_months_max).toBe(24)
     expect(ENTITLEMENT_BOUNDARY.policy.extension.fee_pct_max).toBe(15)
+    expect(ENTITLEMENT_BOUNDARY.policy.extension.fee_pct_min).toBe(5)
     expect(ENTITLEMENT_BOUNDARY.policy.cancellation.cutoff_hours_min).toBe(12)
     expect(ENTITLEMENT_BOUNDARY.policy.cancellation.refund_pct_max).toBe(100)
   })
@@ -229,7 +240,12 @@ describe("Layer 2 — entitlement_boundary", () => {
     expect(
       checkPolicyAgainstBoundary({
         validity_months: 12,
-        extension: { enabled: true, fee_pct: 10 },
+        extension: {
+          allowed: true,
+          paid: true,
+          fee_pct: 10,
+          max_extension_months: 6,
+        },
         cancellation: { enabled: true, cutoff_hours: 24, refund_pct: 100 },
         no_show: { policy: "charge_full", charge_pct: 100 },
         transferability: { transferable: true, max_transfers: 1 },
@@ -240,6 +256,12 @@ describe("Layer 2 — entitlement_boundary", () => {
     expect(
       checkPolicyAgainstBoundary({
         validity_months: 6,
+        extension: {
+          allowed: false,
+          paid: false,
+          fee_pct: 0,
+          max_extension_months: 1,
+        },
         cancellation: { enabled: true, cutoff_hours: 24, refund_pct: 100 },
         no_show: { policy: "forfeit_voucher", charge_pct: 0 },
         transferability: { transferable: true, max_transfers: 1 },
@@ -251,7 +273,12 @@ describe("Layer 2 — entitlement_boundary", () => {
   it("reports each kind of boundary violation", () => {
     const v = checkPolicyAgainstBoundary({
       validity_months: 36, // > 24
-      extension: { enabled: true, fee_pct: 25 }, // > 15
+      extension: {
+        allowed: true,
+        paid: true,
+        fee_pct: 25,
+        max_extension_months: 6,
+      }, // > 15
       cancellation: { enabled: true, cutoff_hours: 6, refund_pct: 150 }, // < 12, > 100
       no_show: { policy: "charge_double" }, // not in enum
       transferability: { transferable: true, max_transfers: -1 }, // < 0
@@ -274,5 +301,220 @@ describe("Layer 2 — entitlement_boundary", () => {
   it("requires validity_months", () => {
     const v = checkPolicyAgainstBoundary({})
     expect(v.some((x) => x.field === "policy.validity_months")).toBe(true)
+  })
+
+  it("rejects paid extension fee below the GP minimum", () => {
+    const v = checkPolicyAgainstBoundary({
+      validity_months: 12,
+      extension: {
+        allowed: true,
+        paid: true,
+        fee_pct: 4,
+        max_extension_months: 6,
+      },
+    })
+    expect(v).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ field: "policy.extension.fee_pct" }),
+      ])
+    )
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Story 2.2 — BE-1 extend(entitlement_id, paid)
+// ---------------------------------------------------------------------------
+
+type QueryRecord = Record<string, unknown>
+
+class FakeEntitlementClient {
+  row: QueryRecord
+  readonly events: string[] = []
+
+  constructor(row: QueryRecord) {
+    this.row = { ...row }
+  }
+
+  async query(sql: string, params: unknown[] = []) {
+    if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK") {
+      this.events.push(sql)
+      return { rows: [], rowCount: 0 }
+    }
+    if (sql.includes("SELECT") && sql.includes("entitlement_instance")) {
+      return { rows: [this.row], rowCount: 1 }
+    }
+    if (sql.includes("UPDATE entitlement_instance")) {
+      this.row.expires_at = params[1]
+      this.row.unpaid_extension_count = params[2]
+      this.events.push("UPDATE")
+      return { rows: [], rowCount: 1 }
+    }
+    throw new Error(`unexpected SQL in test: ${sql}`)
+  }
+
+  release() {
+    this.events.push("RELEASE")
+  }
+}
+
+function entitlementRow(overrides: Partial<QueryRecord> = {}): QueryRecord {
+  return {
+    id: "ent_inst_1",
+    entitlement_profile_id: "voucher-kwotowy-365d",
+    entitlement_type: EntitlementType.VOUCHER_AMOUNT,
+    order_id: "order_1",
+    state: EntitlementInstanceState.ACTIVE,
+    policy_snapshot: snapshotPolicy({
+      validity_months: 12,
+      extension: {
+        allowed: true,
+        paid: true,
+        fee_pct: 10,
+        max_extension_months: 6,
+      },
+    }),
+    expires_at: new Date("2026-06-01T00:00:00.000Z"),
+    unpaid_extension_count: 0,
+    created_at: new Date("2026-01-01T00:00:00.000Z"),
+    updated_at: new Date("2026-01-01T00:00:00.000Z"),
+    ...overrides,
+  }
+}
+
+function serviceWith(row: QueryRecord) {
+  const client = new FakeEntitlementClient(row)
+  const eventBus = {
+    messages: [] as Array<{ name: string; data: Record<string, unknown> }>,
+    async emit(message: { name: string; data: Record<string, unknown> }) {
+      this.messages.push(message)
+    },
+  }
+  const service = new VoucherService({
+    resolve(key: string) {
+      return key === "event_bus" ? eventBus : undefined
+    },
+  })
+  service._testPool = {
+    connect: async () => client,
+  } as never
+  return { service, client, eventBus }
+}
+
+describe("Story 2.2 — extend entitlement", () => {
+  it("rejects paid=true when fee_pct exceeds 15", async () => {
+    const { service } = serviceWith(
+      entitlementRow({
+        policy_snapshot: snapshotPolicy({
+          validity_months: 12,
+          extension: {
+            allowed: true,
+            paid: true,
+            fee_pct: 16,
+            max_extension_months: 6,
+          },
+        }),
+      })
+    )
+
+    await expect(service.extend("ent_inst_1", { paid: true })).rejects.toThrow(
+      EntitlementExtensionError
+    )
+  })
+
+  it("rejects paid=true when fee_pct is below 5", async () => {
+    const { service } = serviceWith(
+      entitlementRow({
+        policy_snapshot: snapshotPolicy({
+          validity_months: 12,
+          extension: {
+            allowed: true,
+            paid: true,
+            fee_pct: 4,
+            max_extension_months: 6,
+          },
+        }),
+      })
+    )
+
+    await expect(service.extend("ent_inst_1", { paid: true })).rejects.toThrow(
+      EntitlementExtensionError
+    )
+  })
+
+  it("rejects a second unpaid extension on the same instance", async () => {
+    const { service } = serviceWith(entitlementRow({ unpaid_extension_count: 1 }))
+
+    await expect(service.extend("ent_inst_1", { paid: false })).rejects.toThrow(
+      EntitlementExtensionError
+    )
+  })
+
+  it("rejects extension when instance is not ACTIVE or extension is disallowed", async () => {
+    const inactive = serviceWith(
+      entitlementRow({ state: EntitlementInstanceState.EXPIRED })
+    )
+    await expect(
+      inactive.service.extend("ent_inst_1", { paid: true })
+    ).rejects.toThrow(EntitlementExtensionError)
+
+    const disallowed = serviceWith(
+      entitlementRow({
+        policy_snapshot: snapshotPolicy({
+          validity_months: 12,
+          extension: {
+            allowed: false,
+            paid: false,
+            fee_pct: 0,
+            max_extension_months: 1,
+          },
+        }),
+      })
+    )
+    await expect(
+      disallowed.service.extend("ent_inst_1", { paid: false })
+    ).rejects.toThrow(EntitlementExtensionError)
+  })
+
+  it("extends expires_at and emits the complete ENTITLEMENT_EXTENDED envelope", async () => {
+    const now = new Date("2026-05-16T12:00:00.000Z")
+    const { service, client, eventBus } = serviceWith(entitlementRow())
+
+    const result = await service.extend("ent_inst_1", {
+      paid: true,
+      actor: "admin_1",
+      source: "unit-test",
+      now,
+    })
+
+    expect(result.previous_expires_at.toISOString()).toBe(
+      "2026-06-01T00:00:00.000Z"
+    )
+    expect(result.new_expires_at.toISOString()).toBe("2026-12-01T00:00:00.000Z")
+    expect(client.row.expires_at).toEqual(result.new_expires_at)
+    expect(eventBus.messages).toHaveLength(1)
+    expect(eventBus.messages[0]).toEqual({
+      name: ENTITLEMENT_EXTENDED_EVENT,
+      data: {
+        event: ENTITLEMENT_EXTENDED_EVENT,
+        entitlement_id: "ent_inst_1",
+        entitlement_instance_id: "ent_inst_1",
+        paid: true,
+        fee_pct: 10,
+        previous_expires_at: "2026-06-01T00:00:00.000Z",
+        new_expires_at: "2026-12-01T00:00:00.000Z",
+        actor: "admin_1",
+        source: "unit-test",
+        timestamp: "2026-05-16T12:00:00.000Z",
+      },
+    })
+    expect(client.events).toEqual(["BEGIN", "UPDATE", "COMMIT", "RELEASE"])
+  })
+
+  it("increments unpaid_extension_count only for unpaid extension", async () => {
+    const { service, client } = serviceWith(entitlementRow())
+
+    await service.extend("ent_inst_1", { paid: false })
+
+    expect(client.row.unpaid_extension_count).toBe(1)
   })
 })

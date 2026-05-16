@@ -8,6 +8,7 @@
  */
 
 import { randomUUID } from "node:crypto"
+import { Modules } from "@medusajs/framework/utils"
 import { Pool } from "pg"
 import type {
   VoucherRow,
@@ -17,9 +18,79 @@ import type {
   AppendEventInput,
   ClaimResult,
 } from "./models/types"
+import {
+  EntitlementInstanceState,
+  EntitlementType,
+  type EntitlementInstanceRow,
+  type EntitlementPolicySnapshot,
+} from "./models/entitlement"
+import { ENTITLEMENT_BOUNDARY, validityMonthsMax } from "./entitlement-boundary"
 
 type VoucherModuleOptions = {
   databaseUrl?: string
+}
+
+type EventBusMessage = { name: string; data: unknown }
+type EventBusLike = {
+  emit(message: EventBusMessage | EventBusMessage[]): Promise<void> | void
+}
+type Queryable = {
+  query<T extends Record<string, unknown> = Record<string, unknown>>(
+    sql: string,
+    params?: unknown[]
+  ): Promise<{ rows: T[]; rowCount?: number | null }>
+}
+
+export const ENTITLEMENT_EXTENDED_EVENT = "ENTITLEMENT_EXTENDED"
+
+export interface ExtendEntitlementInput {
+  paid: boolean
+  actor?: string
+  source?: string
+  now?: Date
+}
+
+export interface EntitlementExtendedEnvelope {
+  event: typeof ENTITLEMENT_EXTENDED_EVENT
+  entitlement_id: string
+  entitlement_instance_id: string
+  paid: boolean
+  fee_pct?: number
+  previous_expires_at: string
+  new_expires_at: string
+  actor: string
+  source: string
+  timestamp: string
+}
+
+export interface ExtendEntitlementResult {
+  entitlement_id: string
+  entitlement_instance_id: string
+  paid: boolean
+  fee_pct?: number
+  previous_expires_at: Date
+  new_expires_at: Date
+  unpaid_extension_count: number
+  event: EntitlementExtendedEnvelope
+}
+
+type ExtensionPolicy = {
+  allowed: boolean
+  paid: boolean
+  fee_pct: number
+  max_extension_months: number
+}
+
+export class EntitlementExtensionError extends Error {
+  readonly code: string
+  readonly details: Record<string, unknown>
+
+  constructor(code: string, message: string, details: Record<string, unknown> = {}) {
+    super(message)
+    this.name = "EntitlementExtensionError"
+    this.code = code
+    this.details = details
+  }
 }
 
 function resolveDatabaseUrl(override?: string): string {
@@ -29,16 +100,18 @@ function resolveDatabaseUrl(override?: string): string {
 }
 
 export class VoucherService {
+  private readonly container_: Record<string, any>
   private readonly moduleOptions_: VoucherModuleOptions
   private pool_: Pool | null = null
   /** @internal — for testing only: inject a mock Pool */
   _testPool?: Pool
 
   constructor(
-    _container: Record<string, unknown> = {},
+    container: Record<string, any> = {},
     moduleOptions: VoucherModuleOptions = {},
     moduleDeclaration: { options?: VoucherModuleOptions } = {}
   ) {
+    this.container_ = container
     this.moduleOptions_ = {
       ...(moduleDeclaration?.options ?? {}),
       ...(moduleOptions ?? {}),
@@ -53,6 +126,28 @@ export class VoucherService {
       })
     }
     return this.pool_
+  }
+
+  private resolveContainerDependency<T = unknown>(key: string): T | null {
+    const direct = this.container_?.[key]
+    if (direct) return direct as T
+
+    if (typeof this.container_?.resolve === "function") {
+      try {
+        return (this.container_.resolve(key) ?? null) as T | null
+      } catch (_error) {
+        return null
+      }
+    }
+
+    return null
+  }
+
+  private get eventBus_(): EventBusLike | null {
+    const eventBus = this.resolveContainerDependency<EventBusLike>(
+      Modules.EVENT_BUS
+    )
+    return eventBus && typeof eventBus.emit === "function" ? eventBus : null
   }
 
   // ---------------------------------------------------------------------------
@@ -89,6 +184,96 @@ export class VoucherService {
       occurred_at: new Date(row.occurred_at as string | Date),
       created_at: new Date(row.created_at as string | Date),
     }
+  }
+
+  private rowToEntitlementInstance(
+    row: Record<string, unknown>
+  ): EntitlementInstanceRow {
+    return {
+      id: row.id as string,
+      entitlement_profile_id: row.entitlement_profile_id as string,
+      entitlement_type: row.entitlement_type as EntitlementType,
+      order_id: (row.order_id ?? null) as string | null,
+      state: row.state as EntitlementInstanceState,
+      policy_snapshot: this.toPolicySnapshot(row.policy_snapshot),
+      expires_at: this.toDate(row.expires_at as string | Date | null),
+      unpaid_extension_count: Number(row.unpaid_extension_count ?? 0),
+      created_at: new Date(row.created_at as string | Date),
+      updated_at: new Date(row.updated_at as string | Date),
+    }
+  }
+
+  private toPolicySnapshot(value: unknown): EntitlementPolicySnapshot {
+    if (typeof value === "string") {
+      return JSON.parse(value) as EntitlementPolicySnapshot
+    }
+    if (!value || typeof value !== "object") {
+      throw new EntitlementExtensionError(
+        "POLICY_SNAPSHOT_INVALID",
+        "entitlement_instance.policy_snapshot must be an object"
+      )
+    }
+    return value as EntitlementPolicySnapshot
+  }
+
+  private extensionPolicyFromSnapshot(
+    snapshot: EntitlementPolicySnapshot
+  ): ExtensionPolicy {
+    const extension = (snapshot as Record<string, unknown>).extension
+    if (!extension || typeof extension !== "object") {
+      throw new EntitlementExtensionError(
+        "EXTENSION_POLICY_MISSING",
+        "policy_snapshot.extension is required for voucher extension"
+      )
+    }
+
+    const ext = extension as Record<string, unknown>
+    const policy = {
+      allowed: ext.allowed,
+      paid: ext.paid,
+      fee_pct: ext.fee_pct,
+      max_extension_months: ext.max_extension_months,
+    }
+    if (
+      typeof policy.allowed !== "boolean" ||
+      typeof policy.paid !== "boolean" ||
+      typeof policy.fee_pct !== "number" ||
+      !Number.isFinite(policy.fee_pct) ||
+      !Number.isInteger(policy.fee_pct) ||
+      typeof policy.max_extension_months !== "number" ||
+      !Number.isInteger(policy.max_extension_months)
+    ) {
+      throw new EntitlementExtensionError(
+        "EXTENSION_POLICY_INVALID",
+        "policy_snapshot.extension must contain allowed, paid, fee_pct and max_extension_months"
+      )
+    }
+
+    return policy as ExtensionPolicy
+  }
+
+  private addMonths(date: Date, months: number): Date {
+    const d = new Date(date.getTime())
+    const day = d.getUTCDate()
+    d.setUTCDate(1)
+    d.setUTCMonth(d.getUTCMonth() + months)
+    const lastDay = new Date(
+      Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 0)
+    ).getUTCDate()
+    d.setUTCDate(Math.min(day, lastDay))
+    return d
+  }
+
+  private async emitEntitlementExtended(
+    event: EntitlementExtendedEnvelope
+  ): Promise<void> {
+    if (!this.eventBus_) {
+      throw new EntitlementExtensionError(
+        "EVENT_BUS_REQUIRED",
+        "voucher extension requires Medusa event bus"
+      )
+    }
+    await this.eventBus_.emit({ name: ENTITLEMENT_EXTENDED_EVENT, data: event })
   }
 
   // ---------------------------------------------------------------------------
@@ -263,6 +448,186 @@ export class VoucherService {
       return { status: "already_claimed", voucher: updated }
     }
     return { status: "claimed", voucher: updated }
+  }
+
+  async extend(
+    entitlementId: string,
+    input: ExtendEntitlementInput | boolean
+  ): Promise<ExtendEntitlementResult> {
+    const opts: ExtendEntitlementInput =
+      typeof input === "boolean" ? { paid: input } : input
+    const now = opts.now ?? new Date()
+    const actor = opts.actor ?? "system"
+    const source = opts.source ?? "voucher.extend"
+    const client = await this.getPool().connect()
+
+    try {
+      await client.query("BEGIN")
+      const result = await (client as Queryable).query(
+        `SELECT id, entitlement_profile_id, entitlement_type, order_id, state,
+                policy_snapshot, expires_at, unpaid_extension_count, created_at, updated_at
+           FROM entitlement_instance
+          WHERE id = $1
+          FOR UPDATE`,
+        [entitlementId]
+      )
+      if (result.rows.length === 0) {
+        throw new EntitlementExtensionError(
+          "ENTITLEMENT_NOT_FOUND",
+          `entitlement_instance '${entitlementId}' was not found`,
+          { entitlement_id: entitlementId }
+        )
+      }
+
+      const row = this.rowToEntitlementInstance(result.rows[0])
+      const extension = this.extensionPolicyFromSnapshot(row.policy_snapshot)
+      this.assertCanExtend(row, extension, opts.paid)
+
+      const previousExpiresAt = row.expires_at
+      if (!previousExpiresAt) {
+        throw new EntitlementExtensionError(
+          "EXPIRES_AT_REQUIRED",
+          "entitlement_instance.expires_at is required before extension",
+          { entitlement_id: entitlementId }
+        )
+      }
+
+      const newExpiresAt = this.addMonths(
+        previousExpiresAt,
+        extension.max_extension_months
+      )
+      const platformMaxExpiresAt = this.addMonths(
+        row.created_at,
+        validityMonthsMax(row.entitlement_type)
+      )
+      if (newExpiresAt > platformMaxExpiresAt) {
+        throw new EntitlementExtensionError(
+          "VALIDITY_BOUNDARY_EXCEEDED",
+          "extension would exceed entitlement_type validity_months_max",
+          {
+            entitlement_id: entitlementId,
+            new_expires_at: newExpiresAt.toISOString(),
+            platform_max_expires_at: platformMaxExpiresAt.toISOString(),
+          }
+        )
+      }
+
+      const unpaidExtensionCount = opts.paid
+        ? row.unpaid_extension_count
+        : row.unpaid_extension_count + 1
+
+      await (client as Queryable).query(
+        `UPDATE entitlement_instance
+            SET expires_at = $2,
+                unpaid_extension_count = $3,
+                updated_at = NOW()
+          WHERE id = $1`,
+        [entitlementId, newExpiresAt, unpaidExtensionCount]
+      )
+
+      const event: EntitlementExtendedEnvelope = {
+        event: ENTITLEMENT_EXTENDED_EVENT,
+        entitlement_id: row.id,
+        entitlement_instance_id: row.id,
+        paid: opts.paid,
+        ...(opts.paid ? { fee_pct: extension.fee_pct } : {}),
+        previous_expires_at: previousExpiresAt.toISOString(),
+        new_expires_at: newExpiresAt.toISOString(),
+        actor,
+        source,
+        timestamp: now.toISOString(),
+      }
+      await this.emitEntitlementExtended(event)
+      await client.query("COMMIT")
+
+      return {
+        entitlement_id: row.id,
+        entitlement_instance_id: row.id,
+        paid: opts.paid,
+        ...(opts.paid ? { fee_pct: extension.fee_pct } : {}),
+        previous_expires_at: previousExpiresAt,
+        new_expires_at: newExpiresAt,
+        unpaid_extension_count: unpaidExtensionCount,
+        event,
+      }
+    } catch (err) {
+      await client.query("ROLLBACK")
+      throw err
+    } finally {
+      client.release()
+    }
+  }
+
+  private assertCanExtend(
+    row: EntitlementInstanceRow,
+    extension: ExtensionPolicy,
+    paid: boolean
+  ): void {
+    if (row.state !== EntitlementInstanceState.ACTIVE) {
+      throw new EntitlementExtensionError(
+        "INVALID_ENTITLEMENT_STATE",
+        "voucher extension is allowed only for ACTIVE entitlement instances",
+        { entitlement_id: row.id, state: row.state }
+      )
+    }
+
+    if (!extension.allowed) {
+      throw new EntitlementExtensionError(
+        "EXTENSION_NOT_ALLOWED",
+        "policy_snapshot.extension.allowed is false",
+        { entitlement_id: row.id }
+      )
+    }
+
+    if (paid && !extension.paid) {
+      throw new EntitlementExtensionError(
+        "PAID_EXTENSION_NOT_ALLOWED",
+        "policy_snapshot.extension.paid is false",
+        { entitlement_id: row.id }
+      )
+    }
+
+    if (!paid && row.unpaid_extension_count >= 1) {
+      throw new EntitlementExtensionError(
+        "UNPAID_EXTENSION_LIMIT_EXCEEDED",
+        "voucher can be extended for free at most once",
+        {
+          entitlement_id: row.id,
+          unpaid_extension_count: row.unpaid_extension_count,
+        }
+      )
+    }
+
+    if (
+      paid &&
+      (extension.fee_pct < ENTITLEMENT_BOUNDARY.policy.extension.fee_pct_min ||
+        extension.fee_pct > ENTITLEMENT_BOUNDARY.policy.extension.fee_pct_max)
+    ) {
+      throw new EntitlementExtensionError(
+        "EXTENSION_FEE_BOUNDARY_VIOLATION",
+        "paid voucher extension fee_pct must be within GP boundary",
+        {
+          entitlement_id: row.id,
+          fee_pct: extension.fee_pct,
+          min: ENTITLEMENT_BOUNDARY.policy.extension.fee_pct_min,
+          max: ENTITLEMENT_BOUNDARY.policy.extension.fee_pct_max,
+        }
+      )
+    }
+
+    if (
+      extension.max_extension_months < 1 ||
+      extension.max_extension_months > ENTITLEMENT_BOUNDARY.validity_months_max
+    ) {
+      throw new EntitlementExtensionError(
+        "MAX_EXTENSION_MONTHS_BOUNDARY_VIOLATION",
+        "policy_snapshot.extension.max_extension_months outside GP boundary",
+        {
+          entitlement_id: row.id,
+          max_extension_months: extension.max_extension_months,
+        }
+      )
+    }
   }
 }
 

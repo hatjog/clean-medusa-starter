@@ -16,6 +16,15 @@ import voucherSeedFixturesLoader from "./loaders/seed-fixtures"
 export const VOUCHER_MODULE = "voucher"
 
 export { VoucherService }
+export {
+  ENTITLEMENT_EXTENDED_EVENT,
+  EntitlementExtensionError,
+} from "./service"
+export type {
+  ExtendEntitlementInput,
+  ExtendEntitlementResult,
+  EntitlementExtendedEnvelope,
+} from "./service"
 
 export type {
   VoucherRow,
