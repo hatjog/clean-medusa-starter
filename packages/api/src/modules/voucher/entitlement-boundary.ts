@@ -28,11 +28,17 @@ export const NO_SHOW_POLICIES = [
 ] as const
 export type NoShowPolicy = (typeof NO_SHOW_POLICIES)[number]
 
-/** Allowed `policy.refund_channel` values (platform-wide enum). */
+/**
+ * Allowed `policy.refund_channel` values (platform-wide enum).
+ *
+ * Single-source note: `_grow/tools/validate_entitlement_profiles.py`
+ * carries a synced governance copy (REFUND_CHANNELS tuple ~line 62). Both
+ * declarations MUST be updated together. Drift requires an ADR per ADR-099.
+ */
 export const REFUND_CHANNELS = [
   "original_payment",
   "store_credit",
-  "bank_transfer",
+  "vendor_wallet",
 ] as const
 export type RefundChannel = (typeof REFUND_CHANNELS)[number]
 

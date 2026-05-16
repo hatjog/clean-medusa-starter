@@ -27,7 +27,7 @@ import {
   type EntitlementInstanceRow,
   type EntitlementPolicySnapshot,
 } from "./models/entitlement"
-import { ENTITLEMENT_BOUNDARY, validityMonthsMax } from "./entitlement-boundary"
+import { ENTITLEMENT_BOUNDARY, REFUND_CHANNELS, type RefundChannel, validityMonthsMax } from "./entitlement-boundary"
 
 type VoucherModuleOptions = {
   databaseUrl?: string
@@ -45,6 +45,8 @@ type Queryable = {
 }
 
 export const ENTITLEMENT_EXTENDED_EVENT = "ENTITLEMENT_EXTENDED"
+export const ENTITLEMENT_REFUND_APPLIED_EVENT =
+  "gp.entitlements.entitlement_refund_applied.v1"
 
 export interface ExtendEntitlementInput {
   paid: boolean
@@ -110,6 +112,69 @@ export class EntitlementExtensionError extends Error {
     this.code = code
     this.details = details
   }
+}
+
+export class EntitlementRefundError extends Error {
+  readonly code: string
+  readonly details: Record<string, unknown>
+
+  constructor(code: string, message: string, details: Record<string, unknown> = {}) {
+    super(message)
+    this.name = "EntitlementRefundError"
+    this.code = code
+    this.details = details
+  }
+}
+
+export interface RefundRequestInput {
+  /** Unique refund identifier for idempotency. */
+  refund_id: string
+  /** Amount in minor units (e.g. grosz for PLN). */
+  amount: number
+  /** ISO 4217 currency code, must match entitlement currency. */
+  currency: string
+  reason?: string
+  actor?: string
+}
+
+export interface RefundRequestResult {
+  entitlement_id: string
+  refund_id: string
+  refund_channel: RefundChannel
+  amount: number
+  currency: string
+  /** Whether this was a duplicate idempotent call (no new effect). */
+  idempotent: boolean
+  event: RefundAppliedEnvelope
+}
+
+/** Payload shape for `gp.entitlements.entitlement_refund_applied.v1`. */
+export interface RefundAppliedPayload {
+  entitlement_id: string
+  refund_id: string
+  applied_at: string
+  currency: string
+  refunded_amount_minor: number
+  refund_channel: RefundChannel
+  order_id?: string
+  payment_id?: string
+  voided?: boolean
+}
+
+/** Full event envelope for `gp.entitlements.entitlement_refund_applied.v1`. */
+export interface RefundAppliedEnvelope {
+  schema_version: "1"
+  event_type: typeof ENTITLEMENT_REFUND_APPLIED_EVENT
+  occurred_at: string
+  actor: string
+  idempotency_key: string
+  scope: {
+    instance_id: string
+    market_id?: string
+    vendor_id?: string
+    location_id?: string
+  }
+  payload: RefundAppliedPayload
 }
 
 function resolveDatabaseUrl(override?: string): string {
@@ -668,6 +733,217 @@ export class VoucherService {
         new_expires_at: newExpiresAt,
         unpaid_extension_count: unpaidExtensionCount,
         event,
+      }
+    } catch (err) {
+      if (!committed) {
+        await client.query("ROLLBACK")
+      }
+      throw err
+    } finally {
+      client.release()
+    }
+  }
+
+  private async emitRefundApplied(envelope: RefundAppliedEnvelope): Promise<void> {
+    if (!this.eventBus_) {
+      throw new EntitlementRefundError(
+        "EVENT_BUS_REQUIRED",
+        "refund_request requires Medusa event bus"
+      )
+    }
+    await this.eventBus_.emit({ name: ENTITLEMENT_REFUND_APPLIED_EVENT, data: envelope })
+  }
+
+  /**
+   * Route a refund request to the correct channel per the entitlement's
+   * policy_snapshot (immutable post-ISSUED, regulamin § 12).
+   *
+   * Channels:
+   * - original_payment → register routing decision + emit audit event;
+   *   delegates to native Medusa payment-refund path consumed by Story 1.3
+   *   subscriber. Does NOT call Stripe refund.create (OOS v1.8.0).
+   * - store_credit → increment customer.metadata.gp.store_credit
+   * - vendor_wallet → increment vendor.metadata.wallet
+   *
+   * Idempotent: a duplicate call with the same refund_id returns the same
+   * result without re-applying the effect.
+   */
+  async refund_request(
+    entitlementId: string,
+    input: RefundRequestInput
+  ): Promise<RefundRequestResult> {
+    const actor = input.actor ?? "system"
+    const now = new Date()
+    const idempotencyKey = `entitlement:${entitlementId}:refund_applied:${input.refund_id}`
+
+    const pool = this.getPool()
+
+    // Idempotency check: has this refund_id already been applied?
+    const existingEvent = await pool.query<Record<string, unknown>>(
+      `SELECT payload FROM voucher_event
+        WHERE entitlement_id = $1
+          AND event_type = $2
+          AND payload->>'refund_id' = $3
+        LIMIT 1`,
+      [entitlementId, ENTITLEMENT_REFUND_APPLIED_EVENT, input.refund_id]
+    )
+    if ((existingEvent.rowCount ?? 0) > 0) {
+      const p = existingEvent.rows[0].payload as RefundAppliedPayload
+      const envelope: RefundAppliedEnvelope = {
+        schema_version: "1",
+        event_type: ENTITLEMENT_REFUND_APPLIED_EVENT,
+        occurred_at: p.applied_at,
+        actor,
+        idempotency_key: idempotencyKey,
+        scope: { instance_id: "gp-dev" },
+        payload: p,
+      }
+      return {
+        entitlement_id: entitlementId,
+        refund_id: input.refund_id,
+        refund_channel: p.refund_channel,
+        amount: p.refunded_amount_minor,
+        currency: p.currency,
+        idempotent: true,
+        event: envelope,
+      }
+    }
+
+    const client = await pool.connect()
+    let committed = false
+    let envelope: RefundAppliedEnvelope | undefined
+
+    try {
+      await client.query("BEGIN")
+
+      const result = await (client as Queryable).query(
+        `SELECT id, entitlement_profile_id, order_id, state, policy_snapshot,
+                created_at, updated_at
+           FROM entitlement_instance
+          WHERE id = $1
+          FOR UPDATE`,
+        [entitlementId]
+      )
+      if (result.rows.length === 0) {
+        throw new EntitlementRefundError(
+          "ENTITLEMENT_NOT_FOUND",
+          `entitlement_instance '${entitlementId}' was not found`,
+          { entitlement_id: entitlementId }
+        )
+      }
+
+      const row = this.rowToEntitlementInstance(result.rows[0])
+      const snapshot = row.policy_snapshot as Record<string, unknown>
+      const rawChannel = snapshot.refund_channel
+
+      if (
+        rawChannel === undefined ||
+        !(REFUND_CHANNELS as readonly string[]).includes(rawChannel as string)
+      ) {
+        throw new EntitlementRefundError(
+          "UNKNOWN_REFUND_CHANNEL",
+          `policy_snapshot.refund_channel '${String(rawChannel)}' is not a supported refund channel`,
+          { entitlement_id: entitlementId, refund_channel: rawChannel }
+        )
+      }
+
+      const refundChannel = rawChannel as RefundChannel
+      const appliedAt = now.toISOString()
+
+      if (refundChannel === "store_credit") {
+        // Increment customer.metadata.gp.store_credit (minor units, currency-aware).
+        await (client as Queryable).query(
+          `UPDATE customer
+              SET metadata = jsonb_set(
+                    jsonb_set(
+                      COALESCE(metadata, '{}'),
+                      '{gp}',
+                      COALESCE(metadata->'gp', '{}'),
+                      true
+                    ),
+                    '{gp,store_credit}',
+                    to_jsonb(
+                      COALESCE((metadata->'gp'->>'store_credit')::bigint, 0) + $2
+                    ),
+                    true
+                  ),
+                  updated_at = NOW()
+            FROM "order" o
+           WHERE customer.id = o.customer_id
+             AND o.id = (SELECT order_id FROM entitlement_instance WHERE id = $1)`,
+          [entitlementId, input.amount]
+        )
+      } else if (refundChannel === "vendor_wallet") {
+        // Increment vendor.metadata.wallet balance (minor units).
+        await (client as Queryable).query(
+          `UPDATE seller
+              SET metadata = jsonb_set(
+                    COALESCE(metadata, '{}'),
+                    '{wallet}',
+                    to_jsonb(
+                      COALESCE((metadata->>'wallet')::bigint, 0) + $2
+                    ),
+                    true
+                  ),
+                  updated_at = NOW()
+            FROM entitlement_instance ei
+            JOIN entitlement_profiles ep ON ep.id = ei.entitlement_profile_id
+           WHERE seller.id = ep.vendor_id
+             AND ei.id = $1`,
+          [entitlementId, input.amount]
+        )
+      }
+      // original_payment: register routing decision + emit audit. No Stripe
+      // refund.create call (OOS v1.8.0 — Story 1.8 manual + webhook consume;
+      // automation named_retry_slot: v1.10.0+).
+
+      const payload: RefundAppliedPayload = {
+        entitlement_id: entitlementId,
+        refund_id: input.refund_id,
+        applied_at: appliedAt,
+        currency: input.currency,
+        refunded_amount_minor: input.amount,
+        refund_channel: refundChannel,
+        ...(row.order_id ? { order_id: row.order_id } : {}),
+      }
+
+      // Persist event record for idempotency tracking.
+      await (client as Queryable).query(
+        `INSERT INTO voucher_event
+           (id, voucher_code, entitlement_id, event_type, payload, occurred_at, created_at)
+         VALUES ($1, NULL, $2, $3, $4::jsonb, $5, NOW())`,
+        [
+          randomUUID(),
+          entitlementId,
+          ENTITLEMENT_REFUND_APPLIED_EVENT,
+          JSON.stringify(payload),
+          now,
+        ]
+      )
+
+      envelope = {
+        schema_version: "1",
+        event_type: ENTITLEMENT_REFUND_APPLIED_EVENT,
+        occurred_at: appliedAt,
+        actor,
+        idempotency_key: idempotencyKey,
+        scope: { instance_id: "gp-dev" },
+        payload,
+      }
+
+      await client.query("COMMIT")
+      committed = true
+
+      await this.emitRefundApplied(envelope)
+
+      return {
+        entitlement_id: entitlementId,
+        refund_id: input.refund_id,
+        refund_channel: refundChannel,
+        amount: input.amount,
+        currency: input.currency,
+        idempotent: false,
+        event: envelope,
       }
     } catch (err) {
       if (!committed) {
