@@ -18,6 +18,7 @@ export const VOUCHER_MODULE = "voucher"
 export { VoucherService }
 export {
   ENTITLEMENT_EXTENDED_EVENT,
+  ENTITLEMENT_CANCELLATION_FEE_APPLIED_EVENT,
   ENTITLEMENT_REFUND_APPLIED_EVENT,
   ENTITLEMENT_NO_SHOW_EVENT_TYPE,
   EntitlementExtensionError,
@@ -27,6 +28,9 @@ export type {
   ExtendEntitlementInput,
   ExtendEntitlementResult,
   EntitlementExtendedEnvelope,
+  CancelBookingInput,
+  CancellationFeeAppliedPayload,
+  CancellationPaymentRefundSeam,
   RefundRequestInput,
   RefundRequestResult,
   RefundAppliedPayload,

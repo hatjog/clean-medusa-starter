@@ -264,7 +264,11 @@ describe("Layer 2 — entitlement_boundary", () => {
     expect(ENTITLEMENT_BOUNDARY.policy.extension.fee_pct_max).toBe(15)
     expect(ENTITLEMENT_BOUNDARY.policy.extension.fee_pct_min).toBe(5)
     expect(ENTITLEMENT_BOUNDARY.policy.cancellation.cutoff_hours_min).toBe(12)
-    expect(ENTITLEMENT_BOUNDARY.policy.cancellation.refund_pct_max).toBe(100)
+    expect(ENTITLEMENT_BOUNDARY.policy.cancellation.fee_pct_max).toBe(100)
+    expect(ENTITLEMENT_BOUNDARY.policy.cancellation.deduct_method).toEqual([
+      "forfeit_credit",
+      "charge_card",
+    ])
   })
 
   it("passes the BonBeauty MVP profile policies (within boundary)", () => {
@@ -278,7 +282,7 @@ describe("Layer 2 — entitlement_boundary", () => {
           fee_pct: 10,
           max_extension_months: 6,
         },
-        cancellation: { enabled: true, cutoff_hours: 24, refund_pct: 100 },
+        cancellation: { cutoff_hours: 24, fee_pct: 0, deduct_method: "forfeit_credit" },
         no_show: { policy: "charge_full", charge_pct: 100 },
         transferability: "bearer",
         refund_channel: "original_payment",
@@ -294,7 +298,7 @@ describe("Layer 2 — entitlement_boundary", () => {
           fee_pct: 0,
           max_extension_months: 1,
         },
-        cancellation: { enabled: true, cutoff_hours: 24, refund_pct: 100 },
+        cancellation: { cutoff_hours: 24, fee_pct: 0, deduct_method: "forfeit_credit" },
         no_show: { policy: "forfeit_voucher", charge_pct: 0 },
         transferability: "bearer",
         refund_channel: "store_credit",
@@ -311,7 +315,7 @@ describe("Layer 2 — entitlement_boundary", () => {
         fee_pct: 25,
         max_extension_months: 6,
       }, // > 15
-      cancellation: { enabled: true, cutoff_hours: 6, refund_pct: 150 }, // < 12, > 100
+      cancellation: { cutoff_hours: 6, fee_pct: 150, deduct_method: "cash" }, // < 12, > 100, bad enum
       no_show: { policy: "charge_double" }, // not in enum
       transferability: "invalid_value", // not in enum (BE-5 Story 2.6)
       refund_channel: "crypto", // not in enum
@@ -320,7 +324,8 @@ describe("Layer 2 — entitlement_boundary", () => {
     expect(fields).toEqual(
       [
         "policy.cancellation.cutoff_hours",
-        "policy.cancellation.refund_pct",
+        "policy.cancellation.deduct_method",
+        "policy.cancellation.fee_pct",
         "policy.extension.fee_pct",
         "policy.no_show.policy",
         "policy.refund_channel",

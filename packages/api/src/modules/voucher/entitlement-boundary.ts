@@ -77,9 +77,11 @@ export const ENTITLEMENT_BOUNDARY = {
     cancellation: {
       /** Minimum cancellation cutoff window (hours before appointment). */
       cutoff_hours_min: 12,
-      /** refund_pct domain is 0..100. */
-      refund_pct_max: 100,
-      refund_pct_min: 0,
+      /** cancellation fee percent domain is 0..100. */
+      fee_pct_max: 100,
+      fee_pct_min: 0,
+      /** Allowed cancellation fee deduction methods. */
+      deduct_method: ["forfeit_credit", "charge_card"] as const,
     },
     no_show: {
       /** Allowed no-show policy enum values. */
@@ -246,15 +248,27 @@ export function checkPolicyAgainstBoundary(
         message: `cancellation.cutoff_hours ${cutoff} below minimum ${B.policy.cancellation.cutoff_hours_min}`,
       })
     }
-    const refund = num(cancel.refund_pct)
+    const fee = num(cancel.fee_pct)
     if (
-      refund !== undefined &&
-      (refund < B.policy.cancellation.refund_pct_min ||
-        refund > B.policy.cancellation.refund_pct_max)
+      fee !== undefined &&
+      (fee < B.policy.cancellation.fee_pct_min ||
+        fee > B.policy.cancellation.fee_pct_max)
     ) {
       v.push({
-        field: "policy.cancellation.refund_pct",
-        message: `cancellation.refund_pct ${refund} outside [${B.policy.cancellation.refund_pct_min}, ${B.policy.cancellation.refund_pct_max}]`,
+        field: "policy.cancellation.fee_pct",
+        message: `cancellation.fee_pct ${fee} outside [${B.policy.cancellation.fee_pct_min}, ${B.policy.cancellation.fee_pct_max}]`,
+      })
+    }
+    const method = cancel.deduct_method
+    if (
+      method !== undefined &&
+      !(B.policy.cancellation.deduct_method as readonly string[]).includes(
+        method as string
+      )
+    ) {
+      v.push({
+        field: "policy.cancellation.deduct_method",
+        message: `cancellation.deduct_method '${String(method)}' not in [${B.policy.cancellation.deduct_method.join(", ")}]`,
       })
     }
   }

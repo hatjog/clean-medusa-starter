@@ -90,6 +90,8 @@ type Queryable = {
 export const ENTITLEMENT_EXTENDED_EVENT = "ENTITLEMENT_EXTENDED"
 export const ENTITLEMENT_REFUND_APPLIED_EVENT =
   "gp.entitlements.entitlement_refund_applied.v1"
+export const ENTITLEMENT_CANCELLATION_FEE_APPLIED_EVENT =
+  "ENTITLEMENT_CANCELLATION_FEE_APPLIED"
 
 export interface ExtendEntitlementInput {
   paid: boolean
@@ -131,6 +133,43 @@ type ExtensionPolicy = {
   paid: boolean
   fee_pct: number
   max_extension_months: number
+}
+
+type CancellationDeductMethod = "forfeit_credit" | "charge_card"
+type CancellationPolicy = {
+  cutoff_hours: number
+  fee_pct: number
+  deduct_method: CancellationDeductMethod
+}
+
+export type CancellationPaymentRefundSeam = (input: {
+  entitlement_id: string
+  order_id?: string
+  refund_amount: number
+  fee_amount: number
+  base_amount: number
+  currency?: string
+}) => Promise<void> | void
+
+export type CancelBookingInput = {
+  current_time?: Date
+  scheduled_at?: Date
+  base_amount?: number
+  currency?: string
+  payment_refund?: CancellationPaymentRefundSeam
+}
+
+export type CancellationFeeAppliedPayload = {
+  entitlement_id: string
+  fee_amount: number
+  fee_pct: number
+  deduct_method: CancellationDeductMethod
+  base_amount: number
+  cutoff_hours: number
+  cancelled_at: string
+  scheduled_at: string
+  refund_amount?: number
+  remaining_amount?: number
 }
 
 type EntitlementInstanceResult = EntitlementInstanceRow & {
@@ -385,6 +424,76 @@ export class VoucherService {
     return policy as ExtensionPolicy
   }
 
+  private cancellationPolicyFromSnapshot(
+    snapshot: EntitlementPolicySnapshot
+  ): CancellationPolicy | null {
+    const cancellation = (snapshot as Record<string, unknown>).cancellation
+    if (!cancellation || typeof cancellation !== "object") return null
+
+    const c = cancellation as Record<string, unknown>
+    if (
+      typeof c.cutoff_hours !== "number" ||
+      !Number.isInteger(c.cutoff_hours) ||
+      typeof c.fee_pct !== "number" ||
+      !Number.isInteger(c.fee_pct) ||
+      (c.deduct_method !== "forfeit_credit" && c.deduct_method !== "charge_card")
+    ) {
+      throw new EntitlementExtensionError(
+        "CANCELLATION_POLICY_INVALID",
+        "policy_snapshot.cancellation must contain cutoff_hours, fee_pct and deduct_method"
+      )
+    }
+
+    if (
+      c.cutoff_hours < ENTITLEMENT_BOUNDARY.policy.cancellation.cutoff_hours_min ||
+      c.fee_pct < ENTITLEMENT_BOUNDARY.policy.cancellation.fee_pct_min ||
+      c.fee_pct > ENTITLEMENT_BOUNDARY.policy.cancellation.fee_pct_max
+    ) {
+      throw new EntitlementExtensionError(
+        "CANCELLATION_POLICY_BOUNDARY_VIOLATION",
+        "policy_snapshot.cancellation is outside GP boundary"
+      )
+    }
+
+    return {
+      cutoff_hours: c.cutoff_hours,
+      fee_pct: c.fee_pct,
+      deduct_method: c.deduct_method,
+    }
+  }
+
+  private resolveScheduledAt(
+    current: EntitlementInstanceResult,
+    input: CancelBookingInput
+  ): Date | null {
+    if (input.scheduled_at) return input.scheduled_at
+    if (!current.booking_pointer) return null
+    try {
+      const parsed = JSON.parse(current.booking_pointer) as Record<string, unknown>
+      const raw = parsed.scheduled_at ?? parsed.scheduledAt
+      if (typeof raw === "string" || raw instanceof Date) return new Date(raw)
+    } catch {
+      return null
+    }
+    return null
+  }
+
+  private isWithinCancellationCutoff(
+    currentTime: Date,
+    scheduledAt: Date,
+    cutoffHours: number
+  ): boolean {
+    const cutoffStart = scheduledAt.getTime() - cutoffHours * 60 * 60 * 1000
+    const now = currentTime.getTime()
+    return (
+      Number.isFinite(now) &&
+      Number.isFinite(cutoffStart) &&
+      Number.isFinite(scheduledAt.getTime()) &&
+      now >= cutoffStart &&
+      now <= scheduledAt.getTime()
+    )
+  }
+
   private addMonths(date: Date, months: number): Date {
     const d = new Date(date.getTime())
     const day = d.getUTCDate()
@@ -421,6 +530,23 @@ export class VoucherService {
         payload.entitlement_id,
         "ENTITLEMENT_BOOKING_CANCELLED",
         payload,
+      ]
+    )
+  }
+
+  private async emitEntitlementCancellationFeeApplied(
+    client: PoolClient,
+    payload: CancellationFeeAppliedPayload
+  ): Promise<void> {
+    await client.query(
+      `INSERT INTO voucher_event (id, voucher_code, entitlement_id, event_type, payload, occurred_at, created_at)
+       VALUES ($1, NULL, $2, $3, $4::jsonb, $5, NOW())`,
+      [
+        randomUUID(),
+        payload.entitlement_id,
+        ENTITLEMENT_CANCELLATION_FEE_APPLIED_EVENT,
+        payload,
+        new Date(payload.cancelled_at),
       ]
     )
   }
@@ -521,7 +647,12 @@ export class VoucherService {
     }
   }
 
-  async cancel_booking(entitlement_id: string): Promise<EntitlementInstanceResult> {
+  async cancel_booking(
+    entitlement_id: string,
+    input: CancelBookingInput | Date = {}
+  ): Promise<EntitlementInstanceResult> {
+    const opts: CancelBookingInput =
+      input instanceof Date ? { current_time: input } : input
     const client = await this.getPool().connect()
 
     try {
@@ -556,15 +687,69 @@ export class VoucherService {
       // assertPolicySnapshotImmutable is NOT called here because passing the
       // same reference as both issued and candidate makes it a no-op; the AC3
       // deep-equal test covers the invariant instead.
+      const cancelledAt = opts.current_time ?? new Date()
+      const scheduledAt = this.resolveScheduledAt(current, opts)
+      const cancellation = this.cancellationPolicyFromSnapshot(
+        current.policy_snapshot
+      )
+      const baseAmount = opts.base_amount ?? current.remaining_amount ?? 0
+      let feePayload: CancellationFeeAppliedPayload | null = null
+      let remainingAmount: number | null = null
+
+      if (
+        cancellation &&
+        scheduledAt &&
+        cancellation.fee_pct > 0 &&
+        baseAmount > 0 &&
+        this.isWithinCancellationCutoff(
+          cancelledAt,
+          scheduledAt,
+          cancellation.cutoff_hours
+        )
+      ) {
+        const feeAmount = Math.round((baseAmount * cancellation.fee_pct) / 100)
+        if (feeAmount > 0) {
+          if (cancellation.deduct_method === "forfeit_credit") {
+            remainingAmount = Math.max(0, (current.remaining_amount ?? baseAmount) - feeAmount)
+          } else {
+            const refundAmount = Math.max(0, baseAmount - feeAmount)
+            await opts.payment_refund?.({
+              entitlement_id,
+              ...(current.order_id ? { order_id: current.order_id } : {}),
+              refund_amount: refundAmount,
+              fee_amount: feeAmount,
+              base_amount: baseAmount,
+              ...(opts.currency ? { currency: opts.currency } : {}),
+            })
+          }
+          feePayload = {
+            entitlement_id,
+            fee_amount: feeAmount,
+            fee_pct: cancellation.fee_pct,
+            deduct_method: cancellation.deduct_method,
+            base_amount: baseAmount,
+            cutoff_hours: cancellation.cutoff_hours,
+            cancelled_at: cancelledAt.toISOString(),
+            scheduled_at: scheduledAt.toISOString(),
+            ...(cancellation.deduct_method === "charge_card"
+              ? { refund_amount: Math.max(0, baseAmount - feeAmount) }
+              : {}),
+            ...(remainingAmount !== null
+              ? { remaining_amount: remainingAmount }
+              : {}),
+          }
+        }
+      }
 
       const updateRes = await client.query<Record<string, unknown>>(
         `UPDATE entitlement_instance
          SET booking_pointer = NULL,
              state = $2,
+             remaining_amount = COALESCE($3, remaining_amount),
              updated_at = NOW()
          WHERE id = $1
          RETURNING *`,
-        [entitlement_id, EntitlementInstanceState.ACTIVE]
+        [entitlement_id, EntitlementInstanceState.ACTIVE, remainingAmount]
       )
       if (updateRes.rows.length === 0) {
         throw new Error(
@@ -580,6 +765,9 @@ export class VoucherService {
         booking_pointer: null,
         entitlement_type: EntitlementType.VOUCHER_SERVICE,
       })
+      if (feePayload) {
+        await this.emitEntitlementCancellationFeeApplied(client, feePayload)
+      }
 
       await client.query("COMMIT")
       return updated

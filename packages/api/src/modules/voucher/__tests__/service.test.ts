@@ -145,7 +145,7 @@ const EXPIRED_ROW: QueryRow = {
 
 const SERVICE_POLICY = {
   validity_months: 12,
-  cancellation: { enabled: true, cutoff_hours: 24, refund_pct: 100 },
+  cancellation: { cutoff_hours: 24, fee_pct: 0, deduct_method: "forfeit_credit" },
 }
 
 const ENTITLEMENT_REBOOK_ROW: EntitlementTestRow = {
@@ -574,6 +574,184 @@ describe("VoucherService", () => {
 
       expect(instance.state).toBe(EntitlementInstanceState.REDEEMED_FULL)
       expect(instance.expires_at).toBe(expiresAt)
+    })
+
+    it("applies forfeit_credit cancellation fee inside cutoff and emits audit event", async () => {
+      const scheduledAt = new Date("2026-05-17T10:00:00.000Z")
+      const cancelledAt = new Date("2026-05-17T02:00:00.000Z")
+      const row = {
+        ...ENTITLEMENT_REBOOK_ROW,
+        remaining_amount: 10000,
+        policy_snapshot: {
+          validity_months: 12,
+          cancellation: {
+            cutoff_hours: 12,
+            fee_pct: 25,
+            deduct_method: "forfeit_credit",
+          },
+        },
+      }
+      const updatedRow = {
+        ...row,
+        state: EntitlementInstanceState.ACTIVE,
+        booking_pointer: null,
+        remaining_amount: 7500,
+      }
+      const capturedClientQueries: Array<{ sql: string; params: unknown[] }> = []
+      const pool = makeMockPool({
+        captureClientQueries: capturedClientQueries,
+        clientQueryResponses: [
+          { rows: [] },
+          { rows: [row] },
+          { rows: [updatedRow], rowCount: 1 } as unknown as QueryResponse,
+          { rows: [] },
+          { rows: [] },
+          { rows: [] },
+        ],
+      })
+      const svc = makeService(pool)
+
+      const result = await svc.cancel_booking("ent_service_rebook_001", {
+        current_time: cancelledAt,
+        scheduled_at: scheduledAt,
+        base_amount: 10000,
+      })
+
+      expect(result.remaining_amount).toBe(7500)
+      const update = capturedClientQueries.find((q) =>
+        q.sql.includes("UPDATE entitlement_instance")
+      )
+      expect(update?.params).toEqual([
+        "ent_service_rebook_001",
+        EntitlementInstanceState.ACTIVE,
+        7500,
+      ])
+      const feeEvent = capturedClientQueries.find(
+        (q) => q.params[2] === "ENTITLEMENT_CANCELLATION_FEE_APPLIED"
+      )
+      expect(feeEvent?.params[3]).toEqual({
+        entitlement_id: "ent_service_rebook_001",
+        fee_amount: 2500,
+        fee_pct: 25,
+        deduct_method: "forfeit_credit",
+        base_amount: 10000,
+        cutoff_hours: 12,
+        cancelled_at: cancelledAt.toISOString(),
+        scheduled_at: scheduledAt.toISOString(),
+        remaining_amount: 7500,
+      })
+    })
+
+    it("applies charge_card cancellation fee through refund seam inside cutoff", async () => {
+      const scheduledAt = new Date("2026-05-17T10:00:00.000Z")
+      const cancelledAt = new Date("2026-05-17T03:00:00.000Z")
+      const paymentRefund = jest.fn()
+      const row = {
+        ...ENTITLEMENT_REBOOK_ROW,
+        remaining_amount: 10000,
+        policy_snapshot: {
+          validity_months: 12,
+          cancellation: {
+            cutoff_hours: 12,
+            fee_pct: 10,
+            deduct_method: "charge_card",
+          },
+        },
+      }
+      const updatedRow = {
+        ...row,
+        state: EntitlementInstanceState.ACTIVE,
+        booking_pointer: null,
+      }
+      const capturedClientQueries: Array<{ sql: string; params: unknown[] }> = []
+      const pool = makeMockPool({
+        captureClientQueries: capturedClientQueries,
+        clientQueryResponses: [
+          { rows: [] },
+          { rows: [row] },
+          { rows: [updatedRow], rowCount: 1 } as unknown as QueryResponse,
+          { rows: [] },
+          { rows: [] },
+          { rows: [] },
+        ],
+      })
+      const svc = makeService(pool)
+
+      await svc.cancel_booking("ent_service_rebook_001", {
+        current_time: cancelledAt,
+        scheduled_at: scheduledAt,
+        base_amount: 10000,
+        currency: "PLN",
+        payment_refund: paymentRefund,
+      })
+
+      expect(paymentRefund).toHaveBeenCalledWith({
+        entitlement_id: "ent_service_rebook_001",
+        order_id: "ord_rebook_001",
+        refund_amount: 9000,
+        fee_amount: 1000,
+        base_amount: 10000,
+        currency: "PLN",
+      })
+      const feeEvent = capturedClientQueries.find(
+        (q) => q.params[2] === "ENTITLEMENT_CANCELLATION_FEE_APPLIED"
+      )
+      expect(feeEvent?.params[3]).toEqual(
+        expect.objectContaining({
+          fee_amount: 1000,
+          fee_pct: 10,
+          deduct_method: "charge_card",
+          refund_amount: 9000,
+        })
+      )
+    })
+
+    it("does not apply cancellation fee outside cutoff", async () => {
+      const row = {
+        ...ENTITLEMENT_REBOOK_ROW,
+        remaining_amount: 10000,
+        policy_snapshot: {
+          validity_months: 12,
+          cancellation: {
+            cutoff_hours: 12,
+            fee_pct: 25,
+            deduct_method: "forfeit_credit",
+          },
+        },
+      }
+      const updatedRow = {
+        ...row,
+        state: EntitlementInstanceState.ACTIVE,
+        booking_pointer: null,
+      }
+      const capturedClientQueries: Array<{ sql: string; params: unknown[] }> = []
+      const pool = makeMockPool({
+        captureClientQueries: capturedClientQueries,
+        clientQueryResponses: [
+          { rows: [] },
+          { rows: [row] },
+          { rows: [updatedRow], rowCount: 1 } as unknown as QueryResponse,
+          { rows: [] },
+          { rows: [] },
+        ],
+      })
+      const svc = makeService(pool)
+
+      await svc.cancel_booking("ent_service_rebook_001", {
+        current_time: new Date("2026-05-16T10:00:00.000Z"),
+        scheduled_at: new Date("2026-05-17T10:00:00.000Z"),
+        base_amount: 10000,
+      })
+
+      expect(
+        capturedClientQueries.some(
+          (q) => q.params[2] === "ENTITLEMENT_CANCELLATION_FEE_APPLIED"
+        )
+      ).toBe(false)
+      const update = capturedClientQueries.find((q) =>
+        q.sql.includes("UPDATE entitlement_instance")
+      )
+      expect(update?.params[2]).toBeNull()
     })
   })
 })
