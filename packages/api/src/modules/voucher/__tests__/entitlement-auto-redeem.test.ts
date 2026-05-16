@@ -350,7 +350,7 @@ describe("RedeemEntitlementWorkflow — event envelope shape", () => {
     expect(envelope).toMatchObject({
       schema_version: "1",
       event_type: "gp.entitlements.entitlement_redeemed.v1",
-      actor: "system:auto-redeem",
+      actor: "system",
       scope: {
         instance_id: "ent-001",
         market_id: "bonbeauty",

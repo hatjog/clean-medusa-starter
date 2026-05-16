@@ -329,6 +329,10 @@ export type AutoRedeemPolicy = {
 
 // Booking-confirmation trigger set (BE-8 scope).
 // on_service_complete and manual_only are explicitly out-of-scope for booking-confirm.
+// Using a Set for extensibility: if new booking-confirmation trigger variants are added
+// to the market-config.v1.schema.json enum in a future story, extend this set.
+// (With a single element a direct `=== "on_appointment_confirm"` check would be
+// simpler, but the Set pattern is preferred here for forward compatibility — I1.)
 const BOOKING_CONFIRM_TRIGGERS: ReadonlySet<string> = new Set([
   "on_appointment_confirm",
 ])

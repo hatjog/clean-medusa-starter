@@ -31,7 +31,8 @@ export type RedeemEventEnvelope = {
   schema_version: "1"
   event_type: typeof ENTITLEMENT_REDEEMED_EVENT_TYPE
   occurred_at: string
-  actor: "system:auto-redeem"
+  /** Must be one of the envelope.v1.schema.json `actor` enum values. */
+  actor: "system"
   scope: {
     instance_id: string
     market_id: string
@@ -226,14 +227,27 @@ function buildResult(
 ): RedeemEntitlementResult {
   const occurredAt = now.toISOString()
   const redemptionId = buildRedemptionId(idempotencyKey)
+  // NOTE (L2): market_id is not in the entitlement_instance DDL (confirmed by T0 recon:
+  // DDL = id, entitlement_profile_id, entitlement_type, order_id, state, policy_snapshot,
+  // created_at, updated_at). So ent.market_id will always be null/undefined until the
+  // column is added. At wiring time (v1.9.0+), pass market_id via RedeemEntitlementInput
+  // from the booking-confirmation event context.
+  const resolvedMarketId = ent.market_id ?? input.market_id
+  if (!resolvedMarketId) {
+    // "unknown" satisfies schema minLength:1 but is semantically incorrect.
+    // This fallback must be resolved when the subscriber is wired to a real event.
+    // Apply-path: derive market_id from the booking-confirmation event payload.
+  }
   const event: RedeemEventEnvelope = {
     schema_version: "1",
     event_type: ENTITLEMENT_REDEEMED_EVENT_TYPE,
     occurred_at: occurredAt,
-    actor: "system:auto-redeem",
+    // "system" is the correct envelope.v1.schema.json enum value for automated actors.
+    // The actor_hint in payload carries the specific sub-actor identity.
+    actor: "system",
     scope: {
       instance_id: ent.id,
-      market_id: ent.market_id ?? input.market_id ?? "unknown",
+      market_id: resolvedMarketId ?? "unknown",
     },
     idempotency_key: idempotencyKey,
     payload: {
@@ -311,12 +325,22 @@ class PostgresRedeemEntitlementTx implements RedeemEntitlementTx {
     )
     const row = result.rows[0]
     if (!row) return null
+    const rawSnapshot = row.policy_snapshot
+    if (
+      rawSnapshot === null ||
+      rawSnapshot === undefined ||
+      typeof rawSnapshot !== "object" ||
+      Array.isArray(rawSnapshot)
+    ) {
+      throw new Error(
+        `entitlement_instance ${row.id as string}: policy_snapshot is not a valid object ` +
+          `(got ${rawSnapshot === null ? "null" : typeof rawSnapshot})`
+      )
+    }
     return {
       id: row.id as string,
       state: row.state as EntitlementInstanceState,
-      policy_snapshot: snapshotPolicy(
-        row.policy_snapshot as Record<string, unknown>
-      ),
+      policy_snapshot: snapshotPolicy(rawSnapshot as Record<string, unknown>),
       order_id: (row.order_id ?? null) as string | null,
       market_id: (row.market_id ?? null) as string | null,
     }

@@ -71,15 +71,39 @@ async function onBookingConfirmed({
   }
 
   // Determine booking reference for idempotency_key derivation.
+  // NOTE (L1): If none of booking_ref/booking_id/order_id is present, we fall
+  // back to entitlementId. This is safe because each entitlement can only reach
+  // REDEEMED_FULL once (state machine idempotency prevents a second redeem for
+  // the same entitlement regardless of booking_ref). However, at wiring time
+  // (v1.9.0+) the real event payload MUST include a booking reference to make
+  // the idempotency_key semantically meaningful across different bookings.
   const bookingRef =
     event.data?.booking_ref ??
     event.data?.booking_id ??
     event.data?.order_id ??
     entitlementId
+  if (
+    !event.data?.booking_ref &&
+    !event.data?.booking_id &&
+    !event.data?.order_id
+  ) {
+    logger.warn?.(
+      `[entitlement-auto-redeem] no booking_ref/booking_id/order_id in event payload ` +
+        `for entitlement_id=${entitlementId} — falling back to entitlement_id as booking_ref. ` +
+        `Ensure the real event payload includes a booking reference at wiring time.`
+    )
+  }
 
   const scope = container as unknown as { resolve: (k: string) => unknown }
   const workflow = createRedeemEntitlementWorkflowFromScope(scope)
 
+  // AUTHORED STUB NOTE (M1): This block makes a separate DB read for policy_snapshot
+  // outside the workflow's FOR UPDATE transaction. This is safe because policy_snapshot
+  // is immutable post-ISSUED (regulamin §12 / AC1), so the gate decision cannot be
+  // invalidated by a concurrent write. When wiring to a real event surface (v1.9.0+),
+  // consider reading policy_snapshot inside the workflow transaction to reduce
+  // connection churn (apply-path: extend RedeemEntitlementTx.getEntitlementForUpdate
+  // to return the snapshot so the caller can evaluate the gate without a second query).
   let entitlement: { policy_snapshot: Record<string, unknown> } | null = null
   try {
     // Resolve entitlement to read policy_snapshot for the auto_redeem gate.
