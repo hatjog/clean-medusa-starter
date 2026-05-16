@@ -19,6 +19,7 @@ export { VoucherService }
 export {
   ENTITLEMENT_EXTENDED_EVENT,
   ENTITLEMENT_REFUND_APPLIED_EVENT,
+  ENTITLEMENT_NO_SHOW_EVENT_TYPE,
   EntitlementExtensionError,
   EntitlementRefundError,
 } from "./service"
@@ -30,6 +31,9 @@ export type {
   RefundRequestResult,
   RefundAppliedPayload,
   RefundAppliedEnvelope,
+  MarkNoShowInput,
+  MarkNoShowResult,
+  NoShowOutcome,
 } from "./service"
 
 export type {
@@ -70,13 +74,18 @@ export {
   LOST_CODE_REISSUE_WINDOW_DAYS,
   NO_SHOW_POLICIES,
   REFUND_CHANNELS,
+  TRANSFERABILITY_VALUES,
   isWithinReissueWindow,
   validityMonthsMax,
   checkPolicyAgainstBoundary,
+  assertTransferabilityAllowed,
+  TransferabilityError,
 } from "./entitlement-boundary"
 export type {
   NoShowPolicy,
   RefundChannel,
+  Transferability,
+  RedeemContext,
   BoundaryViolation,
 } from "./entitlement-boundary"
 export {
