@@ -110,6 +110,10 @@ maybeDescribe("Story 2.8 lifecycle integration — issue → active → refund_r
     pool = new Pool({ connectionString: process.env.DATABASE_URL })
     await pool.query(`DELETE FROM voucher_event WHERE entitlement_id = $1`, [idRefund])
     await pool.query(`DELETE FROM entitlement_instance WHERE id = $1`, [idRefund])
+    // Note: inserting directly in ACTIVE state for test simplicity — the
+    // ISSUED → ACTIVE transition is bypassed here. The full state-machine
+    // lifecycle (ISSUED → ACTIVE transition guard) is covered by the Story 2.1
+    // unit tests; this test focuses on the refund_request() behavior.
     await pool.query(
       `INSERT INTO entitlement_instance (
          id, entitlement_profile_id, entitlement_type, order_id, state,

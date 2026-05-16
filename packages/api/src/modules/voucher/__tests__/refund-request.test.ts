@@ -1,7 +1,7 @@
 /**
  * Story v180-2-8 BE-7 refund channel — unit tests.
  *
- * Covers AC6 cases (a)-(g):
+ * Covers AC6 cases (a)-(g) plus review-fix findings:
  *  (a) original_payment → routing + audit, NO automated Stripe refund.create
  *  (b) store_credit → customer.metadata.gp.store_credit incremented
  *  (c) vendor_wallet → vendor.metadata.wallet incremented
@@ -10,6 +10,10 @@
  *      envelope + refund_channel + refunded_amount_minor + currency
  *  (f) idempotency — duplicate refund_id returns same result without re-applying
  *  (g) snapshot immutability (policy_snapshot.refund_channel immutable post-ISSUED)
+ *  (h) review-fix F-01: scope.instance_id = entitlement instance ID (not "gp-dev")
+ *  (i) review-fix F-02: amount must be positive integer
+ *  (j) review-fix F-05: currency must be 3-char uppercase ISO 4217
+ *  (k) review-fix F-04: terminal/invalid state guard
  */
 
 import { describe, it, expect, beforeEach } from "@jest/globals"
@@ -157,6 +161,9 @@ describe("refund_request — original_payment channel", () => {
     expect(env.payload.refunded_amount_minor).toBe(5000)
     expect(env.payload.currency).toBe("PLN")
     expect(env.idempotency_key).toBe("entitlement:ent_test_001:refund_applied:refund_001")
+
+    // (h) review-fix F-01: scope.instance_id must be the entitlement instance ID
+    expect(env.scope.instance_id).toBe("ent_test_001")
 
     // (a) NO Stripe refund.create call — assert no external HTTP call pattern
     // (structural: no stripe-related SQL or external call in captured queries)
@@ -394,6 +401,167 @@ describe("refund_request — snapshot immutability (AC5/AC6g)", () => {
     expect(() =>
       assertPolicySnapshotImmutable(EntitlementInstanceState.ACTIVE, snap, snap)
     ).not.toThrow()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Review-fix F-02 — amount positivity guard
+// ---------------------------------------------------------------------------
+
+describe("refund_request — amount validation (review-fix F-02)", () => {
+  it("(i) rejects zero amount with EntitlementRefundError", async () => {
+    const pool = makePool()
+    pool.connect = async () => ({ query: pool.query, release: () => {} })
+    const { svc } = makeService(pool)
+
+    await expect(
+      svc.refund_request("ent_test_001", {
+        refund_id: "refund_zero_001",
+        amount: 0,
+        currency: "PLN",
+      })
+    ).rejects.toMatchObject({
+      name: "EntitlementRefundError",
+      code: "INVALID_REFUND_AMOUNT",
+    })
+  })
+
+  it("(i) rejects negative amount with EntitlementRefundError", async () => {
+    const pool = makePool()
+    pool.connect = async () => ({ query: pool.query, release: () => {} })
+    const { svc } = makeService(pool)
+
+    await expect(
+      svc.refund_request("ent_test_001", {
+        refund_id: "refund_neg_001",
+        amount: -500,
+        currency: "PLN",
+      })
+    ).rejects.toMatchObject({
+      name: "EntitlementRefundError",
+      code: "INVALID_REFUND_AMOUNT",
+    })
+  })
+
+  it("(i) rejects non-integer (fractional) amount with EntitlementRefundError", async () => {
+    const pool = makePool()
+    pool.connect = async () => ({ query: pool.query, release: () => {} })
+    const { svc } = makeService(pool)
+
+    await expect(
+      svc.refund_request("ent_test_001", {
+        refund_id: "refund_frac_001",
+        amount: 19.99,
+        currency: "PLN",
+      })
+    ).rejects.toMatchObject({
+      name: "EntitlementRefundError",
+      code: "INVALID_REFUND_AMOUNT",
+    })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Review-fix F-05 — currency format validation
+// ---------------------------------------------------------------------------
+
+describe("refund_request — currency validation (review-fix F-05)", () => {
+  it("(j) rejects empty currency string with EntitlementRefundError", async () => {
+    const pool = makePool()
+    pool.connect = async () => ({ query: pool.query, release: () => {} })
+    const { svc } = makeService(pool)
+
+    await expect(
+      svc.refund_request("ent_test_001", {
+        refund_id: "refund_cur_001",
+        amount: 1000,
+        currency: "",
+      })
+    ).rejects.toMatchObject({
+      name: "EntitlementRefundError",
+      code: "INVALID_CURRENCY",
+    })
+  })
+
+  it("(j) rejects lowercase currency code with EntitlementRefundError", async () => {
+    const pool = makePool()
+    pool.connect = async () => ({ query: pool.query, release: () => {} })
+    const { svc } = makeService(pool)
+
+    await expect(
+      svc.refund_request("ent_test_001", {
+        refund_id: "refund_cur_002",
+        amount: 1000,
+        currency: "pln",
+      })
+    ).rejects.toMatchObject({
+      name: "EntitlementRefundError",
+      code: "INVALID_CURRENCY",
+    })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Review-fix F-04 — entitlement state guard
+// ---------------------------------------------------------------------------
+
+describe("refund_request — state guard (review-fix F-04)", () => {
+  it("(k) rejects REFUNDED (terminal) state with EntitlementRefundError", async () => {
+    const entitlementRow = makeEntitlementRow("store_credit", EntitlementInstanceState.REFUNDED)
+    const pool = makePool()
+    pool.query = async (sql: string, params?: unknown[]) => {
+      pool._calls.push({ sql, params: params ?? [] })
+      const s = sql.trim().toUpperCase()
+      if (s.startsWith("SELECT") && sql.includes("voucher_event")) {
+        return { rows: [], rowCount: 0 }
+      }
+      if (s.startsWith("SELECT") && sql.includes("entitlement_instance")) {
+        return { rows: [entitlementRow], rowCount: 1 }
+      }
+      return { rows: [], rowCount: 1 }
+    }
+    pool.connect = async () => ({ query: pool.query, release: () => {} })
+    const { svc } = makeService(pool)
+
+    await expect(
+      svc.refund_request("ent_test_001", {
+        refund_id: "refund_state_001",
+        amount: 1000,
+        currency: "PLN",
+      })
+    ).rejects.toMatchObject({
+      name: "EntitlementRefundError",
+      code: "INVALID_ENTITLEMENT_STATE_FOR_REFUND",
+    })
+  })
+
+  it("(k) rejects CLOSED (terminal) state with EntitlementRefundError", async () => {
+    const entitlementRow = makeEntitlementRow("store_credit", EntitlementInstanceState.CLOSED)
+    const pool = makePool()
+    pool.query = async (sql: string, params?: unknown[]) => {
+      pool._calls.push({ sql, params: params ?? [] })
+      const s = sql.trim().toUpperCase()
+      if (s.startsWith("SELECT") && sql.includes("voucher_event")) {
+        return { rows: [], rowCount: 0 }
+      }
+      if (s.startsWith("SELECT") && sql.includes("entitlement_instance")) {
+        return { rows: [entitlementRow], rowCount: 1 }
+      }
+      return { rows: [], rowCount: 1 }
+    }
+    pool.connect = async () => ({ query: pool.query, release: () => {} })
+    const { svc } = makeService(pool)
+
+    await expect(
+      svc.refund_request("ent_test_001", {
+        refund_id: "refund_state_002",
+        amount: 1000,
+        currency: "PLN",
+      })
+    ).rejects.toMatchObject({
+      name: "EntitlementRefundError",
+      code: "INVALID_ENTITLEMENT_STATE_FOR_REFUND",
+    })
   })
 })
 

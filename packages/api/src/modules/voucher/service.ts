@@ -27,6 +27,14 @@ import {
   type EntitlementInstanceRow,
   type EntitlementPolicySnapshot,
 } from "./models/entitlement"
+
+/** States from which a refund can be processed. */
+const REFUNDABLE_STATES: ReadonlySet<EntitlementInstanceState> = new Set([
+  EntitlementInstanceState.ACTIVE,
+  EntitlementInstanceState.REDEEMED_PARTIAL,
+  EntitlementInstanceState.REDEEMED_FULL,
+  EntitlementInstanceState.REFUND_REQUESTED,
+])
 import { ENTITLEMENT_BOUNDARY, REFUND_CHANNELS, type RefundChannel, validityMonthsMax } from "./entitlement-boundary"
 
 type VoucherModuleOptions = {
@@ -772,49 +780,70 @@ export class VoucherService {
     entitlementId: string,
     input: RefundRequestInput
   ): Promise<RefundRequestResult> {
+    // F-02 fix: validate amount is a positive integer (minor units).
+    if (!Number.isInteger(input.amount) || input.amount <= 0) {
+      throw new EntitlementRefundError(
+        "INVALID_REFUND_AMOUNT",
+        `refund amount must be a positive integer (minor units), got ${input.amount}`,
+        { entitlement_id: entitlementId, amount: input.amount }
+      )
+    }
+
+    // F-05 fix: validate currency is a 3-character ISO 4217 code.
+    if (!/^[A-Z]{3}$/.test(input.currency)) {
+      throw new EntitlementRefundError(
+        "INVALID_CURRENCY",
+        `currency must be a 3-character ISO 4217 code (uppercase), got '${input.currency}'`,
+        { entitlement_id: entitlementId, currency: input.currency }
+      )
+    }
+
     const actor = input.actor ?? "system"
     const now = new Date()
     const idempotencyKey = `entitlement:${entitlementId}:refund_applied:${input.refund_id}`
 
     const pool = this.getPool()
-
-    // Idempotency check: has this refund_id already been applied?
-    const existingEvent = await pool.query<Record<string, unknown>>(
-      `SELECT payload FROM voucher_event
-        WHERE entitlement_id = $1
-          AND event_type = $2
-          AND payload->>'refund_id' = $3
-        LIMIT 1`,
-      [entitlementId, ENTITLEMENT_REFUND_APPLIED_EVENT, input.refund_id]
-    )
-    if ((existingEvent.rowCount ?? 0) > 0) {
-      const p = existingEvent.rows[0].payload as RefundAppliedPayload
-      const envelope: RefundAppliedEnvelope = {
-        schema_version: "1",
-        event_type: ENTITLEMENT_REFUND_APPLIED_EVENT,
-        occurred_at: p.applied_at,
-        actor,
-        idempotency_key: idempotencyKey,
-        scope: { instance_id: "gp-dev" },
-        payload: p,
-      }
-      return {
-        entitlement_id: entitlementId,
-        refund_id: input.refund_id,
-        refund_channel: p.refund_channel,
-        amount: p.refunded_amount_minor,
-        currency: p.currency,
-        idempotent: true,
-        event: envelope,
-      }
-    }
-
     const client = await pool.connect()
     let committed = false
     let envelope: RefundAppliedEnvelope | undefined
 
     try {
       await client.query("BEGIN")
+
+      // F-06 fix: idempotency check moved inside the transaction (after BEGIN)
+      // to close the TOCTOU race window between check and effect. Both read and
+      // insert execute under the same client transaction.
+      const existingEvent = await (client as Queryable).query<Record<string, unknown>>(
+        `SELECT payload FROM voucher_event
+          WHERE entitlement_id = $1
+            AND event_type = $2
+            AND payload->>'refund_id' = $3
+          LIMIT 1`,
+        [entitlementId, ENTITLEMENT_REFUND_APPLIED_EVENT, input.refund_id]
+      )
+      if ((existingEvent.rowCount ?? 0) > 0) {
+        await client.query("ROLLBACK")
+        const p = existingEvent.rows[0].payload as RefundAppliedPayload
+        const idempotentEnvelope: RefundAppliedEnvelope = {
+          schema_version: "1",
+          event_type: ENTITLEMENT_REFUND_APPLIED_EVENT,
+          occurred_at: p.applied_at,
+          actor,
+          idempotency_key: idempotencyKey,
+          // F-01 fix: use actual entitlement instance ID, not hardcoded "gp-dev".
+          scope: { instance_id: entitlementId },
+          payload: p,
+        }
+        return {
+          entitlement_id: entitlementId,
+          refund_id: input.refund_id,
+          refund_channel: p.refund_channel,
+          amount: p.refunded_amount_minor,
+          currency: p.currency,
+          idempotent: true,
+          event: idempotentEnvelope,
+        }
+      }
 
       const result = await (client as Queryable).query(
         `SELECT id, entitlement_profile_id, order_id, state, policy_snapshot,
@@ -833,6 +862,16 @@ export class VoucherService {
       }
 
       const row = this.rowToEntitlementInstance(result.rows[0])
+
+      // F-04 fix: guard against refund on terminal/invalid states.
+      if (!REFUNDABLE_STATES.has(row.state)) {
+        throw new EntitlementRefundError(
+          "INVALID_ENTITLEMENT_STATE_FOR_REFUND",
+          `entitlement_instance '${entitlementId}' is in state ${row.state} which does not allow refund processing`,
+          { entitlement_id: entitlementId, state: row.state }
+        )
+      }
+
       const snapshot = row.policy_snapshot as Record<string, unknown>
       const rawChannel = snapshot.refund_channel
 
@@ -852,6 +891,11 @@ export class VoucherService {
 
       if (refundChannel === "store_credit") {
         // Increment customer.metadata.gp.store_credit (minor units, currency-aware).
+        // Note: the nested jsonb_set correctly uses the original `metadata` value
+        // in the COALESCE — PostgreSQL evaluates all SET expressions against the
+        // pre-UPDATE row state, so the inner jsonb_set result is threaded as the
+        // first argument to the outer one while COALESCE reads the original value.
+        // This is intentional and correct PostgreSQL behavior.
         await (client as Queryable).query(
           `UPDATE customer
               SET metadata = jsonb_set(
@@ -927,7 +971,8 @@ export class VoucherService {
         occurred_at: appliedAt,
         actor,
         idempotency_key: idempotencyKey,
-        scope: { instance_id: "gp-dev" },
+        // F-01 fix: use actual entitlement instance ID, not hardcoded "gp-dev".
+        scope: { instance_id: entitlementId },
         payload,
       }
 
