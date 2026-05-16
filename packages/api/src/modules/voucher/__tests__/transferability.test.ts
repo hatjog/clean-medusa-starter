@@ -173,15 +173,15 @@ describe("assertTransferabilityAllowed", () => {
     ).toEqual({ softFlag: false })
   })
 
-  // (g) value outside enum in policy_snapshot → reject
-  it("(g) unknown transferability value in policy_snapshot → throws", () => {
+  // (g) value outside enum in policy_snapshot → reject (data-integrity guard)
+  it("(g) unknown transferability value in policy_snapshot → throws with enum message", () => {
     const snap = snapshotPolicy({
       validity_months: 12,
       transferability: "invalid_value",
     })
     expect(() =>
       assertTransferabilityAllowed(snap, { customer_id: "cust_abc" })
-    ).toThrow()
+    ).toThrow(/invalid transferability enum.*invalid_value/)
   })
 
   // Missing transferability in snapshot → defaults to bearer (allow)

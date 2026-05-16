@@ -331,10 +331,13 @@ export function assertTransferabilityAllowed(
     transferability !== "personalized" &&
     transferability !== "hybrid"
   ) {
-    throw new TransferabilityError(
-      "bearer",
-      redeemContext.customer_id ?? null,
-      redeemContext.recipient_customer_id ?? null
+    // Data-integrity guard: the snapshot carries an unrecognised enum value.
+    // This is a policy-data defect (not an identity-check failure), so we throw
+    // a plain Error with the actual offending value rather than misusing
+    // TransferabilityError (which is reserved for identity-check rejections).
+    throw new Error(
+      `assertTransferabilityAllowed: invalid transferability enum '${String(raw)}' ` +
+        `in policy_snapshot — expected one of [${TRANSFERABILITY_VALUES.join(", ")}]`
     )
   }
 
