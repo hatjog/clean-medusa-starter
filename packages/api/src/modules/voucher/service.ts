@@ -405,6 +405,7 @@ export class VoucherService {
       id,
       voucher_code: code,
       event_type: event.event_type,
+      payload: null,
       occurred_at: occurredAt,
       created_at: new Date(),
     }

@@ -185,16 +185,29 @@ export function parseV170CompatAuditEnvelope(
     decline_code: optStr("decline_code"),
     payment_method_type: optStr("payment_method_type"),
     processing_country: optStr("processing_country"),
-    // 10 NEW v1.8.0 policy fields — absent from v1.7.0 records → undefined
-    paid: e.paid === undefined ? undefined : (e.paid as boolean),
-    fee_pct: e.fee_pct === undefined ? undefined : (e.fee_pct as number),
+    // 10 NEW v1.8.0 policy fields — absent from v1.7.0 records → undefined.
+    // When present, fail-loud on wrong type (same principle as required fields).
+    paid: e.paid === undefined
+      ? undefined
+      : typeof e.paid === "boolean"
+        ? e.paid
+        : (() => { throw new EnvelopeParseError("paid", `must be boolean when present, got: ${JSON.stringify(e.paid)}`) })(),
+    fee_pct: e.fee_pct === undefined
+      ? undefined
+      : (typeof e.fee_pct === "number" && Number.isFinite(e.fee_pct))
+        ? e.fee_pct
+        : (() => { throw new EnvelopeParseError("fee_pct", `must be finite number when present, got: ${JSON.stringify(e.fee_pct)}`) })(),
     previous_expires_at: optStr("previous_expires_at"),
     new_expires_at: optStr("new_expires_at"),
     deduct_method: optStr("deduct_method"),
     transferability: optStr("transferability"),
     no_show_outcome: optStr("no_show_outcome"),
     refund_channel: optStr("refund_channel"),
-    auto_redeem: e.auto_redeem === undefined ? undefined : (e.auto_redeem as boolean),
+    auto_redeem: e.auto_redeem === undefined
+      ? undefined
+      : typeof e.auto_redeem === "boolean"
+        ? e.auto_redeem
+        : (() => { throw new EnvelopeParseError("auto_redeem", `must be boolean when present, got: ${JSON.stringify(e.auto_redeem)}`) })(),
     retention_id: optStr("retention_id"),
     entitlement_profile_id: optStr("entitlement_profile_id"),
   }

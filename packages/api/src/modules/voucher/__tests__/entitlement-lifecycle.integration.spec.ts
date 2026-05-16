@@ -122,7 +122,7 @@ maybeDescribe(
           const result = await pool.query(
             `UPDATE entitlement_instance
                SET state = $2, updated_at = NOW()
-             WHERE id = $1 AND state = $1::text
+             WHERE id = $1 AND state = $3
              RETURNING state`,
             [id, toState, fromState]
           )
