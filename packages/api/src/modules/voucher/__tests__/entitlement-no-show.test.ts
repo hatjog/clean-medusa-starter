@@ -470,4 +470,43 @@ describe("mark_no_show — (h) illegal source state", () => {
       svc.mark_no_show("ent_no_show_001", { reason: "bad state" })
     ).rejects.toThrow(EntitlementTransitionError)
   })
+
+  // H1 fix coverage: charge_partial and no_charge must also reject invalid source states.
+  it("rejects charge_partial from SETTLED (H1 guard)", async () => {
+    const row = instanceWithPolicy(
+      { policy: "charge_partial", charge_pct: 50 },
+      { state: EntitlementInstanceState.SETTLED }
+    )
+    const pool = makeMockPool({
+      clientQueryResponses: [
+        { rows: [] },
+        { rows: [row], rowCount: 1 },
+        { rows: [] },
+      ],
+    })
+    const svc = makeService(pool)
+
+    await expect(
+      svc.mark_no_show("ent_no_show_001", { reason: "bad state", base_amount: 20000 })
+    ).rejects.toThrow(EntitlementTransitionError)
+  })
+
+  it("rejects no_charge from SETTLED (H1 guard)", async () => {
+    const row = instanceWithPolicy(
+      { policy: "no_charge" },
+      { state: EntitlementInstanceState.SETTLED }
+    )
+    const pool = makeMockPool({
+      clientQueryResponses: [
+        { rows: [] },
+        { rows: [row], rowCount: 1 },
+        { rows: [] },
+      ],
+    })
+    const svc = makeService(pool)
+
+    await expect(
+      svc.mark_no_show("ent_no_show_001", { reason: "bad state" })
+    ).rejects.toThrow(EntitlementTransitionError)
+  })
 })

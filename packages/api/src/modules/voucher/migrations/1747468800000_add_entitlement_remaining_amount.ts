@@ -2,7 +2,8 @@ import { Migration } from "@medusajs/framework/mikro-orm/migrations"
 
 /**
  * Story 2.7 BE-6: add remaining_amount to entitlement_instance.
- * // Source: architecture.md D-V180-ARCH-6 (ADR-099 4-layer) — BE-6 no-show partial fee.
+ *
+ * @see architecture.md D-V180-ARCH-6 (ADR-099 4-layer) — BE-6 no-show partial fee.
  *
  * Apply path: local docker-compose available → `npx medusa db:migrate`
  * If infra unavailable → AUTHORED-not-applied per Story 2.1 T4 posture.

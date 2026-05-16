@@ -27,7 +27,7 @@ import {
   type EntitlementInstanceRow,
   type EntitlementPolicySnapshot,
 } from "./models/entitlement"
-import { ENTITLEMENT_BOUNDARY, validityMonthsMax } from "./entitlement-boundary"
+import { ENTITLEMENT_BOUNDARY, validityMonthsMax, type NoShowPolicy } from "./entitlement-boundary"
 
 export const ENTITLEMENT_NO_SHOW_EVENT_TYPE =
   "gp.entitlements.entitlement_no_show.v1"
@@ -49,7 +49,7 @@ export interface MarkNoShowInput {
 export interface MarkNoShowResult {
   entitlement_id: string
   outcome: NoShowOutcome
-  no_show_policy: string
+  no_show_policy: NoShowPolicy
   resulting_state: EntitlementInstanceState
   fee_amount?: number
   charge_pct?: number
@@ -558,7 +558,18 @@ export class VoucherService {
 
       const current = this.rowToEntitlementInstance(lockRes.rows[0])
 
-      // Idempotency: if already in a terminal no-show outcome state, return early
+      // Read policy from immutable snapshot (NOT live profile — regulamin § 12).
+      // Must be extracted before idempotency check so idempotent path can return it.
+      const snapshot = current.policy_snapshot as Record<string, unknown>
+      const noShowSnapshot = (snapshot.no_show ?? {}) as Record<string, unknown>
+      const policyValue = ((noShowSnapshot.policy as string | undefined) ?? "no_charge") as NoShowPolicy
+      const snapshotChargePct =
+        typeof noShowSnapshot.charge_pct === "number"
+          ? (noShowSnapshot.charge_pct as number)
+          : 0
+
+      // Idempotency: if already in a terminal no-show outcome state, return early.
+      // Outcome is derived from the policy snapshot (M2 fix: not hardcoded to "forfeiture").
       const noShowTerminalStates: ReadonlySet<EntitlementInstanceState> =
         new Set([
           EntitlementInstanceState.VOIDED,
@@ -567,25 +578,32 @@ export class VoucherService {
       if (noShowTerminalStates.has(current.state)) {
         await client.query("ROLLBACK")
         committed = true
+        const idempotentOutcome: NoShowOutcome =
+          current.state === EntitlementInstanceState.PENDING_VENDOR_DECISION
+            ? "vendor_decision"
+            : policyValue === "charge_full"
+            ? "charge_full"
+            : "forfeiture"
         return {
           entitlement_id,
-          outcome: current.state === EntitlementInstanceState.PENDING_VENDOR_DECISION
-            ? "vendor_decision"
-            : "forfeiture",
-          no_show_policy: "idempotent_skip",
+          outcome: idempotentOutcome,
+          no_show_policy: policyValue,
           resulting_state: current.state,
           marked_at: new Date().toISOString(),
         }
       }
 
-      // Read policy from immutable snapshot (NOT live profile — regulamin § 12)
-      const snapshot = current.policy_snapshot as Record<string, unknown>
-      const noShowSnapshot = (snapshot.no_show ?? {}) as Record<string, unknown>
-      const policyValue = (noShowSnapshot.policy as string | undefined) ?? "no_charge"
-      const snapshotChargePct =
-        typeof noShowSnapshot.charge_pct === "number"
-          ? (noShowSnapshot.charge_pct as number)
-          : 0
+      // H1 fix: guard that source state is valid for a no-show operation.
+      // Only ACTIVE and REDEMPTION_REQUESTED are valid pre-no-show states.
+      // charge_partial and no_charge don't call assertTransition (state-preserving),
+      // so this explicit guard is required for all policy paths.
+      const validNoShowSourceStates: ReadonlySet<EntitlementInstanceState> = new Set([
+        EntitlementInstanceState.ACTIVE,
+        EntitlementInstanceState.REDEMPTION_REQUESTED,
+      ])
+      if (!validNoShowSourceStates.has(current.state)) {
+        throw new EntitlementTransitionError(current.state, EntitlementInstanceState.VOIDED)
+      }
 
       const markedAt = new Date().toISOString()
       let newState: EntitlementInstanceState
