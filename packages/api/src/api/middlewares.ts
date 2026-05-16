@@ -739,19 +739,13 @@ export async function productListMarketScopeMiddleware(
 
 export default defineMiddlewares({
   routes: [
-    // Story 6.1: Stripe webhook — raw body required for HMAC-SHA256 signature
-    // verification (NFR24). bodyParser: false tells Medusa not to pre-parse
-    // JSON so the route handler can read the unmodified byte stream.
-    //
-    // IMPORTANT: Route is at /webhooks/stripe (NOT /store/webhooks/stripe).
-    // Stripe webhooks do not carry x-publishable-api-key, so placing this
-    // route under /store/* would cause marketGuardMiddleware to return 401
-    // on every inbound event. The /webhooks/* path is outside the /store/*
-    // matcher block and receives no market guard middleware.
+    // Story 1.3: retired GP custom Stripe webhook. Real Stripe webhook
+    // processing lives on Medusa native /hooks/payment/stripe.
+    // Keep this route outside /store/* so callers receive the explicit 410
+    // instead of market guard auth noise.
     {
       method: ["POST"],
       matcher: "/webhooks/stripe",
-      bodyParser: false,
     },
     // v1.7.0 B6-WEBHOOK-IMPL: Brevo transactional callback receiver.
     // Brevo bearer token verification (Authorization: Bearer ...); body parses

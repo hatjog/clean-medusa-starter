@@ -8800,6 +8800,428 @@
       "columns": {
         "id": {
           "name": "id",
+          "type": "uuid",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": true,
+          "nullable": false,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": "gen_random_uuid()",
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "uuid"
+        },
+        "actor_id": {
+          "name": "actor_id",
+          "type": "text",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": false,
+          "unique": true,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "text"
+        },
+        "capability": {
+          "name": "capability",
+          "type": "text",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": false,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "text"
+        },
+        "granted_at": {
+          "name": "granted_at",
+          "type": "timestamptz(6)",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": false,
+          "unique": false,
+          "length": 6,
+          "precision": null,
+          "scale": null,
+          "default": "now()",
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "datetime"
+        },
+        "granted_by": {
+          "name": "granted_by",
+          "type": "text",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": true,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "text"
+        },
+        "revoked_at": {
+          "name": "revoked_at",
+          "type": "timestamptz(6)",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": true,
+          "unique": false,
+          "length": 6,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "datetime"
+        }
+      },
+      "name": "admin_capability_grants",
+      "schema": "public",
+      "indexes": [
+        {
+          "columnNames": [
+            "actor_id",
+            "capability"
+          ],
+          "composite": true,
+          "constraint": false,
+          "keyName": "admin_capability_grants_active_uq",
+          "unique": true,
+          "primary": false,
+          "expression": "CREATE UNIQUE INDEX admin_capability_grants_active_uq ON public.admin_capability_grants USING btree (actor_id, capability) WHERE (revoked_at IS NULL)"
+        },
+        {
+          "columnNames": [
+            "id"
+          ],
+          "composite": false,
+          "constraint": false,
+          "keyName": "admin_capability_grants_pkey",
+          "unique": true,
+          "primary": true
+        },
+        {
+          "columnNames": [
+            "actor_id"
+          ],
+          "composite": false,
+          "constraint": false,
+          "keyName": "idx_admin_capability_grants_actor_id",
+          "unique": false,
+          "primary": false
+        },
+        {
+          "columnNames": [
+            "capability"
+          ],
+          "composite": false,
+          "constraint": false,
+          "keyName": "idx_admin_capability_grants_capability",
+          "unique": false,
+          "primary": false
+        }
+      ],
+      "checks": [],
+      "foreignKeys": {},
+      "nativeEnums": {
+        "claim_reason_enum": {
+          "name": "claim_reason_enum",
+          "schema": "public",
+          "items": [
+            "missing_item",
+            "wrong_item",
+            "production_failure",
+            "other"
+          ]
+        },
+        "enum__landing_pages_v_version_data_source": {
+          "name": "enum__landing_pages_v_version_data_source",
+          "schema": "public",
+          "items": [
+            "location",
+            "offer",
+            "vendor",
+            "category",
+            "market"
+          ]
+        },
+        "enum__landing_pages_v_version_generation_status": {
+          "name": "enum__landing_pages_v_version_generation_status",
+          "schema": "public",
+          "items": [
+            "pending",
+            "generated",
+            "error"
+          ]
+        },
+        "enum__landing_pages_v_version_status": {
+          "name": "enum__landing_pages_v_version_status",
+          "schema": "public",
+          "items": [
+            "draft",
+            "published"
+          ]
+        },
+        "enum__market_configs_v_blocks_products_carousel_sort": {
+          "name": "enum__market_configs_v_blocks_products_carousel_sort",
+          "schema": "public",
+          "items": [
+            "newest",
+            "price_asc",
+            "price_desc"
+          ]
+        },
+        "enum__market_configs_v_version_status": {
+          "name": "enum__market_configs_v_version_status",
+          "schema": "public",
+          "items": [
+            "draft",
+            "published"
+          ]
+        },
+        "enum__market_configs_v_version_storefront_filters_display": {
+          "name": "enum__market_configs_v_version_storefront_filters_display",
+          "schema": "public",
+          "items": [
+            "city"
+          ]
+        },
+        "enum__market_configs_v_version_storefront_filters_source": {
+          "name": "enum__market_configs_v_version_storefront_filters_source",
+          "schema": "public",
+          "items": [
+            "catalog_categories",
+            "catalog_tags",
+            "catalog_variants",
+            "api",
+            "vendor_locations"
+          ]
+        },
+        "enum__market_configs_v_version_storefront_filters_type": {
+          "name": "enum__market_configs_v_version_storefront_filters_type",
+          "schema": "public",
+          "items": [
+            "category_group",
+            "tag_group",
+            "price_range",
+            "duration",
+            "seller_rating",
+            "location"
+          ]
+        },
+        "enum__pages_v_version_page_type": {
+          "name": "enum__pages_v_version_page_type",
+          "schema": "public",
+          "items": [
+            "landing",
+            "informational",
+            "legal",
+            "category"
+          ]
+        },
+        "enum__pages_v_version_status": {
+          "name": "enum__pages_v_version_status",
+          "schema": "public",
+          "items": [
+            "draft",
+            "published"
+          ]
+        },
+        "enum_landing_pages_data_source": {
+          "name": "enum_landing_pages_data_source",
+          "schema": "public",
+          "items": [
+            "location",
+            "offer",
+            "vendor",
+            "category",
+            "market"
+          ]
+        },
+        "enum_landing_pages_generation_status": {
+          "name": "enum_landing_pages_generation_status",
+          "schema": "public",
+          "items": [
+            "pending",
+            "generated",
+            "error"
+          ]
+        },
+        "enum_landing_pages_status": {
+          "name": "enum_landing_pages_status",
+          "schema": "public",
+          "items": [
+            "draft",
+            "published"
+          ]
+        },
+        "enum_landing_templates_data_source": {
+          "name": "enum_landing_templates_data_source",
+          "schema": "public",
+          "items": [
+            "location",
+            "offer",
+            "vendor",
+            "category",
+            "market"
+          ]
+        },
+        "enum_market_configs_blocks_products_carousel_sort": {
+          "name": "enum_market_configs_blocks_products_carousel_sort",
+          "schema": "public",
+          "items": [
+            "newest",
+            "price_asc",
+            "price_desc"
+          ]
+        },
+        "enum_market_configs_status": {
+          "name": "enum_market_configs_status",
+          "schema": "public",
+          "items": [
+            "draft",
+            "published"
+          ]
+        },
+        "enum_market_configs_storefront_filters_display": {
+          "name": "enum_market_configs_storefront_filters_display",
+          "schema": "public",
+          "items": [
+            "city"
+          ]
+        },
+        "enum_market_configs_storefront_filters_source": {
+          "name": "enum_market_configs_storefront_filters_source",
+          "schema": "public",
+          "items": [
+            "catalog_categories",
+            "catalog_tags",
+            "catalog_variants",
+            "api",
+            "vendor_locations"
+          ]
+        },
+        "enum_market_configs_storefront_filters_type": {
+          "name": "enum_market_configs_storefront_filters_type",
+          "schema": "public",
+          "items": [
+            "category_group",
+            "tag_group",
+            "price_range",
+            "duration",
+            "seller_rating",
+            "location"
+          ]
+        },
+        "enum_pages_page_type": {
+          "name": "enum_pages_page_type",
+          "schema": "public",
+          "items": [
+            "landing",
+            "informational",
+            "legal",
+            "category"
+          ]
+        },
+        "enum_pages_status": {
+          "name": "enum_pages_status",
+          "schema": "public",
+          "items": [
+            "draft",
+            "published"
+          ]
+        },
+        "enum_redirects_to_type": {
+          "name": "enum_redirects_to_type",
+          "schema": "public",
+          "items": [
+            "reference",
+            "custom"
+          ]
+        },
+        "enum_storefront_templates_blocks_products_carousel_sort": {
+          "name": "enum_storefront_templates_blocks_products_carousel_sort",
+          "schema": "public",
+          "items": [
+            "newest",
+            "price_asc",
+            "price_desc"
+          ]
+        },
+        "enum_users_role": {
+          "name": "enum_users_role",
+          "schema": "public",
+          "items": [
+            "platform_admin",
+            "market_admin"
+          ]
+        },
+        "order_claim_type_enum": {
+          "name": "order_claim_type_enum",
+          "schema": "public",
+          "items": [
+            "refund",
+            "replace"
+          ]
+        },
+        "order_status_enum": {
+          "name": "order_status_enum",
+          "schema": "public",
+          "items": [
+            "pending",
+            "completed",
+            "draft",
+            "archived",
+            "canceled",
+            "requires_action"
+          ]
+        },
+        "page_type_blog": {
+          "name": "page_type_blog",
+          "schema": "public",
+          "items": [
+            "page",
+            "blog"
+          ]
+        },
+        "return_status_enum": {
+          "name": "return_status_enum",
+          "schema": "public",
+          "items": [
+            "open",
+            "requested",
+            "received",
+            "partially_received",
+            "canceled"
+          ]
+        }
+      },
+      "comment": null
+    },
+    {
+      "columns": {
+        "id": {
+          "name": "id",
           "type": "text",
           "unsigned": false,
           "autoincrement": false,
@@ -23504,6 +23926,1387 @@
           "deleteRule": "cascade"
         }
       },
+      "nativeEnums": {
+        "claim_reason_enum": {
+          "name": "claim_reason_enum",
+          "schema": "public",
+          "items": [
+            "missing_item",
+            "wrong_item",
+            "production_failure",
+            "other"
+          ]
+        },
+        "enum__landing_pages_v_version_data_source": {
+          "name": "enum__landing_pages_v_version_data_source",
+          "schema": "public",
+          "items": [
+            "location",
+            "offer",
+            "vendor",
+            "category",
+            "market"
+          ]
+        },
+        "enum__landing_pages_v_version_generation_status": {
+          "name": "enum__landing_pages_v_version_generation_status",
+          "schema": "public",
+          "items": [
+            "pending",
+            "generated",
+            "error"
+          ]
+        },
+        "enum__landing_pages_v_version_status": {
+          "name": "enum__landing_pages_v_version_status",
+          "schema": "public",
+          "items": [
+            "draft",
+            "published"
+          ]
+        },
+        "enum__market_configs_v_blocks_products_carousel_sort": {
+          "name": "enum__market_configs_v_blocks_products_carousel_sort",
+          "schema": "public",
+          "items": [
+            "newest",
+            "price_asc",
+            "price_desc"
+          ]
+        },
+        "enum__market_configs_v_version_status": {
+          "name": "enum__market_configs_v_version_status",
+          "schema": "public",
+          "items": [
+            "draft",
+            "published"
+          ]
+        },
+        "enum__market_configs_v_version_storefront_filters_display": {
+          "name": "enum__market_configs_v_version_storefront_filters_display",
+          "schema": "public",
+          "items": [
+            "city"
+          ]
+        },
+        "enum__market_configs_v_version_storefront_filters_source": {
+          "name": "enum__market_configs_v_version_storefront_filters_source",
+          "schema": "public",
+          "items": [
+            "catalog_categories",
+            "catalog_tags",
+            "catalog_variants",
+            "api",
+            "vendor_locations"
+          ]
+        },
+        "enum__market_configs_v_version_storefront_filters_type": {
+          "name": "enum__market_configs_v_version_storefront_filters_type",
+          "schema": "public",
+          "items": [
+            "category_group",
+            "tag_group",
+            "price_range",
+            "duration",
+            "seller_rating",
+            "location"
+          ]
+        },
+        "enum__pages_v_version_page_type": {
+          "name": "enum__pages_v_version_page_type",
+          "schema": "public",
+          "items": [
+            "landing",
+            "informational",
+            "legal",
+            "category"
+          ]
+        },
+        "enum__pages_v_version_status": {
+          "name": "enum__pages_v_version_status",
+          "schema": "public",
+          "items": [
+            "draft",
+            "published"
+          ]
+        },
+        "enum_landing_pages_data_source": {
+          "name": "enum_landing_pages_data_source",
+          "schema": "public",
+          "items": [
+            "location",
+            "offer",
+            "vendor",
+            "category",
+            "market"
+          ]
+        },
+        "enum_landing_pages_generation_status": {
+          "name": "enum_landing_pages_generation_status",
+          "schema": "public",
+          "items": [
+            "pending",
+            "generated",
+            "error"
+          ]
+        },
+        "enum_landing_pages_status": {
+          "name": "enum_landing_pages_status",
+          "schema": "public",
+          "items": [
+            "draft",
+            "published"
+          ]
+        },
+        "enum_landing_templates_data_source": {
+          "name": "enum_landing_templates_data_source",
+          "schema": "public",
+          "items": [
+            "location",
+            "offer",
+            "vendor",
+            "category",
+            "market"
+          ]
+        },
+        "enum_market_configs_blocks_products_carousel_sort": {
+          "name": "enum_market_configs_blocks_products_carousel_sort",
+          "schema": "public",
+          "items": [
+            "newest",
+            "price_asc",
+            "price_desc"
+          ]
+        },
+        "enum_market_configs_status": {
+          "name": "enum_market_configs_status",
+          "schema": "public",
+          "items": [
+            "draft",
+            "published"
+          ]
+        },
+        "enum_market_configs_storefront_filters_display": {
+          "name": "enum_market_configs_storefront_filters_display",
+          "schema": "public",
+          "items": [
+            "city"
+          ]
+        },
+        "enum_market_configs_storefront_filters_source": {
+          "name": "enum_market_configs_storefront_filters_source",
+          "schema": "public",
+          "items": [
+            "catalog_categories",
+            "catalog_tags",
+            "catalog_variants",
+            "api",
+            "vendor_locations"
+          ]
+        },
+        "enum_market_configs_storefront_filters_type": {
+          "name": "enum_market_configs_storefront_filters_type",
+          "schema": "public",
+          "items": [
+            "category_group",
+            "tag_group",
+            "price_range",
+            "duration",
+            "seller_rating",
+            "location"
+          ]
+        },
+        "enum_pages_page_type": {
+          "name": "enum_pages_page_type",
+          "schema": "public",
+          "items": [
+            "landing",
+            "informational",
+            "legal",
+            "category"
+          ]
+        },
+        "enum_pages_status": {
+          "name": "enum_pages_status",
+          "schema": "public",
+          "items": [
+            "draft",
+            "published"
+          ]
+        },
+        "enum_redirects_to_type": {
+          "name": "enum_redirects_to_type",
+          "schema": "public",
+          "items": [
+            "reference",
+            "custom"
+          ]
+        },
+        "enum_storefront_templates_blocks_products_carousel_sort": {
+          "name": "enum_storefront_templates_blocks_products_carousel_sort",
+          "schema": "public",
+          "items": [
+            "newest",
+            "price_asc",
+            "price_desc"
+          ]
+        },
+        "enum_users_role": {
+          "name": "enum_users_role",
+          "schema": "public",
+          "items": [
+            "platform_admin",
+            "market_admin"
+          ]
+        },
+        "order_claim_type_enum": {
+          "name": "order_claim_type_enum",
+          "schema": "public",
+          "items": [
+            "refund",
+            "replace"
+          ]
+        },
+        "order_status_enum": {
+          "name": "order_status_enum",
+          "schema": "public",
+          "items": [
+            "pending",
+            "completed",
+            "draft",
+            "archived",
+            "canceled",
+            "requires_action"
+          ]
+        },
+        "page_type_blog": {
+          "name": "page_type_blog",
+          "schema": "public",
+          "items": [
+            "page",
+            "blog"
+          ]
+        },
+        "return_status_enum": {
+          "name": "return_status_enum",
+          "schema": "public",
+          "items": [
+            "open",
+            "requested",
+            "received",
+            "partially_received",
+            "canceled"
+          ]
+        }
+      },
+      "comment": null
+    },
+    {
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": true,
+          "nullable": false,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "text"
+        },
+        "entitlement_profile_id": {
+          "name": "entitlement_profile_id",
+          "type": "text",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": false,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "text"
+        },
+        "entitlement_type": {
+          "name": "entitlement_type",
+          "type": "text",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": false,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "enumItems": [
+            "VOUCHER_AMOUNT",
+            "VOUCHER_SERVICE",
+            "CREDIT_PACK",
+            "SUBSCRIPTION_B2C",
+            "SUBSCRIPTION_B2B",
+            "BUNDLE"
+          ],
+          "mappedType": "enum"
+        },
+        "order_id": {
+          "name": "order_id",
+          "type": "text",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": true,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "text"
+        },
+        "state": {
+          "name": "state",
+          "type": "text",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": false,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": "'ISSUED'",
+          "comment": null,
+          "enumItems": [
+            "ISSUED",
+            "ACTIVE",
+            "REDEMPTION_REQUESTED",
+            "REDEEMED_PARTIAL",
+            "REDEEMED_FULL",
+            "SETTLED",
+            "CLOSED",
+            "VOIDED",
+            "EXPIRED",
+            "REFUND_REQUESTED",
+            "REFUNDED",
+            "DISPUTED"
+          ],
+          "mappedType": "enum"
+        },
+        "policy_snapshot": {
+          "name": "policy_snapshot",
+          "type": "jsonb",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": false,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "json"
+        },
+        "remaining_amount": {
+          "name": "remaining_amount",
+          "type": "int4",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": true,
+          "unique": false,
+          "length": null,
+          "precision": 32,
+          "scale": 0,
+          "default": null,
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "integer"
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamptz(6)",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": false,
+          "unique": false,
+          "length": 6,
+          "precision": null,
+          "scale": null,
+          "default": "now()",
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "datetime"
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "timestamptz(6)",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": false,
+          "unique": false,
+          "length": 6,
+          "precision": null,
+          "scale": null,
+          "default": "now()",
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "datetime"
+        },
+        "booking_pointer": {
+          "name": "booking_pointer",
+          "type": "text",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": true,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "text"
+        },
+        "expires_at": {
+          "name": "expires_at",
+          "type": "timestamptz(6)",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": true,
+          "unique": false,
+          "length": 6,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "datetime"
+        },
+        "unpaid_extension_count": {
+          "name": "unpaid_extension_count",
+          "type": "int4",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": false,
+          "unique": false,
+          "length": null,
+          "precision": 32,
+          "scale": 0,
+          "default": "0",
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "integer"
+        },
+        "market_id": {
+          "name": "market_id",
+          "type": "text",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": true,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "text"
+        }
+      },
+      "name": "entitlement_instance",
+      "schema": "public",
+      "indexes": [
+        {
+          "columnNames": [
+            "expires_at"
+          ],
+          "composite": false,
+          "constraint": false,
+          "keyName": "entitlement_instance_expires_at_idx",
+          "unique": false,
+          "primary": false,
+          "expression": "CREATE INDEX entitlement_instance_expires_at_idx ON public.entitlement_instance USING btree (expires_at) WHERE (expires_at IS NOT NULL)"
+        },
+        {
+          "columnNames": [
+            "order_id"
+          ],
+          "composite": false,
+          "constraint": false,
+          "keyName": "entitlement_instance_order_idx",
+          "unique": false,
+          "primary": false,
+          "expression": "CREATE INDEX entitlement_instance_order_idx ON public.entitlement_instance USING btree (order_id) WHERE (order_id IS NOT NULL)"
+        },
+        {
+          "columnNames": [
+            "id"
+          ],
+          "composite": false,
+          "constraint": false,
+          "keyName": "entitlement_instance_pkey",
+          "unique": true,
+          "primary": true
+        },
+        {
+          "columnNames": [
+            "entitlement_profile_id"
+          ],
+          "composite": false,
+          "constraint": false,
+          "keyName": "entitlement_instance_profile_idx",
+          "unique": false,
+          "primary": false
+        },
+        {
+          "columnNames": [
+            "state"
+          ],
+          "composite": false,
+          "constraint": false,
+          "keyName": "entitlement_instance_state_idx",
+          "unique": false,
+          "primary": false
+        }
+      ],
+      "checks": [
+        {
+          "name": "entitlement_instance_remaining_amount_check",
+          "columnName": "remaining_amount",
+          "definition": "CHECK (((remaining_amount IS NULL) OR (remaining_amount >= 0)))",
+          "expression": "(remaining_amount IS NULL) OR (remaining_amount >= 0)"
+        },
+        {
+          "name": "entitlement_instance_unpaid_extension_count_nonnegative",
+          "columnName": "unpaid_extension_count",
+          "definition": "CHECK ((unpaid_extension_count >= 0))",
+          "expression": "unpaid_extension_count >= 0"
+        }
+      ],
+      "foreignKeys": {},
+      "nativeEnums": {
+        "claim_reason_enum": {
+          "name": "claim_reason_enum",
+          "schema": "public",
+          "items": [
+            "missing_item",
+            "wrong_item",
+            "production_failure",
+            "other"
+          ]
+        },
+        "enum__landing_pages_v_version_data_source": {
+          "name": "enum__landing_pages_v_version_data_source",
+          "schema": "public",
+          "items": [
+            "location",
+            "offer",
+            "vendor",
+            "category",
+            "market"
+          ]
+        },
+        "enum__landing_pages_v_version_generation_status": {
+          "name": "enum__landing_pages_v_version_generation_status",
+          "schema": "public",
+          "items": [
+            "pending",
+            "generated",
+            "error"
+          ]
+        },
+        "enum__landing_pages_v_version_status": {
+          "name": "enum__landing_pages_v_version_status",
+          "schema": "public",
+          "items": [
+            "draft",
+            "published"
+          ]
+        },
+        "enum__market_configs_v_blocks_products_carousel_sort": {
+          "name": "enum__market_configs_v_blocks_products_carousel_sort",
+          "schema": "public",
+          "items": [
+            "newest",
+            "price_asc",
+            "price_desc"
+          ]
+        },
+        "enum__market_configs_v_version_status": {
+          "name": "enum__market_configs_v_version_status",
+          "schema": "public",
+          "items": [
+            "draft",
+            "published"
+          ]
+        },
+        "enum__market_configs_v_version_storefront_filters_display": {
+          "name": "enum__market_configs_v_version_storefront_filters_display",
+          "schema": "public",
+          "items": [
+            "city"
+          ]
+        },
+        "enum__market_configs_v_version_storefront_filters_source": {
+          "name": "enum__market_configs_v_version_storefront_filters_source",
+          "schema": "public",
+          "items": [
+            "catalog_categories",
+            "catalog_tags",
+            "catalog_variants",
+            "api",
+            "vendor_locations"
+          ]
+        },
+        "enum__market_configs_v_version_storefront_filters_type": {
+          "name": "enum__market_configs_v_version_storefront_filters_type",
+          "schema": "public",
+          "items": [
+            "category_group",
+            "tag_group",
+            "price_range",
+            "duration",
+            "seller_rating",
+            "location"
+          ]
+        },
+        "enum__pages_v_version_page_type": {
+          "name": "enum__pages_v_version_page_type",
+          "schema": "public",
+          "items": [
+            "landing",
+            "informational",
+            "legal",
+            "category"
+          ]
+        },
+        "enum__pages_v_version_status": {
+          "name": "enum__pages_v_version_status",
+          "schema": "public",
+          "items": [
+            "draft",
+            "published"
+          ]
+        },
+        "enum_landing_pages_data_source": {
+          "name": "enum_landing_pages_data_source",
+          "schema": "public",
+          "items": [
+            "location",
+            "offer",
+            "vendor",
+            "category",
+            "market"
+          ]
+        },
+        "enum_landing_pages_generation_status": {
+          "name": "enum_landing_pages_generation_status",
+          "schema": "public",
+          "items": [
+            "pending",
+            "generated",
+            "error"
+          ]
+        },
+        "enum_landing_pages_status": {
+          "name": "enum_landing_pages_status",
+          "schema": "public",
+          "items": [
+            "draft",
+            "published"
+          ]
+        },
+        "enum_landing_templates_data_source": {
+          "name": "enum_landing_templates_data_source",
+          "schema": "public",
+          "items": [
+            "location",
+            "offer",
+            "vendor",
+            "category",
+            "market"
+          ]
+        },
+        "enum_market_configs_blocks_products_carousel_sort": {
+          "name": "enum_market_configs_blocks_products_carousel_sort",
+          "schema": "public",
+          "items": [
+            "newest",
+            "price_asc",
+            "price_desc"
+          ]
+        },
+        "enum_market_configs_status": {
+          "name": "enum_market_configs_status",
+          "schema": "public",
+          "items": [
+            "draft",
+            "published"
+          ]
+        },
+        "enum_market_configs_storefront_filters_display": {
+          "name": "enum_market_configs_storefront_filters_display",
+          "schema": "public",
+          "items": [
+            "city"
+          ]
+        },
+        "enum_market_configs_storefront_filters_source": {
+          "name": "enum_market_configs_storefront_filters_source",
+          "schema": "public",
+          "items": [
+            "catalog_categories",
+            "catalog_tags",
+            "catalog_variants",
+            "api",
+            "vendor_locations"
+          ]
+        },
+        "enum_market_configs_storefront_filters_type": {
+          "name": "enum_market_configs_storefront_filters_type",
+          "schema": "public",
+          "items": [
+            "category_group",
+            "tag_group",
+            "price_range",
+            "duration",
+            "seller_rating",
+            "location"
+          ]
+        },
+        "enum_pages_page_type": {
+          "name": "enum_pages_page_type",
+          "schema": "public",
+          "items": [
+            "landing",
+            "informational",
+            "legal",
+            "category"
+          ]
+        },
+        "enum_pages_status": {
+          "name": "enum_pages_status",
+          "schema": "public",
+          "items": [
+            "draft",
+            "published"
+          ]
+        },
+        "enum_redirects_to_type": {
+          "name": "enum_redirects_to_type",
+          "schema": "public",
+          "items": [
+            "reference",
+            "custom"
+          ]
+        },
+        "enum_storefront_templates_blocks_products_carousel_sort": {
+          "name": "enum_storefront_templates_blocks_products_carousel_sort",
+          "schema": "public",
+          "items": [
+            "newest",
+            "price_asc",
+            "price_desc"
+          ]
+        },
+        "enum_users_role": {
+          "name": "enum_users_role",
+          "schema": "public",
+          "items": [
+            "platform_admin",
+            "market_admin"
+          ]
+        },
+        "order_claim_type_enum": {
+          "name": "order_claim_type_enum",
+          "schema": "public",
+          "items": [
+            "refund",
+            "replace"
+          ]
+        },
+        "order_status_enum": {
+          "name": "order_status_enum",
+          "schema": "public",
+          "items": [
+            "pending",
+            "completed",
+            "draft",
+            "archived",
+            "canceled",
+            "requires_action"
+          ]
+        },
+        "page_type_blog": {
+          "name": "page_type_blog",
+          "schema": "public",
+          "items": [
+            "page",
+            "blog"
+          ]
+        },
+        "return_status_enum": {
+          "name": "return_status_enum",
+          "schema": "public",
+          "items": [
+            "open",
+            "requested",
+            "received",
+            "partially_received",
+            "canceled"
+          ]
+        }
+      },
+      "comment": null
+    },
+    {
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "uuid",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": true,
+          "nullable": false,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": "gen_random_uuid()",
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "uuid"
+        },
+        "flag_id": {
+          "name": "flag_id",
+          "type": "text",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": false,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "text"
+        },
+        "from_value": {
+          "name": "from_value",
+          "type": "text",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": true,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "text"
+        },
+        "to_value": {
+          "name": "to_value",
+          "type": "text",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": false,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "enumItems": [
+            "off",
+            "shadow",
+            "on"
+          ],
+          "mappedType": "enum"
+        },
+        "updated_by": {
+          "name": "updated_by",
+          "type": "text",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": false,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "text"
+        },
+        "reason": {
+          "name": "reason",
+          "type": "text",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": true,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "text"
+        },
+        "at": {
+          "name": "at",
+          "type": "timestamptz(6)",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": false,
+          "unique": false,
+          "length": 6,
+          "precision": null,
+          "scale": null,
+          "default": "now()",
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "datetime"
+        }
+      },
+      "name": "feature_flag_history",
+      "schema": "public",
+      "indexes": [
+        {
+          "columnNames": [
+            "flag_id",
+            "at"
+          ],
+          "composite": true,
+          "constraint": false,
+          "keyName": "feature_flag_history_flag_id_at_idx",
+          "unique": false,
+          "primary": false
+        },
+        {
+          "columnNames": [
+            "id"
+          ],
+          "composite": false,
+          "constraint": false,
+          "keyName": "feature_flag_history_pkey",
+          "unique": true,
+          "primary": true
+        }
+      ],
+      "checks": [
+        {
+          "name": "feature_flag_history_from_value_chk",
+          "columnName": "from_value",
+          "definition": "CHECK (((from_value IS NULL) OR (from_value = ANY (ARRAY['off'::text, 'shadow'::text, 'on'::text]))))",
+          "expression": "(from_value IS NULL) OR (from_value = ANY (ARRAY['off'::text, 'shadow'::text, 'on'::text]))"
+        }
+      ],
+      "foreignKeys": {
+        "feature_flag_history_flag_id_fkey": {
+          "columnNames": [
+            "flag_id"
+          ],
+          "constraintName": "feature_flag_history_flag_id_fkey",
+          "localTableName": "public.feature_flag_history",
+          "referencedTableName": "public.feature_flag_state",
+          "referencedColumnNames": [
+            "flag_id"
+          ],
+          "updateRule": "no action",
+          "deleteRule": "cascade"
+        }
+      },
+      "nativeEnums": {
+        "claim_reason_enum": {
+          "name": "claim_reason_enum",
+          "schema": "public",
+          "items": [
+            "missing_item",
+            "wrong_item",
+            "production_failure",
+            "other"
+          ]
+        },
+        "enum__landing_pages_v_version_data_source": {
+          "name": "enum__landing_pages_v_version_data_source",
+          "schema": "public",
+          "items": [
+            "location",
+            "offer",
+            "vendor",
+            "category",
+            "market"
+          ]
+        },
+        "enum__landing_pages_v_version_generation_status": {
+          "name": "enum__landing_pages_v_version_generation_status",
+          "schema": "public",
+          "items": [
+            "pending",
+            "generated",
+            "error"
+          ]
+        },
+        "enum__landing_pages_v_version_status": {
+          "name": "enum__landing_pages_v_version_status",
+          "schema": "public",
+          "items": [
+            "draft",
+            "published"
+          ]
+        },
+        "enum__market_configs_v_blocks_products_carousel_sort": {
+          "name": "enum__market_configs_v_blocks_products_carousel_sort",
+          "schema": "public",
+          "items": [
+            "newest",
+            "price_asc",
+            "price_desc"
+          ]
+        },
+        "enum__market_configs_v_version_status": {
+          "name": "enum__market_configs_v_version_status",
+          "schema": "public",
+          "items": [
+            "draft",
+            "published"
+          ]
+        },
+        "enum__market_configs_v_version_storefront_filters_display": {
+          "name": "enum__market_configs_v_version_storefront_filters_display",
+          "schema": "public",
+          "items": [
+            "city"
+          ]
+        },
+        "enum__market_configs_v_version_storefront_filters_source": {
+          "name": "enum__market_configs_v_version_storefront_filters_source",
+          "schema": "public",
+          "items": [
+            "catalog_categories",
+            "catalog_tags",
+            "catalog_variants",
+            "api",
+            "vendor_locations"
+          ]
+        },
+        "enum__market_configs_v_version_storefront_filters_type": {
+          "name": "enum__market_configs_v_version_storefront_filters_type",
+          "schema": "public",
+          "items": [
+            "category_group",
+            "tag_group",
+            "price_range",
+            "duration",
+            "seller_rating",
+            "location"
+          ]
+        },
+        "enum__pages_v_version_page_type": {
+          "name": "enum__pages_v_version_page_type",
+          "schema": "public",
+          "items": [
+            "landing",
+            "informational",
+            "legal",
+            "category"
+          ]
+        },
+        "enum__pages_v_version_status": {
+          "name": "enum__pages_v_version_status",
+          "schema": "public",
+          "items": [
+            "draft",
+            "published"
+          ]
+        },
+        "enum_landing_pages_data_source": {
+          "name": "enum_landing_pages_data_source",
+          "schema": "public",
+          "items": [
+            "location",
+            "offer",
+            "vendor",
+            "category",
+            "market"
+          ]
+        },
+        "enum_landing_pages_generation_status": {
+          "name": "enum_landing_pages_generation_status",
+          "schema": "public",
+          "items": [
+            "pending",
+            "generated",
+            "error"
+          ]
+        },
+        "enum_landing_pages_status": {
+          "name": "enum_landing_pages_status",
+          "schema": "public",
+          "items": [
+            "draft",
+            "published"
+          ]
+        },
+        "enum_landing_templates_data_source": {
+          "name": "enum_landing_templates_data_source",
+          "schema": "public",
+          "items": [
+            "location",
+            "offer",
+            "vendor",
+            "category",
+            "market"
+          ]
+        },
+        "enum_market_configs_blocks_products_carousel_sort": {
+          "name": "enum_market_configs_blocks_products_carousel_sort",
+          "schema": "public",
+          "items": [
+            "newest",
+            "price_asc",
+            "price_desc"
+          ]
+        },
+        "enum_market_configs_status": {
+          "name": "enum_market_configs_status",
+          "schema": "public",
+          "items": [
+            "draft",
+            "published"
+          ]
+        },
+        "enum_market_configs_storefront_filters_display": {
+          "name": "enum_market_configs_storefront_filters_display",
+          "schema": "public",
+          "items": [
+            "city"
+          ]
+        },
+        "enum_market_configs_storefront_filters_source": {
+          "name": "enum_market_configs_storefront_filters_source",
+          "schema": "public",
+          "items": [
+            "catalog_categories",
+            "catalog_tags",
+            "catalog_variants",
+            "api",
+            "vendor_locations"
+          ]
+        },
+        "enum_market_configs_storefront_filters_type": {
+          "name": "enum_market_configs_storefront_filters_type",
+          "schema": "public",
+          "items": [
+            "category_group",
+            "tag_group",
+            "price_range",
+            "duration",
+            "seller_rating",
+            "location"
+          ]
+        },
+        "enum_pages_page_type": {
+          "name": "enum_pages_page_type",
+          "schema": "public",
+          "items": [
+            "landing",
+            "informational",
+            "legal",
+            "category"
+          ]
+        },
+        "enum_pages_status": {
+          "name": "enum_pages_status",
+          "schema": "public",
+          "items": [
+            "draft",
+            "published"
+          ]
+        },
+        "enum_redirects_to_type": {
+          "name": "enum_redirects_to_type",
+          "schema": "public",
+          "items": [
+            "reference",
+            "custom"
+          ]
+        },
+        "enum_storefront_templates_blocks_products_carousel_sort": {
+          "name": "enum_storefront_templates_blocks_products_carousel_sort",
+          "schema": "public",
+          "items": [
+            "newest",
+            "price_asc",
+            "price_desc"
+          ]
+        },
+        "enum_users_role": {
+          "name": "enum_users_role",
+          "schema": "public",
+          "items": [
+            "platform_admin",
+            "market_admin"
+          ]
+        },
+        "order_claim_type_enum": {
+          "name": "order_claim_type_enum",
+          "schema": "public",
+          "items": [
+            "refund",
+            "replace"
+          ]
+        },
+        "order_status_enum": {
+          "name": "order_status_enum",
+          "schema": "public",
+          "items": [
+            "pending",
+            "completed",
+            "draft",
+            "archived",
+            "canceled",
+            "requires_action"
+          ]
+        },
+        "page_type_blog": {
+          "name": "page_type_blog",
+          "schema": "public",
+          "items": [
+            "page",
+            "blog"
+          ]
+        },
+        "return_status_enum": {
+          "name": "return_status_enum",
+          "schema": "public",
+          "items": [
+            "open",
+            "requested",
+            "received",
+            "partially_received",
+            "canceled"
+          ]
+        }
+      },
+      "comment": null
+    },
+    {
+      "columns": {
+        "flag_id": {
+          "name": "flag_id",
+          "type": "text",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": true,
+          "nullable": false,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "text"
+        },
+        "value": {
+          "name": "value",
+          "type": "text",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": false,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "enumItems": [
+            "off",
+            "shadow",
+            "on"
+          ],
+          "mappedType": "enum"
+        },
+        "updated_by": {
+          "name": "updated_by",
+          "type": "text",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": false,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "text"
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "timestamptz(6)",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": false,
+          "unique": false,
+          "length": 6,
+          "precision": null,
+          "scale": null,
+          "default": "now()",
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "datetime"
+        }
+      },
+      "name": "feature_flag_state",
+      "schema": "public",
+      "indexes": [
+        {
+          "columnNames": [
+            "flag_id"
+          ],
+          "composite": false,
+          "constraint": false,
+          "keyName": "feature_flag_state_pkey",
+          "unique": true,
+          "primary": true
+        }
+      ],
+      "checks": [],
+      "foreignKeys": {},
       "nativeEnums": {
         "claim_reason_enum": {
           "name": "claim_reason_enum",
@@ -66233,6 +68036,38 @@
           "comment": null,
           "enumItems": [],
           "mappedType": "datetime"
+        },
+        "idempotency_uuid": {
+          "name": "idempotency_uuid",
+          "type": "text",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": true,
+          "unique": true,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "text"
+        },
+        "idempotency_cart_hash": {
+          "name": "idempotency_cart_hash",
+          "type": "text",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": true,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "text"
         }
       },
       "name": "payment_session",
@@ -66258,6 +68093,17 @@
           "unique": false,
           "primary": false,
           "expression": "CREATE INDEX \"IDX_payment_session_payment_collection_id\" ON public.payment_session USING btree (payment_collection_id) WHERE (deleted_at IS NULL)"
+        },
+        {
+          "columnNames": [
+            "idempotency_uuid"
+          ],
+          "composite": false,
+          "constraint": false,
+          "keyName": "payment_session_idempotency_uuid_idx",
+          "unique": true,
+          "primary": false,
+          "expression": "CREATE UNIQUE INDEX payment_session_idempotency_uuid_idx ON public.payment_session USING btree (idempotency_uuid) WHERE (idempotency_uuid IS NOT NULL)"
         },
         {
           "columnNames": [
@@ -114449,13 +116295,13 @@
       "checks": [
         {
           "name": "CK_tax_region_country_top_level",
-          "columnName": "province_code",
+          "columnName": "parent_id",
           "definition": "CHECK (((parent_id IS NULL) OR (province_code IS NOT NULL)))",
           "expression": "(parent_id IS NULL) OR (province_code IS NOT NULL)"
         },
         {
           "name": "CK_tax_region_provider_top_level",
-          "columnName": "parent_id",
+          "columnName": "provider_id",
           "definition": "CHECK (((parent_id IS NULL) OR (provider_id IS NULL)))",
           "expression": "(parent_id IS NULL) OR (provider_id IS NULL)"
         }
@@ -117903,6 +119749,934 @@
           "enumItems": [],
           "mappedType": "uuid"
         },
+        "idempotency_key": {
+          "name": "idempotency_key",
+          "type": "text",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": false,
+          "unique": true,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "text"
+        },
+        "vendor_id": {
+          "name": "vendor_id",
+          "type": "text",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": false,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "text"
+        },
+        "request_hash": {
+          "name": "request_hash",
+          "type": "text",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": false,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "text"
+        },
+        "status_code": {
+          "name": "status_code",
+          "type": "int4",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": false,
+          "unique": false,
+          "length": null,
+          "precision": 32,
+          "scale": 0,
+          "default": null,
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "integer"
+        },
+        "response_body": {
+          "name": "response_body",
+          "type": "jsonb",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": false,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "json"
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamptz(6)",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": false,
+          "unique": false,
+          "length": 6,
+          "precision": null,
+          "scale": null,
+          "default": "now()",
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "datetime"
+        }
+      },
+      "name": "vendor_decision_idempotency",
+      "schema": "public",
+      "indexes": [
+        {
+          "columnNames": [
+            "idempotency_key"
+          ],
+          "composite": false,
+          "constraint": false,
+          "keyName": "idx_vendor_decision_idempotency_key",
+          "unique": true,
+          "primary": false
+        },
+        {
+          "columnNames": [
+            "vendor_id",
+            "created_at"
+          ],
+          "composite": true,
+          "constraint": false,
+          "keyName": "idx_vendor_decision_idempotency_vendor",
+          "unique": false,
+          "primary": false
+        },
+        {
+          "columnNames": [
+            "id"
+          ],
+          "composite": false,
+          "constraint": false,
+          "keyName": "vendor_decision_idempotency_pkey",
+          "unique": true,
+          "primary": true
+        }
+      ],
+      "checks": [
+        {
+          "name": "vendor_decision_idempotency_key_len_chk",
+          "columnName": "idempotency_key",
+          "definition": "CHECK ((char_length(idempotency_key) <= 255))",
+          "expression": "char_length(idempotency_key) <= 255"
+        }
+      ],
+      "foreignKeys": {},
+      "nativeEnums": {
+        "claim_reason_enum": {
+          "name": "claim_reason_enum",
+          "schema": "public",
+          "items": [
+            "missing_item",
+            "wrong_item",
+            "production_failure",
+            "other"
+          ]
+        },
+        "enum__landing_pages_v_version_data_source": {
+          "name": "enum__landing_pages_v_version_data_source",
+          "schema": "public",
+          "items": [
+            "location",
+            "offer",
+            "vendor",
+            "category",
+            "market"
+          ]
+        },
+        "enum__landing_pages_v_version_generation_status": {
+          "name": "enum__landing_pages_v_version_generation_status",
+          "schema": "public",
+          "items": [
+            "pending",
+            "generated",
+            "error"
+          ]
+        },
+        "enum__landing_pages_v_version_status": {
+          "name": "enum__landing_pages_v_version_status",
+          "schema": "public",
+          "items": [
+            "draft",
+            "published"
+          ]
+        },
+        "enum__market_configs_v_blocks_products_carousel_sort": {
+          "name": "enum__market_configs_v_blocks_products_carousel_sort",
+          "schema": "public",
+          "items": [
+            "newest",
+            "price_asc",
+            "price_desc"
+          ]
+        },
+        "enum__market_configs_v_version_status": {
+          "name": "enum__market_configs_v_version_status",
+          "schema": "public",
+          "items": [
+            "draft",
+            "published"
+          ]
+        },
+        "enum__market_configs_v_version_storefront_filters_display": {
+          "name": "enum__market_configs_v_version_storefront_filters_display",
+          "schema": "public",
+          "items": [
+            "city"
+          ]
+        },
+        "enum__market_configs_v_version_storefront_filters_source": {
+          "name": "enum__market_configs_v_version_storefront_filters_source",
+          "schema": "public",
+          "items": [
+            "catalog_categories",
+            "catalog_tags",
+            "catalog_variants",
+            "api",
+            "vendor_locations"
+          ]
+        },
+        "enum__market_configs_v_version_storefront_filters_type": {
+          "name": "enum__market_configs_v_version_storefront_filters_type",
+          "schema": "public",
+          "items": [
+            "category_group",
+            "tag_group",
+            "price_range",
+            "duration",
+            "seller_rating",
+            "location"
+          ]
+        },
+        "enum__pages_v_version_page_type": {
+          "name": "enum__pages_v_version_page_type",
+          "schema": "public",
+          "items": [
+            "landing",
+            "informational",
+            "legal",
+            "category"
+          ]
+        },
+        "enum__pages_v_version_status": {
+          "name": "enum__pages_v_version_status",
+          "schema": "public",
+          "items": [
+            "draft",
+            "published"
+          ]
+        },
+        "enum_landing_pages_data_source": {
+          "name": "enum_landing_pages_data_source",
+          "schema": "public",
+          "items": [
+            "location",
+            "offer",
+            "vendor",
+            "category",
+            "market"
+          ]
+        },
+        "enum_landing_pages_generation_status": {
+          "name": "enum_landing_pages_generation_status",
+          "schema": "public",
+          "items": [
+            "pending",
+            "generated",
+            "error"
+          ]
+        },
+        "enum_landing_pages_status": {
+          "name": "enum_landing_pages_status",
+          "schema": "public",
+          "items": [
+            "draft",
+            "published"
+          ]
+        },
+        "enum_landing_templates_data_source": {
+          "name": "enum_landing_templates_data_source",
+          "schema": "public",
+          "items": [
+            "location",
+            "offer",
+            "vendor",
+            "category",
+            "market"
+          ]
+        },
+        "enum_market_configs_blocks_products_carousel_sort": {
+          "name": "enum_market_configs_blocks_products_carousel_sort",
+          "schema": "public",
+          "items": [
+            "newest",
+            "price_asc",
+            "price_desc"
+          ]
+        },
+        "enum_market_configs_status": {
+          "name": "enum_market_configs_status",
+          "schema": "public",
+          "items": [
+            "draft",
+            "published"
+          ]
+        },
+        "enum_market_configs_storefront_filters_display": {
+          "name": "enum_market_configs_storefront_filters_display",
+          "schema": "public",
+          "items": [
+            "city"
+          ]
+        },
+        "enum_market_configs_storefront_filters_source": {
+          "name": "enum_market_configs_storefront_filters_source",
+          "schema": "public",
+          "items": [
+            "catalog_categories",
+            "catalog_tags",
+            "catalog_variants",
+            "api",
+            "vendor_locations"
+          ]
+        },
+        "enum_market_configs_storefront_filters_type": {
+          "name": "enum_market_configs_storefront_filters_type",
+          "schema": "public",
+          "items": [
+            "category_group",
+            "tag_group",
+            "price_range",
+            "duration",
+            "seller_rating",
+            "location"
+          ]
+        },
+        "enum_pages_page_type": {
+          "name": "enum_pages_page_type",
+          "schema": "public",
+          "items": [
+            "landing",
+            "informational",
+            "legal",
+            "category"
+          ]
+        },
+        "enum_pages_status": {
+          "name": "enum_pages_status",
+          "schema": "public",
+          "items": [
+            "draft",
+            "published"
+          ]
+        },
+        "enum_redirects_to_type": {
+          "name": "enum_redirects_to_type",
+          "schema": "public",
+          "items": [
+            "reference",
+            "custom"
+          ]
+        },
+        "enum_storefront_templates_blocks_products_carousel_sort": {
+          "name": "enum_storefront_templates_blocks_products_carousel_sort",
+          "schema": "public",
+          "items": [
+            "newest",
+            "price_asc",
+            "price_desc"
+          ]
+        },
+        "enum_users_role": {
+          "name": "enum_users_role",
+          "schema": "public",
+          "items": [
+            "platform_admin",
+            "market_admin"
+          ]
+        },
+        "order_claim_type_enum": {
+          "name": "order_claim_type_enum",
+          "schema": "public",
+          "items": [
+            "refund",
+            "replace"
+          ]
+        },
+        "order_status_enum": {
+          "name": "order_status_enum",
+          "schema": "public",
+          "items": [
+            "pending",
+            "completed",
+            "draft",
+            "archived",
+            "canceled",
+            "requires_action"
+          ]
+        },
+        "page_type_blog": {
+          "name": "page_type_blog",
+          "schema": "public",
+          "items": [
+            "page",
+            "blog"
+          ]
+        },
+        "return_status_enum": {
+          "name": "return_status_enum",
+          "schema": "public",
+          "items": [
+            "open",
+            "requested",
+            "received",
+            "partially_received",
+            "canceled"
+          ]
+        }
+      },
+      "comment": null
+    },
+    {
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "uuid",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": true,
+          "nullable": false,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": "gen_random_uuid()",
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "uuid"
+        },
+        "seller_id": {
+          "name": "seller_id",
+          "type": "text",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": false,
+          "unique": true,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "text"
+        },
+        "lifecycle_status": {
+          "name": "lifecycle_status",
+          "type": "text",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": false,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": "'pending_approval'",
+          "comment": null,
+          "enumItems": [
+            "pending_approval",
+            "open",
+            "suspended",
+            "terminated"
+          ],
+          "mappedType": "enum"
+        },
+        "decision_state": {
+          "name": "decision_state",
+          "type": "text",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": false,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": "'pending'",
+          "comment": null,
+          "enumItems": [
+            "pending",
+            "opted_in",
+            "opted_out",
+            "forced"
+          ],
+          "mappedType": "enum"
+        },
+        "opt_in_at": {
+          "name": "opt_in_at",
+          "type": "timestamptz(6)",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": true,
+          "unique": false,
+          "length": 6,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "datetime"
+        },
+        "opt_out_at": {
+          "name": "opt_out_at",
+          "type": "timestamptz(6)",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": true,
+          "unique": false,
+          "length": 6,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "datetime"
+        },
+        "last_transition_at": {
+          "name": "last_transition_at",
+          "type": "timestamptz(6)",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": false,
+          "unique": false,
+          "length": 6,
+          "precision": null,
+          "scale": null,
+          "default": "now()",
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "datetime"
+        },
+        "last_transition_by": {
+          "name": "last_transition_by",
+          "type": "text",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": false,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": "'system'",
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "text"
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamptz(6)",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": false,
+          "unique": false,
+          "length": 6,
+          "precision": null,
+          "scale": null,
+          "default": "now()",
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "datetime"
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "timestamptz(6)",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": false,
+          "unique": false,
+          "length": 6,
+          "precision": null,
+          "scale": null,
+          "default": "now()",
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "datetime"
+        }
+      },
+      "name": "vendor_lifecycle_state",
+      "schema": "public",
+      "indexes": [
+        {
+          "columnNames": [
+            "lifecycle_status"
+          ],
+          "composite": false,
+          "constraint": false,
+          "keyName": "idx_vendor_lifecycle_state_lifecycle_status",
+          "unique": false,
+          "primary": false
+        },
+        {
+          "columnNames": [
+            "seller_id"
+          ],
+          "composite": false,
+          "constraint": false,
+          "keyName": "idx_vendor_lifecycle_state_seller_id",
+          "unique": false,
+          "primary": false
+        },
+        {
+          "columnNames": [
+            "id"
+          ],
+          "composite": false,
+          "constraint": false,
+          "keyName": "vendor_lifecycle_state_pkey",
+          "unique": true,
+          "primary": true
+        },
+        {
+          "columnNames": [
+            "seller_id"
+          ],
+          "composite": false,
+          "constraint": true,
+          "keyName": "vendor_lifecycle_state_seller_id_key",
+          "unique": true,
+          "primary": false
+        }
+      ],
+      "checks": [],
+      "foreignKeys": {},
+      "nativeEnums": {
+        "claim_reason_enum": {
+          "name": "claim_reason_enum",
+          "schema": "public",
+          "items": [
+            "missing_item",
+            "wrong_item",
+            "production_failure",
+            "other"
+          ]
+        },
+        "enum__landing_pages_v_version_data_source": {
+          "name": "enum__landing_pages_v_version_data_source",
+          "schema": "public",
+          "items": [
+            "location",
+            "offer",
+            "vendor",
+            "category",
+            "market"
+          ]
+        },
+        "enum__landing_pages_v_version_generation_status": {
+          "name": "enum__landing_pages_v_version_generation_status",
+          "schema": "public",
+          "items": [
+            "pending",
+            "generated",
+            "error"
+          ]
+        },
+        "enum__landing_pages_v_version_status": {
+          "name": "enum__landing_pages_v_version_status",
+          "schema": "public",
+          "items": [
+            "draft",
+            "published"
+          ]
+        },
+        "enum__market_configs_v_blocks_products_carousel_sort": {
+          "name": "enum__market_configs_v_blocks_products_carousel_sort",
+          "schema": "public",
+          "items": [
+            "newest",
+            "price_asc",
+            "price_desc"
+          ]
+        },
+        "enum__market_configs_v_version_status": {
+          "name": "enum__market_configs_v_version_status",
+          "schema": "public",
+          "items": [
+            "draft",
+            "published"
+          ]
+        },
+        "enum__market_configs_v_version_storefront_filters_display": {
+          "name": "enum__market_configs_v_version_storefront_filters_display",
+          "schema": "public",
+          "items": [
+            "city"
+          ]
+        },
+        "enum__market_configs_v_version_storefront_filters_source": {
+          "name": "enum__market_configs_v_version_storefront_filters_source",
+          "schema": "public",
+          "items": [
+            "catalog_categories",
+            "catalog_tags",
+            "catalog_variants",
+            "api",
+            "vendor_locations"
+          ]
+        },
+        "enum__market_configs_v_version_storefront_filters_type": {
+          "name": "enum__market_configs_v_version_storefront_filters_type",
+          "schema": "public",
+          "items": [
+            "category_group",
+            "tag_group",
+            "price_range",
+            "duration",
+            "seller_rating",
+            "location"
+          ]
+        },
+        "enum__pages_v_version_page_type": {
+          "name": "enum__pages_v_version_page_type",
+          "schema": "public",
+          "items": [
+            "landing",
+            "informational",
+            "legal",
+            "category"
+          ]
+        },
+        "enum__pages_v_version_status": {
+          "name": "enum__pages_v_version_status",
+          "schema": "public",
+          "items": [
+            "draft",
+            "published"
+          ]
+        },
+        "enum_landing_pages_data_source": {
+          "name": "enum_landing_pages_data_source",
+          "schema": "public",
+          "items": [
+            "location",
+            "offer",
+            "vendor",
+            "category",
+            "market"
+          ]
+        },
+        "enum_landing_pages_generation_status": {
+          "name": "enum_landing_pages_generation_status",
+          "schema": "public",
+          "items": [
+            "pending",
+            "generated",
+            "error"
+          ]
+        },
+        "enum_landing_pages_status": {
+          "name": "enum_landing_pages_status",
+          "schema": "public",
+          "items": [
+            "draft",
+            "published"
+          ]
+        },
+        "enum_landing_templates_data_source": {
+          "name": "enum_landing_templates_data_source",
+          "schema": "public",
+          "items": [
+            "location",
+            "offer",
+            "vendor",
+            "category",
+            "market"
+          ]
+        },
+        "enum_market_configs_blocks_products_carousel_sort": {
+          "name": "enum_market_configs_blocks_products_carousel_sort",
+          "schema": "public",
+          "items": [
+            "newest",
+            "price_asc",
+            "price_desc"
+          ]
+        },
+        "enum_market_configs_status": {
+          "name": "enum_market_configs_status",
+          "schema": "public",
+          "items": [
+            "draft",
+            "published"
+          ]
+        },
+        "enum_market_configs_storefront_filters_display": {
+          "name": "enum_market_configs_storefront_filters_display",
+          "schema": "public",
+          "items": [
+            "city"
+          ]
+        },
+        "enum_market_configs_storefront_filters_source": {
+          "name": "enum_market_configs_storefront_filters_source",
+          "schema": "public",
+          "items": [
+            "catalog_categories",
+            "catalog_tags",
+            "catalog_variants",
+            "api",
+            "vendor_locations"
+          ]
+        },
+        "enum_market_configs_storefront_filters_type": {
+          "name": "enum_market_configs_storefront_filters_type",
+          "schema": "public",
+          "items": [
+            "category_group",
+            "tag_group",
+            "price_range",
+            "duration",
+            "seller_rating",
+            "location"
+          ]
+        },
+        "enum_pages_page_type": {
+          "name": "enum_pages_page_type",
+          "schema": "public",
+          "items": [
+            "landing",
+            "informational",
+            "legal",
+            "category"
+          ]
+        },
+        "enum_pages_status": {
+          "name": "enum_pages_status",
+          "schema": "public",
+          "items": [
+            "draft",
+            "published"
+          ]
+        },
+        "enum_redirects_to_type": {
+          "name": "enum_redirects_to_type",
+          "schema": "public",
+          "items": [
+            "reference",
+            "custom"
+          ]
+        },
+        "enum_storefront_templates_blocks_products_carousel_sort": {
+          "name": "enum_storefront_templates_blocks_products_carousel_sort",
+          "schema": "public",
+          "items": [
+            "newest",
+            "price_asc",
+            "price_desc"
+          ]
+        },
+        "enum_users_role": {
+          "name": "enum_users_role",
+          "schema": "public",
+          "items": [
+            "platform_admin",
+            "market_admin"
+          ]
+        },
+        "order_claim_type_enum": {
+          "name": "order_claim_type_enum",
+          "schema": "public",
+          "items": [
+            "refund",
+            "replace"
+          ]
+        },
+        "order_status_enum": {
+          "name": "order_status_enum",
+          "schema": "public",
+          "items": [
+            "pending",
+            "completed",
+            "draft",
+            "archived",
+            "canceled",
+            "requires_action"
+          ]
+        },
+        "page_type_blog": {
+          "name": "page_type_blog",
+          "schema": "public",
+          "items": [
+            "page",
+            "blog"
+          ]
+        },
+        "return_status_enum": {
+          "name": "return_status_enum",
+          "schema": "public",
+          "items": [
+            "open",
+            "requested",
+            "received",
+            "partially_received",
+            "canceled"
+          ]
+        }
+      },
+      "comment": null
+    },
+    {
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "uuid",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": true,
+          "nullable": false,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": "gen_random_uuid()",
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "uuid"
+        },
         "vendor_id": {
           "name": "vendor_id",
           "type": "text",
@@ -117961,7 +120735,8 @@
             "nudge_t21",
             "nudge_t14",
             "nudge_t7",
-            "nudge_t3"
+            "nudge_t3",
+            "competitive_insights_query"
           ],
           "mappedType": "enum"
         },
@@ -118031,7 +120806,9 @@
           "comment": null,
           "enumItems": [
             "sent",
-            "failed"
+            "failed",
+            "deduplicated",
+            "rejected"
           ],
           "mappedType": "enum"
         },
@@ -118082,6 +120859,22 @@
           "comment": null,
           "enumItems": [],
           "mappedType": "json"
+        },
+        "forced": {
+          "name": "forced",
+          "type": "bool",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": false,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": "false",
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "boolean"
         }
       },
       "name": "vendor_notification_log",
@@ -118107,6 +120900,29 @@
           "composite": true,
           "constraint": false,
           "keyName": "idx_vendor_notification_log_vendor",
+          "unique": false,
+          "primary": false
+        },
+        {
+          "columnNames": [
+            "vendor_id",
+            "notification_type",
+            "sent_at"
+          ],
+          "composite": true,
+          "constraint": false,
+          "keyName": "idx_vendor_notification_log_vendor_type_sent",
+          "unique": false,
+          "primary": false
+        },
+        {
+          "columnNames": [
+            "vendor_id",
+            "notification_type"
+          ],
+          "composite": true,
+          "constraint": false,
+          "keyName": "idx_vnl_vendor_type_competitive",
           "unique": false,
           "primary": false
         },
@@ -119917,7 +122733,7 @@
           "unsigned": false,
           "autoincrement": false,
           "primary": false,
-          "nullable": false,
+          "nullable": true,
           "unique": false,
           "length": null,
           "precision": null,
@@ -119940,14 +122756,8 @@
           "scale": null,
           "default": null,
           "comment": null,
-          "enumItems": [
-            "created",
-            "sent",
-            "opened",
-            "claimed",
-            "withdrawn"
-          ],
-          "mappedType": "enum"
+          "enumItems": [],
+          "mappedType": "text"
         },
         "occurred_at": {
           "name": "occurred_at",
@@ -119980,6 +122790,38 @@
           "comment": null,
           "enumItems": [],
           "mappedType": "datetime"
+        },
+        "entitlement_id": {
+          "name": "entitlement_id",
+          "type": "text",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": true,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "text"
+        },
+        "payload": {
+          "name": "payload",
+          "type": "jsonb",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": false,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": "'{}'",
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "json"
         }
       },
       "name": "voucher_event",
@@ -119995,6 +122837,18 @@
           "keyName": "voucher_event_code_idx",
           "unique": false,
           "primary": false
+        },
+        {
+          "columnNames": [
+            "entitlement_id",
+            "occurred_at"
+          ],
+          "composite": true,
+          "constraint": false,
+          "keyName": "voucher_event_entitlement_id_idx",
+          "unique": false,
+          "primary": false,
+          "expression": "CREATE INDEX voucher_event_entitlement_id_idx ON public.voucher_event USING btree (entitlement_id, occurred_at) WHERE (entitlement_id IS NOT NULL)"
         },
         {
           "columnNames": [
@@ -120969,6 +123823,392 @@
           "composite": false,
           "constraint": false,
           "keyName": "voucher_recipient_pii_pkey",
+          "unique": true,
+          "primary": true
+        }
+      ],
+      "checks": [],
+      "foreignKeys": {},
+      "nativeEnums": {
+        "claim_reason_enum": {
+          "name": "claim_reason_enum",
+          "schema": "public",
+          "items": [
+            "missing_item",
+            "wrong_item",
+            "production_failure",
+            "other"
+          ]
+        },
+        "enum__landing_pages_v_version_data_source": {
+          "name": "enum__landing_pages_v_version_data_source",
+          "schema": "public",
+          "items": [
+            "location",
+            "offer",
+            "vendor",
+            "category",
+            "market"
+          ]
+        },
+        "enum__landing_pages_v_version_generation_status": {
+          "name": "enum__landing_pages_v_version_generation_status",
+          "schema": "public",
+          "items": [
+            "pending",
+            "generated",
+            "error"
+          ]
+        },
+        "enum__landing_pages_v_version_status": {
+          "name": "enum__landing_pages_v_version_status",
+          "schema": "public",
+          "items": [
+            "draft",
+            "published"
+          ]
+        },
+        "enum__market_configs_v_blocks_products_carousel_sort": {
+          "name": "enum__market_configs_v_blocks_products_carousel_sort",
+          "schema": "public",
+          "items": [
+            "newest",
+            "price_asc",
+            "price_desc"
+          ]
+        },
+        "enum__market_configs_v_version_status": {
+          "name": "enum__market_configs_v_version_status",
+          "schema": "public",
+          "items": [
+            "draft",
+            "published"
+          ]
+        },
+        "enum__market_configs_v_version_storefront_filters_display": {
+          "name": "enum__market_configs_v_version_storefront_filters_display",
+          "schema": "public",
+          "items": [
+            "city"
+          ]
+        },
+        "enum__market_configs_v_version_storefront_filters_source": {
+          "name": "enum__market_configs_v_version_storefront_filters_source",
+          "schema": "public",
+          "items": [
+            "catalog_categories",
+            "catalog_tags",
+            "catalog_variants",
+            "api",
+            "vendor_locations"
+          ]
+        },
+        "enum__market_configs_v_version_storefront_filters_type": {
+          "name": "enum__market_configs_v_version_storefront_filters_type",
+          "schema": "public",
+          "items": [
+            "category_group",
+            "tag_group",
+            "price_range",
+            "duration",
+            "seller_rating",
+            "location"
+          ]
+        },
+        "enum__pages_v_version_page_type": {
+          "name": "enum__pages_v_version_page_type",
+          "schema": "public",
+          "items": [
+            "landing",
+            "informational",
+            "legal",
+            "category"
+          ]
+        },
+        "enum__pages_v_version_status": {
+          "name": "enum__pages_v_version_status",
+          "schema": "public",
+          "items": [
+            "draft",
+            "published"
+          ]
+        },
+        "enum_landing_pages_data_source": {
+          "name": "enum_landing_pages_data_source",
+          "schema": "public",
+          "items": [
+            "location",
+            "offer",
+            "vendor",
+            "category",
+            "market"
+          ]
+        },
+        "enum_landing_pages_generation_status": {
+          "name": "enum_landing_pages_generation_status",
+          "schema": "public",
+          "items": [
+            "pending",
+            "generated",
+            "error"
+          ]
+        },
+        "enum_landing_pages_status": {
+          "name": "enum_landing_pages_status",
+          "schema": "public",
+          "items": [
+            "draft",
+            "published"
+          ]
+        },
+        "enum_landing_templates_data_source": {
+          "name": "enum_landing_templates_data_source",
+          "schema": "public",
+          "items": [
+            "location",
+            "offer",
+            "vendor",
+            "category",
+            "market"
+          ]
+        },
+        "enum_market_configs_blocks_products_carousel_sort": {
+          "name": "enum_market_configs_blocks_products_carousel_sort",
+          "schema": "public",
+          "items": [
+            "newest",
+            "price_asc",
+            "price_desc"
+          ]
+        },
+        "enum_market_configs_status": {
+          "name": "enum_market_configs_status",
+          "schema": "public",
+          "items": [
+            "draft",
+            "published"
+          ]
+        },
+        "enum_market_configs_storefront_filters_display": {
+          "name": "enum_market_configs_storefront_filters_display",
+          "schema": "public",
+          "items": [
+            "city"
+          ]
+        },
+        "enum_market_configs_storefront_filters_source": {
+          "name": "enum_market_configs_storefront_filters_source",
+          "schema": "public",
+          "items": [
+            "catalog_categories",
+            "catalog_tags",
+            "catalog_variants",
+            "api",
+            "vendor_locations"
+          ]
+        },
+        "enum_market_configs_storefront_filters_type": {
+          "name": "enum_market_configs_storefront_filters_type",
+          "schema": "public",
+          "items": [
+            "category_group",
+            "tag_group",
+            "price_range",
+            "duration",
+            "seller_rating",
+            "location"
+          ]
+        },
+        "enum_pages_page_type": {
+          "name": "enum_pages_page_type",
+          "schema": "public",
+          "items": [
+            "landing",
+            "informational",
+            "legal",
+            "category"
+          ]
+        },
+        "enum_pages_status": {
+          "name": "enum_pages_status",
+          "schema": "public",
+          "items": [
+            "draft",
+            "published"
+          ]
+        },
+        "enum_redirects_to_type": {
+          "name": "enum_redirects_to_type",
+          "schema": "public",
+          "items": [
+            "reference",
+            "custom"
+          ]
+        },
+        "enum_storefront_templates_blocks_products_carousel_sort": {
+          "name": "enum_storefront_templates_blocks_products_carousel_sort",
+          "schema": "public",
+          "items": [
+            "newest",
+            "price_asc",
+            "price_desc"
+          ]
+        },
+        "enum_users_role": {
+          "name": "enum_users_role",
+          "schema": "public",
+          "items": [
+            "platform_admin",
+            "market_admin"
+          ]
+        },
+        "order_claim_type_enum": {
+          "name": "order_claim_type_enum",
+          "schema": "public",
+          "items": [
+            "refund",
+            "replace"
+          ]
+        },
+        "order_status_enum": {
+          "name": "order_status_enum",
+          "schema": "public",
+          "items": [
+            "pending",
+            "completed",
+            "draft",
+            "archived",
+            "canceled",
+            "requires_action"
+          ]
+        },
+        "page_type_blog": {
+          "name": "page_type_blog",
+          "schema": "public",
+          "items": [
+            "page",
+            "blog"
+          ]
+        },
+        "return_status_enum": {
+          "name": "return_status_enum",
+          "schema": "public",
+          "items": [
+            "open",
+            "requested",
+            "received",
+            "partially_received",
+            "canceled"
+          ]
+        }
+      },
+      "comment": null
+    },
+    {
+      "columns": {
+        "event_id": {
+          "name": "event_id",
+          "type": "text",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": true,
+          "nullable": false,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "text"
+        },
+        "provider": {
+          "name": "provider",
+          "type": "text",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": true,
+          "nullable": false,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "text"
+        },
+        "market_id": {
+          "name": "market_id",
+          "type": "text",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": true,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "text"
+        },
+        "received_at": {
+          "name": "received_at",
+          "type": "timestamptz(6)",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": false,
+          "unique": false,
+          "length": 6,
+          "precision": null,
+          "scale": null,
+          "default": "now()",
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "datetime"
+        },
+        "envelope": {
+          "name": "envelope",
+          "type": "jsonb",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": false,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "json"
+        }
+      },
+      "name": "webhook_event_processed",
+      "schema": "public",
+      "indexes": [
+        {
+          "columnNames": [
+            "market_id",
+            "received_at"
+          ],
+          "composite": true,
+          "constraint": false,
+          "keyName": "webhook_event_processed_market_received_idx",
+          "unique": false,
+          "primary": false
+        },
+        {
+          "columnNames": [
+            "event_id",
+            "provider"
+          ],
+          "composite": true,
+          "constraint": false,
+          "keyName": "webhook_event_processed_pkey",
           "unique": true,
           "primary": true
         }

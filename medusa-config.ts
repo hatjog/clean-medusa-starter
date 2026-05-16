@@ -60,7 +60,7 @@ module.exports = withMercur({
             resolve: "@medusajs/payment-stripe",
             options: {
               apiKey: process.env.STRIPE_SECRET_KEY_BONBEAUTY,
-              webhookSecret: process.env.STRIPE_WEBHOOK_SECRET_BONBEAUTY,
+              webhookSecret: process.env.STRIPE_WEBHOOK_KEY_BONBEAUTY,
               capture: true,
             },
           },
