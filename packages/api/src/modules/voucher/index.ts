@@ -64,13 +64,18 @@ export {
   LOST_CODE_REISSUE_WINDOW_DAYS,
   NO_SHOW_POLICIES,
   REFUND_CHANNELS,
+  TRANSFERABILITY_VALUES,
   isWithinReissueWindow,
   validityMonthsMax,
   checkPolicyAgainstBoundary,
+  assertTransferabilityAllowed,
+  TransferabilityError,
 } from "./entitlement-boundary"
 export type {
   NoShowPolicy,
   RefundChannel,
+  Transferability,
+  RedeemContext,
   BoundaryViolation,
 } from "./entitlement-boundary"
 export {
