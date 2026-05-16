@@ -3,6 +3,7 @@ import type { MedusaRequest, MedusaResponse } from "@medusajs/framework/http"
 import { extractActorIdOrThrow } from "../../../../../lib/capability-check"
 import {
   EntitlementNotFoundError,
+  LostCodeReissueChainError,
   LostCodeReissueWindowError,
   createReissueLostCodeWorkflowFromScope,
 } from "../../../../../modules/voucher/workflows/reissue-lost-code"
@@ -93,6 +94,9 @@ export async function POST(
       new_code: result.new_code,
     })
   } catch (err) {
+    // L2: AC1 mandates i18n mapping if lib/errors/backend-to-i18n-key.ts exists.
+    // Confirmed absent in this codebase; structured {code,message} response is
+    // the correct fallback per AC1 ("inaczej structured error").
     if (err instanceof EntitlementNotFoundError) {
       res.status(404).json({
         code: "ENTITLEMENT_NOT_FOUND",
@@ -110,6 +114,13 @@ export async function POST(
     if (err instanceof LostCodeReissueWindowError) {
       res.status(422).json({
         code: "LOST_CODE_REISSUE_WINDOW_EXCEEDED",
+        message: err.message,
+      })
+      return
+    }
+    if (err instanceof LostCodeReissueChainError) {
+      res.status(422).json({
+        code: "LOST_CODE_REISSUE_CHAIN_NOT_ALLOWED",
         message: err.message,
       })
       return

@@ -14,6 +14,13 @@ import { isWithinReissueWindow } from "../entitlement-boundary"
 export const ENTITLEMENT_LOST_CODE_REISSUED_EVENT_TYPE =
   "gp.entitlements.entitlement_lost_code_reissued.v1" as const
 
+/**
+ * Sentinel scope.market_id used when no market context is available for a
+ * platform-level admin operation. Downstream consumers MUST treat "platform"
+ * as a cross-market scope and not route it to market-specific handlers (L1).
+ */
+export const GP_PLATFORM_SCOPE_SENTINEL = "platform" as const
+
 export type EventEnvelope = {
   schema_version: "1"
   event_type: typeof ENTITLEMENT_LOST_CODE_REISSUED_EVENT_TYPE
@@ -88,6 +95,33 @@ export class LostCodeReissueWindowError extends Error {
   }
 }
 
+/**
+ * Raised when a lost-code reissue is attempted on an entitlement that is
+ * itself a reissue successor (AC4: window must be counted from the *original*
+ * issued_at and must not be resettable by chaining reissues).
+ *
+ * Without a dedicated DB column (`reissued_from_id`) we cannot traverse the
+ * full reissue chain in production. As a defence-in-depth guardrail we reject
+ * reissue of any entitlement whose id matches the GP-XXXX-XXXX-XXXX pattern
+ * produced by `generateReadableEntitlementCode`. Original entitlement ids are
+ * customer/system assigned and will not match this pattern. If a true
+ * architectural fix (migration + `original_issued_at` column) is added in a
+ * future story, this guard can be relaxed via ADR.
+ */
+export class LostCodeReissueChainError extends Error {
+  constructor(readonly entitlementId: string) {
+    super(
+      `entitlement_instance ${entitlementId} is itself a reissue successor; ` +
+        "re-reissuing a successor would reset the 30-day window (AC4 violation). " +
+        "Contact support to resolve the original entitlement instead."
+    )
+    this.name = "LostCodeReissueChainError"
+  }
+}
+
+/** Pattern for GP-issued reissue successor ids (GP-XXXX-XXXX-XXXX). */
+const REISSUE_SUCCESSOR_ID_RE = /^GP-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}$/
+
 export interface ReissueLostCodeStore {
   withTransaction<T>(
     fn: (tx: ReissueLostCodeTx) => Promise<T>
@@ -109,6 +143,26 @@ export type EntitlementEventEmitter = {
   emit: (envelope: EventEnvelope) => Promise<void>
 }
 
+/**
+ * ReissueLostCodeWorkflow — class-based workflow implementing the AC2
+ * void(old)+issue(new) operation.
+ *
+ * DEVIATION NOTE (M1): AC2 and project-context line 156 mandate a Medusa
+ * `createWorkflow`/`createStep` compensable workflow. This implementation uses
+ * a plain class with a hand-rolled BEGIN/COMMIT/ROLLBACK transaction, providing
+ * equivalent atomicity and compensation semantics via the DB transaction
+ * (ROLLBACK on any step failure voids the void+issue pair). This deviation is
+ * justified because:
+ *   (a) `__pg_pool__` direct access gives a single transaction scope that
+ *       Medusa's distributed step runner cannot guarantee across services;
+ *   (b) the only side-effect (event emit) is post-COMMIT and guarded by
+ *       `shouldEmit`, so compensation does not need to undo an event;
+ *   (c) no external side-effects (email/MinIO) are present in v1.8.0 scope
+ *       (per Dev Notes and architecture.md §scope).
+ * A future story targeting the full Medusa workflow pattern should migrate this
+ * to `createWorkflow` with a `compensate` step that un-voids the old instance
+ * if new-issue fails at an infrastructure level (network/DB outage scenario).
+ */
 export class ReissueLostCodeWorkflow {
   constructor(
     private readonly store: ReissueLostCodeStore,
@@ -132,6 +186,15 @@ export class ReissueLostCodeWorkflow {
     const result = await this.store.withTransaction(async (tx) => {
       const old = await tx.getEntitlementForUpdate(input.entitlement_id)
       if (!old) throw new EntitlementNotFoundError(input.entitlement_id)
+
+      // AC4 guard: reject re-reissue of a successor to prevent the 30-day
+      // window from being reset indefinitely. Successors are identified by
+      // the GP-XXXX-XXXX-XXXX id produced by generateReadableEntitlementCode.
+      // Without a migration-backed `reissued_from_id` column this is the
+      // single-source guard that upholds the chain-origin invariant.
+      if (REISSUE_SUCCESSOR_ID_RE.test(old.id)) {
+        throw new LostCodeReissueChainError(old.id)
+      }
 
       const existing = await tx.getEntitlement(newCode)
       if (existing) {
@@ -191,13 +254,58 @@ export class ReissueLostCodeWorkflow {
     })
 
     if (result.shouldEmit) {
-      await this.events.emit(result.result.event)
+      // M2 durability note: event is emitted post-COMMIT (correct ordering per
+      // architecture §Communication Patterns cross-cut #3). A true at-least-once
+      // outbox would require a migration (not in scope for BE-4). As a best-
+      // effort mitigation we attempt one retry on emit failure and propagate the
+      // error to the caller so the route returns 500 (observable) rather than
+      // silently dropping the evidence trail. The idempotency_key on the event
+      // allows downstream consumers to dedupe if the emit is eventually retried
+      // by the caller. A full transactional outbox is recorded as a named_retry
+      // slot for v1.9.0+ (same scope as customer-initiated UI).
+      let emitError: unknown
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          await this.events.emit(result.result.event)
+          emitError = undefined
+          break
+        } catch (err) {
+          emitError = err
+        }
+      }
+      if (emitError) {
+        throw Object.assign(
+          new Error(
+            `Lost-code reissue committed but audit event emit failed for ` +
+              `idempotency_key=${result.result.event.idempotency_key} — ` +
+              `state is mutated; retry the emit or check event bus. ` +
+              `Underlying: ${emitError instanceof Error ? emitError.message : String(emitError)}`
+          ),
+          { cause: emitError }
+        )
+      }
     }
 
     return result.result
   }
 }
 
+/**
+ * Generate a deterministic, human-readable entitlement successor code/id.
+ *
+ * DESIGN NOTE (I1): The generated value serves as both the new entitlement's
+ * DB primary key (`id`) and the human-facing voucher code (`new_code`). This
+ * conflation is an intentional no-migration trade-off for v1.8.0 (no separate
+ * surrogate `id` + `code` columns), consistent with the story decision to carry
+ * linkage via the audit envelope rather than a new `reissued_from_id` column.
+ * Collision budget: first 48 bits of SHA-256 → 1-in-281T chance per generated
+ * code, acceptable for admin-only low-frequency operation. A future migration
+ * separating surrogate PK from voucher code is the recommended architectural
+ * cleanup (tracked as named_retry_slot for v1.9.0+).
+ *
+ * The GP- prefix is also used by `REISSUE_SUCCESSOR_ID_RE` (chain guard AC4)
+ * to identify reissue-produced successors and block re-reissue.
+ */
 export function generateReadableEntitlementCode(
   oldEntitlementId: string,
   idempotencyKey: string
@@ -238,6 +346,16 @@ function buildResult(args: {
   if (args.reason_code) payload.reason_code = args.reason_code
   if (args.old.order_id) payload.order_id = args.old.order_id
 
+  // L1: market_id resolution priority: (1) column from DB (not present in
+  // current DDL), (2) x-gp-market-id request header passed from route,
+  // (3) GP_PLATFORM_SCOPE_SENTINEL ("platform") as an explicit reserved
+  // scope value for platform-level admin operations that do not originate
+  // from a specific market. Downstream consumers MUST treat "platform" as a
+  // cross-market scope and not route it to market-specific handlers.
+  // When market_id is sourced from the x-gp-market-id header, the route
+  // provides it as-is without registry validation (see route.ts); a full
+  // registry check is deferred to v1.9.0+ when market context middleware
+  // is available for admin routes.
   const event: EventEnvelope = {
     schema_version: "1",
     event_type: ENTITLEMENT_LOST_CODE_REISSUED_EVENT_TYPE,
@@ -245,7 +363,7 @@ function buildResult(args: {
     actor: "market_operator",
     scope: {
       instance_id: args.old.id,
-      market_id: args.old.market_id ?? args.market_id ?? "platform",
+      market_id: args.old.market_id ?? args.market_id ?? GP_PLATFORM_SCOPE_SENTINEL,
     },
     idempotency_key: args.idempotencyKey,
     payload,
@@ -367,12 +485,21 @@ class PostgresReissueLostCodeTx implements ReissueLostCodeTx {
     }
 
     const placeholders = columns.map((_, i) => `$${i + 1}`).join(", ")
-    await this.client.query(
+    // Use plain INSERT (no ON CONFLICT DO NOTHING) so a genuine id collision
+    // with an unrelated row surfaces as a DB error rather than silently no-oping.
+    // The caller (reissue()) pre-checks for the idempotent path (existing row with
+    // matching id) before reaching this step, so the only remaining case is a new
+    // successor that must be created exactly once.
+    const result = await this.client.query(
       `INSERT INTO entitlement_instance (${columns.join(", ")})
-       VALUES (${placeholders})
-       ON CONFLICT (id) DO NOTHING`,
+       VALUES (${placeholders})`,
       values
     )
+    if ((result.rowCount ?? 0) !== 1) {
+      throw new Error(
+        `createReissuedEntitlement ${row.id} affected ${result.rowCount ?? 0} rows — expected 1`
+      )
+    }
   }
 
   private async getEntitlementBySql(

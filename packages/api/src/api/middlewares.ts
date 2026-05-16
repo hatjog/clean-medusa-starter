@@ -796,6 +796,18 @@ export default defineMiddlewares({
         operatorAuthMiddleware,
       ],
     },
+    // Story 2.5: admin-only lost-code recovery. POST /admin/entitlements/:id/reissue
+    // requires an authenticated admin/market_operator session (AC1). Mirrors
+    // /admin/vendors/* — authenticate("user") + operatorAuthMiddleware populates
+    // auth_context.actor_id consumed by extractActorIdOrThrow in route.ts.
+    {
+      method: ["POST"],
+      matcher: "/admin/entitlements/*",
+      middlewares: [
+        authenticate("user", ["session", "bearer"]),
+        operatorAuthMiddleware,
+      ],
+    },
     {
       method: ["POST"],
       matcher: "/auth/customer/emailpass/register",

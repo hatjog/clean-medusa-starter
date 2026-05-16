@@ -12,8 +12,10 @@ import {
   ENTITLEMENT_LOST_CODE_REISSUED_EVENT_TYPE,
   EntitlementNotFoundError,
   InMemoryReissueLostCodeStore,
+  LostCodeReissueChainError,
   LostCodeReissueWindowError,
   ReissueLostCodeWorkflow,
+  generateReadableEntitlementCode,
   type ReissuableEntitlement,
 } from "../workflows/reissue-lost-code"
 
@@ -187,5 +189,121 @@ describe("ReissueLostCodeWorkflow", () => {
         admin_user_id: "user_admin_001",
       })
     ).rejects.toBeInstanceOf(EntitlementNotFoundError)
+  })
+
+  // AC4 chain guard: re-reissuing a successor (GP-XXXX-XXXX-XXXX id) must be
+  // rejected to prevent the 30-day window from being reset indefinitely.
+  it("rejects re-reissue of a successor entitlement (AC4 chain guard)", async () => {
+    const originalNow = new Date("2026-05-10T12:00:00Z")
+    const idempotencyKey = "entitlement:ent_old_001:reissue"
+    const successorId = generateReadableEntitlementCode("ent_old_001", idempotencyKey)
+
+    // Successor was issued at reissue time; if re-reissue were allowed its
+    // originalIssueDate would be successorNow, resetting the 30-day window.
+    const successor = entitlement({
+      id: successorId,
+      state: EntitlementInstanceState.ACTIVE,
+      created_at: originalNow,
+      issued_at: originalNow, // window still valid from this date
+    })
+
+    const { workflow } = workflowWith([successor])
+
+    // Attempt to re-reissue the successor itself: must be rejected regardless
+    // of whether the 30-day window from created_at would still be open.
+    await expect(
+      workflow.reissue({
+        entitlement_id: successorId,
+        reason: "Customer lost the replacement code too.",
+        admin_user_id: "user_admin_001",
+        now: new Date("2026-05-11T00:00:00Z"), // within 30d of successor
+      })
+    ).rejects.toBeInstanceOf(LostCodeReissueChainError)
+  })
+
+  // AC5(e) additional: verify that emit failure after commit surfaces as error
+  // (M2 durability guard: at-most-once with explicit propagation).
+  it("propagates emit failure after state mutation so the route can return 500", async () => {
+    const old = entitlement()
+    const store = new InMemoryReissueLostCodeStore([old])
+    const emit = jest.fn<() => Promise<void>>().mockRejectedValue(
+      new Error("event bus unavailable")
+    )
+    const workflow = new ReissueLostCodeWorkflow(store, { emit })
+
+    await expect(
+      workflow.reissue({
+        entitlement_id: old.id,
+        reason: "Customer reports lost code.",
+        admin_user_id: "user_admin_001",
+        now: new Date("2026-05-10T12:00:00Z"),
+        idempotency_key: "entitlement:ent_old_001:reissue",
+      })
+    ).rejects.toThrow("audit event emit failed")
+
+    // State was already mutated inside the transaction (old is VOIDED)
+    const oldAfter = store.get(old.id)
+    expect(oldAfter?.state).toBe(EntitlementInstanceState.VOIDED)
+    // emit was retried once (2 attempts total)
+    expect(emit).toHaveBeenCalledTimes(2)
+  })
+
+  // Integration/lifecycle test (authored; apply path requires live DB per AC5).
+  // Runs against InMemory store to document the full lifecycle without live DB:
+  //   issue → active → reissue → old VOIDED + new ACTIVE, policy_snapshot
+  //   deep-equal, expires_at preserved, idempotent re-trigger.
+  it("lifecycle: issue → active → reissue (InMemory integration path)", async () => {
+    const originalIssuedAt = new Date("2026-05-01T10:00:00Z")
+    const reissueNow = new Date("2026-05-10T12:00:00Z")
+    const originalExpiresAt = new Date("2027-05-01T10:00:00Z")
+    const originalPolicy = snapshotPolicy({
+      validity_months: 12,
+      refund_channel: "original_payment",
+      extension: { enabled: true, fee_pct: 10 },
+    })
+
+    // 1. Start with an ACTIVE entitlement (post-ISSUED lifecycle step)
+    const activeEntitlement = entitlement({
+      state: EntitlementInstanceState.ACTIVE,
+      created_at: originalIssuedAt,
+      issued_at: originalIssuedAt,
+      expires_at: originalExpiresAt,
+      policy_snapshot: originalPolicy,
+    })
+
+    const { store, emit, workflow } = workflowWith([activeEntitlement])
+
+    // 2. First reissue
+    const first = await workflow.reissue({
+      entitlement_id: activeEntitlement.id,
+      reason: "Customer reports lost code after email deletion.",
+      reason_code: "LOST_CODE",
+      admin_user_id: "user_admin_001",
+      now: reissueNow,
+      idempotency_key: "entitlement:ent_old_001:reissue",
+    })
+
+    // Old is VOIDED
+    expect(store.get(activeEntitlement.id)?.state).toBe(EntitlementInstanceState.VOIDED)
+
+    // New is ACTIVE with policy_snapshot deep-equal and expires_at preserved
+    const newEnt = store.get(first.new_entitlement_id)
+    expect(newEnt?.state).toBe(EntitlementInstanceState.ACTIVE)
+    expect(newEnt?.policy_snapshot).toEqual(originalPolicy)
+    expect(newEnt?.policy_snapshot).not.toBe(originalPolicy) // deep copy, not same ref
+    expect(newEnt?.expires_at?.toISOString()).toBe(originalExpiresAt.toISOString())
+
+    // 3. Idempotent re-trigger: same result, no new successor, emit called once
+    const second = await workflow.reissue({
+      entitlement_id: activeEntitlement.id,
+      reason: "Customer reports lost code after email deletion.",
+      reason_code: "LOST_CODE",
+      admin_user_id: "user_admin_001",
+      now: reissueNow,
+      idempotency_key: "entitlement:ent_old_001:reissue",
+    })
+    expect(second.new_entitlement_id).toBe(first.new_entitlement_id)
+    expect(store.all().filter((r) => r.id !== activeEntitlement.id)).toHaveLength(1)
+    expect(emit).toHaveBeenCalledTimes(1) // only on first reissue
   })
 })

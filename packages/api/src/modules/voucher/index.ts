@@ -75,8 +75,10 @@ export type {
 } from "./entitlement-boundary"
 export {
   ENTITLEMENT_LOST_CODE_REISSUED_EVENT_TYPE,
+  GP_PLATFORM_SCOPE_SENTINEL,
   EntitlementNotFoundError,
   LostCodeReissueWindowError,
+  LostCodeReissueChainError,
   ReissueLostCodeWorkflow,
   PostgresReissueLostCodeStore,
   InMemoryReissueLostCodeStore,
