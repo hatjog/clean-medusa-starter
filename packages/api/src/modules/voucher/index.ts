@@ -18,12 +18,22 @@ export const VOUCHER_MODULE = "voucher"
 export { VoucherService }
 export {
   ENTITLEMENT_EXTENDED_EVENT,
+  ENTITLEMENT_REFUND_APPLIED_EVENT,
+  ENTITLEMENT_NO_SHOW_EVENT_TYPE,
   EntitlementExtensionError,
+  EntitlementRefundError,
 } from "./service"
 export type {
   ExtendEntitlementInput,
   ExtendEntitlementResult,
   EntitlementExtendedEnvelope,
+  RefundRequestInput,
+  RefundRequestResult,
+  RefundAppliedPayload,
+  RefundAppliedEnvelope,
+  MarkNoShowInput,
+  MarkNoShowResult,
+  NoShowOutcome,
 } from "./service"
 
 export type {
@@ -54,23 +64,31 @@ export {
   EntitlementTransitionError,
   snapshotPolicy,
   assertPolicySnapshotImmutable,
+  // BE-8 (Story 2.9): auto_redeem policy helper.
+  shouldAutoRedeemOnBookingConfirm,
 } from "./models/entitlement"
 export type {
   EntitlementPolicySnapshot,
   EntitlementInstanceRow,
+  AutoRedeemPolicy,
 } from "./models/entitlement"
 export {
   ENTITLEMENT_BOUNDARY,
   LOST_CODE_REISSUE_WINDOW_DAYS,
   NO_SHOW_POLICIES,
   REFUND_CHANNELS,
+  TRANSFERABILITY_VALUES,
   isWithinReissueWindow,
   validityMonthsMax,
   checkPolicyAgainstBoundary,
+  assertTransferabilityAllowed,
+  TransferabilityError,
 } from "./entitlement-boundary"
 export type {
   NoShowPolicy,
   RefundChannel,
+  Transferability,
+  RedeemContext,
   BoundaryViolation,
 } from "./entitlement-boundary"
 export {
@@ -94,6 +112,25 @@ export type {
   ReissueLostCodeTx,
   EntitlementEventEmitter,
 } from "./workflows/reissue-lost-code"
+
+// BE-8 (Story 2.9): auto-redeem workflow.
+export {
+  ENTITLEMENT_REDEEMED_EVENT_TYPE,
+  EntitlementNotFoundError as RedeemEntitlementNotFoundError,
+  RedeemEntitlementWorkflow,
+  PostgresRedeemEntitlementStore,
+  InMemoryRedeemEntitlementStore,
+  createRedeemEntitlementWorkflowFromScope,
+} from "./workflows/redeem-entitlement"
+export type {
+  RedeemEventEnvelope,
+  RedeemableEntitlement,
+  RedeemEntitlementInput,
+  RedeemEntitlementResult,
+  RedeemEntitlementStore,
+  RedeemEntitlementTx,
+  RedeemEntitlementEventEmitter,
+} from "./workflows/redeem-entitlement"
 
 export default Module(VOUCHER_MODULE, {
   service: VoucherService,

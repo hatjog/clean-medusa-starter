@@ -27,7 +27,50 @@ import {
   type EntitlementInstanceRow,
   type EntitlementPolicySnapshot,
 } from "./models/entitlement"
-import { ENTITLEMENT_BOUNDARY, validityMonthsMax } from "./entitlement-boundary"
+import {
+  ENTITLEMENT_BOUNDARY,
+  REFUND_CHANNELS,
+  type NoShowPolicy,
+  type RefundChannel,
+  validityMonthsMax,
+} from "./entitlement-boundary"
+
+/** States from which a refund can be processed. */
+const REFUNDABLE_STATES: ReadonlySet<EntitlementInstanceState> = new Set([
+  EntitlementInstanceState.ACTIVE,
+  EntitlementInstanceState.REDEEMED_PARTIAL,
+  EntitlementInstanceState.REDEEMED_FULL,
+  EntitlementInstanceState.REFUND_REQUESTED,
+])
+
+export const ENTITLEMENT_NO_SHOW_EVENT_TYPE =
+  "gp.entitlements.entitlement_no_show.v1"
+
+/** Canonical outcome vocabulary for the no-show event payload (epics FR1.17). */
+export type NoShowOutcome =
+  | "forfeiture"
+  | "partial_fee"
+  | "no_charge"
+  | "vendor_decision"
+  | "charge_full"
+
+export interface MarkNoShowInput {
+  reason: string
+  actor?: string
+  base_amount?: number
+}
+
+export interface MarkNoShowResult {
+  entitlement_id: string
+  outcome: NoShowOutcome
+  no_show_policy: NoShowPolicy
+  resulting_state: EntitlementInstanceState
+  fee_amount?: number
+  charge_pct?: number
+  base_amount?: number
+  remaining_amount?: number
+  marked_at: string
+}
 
 type VoucherModuleOptions = {
   databaseUrl?: string
@@ -45,6 +88,8 @@ type Queryable = {
 }
 
 export const ENTITLEMENT_EXTENDED_EVENT = "ENTITLEMENT_EXTENDED"
+export const ENTITLEMENT_REFUND_APPLIED_EVENT =
+  "gp.entitlements.entitlement_refund_applied.v1"
 
 export interface ExtendEntitlementInput {
   paid: boolean
@@ -110,6 +155,69 @@ export class EntitlementExtensionError extends Error {
     this.code = code
     this.details = details
   }
+}
+
+export class EntitlementRefundError extends Error {
+  readonly code: string
+  readonly details: Record<string, unknown>
+
+  constructor(code: string, message: string, details: Record<string, unknown> = {}) {
+    super(message)
+    this.name = "EntitlementRefundError"
+    this.code = code
+    this.details = details
+  }
+}
+
+export interface RefundRequestInput {
+  /** Unique refund identifier for idempotency. */
+  refund_id: string
+  /** Amount in minor units (e.g. grosz for PLN). */
+  amount: number
+  /** ISO 4217 currency code, must match entitlement currency. */
+  currency: string
+  reason?: string
+  actor?: string
+}
+
+export interface RefundRequestResult {
+  entitlement_id: string
+  refund_id: string
+  refund_channel: RefundChannel
+  amount: number
+  currency: string
+  /** Whether this was a duplicate idempotent call (no new effect). */
+  idempotent: boolean
+  event: RefundAppliedEnvelope
+}
+
+/** Payload shape for `gp.entitlements.entitlement_refund_applied.v1`. */
+export interface RefundAppliedPayload {
+  entitlement_id: string
+  refund_id: string
+  applied_at: string
+  currency: string
+  refunded_amount_minor: number
+  refund_channel: RefundChannel
+  order_id?: string
+  payment_id?: string
+  voided?: boolean
+}
+
+/** Full event envelope for `gp.entitlements.entitlement_refund_applied.v1`. */
+export interface RefundAppliedEnvelope {
+  schema_version: "1"
+  event_type: typeof ENTITLEMENT_REFUND_APPLIED_EVENT
+  occurred_at: string
+  actor: string
+  idempotency_key: string
+  scope: {
+    instance_id: string
+    market_id?: string
+    vendor_id?: string
+    location_id?: string
+  }
+  payload: RefundAppliedPayload
 }
 
 function resolveDatabaseUrl(override?: string): string {
@@ -219,6 +327,8 @@ export class VoucherService {
       policy_snapshot: this.toPolicySnapshot(row.policy_snapshot),
       expires_at: this.toDate(row.expires_at as string | Date | null),
       unpaid_extension_count: Number(row.unpaid_extension_count ?? 0),
+      remaining_amount:
+        row.remaining_amount != null ? Number(row.remaining_amount) : null,
       created_at: new Date(row.created_at as string | Date),
       updated_at: new Date(row.updated_at as string | Date),
     }
@@ -481,6 +591,218 @@ export class VoucherService {
     }
   }
 
+  private async emitEntitlementNoShow(
+    client: PoolClient,
+    payload: Record<string, unknown>
+  ): Promise<void> {
+    await client.query(
+      `INSERT INTO voucher_event (id, voucher_code, entitlement_id, event_type, payload, occurred_at, created_at)
+       VALUES ($1, NULL, $2, $3, $4::jsonb, NOW(), NOW())`,
+      [
+        randomUUID(),
+        payload.entitlement_id,
+        ENTITLEMENT_NO_SHOW_EVENT_TYPE,
+        payload,
+      ]
+    )
+  }
+
+  /**
+   * Mark a no-show on an entitlement instance. Reads policy from
+   * `policy_snapshot.no_show` (immutable post-ISSUED, regulamin § 12 — NOT
+   * the live profile). Dispatches deterministic outcomes per policy value.
+   *
+   * Service method (not workflow): synchronous single-module operation, no
+   * external side-effects (no Stripe charge — internal credit deduction only).
+   * Idempotent: repeated call on already-no-show state is a no-op.
+   */
+  async mark_no_show(
+    entitlement_id: string,
+    input: MarkNoShowInput
+  ): Promise<MarkNoShowResult> {
+    const client = await this.getPool().connect()
+    let committed = false
+
+    try {
+      await client.query("BEGIN")
+
+      const lockRes = await client.query<Record<string, unknown>>(
+        `SELECT * FROM entitlement_instance WHERE id = $1 FOR UPDATE`,
+        [entitlement_id]
+      )
+      if (lockRes.rows.length === 0) {
+        throw new Error(
+          `VoucherService.mark_no_show: entitlement not found ${entitlement_id}`
+        )
+      }
+
+      const current = this.rowToEntitlementInstance(lockRes.rows[0])
+
+      // Read policy from immutable snapshot (NOT live profile — regulamin § 12).
+      // Must be extracted before idempotency check so idempotent path can return it.
+      const snapshot = current.policy_snapshot as Record<string, unknown>
+      const noShowSnapshot = (snapshot.no_show ?? {}) as Record<string, unknown>
+      const policyValue = ((noShowSnapshot.policy as string | undefined) ?? "no_charge") as NoShowPolicy
+      const snapshotChargePct =
+        typeof noShowSnapshot.charge_pct === "number"
+          ? (noShowSnapshot.charge_pct as number)
+          : 0
+
+      // Idempotency: if already in a terminal no-show outcome state, return early.
+      // Outcome is derived from the policy snapshot (M2 fix: not hardcoded to "forfeiture").
+      const noShowTerminalStates: ReadonlySet<EntitlementInstanceState> =
+        new Set([
+          EntitlementInstanceState.VOIDED,
+          EntitlementInstanceState.PENDING_VENDOR_DECISION,
+        ])
+      if (noShowTerminalStates.has(current.state)) {
+        await client.query("ROLLBACK")
+        committed = true
+        const idempotentOutcome: NoShowOutcome =
+          current.state === EntitlementInstanceState.PENDING_VENDOR_DECISION
+            ? "vendor_decision"
+            : policyValue === "charge_full"
+            ? "charge_full"
+            : "forfeiture"
+        return {
+          entitlement_id,
+          outcome: idempotentOutcome,
+          no_show_policy: policyValue,
+          resulting_state: current.state,
+          marked_at: new Date().toISOString(),
+        }
+      }
+
+      // H1 fix: guard that source state is valid for a no-show operation.
+      // Only ACTIVE and REDEMPTION_REQUESTED are valid pre-no-show states.
+      // charge_partial and no_charge don't call assertTransition (state-preserving),
+      // so this explicit guard is required for all policy paths.
+      const validNoShowSourceStates: ReadonlySet<EntitlementInstanceState> = new Set([
+        EntitlementInstanceState.ACTIVE,
+        EntitlementInstanceState.REDEMPTION_REQUESTED,
+      ])
+      if (!validNoShowSourceStates.has(current.state)) {
+        throw new EntitlementTransitionError(current.state, EntitlementInstanceState.VOIDED)
+      }
+
+      const markedAt = new Date().toISOString()
+      let newState: EntitlementInstanceState
+      let outcome: NoShowOutcome
+      let feeAmount: number | undefined
+      let newRemainingAmount: number | undefined
+      const baseAmount = input.base_amount ?? current.remaining_amount ?? 0
+
+      switch (policyValue) {
+        case "forfeit_voucher": {
+          assertTransition(current.state, EntitlementInstanceState.VOIDED)
+          newState = EntitlementInstanceState.VOIDED
+          outcome = "forfeiture"
+          await client.query(
+            `UPDATE entitlement_instance SET state = $2, updated_at = NOW() WHERE id = $1`,
+            [entitlement_id, newState]
+          )
+          break
+        }
+        case "charge_partial": {
+          // fee = round(base_amount * charge_pct / 100); remaining preserved (clamp >= 0)
+          const pct = snapshotChargePct
+          feeAmount = Math.round((baseAmount * pct) / 100)
+          const currentRemaining = current.remaining_amount ?? baseAmount
+          newRemainingAmount = Math.max(0, currentRemaining - feeAmount)
+          newState = current.state // state stays (voucher still usable)
+          outcome = "partial_fee"
+          await client.query(
+            `UPDATE entitlement_instance SET remaining_amount = $2, updated_at = NOW() WHERE id = $1`,
+            [entitlement_id, newRemainingAmount]
+          )
+          break
+        }
+        case "charge_full": {
+          // charge 100% — voucher consumed; semantics: VOIDED (no residual value)
+          feeAmount = baseAmount
+          newRemainingAmount = 0
+          newState = EntitlementInstanceState.VOIDED
+          assertTransition(current.state, EntitlementInstanceState.VOIDED)
+          outcome = "charge_full"
+          await client.query(
+            `UPDATE entitlement_instance
+             SET state = $2, remaining_amount = 0, updated_at = NOW()
+             WHERE id = $1`,
+            [entitlement_id, newState]
+          )
+          break
+        }
+        case "no_charge": {
+          // No penalty; entitlement remains usable (state unchanged)
+          newState = current.state
+          outcome = "no_charge"
+          // no DB state change — just emit audit event
+          break
+        }
+        case "vendor_decision": {
+          assertTransition(current.state, EntitlementInstanceState.PENDING_VENDOR_DECISION)
+          newState = EntitlementInstanceState.PENDING_VENDOR_DECISION
+          outcome = "vendor_decision"
+          await client.query(
+            `UPDATE entitlement_instance SET state = $2, updated_at = NOW() WHERE id = $1`,
+            [entitlement_id, newState]
+          )
+          break
+        }
+        default: {
+          // Unknown policy value — fail loud (architecture fail-loud pattern)
+          throw new Error(
+            `VoucherService.mark_no_show: unknown no_show policy '${policyValue}' on instance ${entitlement_id}`
+          )
+        }
+      }
+
+      // Emit audit event AFTER state mutation (HG-4 backwards compat)
+      const eventPayload: Record<string, unknown> = {
+        entitlement_id,
+        outcome,
+        no_show_policy: policyValue,
+        reason: input.reason,
+        marked_at: markedAt,
+        resulting_state: newState,
+        ...(feeAmount !== undefined ? { fee_amount: feeAmount } : {}),
+        ...(snapshotChargePct && policyValue !== "no_charge"
+          ? { charge_pct: snapshotChargePct }
+          : {}),
+        ...(baseAmount > 0 ? { base_amount: baseAmount } : {}),
+        ...(newRemainingAmount !== undefined
+          ? { remaining_amount: newRemainingAmount }
+          : {}),
+        ...(input.actor ? { admin_user_id: input.actor } : {}),
+      }
+      await this.emitEntitlementNoShow(client, eventPayload)
+
+      await client.query("COMMIT")
+      committed = true
+
+      return {
+        entitlement_id,
+        outcome,
+        no_show_policy: policyValue,
+        resulting_state: newState,
+        ...(feeAmount !== undefined ? { fee_amount: feeAmount } : {}),
+        ...(snapshotChargePct ? { charge_pct: snapshotChargePct } : {}),
+        ...(baseAmount > 0 ? { base_amount: baseAmount } : {}),
+        ...(newRemainingAmount !== undefined
+          ? { remaining_amount: newRemainingAmount }
+          : {}),
+        marked_at: markedAt,
+      }
+    } catch (err) {
+      if (!committed) {
+        await client.query("ROLLBACK")
+      }
+      throw err
+    } finally {
+      client.release()
+    }
+  }
+
   async claim(
     code: string,
     opts: { now?: Date } = {}
@@ -669,6 +991,254 @@ export class VoucherService {
         new_expires_at: newExpiresAt,
         unpaid_extension_count: unpaidExtensionCount,
         event,
+      }
+    } catch (err) {
+      if (!committed) {
+        await client.query("ROLLBACK")
+      }
+      throw err
+    } finally {
+      client.release()
+    }
+  }
+
+  private async emitRefundApplied(envelope: RefundAppliedEnvelope): Promise<void> {
+    if (!this.eventBus_) {
+      throw new EntitlementRefundError(
+        "EVENT_BUS_REQUIRED",
+        "refund_request requires Medusa event bus"
+      )
+    }
+    await this.eventBus_.emit({ name: ENTITLEMENT_REFUND_APPLIED_EVENT, data: envelope })
+  }
+
+  /**
+   * Route a refund request to the correct channel per the entitlement's
+   * policy_snapshot (immutable post-ISSUED, regulamin § 12).
+   *
+   * Channels:
+   * - original_payment → register routing decision + emit audit event;
+   *   delegates to native Medusa payment-refund path consumed by Story 1.3
+   *   subscriber. Does NOT call Stripe refund.create (OOS v1.8.0).
+   * - store_credit → increment customer.metadata.gp.store_credit
+   * - vendor_wallet → increment vendor.metadata.wallet
+   *
+   * Idempotent: a duplicate call with the same refund_id returns the same
+   * result without re-applying the effect.
+   */
+  async refund_request(
+    entitlementId: string,
+    input: RefundRequestInput
+  ): Promise<RefundRequestResult> {
+    // F-02 fix: validate amount is a positive integer (minor units).
+    if (!Number.isInteger(input.amount) || input.amount <= 0) {
+      throw new EntitlementRefundError(
+        "INVALID_REFUND_AMOUNT",
+        `refund amount must be a positive integer (minor units), got ${input.amount}`,
+        { entitlement_id: entitlementId, amount: input.amount }
+      )
+    }
+
+    // F-05 fix: validate currency is a 3-character ISO 4217 code.
+    if (!/^[A-Z]{3}$/.test(input.currency)) {
+      throw new EntitlementRefundError(
+        "INVALID_CURRENCY",
+        `currency must be a 3-character ISO 4217 code (uppercase), got '${input.currency}'`,
+        { entitlement_id: entitlementId, currency: input.currency }
+      )
+    }
+
+    const actor = input.actor ?? "system"
+    const now = new Date()
+    const idempotencyKey = `entitlement:${entitlementId}:refund_applied:${input.refund_id}`
+
+    const pool = this.getPool()
+    const client = await pool.connect()
+    let committed = false
+    let envelope: RefundAppliedEnvelope | undefined
+
+    try {
+      await client.query("BEGIN")
+
+      // F-06 fix: idempotency check moved inside the transaction (after BEGIN)
+      // to close the TOCTOU race window between check and effect. Both read and
+      // insert execute under the same client transaction.
+      const existingEvent = await (client as Queryable).query<Record<string, unknown>>(
+        `SELECT payload FROM voucher_event
+          WHERE entitlement_id = $1
+            AND event_type = $2
+            AND payload->>'refund_id' = $3
+          LIMIT 1`,
+        [entitlementId, ENTITLEMENT_REFUND_APPLIED_EVENT, input.refund_id]
+      )
+      if ((existingEvent.rowCount ?? 0) > 0) {
+        await client.query("ROLLBACK")
+        const p = existingEvent.rows[0].payload as RefundAppliedPayload
+        const idempotentEnvelope: RefundAppliedEnvelope = {
+          schema_version: "1",
+          event_type: ENTITLEMENT_REFUND_APPLIED_EVENT,
+          occurred_at: p.applied_at,
+          actor,
+          idempotency_key: idempotencyKey,
+          // F-01 fix: use actual entitlement instance ID, not hardcoded "gp-dev".
+          scope: { instance_id: entitlementId },
+          payload: p,
+        }
+        return {
+          entitlement_id: entitlementId,
+          refund_id: input.refund_id,
+          refund_channel: p.refund_channel,
+          amount: p.refunded_amount_minor,
+          currency: p.currency,
+          idempotent: true,
+          event: idempotentEnvelope,
+        }
+      }
+
+      const result = await (client as Queryable).query(
+        `SELECT id, entitlement_profile_id, order_id, state, policy_snapshot,
+                created_at, updated_at
+           FROM entitlement_instance
+          WHERE id = $1
+          FOR UPDATE`,
+        [entitlementId]
+      )
+      if (result.rows.length === 0) {
+        throw new EntitlementRefundError(
+          "ENTITLEMENT_NOT_FOUND",
+          `entitlement_instance '${entitlementId}' was not found`,
+          { entitlement_id: entitlementId }
+        )
+      }
+
+      const row = this.rowToEntitlementInstance(result.rows[0])
+
+      // F-04 fix: guard against refund on terminal/invalid states.
+      if (!REFUNDABLE_STATES.has(row.state)) {
+        throw new EntitlementRefundError(
+          "INVALID_ENTITLEMENT_STATE_FOR_REFUND",
+          `entitlement_instance '${entitlementId}' is in state ${row.state} which does not allow refund processing`,
+          { entitlement_id: entitlementId, state: row.state }
+        )
+      }
+
+      const snapshot = row.policy_snapshot as Record<string, unknown>
+      const rawChannel = snapshot.refund_channel
+
+      if (
+        rawChannel === undefined ||
+        !(REFUND_CHANNELS as readonly string[]).includes(rawChannel as string)
+      ) {
+        throw new EntitlementRefundError(
+          "UNKNOWN_REFUND_CHANNEL",
+          `policy_snapshot.refund_channel '${String(rawChannel)}' is not a supported refund channel`,
+          { entitlement_id: entitlementId, refund_channel: rawChannel }
+        )
+      }
+
+      const refundChannel = rawChannel as RefundChannel
+      const appliedAt = now.toISOString()
+
+      if (refundChannel === "store_credit") {
+        // Increment customer.metadata.gp.store_credit (minor units, currency-aware).
+        // Note: the nested jsonb_set correctly uses the original `metadata` value
+        // in the COALESCE — PostgreSQL evaluates all SET expressions against the
+        // pre-UPDATE row state, so the inner jsonb_set result is threaded as the
+        // first argument to the outer one while COALESCE reads the original value.
+        // This is intentional and correct PostgreSQL behavior.
+        await (client as Queryable).query(
+          `UPDATE customer
+              SET metadata = jsonb_set(
+                    jsonb_set(
+                      COALESCE(metadata, '{}'),
+                      '{gp}',
+                      COALESCE(metadata->'gp', '{}'),
+                      true
+                    ),
+                    '{gp,store_credit}',
+                    to_jsonb(
+                      COALESCE((metadata->'gp'->>'store_credit')::bigint, 0) + $2
+                    ),
+                    true
+                  ),
+                  updated_at = NOW()
+            FROM "order" o
+           WHERE customer.id = o.customer_id
+             AND o.id = (SELECT order_id FROM entitlement_instance WHERE id = $1)`,
+          [entitlementId, input.amount]
+        )
+      } else if (refundChannel === "vendor_wallet") {
+        // Increment vendor.metadata.wallet balance (minor units).
+        await (client as Queryable).query(
+          `UPDATE seller
+              SET metadata = jsonb_set(
+                    COALESCE(metadata, '{}'),
+                    '{wallet}',
+                    to_jsonb(
+                      COALESCE((metadata->>'wallet')::bigint, 0) + $2
+                    ),
+                    true
+                  ),
+                  updated_at = NOW()
+            FROM entitlement_instance ei
+            JOIN entitlement_profiles ep ON ep.id = ei.entitlement_profile_id
+           WHERE seller.id = ep.vendor_id
+             AND ei.id = $1`,
+          [entitlementId, input.amount]
+        )
+      }
+      // original_payment: register routing decision + emit audit. No Stripe
+      // refund.create call (OOS v1.8.0 — Story 1.8 manual + webhook consume;
+      // automation named_retry_slot: v1.10.0+).
+
+      const payload: RefundAppliedPayload = {
+        entitlement_id: entitlementId,
+        refund_id: input.refund_id,
+        applied_at: appliedAt,
+        currency: input.currency,
+        refunded_amount_minor: input.amount,
+        refund_channel: refundChannel,
+        ...(row.order_id ? { order_id: row.order_id } : {}),
+      }
+
+      // Persist event record for idempotency tracking.
+      await (client as Queryable).query(
+        `INSERT INTO voucher_event
+           (id, voucher_code, entitlement_id, event_type, payload, occurred_at, created_at)
+         VALUES ($1, NULL, $2, $3, $4::jsonb, $5, NOW())`,
+        [
+          randomUUID(),
+          entitlementId,
+          ENTITLEMENT_REFUND_APPLIED_EVENT,
+          JSON.stringify(payload),
+          now,
+        ]
+      )
+
+      envelope = {
+        schema_version: "1",
+        event_type: ENTITLEMENT_REFUND_APPLIED_EVENT,
+        occurred_at: appliedAt,
+        actor,
+        idempotency_key: idempotencyKey,
+        // F-01 fix: use actual entitlement instance ID, not hardcoded "gp-dev".
+        scope: { instance_id: entitlementId },
+        payload,
+      }
+
+      await client.query("COMMIT")
+      committed = true
+
+      await this.emitRefundApplied(envelope)
+
+      return {
+        entitlement_id: entitlementId,
+        refund_id: input.refund_id,
+        refund_channel: refundChannel,
+        amount: input.amount,
+        currency: input.currency,
+        idempotent: false,
+        event: envelope,
       }
     } catch (err) {
       if (!committed) {

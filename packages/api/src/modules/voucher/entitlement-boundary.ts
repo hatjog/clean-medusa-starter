@@ -17,7 +17,7 @@
  * _grow/VALIDATORS.md.
  */
 
-import { EntitlementType } from "./models/entitlement"
+import { EntitlementPolicySnapshot, EntitlementType } from "./models/entitlement"
 
 /** Allowed `policy.no_show.policy` values (platform-wide enum). */
 export const NO_SHOW_POLICIES = [
@@ -25,14 +25,36 @@ export const NO_SHOW_POLICIES = [
   "charge_partial",
   "no_charge",
   "forfeit_voucher",
+  "vendor_decision", // additive — Story 2.7 / FR1.17; vendor-decision resolution UI v1.9.0+
 ] as const
 export type NoShowPolicy = (typeof NO_SHOW_POLICIES)[number]
 
-/** Allowed `policy.refund_channel` values (platform-wide enum). */
+/**
+ * Allowed `policy.transferability` values (platform-wide enum, BE-5 / FR1.16).
+ *
+ * Single-source note: the Python governance gate
+ * `_grow/tools/validate_entitlement_profiles.py` carries its OWN copy
+ * (`TRANSFERABILITY_VALUES`) so it can validate the fixture/config corpus
+ * without a submodule checkout. The two copies MUST stay in sync.
+ */
+export const TRANSFERABILITY_VALUES = [
+  "bearer",
+  "personalized",
+  "hybrid",
+] as const
+export type Transferability = (typeof TRANSFERABILITY_VALUES)[number]
+
+/**
+ * Allowed `policy.refund_channel` values (platform-wide enum).
+ *
+ * Single-source note: `_grow/tools/validate_entitlement_profiles.py`
+ * carries a synced governance copy (REFUND_CHANNELS tuple). Both
+ * declarations MUST be updated together. Drift requires an ADR per ADR-099.
+ */
 export const REFUND_CHANNELS = [
   "original_payment",
   "store_credit",
-  "bank_transfer",
+  "vendor_wallet",
 ] as const
 export type RefundChannel = (typeof REFUND_CHANNELS)[number]
 
@@ -65,10 +87,8 @@ export const ENTITLEMENT_BOUNDARY = {
       charge_pct_min: 0,
       charge_pct_max: 100,
     },
-    transferability: {
-      /** max_transfers must be a non-negative integer. */
-      max_transfers_min: 0,
-    },
+    /** Allowed transferability enum values (BE-5 / FR1.16). */
+    transferability: TRANSFERABILITY_VALUES,
     /** Allowed refund channel enum values. */
     refund_channel: REFUND_CHANNELS,
   },
@@ -207,19 +227,15 @@ export function checkPolicyAgainstBoundary(
     }
   }
 
-  const transfer = policy.transferability as
-    | Record<string, unknown>
-    | undefined
-  if (transfer) {
-    const maxT = num(transfer.max_transfers)
+  if (policy.transferability !== undefined) {
     if (
-      maxT !== undefined &&
-      (maxT < B.policy.transferability.max_transfers_min ||
-        !Number.isInteger(maxT))
+      !(TRANSFERABILITY_VALUES as readonly string[]).includes(
+        policy.transferability as string
+      )
     ) {
       v.push({
-        field: "policy.transferability.max_transfers",
-        message: `transferability.max_transfers ${maxT} must be a non-negative integer`,
+        field: "policy.transferability",
+        message: `transferability '${String(policy.transferability)}' not in [${TRANSFERABILITY_VALUES.join(", ")}]`,
       })
     }
   }
@@ -238,4 +254,117 @@ export function checkPolicyAgainstBoundary(
   }
 
   return v
+}
+
+// ---------------------------------------------------------------------------
+// BE-5 — Transferability guard (AC4 / FR1.16)
+// ---------------------------------------------------------------------------
+
+/**
+ * Redeem context supplied to {@link assertTransferabilityAllowed}.
+ *
+ * `customer_id` is the identity of the party attempting to redeem the
+ * entitlement. May be `null`/`undefined` for anonymous (bearer) flows.
+ *
+ * `recipient_customer_id` is the identity bound to the instance at ISSUED
+ * time (FR1.22 issuance scope). May be `null`/`undefined` when no recipient
+ * binding exists (e.g. bearer issuance, or pre-FR1.22 authored rows).
+ */
+export interface RedeemContext {
+  customer_id?: string | null
+  recipient_customer_id?: string | null
+}
+
+/**
+ * Raised when a `personalized` transferability check fails — the redeeming
+ * party's identity does not match the bound recipient. Sentry-capturable;
+ * fail-loud (never silent-pass). Follows the {@link EntitlementTransitionError}
+ * pattern from Story 2.1.
+ */
+export class TransferabilityError extends Error {
+  readonly transferability: Transferability
+  readonly redeemCustomerId: string | null
+  readonly recipientCustomerId: string | null
+
+  constructor(
+    transferability: Transferability,
+    redeemCustomerId: string | null,
+    recipientCustomerId: string | null
+  ) {
+    super(
+      `Transferability check failed (policy=${transferability}): ` +
+        `redeeming customer_id '${redeemCustomerId ?? "none"}' does not match ` +
+        `recipient customer_id '${recipientCustomerId ?? "none"}'`
+    )
+    this.name = "TransferabilityError"
+    this.transferability = transferability
+    this.redeemCustomerId = redeemCustomerId
+    this.recipientCustomerId = recipientCustomerId
+  }
+}
+
+/**
+ * Pure transferability guard for the redemption path (AC4 / FR1.16).
+ *
+ * Reads `policy_snapshot.transferability` — NEVER the live profile (immutability
+ * post-ISSUED, regulamin § 12). Caller must supply the snapshot captured at
+ * ISSUED time and the redeem context.
+ *
+ * Semantics:
+ *   `bearer`      — no identity check; anonymous redeem OK (no-op).
+ *   `personalized`— redeeming customer_id MUST equal recipient customer_id;
+ *                   mismatch or absent identity → throws {@link TransferabilityError}.
+ *   `hybrid`      — identity check optional; when known and mismatched → allow
+ *                   with soft log (NOT throw); caller receives soft-flag via
+ *                   return value.
+ *
+ * Returns `{ softFlag: true }` when a `hybrid` mismatch was detected (caller
+ * may log/audit). Returns `{ softFlag: false }` in all other allowed cases.
+ *
+ * Authored-vs-applied posture (Story 2.2 M5 precedent): a live redeem
+ * entry-point does not yet exist in v1.8.0. This guard is delivered as a
+ * tested pure function; wiring happens when the issuance/redeem story lands
+ * (tracked dependency — FR1.22 joint Story 1.3 / downstream issuance story).
+ */
+export function assertTransferabilityAllowed(
+  policySnapshot: EntitlementPolicySnapshot,
+  redeemContext: RedeemContext
+): { softFlag: boolean } {
+  const raw = (policySnapshot as Record<string, unknown>).transferability
+  const transferability = (raw ?? "bearer") as Transferability
+
+  if (
+    transferability !== "bearer" &&
+    transferability !== "personalized" &&
+    transferability !== "hybrid"
+  ) {
+    // Data-integrity guard: the snapshot carries an unrecognised enum value.
+    // This is a policy-data defect (not an identity-check failure), so we throw
+    // a plain Error with the actual offending value rather than misusing
+    // TransferabilityError (which is reserved for identity-check rejections).
+    throw new Error(
+      `assertTransferabilityAllowed: invalid transferability enum '${String(raw)}' ` +
+        `in policy_snapshot — expected one of [${TRANSFERABILITY_VALUES.join(", ")}]`
+    )
+  }
+
+  if (transferability === "bearer") {
+    return { softFlag: false }
+  }
+
+  const redeemId = redeemContext.customer_id ?? null
+  const recipientId = redeemContext.recipient_customer_id ?? null
+
+  if (transferability === "personalized") {
+    if (!redeemId || redeemId !== recipientId) {
+      throw new TransferabilityError(transferability, redeemId, recipientId)
+    }
+    return { softFlag: false }
+  }
+
+  // hybrid: allow; flag mismatch softly when both IDs are known and differ
+  if (redeemId && recipientId && redeemId !== recipientId) {
+    return { softFlag: true }
+  }
+  return { softFlag: false }
 }
