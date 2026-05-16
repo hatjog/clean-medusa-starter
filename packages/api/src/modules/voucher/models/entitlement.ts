@@ -113,6 +113,8 @@ export enum EntitlementInstanceState {
   REFUND_REQUESTED = "REFUND_REQUESTED",
   REFUNDED = "REFUNDED",
   DISPUTED = "DISPUTED",
+  // --- Story 2.7 BE-6: vendor-decision no-show holding state ---
+  PENDING_VENDOR_DECISION = "PENDING_VENDOR_DECISION",
 }
 
 /** All instance states (DB CHECK constraint source-of-truth). */
@@ -130,6 +132,7 @@ export const ALL_ENTITLEMENT_INSTANCE_STATES: readonly EntitlementInstanceState[
     EntitlementInstanceState.REFUND_REQUESTED,
     EntitlementInstanceState.REFUNDED,
     EntitlementInstanceState.DISPUTED,
+    EntitlementInstanceState.PENDING_VENDOR_DECISION,
   ]
 
 /** Terminal states — no outbound transitions. */
@@ -159,6 +162,7 @@ export const ALLOWED_ENTITLEMENT_TRANSITIONS: Readonly<
     EntitlementInstanceState.VOIDED,
     EntitlementInstanceState.REFUND_REQUESTED,
     EntitlementInstanceState.DISPUTED,
+    EntitlementInstanceState.PENDING_VENDOR_DECISION, // BE-6 vendor_decision no-show
   ],
   [EntitlementInstanceState.REDEMPTION_REQUESTED]: [
     EntitlementInstanceState.REDEEMED_PARTIAL,
@@ -166,6 +170,7 @@ export const ALLOWED_ENTITLEMENT_TRANSITIONS: Readonly<
     EntitlementInstanceState.ACTIVE, // redemption request withdrawn
     EntitlementInstanceState.DISPUTED,
     EntitlementInstanceState.VOIDED,
+    EntitlementInstanceState.PENDING_VENDOR_DECISION, // BE-6 vendor_decision no-show
   ],
   [EntitlementInstanceState.REDEEMED_PARTIAL]: [
     EntitlementInstanceState.REDEMPTION_REQUESTED, // further redemption
@@ -201,6 +206,13 @@ export const ALLOWED_ENTITLEMENT_TRANSITIONS: Readonly<
     EntitlementInstanceState.REFUNDED,
     EntitlementInstanceState.CLOSED,
     EntitlementInstanceState.VOIDED,
+  ],
+  // BE-6 Story 2.7: vendor-decision holding state — full resolution UI is v1.9.0+
+  [EntitlementInstanceState.PENDING_VENDOR_DECISION]: [
+    EntitlementInstanceState.VOIDED,        // vendor confirms forfeiture
+    EntitlementInstanceState.ACTIVE,        // vendor waives no-show
+    EntitlementInstanceState.REDEEMED_PARTIAL, // vendor allows partial redemption
+    EntitlementInstanceState.REDEEMED_FULL,    // vendor allows full redemption
   ],
 }
 
@@ -382,6 +394,13 @@ export interface EntitlementInstanceRow {
   expires_at: Date | null
   /** Count of free extensions used; BE-1 allows max one unpaid extension. */
   unpaid_extension_count: number
+  /**
+   * Remaining value in minor currency units. Null until migration applied.
+   * Set at ISSUED time from the voucher face value; reduced on partial fees
+   * (BE-6 charge_partial / charge_full) and partial redemptions. Clamped >= 0.
+   * Source: architecture.md D-V180-ARCH-6 (ADR-099 4-layer) — BE-6 no-show partial fee.
+   */
+  remaining_amount: number | null
   created_at: Date
   updated_at: Date
 }

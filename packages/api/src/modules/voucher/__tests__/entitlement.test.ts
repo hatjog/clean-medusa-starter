@@ -268,7 +268,7 @@ describe("Layer 2 — entitlement_boundary", () => {
   })
 
   it("passes the BonBeauty MVP profile policies (within boundary)", () => {
-    // voucher-kwotowy-365d
+    // voucher-kwotowy-365d (BE-5 Story 2.6: transferability is now enum string)
     expect(
       checkPolicyAgainstBoundary({
         validity_months: 12,
@@ -280,7 +280,7 @@ describe("Layer 2 — entitlement_boundary", () => {
         },
         cancellation: { enabled: true, cutoff_hours: 24, refund_pct: 100 },
         no_show: { policy: "charge_full", charge_pct: 100 },
-        transferability: { transferable: true, max_transfers: 1 },
+        transferability: "bearer",
         refund_channel: "original_payment",
       })
     ).toEqual([])
@@ -296,7 +296,7 @@ describe("Layer 2 — entitlement_boundary", () => {
         },
         cancellation: { enabled: true, cutoff_hours: 24, refund_pct: 100 },
         no_show: { policy: "forfeit_voucher", charge_pct: 0 },
-        transferability: { transferable: true, max_transfers: 1 },
+        transferability: "bearer",
         refund_channel: "store_credit",
       })
     ).toEqual([])
@@ -313,7 +313,7 @@ describe("Layer 2 — entitlement_boundary", () => {
       }, // > 15
       cancellation: { enabled: true, cutoff_hours: 6, refund_pct: 150 }, // < 12, > 100
       no_show: { policy: "charge_double" }, // not in enum
-      transferability: { transferable: true, max_transfers: -1 }, // < 0
+      transferability: "invalid_value", // not in enum (BE-5 Story 2.6)
       refund_channel: "crypto", // not in enum
     })
     const fields = v.map((x) => x.field).sort()
@@ -324,7 +324,7 @@ describe("Layer 2 — entitlement_boundary", () => {
         "policy.extension.fee_pct",
         "policy.no_show.policy",
         "policy.refund_channel",
-        "policy.transferability.max_transfers",
+        "policy.transferability",
         "policy.validity_months",
       ].sort()
     )
