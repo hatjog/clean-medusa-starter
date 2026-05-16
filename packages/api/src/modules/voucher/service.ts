@@ -29,6 +29,35 @@ import {
 } from "./models/entitlement"
 import { ENTITLEMENT_BOUNDARY, validityMonthsMax } from "./entitlement-boundary"
 
+export const ENTITLEMENT_NO_SHOW_EVENT_TYPE =
+  "gp.entitlements.entitlement_no_show.v1"
+
+/** Canonical outcome vocabulary for the no-show event payload (epics FR1.17). */
+export type NoShowOutcome =
+  | "forfeiture"
+  | "partial_fee"
+  | "no_charge"
+  | "vendor_decision"
+  | "charge_full"
+
+export interface MarkNoShowInput {
+  reason: string
+  actor?: string
+  base_amount?: number
+}
+
+export interface MarkNoShowResult {
+  entitlement_id: string
+  outcome: NoShowOutcome
+  no_show_policy: string
+  resulting_state: EntitlementInstanceState
+  fee_amount?: number
+  charge_pct?: number
+  base_amount?: number
+  remaining_amount?: number
+  marked_at: string
+}
+
 type VoucherModuleOptions = {
   databaseUrl?: string
 }
@@ -219,6 +248,8 @@ export class VoucherService {
       policy_snapshot: this.toPolicySnapshot(row.policy_snapshot),
       expires_at: this.toDate(row.expires_at as string | Date | null),
       unpaid_extension_count: Number(row.unpaid_extension_count ?? 0),
+      remaining_amount:
+        row.remaining_amount != null ? Number(row.remaining_amount) : null,
       created_at: new Date(row.created_at as string | Date),
       updated_at: new Date(row.updated_at as string | Date),
     }
@@ -474,6 +505,200 @@ export class VoucherService {
       return updated
     } catch (err) {
       await client.query("ROLLBACK")
+      throw err
+    } finally {
+      client.release()
+    }
+  }
+
+  private async emitEntitlementNoShow(
+    client: PoolClient,
+    payload: Record<string, unknown>
+  ): Promise<void> {
+    await client.query(
+      `INSERT INTO voucher_event (id, voucher_code, entitlement_id, event_type, payload, occurred_at, created_at)
+       VALUES ($1, NULL, $2, $3, $4::jsonb, NOW(), NOW())`,
+      [
+        randomUUID(),
+        payload.entitlement_id,
+        ENTITLEMENT_NO_SHOW_EVENT_TYPE,
+        payload,
+      ]
+    )
+  }
+
+  /**
+   * Mark a no-show on an entitlement instance. Reads policy from
+   * `policy_snapshot.no_show` (immutable post-ISSUED, regulamin § 12 — NOT
+   * the live profile). Dispatches deterministic outcomes per policy value.
+   *
+   * Service method (not workflow): synchronous single-module operation, no
+   * external side-effects (no Stripe charge — internal credit deduction only).
+   * Idempotent: repeated call on already-no-show state is a no-op.
+   */
+  async mark_no_show(
+    entitlement_id: string,
+    input: MarkNoShowInput
+  ): Promise<MarkNoShowResult> {
+    const client = await this.getPool().connect()
+    let committed = false
+
+    try {
+      await client.query("BEGIN")
+
+      const lockRes = await client.query<Record<string, unknown>>(
+        `SELECT * FROM entitlement_instance WHERE id = $1 FOR UPDATE`,
+        [entitlement_id]
+      )
+      if (lockRes.rows.length === 0) {
+        throw new Error(
+          `VoucherService.mark_no_show: entitlement not found ${entitlement_id}`
+        )
+      }
+
+      const current = this.rowToEntitlementInstance(lockRes.rows[0])
+
+      // Idempotency: if already in a terminal no-show outcome state, return early
+      const noShowTerminalStates: ReadonlySet<EntitlementInstanceState> =
+        new Set([
+          EntitlementInstanceState.VOIDED,
+          EntitlementInstanceState.PENDING_VENDOR_DECISION,
+        ])
+      if (noShowTerminalStates.has(current.state)) {
+        await client.query("ROLLBACK")
+        committed = true
+        return {
+          entitlement_id,
+          outcome: current.state === EntitlementInstanceState.PENDING_VENDOR_DECISION
+            ? "vendor_decision"
+            : "forfeiture",
+          no_show_policy: "idempotent_skip",
+          resulting_state: current.state,
+          marked_at: new Date().toISOString(),
+        }
+      }
+
+      // Read policy from immutable snapshot (NOT live profile — regulamin § 12)
+      const snapshot = current.policy_snapshot as Record<string, unknown>
+      const noShowSnapshot = (snapshot.no_show ?? {}) as Record<string, unknown>
+      const policyValue = (noShowSnapshot.policy as string | undefined) ?? "no_charge"
+      const snapshotChargePct =
+        typeof noShowSnapshot.charge_pct === "number"
+          ? (noShowSnapshot.charge_pct as number)
+          : 0
+
+      const markedAt = new Date().toISOString()
+      let newState: EntitlementInstanceState
+      let outcome: NoShowOutcome
+      let feeAmount: number | undefined
+      let newRemainingAmount: number | undefined
+      const baseAmount = input.base_amount ?? current.remaining_amount ?? 0
+
+      switch (policyValue) {
+        case "forfeit_voucher": {
+          assertTransition(current.state, EntitlementInstanceState.VOIDED)
+          newState = EntitlementInstanceState.VOIDED
+          outcome = "forfeiture"
+          await client.query(
+            `UPDATE entitlement_instance SET state = $2, updated_at = NOW() WHERE id = $1`,
+            [entitlement_id, newState]
+          )
+          break
+        }
+        case "charge_partial": {
+          // fee = round(base_amount * charge_pct / 100); remaining preserved (clamp >= 0)
+          const pct = snapshotChargePct
+          feeAmount = Math.round((baseAmount * pct) / 100)
+          const currentRemaining = current.remaining_amount ?? baseAmount
+          newRemainingAmount = Math.max(0, currentRemaining - feeAmount)
+          newState = current.state // state stays (voucher still usable)
+          outcome = "partial_fee"
+          await client.query(
+            `UPDATE entitlement_instance SET remaining_amount = $2, updated_at = NOW() WHERE id = $1`,
+            [entitlement_id, newRemainingAmount]
+          )
+          break
+        }
+        case "charge_full": {
+          // charge 100% — voucher consumed; semantics: VOIDED (no residual value)
+          feeAmount = baseAmount
+          newRemainingAmount = 0
+          newState = EntitlementInstanceState.VOIDED
+          assertTransition(current.state, EntitlementInstanceState.VOIDED)
+          outcome = "charge_full"
+          await client.query(
+            `UPDATE entitlement_instance
+             SET state = $2, remaining_amount = 0, updated_at = NOW()
+             WHERE id = $1`,
+            [entitlement_id, newState]
+          )
+          break
+        }
+        case "no_charge": {
+          // No penalty; entitlement remains usable (state unchanged)
+          newState = current.state
+          outcome = "no_charge"
+          // no DB state change — just emit audit event
+          break
+        }
+        case "vendor_decision": {
+          assertTransition(current.state, EntitlementInstanceState.PENDING_VENDOR_DECISION)
+          newState = EntitlementInstanceState.PENDING_VENDOR_DECISION
+          outcome = "vendor_decision"
+          await client.query(
+            `UPDATE entitlement_instance SET state = $2, updated_at = NOW() WHERE id = $1`,
+            [entitlement_id, newState]
+          )
+          break
+        }
+        default: {
+          // Unknown policy value — fail loud (architecture fail-loud pattern)
+          throw new Error(
+            `VoucherService.mark_no_show: unknown no_show policy '${policyValue}' on instance ${entitlement_id}`
+          )
+        }
+      }
+
+      // Emit audit event AFTER state mutation (HG-4 backwards compat)
+      const eventPayload: Record<string, unknown> = {
+        entitlement_id,
+        outcome,
+        no_show_policy: policyValue,
+        reason: input.reason,
+        marked_at: markedAt,
+        resulting_state: newState,
+        ...(feeAmount !== undefined ? { fee_amount: feeAmount } : {}),
+        ...(snapshotChargePct && policyValue !== "no_charge"
+          ? { charge_pct: snapshotChargePct }
+          : {}),
+        ...(baseAmount > 0 ? { base_amount: baseAmount } : {}),
+        ...(newRemainingAmount !== undefined
+          ? { remaining_amount: newRemainingAmount }
+          : {}),
+        ...(input.actor ? { admin_user_id: input.actor } : {}),
+      }
+      await this.emitEntitlementNoShow(client, eventPayload)
+
+      await client.query("COMMIT")
+      committed = true
+
+      return {
+        entitlement_id,
+        outcome,
+        no_show_policy: policyValue,
+        resulting_state: newState,
+        ...(feeAmount !== undefined ? { fee_amount: feeAmount } : {}),
+        ...(snapshotChargePct ? { charge_pct: snapshotChargePct } : {}),
+        ...(baseAmount > 0 ? { base_amount: baseAmount } : {}),
+        ...(newRemainingAmount !== undefined
+          ? { remaining_amount: newRemainingAmount }
+          : {}),
+        marked_at: markedAt,
+      }
+    } catch (err) {
+      if (!committed) {
+        await client.query("ROLLBACK")
+      }
       throw err
     } finally {
       client.release()

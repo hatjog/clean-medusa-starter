@@ -25,6 +25,7 @@ export const NO_SHOW_POLICIES = [
   "charge_partial",
   "no_charge",
   "forfeit_voucher",
+  "vendor_decision", // additive — Story 2.7 / FR1.17; vendor-decision resolution UI v1.9.0+
 ] as const
 export type NoShowPolicy = (typeof NO_SHOW_POLICIES)[number]
 
