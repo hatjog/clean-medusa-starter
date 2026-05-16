@@ -18,12 +18,16 @@ export const VOUCHER_MODULE = "voucher"
 export { VoucherService }
 export {
   ENTITLEMENT_EXTENDED_EVENT,
+  ENTITLEMENT_NO_SHOW_EVENT_TYPE,
   EntitlementExtensionError,
 } from "./service"
 export type {
   ExtendEntitlementInput,
   ExtendEntitlementResult,
   EntitlementExtendedEnvelope,
+  MarkNoShowInput,
+  MarkNoShowResult,
+  NoShowOutcome,
 } from "./service"
 
 export type {
