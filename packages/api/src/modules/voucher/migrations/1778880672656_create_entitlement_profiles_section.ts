@@ -41,6 +41,7 @@ export class Migration1778880672656 extends Migration {
                                   'SUBSCRIPTION_B2B','BUNDLE')),
         -- Nullable until Epic 1 Story 1.3 FR1.22 wires live issue post-payment.
         order_id                text NULL,
+        market_id               text NULL,
         -- Layer 4 state machine. Default ISSUED (snapshot taken at issue).
         state                   text NOT NULL DEFAULT 'ISSUED' CHECK (state IN (
                                   'ISSUED','ACTIVE','REDEMPTION_REQUESTED',
@@ -49,6 +50,9 @@ export class Migration1778880672656 extends Migration {
                                   'REFUNDED','DISPUTED')),
         -- Immutable policy block snapshotted at ISSUED (regulamin § 12).
         policy_snapshot         jsonb NOT NULL,
+        -- Story 2.7 BE-6: remaining value in minor units; nullable for legacy
+        -- rows and non-amount entitlements.
+        remaining_amount        integer NULL CHECK (remaining_amount IS NULL OR remaining_amount >= 0),
         created_at              timestamptz NOT NULL DEFAULT now(),
         updated_at              timestamptz NOT NULL DEFAULT now()
       )

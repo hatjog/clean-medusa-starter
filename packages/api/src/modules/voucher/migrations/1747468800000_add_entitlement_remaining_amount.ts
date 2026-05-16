@@ -13,7 +13,7 @@ import { Migration } from "@medusajs/framework/mikro-orm/migrations"
 export class Migration1747468800000AddEntitlementRemainingAmount extends Migration {
   async up(): Promise<void> {
     this.addSql(`
-      ALTER TABLE entitlement_instance
+      ALTER TABLE IF EXISTS entitlement_instance
         ADD COLUMN IF NOT EXISTS remaining_amount integer NULL
           CHECK (remaining_amount IS NULL OR remaining_amount >= 0)
     `)
@@ -21,7 +21,7 @@ export class Migration1747468800000AddEntitlementRemainingAmount extends Migrati
 
   async down(): Promise<void> {
     this.addSql(`
-      ALTER TABLE entitlement_instance
+      ALTER TABLE IF EXISTS entitlement_instance
         DROP COLUMN IF EXISTS remaining_amount
     `)
   }

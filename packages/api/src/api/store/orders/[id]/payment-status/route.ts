@@ -44,7 +44,7 @@
  *
  * @see GP/storefront/src/app/api/v1/orders/[id]/payment-status/route.ts (consumer proxy)
  * @see specs/contracts/governance/examples/lifecycle-state-machine.v1.example.json
- * @see GP/backend/packages/api/src/api/webhooks/stripe/route.ts (inbound webhook handler)
+ * @see GP/backend/packages/api/src/subscribers/stripe-payment-audit.ts (Path Y payment audit)
  */
 
 import { randomBytes } from "crypto"
@@ -201,7 +201,7 @@ export async function GET(
     // Reconciliation poke: if still pending and order is stale, log signal.
     // This GET endpoint NEVER mutates state — poke is logging only.
     // Actual reconciliation is driven by Medusa's payment module retry job
-    // or the Stripe webhook handler (webhooks/stripe/route.ts).
+    // or the Path Y Stripe payment audit subscriber.
     //
     // Anchor: order.created_at (immutable) — represents the moment the order
     // was placed. Using created_at avoids false clock resets from unrelated

@@ -35,7 +35,6 @@
  *
  * @see specs/operator/brevo-webhook-runbook.md (operator deployment guide)
  * @see _grow/tools/validate_provider_callback_security.py (Story 7.9 validator framework)
- * @see GP/backend/packages/api/src/api/webhooks/stripe/route.ts (sibling pattern)
  */
 
 import { timingSafeEqual } from "crypto"
