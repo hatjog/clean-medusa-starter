@@ -14,15 +14,13 @@ import {
   RETENTION_AMOUNT_PCT_MIN,
   isRetentionAmountWithinBoundary,
 } from "../entitlement-boundary"
+// Import sentinel from reissue-lost-code (single source — F-02 fix).
+// Also re-exported so callers that resolve via issue-retention get the same value.
+import { GP_PLATFORM_SCOPE_SENTINEL } from "./reissue-lost-code"
+export { GP_PLATFORM_SCOPE_SENTINEL } from "./reissue-lost-code"
 
 export const ENTITLEMENT_RETENTION_ISSUED_EVENT_TYPE =
   "gp.entitlements.entitlement_retention_issued.v1" as const
-
-/**
- * Sentinel scope.market_id used when no market context is available for a
- * platform-level admin operation (mirrors reissue-lost-code pattern L1).
- */
-export const GP_PLATFORM_SCOPE_SENTINEL = "platform" as const
 
 export type RetentionEventEnvelope = {
   schema_version: "1"
@@ -64,6 +62,9 @@ export type RetentionEntitlement = {
   expires_at?: Date | null
   market_id?: string | null
   sales_channel_id?: string | null
+  // Optional — absent from v1.8.0 DDL; populated when column exists for
+  // idempotent amount recovery (F-01 fix).
+  amount?: number | null
 }
 
 export type IssueRetentionInput = {
@@ -178,12 +179,19 @@ export class IssueRetentionWorkflow {
       // Idempotency: if retention successor already exists, return it without mutation.
       const existing = await tx.getEntitlement(retentionCode)
       if (existing) {
+        // F-01 fix: prefer the stored amount from the existing row when available
+        // (requires `amount` column in DDL — v1.8.0 DDL absent so falls back to
+        // input.amount). This prevents returning a misleading new request amount
+        // on idempotent retries. When amount column is absent, input.amount is
+        // returned as the best available approximation; documented in Completion Notes.
+        const resolvedAmount =
+          existing.amount != null ? existing.amount : input.amount
         return {
           result: buildResult({
             old,
             next: existing,
             retentionCode,
-            amount: input.amount,
+            amount: resolvedAmount,
             reason,
             reason_code: input.reason_code,
             retention_voucher_template_id:
@@ -246,6 +254,10 @@ export class IssueRetentionWorkflow {
         // copy expires_at from source as the safest fallback (prevents zero TTL).
         issued_at: now,
         expires_at: old.expires_at ?? null,
+        // amount: stored when column exists (F-01 fix — idempotent recovery).
+        // In v1.8.0 DDL the column is absent; Postgres store writes it only
+        // when OPTIONAL_RETENTION_COLUMNS detection finds the column present.
+        amount: input.amount,
       }
       await tx.createRetentionEntitlement(next)
 
@@ -436,6 +448,16 @@ const OPTIONAL_RETENTION_COLUMNS = [
   "expires_at",
   "market_id",
   "sales_channel_id",
+  // `metadata` column: absent in v1.8.0 DDL (DDL drift — Debug Log 2026-05-16).
+  // Added here so AC3 priority (b) [metadata.retention_voucher_template_id] fires
+  // automatically when the column is present in a future DDL migration. When absent
+  // (current state), resolveMetadataTemplateId(null) returns null and the verbatim
+  // snapshot fallback is used — consistent with Completion Notes item 3. F-03 fix.
+  "metadata",
+  // `amount` column: absent in v1.8.0 DDL (DDL drift). Added for forward-compatibility
+  // so the idempotent path can recover the originally committed amount when the column
+  // is added in a future migration (F-01 fix). In v1.8.0 this is a no-op.
+  "amount",
 ] as const
 
 class PostgresIssueRetentionTx implements IssueRetentionTx {
@@ -538,7 +560,13 @@ class PostgresIssueRetentionTx implements IssueRetentionTx {
       policy_snapshot: snapshotPolicy(
         row.policy_snapshot as Record<string, unknown>
       ),
-      metadata: null, // not in base DDL; metadata column not present in v1.8.0
+      // metadata: optional column (not in v1.8.0 DDL); populated when present so
+      // AC3 priority (b) [metadata.retention_voucher_template_id] fires for future
+      // DDL that includes the column. Falls back to null when absent (F-03 fix).
+      metadata:
+        row.metadata != null
+          ? (row.metadata as Record<string, unknown>)
+          : null,
       created_at: new Date(row.created_at as Date | string),
       updated_at: new Date(row.updated_at as Date | string),
       issued_at:
@@ -549,6 +577,12 @@ class PostgresIssueRetentionTx implements IssueRetentionTx {
           : new Date(row.expires_at as Date | string),
       market_id: (row.market_id ?? null) as string | null,
       sales_channel_id: (row.sales_channel_id ?? null) as string | null,
+      // amount: optional column (absent in v1.8.0 DDL); read when present so
+      // idempotent retries can return the originally committed amount (F-01 fix).
+      amount:
+        typeof row.amount === "number" && Number.isFinite(row.amount)
+          ? row.amount
+          : null,
     }
   }
 
@@ -643,9 +677,13 @@ class InMemoryIssueRetentionTx implements IssueRetentionTx {
   }
 
   async createRetentionEntitlement(row: RetentionEntitlement): Promise<void> {
-    if (!this.rows.has(row.id)) {
-      this.rows.set(row.id, cloneEntitlement(row))
+    // F-04 fix: throw on duplicate to mirror Postgres rowCount==1 guard.
+    if (this.rows.has(row.id)) {
+      throw new Error(
+        `createRetentionEntitlement: duplicate id ${row.id} — mirrors Postgres unique constraint`
+      )
     }
+    this.rows.set(row.id, cloneEntitlement(row))
   }
 }
 
@@ -659,6 +697,8 @@ function cloneEntitlement(row: RetentionEntitlement): RetentionEntitlement {
     updated_at: new Date(row.updated_at),
     issued_at: row.issued_at ? new Date(row.issued_at) : row.issued_at,
     expires_at: row.expires_at ? new Date(row.expires_at) : row.expires_at,
+    // amount is a scalar — spread (...row) already covers it; kept explicit for clarity.
+    amount: row.amount ?? null,
   }
 }
 
