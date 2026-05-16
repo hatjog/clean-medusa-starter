@@ -23,7 +23,6 @@ import {
   EntitlementInstanceState,
   EntitlementTransitionError,
   EntitlementType,
-  assertPolicySnapshotImmutable,
   assertTransition,
   type EntitlementInstanceRow,
   type EntitlementPolicySnapshot,
@@ -441,11 +440,11 @@ export class VoucherService {
           `VoucherService.cancel_booking: entitlement ${entitlement_id} is not VOUCHER_SERVICE`
         )
       }
-      assertPolicySnapshotImmutable(
-        previousState,
-        current.policy_snapshot,
-        current.policy_snapshot
-      )
+      // policy_snapshot is never written by cancel_booking — the invariant is
+      // guaranteed structurally (no SET policy_snapshot in the UPDATE below).
+      // assertPolicySnapshotImmutable is NOT called here because passing the
+      // same reference as both issued and candidate makes it a no-op; the AC3
+      // deep-equal test covers the invariant instead.
 
       const updateRes = await client.query<Record<string, unknown>>(
         `UPDATE entitlement_instance

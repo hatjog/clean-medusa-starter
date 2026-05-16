@@ -504,7 +504,6 @@ describe("VoucherService", () => {
     it("supports rebook lifecycle: request → cancel → request → redeem while preserving TTL", async () => {
       const expiresAt = ENTITLEMENT_REBOOK_ROW.expires_at
       const policySnapshot = structuredClone(ENTITLEMENT_REBOOK_ROW.policy_snapshot)
-      const audit: string[] = []
       let instance: EntitlementTestRow = {
         ...ENTITLEMENT_REBOOK_ROW,
         state: EntitlementInstanceState.ACTIVE,
@@ -535,8 +534,12 @@ describe("VoucherService", () => {
         state: EntitlementInstanceState.ACTIVE,
         booking_pointer: null,
       }
+      // M2 fix: capture real client queries so we can verify the INSERT INTO
+      // voucher_event for ENTITLEMENT_BOOKING_CANCELLED fires exactly once,
+      // not via a self-pushed local array (which was tautological).
+      const capturedLifecycleQueries: Array<{ sql: string; params: unknown[] }> = []
       const pool = makeMockPool({
-        captureClientQueries: [],
+        captureClientQueries: capturedLifecycleQueries,
         clientQueryResponses: [
           { rows: [] },
           { rows: [instance] },
@@ -551,19 +554,26 @@ describe("VoucherService", () => {
         ...instance,
         ...(await svc.cancel_booking("ent_service_rebook_001")),
       }
-      audit.push("ENTITLEMENT_BOOKING_CANCELLED")
 
       expect(instance.state).toBe(EntitlementInstanceState.ACTIVE)
       expect(instance.booking_pointer).toBeNull()
       expect(instance.expires_at).toBe(expiresAt)
       expect(instance.policy_snapshot).toEqual(policySnapshot)
 
+      // AC6: verify ENTITLEMENT_BOOKING_CANCELLED was actually inserted into
+      // voucher_event exactly once (not just asserted via a hand-pushed array).
+      const cancelledEventInserts = capturedLifecycleQueries.filter(
+        (q) =>
+          q.sql.includes("INSERT INTO voucher_event") &&
+          q.params[2] === "ENTITLEMENT_BOOKING_CANCELLED"
+      )
+      expect(cancelledEventInserts).toHaveLength(1)
+
       requestRedemption("booking_second")
       redeem()
 
       expect(instance.state).toBe(EntitlementInstanceState.REDEEMED_FULL)
       expect(instance.expires_at).toBe(expiresAt)
-      expect(audit.filter((e) => e === "ENTITLEMENT_BOOKING_CANCELLED")).toHaveLength(1)
     })
   })
 })
