@@ -81,10 +81,10 @@ export async function resolveInsightSnapshots(
    *   product_category         — id, name
    *   product_category_product — product_id, category_id
    *   product_variant          — id, product_id, calculated_price
-   *   seller_product           — seller_id, product_id
+   *   product_product_seller_seller — seller_id, product_id
    *
-   * We join through seller_product to get vendor_id (Mercur seller id maps
-   * 1:1 to GP vendor_id per ADR-025 / resolveVendorId contract).
+   * We join through product_product_seller_seller to get vendor_id (Mercur
+   * seller id maps 1:1 to GP vendor_id per ADR-025 / resolveVendorId contract).
    *
    * Note: product_category_product is a junction table; when a product has no
    * category assigned it is excluded from the result (no category_id available
@@ -96,7 +96,7 @@ export async function resolveInsightSnapshots(
     .join("product as p", "pv.product_id", "p.id")
     .join("product_category_product as pcp", "p.id", "pcp.product_id")
     .join("product_category as pc", "pcp.category_id", "pc.id")
-    .join("seller_product as sp", "p.id", "sp.product_id")
+    .join("product_product_seller_seller as sp", "p.id", "sp.product_id")
     .select<InsightRow[]>(
       "sp.seller_id as vendor_id",
       "pc.id as category_id",
