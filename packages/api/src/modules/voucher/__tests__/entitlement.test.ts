@@ -220,6 +220,38 @@ describe("Layer 4 — policy_snapshot immutability post-ISSUED", () => {
       )
     ).not.toThrow()
   })
+
+  // AC4/AC5 explicit proof: mutating policy_snapshot.extension post-ISSUED
+  // must throw (L2 traceability — a dedicated assertion targeting .extension).
+  it("rejects snapshot change of extension sub-object post-ISSUED (AC4/AC5)", () => {
+    const extensionPolicy = {
+      validity_months: 12,
+      extension: {
+        allowed: true,
+        paid: true,
+        fee_pct: 10,
+        max_extension_months: 6,
+      },
+    }
+    const issued = snapshotPolicy(extensionPolicy)
+    const mutatedExtension = snapshotPolicy({
+      validity_months: 12,
+      extension: {
+        allowed: true,
+        paid: false,
+        fee_pct: 0,
+        max_extension_months: 3,
+      },
+    })
+    // changing extension sub-object after ISSUED must throw
+    expect(() =>
+      assertPolicySnapshotImmutable(
+        EntitlementInstanceState.ACTIVE,
+        issued,
+        mutatedExtension
+      )
+    ).toThrow(/immutable after ISSUED/)
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -318,6 +350,39 @@ describe("Layer 2 — entitlement_boundary", () => {
         expect.objectContaining({ field: "policy.extension.fee_pct" }),
       ])
     )
+  })
+
+  // L1 governance gate: unpaid extension with non-zero fee_pct must fail (even
+  // though it passes the paid-only range check). Prevents garbage values from
+  // silently slipping through when paid=false.
+  it("rejects unpaid extension with non-zero fee_pct (L1 governance gate)", () => {
+    const v = checkPolicyAgainstBoundary({
+      validity_months: 12,
+      extension: {
+        allowed: true,
+        paid: false,
+        fee_pct: 5, // non-zero is invalid for unpaid
+        max_extension_months: 6,
+      },
+    })
+    expect(v).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ field: "policy.extension.fee_pct" }),
+      ])
+    )
+  })
+
+  it("accepts unpaid extension with fee_pct=0 (free extension semantics)", () => {
+    const v = checkPolicyAgainstBoundary({
+      validity_months: 12,
+      extension: {
+        allowed: true,
+        paid: false,
+        fee_pct: 0,
+        max_extension_months: 3,
+      },
+    })
+    expect(v.some((x) => x.field === "policy.extension.fee_pct")).toBe(false)
   })
 })
 
@@ -496,7 +561,9 @@ describe("Story 2.2 — extend entitlement", () => {
       name: ENTITLEMENT_EXTENDED_EVENT,
       data: {
         event: ENTITLEMENT_EXTENDED_EVENT,
-        entitlement_id: "ent_inst_1",
+        // entitlement_id = entitlement_profile_id (the template), not the
+        // instance id — they are distinct identifiers (H1 fix).
+        entitlement_id: "voucher-kwotowy-365d",
         entitlement_instance_id: "ent_inst_1",
         paid: true,
         fee_pct: 10,

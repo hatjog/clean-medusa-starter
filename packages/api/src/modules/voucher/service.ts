@@ -52,7 +52,9 @@ export interface ExtendEntitlementInput {
 
 export interface EntitlementExtendedEnvelope {
   event: typeof ENTITLEMENT_EXTENDED_EVENT
+  /** entitlement_profile_id — the profile/template identifier for this entitlement. */
   entitlement_id: string
+  /** id of the specific entitlement_instance row being extended. */
   entitlement_instance_id: string
   paid: boolean
   fee_pct?: number
@@ -64,7 +66,9 @@ export interface EntitlementExtendedEnvelope {
 }
 
 export interface ExtendEntitlementResult {
+  /** entitlement_profile_id — the profile/template identifier (mirrors envelope). */
   entitlement_id: string
+  /** id of the specific entitlement_instance row that was extended. */
   entitlement_instance_id: string
   paid: boolean
   fee_pct?: number
@@ -461,6 +465,10 @@ export class VoucherService {
     const source = opts.source ?? "voucher.extend"
     const client = await this.getPool().connect()
 
+    // committed tracks whether COMMIT succeeded so the catch block does not
+    // attempt ROLLBACK on an already-committed transaction.
+    let committed = false
+    let event: EntitlementExtendedEnvelope | undefined
     try {
       await client.query("BEGIN")
       const result = await (client as Queryable).query(
@@ -525,9 +533,9 @@ export class VoucherService {
         [entitlementId, newExpiresAt, unpaidExtensionCount]
       )
 
-      const event: EntitlementExtendedEnvelope = {
+      event = {
         event: ENTITLEMENT_EXTENDED_EVENT,
-        entitlement_id: row.id,
+        entitlement_id: row.entitlement_profile_id,
         entitlement_instance_id: row.id,
         paid: opts.paid,
         ...(opts.paid ? { fee_pct: extension.fee_pct } : {}),
@@ -537,11 +545,17 @@ export class VoucherService {
         source,
         timestamp: now.toISOString(),
       }
-      await this.emitEntitlementExtended(event)
+
+      // COMMIT before emitting — ensures the event is only broadcast when the
+      // DB mutation is durable (AC2 atomicity: no partial state on COMMIT
+      // failure, M1 fix).
       await client.query("COMMIT")
+      committed = true
+
+      await this.emitEntitlementExtended(event)
 
       return {
-        entitlement_id: row.id,
+        entitlement_id: row.entitlement_profile_id,
         entitlement_instance_id: row.id,
         paid: opts.paid,
         ...(opts.paid ? { fee_pct: extension.fee_pct } : {}),
@@ -551,7 +565,9 @@ export class VoucherService {
         event,
       }
     } catch (err) {
-      await client.query("ROLLBACK")
+      if (!committed) {
+        await client.query("ROLLBACK")
+      }
       throw err
     } finally {
       client.release()

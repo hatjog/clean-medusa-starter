@@ -124,16 +124,27 @@ export function checkPolicyAgainstBoundary(
   if (ext) {
     const fee = num(ext.fee_pct)
     const paid = ext.paid === true
-    if (
-      paid &&
-      fee !== undefined &&
-      (fee < B.policy.extension.fee_pct_min ||
-        fee > B.policy.extension.fee_pct_max)
-    ) {
-      v.push({
-        field: "policy.extension.fee_pct",
-        message: `extension.fee_pct ${fee} outside [${B.policy.extension.fee_pct_min}, ${B.policy.extension.fee_pct_max}]`,
-      })
+    if (paid) {
+      // Paid extension: fee_pct must be within [fee_pct_min, fee_pct_max].
+      if (
+        fee !== undefined &&
+        (fee < B.policy.extension.fee_pct_min ||
+          fee > B.policy.extension.fee_pct_max)
+      ) {
+        v.push({
+          field: "policy.extension.fee_pct",
+          message: `extension.fee_pct ${fee} outside [${B.policy.extension.fee_pct_min}, ${B.policy.extension.fee_pct_max}] for paid extension`,
+        })
+      }
+    } else {
+      // Unpaid extension: fee_pct must be exactly 0 (or absent) to prevent
+      // garbage values from silently passing governance (L1 fix).
+      if (fee !== undefined && fee !== 0) {
+        v.push({
+          field: "policy.extension.fee_pct",
+          message: `extension.fee_pct must be 0 for unpaid extension, got ${fee}`,
+        })
+      }
     }
   }
 
