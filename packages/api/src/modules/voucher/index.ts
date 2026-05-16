@@ -61,8 +61,10 @@ export type {
 } from "./models/entitlement"
 export {
   ENTITLEMENT_BOUNDARY,
+  LOST_CODE_REISSUE_WINDOW_DAYS,
   NO_SHOW_POLICIES,
   REFUND_CHANNELS,
+  isWithinReissueWindow,
   validityMonthsMax,
   checkPolicyAgainstBoundary,
 } from "./entitlement-boundary"
@@ -71,6 +73,25 @@ export type {
   RefundChannel,
   BoundaryViolation,
 } from "./entitlement-boundary"
+export {
+  ENTITLEMENT_LOST_CODE_REISSUED_EVENT_TYPE,
+  EntitlementNotFoundError,
+  LostCodeReissueWindowError,
+  ReissueLostCodeWorkflow,
+  PostgresReissueLostCodeStore,
+  InMemoryReissueLostCodeStore,
+  createReissueLostCodeWorkflowFromScope,
+  generateReadableEntitlementCode,
+} from "./workflows/reissue-lost-code"
+export type {
+  EventEnvelope,
+  ReissuableEntitlement,
+  ReissueLostCodeInput,
+  ReissueLostCodeResult,
+  ReissueLostCodeStore,
+  ReissueLostCodeTx,
+  EntitlementEventEmitter,
+} from "./workflows/reissue-lost-code"
 
 export default Module(VOUCHER_MODULE, {
   service: VoucherService,

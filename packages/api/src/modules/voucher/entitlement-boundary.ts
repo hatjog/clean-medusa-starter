@@ -74,6 +74,26 @@ export const ENTITLEMENT_BOUNDARY = {
   },
 } as const
 
+/** Lost-code recovery is admin-triggered and platform-wide in v1.8.0. */
+export const LOST_CODE_REISSUE_WINDOW_DAYS = 30
+
+const DAY_MS = 24 * 60 * 60 * 1000
+
+/**
+ * Inclusive 30-day lost-code recovery boundary, counted from the original
+ * entitlement issue date. The boundary is deliberately not market/vendor
+ * configurable.
+ */
+export function isWithinReissueWindow(
+  originalIssuedAt: Date,
+  now: Date = new Date()
+): boolean {
+  const issuedMs = originalIssuedAt.getTime()
+  const nowMs = now.getTime()
+  if (!Number.isFinite(issuedMs) || !Number.isFinite(nowMs)) return false
+  return nowMs - issuedMs <= LOST_CODE_REISSUE_WINDOW_DAYS * DAY_MS
+}
+
 /**
  * The validity ceiling is uniform across the v1.8.0-active types
  * (VOUCHER_AMOUNT + VOUCHER_SERVICE) but is keyed by type so future inactive
