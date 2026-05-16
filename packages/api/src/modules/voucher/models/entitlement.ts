@@ -312,6 +312,50 @@ function deepFreeze<T>(o: T): T {
 }
 
 // ---------------------------------------------------------------------------
+// Layer 4 — auto_redeem policy (BE-8 / Story 2.9, as-built Story 0.17 substrate)
+// ---------------------------------------------------------------------------
+
+/**
+ * Drift-reconcile: epics.md Story 2.9 narrates `policy.auto_redeem_on_booking: bool`
+ * as a shorthand. The as-built schema (Story 0.17, market-config.v1.schema.json ~335-344)
+ * uses `auto_redeem: { enabled: bool (required), trigger?: enum }`. This type
+ * captures the as-built shape and is read exclusively from `policy_snapshot`
+ * (immutability post-ISSUED, regulamin § 12 — never re-resolved from live profile).
+ */
+export type AutoRedeemPolicy = {
+  enabled: boolean
+  trigger?: "on_appointment_confirm" | "on_service_complete" | "manual_only"
+}
+
+// Booking-confirmation trigger set (BE-8 scope).
+// on_service_complete and manual_only are explicitly out-of-scope for booking-confirm.
+const BOOKING_CONFIRM_TRIGGERS: ReadonlySet<string> = new Set([
+  "on_appointment_confirm",
+])
+
+/**
+ * Pure predicate: should this entitlement auto-redeem when a booking-confirmation
+ * event is received?
+ *
+ * Returns true iff `policy_snapshot.auto_redeem.enabled === true` AND
+ * `trigger` is in the booking-confirmation trigger set (`on_appointment_confirm`).
+ *
+ * Drift mapping: `auto_redeem_on_booking=true` (epics narrative) ≡
+ * `auto_redeem.enabled=true` + `trigger ∈ {on_appointment_confirm}` (as-built).
+ */
+export function shouldAutoRedeemOnBookingConfirm(
+  policySnapshot: EntitlementPolicySnapshot
+): boolean {
+  const ar = (policySnapshot as Record<string, unknown>)
+    .auto_redeem as AutoRedeemPolicy | undefined
+  return (
+    ar?.enabled === true &&
+    ar.trigger !== undefined &&
+    BOOKING_CONFIRM_TRIGGERS.has(ar.trigger)
+  )
+}
+
+// ---------------------------------------------------------------------------
 // Layer 4 — entitlement_instance row type (matches migration DDL)
 // ---------------------------------------------------------------------------
 

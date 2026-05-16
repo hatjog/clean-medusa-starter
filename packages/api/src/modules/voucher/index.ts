@@ -54,10 +54,13 @@ export {
   EntitlementTransitionError,
   snapshotPolicy,
   assertPolicySnapshotImmutable,
+  // BE-8 (Story 2.9): auto_redeem policy helper.
+  shouldAutoRedeemOnBookingConfirm,
 } from "./models/entitlement"
 export type {
   EntitlementPolicySnapshot,
   EntitlementInstanceRow,
+  AutoRedeemPolicy,
 } from "./models/entitlement"
 export {
   ENTITLEMENT_BOUNDARY,
@@ -94,6 +97,25 @@ export type {
   ReissueLostCodeTx,
   EntitlementEventEmitter,
 } from "./workflows/reissue-lost-code"
+
+// BE-8 (Story 2.9): auto-redeem workflow.
+export {
+  ENTITLEMENT_REDEEMED_EVENT_TYPE,
+  EntitlementNotFoundError as RedeemEntitlementNotFoundError,
+  RedeemEntitlementWorkflow,
+  PostgresRedeemEntitlementStore,
+  InMemoryRedeemEntitlementStore,
+  createRedeemEntitlementWorkflowFromScope,
+} from "./workflows/redeem-entitlement"
+export type {
+  RedeemEventEnvelope,
+  RedeemableEntitlement,
+  RedeemEntitlementInput,
+  RedeemEntitlementResult,
+  RedeemEntitlementStore,
+  RedeemEntitlementTx,
+  RedeemEntitlementEventEmitter,
+} from "./workflows/redeem-entitlement"
 
 export default Module(VOUCHER_MODULE, {
   service: VoucherService,
