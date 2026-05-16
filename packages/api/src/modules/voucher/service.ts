@@ -10,6 +10,7 @@
 import { randomUUID } from "node:crypto"
 import { Modules } from "@medusajs/framework/utils"
 import { Pool } from "pg"
+import type { PoolClient } from "pg"
 import type {
   VoucherRow,
   VoucherEventRow,
@@ -20,7 +21,10 @@ import type {
 } from "./models/types"
 import {
   EntitlementInstanceState,
+  EntitlementTransitionError,
   EntitlementType,
+  assertPolicySnapshotImmutable,
+  assertTransition,
   type EntitlementInstanceRow,
   type EntitlementPolicySnapshot,
 } from "./models/entitlement"
@@ -83,6 +87,18 @@ type ExtensionPolicy = {
   paid: boolean
   fee_pct: number
   max_extension_months: number
+}
+
+type EntitlementInstanceResult = EntitlementInstanceRow & {
+  expires_at?: Date | null
+}
+
+type EntitlementBookingCancelledPayload = {
+  entitlement_id: string
+  previous_state: EntitlementInstanceState.REDEMPTION_REQUESTED
+  state: EntitlementInstanceState.ACTIVE
+  booking_pointer: null
+  entitlement_type: EntitlementType.VOUCHER_SERVICE
 }
 
 export class EntitlementExtensionError extends Error {
@@ -183,8 +199,9 @@ export class VoucherService {
   private rowToEvent(row: Record<string, unknown>): VoucherEventRow {
     return {
       id: row.id as string,
-      voucher_code: row.voucher_code as string,
+      voucher_code: (row.voucher_code ?? null) as string | null,
       event_type: row.event_type as VoucherEventRow["event_type"],
+      payload: (row.payload ?? null) as Record<string, unknown> | null,
       occurred_at: new Date(row.occurred_at as string | Date),
       created_at: new Date(row.created_at as string | Date),
     }
@@ -192,19 +209,22 @@ export class VoucherService {
 
   private rowToEntitlementInstance(
     row: Record<string, unknown>
-  ): EntitlementInstanceRow {
-    return {
+  ): EntitlementInstanceResult {
+    const result: EntitlementInstanceResult = {
       id: row.id as string,
       entitlement_profile_id: row.entitlement_profile_id as string,
       entitlement_type: row.entitlement_type as EntitlementType,
       order_id: (row.order_id ?? null) as string | null,
       state: row.state as EntitlementInstanceState,
+      booking_pointer: (row.booking_pointer ?? null) as string | null,
       policy_snapshot: this.toPolicySnapshot(row.policy_snapshot),
       expires_at: this.toDate(row.expires_at as string | Date | null),
       unpaid_extension_count: Number(row.unpaid_extension_count ?? 0),
       created_at: new Date(row.created_at as string | Date),
       updated_at: new Date(row.updated_at as string | Date),
     }
+
+    return result
   }
 
   private toPolicySnapshot(value: unknown): EntitlementPolicySnapshot {
@@ -278,6 +298,22 @@ export class VoucherService {
       )
     }
     await this.eventBus_.emit({ name: ENTITLEMENT_EXTENDED_EVENT, data: event })
+  }
+
+  private async emitEntitlementBookingCancelled(
+    client: PoolClient,
+    payload: EntitlementBookingCancelledPayload
+  ): Promise<void> {
+    await client.query(
+      `INSERT INTO voucher_event (id, voucher_code, entitlement_id, event_type, payload, occurred_at, created_at)
+       VALUES ($1, NULL, $2, $3, $4::jsonb, NOW(), NOW())`,
+      [
+        randomUUID(),
+        payload.entitlement_id,
+        "ENTITLEMENT_BOOKING_CANCELLED",
+        payload,
+      ]
+    )
   }
 
   // ---------------------------------------------------------------------------
@@ -372,6 +408,76 @@ export class VoucherService {
       event_type: event.event_type,
       occurred_at: occurredAt,
       created_at: new Date(),
+    }
+  }
+
+  async cancel_booking(entitlement_id: string): Promise<EntitlementInstanceResult> {
+    const client = await this.getPool().connect()
+
+    try {
+      await client.query("BEGIN")
+
+      const lockRes = await client.query<Record<string, unknown>>(
+        `SELECT * FROM entitlement_instance WHERE id = $1 FOR UPDATE`,
+        [entitlement_id]
+      )
+      if (lockRes.rows.length === 0) {
+        throw new Error(
+          `VoucherService.cancel_booking: entitlement not found ${entitlement_id}`
+        )
+      }
+
+      const current = this.rowToEntitlementInstance(lockRes.rows[0])
+      const previousState = current.state
+      assertTransition(previousState, EntitlementInstanceState.ACTIVE)
+      if (previousState !== EntitlementInstanceState.REDEMPTION_REQUESTED) {
+        throw new EntitlementTransitionError(
+          previousState,
+          EntitlementInstanceState.ACTIVE
+        )
+      }
+      if (current.entitlement_type !== EntitlementType.VOUCHER_SERVICE) {
+        throw new Error(
+          `VoucherService.cancel_booking: entitlement ${entitlement_id} is not VOUCHER_SERVICE`
+        )
+      }
+      assertPolicySnapshotImmutable(
+        previousState,
+        current.policy_snapshot,
+        current.policy_snapshot
+      )
+
+      const updateRes = await client.query<Record<string, unknown>>(
+        `UPDATE entitlement_instance
+         SET booking_pointer = NULL,
+             state = $2,
+             updated_at = NOW()
+         WHERE id = $1
+         RETURNING *`,
+        [entitlement_id, EntitlementInstanceState.ACTIVE]
+      )
+      if (updateRes.rows.length === 0) {
+        throw new Error(
+          `VoucherService.cancel_booking: failed to update ${entitlement_id}`
+        )
+      }
+
+      const updated = this.rowToEntitlementInstance(updateRes.rows[0])
+      await this.emitEntitlementBookingCancelled(client, {
+        entitlement_id,
+        previous_state: EntitlementInstanceState.REDEMPTION_REQUESTED,
+        state: EntitlementInstanceState.ACTIVE,
+        booking_pointer: null,
+        entitlement_type: EntitlementType.VOUCHER_SERVICE,
+      })
+
+      await client.query("COMMIT")
+      return updated
+    } catch (err) {
+      await client.query("ROLLBACK")
+      throw err
+    } finally {
+      client.release()
     }
   }
 

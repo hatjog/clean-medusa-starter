@@ -17,6 +17,11 @@
 import { describe, it, expect, beforeEach, afterEach, jest } from "@jest/globals"
 import { VoucherService } from "../service"
 import type { VoucherWithEvents } from "../models/types"
+import {
+  EntitlementInstanceState,
+  EntitlementTransitionError,
+  EntitlementType,
+} from "../models/entitlement"
 import type { Pool, PoolClient } from "pg"
 
 // ---------------------------------------------------------------------------
@@ -25,11 +30,24 @@ import type { Pool, PoolClient } from "pg"
 
 type QueryRow = Record<string, unknown>
 type QueryResponse = { rows: QueryRow[] }
+type EntitlementTestRow = QueryRow & {
+  id: string
+  entitlement_profile_id: string
+  entitlement_type: EntitlementType
+  order_id: string | null
+  state: EntitlementInstanceState
+  policy_snapshot: Record<string, unknown>
+  booking_pointer: string | null
+  expires_at: Date | null
+  created_at: Date
+  updated_at: Date
+}
 
 interface MockPoolConfig {
   queryResponses?: QueryResponse[]
   clientQueryResponses?: QueryResponse[]
   captureQuerySql?: string[]
+  captureClientQueries?: Array<{ sql: string; params: unknown[] }>
 }
 
 function makeMockPool(config: MockPoolConfig = {}): Pool {
@@ -46,7 +64,10 @@ function makeMockPool(config: MockPoolConfig = {}): Pool {
     return resp
   })
 
-  const mockClientQuery = jest.fn().mockImplementation(async () => {
+  const mockClientQuery = jest.fn().mockImplementation(async (sql: unknown, params?: unknown[]) => {
+    if (config.captureClientQueries) {
+      config.captureClientQueries.push({ sql: String(sql), params: params ?? [] })
+    }
     const resp = clientResponses[cIdx] ?? { rows: [] }
     cIdx++
     return resp
@@ -120,6 +141,24 @@ const EXPIRED_ROW: QueryRow = {
   code: "EXPIRED-VOUCHER-003",
   status: "idle",
   expires_at: new Date("2020-01-01T00:00:00Z"),
+}
+
+const SERVICE_POLICY = {
+  validity_months: 12,
+  cancellation: { enabled: true, cutoff_hours: 24, refund_pct: 100 },
+}
+
+const ENTITLEMENT_REBOOK_ROW: EntitlementTestRow = {
+  id: "ent_service_rebook_001",
+  entitlement_profile_id: "voucher-rezerwacja-otwarta",
+  entitlement_type: EntitlementType.VOUCHER_SERVICE,
+  order_id: "ord_rebook_001",
+  state: EntitlementInstanceState.REDEMPTION_REQUESTED,
+  policy_snapshot: SERVICE_POLICY,
+  booking_pointer: "booking_abc_123",
+  expires_at: new Date("2027-05-16T12:00:00.000Z"),
+  created_at: new Date("2026-05-16T08:00:00.000Z"),
+  updated_at: new Date("2026-05-16T09:00:00.000Z"),
 }
 
 // ---------------------------------------------------------------------------
@@ -364,6 +403,167 @@ describe("VoucherService", () => {
 
       const result = await svc.claim("NONEXISTENT-999")
       expect(result.status).toBe("not_found")
+    })
+  })
+
+  describe("cancel_booking — service voucher rebook state machine", () => {
+    it("returns REDEMPTION_REQUESTED service voucher to ACTIVE without changing TTL or policy snapshot", async () => {
+      const updatedRow = {
+        ...ENTITLEMENT_REBOOK_ROW,
+        state: EntitlementInstanceState.ACTIVE,
+        booking_pointer: null,
+      }
+      const capturedClientQueries: Array<{ sql: string; params: unknown[] }> = []
+      const pool = makeMockPool({
+        captureClientQueries: capturedClientQueries,
+        clientQueryResponses: [
+          { rows: [] },
+          { rows: [ENTITLEMENT_REBOOK_ROW] },
+          { rows: [updatedRow], rowCount: 1 } as unknown as QueryResponse,
+          { rows: [] },
+          { rows: [] },
+        ],
+      })
+      const svc = makeService(pool)
+
+      const beforePolicy = structuredClone(ENTITLEMENT_REBOOK_ROW.policy_snapshot)
+      const beforeExpiresAt = ENTITLEMENT_REBOOK_ROW.expires_at
+
+      const result = await svc.cancel_booking("ent_service_rebook_001")
+
+      expect(result.state).toBe(EntitlementInstanceState.ACTIVE)
+      expect(result.booking_pointer).toBeNull()
+      expect((result as unknown as { expires_at?: Date }).expires_at).toBe(beforeExpiresAt)
+      expect(result.policy_snapshot).toEqual(beforePolicy)
+
+      const update = capturedClientQueries.find((q) =>
+        q.sql.includes("UPDATE entitlement_instance")
+      )
+      expect(update?.sql).toContain("booking_pointer = NULL")
+      expect(update?.sql).toContain("state = $2")
+      expect(update?.sql).not.toContain("expires_at")
+
+      const eventInsert = capturedClientQueries.find((q) =>
+        q.sql.includes("INSERT INTO voucher_event")
+      )
+      expect(eventInsert?.sql).toContain("payload")
+      expect(eventInsert?.params[2]).toBe("ENTITLEMENT_BOOKING_CANCELLED")
+      expect(eventInsert?.params[3]).toEqual({
+        entitlement_id: "ent_service_rebook_001",
+        previous_state: EntitlementInstanceState.REDEMPTION_REQUESTED,
+        state: EntitlementInstanceState.ACTIVE,
+        booking_pointer: null,
+        entitlement_type: EntitlementType.VOUCHER_SERVICE,
+      })
+    })
+
+    it("rejects illegal source states without mutation or event emission", async () => {
+      const activeRow = {
+        ...ENTITLEMENT_REBOOK_ROW,
+        state: EntitlementInstanceState.ACTIVE,
+        booking_pointer: "booking_abc_123",
+      }
+      const closedRow = {
+        ...ENTITLEMENT_REBOOK_ROW,
+        state: EntitlementInstanceState.CLOSED,
+        booking_pointer: "booking_closed_123",
+      }
+      const refundRequestedRow = {
+        ...ENTITLEMENT_REBOOK_ROW,
+        state: EntitlementInstanceState.REFUND_REQUESTED,
+        booking_pointer: "booking_refund_123",
+      }
+
+      for (const row of [activeRow, closedRow, refundRequestedRow]) {
+        const capturedClientQueries: Array<{ sql: string; params: unknown[] }> = []
+        const pool = makeMockPool({
+          captureClientQueries: capturedClientQueries,
+          clientQueryResponses: [
+            { rows: [] },
+            { rows: [row] },
+            { rows: [] },
+          ],
+        })
+        const svc = makeService(pool)
+
+        await expect(svc.cancel_booking(row.id)).rejects.toThrow(
+          EntitlementTransitionError
+        )
+
+        expect(
+          capturedClientQueries.some((q) =>
+            q.sql.includes("UPDATE entitlement_instance")
+          )
+        ).toBe(false)
+        expect(
+          capturedClientQueries.some((q) => q.sql.includes("INSERT INTO voucher_event"))
+        ).toBe(false)
+      }
+    })
+
+    it("supports rebook lifecycle: request → cancel → request → redeem while preserving TTL", async () => {
+      const expiresAt = ENTITLEMENT_REBOOK_ROW.expires_at
+      const policySnapshot = structuredClone(ENTITLEMENT_REBOOK_ROW.policy_snapshot)
+      const audit: string[] = []
+      let instance: EntitlementTestRow = {
+        ...ENTITLEMENT_REBOOK_ROW,
+        state: EntitlementInstanceState.ACTIVE,
+        booking_pointer: null,
+      }
+
+      function requestRedemption(bookingPointer: string): void {
+        expect(instance.state).toBe(EntitlementInstanceState.ACTIVE)
+        instance = {
+          ...instance,
+          state: EntitlementInstanceState.REDEMPTION_REQUESTED,
+          booking_pointer: bookingPointer,
+        }
+      }
+
+      function redeem(): void {
+        expect(instance.state).toBe(EntitlementInstanceState.REDEMPTION_REQUESTED)
+        instance = {
+          ...instance,
+          state: EntitlementInstanceState.REDEEMED_FULL,
+        }
+      }
+
+      requestRedemption("booking_first")
+
+      const updatedRow = {
+        ...instance,
+        state: EntitlementInstanceState.ACTIVE,
+        booking_pointer: null,
+      }
+      const pool = makeMockPool({
+        captureClientQueries: [],
+        clientQueryResponses: [
+          { rows: [] },
+          { rows: [instance] },
+          { rows: [updatedRow], rowCount: 1 } as unknown as QueryResponse,
+          { rows: [] },
+          { rows: [] },
+        ],
+      })
+      const svc = makeService(pool)
+
+      instance = {
+        ...instance,
+        ...(await svc.cancel_booking("ent_service_rebook_001")),
+      }
+      audit.push("ENTITLEMENT_BOOKING_CANCELLED")
+
+      expect(instance.state).toBe(EntitlementInstanceState.ACTIVE)
+      expect(instance.booking_pointer).toBeNull()
+      expect(instance.expires_at).toBe(expiresAt)
+      expect(instance.policy_snapshot).toEqual(policySnapshot)
+
+      requestRedemption("booking_second")
+      redeem()
+
+      expect(instance.state).toBe(EntitlementInstanceState.REDEEMED_FULL)
+      expect(instance.expires_at).toBe(expiresAt)
+      expect(audit.filter((e) => e === "ENTITLEMENT_BOOKING_CANCELLED")).toHaveLength(1)
     })
   })
 })

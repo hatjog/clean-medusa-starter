@@ -17,6 +17,7 @@ export type VoucherEventType =
   | "opened"
   | "claimed"
   | "withdrawn"
+  | "ENTITLEMENT_BOOKING_CANCELLED"
 
 export interface VoucherRow {
   code: string
@@ -35,8 +36,9 @@ export interface VoucherRow {
 
 export interface VoucherEventRow {
   id: string
-  voucher_code: string
+  voucher_code: string | null
   event_type: VoucherEventType
+  payload?: Record<string, unknown> | null
   occurred_at: Date
   created_at: Date
 }

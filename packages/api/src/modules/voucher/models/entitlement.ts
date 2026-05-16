@@ -326,6 +326,8 @@ export interface EntitlementInstanceRow {
   /** Nullable until Epic 1 Story 1.3 wires live issue post-payment. */
   order_id: string | null
   state: EntitlementInstanceState
+  // BE-2 (Story 2.3): active service-booking pointer; reset on cancel_booking.
+  booking_pointer: string | null
   /** Immutable policy block snapshotted at ISSUED time (regulamin § 12). */
   policy_snapshot: EntitlementPolicySnapshot
   /** Nullable only for legacy/authored rows before Story 2.2 migration apply. */
