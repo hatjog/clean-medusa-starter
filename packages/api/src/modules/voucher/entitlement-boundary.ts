@@ -97,6 +97,52 @@ export const ENTITLEMENT_BOUNDARY = {
 /** Lost-code recovery is admin-triggered and platform-wide in v1.8.0. */
 export const LOST_CODE_REISSUE_WINDOW_DAYS = 30
 
+/**
+ * Retention voucher amount boundaries (GP platform hardcoded, BE-9 / FR1.20).
+ *
+ * RETENTION_AMOUNT_PCT_MIN = 100: retention ≥ par value of the original —
+ * retention is an incentive to stay, not a masked partial refund.
+ *
+ * RETENTION_AMOUNT_PCT_MAX = 200: anti-abuse ceiling that prevents unlimited
+ * value escalation via admin-initiated retention while remaining permissive
+ * enough for legitimate high-value retention offers. Not a tight 120% hard
+ * cap — the operation is discretionary (per product guidance "zwykle 110-120%"
+ * but cap allows higher offers where business judgment warrants it).
+ *
+ * Single-source note: Python governance gate `validate_entitlement_profiles.py`
+ * does NOT carry these constants (retention is admin-triggered, not profile-
+ * driven in v1.8.0). If profile-level retention bounds are added in a future
+ * story, the validator must be updated in sync with this file.
+ */
+export const RETENTION_AMOUNT_PCT_MIN = 100
+export const RETENTION_AMOUNT_PCT_MAX = 200
+
+/**
+ * Pure boundary check for retention voucher amount (BE-9 / AC4).
+ *
+ * When `originalAmount` is provided, enforces incentive ratio within GP
+ * boundary ([RETENTION_AMOUNT_PCT_MIN, RETENTION_AMOUNT_PCT_MAX] of original).
+ * When `originalAmount` is undefined/null (DDL drift — column not present),
+ * degrades gracefully to `amount > 0` only (deterministically documented per
+ * AC4 / Dev Notes DDL drift posture from Story 2.5).
+ */
+export function isRetentionAmountWithinBoundary(
+  amount: number,
+  originalAmount?: number | null
+): boolean {
+  if (!Number.isFinite(amount) || amount <= 0) return false
+  if (
+    originalAmount == null ||
+    !Number.isFinite(originalAmount) ||
+    originalAmount <= 0
+  ) {
+    // DDL drift degradation: original value not resolvable — enforce amount > 0 only.
+    return true
+  }
+  const pct = (amount / originalAmount) * 100
+  return pct >= RETENTION_AMOUNT_PCT_MIN && pct <= RETENTION_AMOUNT_PCT_MAX
+}
+
 const DAY_MS = 24 * 60 * 60 * 1000
 
 /**

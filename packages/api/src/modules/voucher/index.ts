@@ -75,10 +75,13 @@ export type {
 export {
   ENTITLEMENT_BOUNDARY,
   LOST_CODE_REISSUE_WINDOW_DAYS,
+  RETENTION_AMOUNT_PCT_MIN,
+  RETENTION_AMOUNT_PCT_MAX,
   NO_SHOW_POLICIES,
   REFUND_CHANNELS,
   TRANSFERABILITY_VALUES,
   isWithinReissueWindow,
+  isRetentionAmountWithinBoundary,
   validityMonthsMax,
   checkPolicyAgainstBoundary,
   assertTransferabilityAllowed,
@@ -112,6 +115,27 @@ export type {
   ReissueLostCodeTx,
   EntitlementEventEmitter,
 } from "./workflows/reissue-lost-code"
+
+// BE-9 (Story 2.10): retention voucher workflow.
+export {
+  ENTITLEMENT_RETENTION_ISSUED_EVENT_TYPE,
+  RetentionAmountBoundaryError,
+  RetentionEntitlementNotFoundError,
+  IssueRetentionWorkflow,
+  PostgresIssueRetentionStore,
+  InMemoryIssueRetentionStore,
+  createIssueRetentionWorkflowFromScope,
+  generateRetentionEntitlementCode,
+} from "./workflows/issue-retention"
+export type {
+  RetentionEventEnvelope,
+  RetentionEntitlement,
+  IssueRetentionInput,
+  IssueRetentionResult,
+  IssueRetentionStore,
+  IssueRetentionTx,
+  RetentionEventEmitter,
+} from "./workflows/issue-retention"
 
 // BE-8 (Story 2.9): auto-redeem workflow.
 export {
