@@ -4,6 +4,25 @@ import {
   buildPaymentAuditEnvelope,
 } from "../../../workflows/payment/stripe-payment-audit"
 
+function refundPayload(overrides: Record<string, unknown> = {}) {
+  return {
+    event_id: "evt_ref_1",
+    request_id: "req_ref_1",
+    payment_intent_id: "pi_1",
+    payment_id: "pay_1",
+    order_id: "ord_1",
+    market_id: "bonbeauty",
+    payment_method_type: "card",
+    processing_country: "PL",
+    amount_minor: 19900,
+    currency: "PLN",
+    refund_id: "re_abc123",
+    refund_amount: 9900,
+    refund_reason: "customer_request",
+    ...overrides,
+  }
+}
+
 class FakeClient {
   rows = new Map<string, Record<string, unknown>>()
   queries: string[] = []
@@ -153,5 +172,100 @@ describe("StripePaymentAuditWorkflow", () => {
 
     expect(result.deduplicated).toBe(false)
     expect(result.entitlement).toBeUndefined()
+  })
+})
+
+describe("payment.refunded branch (AC1, AC2, AC3)", () => {
+  it("builds audit envelope with refund fields — outcome=refunded, lifecycle_status=refunded (AC2)", () => {
+    const envelope = buildPaymentAuditEnvelope("payment.refunded", {
+      event_id: "evt_ref_1",
+      request_id: "req_ref_1",
+      payment_intent_id: "pi_1",
+      payment_method_type: "card",
+      processing_country: "PL",
+      refund_id: "re_abc123",
+      refund_amount: 9900,
+      refund_reason: "customer_request",
+    })
+    expect(envelope).toMatchObject({
+      level: "info",
+      actor: "system",
+      scope: "payment_intent:pi_1",
+      request_id: "req_ref_1",
+      outcome: "refunded",
+      lifecycle_status: "refunded",
+      event_type: "payment.refunded",
+      refund_id: "re_abc123",
+      refund_amount: 9900,
+      refund_reason: "customer_request",
+    })
+  })
+
+  it("defaults refund_reason to 'unspecified' when absent — no silent omission (AC2)", () => {
+    const envelope = buildPaymentAuditEnvelope("payment.refunded", {
+      event_id: "evt_ref_2",
+      request_id: "req_ref_2",
+      payment_intent_id: "pi_2",
+      payment_method_type: "card",
+      processing_country: "PL",
+    })
+    expect(envelope.refund_reason).toBe("unspecified")
+  })
+
+  it("persists refund dedup row and emits audit_refunded event — replay returns deduplicated=true (AC3)", async () => {
+    const client = new FakeClient()
+    const eventBus = { emit: jest.fn().mockResolvedValue(undefined) }
+    const workflow = new StripePaymentAuditWorkflow({ connect: async () => client }, eventBus)
+
+    const first = await workflow.process("payment.refunded", refundPayload())
+    expect(first.deduplicated).toBe(false)
+    expect(eventBus.emit).toHaveBeenCalledWith(
+      expect.objectContaining({ name: "payment_audit.refunded" })
+    )
+
+    const replay = await workflow.process("payment.refunded", refundPayload())
+    expect(replay.deduplicated).toBe(true)
+  })
+
+  it("two distinct partial refunds create two separate dedup rows (AC3)", async () => {
+    const client = new FakeClient()
+    const workflow = new StripePaymentAuditWorkflow({ connect: async () => client })
+
+    const first = await workflow.process(
+      "payment.refunded",
+      refundPayload({ event_id: "evt_partial_1", refund_amount: 5000 })
+    )
+    const second = await workflow.process(
+      "payment.refunded",
+      refundPayload({ event_id: "evt_partial_2", refund_amount: 4900 })
+    )
+
+    expect(first.deduplicated).toBe(false)
+    expect(second.deduplicated).toBe(false)
+    expect(client.rows.size).toBe(2)
+  })
+
+  it("envelope shape is HG-4 backwards compatible — same field names as captured/failed (AC2)", () => {
+    const refundEnv = buildPaymentAuditEnvelope("payment.refunded", {
+      event_id: "evt_ref_3",
+      request_id: "req_ref_3",
+      payment_intent_id: "pi_3",
+      payment_method_type: "card",
+      processing_country: "PL",
+      refund_amount: 19900,
+      refund_reason: null,
+    })
+    const capturedEnv = buildPaymentAuditEnvelope("payment.captured", {
+      event_id: "evt_cap_1",
+      request_id: "req_cap_1",
+      payment_intent_id: "pi_3",
+      payment_method_type: "card",
+      processing_country: "PL",
+    })
+    const hg4Fields = ["level", "actor", "scope", "request_id", "outcome", "lifecycle_status", "event_type", "timestamp"]
+    for (const field of hg4Fields) {
+      expect(refundEnv).toHaveProperty(field)
+      expect(capturedEnv).toHaveProperty(field)
+    }
   })
 })

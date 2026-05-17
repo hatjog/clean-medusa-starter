@@ -5,6 +5,7 @@ import {
   StepResponse,
   WorkflowResponse,
 } from "@medusajs/framework/workflows-sdk"
+import { refundPaymentWorkflow } from "@medusajs/core-flows"
 
 import {
   compensateIssuedEntitlement,
@@ -37,6 +38,9 @@ export type StripePaymentAuditPayload = {
   decline_code?: string | null
   amount_minor?: number | null
   currency?: string | null
+  refund_id?: string | null
+  refund_amount?: number | null
+  refund_reason?: string | null
   entitlement_profile?: {
     profile_id?: string
     entitlement_type?: EntitlementType | string
@@ -60,6 +64,16 @@ export type PaymentAuditEnvelope = {
   decline_code?: string
   payment_method_type?: string
   processing_country?: string
+  refund_id?: string
+  refund_amount?: number
+  refund_reason?: string
+}
+
+export type StripeRefundResult = {
+  payment_id: string
+  refund_amount?: number
+  skipped: boolean
+  error?: string
 }
 
 export type StripePaymentAuditResult = {
@@ -67,6 +81,7 @@ export type StripePaymentAuditResult = {
   envelope: PaymentAuditEnvelope
   deduplicated: boolean
   entitlement?: IssueEntitlementResult
+  nativeRefund?: StripeRefundResult
 }
 
 type QueryResult<T> = Promise<{ rows: T[]; rowCount?: number | null }>
@@ -302,6 +317,11 @@ export function buildPaymentAuditEnvelope(
   const failureCode = redactFailureCode(payload.failure_code)
   if (failureCode) envelope.failure_code = failureCode
   if (payload.decline_code) envelope.decline_code = payload.decline_code
+  if (eventType === "payment.refunded") {
+    if (payload.refund_id) envelope.refund_id = payload.refund_id
+    envelope.refund_amount = payload.refund_amount ?? undefined
+    envelope.refund_reason = payload.refund_reason ?? "unspecified"
+  }
   return envelope
 }
 
@@ -324,6 +344,43 @@ async function insertDedupRow(
   )
   return (result.rowCount ?? 0) === 1
 }
+
+type TriggerNativeRefundInput = {
+  eventType: StripePaymentEventName
+  payment_id?: string | null
+  refund_amount?: number | null
+  refund_reason?: string | null
+}
+
+export const triggerNativeRefundStep = createStep<TriggerNativeRefundInput, StripeRefundResult, void>(
+  "gp-trigger-native-refund",
+  async (input, { container }) => {
+    if (input.eventType !== "payment.refunded" || !input.payment_id) {
+      return new StepResponse({ payment_id: input.payment_id ?? "", skipped: true })
+    }
+    try {
+      await refundPaymentWorkflow(container).run({
+        input: {
+          payment_id: input.payment_id,
+          ...(input.refund_amount != null ? { amount: input.refund_amount } : {}),
+          ...(input.refund_reason ? { note: input.refund_reason } : {}),
+        },
+      })
+      return new StepResponse({
+        payment_id: input.payment_id,
+        refund_amount: input.refund_amount ?? undefined,
+        skipped: false,
+      })
+    } catch (err) {
+      const error = err as Error
+      return new StepResponse({
+        payment_id: input.payment_id,
+        skipped: false,
+        error: `${error.name}: ${error.message}`.slice(0, 256),
+      })
+    }
+  }
+)
 
 export function createStripePaymentAuditWorkflowFromScope(scope: {
   resolve: (key: string) => unknown
@@ -432,7 +489,13 @@ export const stripePaymentAuditWorkflow = createWorkflow<
 >("gp-stripe-payment-audit-workflow", function (input) {
   const result = persistStripePaymentAuditStep(input)
   emitStripePaymentAuditStep({ result, payload: input.payload })
-  return new WorkflowResponse(result)
+  const nativeRefund = triggerNativeRefundStep({
+    eventType: input.eventType,
+    payment_id: input.payload.payment_id,
+    refund_amount: input.payload.refund_amount,
+    refund_reason: input.payload.refund_reason,
+  })
+  return new WorkflowResponse({ ...result, nativeRefund } as StripePaymentAuditResult)
 })
 
 export { MissingEntitlementProfileError }
