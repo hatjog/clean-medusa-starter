@@ -21,6 +21,19 @@ function buildFakeDeps(rows: FakeRow[]) {
   return { db, scope }
 }
 
+// C6 regression: the route MUST source currency from the audit envelope
+// (real currency code), NOT from `wep.market_id` (a market id like
+// "bonbeauty" → wrong currency / RangeError in the widget).
+describe("refund-history SQL — currency from envelope, not market_id (C6)", () => {
+  it("selects envelope->>'currency' and never aliases market_id AS currency", async () => {
+    const { db, scope } = buildFakeDeps([])
+    await GET(buildReq("ord_1", scope) as never, buildRes() as never)
+    const sql = String(db.raw.mock.calls[0][0])
+    expect(sql).toContain("envelope->>'currency'")
+    expect(sql).not.toMatch(/market_id\s+AS\s+currency/i)
+  })
+})
+
 function buildReq(orderId: string, scope: object) {
   return {
     params: { id: orderId },
@@ -61,7 +74,7 @@ describe("GET /admin/gp/orders/:id/refund-history (AC4)", () => {
       refund_id: "re_abc123",
       refund_amount: 9900,
       refund_reason: "customer_request",
-      currency: "bonbeauty",
+      currency: "PLN",
       received_at: "2026-05-17T10:00:00Z",
       payment_intent_id: "pi_test_1",
     }
@@ -78,6 +91,7 @@ describe("GET /admin/gp/orders/:id/refund-history (AC4)", () => {
       refund_id: "re_abc123",
       refund_amount: 9900,
       refund_reason: "customer_request",
+      currency: "PLN",
       payment_intent_id: "pi_test_1",
     })
   })
@@ -89,7 +103,7 @@ describe("GET /admin/gp/orders/:id/refund-history (AC4)", () => {
         refund_id: "re_p1",
         refund_amount: 5000,
         refund_reason: "partial_refund",
-        currency: "bonbeauty",
+        currency: "PLN",
         received_at: "2026-05-17T10:00:00Z",
         payment_intent_id: "pi_1",
       },
@@ -98,7 +112,7 @@ describe("GET /admin/gp/orders/:id/refund-history (AC4)", () => {
         refund_id: "re_p2",
         refund_amount: 4900,
         refund_reason: "customer_request",
-        currency: "bonbeauty",
+        currency: "PLN",
         received_at: "2026-05-17T11:00:00Z",
         payment_intent_id: "pi_1",
       },

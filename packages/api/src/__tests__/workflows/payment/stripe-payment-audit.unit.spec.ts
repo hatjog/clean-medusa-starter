@@ -1,5 +1,6 @@
 import {
   MissingNativeStripePayloadFieldError,
+  reconcileManualRefund,
   StripePaymentAuditWorkflow,
   buildPaymentAuditEnvelope,
 } from "../../../workflows/payment/stripe-payment-audit"
@@ -183,6 +184,7 @@ describe("payment.refunded branch (AC1, AC2, AC3)", () => {
       payment_intent_id: "pi_1",
       payment_method_type: "card",
       processing_country: "PL",
+      currency: "pln",
       refund_id: "re_abc123",
       refund_amount: 9900,
       refund_reason: "customer_request",
@@ -195,6 +197,8 @@ describe("payment.refunded branch (AC1, AC2, AC3)", () => {
       outcome: "refunded",
       lifecycle_status: "refunded",
       event_type: "payment.refunded",
+      // C6: real currency code (uppercased), NOT a market id
+      currency: "PLN",
       refund_id: "re_abc123",
       refund_amount: 9900,
       refund_reason: "customer_request",
@@ -245,6 +249,20 @@ describe("payment.refunded branch (AC1, AC2, AC3)", () => {
     expect(client.rows.size).toBe(2)
   })
 
+  it("does NOT default refund currency — only present when supplied (C6)", () => {
+    const noCurrency = buildPaymentAuditEnvelope("payment.refunded", {
+      event_id: "evt_ref_nc",
+      request_id: "req_ref_nc",
+      payment_intent_id: "pi_nc",
+      payment_method_type: "card",
+      processing_country: "PL",
+      refund_amount: 9900,
+    })
+    // Better an absent currency (admin renders fallback) than a wrong one
+    // (e.g. market_id rendered as currency → RangeError).
+    expect(noCurrency.currency).toBeUndefined()
+  })
+
   it("envelope shape is HG-4 backwards compatible — same field names as captured/failed (AC2)", () => {
     const refundEnv = buildPaymentAuditEnvelope("payment.refunded", {
       event_id: "evt_ref_3",
@@ -267,5 +285,80 @@ describe("payment.refunded branch (AC1, AC2, AC3)", () => {
       expect(refundEnv).toHaveProperty(field)
       expect(capturedEnv).toHaveProperty(field)
     }
+  })
+})
+
+describe("reconcileManualRefund — reconcile-only (AC1/AC3, C1/C2/C3/C5)", () => {
+  const base = {
+    eventType: "payment.refunded" as const,
+    deduplicated: false,
+    payment_id: "pay_1",
+    payment_intent_id: "pi_1",
+    refund_id: "re_abc123",
+    refund_amount: 9900,
+    refund_reason: "customer_request",
+  }
+
+  function fakeLogger() {
+    return {
+      info: jest.fn(),
+      warn: jest.fn(),
+      error: jest.fn(),
+    }
+  }
+
+  it("AC1/C1: reconcile-only — never creates a provider-side refund (no refundPaymentWorkflow)", () => {
+    // The function has no container/provider dependency at all: a manual Stripe
+    // refund is the source of truth. Reconcile just records the audit decision.
+    const logger = fakeLogger()
+    const out = reconcileManualRefund(base, logger)
+    expect(out).toMatchObject({
+      payment_id: "pay_1",
+      refund_id: "re_abc123",
+      refund_amount: 9900,
+      reconciled: true,
+      skipped: false,
+      degraded: false,
+    })
+    expect(logger.info).toHaveBeenCalledWith(
+      expect.stringContaining("reconcile-only")
+    )
+  })
+
+  it("skips non-refund events explicitly (no silent no-op)", () => {
+    const out = reconcileManualRefund({ ...base, eventType: "payment.captured" })
+    expect(out).toMatchObject({
+      reconciled: false,
+      skipped: true,
+      skipReason: "not-a-refund-event",
+    })
+  })
+
+  it("C2/AC3: replay (deduplicated) does NOT reconcile a second time", () => {
+    const logger = fakeLogger()
+    const out = reconcileManualRefund({ ...base, deduplicated: true }, logger)
+    expect(out).toMatchObject({
+      reconciled: false,
+      skipped: true,
+      skipReason: "replay-deduplicated",
+    })
+    // explicit skip log, not a silent pass
+    expect(logger.info).toHaveBeenCalledWith(
+      expect.stringContaining("skipped (replay)")
+    )
+  })
+
+  it("C3/AC2: missing refund_id/amount is surfaced as a loud warn — never silent", () => {
+    const logger = fakeLogger()
+    const out = reconcileManualRefund(
+      { ...base, refund_id: null, refund_amount: null },
+      logger
+    )
+    expect(out.reconciled).toBe(true)
+    expect(out.degraded).toBe(true)
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining("reconcile degraded")
+    )
+    expect(logger.info).not.toHaveBeenCalled()
   })
 })

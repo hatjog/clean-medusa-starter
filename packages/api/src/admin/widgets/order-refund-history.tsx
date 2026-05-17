@@ -40,11 +40,16 @@ function formatTimestamp(iso: string): string {
   }
 }
 
-function stripeRefundLink(paymentIntentId: string | null, refundId: string | null): string | null {
+// L2: link points to the Stripe payment-intent detail (which shows refund
+// history) — AC4 explicitly allows the payment-intent link. The Stripe
+// per-refund deep-link (`/refunds/<re_*>`) is not officially documented, so we
+// do not guess it. Env note: test vs live mode cannot be derived from
+// `payment_intent_id` alone — the operator must open the Stripe Dashboard in
+// the environment that matches `STRIPE_SECRET_KEY_*` (test `sk_test_*` →
+// dashboard.stripe.com/test/...). The unused `refundId` param was removed (was
+// dead).
+function stripeRefundLink(paymentIntentId: string | null): string | null {
   if (!paymentIntentId) return null
-  // Dev Agent Record note: test vs live mode cannot be reliably determined from
-  // payment_intent_id alone; operators should use the appropriate Stripe Dashboard
-  // environment. Link points to payment detail which shows refund history.
   return `https://dashboard.stripe.com/payments/${paymentIntentId}`
 }
 
@@ -121,7 +126,11 @@ function OrderRefundHistoryWidget({ data }: { data: { id: string } }) {
         </thead>
         <tbody>
           {refunds.map((r) => {
-            const link = stripeRefundLink(r.payment_intent_id, r.refund_id)
+            const link = stripeRefundLink(r.payment_intent_id)
+            // L1: never present the internal `event_id` as a Stripe Refund ID
+            // (misleads operators reconciling against the Dashboard). Show an
+            // explicit placeholder when the Stripe `re_*` id is unavailable.
+            const refundIdLabel = r.refund_id ?? "— (brak refund_id)"
             return (
               <tr key={r.event_id} className="border-b border-ui-border-base last:border-0">
                 <td className="py-2 pr-4">{formatTimestamp(r.received_at)}</td>
@@ -135,11 +144,11 @@ function OrderRefundHistoryWidget({ data }: { data: { id: string } }) {
                       rel="noopener noreferrer"
                       className="text-ui-fg-interactive hover:underline font-mono text-xs"
                     >
-                      {r.refund_id ?? r.event_id}
+                      {refundIdLabel}
                     </a>
                   ) : (
                     <span className="text-ui-fg-subtle font-mono text-xs">
-                      {r.refund_id ?? r.event_id}
+                      {refundIdLabel}
                     </span>
                   )}
                 </td>

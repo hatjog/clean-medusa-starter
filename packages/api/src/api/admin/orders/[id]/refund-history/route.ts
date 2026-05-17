@@ -30,6 +30,16 @@ export async function GET(req: MedusaRequest, res: MedusaResponse): Promise<void
     return
   }
 
+  // C6: currency MUST come from the audit envelope (real currency code, e.g.
+  // "PLN"), NOT `wep.market_id` (which is a market id like "bonbeauty" and
+  // produced a wrong/RangeError currency in the widget).
+  // M5: this admin-only view projects directly off `webhook_event_processed`
+  // (the idempotency/dedup store). That is an accepted v1.8.0 reconcile-only
+  // trade-off — a dedicated refund projection table is deferred to
+  // named_retry_slot v1.10.0+ (NFR15, customer-facing/operator dashboard).
+  // The JOIN matches the envelope `scope` (`payment_intent:<pi>`) against
+  // `payment.data->>'id'`; if the Stripe payment-intent id cannot be derived
+  // the row simply does not surface (admin-only, non-financial path).
   const result = await db.raw(
     `
     SELECT
@@ -37,7 +47,7 @@ export async function GET(req: MedusaRequest, res: MedusaResponse): Promise<void
       wep.envelope->>'refund_id'    AS refund_id,
       (wep.envelope->>'refund_amount')::bigint AS refund_amount,
       wep.envelope->>'refund_reason' AS refund_reason,
-      wep.market_id AS currency,
+      wep.envelope->>'currency' AS currency,
       wep.received_at,
       SUBSTRING(wep.envelope->>'scope' FROM 'payment_intent:(.+)') AS payment_intent_id
     FROM webhook_event_processed wep
