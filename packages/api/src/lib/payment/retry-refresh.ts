@@ -50,6 +50,7 @@ export type PaymentRetrySessionRow = {
   data: Record<string, unknown> | null
   context: Record<string, unknown> | null
   retry_count: number | string | null
+  retry_idempotency_key?: string | null
   payment_collection_id: string
   order_id: string | null
   customer_id: string | null
@@ -98,6 +99,32 @@ function extractSessionId(value: unknown): string | null {
     return typeof nestedId === "string" && nestedId.trim() ? nestedId : null
   }
   return null
+}
+
+function objectValue(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {}
+}
+
+function readString(value: unknown): string | null {
+  return typeof value === "string" && value.trim() ? value.trim() : null
+}
+
+function readReservationState(row: PaymentRetrySessionRow): {
+  state: string | null
+  idempotencyKey: string | null
+  createdSessionId: string | null
+} {
+  const context = objectValue(row.context)
+  return {
+    state: readString(context.gp_retry_reservation_state),
+    idempotencyKey:
+      readString(row.retry_idempotency_key) ??
+      readString(context.gp_payment_retry_idempotency_key) ??
+      readString(context.gp_last_retry_idempotency_key),
+    createdSessionId: readString(context.gp_retry_created_payment_session_id),
+  }
 }
 
 function assertOwnedSession(
@@ -172,15 +199,41 @@ function assertStripeProvider(row: PaymentRetrySessionRow): void {
   }
 }
 
-export async function refreshPaymentSessionForRetry<T>(
+function assertNoReservedRetry(row: PaymentRetrySessionRow): void {
+  const reservation = readReservationState(row)
+  if (!reservation.idempotencyKey) {
+    return
+  }
+
+  if (
+    reservation.state === "reserved" ||
+    (reservation.state === "created" && reservation.createdSessionId)
+  ) {
+    throw new PaymentRetryConflictError({
+      code: "payment_retry_pending",
+      publicMessage: PAYMENT_RETRY_PENDING_MESSAGE,
+    })
+  }
+
+  throw new PaymentRetryConflictError({
+    code: "payment_retry_support_required",
+    publicMessage: PAYMENT_RETRY_SUPPORT_REQUIRED_MESSAGE,
+  })
+}
+
+async function reserveRetryAttempt(
   client: PaymentRetryClient,
   input: {
     paymentCollectionId: string
     customerId?: string | null
     salesChannelId?: string | null
-    createSession: (args: CreateRetrySessionInput) => Promise<T>
   }
-): Promise<PaymentRetryRefreshResult<T>> {
+): Promise<{
+  currentSession: PaymentRetrySessionRow
+  retryCount: number
+  idempotencyKey: string
+  failure: PaymentAttemptClassificationResult & { classification: "retryable" }
+}> {
   await client.query("BEGIN")
   try {
     await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [
@@ -196,6 +249,7 @@ export async function refreshPaymentSessionForRetry<T>(
           ps.data,
           ps.context,
           ps.retry_count,
+          ps.retry_idempotency_key,
           ps.payment_collection_id,
           opc.order_id,
           o.customer_id,
@@ -218,6 +272,8 @@ export async function refreshPaymentSessionForRetry<T>(
 
     const currentSession = assertOwnedSession(latest.rows[0], input)
     assertStripeProvider(currentSession)
+    assertNoReservedRetry(currentSession)
+
     const failure = classifyPaymentAttempt({
       status: currentSession.status,
       data: currentSession.data,
@@ -232,10 +288,14 @@ export async function refreshPaymentSessionForRetry<T>(
       `
         UPDATE payment_session
            SET retry_count = $2,
+               retry_idempotency_key = $3,
                context = COALESCE(context, '{}'::jsonb) ||
                  jsonb_build_object(
-                   'gp_last_retry_idempotency_key', $3::text,
-                   'gp_last_retry_count', $2::int,
+                   'gp_retry_reservation_state', 'reserved',
+                   'gp_payment_retry', true,
+                   'gp_payment_retry_count', $2::int,
+                   'gp_payment_retry_idempotency_key', $3::text,
+                   'gp_previous_payment_session_id', $1::text,
                    'gp_last_retry_failure_code', $4::text,
                    'gp_last_retry_decline_code', $5::text
                  )
@@ -250,21 +310,35 @@ export async function refreshPaymentSessionForRetry<T>(
       ]
     )
 
-    const createdSession = await input.createSession({
-      currentSession,
-      idempotencyKey,
-      retryCount,
-    })
-    const createdSessionId = extractSessionId(createdSession)
-    if (!createdSessionId) {
-      throw new Error("Retry payment session creation did not return a payment_session id")
-    }
+    await client.query("COMMIT")
 
+    return {
+      currentSession,
+      retryCount,
+      idempotencyKey,
+      failure,
+    }
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => undefined)
+    throw err
+  }
+}
+
+async function finalizeRetryAttempt(
+  client: PaymentRetryClient,
+  input: {
+    reservedSessionId: string
+    createdSessionId: string
+    retryCount: number
+    idempotencyKey: string
+  }
+): Promise<void> {
+  await client.query("BEGIN")
+  try {
     await client.query(
       `
         UPDATE payment_session
            SET retry_count = $2,
-               retry_idempotency_key = $3,
                context = COALESCE(context, '{}'::jsonb) ||
                  jsonb_build_object(
                    'gp_payment_retry', true,
@@ -274,21 +348,106 @@ export async function refreshPaymentSessionForRetry<T>(
                  )
          WHERE id = $1
       `,
-      [createdSessionId, retryCount, idempotencyKey, currentSession.id]
+      [
+        input.createdSessionId,
+        input.retryCount,
+        input.idempotencyKey,
+        input.reservedSessionId,
+      ]
+    )
+
+    await client.query(
+      `
+        UPDATE payment_session
+           SET context = COALESCE(context, '{}'::jsonb) ||
+                 jsonb_build_object(
+                   'gp_retry_reservation_state', 'created',
+                   'gp_retry_created_payment_session_id', $2::text
+                 )
+         WHERE id = $1
+      `,
+      [input.reservedSessionId, input.createdSessionId]
     )
 
     await client.query("COMMIT")
-
-    return {
-      retry_count: retryCount,
-      idempotency_key: idempotencyKey,
-      payment_session_id: createdSessionId,
-      payment_session: createdSession,
-      previous_payment_session_id: currentSession.id,
-      failure,
-    }
   } catch (err) {
     await client.query("ROLLBACK").catch(() => undefined)
+    throw err
+  }
+}
+
+async function markRetryReservationFailed(
+  client: PaymentRetryClient,
+  reservedSessionId: string,
+  errorName: string
+): Promise<void> {
+  await client.query(
+    `
+      UPDATE payment_session
+         SET context = COALESCE(context, '{}'::jsonb) ||
+               jsonb_build_object(
+                 'gp_retry_reservation_state', 'failed_to_create',
+                 'gp_retry_failure_class', $2::text
+               )
+       WHERE id = $1
+    `,
+    [reservedSessionId, errorName]
+  )
+}
+
+export async function refreshPaymentSessionForRetry<T>(
+  client: PaymentRetryClient,
+  input: {
+    paymentCollectionId: string
+    customerId?: string | null
+    salesChannelId?: string | null
+    createSession: (args: CreateRetrySessionInput) => Promise<T>
+  }
+): Promise<PaymentRetryRefreshResult<T>> {
+  const reservation = await reserveRetryAttempt(client, {
+    paymentCollectionId: input.paymentCollectionId,
+    customerId: input.customerId,
+    salesChannelId: input.salesChannelId,
+  })
+
+  let createdSession: T
+  try {
+    createdSession = await input.createSession({
+      currentSession: reservation.currentSession,
+      idempotencyKey: reservation.idempotencyKey,
+      retryCount: reservation.retryCount,
+    })
+  } catch (err) {
+    await markRetryReservationFailed(
+      client,
+      reservation.currentSession.id,
+      (err as Error)?.name ?? "UnknownError"
+    ).catch(() => undefined)
+    throw err
+  }
+
+  try {
+    const createdSessionId = extractSessionId(createdSession)
+    if (!createdSessionId) {
+      throw new Error("Retry payment session creation did not return a payment_session id")
+    }
+
+    await finalizeRetryAttempt(client, {
+      reservedSessionId: reservation.currentSession.id,
+      createdSessionId,
+      retryCount: reservation.retryCount,
+      idempotencyKey: reservation.idempotencyKey,
+    })
+
+    return {
+      retry_count: reservation.retryCount,
+      idempotency_key: reservation.idempotencyKey,
+      payment_session_id: createdSessionId,
+      payment_session: createdSession,
+      previous_payment_session_id: reservation.currentSession.id,
+      failure: reservation.failure,
+    }
+  } catch (err) {
     throw err
   }
 }

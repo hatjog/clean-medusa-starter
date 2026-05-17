@@ -5,6 +5,10 @@ import {
   buildPaymentFailedContractEvent,
   buildPaymentAuditEnvelope,
 } from "../../../workflows/payment/stripe-payment-audit"
+import {
+  MISSING_FAILURE_METADATA_CODE,
+  hydrateStripePaymentAuditPayload,
+} from "../../../subscribers/stripe-payment-audit"
 
 function refundPayload(overrides: Record<string, unknown> = {}) {
   return {
@@ -85,6 +89,87 @@ function payload() {
 }
 
 describe("StripePaymentAuditWorkflow", () => {
+  it("hydrates native payment.failed payload from DB failure metadata", async () => {
+    const logger = { warn: jest.fn() }
+    const payload = await hydrateStripePaymentAuditPayload(
+      "payment.failed",
+      { id: "pay_native_1" },
+      {
+        resolve: () => ({
+          raw: async () => ({
+            rows: [
+              {
+                payment_id: "pay_native_1",
+                amount_minor: 19900,
+                currency_code: "pln",
+                payment_data: {
+                  id: "pi_native_1",
+                  last_payment_error: {
+                    code: "card_declined: raw provider detail",
+                    decline_code: "insufficient_funds",
+                  },
+                  payment_method_types: ["card"],
+                  payment_method_details: { card: { country: "PL" } },
+                },
+                payment_metadata: {},
+                session_data: {},
+                session_metadata: {},
+                order_id: "ord_native_1",
+                order_metadata: {},
+                sales_channel_id: "sc_1",
+              },
+            ],
+          }),
+        }),
+      },
+      logger
+    )
+
+    expect(payload).toMatchObject({
+      payment_id: "pay_native_1",
+      payment_intent_id: "pi_native_1",
+      order_id: "ord_native_1",
+      failure_code: "card_declined",
+      decline_code: "insufficient_funds",
+    })
+  })
+
+  it("uses support/manual-review sentinel when native payment.failed metadata is absent", async () => {
+    const logger = { warn: jest.fn() }
+    const payload = await hydrateStripePaymentAuditPayload(
+      "payment.failed",
+      { id: "pay_native_2" },
+      {
+        resolve: () => ({
+          raw: async () => ({
+            rows: [
+              {
+                payment_id: "pay_native_2",
+                amount_minor: 19900,
+                currency_code: "pln",
+                payment_data: {
+                  id: "pi_native_2",
+                  payment_method_types: ["card"],
+                  payment_method_details: { card: { country: "PL" } },
+                },
+                payment_metadata: {},
+                session_data: {},
+                session_metadata: {},
+                order_id: "ord_native_2",
+                order_metadata: {},
+                sales_channel_id: "sc_1",
+              },
+            ],
+          }),
+        }),
+      },
+      logger
+    )
+
+    expect(payload.failure_code).toBe(MISSING_FAILURE_METADATA_CODE)
+    expect(logger.warn).toHaveBeenCalled()
+  })
+
   it("builds HG-4-compatible audit envelope", () => {
     expect(buildPaymentAuditEnvelope("payment.failed", {
       event_id: "evt_1",

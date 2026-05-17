@@ -67,4 +67,20 @@ describe("Stripe payment failure classification", () => {
       }).classification
     ).toBe("pending")
   })
+
+  it("keeps pending PSP status ahead of stale historical last_payment_error", () => {
+    expect(
+      classifyPaymentAttempt({
+        status: "pending",
+        data: {
+          status: "processing",
+          last_payment_error: {
+            code: "card_declined",
+            decline_code: "insufficient_funds",
+          },
+        },
+        context: {},
+      }).classification
+    ).toBe("pending")
+  })
 })

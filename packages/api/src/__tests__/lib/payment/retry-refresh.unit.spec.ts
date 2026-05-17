@@ -9,8 +9,20 @@ type QueryCall = { sql: string; params: ReadonlyArray<unknown> }
 
 class FakeRetryClient {
   calls: QueryCall[] = []
+  rows = new Map<string, Record<string, unknown>>()
+  latestId: string | null
 
-  constructor(private readonly latestRow: Record<string, unknown> | null) {}
+  constructor(latestRow: Record<string, unknown> | null) {
+    this.latestId = typeof latestRow?.id === "string" ? latestRow.id : null
+    if (this.latestId && latestRow) {
+      this.rows.set(this.latestId, structuredClone(latestRow))
+    }
+  }
+
+  setLatest(row: Record<string, unknown>) {
+    this.latestId = row.id as string
+    this.rows.set(row.id as string, structuredClone(row))
+  }
 
   async query<T = Record<string, unknown>>(
     sql: string,
@@ -19,10 +31,65 @@ class FakeRetryClient {
     this.calls.push({ sql, params })
 
     if (sql.includes("FROM payment_session ps")) {
+      const latestRow = this.latestId ? this.rows.get(this.latestId) ?? null : null
       return {
-        rows: (this.latestRow ? [this.latestRow] : []) as T[],
-        rowCount: this.latestRow ? 1 : 0,
+        rows: (latestRow ? [structuredClone(latestRow)] : []) as T[],
+        rowCount: latestRow ? 1 : 0,
       }
+    }
+
+    if (sql.includes("SET retry_count = $2") && sql.includes("retry_idempotency_key = $3")) {
+      const row = this.rows.get(params[0] as string)
+      if (row) {
+        row.retry_count = params[1]
+        row.retry_idempotency_key = params[2]
+        row.context = {
+          ...(row.context as Record<string, unknown>),
+          gp_retry_reservation_state: "reserved",
+          gp_payment_retry_idempotency_key: params[2],
+        }
+      }
+      return { rows: [] as T[], rowCount: row ? 1 : 0 }
+    }
+
+    if (sql.includes("gp_retry_reservation_state', 'created'")) {
+      const row = this.rows.get(params[0] as string)
+      if (row) {
+        row.context = {
+          ...(row.context as Record<string, unknown>),
+          gp_retry_reservation_state: "created",
+          gp_retry_created_payment_session_id: params[1],
+        }
+      }
+      return { rows: [] as T[], rowCount: row ? 1 : 0 }
+    }
+
+    if (sql.includes("gp_payment_retry_idempotency_key")) {
+      const sessionId = params[0] as string
+      const row = this.rows.get(sessionId) ?? { id: sessionId }
+      row.retry_count = params[1]
+      row.context = {
+        ...(row.context as Record<string, unknown>),
+        gp_payment_retry: true,
+        gp_payment_retry_count: params[1],
+        gp_payment_retry_idempotency_key: params[2],
+        gp_previous_payment_session_id: params[3],
+      }
+      this.rows.set(sessionId, row)
+      this.latestId = sessionId
+      return { rows: [] as T[], rowCount: 1 }
+    }
+
+    if (sql.includes("gp_retry_reservation_state', 'failed_to_create'")) {
+      const row = this.rows.get(params[0] as string)
+      if (row) {
+        row.context = {
+          ...(row.context as Record<string, unknown>),
+          gp_retry_reservation_state: "failed_to_create",
+          gp_retry_failure_class: params[1],
+        }
+      }
+      return { rows: [] as T[], rowCount: row ? 1 : 0 }
     }
 
     return { rows: [] as T[], rowCount: 1 }
@@ -57,7 +124,23 @@ describe("payment retry refresh", () => {
 
   it("increments retry_count and creates one retry session with the derived idempotency key", async () => {
     const client = new FakeRetryClient(failedSession())
-    const createSession = jest.fn(async () => ({ id: "ps_retry_1" }))
+    let callCountAtCreate = 0
+    const createSession = jest.fn(async () => {
+      callCountAtCreate = client.calls.length
+      client.setLatest({
+        id: "ps_retry_1",
+        provider_id: "pp_stripe_stripe",
+        status: "pending",
+        data: { id: "pi_retry_1" },
+        context: {},
+        retry_count: 0,
+        payment_collection_id: "paycol_1",
+        order_id: "order_123",
+        customer_id: "cus_1",
+        sales_channel_id: "sc_1",
+      })
+      return { id: "ps_retry_1" }
+    })
 
     const result = await refreshPaymentSessionForRetry(client, {
       paymentCollectionId: "paycol_1",
@@ -75,13 +158,14 @@ describe("payment retry refresh", () => {
         retryCount: 1,
       })
     )
-    expect(
-      client.calls.some(
-        (call) =>
-          call.sql.includes("UPDATE payment_session") &&
-          call.sql.includes("retry_idempotency_key")
-      )
-    ).toBe(true)
+    expect(client.calls[callCountAtCreate - 1]?.sql).toBe("COMMIT")
+    expect(client.calls.slice(callCountAtCreate).some((call) => call.sql === "BEGIN")).toBe(true)
+    expect(client.rows.get("ps_retry_1")).toMatchObject({
+      retry_count: 1,
+      context: expect.objectContaining({
+        gp_payment_retry_idempotency_key: "order_123_1",
+      }),
+    })
   })
 
   it("rejects a still-pending previous attempt with 409 and no new session", async () => {
@@ -104,6 +188,35 @@ describe("payment retry refresh", () => {
       status: 409,
       code: "payment_retry_pending",
       publicMessage: PAYMENT_RETRY_PENDING_MESSAGE,
+    })
+    expect(createSession).not.toHaveBeenCalled()
+  })
+
+  it("prioritizes pending PSP status over stale last_payment_error metadata", async () => {
+    const client = new FakeRetryClient(
+      failedSession({
+        status: "pending",
+        data: {
+          status: "processing",
+          last_payment_error: {
+            code: "card_declined",
+            decline_code: "insufficient_funds",
+          },
+        },
+      })
+    )
+    const createSession = jest.fn()
+
+    await expect(
+      refreshPaymentSessionForRetry(client, {
+        paymentCollectionId: "paycol_1",
+        customerId: "cus_1",
+        salesChannelId: "sc_1",
+        createSession,
+      })
+    ).rejects.toMatchObject({
+      status: 409,
+      code: "payment_retry_pending",
     })
     expect(createSession).not.toHaveBeenCalled()
   })
@@ -150,6 +263,33 @@ describe("payment retry refresh", () => {
     ).rejects.toMatchObject({
       status: 409,
       code: "payment_retry_support_required",
+    })
+    expect(createSession).not.toHaveBeenCalled()
+  })
+
+  it("blocks replay when the same retry key is already reserved", async () => {
+    const client = new FakeRetryClient(
+      failedSession({
+        retry_count: 1,
+        retry_idempotency_key: "order_123_1",
+        context: {
+          gp_retry_reservation_state: "reserved",
+          gp_payment_retry_idempotency_key: "order_123_1",
+        },
+      })
+    )
+    const createSession = jest.fn()
+
+    await expect(
+      refreshPaymentSessionForRetry(client, {
+        paymentCollectionId: "paycol_1",
+        customerId: "cus_1",
+        salesChannelId: "sc_1",
+        createSession,
+      })
+    ).rejects.toMatchObject({
+      status: 409,
+      code: "payment_retry_pending",
     })
     expect(createSession).not.toHaveBeenCalled()
   })

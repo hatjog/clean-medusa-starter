@@ -191,11 +191,6 @@ export function classifyStripeFailure(
 export function classifyPaymentAttempt(
   input: PaymentAttemptClassificationInput
 ): PaymentAttemptClassificationResult {
-  const failure = extractStripeFailureDetails(input.data, input.context)
-  if (failure.failure_code || failure.decline_code) {
-    return classifyStripeFailure(failure)
-  }
-
   const sessionStatus = input.status?.toLowerCase()
   const data = objectValue(input.data)
   const intentStatus =
@@ -207,6 +202,11 @@ export function classifyPaymentAttempt(
     (intentStatus && PENDING_INTENT_STATUSES.has(intentStatus))
   ) {
     return { classification: "pending" }
+  }
+
+  const failure = extractStripeFailureDetails(input.data, input.context)
+  if (failure.failure_code || failure.decline_code) {
+    return classifyStripeFailure(failure)
   }
 
   return classifyStripeFailure(failure)

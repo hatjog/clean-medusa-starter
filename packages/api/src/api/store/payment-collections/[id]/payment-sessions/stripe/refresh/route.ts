@@ -180,7 +180,7 @@ export const POST = async (
     }
 
     const error = err as Error
-    logger.error?.(`[payment-retry-refresh] failed: ${error.name}: ${error.message}`)
+    logger.error?.(`[payment-retry-refresh] failed class=${error.name}`)
     res.status(503).json({
       type: "service_unavailable",
       message: "Payment retry is temporarily unavailable",
