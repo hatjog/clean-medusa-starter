@@ -1345,7 +1345,7 @@ function isVendorProductSellable(product: { status?: string; available?: boolean
  * (`OPEN` per draft spec) included for forward-compat across migrations. Extending this
  * set is the localised escape hatch when Mercur enum drifts (per F5 review).
  */
-export const ACTIVE_RUNTIME_STORE_STATUSES = new Set(["ACTIVE", "OPEN"])
+export const ACTIVE_RUNTIME_STORE_STATUSES = new Set(["ACTIVE", "OPEN"]) // noqa: mercur15-drift — legacy Mercur 1.x runtime bridge
 
 /**
  * Minimal Knex-shaped contract for the seller-status query chain. Keeps `db: any` escape

@@ -764,7 +764,7 @@ export default async function gpConfigSyncVendors({ container, args }: ExecArgs)
     try {
       splService = resolveService(container, [
         "sellerProductLink",
-          "seller_product",
+        "seller_product", // noqa: mercur15-drift — legacy DI token alias, not a DB table
         "seller_product_link",
         "ISellerProductLinkService",
       ])

@@ -1544,10 +1544,10 @@ describe("buildVendorPricingMap — runtime-state-map", () => {
   // AC4 (a) — Mixed-status happy path
   it("(a) includes only ACTIVE sellers when runtime rows provided", async () => {
     const dbRows = [
-      { handle: "seller-a", store_status: "ACTIVE" },
-      { handle: "seller-b", store_status: "ACTIVE" },
-      { handle: "seller-c", store_status: "ACTIVE" },
-      { handle: "seller-d", store_status: "SUSPENDED" },
+      { handle: "seller-a", store_status: "ACTIVE" }, // noqa: mercur15-drift — legacy bridge fixture
+      { handle: "seller-b", store_status: "ACTIVE" }, // noqa: mercur15-drift — legacy bridge fixture
+      { handle: "seller-c", store_status: "ACTIVE" }, // noqa: mercur15-drift — legacy bridge fixture
+      { handle: "seller-d", store_status: "SUSPENDED" }, // noqa: mercur15-drift — legacy bridge fixture
       { handle: "seller-e", store_status: "CLOSED" },
     ]
     const { db, whereIn, whereRaw, select } = makeDbStub(dbRows)
@@ -1633,8 +1633,8 @@ describe("buildVendorPricingMap — runtime-state-map", () => {
   it("(c) falls back to config status for vendor with no runtime row", async () => {
     // DB returns rows for seller-1 and seller-2 only; seller-3 has no runtime row
     const dbRows = [
-      { handle: "seller-1", store_status: "ACTIVE" },
-      { handle: "seller-2", store_status: "SUSPENDED" },
+      { handle: "seller-1", store_status: "ACTIVE" }, // noqa: mercur15-drift — legacy bridge fixture
+      { handle: "seller-2", store_status: "SUSPENDED" }, // noqa: mercur15-drift — legacy bridge fixture
     ]
     const { db } = makeDbStub(dbRows)
 
@@ -1657,8 +1657,8 @@ describe("buildVendorPricingMap — runtime-state-map", () => {
     const warnings: string[] = []
     const map = await buildVendorPricingMap("/config/bonbeauty/market.yaml", warnings, db, "bonbeauty")
 
-    expect(map.has("p1")).toBe(true)  // runtime ACTIVE
-    expect(map.has("p2")).toBe(false) // runtime SUSPENDED
+    expect(map.has("p1")).toBe(true)  // runtime ACTIVE // noqa: mercur15-drift — assertion label
+    expect(map.has("p2")).toBe(false) // runtime SUSPENDED // noqa: mercur15-drift — assertion label
     expect(map.has("p3")).toBe(true)  // no runtime row → config "active" → included
 
     // F4 fix: aggregated drift warning is emitted for slugged vendors lacking runtime row
@@ -1700,7 +1700,7 @@ describe("buildVendorPricingMap — runtime-state-map", () => {
 
   // AC4 (e) — Slug missing on config vendor → fallback to config status, no crash
   it("(e) handles vendors with missing slug gracefully — falls back to config status", async () => {
-    const dbRows = [{ handle: "slug-vendor", store_status: "ACTIVE" }]
+    const dbRows = [{ handle: "slug-vendor", store_status: "ACTIVE" }] // noqa: mercur15-drift — legacy bridge fixture
     const { db } = makeDbStub(dbRows)
 
     setupMarketFile(
@@ -1733,7 +1733,7 @@ describe("buildVendorPricingMap — runtime-state-map", () => {
     const dbRows = [
       { handle: "seller-open", store_status: "OPEN" },
       { handle: "seller-open-lc", store_status: "open" }, // case-insensitive
-      { handle: "seller-suspended", store_status: "SUSPENDED" },
+      { handle: "seller-suspended", store_status: "SUSPENDED" }, // noqa: mercur15-drift — legacy bridge fixture
     ]
     const { db } = makeDbStub(dbRows)
 
@@ -1795,7 +1795,7 @@ describe("buildVendorPricingMap — runtime-state-map", () => {
     const dbRows = [
       { handle: "seller-null", store_status: null },
       { handle: "seller-empty", store_status: "" },
-      { handle: "seller-active", store_status: "ACTIVE" },
+      { handle: "seller-active", store_status: "ACTIVE" }, // noqa: mercur15-drift — legacy bridge fixture
     ]
     const { db } = makeDbStub(dbRows)
 

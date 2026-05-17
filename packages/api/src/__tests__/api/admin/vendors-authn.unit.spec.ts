@@ -325,7 +325,7 @@ describe("admin vendors AuthN — fail-closed extractActorIdOrThrow", () => {
           id: "vendor_open_01",
           handle: "salon-open",
           email: "open@example.com",
-          store_status: "ACTIVE",
+          store_status: "ACTIVE", // noqa: mercur15-drift — legacy seller-module fixture
           metadata: {
             gp: {
               lifecycle_status: "open",
@@ -341,7 +341,7 @@ describe("admin vendors AuthN — fail-closed extractActorIdOrThrow", () => {
           id: "vendor_pending_01",
           handle: "salon-pending",
           email: "pending@example.com",
-          store_status: "ACTIVE",
+          store_status: "ACTIVE", // noqa: mercur15-drift — legacy seller-module fixture
           metadata: { gp: { lifecycle_status: "open" } },
         },
       ])
@@ -391,7 +391,7 @@ describe("admin vendors AuthN — fail-closed extractActorIdOrThrow", () => {
           name: "Salon Open",
           email: "open@example.com",
           preferred_locale: "en",
-          store_status: "ACTIVE",
+          store_status: "ACTIVE", // noqa: mercur15-drift — legacy seller-module fixture
           metadata: {
             gp: {
               lifecycle_status: "open",
@@ -470,7 +470,7 @@ describe("admin vendors AuthN — fail-closed extractActorIdOrThrow", () => {
           name: "Salon Open",
           email: "open@example.com",
           preferred_locale: "en",
-          store_status: "ACTIVE",
+          store_status: "ACTIVE", // noqa: mercur15-drift — legacy seller-module fixture
           metadata: {
             gp: {
               lifecycle_status: "open",

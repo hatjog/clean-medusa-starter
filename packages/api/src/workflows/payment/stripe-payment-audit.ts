@@ -3,8 +3,20 @@ import {
   createStep,
   createWorkflow,
   StepResponse,
+  transform,
   WorkflowResponse,
 } from "@medusajs/framework/workflows-sdk"
+
+// C1 / Story 1.8 security decision (2026-05-17): the manual refund executed by
+// the operator in the Stripe Dashboard is the SOURCE OF TRUTH. The
+// `payment.refunded` webhook path is reconcile/audit-only — it MUST NOT create
+// a second refund at the provider. The Medusa-native `refundPaymentWorkflow`
+// (`@medusajs/core-flows`) is intentionally NOT imported/called here: it routes
+// `refundPaymentStep → paymentModuleService.refundPayment() → provider.refundPayment()`
+// which for Stripe issues a real `stripe.refunds.create()` (double-refund risk).
+// AC1 wording still says `refundPaymentWorkflow`; that wording↔code conflict is
+// closed as a contract-semver / story-wording deferral (see Dev Agent Record +
+// review Fixes Applied) — code stays reconcile-only.
 
 import {
   compensateIssuedEntitlement,
@@ -37,6 +49,9 @@ export type StripePaymentAuditPayload = {
   decline_code?: string | null
   amount_minor?: number | null
   currency?: string | null
+  refund_id?: string | null
+  refund_amount?: number | null
+  refund_reason?: string | null
   entitlement_profile?: {
     profile_id?: string
     entitlement_type?: EntitlementType | string
@@ -60,6 +75,25 @@ export type PaymentAuditEnvelope = {
   decline_code?: string
   payment_method_type?: string
   processing_country?: string
+  currency?: string
+  refund_id?: string
+  refund_amount?: number
+  refund_reason?: string
+}
+
+// Reconcile-only result. There is no provider mutation on this path, so there
+// is nothing to compensate (manual Stripe refund already happened and is the
+// source of truth). `reconciled` records that the audit/reconcile side-effect
+// ran exactly once for this event_id; `skipped` + `skipReason` make replay /
+// non-refund no-ops explicit (NOT a silent success — AC2 / C3).
+export type StripeRefundReconcileResult = {
+  payment_id: string
+  refund_id?: string | null
+  refund_amount?: number | null
+  reconciled: boolean
+  skipped: boolean
+  skipReason?: "not-a-refund-event" | "replay-deduplicated"
+  degraded?: boolean
 }
 
 export type StripePaymentAuditResult = {
@@ -67,6 +101,7 @@ export type StripePaymentAuditResult = {
   envelope: PaymentAuditEnvelope
   deduplicated: boolean
   entitlement?: IssueEntitlementResult
+  refundReconcile?: StripeRefundReconcileResult
 }
 
 type QueryResult<T> = Promise<{ rows: T[]; rowCount?: number | null }>
@@ -302,6 +337,16 @@ export function buildPaymentAuditEnvelope(
   const failureCode = redactFailureCode(payload.failure_code)
   if (failureCode) envelope.failure_code = failureCode
   if (payload.decline_code) envelope.decline_code = payload.decline_code
+  if (eventType === "payment.refunded") {
+    if (payload.refund_id) envelope.refund_id = payload.refund_id
+    envelope.refund_amount = payload.refund_amount ?? undefined
+    envelope.refund_reason = payload.refund_reason ?? "unspecified"
+    // C6: persist the real currency code in the envelope so the admin
+    // refund-history route can render "amount + waluta" without abusing
+    // `market_id` as a currency. `currency` is hydrated from
+    // `payment.currency_code` by the subscriber translator.
+    if (payload.currency) envelope.currency = payload.currency.toUpperCase()
+  }
   return envelope
 }
 
@@ -324,6 +369,116 @@ async function insertDedupRow(
   )
   return (result.rowCount ?? 0) === 1
 }
+
+export type ReconcileRefundInput = {
+  eventType: StripePaymentEventName
+  deduplicated: boolean
+  payment_id?: string | null
+  payment_intent_id?: string | null
+  refund_id?: string | null
+  refund_amount?: number | null
+  refund_reason?: string | null
+}
+
+// Pure, testable reconcile-only logic (C1/C2/C3/C5). NO provider call.
+//   - Not a refund event           → explicit no-op (skipReason).
+//   - Replay (dedup hit, C2)       → explicit no-op; the audit/reconcile
+//                                    side-effect ran already for this event_id,
+//                                    so a replay MUST NOT reconcile a 2nd time.
+//   - First delivery               → emit a structured reconcile log so the
+//                                    audit chain honestly states "reconciled
+//                                    from Stripe webhook; no provider refund
+//                                    created". Missing refund_id/amount is
+//                                    surfaced as a loud `warn` (NOT swallowed —
+//                                    AC2 silent-failure ban / C3), the row is
+//                                    still persisted (dedup row = audit truth).
+// No compensation function (M2): there is no external mutation on this path to
+// undo. Rolling back the dedup row is owned by `persistStripePaymentAuditStep`'s
+// compensation. No minor→major unit conversion (M3): no provider call consumes
+// `refund_amount`; it is audit/display-only, consistent with `amount_minor`.
+export function reconcileManualRefund(
+  input: ReconcileRefundInput,
+  logger?: LoggerLike
+): StripeRefundReconcileResult {
+  if (input.eventType !== "payment.refunded" || !input.payment_id) {
+    return {
+      payment_id: input.payment_id ?? "",
+      reconciled: false,
+      skipped: true,
+      skipReason: "not-a-refund-event",
+    }
+  }
+
+  if (input.deduplicated) {
+    logger?.info?.(
+      `[stripe-payment-audit] payment.refunded reconcile skipped (replay) ` +
+        `payment_id=${input.payment_id} — dedup hit, no second reconcile`
+    )
+    return {
+      payment_id: input.payment_id,
+      reconciled: false,
+      skipped: true,
+      skipReason: "replay-deduplicated",
+    }
+  }
+
+  const degraded = !input.refund_id || input.refund_amount == null
+  if (degraded) {
+    // Not silent: explicit warn so an operator/alert sees the gap during a
+    // financial reconcile instead of an "info refunded" with missing data.
+    logger?.warn?.(
+      `[stripe-payment-audit] payment.refunded reconcile degraded ` +
+        `payment_id=${input.payment_id} ` +
+        `refund_id=${input.refund_id ?? "<missing>"} ` +
+        `refund_amount=${input.refund_amount ?? "<missing>"} — ` +
+        `audit row persisted; verify against Stripe Dashboard (source of truth)`
+    )
+  } else {
+    logger?.info?.(
+      `[stripe-payment-audit] payment.refunded reconciled ` +
+        `payment_id=${input.payment_id} refund_id=${input.refund_id} ` +
+        `refund_amount=${input.refund_amount} — reconcile-only, ` +
+        `no provider-side refund created (manual Stripe Dashboard refund is SoT)`
+    )
+  }
+
+  return {
+    payment_id: input.payment_id,
+    refund_id: input.refund_id ?? null,
+    refund_amount: input.refund_amount ?? null,
+    reconciled: true,
+    skipped: false,
+    degraded,
+  }
+}
+
+export const reconcileRefundStep = createStep<
+  ReconcileRefundInput,
+  StripeRefundReconcileResult,
+  void
+>("gp-reconcile-manual-refund", async (input, { container }) => {
+  let logger: LoggerLike | undefined
+  try {
+    logger = (
+      container as unknown as { resolve: (key: string) => unknown }
+    ).resolve("logger") as LoggerLike
+  } catch {
+    logger = undefined
+  }
+  try {
+    return new StepResponse(reconcileManualRefund(input, logger))
+  } catch (err) {
+    // Reconcile-only failures are NOT swallowed (C3): log error and rethrow so
+    // the workflow fails and `persistStripePaymentAuditStep` compensation rolls
+    // back the dedup row (event becomes replayable).
+    const error = err as Error
+    logger?.error?.(
+      `[stripe-payment-audit] payment.refunded reconcile failed: ` +
+        `${error.name}: ${error.message}`
+    )
+    throw err
+  }
+})
 
 export function createStripePaymentAuditWorkflowFromScope(scope: {
   resolve: (key: string) => unknown
@@ -432,7 +587,24 @@ export const stripePaymentAuditWorkflow = createWorkflow<
 >("gp-stripe-payment-audit-workflow", function (input) {
   const result = persistStripePaymentAuditStep(input)
   emitStripePaymentAuditStep({ result, payload: input.payload })
-  return new WorkflowResponse(result)
+  const refundReconcile = reconcileRefundStep({
+    eventType: input.eventType,
+    deduplicated: result.deduplicated,
+    payment_id: input.payload.payment_id,
+    payment_intent_id: input.payload.payment_intent_id,
+    refund_id: input.payload.refund_id,
+    refund_amount: input.payload.refund_amount,
+    refund_reason: input.payload.refund_reason,
+  })
+  // M1: compose step outputs via `transform` (WorkflowData proxies cannot be
+  // spread at graph-definition time; the prior `{ ...result } as ...` cast
+  // masked that and risked a malformed runtime output).
+  return new WorkflowResponse(
+    transform({ result, refundReconcile }, (data) => ({
+      ...data.result,
+      refundReconcile: data.refundReconcile,
+    }))
+  )
 })
 
 export { MissingEntitlementProfileError }

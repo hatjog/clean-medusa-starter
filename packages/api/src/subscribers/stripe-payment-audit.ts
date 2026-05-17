@@ -158,6 +158,18 @@ async function hydrateStripePaymentAuditPayload(
     readNestedString(sessionMetadata, ["market_id"]) ??
     null
 
+  // C4: the only translator event→payload is here. Native Medusa
+  // `payment.refunded` carries just `{ id: <payment_id> }` (see
+  // core-flows refund-payment workflow `emitEventStep`), so refund fields MUST
+  // be hydrated from the DB — they are NOT on the event. Without this the
+  // envelope would always emit refund_amount=undefined / refund_reason=
+  // "unspecified" / refund_id missing in production (test payloads inject them
+  // directly and masked the gap).
+  const refundFields =
+    eventName === "payment.refunded"
+      ? await hydrateRefundFields(db, paymentId, paymentData, data)
+      : {}
+
   const fallbackFields = [
     data.event_id ? null : "event_id",
     data.request_id ? null : "request_id",
@@ -202,6 +214,76 @@ async function hydrateStripePaymentAuditPayload(
       data.amount_minor ??
       (typeof row.amount_minor === "number" ? row.amount_minor : Number(row.amount_minor ?? 0)),
     currency: data.currency ?? readString(row.currency_code)?.toUpperCase(),
+    ...refundFields,
+  }
+}
+
+// C4: hydrate Stripe refund fields from the Medusa `refund` table (latest
+// refund of the payment). `refund.amount` is treated as the audit/display
+// amount consistent with the existing `p.amount AS amount_minor` convention
+// inherited from Story 1.3 (no provider call consumes it — no unit-conversion
+// risk, M3). `refund_id` (Stripe `re_*`) is best-effort from refund.metadata;
+// Medusa's native refund record does not guarantee the Stripe id, so a missing
+// value falls back to `null` (explicit — surfaced as a loud reconcile `warn`
+// downstream, NOT a silent omission). See Dev Agent Record note.
+async function hydrateRefundFields(
+  db: KnexLike,
+  paymentId: string,
+  paymentData: Record<string, unknown>,
+  data: StripePaymentAuditPayload
+): Promise<Partial<StripePaymentAuditPayload>> {
+  let result: { rows?: unknown[] }
+  try {
+    result = await db.raw(
+      `
+        SELECT
+          r.id            AS medusa_refund_id,
+          r.amount        AS refund_amount,
+          r.note          AS refund_note,
+          r.metadata      AS refund_metadata,
+          rr.code         AS reason_code,
+          rr.label        AS reason_label
+        FROM refund r
+        LEFT JOIN refund_reason rr
+          ON rr.id = r.refund_reason_id
+         AND rr.deleted_at IS NULL
+        WHERE r.payment_id = ?
+          AND r.deleted_at IS NULL
+        ORDER BY r.created_at DESC
+        LIMIT 1
+      `,
+      [paymentId]
+    )
+  } catch {
+    return {}
+  }
+
+  const row = result.rows?.[0] as Record<string, unknown> | undefined
+  if (!row) return {}
+
+  const refundMetadata = objectValue(row.refund_metadata)
+  const refundAmountRaw =
+    typeof row.refund_amount === "number"
+      ? row.refund_amount
+      : Number(row.refund_amount ?? Number.NaN)
+
+  return {
+    refund_id:
+      data.refund_id ??
+      readNestedString(refundMetadata, ["stripe_refund_id"]) ??
+      readNestedString(refundMetadata, ["refund_id"]) ??
+      readNestedString(refundMetadata, ["id"]) ??
+      readNestedString(paymentData, ["latest_charge", "refund"]) ??
+      null,
+    refund_amount:
+      data.refund_amount ?? (Number.isFinite(refundAmountRaw) ? refundAmountRaw : null),
+    refund_reason:
+      data.refund_reason ??
+      readNestedString(refundMetadata, ["reason"]) ??
+      readString(row.reason_code) ??
+      readString(row.reason_label) ??
+      readString(row.refund_note) ??
+      null,
   }
 }
 
