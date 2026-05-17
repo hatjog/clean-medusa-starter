@@ -38,6 +38,7 @@ export type StripePaymentEventName = (typeof STRIPE_PAYMENT_EVENTS)[number]
 export type PaymentAuditOutcome = "captured" | "failed" | "canceled" | "refunded"
 
 export type StripePaymentAuditPayload = {
+  id?: string
   event_id?: string
   request_id?: string
   payment_intent_id?: string

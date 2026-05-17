@@ -10,6 +10,7 @@ import { ContainerRegistrationKeys } from "@medusajs/framework/utils"
 import { createProductsWorkflow, linkProductsToSalesChannelWorkflow, upsertVariantPricesWorkflow } from "@medusajs/core-flows"
 
 import fs from "node:fs/promises"
+import * as fsSync from "node:fs"
 import path from "node:path"
 
 import * as yaml from "js-yaml"
@@ -70,6 +71,47 @@ type Prerequisites = {
 }
 
 // ---- Utilities (pattern from gp-config-sync-media) ----
+
+const DEFAULT_WARNING_THRESHOLD = 3
+const DEFAULT_SUMMARY_PATH = "_grow/output/sync-catalog-last-run.json"
+
+function dedupeWarnings(warnings: string[]): string[] {
+  return Array.from(new Set(warnings))
+}
+
+function resolveProjectRoot(start: string): string {
+  let current = path.resolve(start)
+
+  while (true) {
+    if (
+      fsSyncExists(path.join(current, "_grow")) ||
+      fsSyncExists(path.join(current, "specs"))
+    ) {
+      return current
+    }
+
+    const parent = path.dirname(current)
+    if (parent === current) {
+      return path.resolve(start)
+    }
+    current = parent
+  }
+}
+
+function fsSyncExists(candidate: string): boolean {
+  try {
+    return fsSync.existsSync(candidate)
+  } catch {
+    return false
+  }
+}
+
+function resolveSummaryPath(): string {
+  return path.resolve(
+    process.env.GP_SYNC_CATALOG_SUMMARY ??
+      path.join(resolveProjectRoot(process.cwd()), DEFAULT_SUMMARY_PATH)
+  )
+}
 
 export function parseArgs(args: string[] | undefined): {
   instanceId: string
@@ -1863,9 +1905,18 @@ export default async function gpConfigSyncCatalog({ container, args }: ExecArgs)
     console.log(`Vendor status gate: ${draftedCount} product(s) set to draft`)
   }
 
+  const uniqueWarnings = dedupeWarnings(warnings)
+  const warningThreshold = Number.parseInt(
+    process.env.GP_SYNC_CATALOG_MAX_WARNINGS ?? String(DEFAULT_WARNING_THRESHOLD),
+    10
+  )
+  const maxWarnings = Number.isFinite(warningThreshold)
+    ? warningThreshold
+    : DEFAULT_WARNING_THRESHOLD
+
   // JSON summary (like sync-media)
   const summary = {
-    ok: warnings.length === 0,
+    ok: uniqueWarnings.length <= maxWarnings,
     dry_run: dryRun,
     instance_id: instanceId,
     market_id: marketId,
@@ -1876,7 +1927,8 @@ export default async function gpConfigSyncCatalog({ container, args }: ExecArgs)
     products: productCounts,
     orphan_reconcile: { drafted: orphanDraftedCount },
     vendor_gate: { drafted: draftedCount },
-    warnings,
+    warnings: uniqueWarnings,
+    warning_threshold: maxWarnings,
     timestamp: new Date().toISOString(),
   }
 
@@ -1884,10 +1936,17 @@ export default async function gpConfigSyncCatalog({ container, args }: ExecArgs)
     console.log(collector.renderTable())
   }
 
-  console.log(JSON.stringify(summary, null, 2))
+  const summaryJson = JSON.stringify(summary, null, 2)
+  const summaryPath = resolveSummaryPath()
+  await fs.mkdir(path.dirname(summaryPath), { recursive: true })
+  await fs.writeFile(summaryPath, `${summaryJson}\n`, "utf8")
+  console.log(summaryJson)
+  console.log(`Summary written: ${summaryPath}`)
 
-  // Signal warnings via exit code (non-destructive — lets event loop drain)
-  if (warnings.length > 0 && !dryRun) {
+  // Signal blocking warning volume via exit code (non-destructive — lets event loop drain).
+  // The threshold mirrors validate_sync_catalog_output.py so local sync and quality gate
+  // classify the same result consistently.
+  if (uniqueWarnings.length > maxWarnings && !dryRun) {
     process.exitCode = 1
   }
 }

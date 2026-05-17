@@ -16,6 +16,7 @@
 
 import { describe, it, expect, beforeEach, afterEach, jest } from "@jest/globals"
 import { VoucherService } from "../service"
+import type { CancellationPaymentRefundSeam } from "../service"
 import type { VoucherWithEvents } from "../models/types"
 import {
   EntitlementInstanceState,
@@ -645,7 +646,8 @@ describe("VoucherService", () => {
     it("applies charge_card cancellation fee through refund seam inside cutoff", async () => {
       const scheduledAt = new Date("2026-05-17T10:00:00.000Z")
       const cancelledAt = new Date("2026-05-17T03:00:00.000Z")
-      const paymentRefund = jest.fn()
+      const paymentRefund =
+        jest.fn() as jest.MockedFunction<CancellationPaymentRefundSeam>
       const row = {
         ...ENTITLEMENT_REBOOK_ROW,
         remaining_amount: 10000,
