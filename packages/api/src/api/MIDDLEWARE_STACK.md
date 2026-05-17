@@ -28,6 +28,7 @@ Po globalnym chainie dokładane są middleware specyficzne dla wybranych ścież
 
 | Matcher | Dodatkowe middleware | Po co istnieją |
 |---|---|---|
+| `/store/payment-collections/:id/payment-sessions/stripe/refresh` `POST` | `authenticate("customer", ["session", "bearer"])` | Mutacyjna ścieżka retry płatności; wymaga właściciela zamówienia zanim route atomowo utworzy nową próbę płatności. |
 | `/store/customers` `POST` | `customerRegistrationMarketGuardMiddleware` -> `customerScopedCustomerCreateMiddleware` -> `customerResponseSanitizerMiddleware` | Pilnuje zgodności auth identity z marketem, scopinguje email/metadata przy tworzeniu customera i usuwa prefix email z odpowiedzi. |
 | `/store/customers/me*` `ALL` | `customerResponseSanitizerMiddleware` | Usuwa `{market_id}::` z pól email przed wysłaniem payloadu do klienta. |
 | `/store/orders*` `ALL` | `customerResponseSanitizerMiddleware` | Ten sam cel co wyżej dla odpowiedzi order/customer. |

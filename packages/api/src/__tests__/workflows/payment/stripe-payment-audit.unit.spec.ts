@@ -2,8 +2,13 @@ import {
   MissingNativeStripePayloadFieldError,
   reconcileManualRefund,
   StripePaymentAuditWorkflow,
+  buildPaymentFailedContractEvent,
   buildPaymentAuditEnvelope,
 } from "../../../workflows/payment/stripe-payment-audit"
+import {
+  MISSING_FAILURE_METADATA_CODE,
+  hydrateStripePaymentAuditPayload,
+} from "../../../subscribers/stripe-payment-audit"
 
 function refundPayload(overrides: Record<string, unknown> = {}) {
   return {
@@ -84,6 +89,87 @@ function payload() {
 }
 
 describe("StripePaymentAuditWorkflow", () => {
+  it("hydrates native payment.failed payload from DB failure metadata", async () => {
+    const logger = { warn: jest.fn() }
+    const payload = await hydrateStripePaymentAuditPayload(
+      "payment.failed",
+      { id: "pay_native_1" },
+      {
+        resolve: () => ({
+          raw: async () => ({
+            rows: [
+              {
+                payment_id: "pay_native_1",
+                amount_minor: 19900,
+                currency_code: "pln",
+                payment_data: {
+                  id: "pi_native_1",
+                  last_payment_error: {
+                    code: "card_declined: raw provider detail",
+                    decline_code: "insufficient_funds",
+                  },
+                  payment_method_types: ["card"],
+                  payment_method_details: { card: { country: "PL" } },
+                },
+                payment_metadata: {},
+                session_data: {},
+                session_metadata: {},
+                order_id: "ord_native_1",
+                order_metadata: {},
+                sales_channel_id: "sc_1",
+              },
+            ],
+          }),
+        }),
+      },
+      logger
+    )
+
+    expect(payload).toMatchObject({
+      payment_id: "pay_native_1",
+      payment_intent_id: "pi_native_1",
+      order_id: "ord_native_1",
+      failure_code: "card_declined",
+      decline_code: "insufficient_funds",
+    })
+  })
+
+  it("uses support/manual-review sentinel when native payment.failed metadata is absent", async () => {
+    const logger = { warn: jest.fn() }
+    const payload = await hydrateStripePaymentAuditPayload(
+      "payment.failed",
+      { id: "pay_native_2" },
+      {
+        resolve: () => ({
+          raw: async () => ({
+            rows: [
+              {
+                payment_id: "pay_native_2",
+                amount_minor: 19900,
+                currency_code: "pln",
+                payment_data: {
+                  id: "pi_native_2",
+                  payment_method_types: ["card"],
+                  payment_method_details: { card: { country: "PL" } },
+                },
+                payment_metadata: {},
+                session_data: {},
+                session_metadata: {},
+                order_id: "ord_native_2",
+                order_metadata: {},
+                sales_channel_id: "sc_1",
+              },
+            ],
+          }),
+        }),
+      },
+      logger
+    )
+
+    expect(payload.failure_code).toBe(MISSING_FAILURE_METADATA_CODE)
+    expect(logger.warn).toHaveBeenCalled()
+  })
+
   it("builds HG-4-compatible audit envelope", () => {
     expect(buildPaymentAuditEnvelope("payment.failed", {
       event_id: "evt_1",
@@ -103,6 +189,59 @@ describe("StripePaymentAuditWorkflow", () => {
       event_type: "payment.failed",
       failure_code: "card_declined",
       decline_code: "insufficient_funds",
+    })
+  })
+
+  it("builds gp.payments.payment_failed.v1 contract event with redacted failure_code", () => {
+    const result = {
+      event_id: "evt_1",
+      deduplicated: false,
+      envelope: buildPaymentAuditEnvelope("payment.failed", {
+        event_id: "evt_1",
+        request_id: "req_1",
+        payment_intent_id: "pi_1",
+        payment_id: "pay_1",
+        order_id: "ord_1",
+        market_id: "bonbeauty",
+        payment_method_type: "card",
+        processing_country: "PL",
+        failure_code: "card_declined: insufficient_funds",
+        decline_code: "insufficient_funds",
+      }),
+    }
+
+    expect(
+      buildPaymentFailedContractEvent(
+        result,
+        {
+          event_id: "evt_1",
+          request_id: "req_1",
+          payment_intent_id: "pi_1",
+          payment_id: "pay_1",
+          order_id: "ord_1",
+          market_id: "bonbeauty",
+          payment_method_type: "card",
+          processing_country: "PL",
+          failure_code: "card_declined: insufficient_funds",
+          decline_code: "insufficient_funds",
+        },
+        new Date("2026-05-16T10:00:00Z")
+      )
+    ).toMatchObject({
+      schema_version: "1",
+      event_type: "gp.payments.payment_failed.v1",
+      idempotency_key: "bonbeauty:pi_1:payment_failed",
+      causation_id: "stripe:webhook:evt_1",
+      payload: {
+        payment_id: "pay_1",
+        order_id: "ord_1",
+        provider_id: "stripe",
+        provider_payment_id: "pi_1",
+        failure_code: "card_declined",
+        decline_code: "insufficient_funds",
+        payment_method_type: "card",
+        processing_country: "PL",
+      },
     })
   })
 
@@ -135,6 +274,34 @@ describe("StripePaymentAuditWorkflow", () => {
     const replay = await workflow.process("payment.captured", payload())
 
     expect(replay.deduplicated).toBe(true)
+  })
+
+  it("emits gp.payments.payment_failed.v1 only on first failed event delivery", async () => {
+    const client = new FakeClient()
+    const eventBus = { emit: jest.fn().mockResolvedValue(undefined) }
+    const workflow = new StripePaymentAuditWorkflow(
+      { connect: async () => client },
+      eventBus
+    )
+    const failedPayload = {
+      ...payload(),
+      failure_code: "card_declined: insufficient_funds",
+      decline_code: "insufficient_funds",
+    }
+
+    await workflow.process("payment.failed", failedPayload)
+    await workflow.process("payment.failed", failedPayload)
+
+    const contractEvents = eventBus.emit.mock.calls.filter(
+      ([message]) => message.name === "gp.payments.payment_failed.v1"
+    )
+    expect(contractEvents).toHaveLength(1)
+    expect(contractEvents[0][0].data).toMatchObject({
+      payload: {
+        failure_code: "card_declined",
+        decline_code: "insufficient_funds",
+      },
+    })
   })
 
   it("resolves entitlement profile from order line metadata when native event is not enriched", async () => {

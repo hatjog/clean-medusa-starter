@@ -7,6 +7,10 @@ import {
   type StripePaymentAuditPayload,
   type StripePaymentEventName,
 } from "../workflows/payment/stripe-payment-audit"
+import { failPaymentWorkflow } from "../workflows/payment/fail-payment"
+import { extractStripeFailureDetails } from "../lib/payment/failure-classification"
+
+export const MISSING_FAILURE_METADATA_CODE = "support_required_missing_failure_metadata"
 
 type LoggerLike = {
   info?: (message: string) => void
@@ -50,9 +54,12 @@ export default async function stripePaymentAuditSubscriber({
       container as unknown as { resolve: (key: string) => unknown },
       logger
     )
-    const { result } = await stripePaymentAuditWorkflow(container).run({
-      input: { eventType: eventName, payload },
-    })
+    const { result } =
+      eventName === "payment.failed"
+        ? await failPaymentWorkflow(container).run({ input: payload })
+        : await stripePaymentAuditWorkflow(container).run({
+            input: { eventType: eventName, payload },
+          })
     logger.info?.(
       `[stripe-payment-audit] ${eventName} event_id=${result.event_id} ` +
         `deduplicated=${result.deduplicated}`
@@ -71,7 +78,7 @@ export const config: SubscriberConfig = {
   event: [...STRIPE_PAYMENT_EVENTS],
 }
 
-async function hydrateStripePaymentAuditPayload(
+export async function hydrateStripePaymentAuditPayload(
   eventName: StripePaymentEventName,
   data: StripePaymentAuditPayload,
   container: { resolve: (key: string) => unknown },
@@ -182,6 +189,23 @@ async function hydrateStripePaymentAuditPayload(
     )
   }
 
+  const paymentFailure = extractStripeFailureDetails(paymentData, paymentMetadata)
+  const sessionFailure = extractStripeFailureDetails(sessionData, sessionMetadata)
+  const hydratedFailureCode =
+    data.failure_code ??
+    paymentFailure.failure_code ??
+    sessionFailure.failure_code ??
+    (eventName === "payment.failed" ? MISSING_FAILURE_METADATA_CODE : null)
+  const hydratedDeclineCode =
+    data.decline_code ?? paymentFailure.decline_code ?? sessionFailure.decline_code ?? null
+
+  if (eventName === "payment.failed" && hydratedFailureCode === MISSING_FAILURE_METADATA_CODE) {
+    logger.warn?.(
+      `[stripe-payment-audit] ${eventName} payment_id=${paymentId} missing failure metadata; ` +
+        `persisting support/manual-review sentinel`
+    )
+  }
+
   return {
     ...data,
     event_id:
@@ -205,6 +229,8 @@ async function hydrateStripePaymentAuditPayload(
       readNestedString(paymentData, ["payment_method_details", "type"]) ??
       readFirstString(paymentData.payment_method_types) ??
       "unknown",
+    failure_code: hydratedFailureCode,
+    decline_code: hydratedDeclineCode,
     processing_country:
       data.processing_country ??
       readNestedString(paymentData, ["processing_country"]) ??
