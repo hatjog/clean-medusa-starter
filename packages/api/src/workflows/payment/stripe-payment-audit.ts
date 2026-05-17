@@ -25,6 +25,7 @@ import {
   type IssueEntitlementResult,
 } from "../entitlements/issue-entitlement"
 import type { EntitlementType } from "../../modules/voucher/models/entitlement"
+import { redactFailureCode } from "../../lib/payment/failure-classification"
 
 export const STRIPE_PAYMENT_EVENTS = [
   "payment.captured",
@@ -215,6 +216,12 @@ export class StripePaymentAuditWorkflow {
       name: `payment_audit.${result.envelope.outcome}`,
       data: result.envelope,
     })
+    if (result.envelope.event_type === "payment.failed") {
+      await this.eventBus?.emit?.({
+        name: "gp.payments.payment_failed.v1",
+        data: buildPaymentFailedContractEvent(result, payload, now),
+      })
+    }
     if (result.entitlement) {
       await this.eventBus?.emit?.({
         name: "gp.entitlements.entitlement_issued.v1",
@@ -350,11 +357,6 @@ export function buildPaymentAuditEnvelope(
   return envelope
 }
 
-export function redactFailureCode(value: string | null | undefined): string | undefined {
-  if (!value) return undefined
-  return value.split(":")[0]?.trim() || undefined
-}
-
 async function insertDedupRow(
   client: PgClient,
   payload: StripePaymentAuditPayload,
@@ -368,6 +370,46 @@ async function insertDedupRow(
     [payload.event_id, payload.market_id ?? null, JSON.stringify(envelope)]
   )
   return (result.rowCount ?? 0) === 1
+}
+
+export function buildPaymentFailedContractEvent(
+  result: StripePaymentAuditResult,
+  payload: StripePaymentAuditPayload,
+  now = new Date()
+): Record<string, unknown> {
+  const envelope = result.envelope
+  const marketId = payload.market_id ?? "unknown"
+  const paymentId = payload.payment_id ?? payload.payment_intent_id ?? "unknown"
+  const providerPaymentId = payload.payment_intent_id ?? paymentId
+  const failureCode = envelope.failure_code ?? redactFailureCode(payload.failure_code) ?? "unknown"
+
+  return {
+    schema_version: "1",
+    event_type: "gp.payments.payment_failed.v1",
+    occurred_at: now.toISOString(),
+    actor: "system",
+    scope: {
+      instance_id: "gp-dev",
+      market_id: marketId,
+      vendor_id: null,
+      location_id: null,
+    },
+    idempotency_key: `${marketId}:${providerPaymentId}:payment_failed`,
+    correlation_id: payload.order_id ?? paymentId,
+    causation_id: `stripe:webhook:${result.event_id}`,
+    payload: {
+      payment_id: paymentId,
+      order_id: payload.order_id ?? null,
+      provider_id: "stripe",
+      provider_payment_id: providerPaymentId,
+      failure_code: failureCode,
+      decline_code: envelope.decline_code ?? payload.decline_code ?? null,
+      payment_method_type:
+        envelope.payment_method_type ?? payload.payment_method_type ?? "unknown",
+      processing_country:
+        envelope.processing_country ?? payload.processing_country ?? "unknown",
+    },
+  }
 }
 
 export type ReconcileRefundInput = {

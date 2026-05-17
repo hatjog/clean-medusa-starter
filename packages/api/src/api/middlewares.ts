@@ -765,6 +765,11 @@ export default defineMiddlewares({
     },
     {
       method: ["POST"],
+      matcher: "/store/payment-collections/:id/payment-sessions/stripe/refresh",
+      middlewares: [authenticate("customer", ["session", "bearer"])],
+    },
+    {
+      method: ["POST"],
       matcher: "/auth/user/emailpass",
       middlewares: [requestLogMetricsMiddleware],
     },

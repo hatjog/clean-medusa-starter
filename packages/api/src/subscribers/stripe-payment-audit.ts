@@ -7,6 +7,7 @@ import {
   type StripePaymentAuditPayload,
   type StripePaymentEventName,
 } from "../workflows/payment/stripe-payment-audit"
+import { failPaymentWorkflow } from "../workflows/payment/fail-payment"
 
 type LoggerLike = {
   info?: (message: string) => void
@@ -50,9 +51,12 @@ export default async function stripePaymentAuditSubscriber({
       container as unknown as { resolve: (key: string) => unknown },
       logger
     )
-    const { result } = await stripePaymentAuditWorkflow(container).run({
-      input: { eventType: eventName, payload },
-    })
+    const { result } =
+      eventName === "payment.failed"
+        ? await failPaymentWorkflow(container).run({ input: payload })
+        : await stripePaymentAuditWorkflow(container).run({
+            input: { eventType: eventName, payload },
+          })
     logger.info?.(
       `[stripe-payment-audit] ${eventName} event_id=${result.event_id} ` +
         `deduplicated=${result.deduplicated}`

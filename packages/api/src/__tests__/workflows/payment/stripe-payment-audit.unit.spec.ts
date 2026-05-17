@@ -2,6 +2,7 @@ import {
   MissingNativeStripePayloadFieldError,
   reconcileManualRefund,
   StripePaymentAuditWorkflow,
+  buildPaymentFailedContractEvent,
   buildPaymentAuditEnvelope,
 } from "../../../workflows/payment/stripe-payment-audit"
 
@@ -106,6 +107,59 @@ describe("StripePaymentAuditWorkflow", () => {
     })
   })
 
+  it("builds gp.payments.payment_failed.v1 contract event with redacted failure_code", () => {
+    const result = {
+      event_id: "evt_1",
+      deduplicated: false,
+      envelope: buildPaymentAuditEnvelope("payment.failed", {
+        event_id: "evt_1",
+        request_id: "req_1",
+        payment_intent_id: "pi_1",
+        payment_id: "pay_1",
+        order_id: "ord_1",
+        market_id: "bonbeauty",
+        payment_method_type: "card",
+        processing_country: "PL",
+        failure_code: "card_declined: insufficient_funds",
+        decline_code: "insufficient_funds",
+      }),
+    }
+
+    expect(
+      buildPaymentFailedContractEvent(
+        result,
+        {
+          event_id: "evt_1",
+          request_id: "req_1",
+          payment_intent_id: "pi_1",
+          payment_id: "pay_1",
+          order_id: "ord_1",
+          market_id: "bonbeauty",
+          payment_method_type: "card",
+          processing_country: "PL",
+          failure_code: "card_declined: insufficient_funds",
+          decline_code: "insufficient_funds",
+        },
+        new Date("2026-05-16T10:00:00Z")
+      )
+    ).toMatchObject({
+      schema_version: "1",
+      event_type: "gp.payments.payment_failed.v1",
+      idempotency_key: "bonbeauty:pi_1:payment_failed",
+      causation_id: "stripe:webhook:evt_1",
+      payload: {
+        payment_id: "pay_1",
+        order_id: "ord_1",
+        provider_id: "stripe",
+        provider_payment_id: "pi_1",
+        failure_code: "card_declined",
+        decline_code: "insufficient_funds",
+        payment_method_type: "card",
+        processing_country: "PL",
+      },
+    })
+  })
+
   it("persists dedup, issues entitlement once, and emits post-commit audit event", async () => {
     const client = new FakeClient()
     const eventBus = { emit: jest.fn().mockResolvedValue(undefined) }
@@ -135,6 +189,34 @@ describe("StripePaymentAuditWorkflow", () => {
     const replay = await workflow.process("payment.captured", payload())
 
     expect(replay.deduplicated).toBe(true)
+  })
+
+  it("emits gp.payments.payment_failed.v1 only on first failed event delivery", async () => {
+    const client = new FakeClient()
+    const eventBus = { emit: jest.fn().mockResolvedValue(undefined) }
+    const workflow = new StripePaymentAuditWorkflow(
+      { connect: async () => client },
+      eventBus
+    )
+    const failedPayload = {
+      ...payload(),
+      failure_code: "card_declined: insufficient_funds",
+      decline_code: "insufficient_funds",
+    }
+
+    await workflow.process("payment.failed", failedPayload)
+    await workflow.process("payment.failed", failedPayload)
+
+    const contractEvents = eventBus.emit.mock.calls.filter(
+      ([message]) => message.name === "gp.payments.payment_failed.v1"
+    )
+    expect(contractEvents).toHaveLength(1)
+    expect(contractEvents[0][0].data).toMatchObject({
+      payload: {
+        failure_code: "card_declined",
+        decline_code: "insufficient_funds",
+      },
+    })
   })
 
   it("resolves entitlement profile from order line metadata when native event is not enriched", async () => {

@@ -25,8 +25,9 @@
  *   Medusa `OrderPaymentStatus` + order `status` → GP lifecycle id. This
  *   mirrors the storefront proxy `/api/v1/orders/[id]/route.ts` and must stay
  *   in sync with it. Only values from the shared lifecycle state machine are
- *   returned: `payment` ∈ {paid, pending_psp_confirmation, failed,
- *   support_required}; `order` includes `expired`.
+ *   returned: `payment` ∈ {paid, pending_psp_confirmation,
+ *   failed_retryable, failed_nonretryable, support_required}; `order`
+ *   includes `expired`.
  *
  * Reconciliation poke (webhook_age):
  *   Uses `order.created_at` (not `updated_at`) as the anchor for the
@@ -49,9 +50,10 @@
 
 import { randomBytes } from "crypto"
 
-import { Modules } from "@medusajs/framework/utils"
+import { ContainerRegistrationKeys, Modules } from "@medusajs/framework/utils"
 import type { MedusaRequest, MedusaResponse } from "@medusajs/framework/http"
 import { marketContextStorage } from "../../../../../lib/market-context"
+import { classifyPaymentAttempt } from "../../../../../lib/payment/failure-classification"
 
 // Customer auth is installed for this route in api/middlewares.ts. Keep the
 // route-level flag off so Medusa does not apply default admin auth semantics.
@@ -64,7 +66,8 @@ const RECONCILIATION_POKE_THRESHOLD_MS = 120_000
 type PaymentLifecycleStatus =
   | "paid"
   | "pending_psp_confirmation"
-  | "failed"
+  | "failed_retryable"
+  | "failed_nonretryable"
   | "support_required"
   | "expired"
 
@@ -72,7 +75,8 @@ type PaymentLifecycleStatus =
 const RECOMMENDED_ACTION: Record<PaymentLifecycleStatus, string> = {
   paid: "continue",
   pending_psp_confirmation: "wait",
-  failed: "retry",
+  failed_retryable: "retry",
+  failed_nonretryable: "contact_support",
   support_required: "contact_support",
   expired: "abandon",
 }
@@ -92,7 +96,7 @@ function mapMedusaPaymentStatus(
       return "pending_psp_confirmation"
     case "requires_action":
       // SCA / 3DS requires customer action. Waiting or refreshing will not fix it.
-      return "failed"
+      return "failed_retryable"
     case "canceled":
       return "expired"
     case "refunded":
@@ -151,6 +155,130 @@ type AuthenticatedMedusaRequest = MedusaRequest & {
   }
 }
 
+type KnexLike = {
+  raw: (sql: string, bindings?: ReadonlyArray<unknown>) => Promise<{ rows?: unknown[] }>
+}
+
+type LatestPaymentAttempt = {
+  payment_collection_id: string | null
+  payment_session_id: string | null
+  provider_id: string | null
+  status: string | null
+  data: Record<string, unknown> | null
+  context: Record<string, unknown> | null
+  retry_count: number | string | null
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value)
+}
+
+async function resolveLatestPaymentAttempt(
+  req: MedusaRequest,
+  orderId: string
+): Promise<LatestPaymentAttempt | null> {
+  const db = req.scope.resolve(ContainerRegistrationKeys.PG_CONNECTION) as KnexLike
+  const result = await db.raw(
+    `
+      SELECT
+        opc.payment_collection_id,
+        ps.id AS payment_session_id,
+        ps.provider_id,
+        ps.status,
+        ps.data,
+        ps.context,
+        ps.retry_count
+      FROM order_payment_collection opc
+      LEFT JOIN payment_session ps
+        ON ps.payment_collection_id = opc.payment_collection_id
+       AND ps.deleted_at IS NULL
+      WHERE opc.order_id = ?
+        AND opc.deleted_at IS NULL
+      ORDER BY ps.created_at DESC NULLS LAST
+      LIMIT 1
+    `,
+    [orderId]
+  )
+  const row = result.rows?.[0] as Record<string, unknown> | undefined
+  if (!row) return null
+
+  return {
+    payment_collection_id:
+      typeof row.payment_collection_id === "string" ? row.payment_collection_id : null,
+    payment_session_id:
+      typeof row.payment_session_id === "string" ? row.payment_session_id : null,
+    provider_id: typeof row.provider_id === "string" ? row.provider_id : null,
+    status: typeof row.status === "string" ? row.status : null,
+    data: isObject(row.data) ? row.data : null,
+    context: isObject(row.context) ? row.context : null,
+    retry_count:
+      typeof row.retry_count === "number" || typeof row.retry_count === "string"
+        ? row.retry_count
+        : null,
+  }
+}
+
+function refineFailureStatus(
+  baseStatus: PaymentLifecycleStatus,
+  attempt: LatestPaymentAttempt | null
+): {
+  status: PaymentLifecycleStatus
+  failure_code: string | null
+  decline_code: string | null
+} {
+  if (!attempt) {
+    return { status: baseStatus, failure_code: null, decline_code: null }
+  }
+
+  const classification = classifyPaymentAttempt({
+    status: attempt.status,
+    data: attempt.data,
+    context: attempt.context,
+  })
+
+  if (
+    baseStatus !== "failed_retryable" &&
+    baseStatus !== "pending_psp_confirmation"
+  ) {
+    return { status: baseStatus, failure_code: null, decline_code: null }
+  }
+
+  if (classification.classification === "retryable") {
+    return {
+      status: "failed_retryable",
+      failure_code: classification.failure_code ?? null,
+      decline_code: classification.decline_code ?? null,
+    }
+  }
+
+  if (classification.classification === "non_retryable") {
+    return {
+      status: "failed_nonretryable",
+      failure_code: classification.failure_code ?? null,
+      decline_code: classification.decline_code ?? null,
+    }
+  }
+
+  if (classification.classification === "support_required") {
+    return {
+      status: "support_required",
+      failure_code: classification.failure_code ?? null,
+      decline_code: classification.decline_code ?? null,
+    }
+  }
+
+  return { status: "pending_psp_confirmation", failure_code: null, decline_code: null }
+}
+
+function parseRetryCount(value: number | string | null): number {
+  if (typeof value === "number" && Number.isFinite(value)) return Math.max(0, value)
+  if (typeof value === "string" && value.trim()) {
+    const parsed = Number.parseInt(value, 10)
+    return Number.isFinite(parsed) ? Math.max(0, parsed) : 0
+  }
+  return 0
+}
+
 export async function GET(
   req: MedusaRequest,
   res: MedusaResponse,
@@ -192,9 +320,12 @@ export async function GET(
       return
     }
 
-    const status =
+    const baseStatus =
       mapMedusaOrderStatus(order.status) ??
       mapMedusaPaymentStatus(order.payment_status, logger)
+    const latestAttempt = await resolveLatestPaymentAttempt(req, orderId)
+    const failureStatus = refineFailureStatus(baseStatus, latestAttempt)
+    const status = failureStatus.status
     const last_checked_at = new Date().toISOString()
     const recommended_action_key = RECOMMENDED_ACTION[status]
 
@@ -230,6 +361,12 @@ export async function GET(
       last_checked_at,
       recommended_action_key,
       request_id,
+      failure_code: failureStatus.failure_code,
+      decline_code: failureStatus.decline_code,
+      payment_collection_id: latestAttempt?.payment_collection_id ?? null,
+      payment_session_id: latestAttempt?.payment_session_id ?? null,
+      payment_provider_id: latestAttempt?.provider_id ?? null,
+      retry_count: parseRetryCount(latestAttempt?.retry_count ?? null),
     })
   } catch (err) {
     logger.error?.(`[payment-status] GET ${orderId} error: ${String(err)}`)

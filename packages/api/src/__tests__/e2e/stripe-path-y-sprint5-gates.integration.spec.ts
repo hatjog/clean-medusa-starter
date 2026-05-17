@@ -11,4 +11,11 @@ describe.skip("Sprint 5 gate: Stripe Path Y lifecycle", () => {
     // webhook delivery. Kill the subscriber between payment.captured receipt and
     // completion, then retry delivery and assert no partial state remains.
   })
+
+  it("Sprint 5 gate: decline card -> failed_retryable -> refresh retry -> paid", async () => {
+    // Sprint 5 live gate: requires running storefront + backend + Stripe test mode.
+    // Use decline card 4000 0000 0000 0341, assert payment-status returns
+    // failed_retryable, POST refresh creates exactly one retry PaymentIntent,
+    // then confirm with success card 4242 4242 4242 4242 and assert paid.
+  })
 })
