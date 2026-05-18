@@ -770,6 +770,11 @@ export default defineMiddlewares({
     },
     {
       method: ["POST"],
+      matcher: "/store/account/magic-links/revoke-all",
+      middlewares: [authenticate("customer", ["session", "bearer"])],
+    },
+    {
+      method: ["POST"],
       matcher: "/auth/user/emailpass",
       middlewares: [requestLogMetricsMiddleware],
     },
@@ -802,6 +807,14 @@ export default defineMiddlewares({
     {
       method: ["POST"],
       matcher: "/admin/entitlements/*",
+      middlewares: [
+        authenticate("user", ["session", "bearer"]),
+        operatorAuthMiddleware,
+      ],
+    },
+    {
+      method: ["POST"],
+      matcher: "/admin/magic-links/*",
       middlewares: [
         authenticate("user", ["session", "bearer"]),
         operatorAuthMiddleware,

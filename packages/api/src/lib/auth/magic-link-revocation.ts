@@ -1,0 +1,177 @@
+import type { Knex } from "knex"
+
+import {
+  generateMagicLinkWithClaims,
+  getMagicLinkSubjectCustomerId,
+  getMagicLinkSubjectMarketId,
+  type MagicLinkOptions,
+  type MagicLinkPurpose,
+  type MagicLinkSubject,
+} from "./magic-link"
+
+export type MagicLinkRevocationReason =
+  | "user_revoke"
+  | "admin_revoke"
+  | "auto_expired"
+  | "security_response"
+
+export type RecordIssuedMagicLinkInput = {
+  token_jti: string
+  purpose: MagicLinkPurpose
+  subject: MagicLinkSubject
+  issued_at: Date
+  expires_at: Date
+}
+
+export type RevokeMagicLinkInput = {
+  token_jti: string
+  reason: MagicLinkRevocationReason
+  revoked_by?: string | null
+}
+
+export type RevokePendingCustomerMagicLinksInput = {
+  customer_id: string
+  market_id?: string | null
+  reason: "user_revoke"
+  revoked_by: string
+  now?: Date
+}
+
+export type MagicLinkRevocationStore = {
+  isJtiRevoked(jti: string): Promise<boolean>
+  recordIssued(input: RecordIssuedMagicLinkInput): Promise<void>
+  revokeJti(input: RevokeMagicLinkInput): Promise<void>
+  revokePendingForCustomer(
+    input: RevokePendingCustomerMagicLinksInput
+  ): Promise<{ revoked_count: number }>
+  cleanupExpiredRevocations(): Promise<number>
+}
+
+export const MAGIC_LINK_REVOCATION_RETENTION_DAYS = 30
+
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+
+export function isValidMagicLinkJti(value: string): boolean {
+  return UUID_RE.test(value)
+}
+
+export function shouldDeleteMagicLinkRevocation(
+  revokedAt: Date,
+  now: Date
+): boolean {
+  const cutoff =
+    now.getTime() -
+    MAGIC_LINK_REVOCATION_RETENTION_DAYS * 24 * 60 * 60 * 1000
+
+  return revokedAt.getTime() < cutoff
+}
+
+function toNullableString(value: string | null): string | null {
+  return value && value.trim() ? value.trim() : null
+}
+
+export class PostgresMagicLinkStore implements MagicLinkRevocationStore {
+  constructor(private readonly db: Knex) {}
+
+  async isJtiRevoked(jti: string): Promise<boolean> {
+    const row = await this.db("magic_link_revocation")
+      .select("token_jti")
+      .where({ token_jti: jti })
+      .first<{ token_jti: string }>()
+
+    return Boolean(row?.token_jti)
+  }
+
+  async recordIssued(input: RecordIssuedMagicLinkInput): Promise<void> {
+    await this.db("magic_link_issued")
+      .insert({
+        token_jti: input.token_jti,
+        purpose: input.purpose,
+        subject: input.subject,
+        subject_customer_id: toNullableString(
+          getMagicLinkSubjectCustomerId(input.subject)
+        ),
+        market_id: toNullableString(getMagicLinkSubjectMarketId(input.subject)),
+        issued_at: input.issued_at,
+        expires_at: input.expires_at,
+      })
+      .onConflict("token_jti")
+      .ignore()
+  }
+
+  async revokeJti(input: RevokeMagicLinkInput): Promise<void> {
+    await this.db("magic_link_revocation")
+      .insert({
+        token_jti: input.token_jti,
+        reason: input.reason,
+        revoked_by: input.revoked_by ?? null,
+      })
+      .onConflict("token_jti")
+      .ignore()
+  }
+
+  async revokePendingForCustomer(
+    input: RevokePendingCustomerMagicLinksInput
+  ): Promise<{ revoked_count: number }> {
+    const rows = await this.db("magic_link_issued as issued")
+      .leftJoin(
+        "magic_link_revocation as revoked",
+        "issued.token_jti",
+        "revoked.token_jti"
+      )
+      .select<{ token_jti: string }[]>("issued.token_jti")
+      .where("issued.subject_customer_id", input.customer_id)
+      .where("issued.expires_at", ">", input.now ?? new Date())
+      .modify((query) => {
+        if (input.market_id) {
+          query.andWhere("issued.market_id", input.market_id)
+        }
+      })
+      .whereNull("revoked.token_jti")
+
+    if (rows.length === 0) {
+      return { revoked_count: 0 }
+    }
+
+    await this.db("magic_link_revocation")
+      .insert(
+        rows.map((row) => ({
+          token_jti: row.token_jti,
+          reason: input.reason,
+          revoked_by: input.revoked_by,
+        }))
+      )
+      .onConflict("token_jti")
+      .ignore()
+
+    return { revoked_count: rows.length }
+  }
+
+  async cleanupExpiredRevocations(): Promise<number> {
+    const deleted = await this.db("magic_link_revocation")
+      .whereRaw("revoked_at < now() - interval '30 days'")
+      .delete()
+
+    return Number(deleted ?? 0)
+  }
+}
+
+export async function issueMagicLink(
+  store: Pick<MagicLinkRevocationStore, "recordIssued">,
+  purpose: MagicLinkPurpose,
+  subject: MagicLinkSubject,
+  options: MagicLinkOptions = {}
+): Promise<string> {
+  const generated = generateMagicLinkWithClaims(purpose, subject, options)
+
+  await store.recordIssued({
+    token_jti: generated.claims.jti,
+    purpose,
+    subject,
+    issued_at: new Date(generated.claims.iat * 1000),
+    expires_at: new Date(generated.claims.exp * 1000),
+  })
+
+  return generated.token
+}
