@@ -48,10 +48,19 @@ export async function POST(
     return
   }
 
+  const marketId = marketContextStorage.getStore()?.market_id?.trim()
+  if (!marketId) {
+    res.status(403).json({
+      code: "MARKET_CONTEXT_REQUIRED",
+      message: "Market context required",
+    })
+    return
+  }
+
   const store = new PostgresMagicLinkStore(db)
   await store.revokePendingForCustomer({
     customer_id: customerId,
-    market_id: marketContextStorage.getStore()?.market_id ?? null,
+    market_id: marketId,
     reason: "user_revoke",
     revoked_by: customerId,
   })

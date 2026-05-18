@@ -23,9 +23,12 @@ describe("magic-link-revocation-cleanup", () => {
   })
 
   it("runs the Postgres cleanup store from the scheduled job", async () => {
-    const cleanupSpy = jest
+    const cleanupRevocationsSpy = jest
       .spyOn(PostgresMagicLinkStore.prototype, "cleanupExpiredRevocations")
       .mockResolvedValue(2)
+    const cleanupIssuedSpy = jest
+      .spyOn(PostgresMagicLinkStore.prototype, "cleanupExpiredIssued")
+      .mockResolvedValue(4)
     const logger = { info: jest.fn(), warn: jest.fn(), error: jest.fn() }
     const container = {
       resolve: jest.fn((key: string) => {
@@ -36,8 +39,11 @@ describe("magic-link-revocation-cleanup", () => {
 
     await magicLinkRevocationCleanup(container as never)
 
-    expect(cleanupSpy).toHaveBeenCalledTimes(1)
-    expect(logger.info).toHaveBeenCalledWith("deleted=2")
+    expect(cleanupRevocationsSpy).toHaveBeenCalledTimes(1)
+    expect(cleanupIssuedSpy).toHaveBeenCalledTimes(1)
+    expect(logger.info).toHaveBeenCalledWith(
+      "deleted_revocations=2 deleted_issued=4"
+    )
   })
 
   it("exports the cron registration", () => {

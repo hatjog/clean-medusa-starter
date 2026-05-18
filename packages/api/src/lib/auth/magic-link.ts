@@ -32,6 +32,10 @@ export type GeneratedMagicLink = {
   claims: MagicLinkClaims
 }
 
+export type MagicLinkIssuedRecorder = (
+  generated: GeneratedMagicLink
+) => void | Promise<void>
+
 export type MagicLinkRevocationChecker = (
   jti: string
 ) => boolean | Promise<boolean>
@@ -42,10 +46,19 @@ export type MagicLinkOptions = {
   secret?: string
 }
 
+export type GenerateMagicLinkOptions = MagicLinkOptions & {
+  recordIssued?: MagicLinkIssuedRecorder
+}
+
 export type VerifyMagicLinkOptions = {
   now?: Date
   secret?: string
   isJtiRevoked?: MagicLinkRevocationChecker
+}
+
+export type MagicLinkRuntimeBindings = {
+  isJtiRevoked?: MagicLinkRevocationChecker
+  recordIssued?: MagicLinkIssuedRecorder
 }
 
 export const MAGIC_LINK_TTL_SECONDS: Record<MagicLinkPurpose, number> = {
@@ -56,12 +69,25 @@ export const MAGIC_LINK_TTL_SECONDS: Record<MagicLinkPurpose, number> = {
 const HS256_ALGORITHM = "HS256"
 const JWT_SECRET_MIN_BYTES = 32
 const TEST_SECRET_ENV = "MAGIC_LINK_TEST_JWT_SECRET"
+const runtimeBindings: MagicLinkRuntimeBindings = {}
 
 export class MagicLinkConfigurationError extends Error {
   constructor(message: string) {
     super(message)
     this.name = "MagicLinkConfigurationError"
   }
+}
+
+export function configureMagicLinkRuntime(
+  bindings: MagicLinkRuntimeBindings
+): void {
+  runtimeBindings.isJtiRevoked = bindings.isJtiRevoked
+  runtimeBindings.recordIssued = bindings.recordIssued
+}
+
+export function resetMagicLinkRuntime(): void {
+  delete runtimeBindings.isJtiRevoked
+  delete runtimeBindings.recordIssued
 }
 
 function base64UrlEncode(value: Buffer | string): string {
@@ -283,11 +309,23 @@ export function generateMagicLinkWithClaims(
   }
 }
 
-export function generateMagicLink(
+export async function generateMagicLink(
   purpose: MagicLinkPurpose,
-  subject: MagicLinkSubject
-): string {
-  return generateMagicLinkWithClaims(purpose, subject).token
+  subject: MagicLinkSubject,
+  options: GenerateMagicLinkOptions = {}
+): Promise<string> {
+  const generated = generateMagicLinkWithClaims(purpose, subject, options)
+  const recordIssued = options.recordIssued ?? runtimeBindings.recordIssued
+
+  if (!recordIssued) {
+    throw new MagicLinkConfigurationError(
+      "Magic link issued ledger recorder is required for generateMagicLink"
+    )
+  }
+
+  await recordIssued(generated)
+
+  return generated.token
 }
 
 export async function verifyMagicLink(
@@ -311,7 +349,12 @@ export async function verifyMagicLink(
     return { valid: false, reason: "expired" }
   }
 
-  if (options.isJtiRevoked && (await options.isJtiRevoked(claims.jti))) {
+  const isJtiRevoked = options.isJtiRevoked ?? runtimeBindings.isJtiRevoked
+  if (!isJtiRevoked) {
+    return { valid: false, reason: "invalid" }
+  }
+
+  if (await isJtiRevoked(claims.jti)) {
     return { valid: false, reason: "revoked" }
   }
 

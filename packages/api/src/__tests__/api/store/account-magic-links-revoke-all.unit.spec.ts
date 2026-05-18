@@ -74,10 +74,28 @@ describe("POST /store/account/magic-links/revoke-all", () => {
     const first = response()
     const second = response()
 
-    await POST(request("cus_1"), first as unknown as MedusaResponse)
-    await POST(request("cus_1"), second as unknown as MedusaResponse)
+    await marketContextStorage.run(
+      { market_id: "bonbeauty", sales_channel_id: "sc_bb" },
+      async () => {
+        await POST(request("cus_1"), first as unknown as MedusaResponse)
+        await POST(request("cus_1"), second as unknown as MedusaResponse)
+      }
+    )
 
     expect(first.body).toEqual({ success: true })
     expect(second.body).toEqual({ success: true })
+  })
+
+  it("fails closed when market context is missing", async () => {
+    const res = response()
+
+    await POST(request("cus_1"), res as unknown as MedusaResponse)
+
+    expect(res.statusCode).toBe(403)
+    expect(res.body).toEqual({
+      code: "MARKET_CONTEXT_REQUIRED",
+      message: "Market context required",
+    })
+    expect(revokeSpy).not.toHaveBeenCalled()
   })
 })

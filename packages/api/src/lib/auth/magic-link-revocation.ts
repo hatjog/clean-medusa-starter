@@ -1,11 +1,13 @@
 import type { Knex } from "knex"
 
 import {
-  generateMagicLinkWithClaims,
+  generateMagicLink,
   getMagicLinkSubjectCustomerId,
   getMagicLinkSubjectMarketId,
+  type GeneratedMagicLink,
   type MagicLinkOptions,
   type MagicLinkPurpose,
+  type MagicLinkRuntimeBindings,
   type MagicLinkSubject,
 } from "./magic-link"
 
@@ -18,7 +20,8 @@ export type MagicLinkRevocationReason =
 export type RecordIssuedMagicLinkInput = {
   token_jti: string
   purpose: MagicLinkPurpose
-  subject: MagicLinkSubject
+  subject_customer_id?: string | null
+  market_id?: string | null
   issued_at: Date
   expires_at: Date
 }
@@ -31,7 +34,7 @@ export type RevokeMagicLinkInput = {
 
 export type RevokePendingCustomerMagicLinksInput = {
   customer_id: string
-  market_id?: string | null
+  market_id: string
   reason: "user_revoke"
   revoked_by: string
   now?: Date
@@ -45,6 +48,7 @@ export type MagicLinkRevocationStore = {
     input: RevokePendingCustomerMagicLinksInput
   ): Promise<{ revoked_count: number }>
   cleanupExpiredRevocations(): Promise<number>
+  cleanupExpiredIssued(): Promise<number>
 }
 
 export const MAGIC_LINK_REVOCATION_RETENTION_DAYS = 30
@@ -88,11 +92,8 @@ export class PostgresMagicLinkStore implements MagicLinkRevocationStore {
       .insert({
         token_jti: input.token_jti,
         purpose: input.purpose,
-        subject: input.subject,
-        subject_customer_id: toNullableString(
-          getMagicLinkSubjectCustomerId(input.subject)
-        ),
-        market_id: toNullableString(getMagicLinkSubjectMarketId(input.subject)),
+        subject_customer_id: toNullableString(input.subject_customer_id ?? null),
+        market_id: toNullableString(input.market_id ?? null),
         issued_at: input.issued_at,
         expires_at: input.expires_at,
       })
@@ -114,6 +115,10 @@ export class PostgresMagicLinkStore implements MagicLinkRevocationStore {
   async revokePendingForCustomer(
     input: RevokePendingCustomerMagicLinksInput
   ): Promise<{ revoked_count: number }> {
+    if (!input.market_id.trim()) {
+      throw new Error("market_id is required for magic link revoke-all")
+    }
+
     const rows = await this.db("magic_link_issued as issued")
       .leftJoin(
         "magic_link_revocation as revoked",
@@ -123,11 +128,7 @@ export class PostgresMagicLinkStore implements MagicLinkRevocationStore {
       .select<{ token_jti: string }[]>("issued.token_jti")
       .where("issued.subject_customer_id", input.customer_id)
       .where("issued.expires_at", ">", input.now ?? new Date())
-      .modify((query) => {
-        if (input.market_id) {
-          query.andWhere("issued.market_id", input.market_id)
-        }
-      })
+      .andWhere("issued.market_id", input.market_id)
       .whereNull("revoked.token_jti")
 
     if (rows.length === 0) {
@@ -155,6 +156,37 @@ export class PostgresMagicLinkStore implements MagicLinkRevocationStore {
 
     return Number(deleted ?? 0)
   }
+
+  async cleanupExpiredIssued(): Promise<number> {
+    const deleted = await this.db("magic_link_issued")
+      .whereRaw("expires_at < now()")
+      .delete()
+
+    return Number(deleted ?? 0)
+  }
+}
+
+function recordIssuedFromGenerated(
+  store: Pick<MagicLinkRevocationStore, "recordIssued">,
+  generated: GeneratedMagicLink
+): Promise<void> {
+  return store.recordIssued({
+    token_jti: generated.claims.jti,
+    purpose: generated.claims.purpose,
+    subject_customer_id: getMagicLinkSubjectCustomerId(generated.claims.subject),
+    market_id: getMagicLinkSubjectMarketId(generated.claims.subject),
+    issued_at: new Date(generated.claims.iat * 1000),
+    expires_at: new Date(generated.claims.exp * 1000),
+  })
+}
+
+export function createMagicLinkRuntimeBindings(
+  store: Pick<MagicLinkRevocationStore, "isJtiRevoked" | "recordIssued">
+): Required<MagicLinkRuntimeBindings> {
+  return {
+    isJtiRevoked: (jti) => store.isJtiRevoked(jti),
+    recordIssued: (generated) => recordIssuedFromGenerated(store, generated),
+  }
 }
 
 export async function issueMagicLink(
@@ -163,15 +195,9 @@ export async function issueMagicLink(
   subject: MagicLinkSubject,
   options: MagicLinkOptions = {}
 ): Promise<string> {
-  const generated = generateMagicLinkWithClaims(purpose, subject, options)
-
-  await store.recordIssued({
-    token_jti: generated.claims.jti,
-    purpose,
-    subject,
-    issued_at: new Date(generated.claims.iat * 1000),
-    expires_at: new Date(generated.claims.exp * 1000),
+  return generateMagicLink(purpose, subject, {
+    ...options,
+    recordIssued: (generated) =>
+      recordIssuedFromGenerated(store, generated),
   })
-
-  return generated.token
 }

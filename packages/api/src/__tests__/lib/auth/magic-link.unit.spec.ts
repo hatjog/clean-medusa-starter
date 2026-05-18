@@ -2,7 +2,10 @@ import { createHmac } from "node:crypto"
 
 import {
   MAGIC_LINK_TTL_SECONDS,
+  configureMagicLinkRuntime,
+  generateMagicLink,
   generateMagicLinkWithClaims,
+  resetMagicLinkRuntime,
   verifyMagicLink,
   type MagicLinkClaims,
 } from "../../../lib/auth/magic-link"
@@ -35,6 +38,14 @@ describe("magic link JWT infrastructure", () => {
   beforeEach(() => {
     process.env.NODE_ENV = "test"
     process.env.JWT_SECRET = SECRET
+    configureMagicLinkRuntime({
+      isJtiRevoked: async () => false,
+      recordIssued: async () => undefined,
+    })
+  })
+
+  afterEach(() => {
+    resetMagicLinkRuntime()
   })
 
   afterAll(() => {
@@ -73,6 +84,34 @@ describe("magic link JWT infrastructure", () => {
         order_id: "ord_1",
       },
     })
+  })
+
+  it("records issuance through the default runtime binding", async () => {
+    const recordIssued = jest.fn().mockResolvedValue(undefined)
+    configureMagicLinkRuntime({
+      isJtiRevoked: async () => false,
+      recordIssued,
+    })
+
+    const token = await generateMagicLink(
+      "recover",
+      {
+        customer_id: "cus_2",
+        market_id: "bonbeauty",
+        email: "customer@example.test",
+      },
+      { now: NOW, jti: RECOVER_JTI }
+    )
+
+    expect(token).toEqual(expect.any(String))
+    expect(recordIssued).toHaveBeenCalledWith(
+      expect.objectContaining({
+        claims: expect.objectContaining({
+          jti: RECOVER_JTI,
+          purpose: "recover",
+        }),
+      })
+    )
   })
 
   it("generates and verifies recover links with a 7d TTL", async () => {
@@ -174,6 +213,21 @@ describe("magic link JWT infrastructure", () => {
       reason: "revoked",
     })
     expect(isJtiRevoked).toHaveBeenCalledWith(RECOVER_JTI)
+  })
+
+  it("fails closed when no revocation checker is configured", async () => {
+    resetMagicLinkRuntime()
+
+    const { token } = generateMagicLinkWithClaims(
+      "recover",
+      { customer_id: "cus_1" },
+      { now: NOW, jti: RECOVER_JTI }
+    )
+
+    await expect(verifyMagicLink(token, { now: NOW })).resolves.toEqual({
+      valid: false,
+      reason: "invalid",
+    })
   })
 
   it("fails closed when JWT_SECRET is missing or too short", async () => {

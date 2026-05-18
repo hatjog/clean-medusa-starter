@@ -56,8 +56,11 @@ export default async function magicLinkRevocationCleanup(
   }
 
   const store = new PostgresMagicLinkStore(db)
-  const deleted = await store.cleanupExpiredRevocations()
-  logger.info(`deleted=${deleted}`)
+  const deletedRevocations = await store.cleanupExpiredRevocations()
+  const deletedIssued = await store.cleanupExpiredIssued()
+  logger.info(
+    `deleted_revocations=${deletedRevocations} deleted_issued=${deletedIssued}`
+  )
 }
 
 export const config = {
