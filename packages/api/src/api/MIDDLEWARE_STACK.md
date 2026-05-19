@@ -29,6 +29,7 @@ Po globalnym chainie dokładane są middleware specyficzne dla wybranych ścież
 | Matcher | Dodatkowe middleware | Po co istnieją |
 |---|---|---|
 | `/store/payment-collections/:id/payment-sessions/stripe/refresh` `POST` | `authenticate("customer", ["session", "bearer"])` | Mutacyjna ścieżka retry płatności; wymaga właściciela zamówienia zanim route atomowo utworzy nową próbę płatności. |
+| `/store/account/magic-links/revoke-all` `POST` | `authenticate("customer", ["session", "bearer"])` | Customer self-service revocation; global `/store/*` chain nadal dostarcza market/RLS context, a auth dostarcza `customer_id` do idempotentnego revoke-all. |
 | `/store/customers` `POST` | `customerRegistrationMarketGuardMiddleware` -> `customerScopedCustomerCreateMiddleware` -> `customerResponseSanitizerMiddleware` | Pilnuje zgodności auth identity z marketem, scopinguje email/metadata przy tworzeniu customera i usuwa prefix email z odpowiedzi. |
 | `/store/customers/me*` `ALL` | `customerResponseSanitizerMiddleware` | Usuwa `{market_id}::` z pól email przed wysłaniem payloadu do klienta. |
 | `/store/orders*` `ALL` | `customerResponseSanitizerMiddleware` | Ten sam cel co wyżej dla odpowiedzi order/customer. |
@@ -70,6 +71,12 @@ GP backend API is organized into four route groups with distinct auth and middle
 | vendor | `/vendor/*` | Mercur seller auth | Native Mercur (no GP middleware) |
 | admin | `/admin/*` | Medusa admin auth | Native Medusa (no GP middleware) |
 | operator | `/api/v1/admin/*` | Medusa admin auth | `operatorAuthMiddleware` — verifies `actor_type="user"`, 401/403 fail-closed |
+
+Route-specific admin overlays:
+
+| Matcher | Middleware | Cel |
+|---|---|---|
+| `/admin/magic-links/*` `POST` | `authenticate("user", ["session", "bearer"])` -> `operatorAuthMiddleware` | Manualne unieważnianie pojedynczego `jti`; handler zapisuje `revoked_by = admin_user_id`. |
 
 ## Notes utrzymaniowe
 

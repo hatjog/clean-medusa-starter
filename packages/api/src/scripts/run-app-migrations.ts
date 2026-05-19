@@ -56,6 +56,12 @@ const APP_SURFACE_CONFIG: MigrationSurfaceConfig = {
       tableExists(connection, "vendor_lifecycle_state"),
     Migration20260507400000AdminCapabilityGrantsTable: (connection) =>
       tableExists(connection, "admin_capability_grants"),
+    Migration1747300000100: (connection) =>
+      tableExists(connection, "magic_link_revocation"),
+    Migration20260518000100MagicLinkIssuedLedger: (connection) =>
+      tableExists(connection, "magic_link_issued"),
+    Migration20260519081500CreateVoucherConsentTable: (connection) =>
+      tableExists(connection, "voucher_consent"),
   },
   prerequisites: {
     Migration20260430090100VoucherDeliveryDecisionTable: {
