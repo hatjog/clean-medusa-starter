@@ -91,21 +91,26 @@ afterEach(() => {
   delete process.env.JWT_SECRET
 })
 
-async function withMarket(callback: () => Promise<void>) {
-  await marketContextStorage.run(
-    { market_id: "bonbeauty", sales_channel_id: "sc_bb" },
-    callback
-  )
+async function withMarket(
+  callback: () => Promise<void>,
+  context: { market_id: string; sales_channel_id: string } = {
+    market_id: "bonbeauty",
+    sales_channel_id: "sc_bb",
+  }
+) {
+  await marketContextStorage.run(context, callback)
 }
 
 describe("GET /store/voucher-consent/:token", () => {
-  it("returns blocked minor state fail-closed when guardian approval is absent", async () => {
+  it("returns blocked minor state fail-closed from authoritative order data when JWT omits age flags", async () => {
     const token = signedToken({
       customer_id: "cus_1",
-      order_id: "ord_1",
-      recipient_age: 16,
+      order_id: "ord_minor",
     })
-    const db = dbWithRows([])
+    const db = dbWithRows(
+      [{ market_id: "bonbeauty", sales_channel_id: null, requires_age_check: true }],
+      []
+    )
     const res = response()
 
     await withMarket(async () => {
@@ -120,6 +125,22 @@ describe("GET /store/voucher-consent/:token", () => {
         error: "GUARDIAN_APPROVAL_REQUIRED",
       })
     )
+  })
+
+  it("returns TOKEN_INVALID when authoritative consent context cannot be resolved", async () => {
+    const token = signedToken({
+      customer_id: "cus_1",
+      order_id: "ord_missing",
+    })
+    const db = dbWithRows([{ market_id: null, sales_channel_id: null, requires_age_check: false }])
+    const res = response()
+
+    await withMarket(async () => {
+      await GET(request({}, db, {}, token), res as unknown as MedusaResponse)
+    })
+
+    expect(res.statusCode).toBe(404)
+    expect(res.body).toEqual({ error: "TOKEN_INVALID" })
   })
 
   it.each([
@@ -144,9 +165,20 @@ describe("GET /store/voucher-consent/:token", () => {
 })
 
 describe("POST /store/voucher-consent/:token", () => {
-  it("persists adult consent with minimized fields only", async () => {
-    const token = signedToken({ customer_id: "cus_1", order_id: "ord_1" })
-    const db = dbWithRows([{ attempts: "0" }], [])
+  it("persists adult consent with market-scoped minimized fields only", async () => {
+    const token = signedToken({
+      customer_id: "cus_1",
+      order_id: "ord_1",
+      market_id: "bonbeauty",
+      sales_channel_id: "sc_bb",
+    })
+    const db = dbWithRows(
+      [{ market_id: "bonbeauty", sales_channel_id: null, requires_age_check: false }],
+      [],
+      [{ attempts: "1" }],
+      [],
+      []
+    )
     const res = response()
 
     await withMarket(async () => {
@@ -174,11 +206,13 @@ describe("POST /store/voucher-consent/:token", () => {
         status: "approved",
       })
     )
-    const insertParams = db.raw.mock.calls[1][1] as unknown[]
+    const insertParams = db.raw.mock.calls[4][1] as unknown[]
     expect(insertParams).toEqual(
       expect.arrayContaining([
         "jti-123",
         "cus_1",
+        "bonbeauty",
+        "sc_bb",
         true,
         true,
         false,
@@ -192,13 +226,51 @@ describe("POST /store/voucher-consent/:token", () => {
     expect(JSON.stringify(insertParams)).not.toContain("phone")
   })
 
-  it("persists minor guardian consent only after guardian email, parent checkbox, and captcha", async () => {
+  it("forces minor guardian validation from authoritative order data when JWT omits age flags", async () => {
     const token = signedToken({
       customer_id: "cus_1",
-      order_id: "ord_1",
-      recipient_age: 17,
+      order_id: "ord_minor",
     })
-    const db = dbWithRows([{ attempts: "0" }], [])
+    const db = dbWithRows(
+      [{ market_id: "bonbeauty", sales_channel_id: null, requires_age_check: true }],
+      [],
+      [{ attempts: "1" }],
+      []
+    )
+    const res = response()
+
+    await withMarket(async () => {
+      await POST(
+        request(
+          {
+            consent_rodo: true,
+            consent_service_execution: true,
+            consent_marketing: false,
+          },
+          db,
+          {},
+          token
+        ),
+        res as unknown as MedusaResponse
+      )
+    })
+
+    expect(res.statusCode).toBe(400)
+    expect(res.body).toEqual({ error: "GUARDIAN_EMAIL_INVALID" })
+  })
+
+  it("persists guardian consent only after authoritative minor resolution, guardian inputs, and captcha", async () => {
+    const token = signedToken({
+      customer_id: "cus_1",
+      order_id: "ord_minor",
+    })
+    const db = dbWithRows(
+      [{ market_id: "bonbeauty", sales_channel_id: null, requires_age_check: true }],
+      [],
+      [{ attempts: "1" }],
+      [],
+      []
+    )
     const res = response()
 
     await withMarket(async () => {
@@ -228,9 +300,13 @@ describe("POST /store/voucher-consent/:token", () => {
     )
   })
 
-  it("rejects demographic and contact fields outside the allowed payload", async () => {
-    const token = signedToken({ customer_id: "cus_1", order_id: "ord_1" })
-    const db = dbWithRows([{ attempts: "0" }])
+  it("rejects subject market mismatch against ALS context", async () => {
+    const token = signedToken({
+      customer_id: "cus_1",
+      order_id: "ord_1",
+      market_id: "other-market",
+    })
+    const db = dbWithRows()
     const res = response()
 
     await withMarket(async () => {
@@ -240,7 +316,6 @@ describe("POST /store/voucher-consent/:token", () => {
             consent_rodo: true,
             consent_service_execution: true,
             consent_marketing: false,
-            phone: "+48123123123",
           },
           db,
           {},
@@ -250,14 +325,88 @@ describe("POST /store/voucher-consent/:token", () => {
       )
     })
 
-    expect(res.statusCode).toBe(400)
-    expect(res.body).toEqual({ error: "FIELD_NOT_ALLOWED", field: "phone" })
+    expect(res.statusCode).toBe(404)
+    expect(res.body).toEqual({ error: "TOKEN_INVALID" })
     expect(db.raw).not.toHaveBeenCalled()
   })
 
-  it("rate-limits after three buyer consent initiations per hour", async () => {
-    const token = signedToken({ customer_id: "cus_1", order_id: "ord_1" })
-    const db = dbWithRows([{ attempts: "3" }])
+  it("rejects authoritative market mismatch against ALS context", async () => {
+    const token = signedToken({
+      customer_id: "cus_1",
+      order_id: "ord_1",
+    })
+    const db = dbWithRows(
+      [{ market_id: "testmarketb", sales_channel_id: null, requires_age_check: false }]
+    )
+    const res = response()
+
+    await withMarket(async () => {
+      await POST(
+        request(
+          {
+            consent_rodo: true,
+            consent_service_execution: true,
+            consent_marketing: false,
+          },
+          db,
+          {},
+          token
+        ),
+        res as unknown as MedusaResponse
+      )
+    })
+
+    expect(res.statusCode).toBe(404)
+    expect(res.body).toEqual({ error: "TOKEN_INVALID" })
+  })
+
+  it("treats approved consent as single-use and does not overwrite the row", async () => {
+    const token = signedToken({
+      customer_id: "cus_1",
+      order_id: "ord_1",
+    })
+    const db = dbWithRows(
+      [{ market_id: "bonbeauty", sales_channel_id: null, requires_age_check: false }],
+      [],
+      [{ attempts: "2" }],
+      [{ status: "approved" }]
+    )
+    const res = response()
+
+    await withMarket(async () => {
+      await POST(
+        request(
+          {
+            consent_rodo: true,
+            consent_service_execution: true,
+            consent_marketing: true,
+          },
+          db,
+          {},
+          token
+        ),
+        res as unknown as MedusaResponse
+      )
+    })
+
+    expect(res.statusCode).toBe(200)
+    expect(res.body).toEqual({
+      status: "approved",
+      redirect_url: "/voucher",
+    })
+    expect(db.raw).toHaveBeenCalledTimes(4)
+  })
+
+  it("rate-limits after the fourth recorded attempt, including retries on the same token", async () => {
+    const token = signedToken({
+      customer_id: "cus_1",
+      order_id: "ord_1",
+    })
+    const db = dbWithRows(
+      [{ market_id: "bonbeauty", sales_channel_id: null, requires_age_check: false }],
+      [],
+      [{ attempts: "4" }]
+    )
     const res = response()
 
     await withMarket(async () => {
@@ -281,11 +430,48 @@ describe("POST /store/voucher-consent/:token", () => {
     expect(res.body).toEqual({ error: "RATE_LIMITED" })
   })
 
+  it("rejects demographic and contact fields outside the allowed payload", async () => {
+    const token = signedToken({ customer_id: "cus_1", order_id: "ord_1" })
+    const db = dbWithRows(
+      [{ market_id: "bonbeauty", sales_channel_id: null, requires_age_check: false }],
+      [],
+      [{ attempts: "1" }],
+      []
+    )
+    const res = response()
+
+    await withMarket(async () => {
+      await POST(
+        request(
+          {
+            consent_rodo: true,
+            consent_service_execution: true,
+            consent_marketing: false,
+            phone: "+48123123123",
+          },
+          db,
+          {},
+          token
+        ),
+        res as unknown as MedusaResponse
+      )
+    })
+
+    expect(res.statusCode).toBe(400)
+    expect(res.body).toEqual({ error: "FIELD_NOT_ALLOWED", field: "phone" })
+  })
+
   it.each([
     [{ consent_rodo: false, consent_service_execution: true }, "RODO_CONSENT_REQUIRED"],
     [{ consent_rodo: true, consent_service_execution: false }, "SERVICE_CONSENT_REQUIRED"],
   ] as const)("rejects mandatory consent failure %j as %s", async (body, code) => {
     const token = signedToken({ customer_id: "cus_1", order_id: "ord_1" })
+    const db = dbWithRows(
+      [{ market_id: "bonbeauty", sales_channel_id: null, requires_age_check: false }],
+      [],
+      [{ attempts: "1" }],
+      []
+    )
     const res = response()
 
     await withMarket(async () => {
@@ -295,7 +481,7 @@ describe("POST /store/voucher-consent/:token", () => {
             consent_marketing: false,
             ...body,
           },
-          null,
+          db,
           {},
           token
         ),

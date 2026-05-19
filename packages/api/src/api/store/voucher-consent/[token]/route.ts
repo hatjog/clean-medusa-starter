@@ -6,7 +6,10 @@ import {
   verifyMagicLink,
   type MagicLinkSubject,
 } from "../../../../lib/auth/magic-link"
-import { marketContextStorage } from "../../../../lib/market-context"
+import {
+  marketContextStorage,
+  type MarketContext,
+} from "../../../../lib/market-context"
 
 type Db = {
   raw: (sql: string, params?: unknown[]) => Promise<unknown>
@@ -33,6 +36,12 @@ type ConsentPayload = {
   guardian_email: string | null
   guardian_is_parent: boolean | null
   captcha_token: string | null
+}
+
+type AuthoritativeConsentContext = {
+  age_check_required: boolean
+  market_id: string | null
+  sales_channel_id: string | null
 }
 
 const ALLOWED_FIELDS = new Set([
@@ -88,6 +97,10 @@ function mapTokenReason(reason: "expired" | "invalid" | "revoked"): ConsentError
   return "TOKEN_INVALID"
 }
 
+function tokenInvalid(res: MedusaResponse, status = 404): void {
+  jsonError(res, status, "TOKEN_INVALID")
+}
+
 async function verifyPurchaseToken(token: string): Promise<
   | {
       ok: true
@@ -138,6 +151,179 @@ function ageCheckRequired(subject: MagicLinkSubject): boolean {
     subject.voucher_template_requires_age_check === true ||
     subject.age_check_required === true
   )
+}
+
+function normalizedBoolean(value: unknown): boolean {
+  if (typeof value === "boolean") return value
+  if (typeof value === "string") return value.trim().toLowerCase() === "true"
+  return false
+}
+
+function authoritativeRowToContext(
+  row: Record<string, unknown> | undefined
+): AuthoritativeConsentContext | null {
+  if (!row) return null
+
+  const market_id =
+    typeof row.market_id === "string" && row.market_id.trim()
+      ? row.market_id.trim()
+      : null
+  const sales_channel_id =
+    typeof row.sales_channel_id === "string" && row.sales_channel_id.trim()
+      ? row.sales_channel_id.trim()
+      : null
+
+  return {
+    age_check_required: normalizedBoolean(row.requires_age_check),
+    market_id,
+    sales_channel_id,
+  }
+}
+
+async function resolveEntitlementAuthorityById(
+  db: Db,
+  entitlementId: string
+): Promise<AuthoritativeConsentContext | null> {
+  const result = await db.raw(
+    `SELECT
+        NULLIF(ei.market_id, '') AS market_id,
+        NULL::text AS sales_channel_id,
+        (
+          LOWER(
+            COALESCE(
+              ei.policy_snapshot #>> '{voucher_template,requires_age_check}',
+              ei.policy_snapshot #>> '{recipient_rules,requires_age_check}',
+              ei.policy_snapshot->>'requires_age_check',
+              'false'
+            )
+          ) = 'true'
+        ) AS requires_age_check
+       FROM entitlement_instance ei
+      WHERE ei.id = $1
+      LIMIT 1`,
+    [entitlementId]
+  )
+
+  return authoritativeRowToContext(rowsFromResult(result)[0])
+}
+
+async function resolveEntitlementAuthorityByOrderId(
+  db: Db,
+  orderId: string
+): Promise<AuthoritativeConsentContext | null> {
+  const result = await db.raw(
+    `SELECT
+        CASE
+          WHEN COUNT(*) = 0 THEN NULL
+          WHEN COUNT(DISTINCT NULLIF(ei.market_id, '')) = 1 THEN MIN(NULLIF(ei.market_id, ''))
+          ELSE NULL
+        END AS market_id,
+        NULL::text AS sales_channel_id,
+        COALESCE(
+          BOOL_OR(
+            LOWER(
+              COALESCE(
+                ei.policy_snapshot #>> '{voucher_template,requires_age_check}',
+                ei.policy_snapshot #>> '{recipient_rules,requires_age_check}',
+                ei.policy_snapshot->>'requires_age_check',
+                'false'
+              )
+            ) = 'true'
+          ),
+          false
+        ) AS requires_age_check
+       FROM entitlement_instance ei
+      WHERE ei.order_id = $1`,
+    [orderId]
+  )
+
+  const row = rowsFromResult(result)[0]
+  if (!row || row.market_id === undefined) {
+    return null
+  }
+
+  const context = authoritativeRowToContext(row)
+  if (!context?.market_id) {
+    return null
+  }
+
+  return context
+}
+
+async function resolveOrderIdByVoucherCode(
+  db: Db,
+  voucherCode: string
+): Promise<{ order_id: string | null; market_id: string | null; sales_channel_id: string | null } | null> {
+  const result = await db.raw(
+    `SELECT
+        ge.order_id,
+        gm.slug AS market_id,
+        gm.sales_channel_id
+       FROM gp_core.entitlements ge
+       JOIN gp_core.markets gm
+         ON gm.id = ge.market_id
+      WHERE ge.voucher_code_normalized = LOWER($1)
+      LIMIT 1`,
+    [voucherCode]
+  )
+
+  const row = rowsFromResult(result)[0]
+  if (!row) return null
+
+  return {
+    order_id:
+      typeof row.order_id === "string" && row.order_id.trim() ? row.order_id.trim() : null,
+    market_id:
+      typeof row.market_id === "string" && row.market_id.trim()
+        ? row.market_id.trim()
+        : null,
+    sales_channel_id:
+      typeof row.sales_channel_id === "string" && row.sales_channel_id.trim()
+        ? row.sales_channel_id.trim()
+        : null,
+  }
+}
+
+async function resolveAuthoritativeConsentContext(
+  db: Db,
+  subject: MagicLinkSubject
+): Promise<AuthoritativeConsentContext | null> {
+  const entitlementId = getStringSubject(subject, "entitlement_id")
+  if (entitlementId) {
+    const byEntitlement = await resolveEntitlementAuthorityById(db, entitlementId)
+    if (byEntitlement) {
+      return byEntitlement
+    }
+  }
+
+  const orderId = getStringSubject(subject, "order_id")
+  if (orderId) {
+    const byOrder = await resolveEntitlementAuthorityByOrderId(db, orderId)
+    if (byOrder) {
+      return byOrder
+    }
+  }
+
+  const voucherCode = getStringSubject(subject, "voucher_code")
+  if (voucherCode) {
+    const voucherLookup = await resolveOrderIdByVoucherCode(db, voucherCode)
+    if (voucherLookup?.order_id) {
+      const byVoucherOrder = await resolveEntitlementAuthorityByOrderId(
+        db,
+        voucherLookup.order_id
+      )
+      if (byVoucherOrder) {
+        return {
+          ...byVoucherOrder,
+          market_id: byVoucherOrder.market_id ?? voucherLookup.market_id,
+          sales_channel_id:
+            byVoucherOrder.sales_channel_id ?? voucherLookup.sales_channel_id,
+        }
+      }
+    }
+  }
+
+  return null
 }
 
 function validatePayload(
@@ -231,30 +417,66 @@ function resolveUserAgent(req: MedusaRequest): string {
   return requestHeader(req, "user-agent") ?? ""
 }
 
-async function consentStatus(db: Db, tokenJti: string): Promise<ConsentStatus | null> {
+async function consentStatus(
+  db: Db,
+  tokenJti: string,
+  marketId: string
+): Promise<ConsentStatus | null> {
   const result = await db.raw(
     `SELECT status
        FROM voucher_consent
       WHERE token_jti = $1
+        AND market_id = $2
       LIMIT 1`,
-    [tokenJti]
+    [tokenJti, marketId]
   )
   const status = rowsFromResult(result)[0]?.status
   return typeof status === "string" ? (status as ConsentStatus) : null
 }
 
+async function recordConsentAttempt(args: {
+  db: Db,
+  recipientId: string,
+  tokenJti: string,
+  market_id: string,
+  sales_channel_id: string,
+  ip_address: string | null,
+  user_agent: string,
+}): Promise<void> {
+  await args.db.raw(
+    `INSERT INTO voucher_consent_attempt (
+        token_jti,
+        recipient_id,
+        market_id,
+        sales_channel_id,
+        ip_address,
+        user_agent,
+        created_at
+      )
+      VALUES ($1, $2, $3, $4, $5::inet, $6, now())`,
+    [
+      args.tokenJti,
+      args.recipientId,
+      args.market_id,
+      args.sales_channel_id,
+      args.ip_address,
+      args.user_agent,
+    ]
+  )
+}
+
 async function countRecentBuyerInitiations(
   db: Db,
   recipientId: string,
-  tokenJti: string
+  marketId: string
 ): Promise<number> {
   const result = await db.raw(
     `SELECT COUNT(*)::int AS attempts
-       FROM voucher_consent
+       FROM voucher_consent_attempt
       WHERE recipient_id = $1
-        AND token_jti <> $2
+        AND market_id = $2
         AND created_at >= now() - interval '1 hour'`,
-    [recipientId, tokenJti]
+    [recipientId, marketId]
   )
   const attempts = rowsFromResult(result)[0]?.attempts
   return typeof attempts === "number" ? attempts : Number(attempts ?? 0)
@@ -290,6 +512,8 @@ async function persistConsent(args: {
   db: Db
   token_jti: string
   recipient_id: string
+  market_id: string
+  sales_channel_id: string
   payload: ConsentPayload
   status: ConsentStatus
   ip_address: string | null
@@ -300,6 +524,8 @@ async function persistConsent(args: {
     `INSERT INTO voucher_consent (
         token_jti,
         recipient_id,
+        market_id,
+        sales_channel_id,
         consent_rodo,
         consent_service_execution,
         consent_marketing,
@@ -312,8 +538,8 @@ async function persistConsent(args: {
         created_at,
         updated_at
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::inet, $10, $11, now(), now())
-      ON CONFLICT (token_jti) DO UPDATE SET
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::inet, $12, $13, now(), now())
+      ON CONFLICT (market_id, token_jti) DO UPDATE SET
         consent_rodo = EXCLUDED.consent_rodo,
         consent_service_execution = EXCLUDED.consent_service_execution,
         consent_marketing = EXCLUDED.consent_marketing,
@@ -327,6 +553,8 @@ async function persistConsent(args: {
     [
       args.token_jti,
       args.recipient_id,
+      args.market_id,
+      args.sales_channel_id,
       args.payload.consent_rodo,
       args.payload.consent_service_execution,
       args.payload.consent_marketing,
@@ -340,19 +568,55 @@ async function persistConsent(args: {
   )
 }
 
-function requireMarketContext(res: MedusaResponse): boolean {
+function requireMarketContext(res: MedusaResponse): MarketContext | null {
   const context = marketContextStorage.getStore()
-  if (context?.market_id) return true
+  if (context?.market_id && context.sales_channel_id) return context
   res.status(403).json({
     code: "MARKET_CONTEXT_REQUIRED",
     message: "Market context required",
   })
-  return false
+  return null
+}
+
+function subjectMatchesMarketContext(
+  subject: MagicLinkSubject,
+  context: MarketContext
+): boolean {
+  const subjectMarketId = getStringSubject(subject, "market_id")
+  if (subjectMarketId && subjectMarketId !== context.market_id) {
+    return false
+  }
+
+  const subjectSalesChannelId = getStringSubject(subject, "sales_channel_id")
+  if (subjectSalesChannelId && subjectSalesChannelId !== context.sales_channel_id) {
+    return false
+  }
+
+  return true
+}
+
+function authorityMatchesMarketContext(
+  authority: AuthoritativeConsentContext,
+  context: MarketContext
+): boolean {
+  if (authority.market_id && authority.market_id !== context.market_id) {
+    return false
+  }
+
+  if (
+    authority.sales_channel_id &&
+    authority.sales_channel_id !== context.sales_channel_id
+  ) {
+    return false
+  }
+
+  return true
 }
 
 export async function GET(req: MedusaRequest, res: MedusaResponse): Promise<void> {
   setSecurityHeaders(res)
-  if (!requireMarketContext(res)) return
+  const marketContext = requireMarketContext(res)
+  if (!marketContext) return
 
   const token = tokenFromRequest(req)
   const verification = await verifyPurchaseToken(token)
@@ -367,8 +631,24 @@ export async function GET(req: MedusaRequest, res: MedusaResponse): Promise<void
     return
   }
 
-  const minorPath = ageCheckRequired(verification.subject)
-  const currentStatus = await consentStatus(db, verification.token_jti)
+  if (!subjectMatchesMarketContext(verification.subject, marketContext)) {
+    tokenInvalid(res)
+    return
+  }
+
+  const authority = await resolveAuthoritativeConsentContext(db, verification.subject)
+  if (!authority || !authorityMatchesMarketContext(authority, marketContext)) {
+    tokenInvalid(res)
+    return
+  }
+
+  const minorPath =
+    authority.age_check_required || ageCheckRequired(verification.subject)
+  const currentStatus = await consentStatus(
+    db,
+    verification.token_jti,
+    marketContext.market_id
+  )
   const blocked = minorPath && currentStatus !== "approved_by_guardian"
 
   res.status(200).json({
@@ -381,7 +661,8 @@ export async function GET(req: MedusaRequest, res: MedusaResponse): Promise<void
 
 export async function POST(req: MedusaRequest, res: MedusaResponse): Promise<void> {
   setSecurityHeaders(res)
-  if (!requireMarketContext(res)) return
+  const marketContext = requireMarketContext(res)
+  if (!marketContext) return
 
   const token = tokenFromRequest(req)
   const verification = await verifyPurchaseToken(token)
@@ -390,7 +671,61 @@ export async function POST(req: MedusaRequest, res: MedusaResponse): Promise<voi
     return
   }
 
-  const minorPath = ageCheckRequired(verification.subject)
+  const db = resolveDb(req)
+  if (!db) {
+    res.status(503).json({ error: "SERVICE_UNAVAILABLE" })
+    return
+  }
+
+  if (!subjectMatchesMarketContext(verification.subject, marketContext)) {
+    tokenInvalid(res)
+    return
+  }
+
+  const authority = await resolveAuthoritativeConsentContext(db, verification.subject)
+  if (!authority || !authorityMatchesMarketContext(authority, marketContext)) {
+    tokenInvalid(res)
+    return
+  }
+
+  const minorPath =
+    authority.age_check_required || ageCheckRequired(verification.subject)
+  const recipientId = buyerAccountId(verification.subject, verification.token_jti)
+
+  await recordConsentAttempt({
+    db,
+    recipientId,
+    tokenJti: verification.token_jti,
+    market_id: marketContext.market_id,
+    sales_channel_id: marketContext.sales_channel_id,
+    ip_address: resolveIpAddress(req),
+    user_agent: resolveUserAgent(req),
+  })
+
+  const attempts = await countRecentBuyerInitiations(
+    db,
+    recipientId,
+    marketContext.market_id
+  )
+  if (attempts > RATE_LIMIT_MAX_PER_HOUR) {
+    res.setHeader("Retry-After", RETRY_AFTER_SECONDS)
+    jsonError(res, 429, "RATE_LIMITED")
+    return
+  }
+
+  const currentStatus = await consentStatus(
+    db,
+    verification.token_jti,
+    marketContext.market_id
+  )
+  if (currentStatus === "approved" || currentStatus === "approved_by_guardian") {
+    res.status(200).json({
+      status: currentStatus,
+      redirect_url: "/voucher",
+    })
+    return
+  }
+
   const validation = validatePayload(req.body, minorPath)
   if ("error" in validation) {
     jsonError(
@@ -407,25 +742,13 @@ export async function POST(req: MedusaRequest, res: MedusaResponse): Promise<voi
     return
   }
 
-  const db = resolveDb(req)
-  if (!db) {
-    res.status(503).json({ error: "SERVICE_UNAVAILABLE" })
-    return
-  }
-
-  const recipientId = buyerAccountId(verification.subject, verification.token_jti)
-  const attempts = await countRecentBuyerInitiations(db, recipientId, verification.token_jti)
-  if (attempts >= RATE_LIMIT_MAX_PER_HOUR) {
-    res.setHeader("Retry-After", RETRY_AFTER_SECONDS)
-    jsonError(res, 429, "RATE_LIMITED")
-    return
-  }
-
   const status: ConsentStatus = minorPath ? "approved_by_guardian" : "approved"
   await persistConsent({
     db,
     token_jti: verification.token_jti,
     recipient_id: recipientId,
+    market_id: marketContext.market_id,
+    sales_channel_id: marketContext.sales_channel_id,
     payload: validation,
     status,
     ip_address: resolveIpAddress(req),
