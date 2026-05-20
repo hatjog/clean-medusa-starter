@@ -40,11 +40,11 @@
     "test:patches": "TEST_TYPE=patches NODE_OPTIONS=--experimental-vm-modules jest --silent=false --runInBand --forceExit"
   },
   "dependencies": {
-    "@medusajs/admin-sdk": "2.13.6",
-    "@medusajs/cli": "2.13.6",
-    "@medusajs/framework": "2.13.6",
-    "@medusajs/icons": "2.13.6",
-    "@medusajs/medusa": "2.13.6",
+    "@medusajs/admin-sdk": "2.14.2",
+    "@medusajs/cli": "2.14.2",
+    "@medusajs/framework": "2.14.2",
+    "@medusajs/icons": "2.14.2",
+    "@medusajs/medusa": "2.14.2",
     "@medusajs/ui": "4.0.25",
     "@mercurjs/cli": "2.1.1",
     "@mercurjs/core": "2.1.1",
@@ -58,11 +58,11 @@
     "pdfkit": "^0.15.0",
     "posthog-node": "^5.11.0",
     "resend": "^4.1.2",
-    "zod": "^3.25.76"
+    "zod": "4.2.0"
   },
   "devDependencies": {
     "@google-cloud/secret-manager": "6.1.2",
-    "@medusajs/test-utils": "2.13.6",
+    "@medusajs/test-utils": "2.14.2",
     "@swc/core": "1.5.7",
     "@swc/jest": "^0.2.36",
     "@types/jest": "^29.5.13",
@@ -90,6 +90,19 @@
       "esbuild",
       "@swc/core"
     ],
+    "overrides": {
+      "@medusajs/admin-sdk": "2.14.2",
+      "@medusajs/admin-shared": "2.14.2",
+      "@medusajs/admin-vite-plugin": "2.14.2",
+      "@medusajs/cli": "2.14.2",
+      "@medusajs/dashboard": "2.14.2",
+      "@medusajs/framework": "2.14.2",
+      "@medusajs/icons": "2.14.2",
+      "@medusajs/js-sdk": "2.14.2",
+      "@medusajs/medusa": "2.14.2",
+      "@medusajs/test-utils": "2.14.2",
+      "@medusajs/types": "2.14.2"
+    },
     "patchedDependencies": {
       "@mercurjs/core@2.1.1": "patches/@mercurjs__core@2.1.1.patch"
     }

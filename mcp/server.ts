@@ -108,7 +108,7 @@ const requestInput = {
 		.string()
 		.default("GET")
 		.describe("HTTP method: GET|POST|PUT|PATCH|DELETE"),
-	headers: z.record(z.string()).optional().describe("Extra HTTP headers"),
+	headers: z.record(z.string(), z.string()).optional().describe("Extra HTTP headers"),
 	body: z.any().optional().describe("Request body (object will be JSON encoded)"),
 };
 

@@ -1585,7 +1585,7 @@ describe("buildVendorPricingMap — runtime-state-map", () => {
 
     // F9 fix: assert the seller query was scoped correctly — locks cross-market
     // isolation contract and verifies marketIdForRuntime is actually parameterised.
-    expect(select).toHaveBeenCalledWith("handle", "store_status")
+    expect(select).toHaveBeenCalledWith("handle", { store_status: "status" })
     expect(whereIn).toHaveBeenCalledWith(
       "handle",
       expect.arrayContaining(["seller-a", "seller-b", "seller-c", "seller-d", "seller-e"])

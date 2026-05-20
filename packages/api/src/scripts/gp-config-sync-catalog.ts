@@ -1111,7 +1111,7 @@ export async function syncProducts(
     try {
       const matches = await productModuleService.listProducts(
         { handle },
-        { select: ["id", "handle", "title", "description", "status", "metadata"], relations: ["variants", "categories"] }
+        { select: ["id", "handle", "title", "description", "status", "metadata"], relations: ["variants"] }
       )
       const existing = matches?.[0]
 
@@ -1133,13 +1133,10 @@ export async function syncProducts(
           continue
         }
 
-        // REPLACE semantic: merge existing category_ids + fixture (H-7, full set)
-        const existingCategoryIds = (existing.categories ?? [])
-          .map((c: any) => c.id)
-          .filter(Boolean)
-        const mergedCategoryIds = Array.from(
-          new Set([...existingCategoryIds, ...resolvedCategoryIds])
-        )
+        // Keep the product read lean: Medusa/Mercur 2.14 local schemas may not expose
+        // every category relation projection. gp-config remains the source of truth for
+        // fixture category links, so sync the resolved fixture category set directly.
+        const nextCategoryIds = Array.from(new Set(resolvedCategoryIds))
 
         // Quality gate evaluation before status assignment
         const gateResult = evaluateQualityGate(product, { vendorPricing: hasVendorPricing })
@@ -1157,8 +1154,8 @@ export async function syncProducts(
               ? `price=${catalogPrice.amount} ${catalogPrice.currency} (min-vendor)`
               : `price=${catalogPrice.amount} ${catalogPrice.currency}`,
           ]
-          if (mergedCategoryIds.length > 0) {
-            noteParts.push(`category_ids=${mergedCategoryIds.length}`)
+          if (nextCategoryIds.length > 0) {
+            noteParts.push(`category_ids=${nextCategoryIds.length}`)
           }
           if (resolvedCollectionId) {
             noteParts.push(`collection_id=${resolvedCollectionId}`)
@@ -1191,8 +1188,8 @@ export async function syncProducts(
           },
         }
 
-        if (mergedCategoryIds.length > 0) {
-          updatePayload.category_ids = mergedCategoryIds
+        if (nextCategoryIds.length > 0) {
+          updatePayload.category_ids = nextCategoryIds
         }
         if (resolvedCollectionId) {
           updatePayload.collection_id = resolvedCollectionId
@@ -1428,7 +1425,9 @@ export function isRuntimeSellerActive(storeStatus: string | null | undefined): b
 }
 
 /**
- * Reads `seller.store_status` for the given market from the Mercur 2 DB (Knex handle).
+ * Reads Mercur 2 `seller.status` for the given market from the DB (Knex handle).
+ * Rows are mapped to `store_status` internally so older unit fixtures can keep exercising
+ * the legacy bridge semantics while runtime SQL stays on the current Mercur schema.
  *
  * Best-effort: if the DB query throws, a warning is pushed and an empty Map is returned
  * so that the caller falls back to config-only filtering without crashing the sync run.
@@ -1465,7 +1464,7 @@ async function resolveVendorRuntimeStateMap(
   let rows: Array<{ handle: string; store_status: string | null }> = []
   try {
     rows = await db("seller")
-      .select("handle", "store_status")
+      .select("handle", { store_status: "status" })
       .whereIn("handle", slugs)
       .whereRaw("metadata->'gp'->>'market_id' = ?", [marketId])
       .whereNull("deleted_at")
