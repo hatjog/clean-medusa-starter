@@ -10,7 +10,7 @@ describe("PostgresMagicLinkStore", () => {
     jest.restoreAllMocks()
   })
 
-  it("records issued links without persisting subject JSON", async () => {
+  it("records issued links with subject metadata for revoke-all lookup", async () => {
     const ignore = jest.fn().mockResolvedValue(undefined)
     const onConflict = jest.fn(() => ({ ignore }))
     const insert = jest.fn(() => ({ onConflict }))
@@ -20,7 +20,11 @@ describe("PostgresMagicLinkStore", () => {
     await store.recordIssued({
       token_jti: "00000000-0000-4000-8000-000000000001",
       purpose: "recover",
+      subject: {
+        email: "Customer@Example.test",
+      },
       subject_customer_id: "cus_1",
+      subject_email: "Customer@Example.test",
       market_id: "bonbeauty",
       issued_at: new Date("2026-05-18T08:00:00.000Z"),
       expires_at: new Date("2026-05-25T08:00:00.000Z"),
@@ -29,7 +33,11 @@ describe("PostgresMagicLinkStore", () => {
     expect(insert).toHaveBeenCalledWith({
       token_jti: "00000000-0000-4000-8000-000000000001",
       purpose: "recover",
+      subject: {
+        email: "Customer@Example.test",
+      },
       subject_customer_id: "cus_1",
+      subject_email: "customer@example.test",
       market_id: "bonbeauty",
       issued_at: new Date("2026-05-18T08:00:00.000Z"),
       expires_at: new Date("2026-05-25T08:00:00.000Z"),
@@ -39,7 +47,6 @@ describe("PostgresMagicLinkStore", () => {
       | Record<string, unknown>
       | undefined
     expect(insertedPayload).toBeDefined()
-    expect(insertedPayload).not.toHaveProperty("subject")
     expect(onConflict).toHaveBeenCalledWith("token_jti")
     expect(ignore).toHaveBeenCalledTimes(1)
   })
@@ -54,13 +61,13 @@ describe("PostgresMagicLinkStore", () => {
       leftJoin: jest.fn(),
       select: jest.fn(),
       where: jest.fn(),
-      andWhere: jest.fn(),
+      whereRaw: jest.fn(),
       whereNull: jest.fn(),
     }
     pendingQuery.leftJoin.mockReturnValue(pendingQuery)
     pendingQuery.select.mockReturnValue(pendingQuery)
     pendingQuery.where.mockReturnValue(pendingQuery)
-    pendingQuery.andWhere.mockReturnValue(pendingQuery)
+    pendingQuery.whereRaw.mockReturnValue(pendingQuery)
     pendingQuery.whereNull.mockResolvedValue(issuedRows)
 
     const ignore = jest.fn().mockResolvedValue(undefined)
@@ -83,6 +90,7 @@ describe("PostgresMagicLinkStore", () => {
     const now = new Date("2026-05-18T08:00:00.000Z")
     const result = await store.revokePendingForCustomer({
       customer_id: "cus_1",
+      customer_email: "Customer@Example.test",
       market_id: "bonbeauty",
       reason: "user_revoke",
       revoked_by: "cus_1",
@@ -90,20 +98,28 @@ describe("PostgresMagicLinkStore", () => {
     })
 
     expect(result).toEqual({ revoked_count: 2 })
-    expect(pendingQuery.where).toHaveBeenNthCalledWith(
+    expect(pendingQuery.whereRaw).toHaveBeenNthCalledWith(
       1,
-      "issued.subject_customer_id",
-      "cus_1"
+      expect.stringContaining("issued.subject_customer_id = ?"),
+      [
+        "cus_1",
+        "cus_1",
+        "customer@example.test",
+        "customer@example.test",
+        "customer@example.test",
+        "customer@example.test",
+      ]
     )
     expect(pendingQuery.where).toHaveBeenNthCalledWith(
-      2,
+      1,
       "issued.expires_at",
       ">",
       now
     )
-    expect(pendingQuery.andWhere).toHaveBeenCalledWith(
-      "issued.market_id",
-      "bonbeauty"
+    expect(pendingQuery.whereRaw).toHaveBeenNthCalledWith(
+      2,
+      "(issued.market_id = ? OR issued.market_id IS NULL)",
+      ["bonbeauty"]
     )
     expect(pendingQuery.whereNull).toHaveBeenCalledWith("revoked.token_jti")
     expect(insert).toHaveBeenCalledWith([
@@ -192,7 +208,13 @@ describe("createMagicLinkRuntimeBindings", () => {
     expect(store.recordIssued).toHaveBeenCalledWith({
       token_jti: "00000000-0000-4000-8000-000000000001",
       purpose: "recover",
+      subject: {
+        customer_id: "cus_1",
+        market_id: "bonbeauty",
+        email: "customer@example.test",
+      },
       subject_customer_id: "cus_1",
+      subject_email: "customer@example.test",
       market_id: "bonbeauty",
       issued_at: new Date("2025-05-18T08:26:40.000Z"),
       expires_at: new Date("2025-05-25T08:26:40.000Z"),

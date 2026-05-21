@@ -70,6 +70,8 @@ const HS256_ALGORITHM = "HS256"
 const JWT_SECRET_MIN_BYTES = 32
 const TEST_SECRET_ENV = "MAGIC_LINK_TEST_JWT_SECRET"
 const runtimeBindings: MagicLinkRuntimeBindings = {}
+const MAGIC_LINK_JTI_UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 
 export class MagicLinkConfigurationError extends Error {
   constructor(message: string) {
@@ -88,6 +90,10 @@ export function configureMagicLinkRuntime(
 export function resetMagicLinkRuntime(): void {
   delete runtimeBindings.isJtiRevoked
   delete runtimeBindings.recordIssued
+}
+
+export function isValidMagicLinkJti(value: unknown): value is string {
+  return typeof value === "string" && MAGIC_LINK_JTI_UUID_RE.test(value)
 }
 
 function base64UrlEncode(value: Buffer | string): string {
@@ -210,8 +216,7 @@ function isMagicLinkClaims(value: unknown): value is MagicLinkClaims {
   }
 
   return (
-    typeof value.jti === "string" &&
-    value.jti.trim().length > 0 &&
+    isValidMagicLinkJti(value.jti) &&
     typeof value.iat === "number" &&
     Number.isFinite(value.iat) &&
     typeof value.exp === "number" &&
@@ -279,6 +284,15 @@ export function getMagicLinkSubjectMarketId(
   return typeof value === "string" && value.trim() ? value.trim() : null
 }
 
+export function getMagicLinkSubjectEmail(
+  subject: MagicLinkSubject
+): string | null {
+  const value = subject.email
+  return typeof value === "string" && value.trim()
+    ? value.trim().toLowerCase()
+    : null
+}
+
 export function generateMagicLinkWithClaims(
   purpose: MagicLinkPurpose,
   subject: MagicLinkSubject,
@@ -290,8 +304,13 @@ export function generateMagicLinkWithClaims(
 
   const now = options.now ?? new Date()
   const iat = epochSeconds(now)
+  const jti = options.jti ?? randomUUID()
+  if (!isValidMagicLinkJti(jti)) {
+    throw new Error("Invalid magic link jti")
+  }
+
   const claims: MagicLinkClaims = {
-    jti: options.jti ?? randomUUID(),
+    jti,
     purpose,
     subject,
     iat,
@@ -349,13 +368,21 @@ export async function verifyMagicLink(
     return { valid: false, reason: "expired" }
   }
 
+  if (claims.exp - claims.iat > MAGIC_LINK_TTL_SECONDS[claims.purpose]) {
+    return { valid: false, reason: "invalid" }
+  }
+
   const isJtiRevoked = options.isJtiRevoked ?? runtimeBindings.isJtiRevoked
   if (!isJtiRevoked) {
     return { valid: false, reason: "invalid" }
   }
 
-  if (await isJtiRevoked(claims.jti)) {
-    return { valid: false, reason: "revoked" }
+  try {
+    if (await isJtiRevoked(claims.jti)) {
+      return { valid: false, reason: "revoked" }
+    }
+  } catch {
+    return { valid: false, reason: "invalid" }
   }
 
   return {

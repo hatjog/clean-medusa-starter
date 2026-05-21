@@ -19,11 +19,19 @@ function response() {
   }
 }
 
-function request(actorId?: string): MedusaRequest {
+function request(actorId?: string, email?: string | null): MedusaRequest {
   return {
     auth_context: actorId ? { actor_id: actorId } : undefined,
     scope: {
-      resolve: jest.fn().mockReturnValue({}),
+      resolve: jest.fn((key: string) => {
+        if (key === "customer") {
+          return {
+            retrieveCustomer: jest.fn().mockResolvedValue({ email }),
+          }
+        }
+
+        return {}
+      }),
     },
   } as unknown as MedusaRequest
 }
@@ -56,7 +64,10 @@ describe("POST /store/account/magic-links/revoke-all", () => {
     await marketContextStorage.run(
       { market_id: "bonbeauty", sales_channel_id: "sc_bb" },
       async () => {
-        await POST(request("cus_1"), res as unknown as MedusaResponse)
+        await POST(
+          request("cus_1", "Customer@Example.test"),
+          res as unknown as MedusaResponse
+        )
       }
     )
 
@@ -64,6 +75,7 @@ describe("POST /store/account/magic-links/revoke-all", () => {
     expect(res.body).toEqual({ success: true })
     expect(revokeSpy).toHaveBeenCalledWith({
       customer_id: "cus_1",
+      customer_email: "customer@example.test",
       market_id: "bonbeauty",
       reason: "user_revoke",
       revoked_by: "cus_1",
