@@ -196,6 +196,39 @@ describe("magic link JWT infrastructure", () => {
         now: NOW,
       })
     ).resolves.toEqual({ valid: false, reason: "invalid" })
+
+    await expect(
+      verifyMagicLink(signedToken({ ...validClaims, jti: "not-a-uuid" }), {
+        now: NOW,
+      })
+    ).resolves.toEqual({ valid: false, reason: "invalid" })
+  })
+
+  it("rejects caller-supplied non-UUID jti values", () => {
+    expect(() =>
+      generateMagicLinkWithClaims(
+        "recover",
+        { customer_id: "cus_1" },
+        { now: NOW, jti: "not-a-uuid" }
+      )
+    ).toThrow(/jti/)
+  })
+
+  it("rejects signed tokens whose exp exceeds the purpose TTL", async () => {
+    const longLivedClaims: MagicLinkClaims = {
+      jti: RECOVER_JTI,
+      purpose: "recover",
+      subject: { customer_id: "cus_1" },
+      iat: Math.floor(NOW.getTime() / 1000),
+      exp:
+        Math.floor(NOW.getTime() / 1000) +
+        MAGIC_LINK_TTL_SECONDS.recover +
+        1,
+    }
+
+    await expect(
+      verifyMagicLink(signedToken(longLivedClaims), { now: NOW })
+    ).resolves.toEqual({ valid: false, reason: "invalid" })
   })
 
   it("checks revocation after cryptographic validation", async () => {
@@ -213,6 +246,22 @@ describe("magic link JWT infrastructure", () => {
       reason: "revoked",
     })
     expect(isJtiRevoked).toHaveBeenCalledWith(RECOVER_JTI)
+  })
+
+  it("fails closed when the revocation checker throws", async () => {
+    const { token } = generateMagicLinkWithClaims(
+      "recover",
+      { customer_id: "cus_1" },
+      { now: NOW, jti: RECOVER_JTI }
+    )
+    const isJtiRevoked = jest.fn().mockRejectedValue(new Error("db down"))
+
+    await expect(
+      verifyMagicLink(token, { now: NOW, isJtiRevoked })
+    ).resolves.toEqual({
+      valid: false,
+      reason: "invalid",
+    })
   })
 
   it("fails closed when no revocation checker is configured", async () => {
