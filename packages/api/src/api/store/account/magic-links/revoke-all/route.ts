@@ -1,5 +1,5 @@
 import type { MedusaRequest, MedusaResponse } from "@medusajs/framework/http"
-import { ContainerRegistrationKeys } from "@medusajs/framework/utils"
+import { ContainerRegistrationKeys, Modules } from "@medusajs/framework/utils"
 import type { Knex } from "knex"
 
 import { PostgresMagicLinkStore } from "../../../../../lib/auth/magic-link-revocation"
@@ -21,6 +21,22 @@ function resolveCustomerId(req: MedusaRequest): string | null {
 function resolveDb(req: MedusaRequest): Knex | null {
   try {
     return req.scope.resolve(ContainerRegistrationKeys.PG_CONNECTION) as Knex
+  } catch {
+    return null
+  }
+}
+
+async function resolveCustomerEmail(
+  req: MedusaRequest,
+  customerId: string
+): Promise<string | null> {
+  try {
+    const customerService = req.scope.resolve(Modules.CUSTOMER) as {
+      retrieveCustomer: (id: string) => Promise<{ email?: string | null }>
+    }
+    const customer = await customerService.retrieveCustomer(customerId)
+    const email = customer.email?.trim().toLowerCase()
+    return email || null
   } catch {
     return null
   }
@@ -58,8 +74,10 @@ export async function POST(
   }
 
   const store = new PostgresMagicLinkStore(db)
+  const customerEmail = await resolveCustomerEmail(req, customerId)
   await store.revokePendingForCustomer({
     customer_id: customerId,
+    customer_email: customerEmail,
     market_id: marketId,
     reason: "user_revoke",
     revoked_by: customerId,

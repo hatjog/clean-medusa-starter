@@ -2,8 +2,10 @@ import type { Knex } from "knex"
 
 import {
   generateMagicLink,
+  getMagicLinkSubjectEmail,
   getMagicLinkSubjectCustomerId,
   getMagicLinkSubjectMarketId,
+  isValidMagicLinkJti as isValidJwtMagicLinkJti,
   type GeneratedMagicLink,
   type MagicLinkOptions,
   type MagicLinkPurpose,
@@ -20,7 +22,9 @@ export type MagicLinkRevocationReason =
 export type RecordIssuedMagicLinkInput = {
   token_jti: string
   purpose: MagicLinkPurpose
+  subject?: MagicLinkSubject | null
   subject_customer_id?: string | null
+  subject_email?: string | null
   market_id?: string | null
   issued_at: Date
   expires_at: Date
@@ -34,6 +38,7 @@ export type RevokeMagicLinkInput = {
 
 export type RevokePendingCustomerMagicLinksInput = {
   customer_id: string
+  customer_email?: string | null
   market_id: string
   reason: "user_revoke"
   revoked_by: string
@@ -57,7 +62,7 @@ const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 
 export function isValidMagicLinkJti(value: string): boolean {
-  return UUID_RE.test(value)
+  return UUID_RE.test(value) && isValidJwtMagicLinkJti(value)
 }
 
 export function shouldDeleteMagicLinkRevocation(
@@ -73,6 +78,11 @@ export function shouldDeleteMagicLinkRevocation(
 
 function toNullableString(value: string | null): string | null {
   return value && value.trim() ? value.trim() : null
+}
+
+function normalizeEmail(value: string | null | undefined): string | null {
+  const normalized = value?.trim().toLowerCase()
+  return normalized ? normalized : null
 }
 
 export class PostgresMagicLinkStore implements MagicLinkRevocationStore {
@@ -92,7 +102,9 @@ export class PostgresMagicLinkStore implements MagicLinkRevocationStore {
       .insert({
         token_jti: input.token_jti,
         purpose: input.purpose,
+        subject: input.subject ?? null,
         subject_customer_id: toNullableString(input.subject_customer_id ?? null),
+        subject_email: normalizeEmail(input.subject_email),
         market_id: toNullableString(input.market_id ?? null),
         issued_at: input.issued_at,
         expires_at: input.expires_at,
@@ -119,6 +131,7 @@ export class PostgresMagicLinkStore implements MagicLinkRevocationStore {
       throw new Error("market_id is required for magic link revoke-all")
     }
 
+    const customerEmail = normalizeEmail(input.customer_email)
     const rows = await this.db("magic_link_issued as issued")
       .leftJoin(
         "magic_link_revocation as revoked",
@@ -126,9 +139,28 @@ export class PostgresMagicLinkStore implements MagicLinkRevocationStore {
         "revoked.token_jti"
       )
       .select<{ token_jti: string }[]>("issued.token_jti")
-      .where("issued.subject_customer_id", input.customer_id)
+      .whereRaw(
+        [
+          "(",
+          "issued.subject_customer_id = ?",
+          "OR issued.subject->>'customer_id' = ?",
+          "OR (? IS NOT NULL AND issued.subject_email = ?)",
+          "OR (? IS NOT NULL AND lower(issued.subject->>'email') = ?)",
+          ")",
+        ].join(" "),
+        [
+          input.customer_id,
+          input.customer_id,
+          customerEmail,
+          customerEmail,
+          customerEmail,
+          customerEmail,
+        ]
+      )
       .where("issued.expires_at", ">", input.now ?? new Date())
-      .andWhere("issued.market_id", input.market_id)
+      .whereRaw("(issued.market_id = ? OR issued.market_id IS NULL)", [
+        input.market_id.trim(),
+      ])
       .whereNull("revoked.token_jti")
 
     if (rows.length === 0) {
@@ -173,7 +205,9 @@ function recordIssuedFromGenerated(
   return store.recordIssued({
     token_jti: generated.claims.jti,
     purpose: generated.claims.purpose,
+    subject: generated.claims.subject,
     subject_customer_id: getMagicLinkSubjectCustomerId(generated.claims.subject),
+    subject_email: getMagicLinkSubjectEmail(generated.claims.subject),
     market_id: getMagicLinkSubjectMarketId(generated.claims.subject),
     issued_at: new Date(generated.claims.iat * 1000),
     expires_at: new Date(generated.claims.exp * 1000),
