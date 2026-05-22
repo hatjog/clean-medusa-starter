@@ -36,7 +36,6 @@ export class PgVoucherPiiAdapter implements VoucherPiiPort {
         recipient_phone: input.recipient_phone,
         locale: input.locale,
         is_gift: input.is_gift,
-        tombstoned: false,
         created_at: new Date(),
         updated_at: new Date(),
       })
@@ -51,7 +50,8 @@ export class PgVoucherPiiAdapter implements VoucherPiiPort {
   }): Promise<{ rows_affected: number }> {
     const rows_affected = await this.db("voucher_recipient_pii")
       .where({ market_id: args.market_id, order_id: args.order_id })
-      .update({ tombstoned: true, updated_at: new Date() });
+      .whereNull("tombstoned_at")
+      .update({ tombstoned_at: new Date(), updated_at: new Date() });
     return { rows_affected };
   }
 
@@ -61,7 +61,8 @@ export class PgVoucherPiiAdapter implements VoucherPiiPort {
     batch_size: number;
   }): Promise<{ rows_deleted: number }> {
     const rows_deleted = await this.db("voucher_recipient_pii")
-      .where({ market_id: args.market_id, tombstoned: true })
+      .where({ market_id: args.market_id })
+      .whereNotNull("tombstoned_at")
       .where("created_at", "<", args.cutoff)
       .limit(args.batch_size)
       .delete();
@@ -78,7 +79,7 @@ export class PgVoucherPiiAdapter implements VoucherPiiPort {
           .whereRaw("a.payload->>'recipient_pii_id' = p.id::text")
           .limit(1)
       )
-      .where("p.tombstoned", true)
+      .whereNotNull("p.tombstoned_at")
       .limit(args.batch_size)
       .delete();
     return { rows_deleted };

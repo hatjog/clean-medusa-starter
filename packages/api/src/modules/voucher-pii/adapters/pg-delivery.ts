@@ -22,12 +22,11 @@ export class PgDeliveryAdapter implements DeliveryDecisionPort {
       id,
       consent_audit_id: args.consent_audit_id,
       market_id: args.market_id,
-      state: "pending",
+      outcome: "pending",
       delivery_attempt_n: 0,
       provider_ref: null,
       latency_ms: null,
       created_at: new Date(),
-      updated_at: new Date(),
     });
     return { delivery_decision_id: id };
   }
@@ -42,11 +41,11 @@ export class PgDeliveryAdapter implements DeliveryDecisionPort {
     await this.db("voucher_delivery_decision")
       .where({ id: args.delivery_decision_id })
       .update({
-        state: args.outcome,
+        outcome: args.outcome,
+        dispatched_at: args.outcome === "dispatched" ? new Date() : null,
         latency_ms: args.latency_ms,
         provider_ref: args.provider_ref,
         delivery_attempt_n: args.delivery_attempt_n,
-        updated_at: new Date(),
       });
   }
 }
