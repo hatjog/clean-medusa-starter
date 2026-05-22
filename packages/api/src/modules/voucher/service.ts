@@ -1329,7 +1329,7 @@ export class VoucherService {
 
       if (refundChannel === "store_credit") {
         // Increment customer.metadata.gp.store_credit (minor units, currency-aware).
-        // Note: the nested jsonb_set correctly uses the original `metadata` value
+        // Note: the nested jsonb_set correctly uses the original customer metadata
         // in the COALESCE — PostgreSQL evaluates all SET expressions against the
         // pre-UPDATE row state, so the inner jsonb_set result is threaded as the
         // first argument to the outer one while COALESCE reads the original value.
@@ -1338,14 +1338,14 @@ export class VoucherService {
           `UPDATE customer
               SET metadata = jsonb_set(
                     jsonb_set(
-                      COALESCE(metadata, '{}'),
+                      COALESCE(customer.metadata, '{}'::jsonb),
                       '{gp}',
-                      COALESCE(metadata->'gp', '{}'),
+                      COALESCE(customer.metadata->'gp', '{}'::jsonb),
                       true
                     ),
                     '{gp,store_credit}',
                     to_jsonb(
-                      COALESCE((metadata->'gp'->>'store_credit')::bigint, 0) + $2
+                      COALESCE((customer.metadata->'gp'->>'store_credit')::bigint, 0) + $2
                     ),
                     true
                   ),
@@ -1360,10 +1360,10 @@ export class VoucherService {
         await (client as Queryable).query(
           `UPDATE seller
               SET metadata = jsonb_set(
-                    COALESCE(metadata, '{}'),
+                    COALESCE(seller.metadata, '{}'::jsonb),
                     '{wallet}',
                     to_jsonb(
-                      COALESCE((metadata->>'wallet')::bigint, 0) + $2
+                      COALESCE((seller.metadata->>'wallet')::bigint, 0) + $2
                     ),
                     true
                   ),

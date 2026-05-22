@@ -16,9 +16,18 @@ import { computeRowHash } from "../../../lib/audit-hash-chain";
 import type { ConsentStateSnapshot } from "../types";
 import type { AuditChainPort } from "../ports";
 
-/** Hour bucket key for shard resolution — ISO-8601 hour UTC. */
-function hourBucket(): string {
-  return new Date().toISOString().slice(0, 13); // "2026-05-07T14"
+/** Hour bucket key for shard resolution — UTC hour as timestamptz-compatible Date. */
+function hourBucket(now = new Date()): Date {
+  const bucket = new Date(now);
+  bucket.setUTCMinutes(0, 0, 0);
+  return bucket;
+}
+
+function asBuffer(value: unknown): Buffer | null {
+  if (!value) return null;
+  if (Buffer.isBuffer(value)) return value;
+  if (typeof value === "string") return Buffer.from(value, "hex");
+  return null;
 }
 
 export class PgAuditAdapter implements AuditChainPort {
@@ -28,7 +37,8 @@ export class PgAuditAdapter implements AuditChainPort {
     market_id: string;
     payload: Record<string, unknown>;
   }): Promise<{ audit_id: string }> {
-    const bucket = hourBucket();
+    const createdAt = new Date();
+    const bucket = hourBucket(createdAt);
 
     // Resolve previous row hash for this shard.
     const prevRow = await this.db("voucher_pii_consent_audit")
@@ -37,9 +47,7 @@ export class PgAuditAdapter implements AuditChainPort {
       .orderBy("created_at", "desc")
       .first();
 
-    const prevHash = prevRow?.current_row_hash
-      ? Buffer.from(prevRow.current_row_hash, "hex")
-      : null;
+    const prevHash = asBuffer(prevRow?.current_row_hash);
 
     const currentHash = computeRowHash(prevHash, args.payload);
     const id = randomUUID();
@@ -49,9 +57,9 @@ export class PgAuditAdapter implements AuditChainPort {
       market_id: args.market_id,
       hour_bucket: bucket,
       payload: JSON.stringify(args.payload),
-      prev_row_hash: prevHash?.toString("hex") ?? null,
-      current_row_hash: currentHash.toString("hex"),
-      created_at: new Date(),
+      prev_row_hash: prevHash,
+      current_row_hash: currentHash,
+      created_at: createdAt,
     });
 
     return { audit_id: id };

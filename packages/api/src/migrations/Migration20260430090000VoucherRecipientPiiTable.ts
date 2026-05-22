@@ -10,7 +10,7 @@ import { Migration } from "@mikro-orm/migrations";
  *
  * Convention (D-70 / ADR-065):
  *   - RLS by `market_id` (multi-tenant isolation; mirrors v1.4.0 guards).
- *   - FK `entitlement_id` → `entitlement(id)` for orphan-PII detection
+ *   - Logical ref `entitlement_id` → entitlement instance id for orphan-PII detection
  *     (LEFT JOIN scan in retention scheduler).
  *   - Tombstone-on-erasure via `tombstoned_at timestamptz NULL`.
  *   - Composite index `(market_id, entitlement_id)` for write-path lookup.
@@ -20,10 +20,10 @@ import { Migration } from "@mikro-orm/migrations";
  *     disk encryption baseline. Per-row KMS encryption deferred to v1.10.0
  *     (OOS-N6) — TODO(KMS-PER-ROW) marker tracked.
  *
- * The `entitlement(id)` FK is declared but NOT enforced at the SQL level
- * because `entitlement` table may not exist in every test environment (Mercur
- * fork tracks entitlements via gp_core stubs in v1.4.0). The FK is logical;
- * orphan cleanup runs even if the relation is dropped.
+ * The entitlement FK is NOT enforced at the SQL level because entitlement ids
+ * are GP text ids (`ent_...`) in current runtime and older test environments
+ * may expose different entitlement backing tables. The FK is logical; orphan
+ * cleanup runs even if the relation is absent.
  *
  * Refs:
  *   - D-66 (architecture.md L412-422)
@@ -42,7 +42,7 @@ export class Migration20260430090000VoucherRecipientPiiTable extends Migration {
       `CREATE TABLE voucher_recipient_pii (
         id uuid NOT NULL DEFAULT gen_random_uuid() PRIMARY KEY,
         market_id text NOT NULL,
-        entitlement_id uuid NOT NULL,
+        entitlement_id text NOT NULL,
         order_id text NOT NULL,
         recipient_email text NULL,
         recipient_phone text NULL,
