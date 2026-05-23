@@ -254,6 +254,89 @@ describe("Story 1.10.1 — entitlement_instance creation contract (FakeClient la
 
     expect(client.insertedEntitlementInstance).toBeNull()
   })
+
+  // ---------------------------------------------------------------------------
+  // Story 1.10.1 GAP #1 fix verification — BonBeauty MVP profile (voucher-
+  // rezerwacja-otwarta) end-to-end propagation. Simulates the post-fix state:
+  // gp-config-sync-catalog wrote product.metadata.gp.entitlement_profile from
+  // products.yaml entitlement_profile_id cross-ref → storefront cart echoed it
+  // to line_item.metadata.entitlement_profile (embedded form) → backend resolver
+  // short-circuits the DB-scan branch and issues entitlement_instance.
+  //
+  // This is the regression gate: if this test fails, the storefront write
+  // contract has drifted away from the backend resolver contract.
+  // ---------------------------------------------------------------------------
+  it("(e) Story 1.10.1 fix — BonBeauty voucher-rezerwacja-otwarta propagation issues entitlement_instance", async () => {
+    const client = new FakeClient()
+    // The post-fix line_item metadata SHAPE produced by storefront
+    // `buildEntitlementLineItemMetadata` (GP/storefront/src/lib/voucher/
+    // entitlement-metadata.ts) for the canonical BonBeauty MVP service voucher.
+    // Mirror specs/contracts/config/fixtures/markets/bonbeauty/market.bonbeauty.yaml
+    // lines 218-252 (voucher-rezerwacja-otwarta profile).
+    client.orderLineMetadata = {
+      // Storefront echoes BOTH the embedded form (resolver fast-path) and the
+      // destructured triad (analytics readers).
+      entitlement_profile: {
+        profile_id: "voucher-rezerwacja-otwarta",
+        entitlement_type: "VOUCHER_SERVICE",
+        policy: {
+          validity_months: 12,
+          extension: {
+            allowed: true,
+            paid: false,
+            fee_pct: 0,
+            max_extension_months: 3,
+          },
+          cancellation: { cutoff_hours: 12, fee_pct: 10, deduct_method: "charge_card" },
+          no_show: { policy: "forfeit_voucher", charge_pct: 0 },
+          refund_channel: "original_payment",
+          auto_redeem: { enabled: true, trigger: "on_service_complete" },
+        },
+        currency: "PLN",
+        amount_minor: 18000,
+      },
+      entitlement_profile_id: "voucher-rezerwacja-otwarta",
+      entitlement_type: "VOUCHER_SERVICE",
+      entitlement_policy: { validity_months: 12 },
+      currency: "PLN",
+      amount_minor: 18000,
+      // Non-entitlement keys (seller / purchase_mode) must coexist — the post-fix
+      // storefront write spreads BOTH legacy + entitlement fragments into
+      // line_item.metadata (see GP/storefront/src/lib/data/cart.ts addToCart).
+      selected_seller_id: "sel_studio-nova",
+      selected_seller_name: "Studio Nova",
+      selected_seller_handle: "studio-nova",
+      purchase_mode: "self",
+      is_gift: false,
+    }
+
+    const result = await issueEntitlementWithinPaymentTransaction(
+      client,
+      buildInput({ entitlement_profile: null }), // payload-side empty → resolver falls back to metadata
+      new Date("2026-05-23T00:00:00Z")
+    )
+
+    expect(result.idempotent).toBe(false)
+    expect(result.entitlement_id).toMatch(/^ent_[0-9a-f]{24}$/)
+    expect(client.insertedEntitlementInstance).toMatchObject({
+      entitlement_profile_id: "voucher-rezerwacja-otwarta",
+      entitlement_type: "VOUCHER_SERVICE",
+      order_id: "order_invtest_001",
+      state: "ACTIVE",
+      market_id: "bonbeauty",
+    })
+    // policy_snapshot is JSONB stringified by the workflow; verify the per-key
+    // shape from market.yaml flows through end-to-end.
+    const snapshot = JSON.parse(
+      client.insertedEntitlementInstance!.policy_snapshot as string
+    ) as Record<string, unknown>
+    expect(snapshot).toMatchObject({
+      validity_months: 12,
+      refund_channel: "original_payment",
+      currency: "PLN",
+    })
+    expect((snapshot.auto_redeem as Record<string, unknown>).enabled).toBe(true)
+  })
 })
 
 // ---------------------------------------------------------------------------

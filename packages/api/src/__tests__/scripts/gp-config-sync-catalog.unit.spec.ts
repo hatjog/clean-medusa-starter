@@ -25,6 +25,8 @@ import {
   enforceVendorStatusGate,
   draftOrphanMarketProducts,
   buildVendorPricingMap,
+  loadEntitlementProfileMap,
+  resolveProductEntitlementProfile,
 } from "../../scripts/gp-config-sync-catalog"
 import { DryRunCollector } from "../../scripts/gp-sync-dry-run"
 
@@ -1823,5 +1825,321 @@ describe("buildVendorPricingMap — runtime-state-map", () => {
     expect(map.has("p-null")).toBe(false)
     expect(map.has("p-empty")).toBe(false)
     expect(map.has("p-active")).toBe(true)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// v1.8.0 Story 1.10.1 — loadEntitlementProfileMap + resolveProductEntitlementProfile
+// Catalog → checkout entitlement_profile propagation bridge (per investigation
+// finding `_bmad-output/releases/v1.8.0/planning-artifacts/
+// 1-10-1-investigation-finding-2026-05-23.md`).
+// ---------------------------------------------------------------------------
+
+describe("loadEntitlementProfileMap (Story 1.10.1)", () => {
+  const mockReadFile = fs.readFile as jest.Mock
+
+  beforeEach(() => {
+    mockReadFile.mockReset()
+  })
+
+  it("loads 3 BonBeauty MVP profiles from market.yaml", async () => {
+    mockReadFile.mockResolvedValue(
+      yaml.dump({
+        market_id: "bonbeauty",
+        entitlement_profiles: [
+          {
+            profile_id: "voucher-kwotowy-365d",
+            entitlement_type: "VOUCHER_AMOUNT",
+            policy: { validity_months: 12 },
+          },
+          {
+            profile_id: "voucher-rezerwacja-otwarta",
+            entitlement_type: "VOUCHER_SERVICE",
+            policy: { validity_months: 12 },
+          },
+          {
+            profile_id: "voucher-sezonowy",
+            entitlement_type: "VOUCHER_AMOUNT",
+            policy: { validity_months: 6 },
+          },
+        ],
+      })
+    )
+    const warnings: string[] = []
+    const map = await loadEntitlementProfileMap("/config/bonbeauty/market.yaml", warnings)
+    expect(map.size).toBe(3)
+    expect(map.has("voucher-kwotowy-365d")).toBe(true)
+    expect(map.has("voucher-rezerwacja-otwarta")).toBe(true)
+    expect(map.has("voucher-sezonowy")).toBe(true)
+    expect(warnings).toHaveLength(0)
+  })
+
+  it("returns empty map and warns when market.yaml unreadable", async () => {
+    mockReadFile.mockRejectedValue(new Error("ENOENT"))
+    const warnings: string[] = []
+    const map = await loadEntitlementProfileMap("/config/missing/market.yaml", warnings)
+    expect(map.size).toBe(0)
+    expect(warnings.some((w) => w.includes("cannot read market.yaml"))).toBe(true)
+  })
+
+  it("returns empty map when market has no entitlement_profiles section (legacy markets)", async () => {
+    mockReadFile.mockResolvedValue(yaml.dump({ market_id: "bonbeauty" }))
+    const warnings: string[] = []
+    const map = await loadEntitlementProfileMap("/config/bonbeauty/market.yaml", warnings)
+    expect(map.size).toBe(0)
+    expect(warnings).toHaveLength(0)
+  })
+
+  it("skips malformed profiles with explicit warnings (fail-loud)", async () => {
+    mockReadFile.mockResolvedValue(
+      yaml.dump({
+        market_id: "bonbeauty",
+        entitlement_profiles: [
+          { entitlement_type: "VOUCHER_AMOUNT", policy: {} }, // no profile_id
+          { profile_id: "p1", policy: {} }, // no entitlement_type
+          { profile_id: "p2", entitlement_type: "VOUCHER_AMOUNT" }, // no policy
+          { profile_id: "ok", entitlement_type: "VOUCHER_AMOUNT", policy: { validity_months: 12 } },
+        ],
+      })
+    )
+    const warnings: string[] = []
+    const map = await loadEntitlementProfileMap("/config/bonbeauty/market.yaml", warnings)
+    expect(map.size).toBe(1)
+    expect(map.has("ok")).toBe(true)
+    expect(warnings.length).toBeGreaterThanOrEqual(3)
+  })
+})
+
+describe("resolveProductEntitlementProfile (Story 1.10.1)", () => {
+  function makeProfileMap() {
+    return new Map([
+      [
+        "voucher-rezerwacja-otwarta",
+        {
+          profile_id: "voucher-rezerwacja-otwarta",
+          entitlement_type: "VOUCHER_SERVICE",
+          policy: { validity_months: 12, cancellation: { cutoff_hours: 12 } },
+        },
+      ],
+    ])
+  }
+
+  it("returns undefined when product has no entitlement_profile_id (non-voucher SKU)", () => {
+    const warnings: string[] = []
+    const result = resolveProductEntitlementProfile(
+      { product_id: "p1", name: "x", base_price: { amount: 100, currency: "PLN" } },
+      makeProfileMap(),
+      warnings
+    )
+    expect(result).toBeUndefined()
+    expect(warnings).toHaveLength(0)
+  })
+
+  it("returns embedded profile + currency when cross-ref resolves", () => {
+    const warnings: string[] = []
+    const result = resolveProductEntitlementProfile(
+      {
+        product_id: "p1",
+        name: "x",
+        base_price: { amount: 100, currency: "pln" },
+        entitlement_profile_id: "voucher-rezerwacja-otwarta",
+      },
+      makeProfileMap(),
+      warnings
+    )
+    expect(result).toMatchObject({
+      profile_id: "voucher-rezerwacja-otwarta",
+      entitlement_type: "VOUCHER_SERVICE",
+      policy: { validity_months: 12 },
+      currency: "PLN",
+    })
+    expect(warnings).toHaveLength(0)
+  })
+
+  it("returns undefined + warns when cross-ref dangles (fail-loud)", () => {
+    const warnings: string[] = []
+    const result = resolveProductEntitlementProfile(
+      {
+        product_id: "p1",
+        name: "x",
+        base_price: { amount: 100, currency: "PLN" },
+        entitlement_profile_id: "voucher-typo-id",
+      },
+      makeProfileMap(),
+      warnings
+    )
+    expect(result).toBeUndefined()
+    expect(warnings.some((w) => w.includes("dangling cross-ref"))).toBe(true)
+  })
+})
+
+describe("syncProducts writes entitlement_profile to product.metadata.gp (Story 1.10.1)", () => {
+  const prereqs = { salesChannelId: "sc-bonbeauty", shippingProfileId: "sp-default" }
+  const emptyMaps = {
+    categoryMap: new Map<string, string>(),
+    collectionMap: new Map<string, string>(),
+    tagIdMap: new Map<string, string>(),
+  }
+
+  function makeContainerLite() {
+    return { resolve: jest.fn().mockReturnValue({}) }
+  }
+
+  it("writes embedded entitlement_profile on the update payload for a voucher product", async () => {
+    const svc = {
+      listProducts: jest.fn().mockResolvedValue([
+        {
+          id: "p-existing",
+          handle: "oczyszczanie-twarzy",
+          categories: [],
+          metadata: { gp: { market_id: "bonbeauty" } },
+          variants: [],
+        },
+      ]),
+      updateProducts: jest.fn().mockResolvedValue({}),
+    } as any
+    const warnings: string[] = []
+    const profileMap = new Map([
+      [
+        "voucher-rezerwacja-otwarta",
+        {
+          profile_id: "voucher-rezerwacja-otwarta",
+          entitlement_type: "VOUCHER_SERVICE",
+          policy: { validity_months: 12 },
+        },
+      ],
+    ])
+
+    await syncProducts(
+      makeContainerLite(),
+      svc,
+      [
+        {
+          product_id: "srv_0101",
+          name: "Oczyszczanie twarzy",
+          handle: "oczyszczanie-twarzy",
+          base_price: { amount: 180, currency: "PLN" },
+          entitlement_profile_id: "voucher-rezerwacja-otwarta",
+        },
+      ],
+      prereqs,
+      emptyMaps.categoryMap,
+      emptyMaps.collectionMap,
+      emptyMaps.tagIdMap,
+      "bonbeauty",
+      warnings,
+      undefined,
+      false,
+      undefined,
+      profileMap
+    )
+
+    expect(svc.updateProducts).toHaveBeenCalledTimes(1)
+    const [, payload] = svc.updateProducts.mock.calls[0]
+    expect(payload.metadata.gp.entitlement_profile).toMatchObject({
+      profile_id: "voucher-rezerwacja-otwarta",
+      entitlement_type: "VOUCHER_SERVICE",
+      policy: { validity_months: 12 },
+      currency: "PLN",
+    })
+    // Existing gp.* keys preserved + new SoT keys re-asserted.
+    expect(payload.metadata.gp.market_id).toBe("bonbeauty")
+    expect(payload.metadata.gp.synced_by).toBe("gp-config-sync-catalog")
+    expect(payload.metadata.gp.fixture_id).toBe("srv_0101")
+  })
+
+  it("does NOT write entitlement_profile when product lacks entitlement_profile_id (legacy/non-voucher flow)", async () => {
+    const svc = {
+      listProducts: jest.fn().mockResolvedValue([
+        {
+          id: "p-existing",
+          handle: "hair-color",
+          categories: [],
+          metadata: { gp: { market_id: "bonbeauty" } },
+          variants: [],
+        },
+      ]),
+      updateProducts: jest.fn().mockResolvedValue({}),
+    } as any
+    const warnings: string[] = []
+
+    await syncProducts(
+      makeContainerLite(),
+      svc,
+      [
+        {
+          product_id: "p-no-ent",
+          name: "Hair Color",
+          handle: "hair-color",
+          base_price: { amount: 200, currency: "PLN" },
+        },
+      ],
+      prereqs,
+      emptyMaps.categoryMap,
+      emptyMaps.collectionMap,
+      emptyMaps.tagIdMap,
+      "bonbeauty",
+      warnings,
+      undefined,
+      false,
+      undefined,
+      new Map()
+    )
+
+    expect(svc.updateProducts).toHaveBeenCalledTimes(1)
+    const [, payload] = svc.updateProducts.mock.calls[0]
+    expect(payload.metadata.gp.entitlement_profile).toBeUndefined()
+  })
+
+  it("removes stale entitlement_profile from existing metadata when product no longer voucher-bearing", async () => {
+    const svc = {
+      listProducts: jest.fn().mockResolvedValue([
+        {
+          id: "p-existing",
+          handle: "former-voucher",
+          categories: [],
+          metadata: {
+            gp: {
+              market_id: "bonbeauty",
+              entitlement_profile: {
+                profile_id: "stale-profile",
+                entitlement_type: "VOUCHER_AMOUNT",
+                policy: { validity_months: 12 },
+              },
+            },
+          },
+          variants: [],
+        },
+      ]),
+      updateProducts: jest.fn().mockResolvedValue({}),
+    } as any
+    const warnings: string[] = []
+
+    await syncProducts(
+      makeContainerLite(),
+      svc,
+      [
+        {
+          product_id: "p-clean",
+          name: "Former Voucher",
+          handle: "former-voucher",
+          base_price: { amount: 100, currency: "PLN" },
+          // no entitlement_profile_id
+        },
+      ],
+      prereqs,
+      emptyMaps.categoryMap,
+      emptyMaps.collectionMap,
+      emptyMaps.tagIdMap,
+      "bonbeauty",
+      warnings,
+      undefined,
+      false,
+      undefined,
+      new Map()
+    )
+
+    const [, payload] = svc.updateProducts.mock.calls[0]
+    expect(payload.metadata.gp.entitlement_profile).toBeUndefined()
   })
 })

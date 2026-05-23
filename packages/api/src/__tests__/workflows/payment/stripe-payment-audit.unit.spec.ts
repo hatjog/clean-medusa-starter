@@ -40,8 +40,23 @@ class FakeClient {
     if (sql.includes("INSERT INTO webhook_event_processed")) {
       const key = `${params[0]}:stripe`
       if (this.rows.has(key)) return { rows: [] as T[], rowCount: 0 }
-      this.rows.set(key, { event_id: params[0] })
+      this.rows.set(key, {
+        event_id: params[0],
+        envelope: JSON.parse(params[2] as string),
+      })
       return { rows: [] as T[], rowCount: 1 }
+    }
+    // Story 1.10.1 GAP #3 — fail-loud envelope update path.
+    if (sql.includes("UPDATE webhook_event_processed")) {
+      const key = `${params[0]}:stripe`
+      const existing = this.rows.get(key) as { envelope?: Record<string, unknown> } | undefined
+      if (existing) {
+        existing.envelope = {
+          ...(existing.envelope ?? {}),
+          entitlement_issue_failed_reason: params[1] as string,
+        }
+      }
+      return { rows: [] as T[], rowCount: existing ? 1 : 0 }
     }
     if (sql.includes("SELECT id FROM entitlement_instance")) {
       return { rows: [] as T[], rowCount: 0 }
@@ -331,8 +346,14 @@ describe("StripePaymentAuditWorkflow", () => {
     ).rejects.toBeInstanceOf(MissingNativeStripePayloadFieldError)
   })
 
-  it("persists captured audit when entitlement profile is missing", async () => {
-    const workflow = new StripePaymentAuditWorkflow({ connect: async () => new FakeClient() })
+  it("persists captured audit when entitlement profile is missing (Story 1.10.1 GAP #3 fail-loud)", async () => {
+    const client = new FakeClient()
+    const logger = { error: jest.fn(), warn: jest.fn(), info: jest.fn() }
+    const workflow = new StripePaymentAuditWorkflow(
+      { connect: async () => client },
+      undefined,
+      logger
+    )
     const p = payload() as any
     p.entitlement_profile = null
 
@@ -340,6 +361,25 @@ describe("StripePaymentAuditWorkflow", () => {
 
     expect(result.deduplicated).toBe(false)
     expect(result.entitlement).toBeUndefined()
+    // GAP #3 fail-loud assertions — structured envelope key surfaces the
+    // missing-profile failure (replaces the previous silent warn).
+    expect(result.envelope.entitlement_issue_failed_reason).toMatch(
+      /no entitlement_profile augmentation/
+    )
+    expect(logger.error).toHaveBeenCalledWith(
+      expect.stringContaining("entitlement_issue_failed")
+    )
+    expect(logger.warn).not.toHaveBeenCalledWith(
+      expect.stringContaining("audit persisted without entitlement issue")
+    )
+    // GAP #3 durability — persisted envelope (in `webhook_event_processed`) MUST
+    // carry the failure key, not just the in-memory copy (replay survives).
+    const stored = client.rows.get(`${p.event_id}:stripe`) as
+      | { envelope: Record<string, unknown> }
+      | undefined
+    expect(stored?.envelope?.entitlement_issue_failed_reason).toMatch(
+      /no entitlement_profile augmentation/
+    )
   })
 })
 

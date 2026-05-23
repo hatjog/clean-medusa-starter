@@ -53,6 +53,42 @@ type FixtureProduct = {
   photo_url?: string
   tags?: string[]
   active?: boolean
+  // v1.8.0 Story 1.10.1 — opcjonalny cross-ref do market.yaml
+  // entitlement_profiles[].profile_id (ADR-099 Layer 3). Sync writes the
+  // resolved embedded profile to `product.metadata.gp.entitlement_profile`
+  // so storefront cart can echo the triad to line_item.metadata (resolver
+  // short-circuit at GP/backend voucher issue-entitlement.ts:123-128).
+  entitlement_profile_id?: string
+}
+
+// v1.8.0 Story 1.10.1 — Layer 3 entitlement_profile structure from market.yaml.
+// Loaded once per sync run and looked up by `entitlement_profile_id` to enrich
+// product.metadata. Mirrors the canonical schema at
+// specs/contracts/config/schemas/market-config.v1.schema.json (entitlement_profiles).
+type EntitlementProfileFixture = {
+  profile_id: string
+  display_name?: string
+  entitlement_type: string
+  policy: Record<string, unknown>
+}
+
+type MarketConfigWithEntitlements = {
+  market_id: string
+  vendors?: Array<Record<string, unknown>>
+  entitlement_profiles?: EntitlementProfileFixture[]
+}
+
+/**
+ * Embedded form persisted on `product.metadata.gp.entitlement_profile`.
+ * Shape MUST match `EntitlementProfilePayload` in
+ * GP/backend voucher issue-entitlement.ts so the storefront cart echo
+ * satisfies `resolveEntitlementProfile()` short-circuit without DB scan.
+ */
+type EmbeddedEntitlementProfile = {
+  profile_id: string
+  entitlement_type: string
+  policy: Record<string, unknown>
+  currency?: string
 }
 
 type CatalogFixture = {
@@ -1014,7 +1050,13 @@ export async function syncProducts(
   warnings: string[],
   vendorPricingMap?: Map<string, VendorPricingInfo>,
   dryRun = false,
-  collector?: DryRunCollector
+  collector?: DryRunCollector,
+  // v1.8.0 Story 1.10.1 — Layer 3 entitlement_profile catalog loaded from
+  // market.yaml. Passed in so syncProducts can write
+  // `product.metadata.gp.entitlement_profile` from each product's
+  // `entitlement_profile_id` cross-ref. Optional: when absent (legacy markets
+  // without voucher config) all products stay non-voucher-bearing.
+  entitlementProfileMap?: Map<string, EntitlementProfileFixture>
 ): Promise<OpCounts> {
   const counts: OpCounts = { created: 0, updated: 0, skipped: 0 }
 
@@ -1108,6 +1150,14 @@ export async function syncProducts(
     const hasVendorPricing = Boolean(vendorPricing?.prices.length)
     const catalogPrice = resolveCatalogPrice(product, vendorPricing, warnings)
 
+    // v1.8.0 Story 1.10.1 — resolve the optional entitlement_profile cross-ref
+    // so payment.captured can issue entitlement_instance. Undefined when the
+    // product is non-voucher OR no map was passed (legacy market without
+    // voucher activation). Dangling refs surface as warnings (fail-loud).
+    const entitlementProfile = entitlementProfileMap
+      ? resolveProductEntitlementProfile(product, entitlementProfileMap, warnings)
+      : undefined
+
     try {
       const matches = await productModuleService.listProducts(
         { handle },
@@ -1172,19 +1222,29 @@ export async function syncProducts(
         }
 
         // H-1: explicit fields update (including base price when changed)
+        // Story 1.10.1 — entitlement_profile is written when resolved; otherwise
+        // cleared so a transition from voucher → non-voucher (rare but possible
+        // via products.yaml edit) doesn't leave stale embedded data behind.
+        const existingGpMeta = (existing.metadata as any)?.gp ?? {}
+        const nextGpMeta: Record<string, any> = {
+          ...existingGpMeta,
+          synced_by: "gp-config-sync-catalog",
+          market_id: marketId,
+          fixture_id: product.product_id,
+          has_vendor_pricing: hasVendorPricing,
+        }
+        if (entitlementProfile) {
+          nextGpMeta.entitlement_profile = entitlementProfile
+        } else if ("entitlement_profile" in existingGpMeta) {
+          delete nextGpMeta.entitlement_profile
+        }
         const updatePayload: Record<string, any> = {
           title: product.name,
           description: product.description ?? existing.description,
           status: gateStatus,
           metadata: {
             ...(existing.metadata ?? {}),
-            gp: {
-              ...((existing.metadata as any)?.gp ?? {}),
-              synced_by: "gp-config-sync-catalog",
-              market_id: marketId,
-              fixture_id: product.product_id,
-              has_vendor_pricing: hasVendorPricing,
-            },
+            gp: nextGpMeta,
           },
         }
 
@@ -1322,6 +1382,12 @@ export async function syncProducts(
                     market_id: marketId,
                     fixture_id: product.product_id,
                     has_vendor_pricing: hasVendorPricing,
+                    // Story 1.10.1 — embedded entitlement_profile for the
+                    // payment.captured → entitlement_instance chain. Omitted
+                    // for non-voucher SKUs (entitlementProfile === undefined).
+                    ...(entitlementProfile
+                      ? { entitlement_profile: entitlementProfile }
+                      : {}),
                   },
                 },
               },
@@ -1347,6 +1413,101 @@ export async function syncProducts(
     `Products: created=${counts.created}, updated=${counts.updated}, skipped=${counts.skipped}`
   )
   return counts
+}
+
+// ---- Entitlement Profile Map (Story 1.10.1) ----
+
+/**
+ * v1.8.0 Story 1.10.1 — load market.yaml `entitlement_profiles[]` into a Map
+ * keyed by `profile_id` so syncProducts can resolve each product's
+ * `entitlement_profile_id` cross-ref into the embedded form (profile_id +
+ * entitlement_type + policy). Returns empty Map when:
+ *  - market.yaml unreadable / malformed (warning emitted, fall back to no-op),
+ *  - market.yaml has no `entitlement_profiles` section (market not voucher-enabled),
+ *  - all products lack `entitlement_profile_id` (no need to load).
+ *
+ * Fail-loud parity with validate_entitlement_profiles.py: the validator is the
+ * design-time gate; this loader is the runtime gate; both must agree on the
+ * Layer 1 entitlement_type taxonomy. Drift between validator + loader is
+ * out-of-scope here (caught by validator at CI / pre-commit).
+ */
+export async function loadEntitlementProfileMap(
+  marketConfigPath: string,
+  warnings: string[]
+): Promise<Map<string, EntitlementProfileFixture>> {
+  const map = new Map<string, EntitlementProfileFixture>()
+  let marketConfig: MarketConfigWithEntitlements
+  try {
+    marketConfig = await readYamlFile<MarketConfigWithEntitlements>(marketConfigPath)
+  } catch (e: any) {
+    warnings.push(
+      `Entitlement profile map: cannot read market.yaml — ${e?.message ?? String(e)}`
+    )
+    return map
+  }
+  const profiles = marketConfig.entitlement_profiles ?? []
+  for (const profile of profiles) {
+    if (!profile?.profile_id || typeof profile.profile_id !== "string") {
+      warnings.push(
+        `Entitlement profile map: skipped profile without profile_id`
+      )
+      continue
+    }
+    if (!profile.entitlement_type || typeof profile.entitlement_type !== "string") {
+      warnings.push(
+        `Entitlement profile '${profile.profile_id}': missing entitlement_type — skipped`
+      )
+      continue
+    }
+    if (!profile.policy || typeof profile.policy !== "object" || Array.isArray(profile.policy)) {
+      warnings.push(
+        `Entitlement profile '${profile.profile_id}': missing/invalid policy — skipped`
+      )
+      continue
+    }
+    map.set(profile.profile_id, profile)
+  }
+  return map
+}
+
+/**
+ * v1.8.0 Story 1.10.1 — resolve a product's `entitlement_profile_id` against
+ * the loaded Layer 3 map. Returns:
+ *  - the embedded entitlement_profile form when the cross-ref resolves;
+ *  - `undefined` when the product has no entitlement_profile_id (non-voucher SKU);
+ *  - `undefined` PLUS a warning when the cross-ref is dangling (referenced
+ *    profile_id absent in market.yaml — propagation gap, NOT silent).
+ *
+ * Currency is derived from `product.base_price.currency` so the embedded form
+ * carries it for the storefront cart write (avoids storefront lookup).
+ */
+export function resolveProductEntitlementProfile(
+  product: FixtureProduct,
+  profileMap: Map<string, EntitlementProfileFixture>,
+  warnings: string[]
+): EmbeddedEntitlementProfile | undefined {
+  const profileId = product.entitlement_profile_id?.trim()
+  if (!profileId) return undefined
+  const profile = profileMap.get(profileId)
+  if (!profile) {
+    // Fail-loud: dangling cross-ref means a product was promoted to voucher-bearing
+    // but the Layer 3 profile is missing from market.yaml. Story 1.10.1 GAP #1
+    // surfaces this class of drift; surface it here too rather than silently drop.
+    warnings.push(
+      `Product '${product.product_id}': entitlement_profile_id '${profileId}' ` +
+        `not found in market.yaml entitlement_profiles[] — entitlement metadata ` +
+        `not propagated (Story 1.10.1 dangling cross-ref guard)`
+    )
+    return undefined
+  }
+  return {
+    profile_id: profile.profile_id,
+    entitlement_type: profile.entitlement_type,
+    policy: profile.policy,
+    ...(product.base_price?.currency
+      ? { currency: product.base_price.currency.toUpperCase() }
+      : {}),
+  }
 }
 
 // ---- Vendor Status Enforcement ----
@@ -1859,6 +2020,17 @@ export default async function gpConfigSyncCatalog({ container, args }: ExecArgs)
     console.log(`Vendor pricing: ${resolvedVendorPricingMap.size} product(s) have active vendor prices`)
   }
 
+  // Story 1.10.1 — load Layer 3 entitlement_profiles[] from market.yaml so the
+  // product sync can write the embedded form to product.metadata.gp.entitlement_profile.
+  // Empty map for markets without voucher activation → product sync skips entitlement
+  // augmentation (legacy single-vendor / non-voucher flow preserved).
+  const entitlementProfileMap = await loadEntitlementProfileMap(marketConfigPath, warnings)
+  if (entitlementProfileMap.size > 0) {
+    console.log(
+      `Entitlement profiles: ${entitlementProfileMap.size} Layer 3 profile(s) loaded from market.yaml`
+    )
+  }
+
   // Sync products
   const productCounts = await syncProducts(
     container,
@@ -1872,7 +2044,8 @@ export default async function gpConfigSyncCatalog({ container, args }: ExecArgs)
     warnings,
     resolvedVendorPricingMap,
     dryRun,
-    collector
+    collector,
+    entitlementProfileMap
   )
 
   const configuredFixtureIds = await collectConfiguredProductFixtureIds(

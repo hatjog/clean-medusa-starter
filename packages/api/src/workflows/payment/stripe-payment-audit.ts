@@ -81,6 +81,13 @@ export type PaymentAuditEnvelope = {
   refund_id?: string
   refund_amount?: number
   refund_reason?: string
+  // Story 1.10.1 GAP #3 — fail-loud surface for missing entitlement_profile.
+  // Set when payment.captured with order_id reaches issueEntitlementWithinPaymentTransaction
+  // but MissingEntitlementProfileError is thrown (catalog→checkout propagation gap,
+  // GAP #1). The audit row IS still persisted (webhook ack = OK; no rollback), but
+  // the structured key is the durable, queryable failure signal — replaces the
+  // previous silent warn that violated Story 1.3 "Fail-loud, NIE silent".
+  entitlement_issue_failed_reason?: string
 }
 
 // Reconcile-only result. There is no provider mutation on this path, so there
@@ -195,9 +202,26 @@ export class StripePaymentAuditWorkflow {
           if (!(err instanceof MissingEntitlementProfileError)) {
             throw err
           }
-          this.logger?.warn?.(
+          // Story 1.10.1 GAP #3 — fail-loud per Q3 default (structured envelope key,
+          // NOT a separate table; defer table to v1.9.0+ if pattern recurs).
+          // Webhook still ack-OK (no rollback, audit row stays committed for dedup),
+          // but the failure is now durable + queryable via the envelope JSONB key
+          // rather than swallowed in a transient warn line. Story 1.3 "Fail-loud,
+          // NIE silent" (line 121) compliance.
+          envelope.entitlement_issue_failed_reason = err.message
+          // Persist the failure key on the already-inserted dedup row so the
+          // signal survives webhook-dedup replay (the row is the durable audit
+          // truth; the in-memory envelope alone would be lost on re-delivery).
+          await persistAuditFailureKey(
+            client,
+            payload.event_id as string,
+            err.message
+          )
+          this.logger?.error?.(
             `[stripe-payment-audit] ${eventType} order_id=${payload.order_id} ` +
-              `has no entitlement profile; audit persisted without entitlement issue`
+              `entitlement_issue_failed: ${err.message} — audit row persisted ` +
+              `with envelope.entitlement_issue_failed_reason; investigate ` +
+              `catalog→checkout entitlement_profile propagation (Story 1.10.1)`
           )
         }
       }
@@ -371,6 +395,26 @@ async function insertDedupRow(
     [payload.event_id, payload.market_id ?? null, JSON.stringify(envelope)]
   )
   return (result.rowCount ?? 0) === 1
+}
+
+/**
+ * Story 1.10.1 GAP #3 — persist `entitlement_issue_failed_reason` onto the
+ * already-inserted `webhook_event_processed` envelope so the failure signal
+ * survives webhook replay (the in-memory envelope is lost on re-delivery; the
+ * row is the durable audit truth). JSONB merge preserves any other envelope
+ * keys already written by `insertDedupRow`.
+ */
+async function persistAuditFailureKey(
+  client: PgClient,
+  eventId: string,
+  reason: string
+): Promise<void> {
+  await client.query(
+    `UPDATE webhook_event_processed
+        SET envelope = envelope || jsonb_build_object('entitlement_issue_failed_reason', $2::text)
+      WHERE event_id = $1 AND provider = 'stripe'`,
+    [eventId, reason]
+  )
 }
 
 export function buildPaymentFailedContractEvent(
