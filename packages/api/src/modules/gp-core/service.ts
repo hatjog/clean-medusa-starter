@@ -27,6 +27,7 @@ import {
   CreateVendorInput,
   Entitlement,
   EntitlementCreateDto,
+  EntitlementStatus,
   GpCoreMarket,
   GpCoreMarketDetail,
   GpCoreMarketRecord,
@@ -47,7 +48,7 @@ export class NotImplementedError extends Error {
   }
 }
 
-type Queryable = Pick<Pool, "query"> | Pick<PoolClient, "query">
+export type Queryable = Pick<Pool, "query"> | Pick<PoolClient, "query">
 type EventBusLike = {
   emit: (message: unknown) => Promise<unknown>
 }
@@ -765,14 +766,360 @@ export default class GpCoreService {
     return row
   }
 
-  // --- Entitlement Domain Stubs (Story 1.2) ---
+  // --- Entitlement Domain (Story 1.10 — ADR-118 Path Y subscriber dispatch) ---
 
   /**
-   * @planned ADR-052 — entitlement issuance via Mercur→gp_core event flow (checkout→issue).
-   * This stub will be implemented when event-driven integration is built.
+   * createEntitlement — Real implementation of the order.placed → gp_core entitlement
+   * issuance path. Replaces the Story 1.3 stub that previously blocked Story 1.10 C1
+   * (`entitlement_count=0` for fresh Stripe-paid orders).
+   *
+   * Idempotency: keyed on `(order_id, line_item_id)` via the unique constraint on
+   * `gp_core.entitlements` (Migration20260317000000). The INSERT uses ON CONFLICT
+   * DO UPDATE so subscriber retries do not violate the BEFORE UPDATE status trigger
+   * (trigger guards UPDATE-of-status only; INSERT may set any status). Re-runs that
+   * hit ON CONFLICT preserve the existing state but refresh `updated_at` + identifying
+   * fields per the seed-entitlements canonical pattern.
+   *
+   * Subscriber payload contract (ADR-118): `{order_id, recipient_locale?,
+   * message_locale?, is_gift?, voucher_kind?}`. Missing fields required for the row
+   * are derived from the Mercur `public.order` + `order_item` + `order_line_item`
+   * tables. v2 OrderPlaced enrichment fields are persisted into the audit envelope
+   * metadata rather than the entitlement row itself (no new schema columns).
+   *
+   * Audit envelope: appended to `gp_core.entitlement_audit_log` with
+   * `actor_type='system'`, `actor_id='order_placed_subscriber'`, action `ISSUED`,
+   * `old_status=NULL`, `new_status='ACTIVE'`, and JSONB metadata carrying the
+   * subscriber-provided locale/voucher_kind/is_gift telemetry. Secret material is
+   * never written to audit metadata.
    */
-  async createEntitlement(_dto: EntitlementCreateDto): Promise<Entitlement> {
-    throw new NotImplementedError("Story 1.3")
+  async createEntitlement(
+    dto: EntitlementCreateDto,
+    options?: { coreClient?: Queryable; mercurClient?: Queryable }
+  ): Promise<Entitlement> {
+    if (!dto || typeof dto !== "object") {
+      throw new Error("createEntitlement: dto is required")
+    }
+
+    const orderId = typeof dto.order_id === "string" ? dto.order_id.trim() : ""
+    if (!orderId) {
+      throw new Error("createEntitlement: order_id is required")
+    }
+
+    const derived = await this.deriveEntitlementFieldsFromOrder(
+      orderId,
+      options?.mercurClient,
+      options?.coreClient
+    )
+
+    const lineItemId = dto.line_item_id ?? derived.line_item_id ?? orderId
+    const marketId = dto.market_id ?? derived.market_id
+    if (!marketId) {
+      throw new Error(
+        `createEntitlement: market_id could not be resolved for order ${orderId}`
+      )
+    }
+    const vendorId = dto.vendor_id ?? derived.vendor_id ?? "unknown"
+    const productId = dto.product_id ?? derived.product_id ?? null
+    const instanceId = dto.instance_id ?? derived.instance_id ?? "gp-dev"
+    const faceValueMinor = dto.face_value_minor ?? derived.face_value_minor ?? 0
+    if (!faceValueMinor || faceValueMinor <= 0) {
+      throw new Error(
+        `createEntitlement: face_value_minor must be > 0 for order ${orderId} ` +
+          `(received ${faceValueMinor})`
+      )
+    }
+    const currency = (dto.currency ?? derived.currency ?? "PLN").toUpperCase()
+    const buyerEmail = dto.buyer_email ?? derived.buyer_email ?? ""
+    const buyerIsRecipient = dto.buyer_is_recipient ?? false
+    const customerId = dto.customer_id ?? derived.customer_id ?? null
+    const idempotencyKey = dto.idempotency_key ?? `${orderId}::${lineItemId}`
+
+    const auditMetadata: Record<string, unknown> = {
+      source: "order_placed_subscriber",
+      idempotency_key: idempotencyKey,
+    }
+    if (dto.recipient_locale !== undefined && dto.recipient_locale !== null) {
+      auditMetadata.recipient_locale = dto.recipient_locale
+    }
+    if (dto.message_locale !== undefined && dto.message_locale !== null) {
+      auditMetadata.message_locale = dto.message_locale
+    }
+    if (dto.is_gift !== undefined) {
+      auditMetadata.is_gift = dto.is_gift
+    }
+    if (dto.voucher_kind !== undefined) {
+      auditMetadata.voucher_kind = dto.voucher_kind
+    }
+
+    const executor: Queryable = options?.coreClient ?? this.getCorePool()
+
+    // INSERT ... ON CONFLICT DO UPDATE — idempotent on (order_id, line_item_id).
+    // The xmax = 0 hint distinguishes INSERT from UPDATE for the audit envelope.
+    const row = await this.queryOne<{
+      entitlement_id: string
+      market_id: string
+      order_id: string
+      line_item_id: string
+      product_id: string | null
+      vendor_id: string
+      face_value_minor: number
+      remaining_minor: number
+      currency: string
+      status: EntitlementStatus
+      claim_token: string | null
+      voucher_code_normalized: string | null
+      buyer_email: string | null
+      buyer_is_recipient: boolean
+      customer_id: string | null
+      expires_at: Date | string | null
+      created_at: Date | string
+      updated_at: Date | string
+      was_insert: boolean
+    }>(
+      executor,
+      `
+        INSERT INTO gp_core.entitlements (
+          instance_id,
+          market_id,
+          vendor_id,
+          order_id,
+          line_item_id,
+          product_id,
+          face_value_minor,
+          remaining_minor,
+          currency,
+          status,
+          buyer_email,
+          buyer_is_recipient,
+          customer_id
+        )
+        VALUES (
+          $1, $2::uuid, $3, $4, $5, $6, $7, $8, $9, $10::gp_core.entitlement_status, $11, $12, $13
+        )
+        ON CONFLICT (order_id, line_item_id) DO UPDATE SET
+          instance_id        = EXCLUDED.instance_id,
+          market_id          = EXCLUDED.market_id,
+          vendor_id          = EXCLUDED.vendor_id,
+          product_id         = EXCLUDED.product_id,
+          face_value_minor   = EXCLUDED.face_value_minor,
+          currency           = EXCLUDED.currency,
+          buyer_email        = EXCLUDED.buyer_email,
+          buyer_is_recipient = EXCLUDED.buyer_is_recipient,
+          customer_id        = EXCLUDED.customer_id,
+          updated_at         = NOW()
+        RETURNING
+          entitlement_id,
+          market_id::text   AS market_id,
+          order_id,
+          line_item_id,
+          product_id,
+          vendor_id,
+          face_value_minor,
+          remaining_minor,
+          currency,
+          status::text      AS status,
+          claim_token::text AS claim_token,
+          voucher_code_normalized,
+          buyer_email,
+          buyer_is_recipient,
+          customer_id,
+          expires_at,
+          created_at,
+          updated_at,
+          (xmax = 0)        AS was_insert
+      `,
+      [
+        instanceId,
+        marketId,
+        vendorId,
+        orderId,
+        lineItemId,
+        productId,
+        faceValueMinor,
+        faceValueMinor,
+        currency,
+        EntitlementStatus.ACTIVE,
+        buyerEmail || null,
+        buyerIsRecipient,
+        customerId,
+      ]
+    )
+
+    if (!row) {
+      throw new Error(
+        `createEntitlement: failed to upsert entitlement for order ${orderId} ` +
+          `line_item ${lineItemId}`
+      )
+    }
+
+    // Append audit envelope. INSERT actions log as ISSUED + new_status=ACTIVE;
+    // idempotent re-runs log as RE_ISSUED to preserve append-only audit trail.
+    const auditAction = row.was_insert ? "ISSUED" : "RE_ISSUED"
+    try {
+      await executor.query(
+        `
+          INSERT INTO gp_core.entitlement_audit_log (
+            entitlement_id,
+            action,
+            actor_type,
+            actor_id,
+            old_status,
+            new_status,
+            metadata
+          )
+          VALUES ($1::uuid, $2, $3, $4, $5, $6, $7::jsonb)
+        `,
+        [
+          row.entitlement_id,
+          auditAction,
+          "system",
+          "order_placed_subscriber",
+          row.was_insert ? null : (row.status as string),
+          row.status as string,
+          JSON.stringify(auditMetadata),
+        ]
+      )
+    } catch (auditError) {
+      // Audit table may be absent in older environments; entitlement row is the
+      // source of truth so we log but do not roll back the issuance.
+      this.logger_.warn?.(
+        `[gp_core] createEntitlement audit append failed for ` +
+          `entitlement_id=${row.entitlement_id}: ${String(auditError)}`
+      )
+    }
+
+    return {
+      id: row.entitlement_id,
+      market_id: row.market_id,
+      order_id: row.order_id,
+      line_item_id: row.line_item_id,
+      product_id: row.product_id ?? "",
+      vendor_id: row.vendor_id,
+      face_value_minor: row.face_value_minor,
+      remaining_minor: row.remaining_minor,
+      currency: row.currency,
+      status: row.status as EntitlementStatus,
+      claim_token: row.claim_token,
+      voucher_code: row.voucher_code_normalized,
+      buyer_email: row.buyer_email ?? "",
+      buyer_is_recipient: row.buyer_is_recipient,
+      customer_id: row.customer_id,
+      expires_at: row.expires_at,
+      created_at: row.created_at,
+      updated_at: row.updated_at,
+    }
+  }
+
+  /**
+   * Resolve the entitlement fields that the order.placed subscriber payload
+   * omits, by inspecting the live Mercur order + line item tables. Returns a
+   * partial bag — callers must validate required fields after merging.
+   *
+   * Best-effort: when the Mercur pool is unavailable or the order does not
+   * yet have line items (e.g. test fixtures), the missing fields fall back to
+   * the caller-supplied defaults inside `createEntitlement`. A failure here
+   * MUST NOT throw — that would crash the subscriber retry loop.
+   */
+  private async deriveEntitlementFieldsFromOrder(
+    orderId: string,
+    mercurClient?: Queryable,
+    coreClient?: Queryable
+  ): Promise<{
+    instance_id?: string
+    market_id?: string
+    vendor_id?: string
+    product_id?: string
+    line_item_id?: string
+    face_value_minor?: number
+    currency?: string
+    buyer_email?: string
+    customer_id?: string | null
+  }> {
+    try {
+      const mercurExecutor: Queryable = mercurClient ?? this.getMercurPool()
+      const coreExecutor: Queryable = coreClient ?? this.getCorePool()
+      const orderRow = await this.queryOne<{
+        sales_channel_id: string | null
+        currency_code: string | null
+        email: string | null
+        customer_id: string | null
+      }>(
+        mercurExecutor,
+        `
+          SELECT sales_channel_id, currency_code, email, customer_id
+          FROM "order"
+          WHERE id = $1
+          LIMIT 1
+        `,
+        [orderId]
+      )
+
+      const lineItemRow = await this.queryOne<{
+        line_item_id: string | null
+        product_id: string | null
+        unit_price: string | number | null
+        quantity: string | number | null
+        seller_id: string | null
+      }>(
+        mercurExecutor,
+        `
+          SELECT
+            oli.id              AS line_item_id,
+            oli.product_id      AS product_id,
+            oli.unit_price      AS unit_price,
+            oli.quantity        AS quantity,
+            COALESCE(
+              oli.metadata->>'seller_id',
+              oli.metadata->>'selected_seller_id'
+            )                   AS seller_id
+          FROM order_item oi
+          JOIN order_line_item oli ON oli.id = oi.item_id
+          WHERE oi.order_id = $1
+            AND oi.deleted_at IS NULL
+            AND oli.deleted_at IS NULL
+          ORDER BY oi.created_at ASC
+          LIMIT 1
+        `,
+        [orderId]
+      )
+
+      const marketRow = orderRow?.sales_channel_id
+        ? await this.queryOne<{ id: string; instance_id: string }>(
+            coreExecutor,
+            `
+              SELECT id::text AS id, instance_id
+              FROM gp_core.markets
+              WHERE sales_channel_id = $1
+              LIMIT 1
+            `,
+            [orderRow.sales_channel_id]
+          )
+        : null
+
+      const unitPriceMinor = lineItemRow?.unit_price
+        ? Math.round(Number(lineItemRow.unit_price))
+        : 0
+      const quantity = lineItemRow?.quantity ? Number(lineItemRow.quantity) : 1
+      const faceValueMinor =
+        unitPriceMinor && quantity ? unitPriceMinor * quantity : undefined
+
+      return {
+        instance_id: marketRow?.instance_id,
+        market_id: marketRow?.id,
+        vendor_id: lineItemRow?.seller_id ?? undefined,
+        product_id: lineItemRow?.product_id ?? undefined,
+        line_item_id: lineItemRow?.line_item_id ?? undefined,
+        face_value_minor: faceValueMinor,
+        currency: orderRow?.currency_code?.toUpperCase() ?? undefined,
+        buyer_email: orderRow?.email ?? undefined,
+        customer_id: orderRow?.customer_id ?? null,
+      }
+    } catch (error) {
+      this.logger_.warn?.(
+        `[gp_core] deriveEntitlementFieldsFromOrder failed for ${orderId}: ${String(error)}`
+      )
+      return {}
+    }
   }
 
   /**
