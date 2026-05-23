@@ -138,41 +138,19 @@ export type Redemption = {
   created_at: TimestampValue
 }
 
-/**
- * Subscriber-friendly DTO for createEntitlement (Story 1.10, ADR-118 Path Y).
- *
- * The `on-order-completed` subscriber emits only `{order_id, recipient_locale?,
- * message_locale?, is_gift?, voucher_kind?}` per the cross-version OrderPlaced
- * payload. The service derives the remaining fields from a Mercur order lookup
- * when they are not provided. Callers that already have full context (admin
- * tools, integration tests) MAY pass the full canonical shape.
- *
- * - `order_id` is REQUIRED and is the idempotency anchor in combination with
- *   `line_item_id` (UNIQUE constraint on `gp_core.entitlements`).
- * - `idempotency_key` is optional metadata; when absent the service derives
- *   `${order_id}::${line_item_id}` per the seed-entitlements pattern.
- * - v2 OrderPlaced fields (`recipient_locale`, `message_locale`, `is_gift`,
- *   `voucher_kind`) are persisted into `entitlement_audit_log.metadata` so the
- *   subscriber telemetry remains traceable post-issue.
- */
 export type EntitlementCreateDto = {
   order_id: string
-  line_item_id?: string
-  vendor_id?: string
-  market_id?: string
-  instance_id?: string
-  product_id?: string | null
-  face_value_minor?: number
-  currency?: string
-  buyer_email?: string
-  buyer_is_recipient?: boolean
-  customer_id?: string | null
-  idempotency_key?: string
-  // v2 OrderPlaced enrichment (D-50 backward compatibility — optional)
-  recipient_locale?: string | null
-  message_locale?: string | null
-  is_gift?: boolean
-  voucher_kind?: "SPV" | "MPV" | "none" | string
+  line_item_id: string
+  vendor_id: string
+  market_id: string
+  instance_id: string
+  product_id: string
+  face_value_minor: number
+  currency: string
+  buyer_email: string
+  buyer_is_recipient: boolean
+  customer_id: string | null
+  idempotency_key: string
 }
 
 export type RedemptionCreateDto = {
