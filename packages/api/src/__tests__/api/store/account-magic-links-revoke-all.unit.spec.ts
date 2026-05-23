@@ -36,6 +36,23 @@ function request(actorId?: string, email?: string | null): MedusaRequest {
   } as unknown as MedusaRequest
 }
 
+function requestWithCustomerLookupFailure(actorId: string): MedusaRequest {
+  return {
+    auth_context: { actor_id: actorId },
+    scope: {
+      resolve: jest.fn((key: string) => {
+        if (key === "customer") {
+          return {
+            retrieveCustomer: jest.fn().mockRejectedValue(new Error("db down")),
+          }
+        }
+
+        return {}
+      }),
+    },
+  } as unknown as MedusaRequest
+}
+
 describe("POST /store/account/magic-links/revoke-all", () => {
   let revokeSpy: jest.SpiedFunction<PostgresMagicLinkStore["revokePendingForCustomer"]>
 
@@ -89,13 +106,58 @@ describe("POST /store/account/magic-links/revoke-all", () => {
     await marketContextStorage.run(
       { market_id: "bonbeauty", sales_channel_id: "sc_bb" },
       async () => {
-        await POST(request("cus_1"), first as unknown as MedusaResponse)
-        await POST(request("cus_1"), second as unknown as MedusaResponse)
+        await POST(
+          request("cus_1", "customer@example.test"),
+          first as unknown as MedusaResponse
+        )
+        await POST(
+          request("cus_1", "customer@example.test"),
+          second as unknown as MedusaResponse
+        )
       }
     )
 
     expect(first.body).toEqual({ success: true })
     expect(second.body).toEqual({ success: true })
+  })
+
+  it("fails closed when customer email is not available", async () => {
+    const res = response()
+
+    await marketContextStorage.run(
+      { market_id: "bonbeauty", sales_channel_id: "sc_bb" },
+      async () => {
+        await POST(request("cus_1", null), res as unknown as MedusaResponse)
+      }
+    )
+
+    expect(res.statusCode).toBe(409)
+    expect(res.body).toEqual({
+      code: "CUSTOMER_EMAIL_REQUIRED",
+      message: "Customer email is required to revoke all magic links",
+    })
+    expect(revokeSpy).not.toHaveBeenCalled()
+  })
+
+  it("fails closed when customer lookup is unavailable", async () => {
+    const res = response()
+
+    await marketContextStorage.run(
+      { market_id: "bonbeauty", sales_channel_id: "sc_bb" },
+      async () => {
+        await POST(
+          requestWithCustomerLookupFailure("cus_1"),
+          res as unknown as MedusaResponse
+        )
+      }
+    )
+
+    expect(res.statusCode).toBe(503)
+    expect(res.body).toEqual({
+      code: "CUSTOMER_LOOKUP_UNAVAILABLE",
+      message: "Customer lookup unavailable",
+    })
+    expect(revokeSpy).not.toHaveBeenCalled()
   })
 
   it("fails closed when market context is missing", async () => {

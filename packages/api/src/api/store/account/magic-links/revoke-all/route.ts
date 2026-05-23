@@ -30,16 +30,12 @@ async function resolveCustomerEmail(
   req: MedusaRequest,
   customerId: string
 ): Promise<string | null> {
-  try {
-    const customerService = req.scope.resolve(Modules.CUSTOMER) as {
-      retrieveCustomer: (id: string) => Promise<{ email?: string | null }>
-    }
-    const customer = await customerService.retrieveCustomer(customerId)
-    const email = customer.email?.trim().toLowerCase()
-    return email || null
-  } catch {
-    return null
+  const customerService = req.scope.resolve(Modules.CUSTOMER) as {
+    retrieveCustomer: (id: string) => Promise<{ email?: string | null }>
   }
+  const customer = await customerService.retrieveCustomer(customerId)
+  const email = customer.email?.trim().toLowerCase()
+  return email || null
 }
 
 export async function POST(
@@ -74,7 +70,25 @@ export async function POST(
   }
 
   const store = new PostgresMagicLinkStore(db)
-  const customerEmail = await resolveCustomerEmail(req, customerId)
+  let customerEmail: string | null
+  try {
+    customerEmail = await resolveCustomerEmail(req, customerId)
+  } catch {
+    res.status(503).json({
+      code: "CUSTOMER_LOOKUP_UNAVAILABLE",
+      message: "Customer lookup unavailable",
+    })
+    return
+  }
+
+  if (!customerEmail) {
+    res.status(409).json({
+      code: "CUSTOMER_EMAIL_REQUIRED",
+      message: "Customer email is required to revoke all magic links",
+    })
+    return
+  }
+
   await store.revokePendingForCustomer({
     customer_id: customerId,
     customer_email: customerEmail,

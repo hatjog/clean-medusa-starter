@@ -231,6 +231,23 @@ describe("magic link JWT infrastructure", () => {
     ).resolves.toEqual({ valid: false, reason: "invalid" })
   })
 
+  it("rejects signed tokens issued in the future", async () => {
+    const futureIssuedClaims: MagicLinkClaims = {
+      jti: RECOVER_JTI,
+      purpose: "recover",
+      subject: { customer_id: "cus_1" },
+      iat: Math.floor(NOW.getTime() / 1000) + 60,
+      exp:
+        Math.floor(NOW.getTime() / 1000) +
+        60 +
+        MAGIC_LINK_TTL_SECONDS.recover,
+    }
+
+    await expect(
+      verifyMagicLink(signedToken(futureIssuedClaims), { now: NOW })
+    ).resolves.toEqual({ valid: false, reason: "invalid" })
+  })
+
   it("checks revocation after cryptographic validation", async () => {
     const { token } = generateMagicLinkWithClaims(
       "recover",

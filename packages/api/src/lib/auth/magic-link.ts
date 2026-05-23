@@ -364,6 +364,10 @@ export async function verifyMagicLink(
   }
 
   const now = epochSeconds(options.now ?? new Date())
+  if (claims.iat > now) {
+    return { valid: false, reason: "invalid" }
+  }
+
   if (claims.exp <= now) {
     return { valid: false, reason: "expired" }
   }
