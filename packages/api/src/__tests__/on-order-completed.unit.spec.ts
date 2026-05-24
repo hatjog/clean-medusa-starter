@@ -1,30 +1,34 @@
-import { describe, it, expect, jest, beforeEach } from "@jest/globals"
+import { describe, it, expect, jest } from "@jest/globals"
 
 import onOrderCompleted from "../subscribers/on-order-completed"
-import { NotImplementedError } from "../modules/gp-core/service"
 
-function buildMockContainer(overrides: {
-  gpCore?: Record<string, unknown> | null
-  logger?: Record<string, unknown>
-} = {}) {
-  const logger = overrides.logger ?? {
+/**
+ * v1.9.0 wf5 H-8 / CC-1 F-CC1-001 (DEC-A Option 2, ra-E9):
+ *
+ * The `on-order-completed` subscriber is now a NO-OP marker. The previous
+ * implementation called `gpCore.createEntitlement(...)` which threw
+ * `NotImplementedError` and produced a `[gp_core] order.placed —
+ * createEntitlement stub` warn line that misled the Wave-B agent into
+ * reimplementing 787 lines in the wrong ADR-052 deprecation layer.
+ *
+ * This test suite locks in the no-op contract:
+ *   - subscriber logs a single info breadcrumb with order count
+ *   - NEVER calls gp_core / createEntitlement (call removed entirely)
+ *   - NEVER emits the misleading "stub" warn line again (Wave-B recurrence)
+ *   - returns cleanly for all payload shapes (Mercur / standard / v1 / v2)
+ */
+function buildMockContainer() {
+  const logger = {
     info: jest.fn(),
     warn: jest.fn(),
     error: jest.fn(),
   }
-
-  const gpCore = overrides.gpCore !== undefined ? overrides.gpCore : {
-    createEntitlement: (jest.fn() as any).mockRejectedValue(new NotImplementedError("Story 1.3")),
-  }
-
   return {
     resolve: jest.fn((key: string) => {
       if (key === "logger") return logger
-      if (key === "gp_core") return gpCore
       return null
     }),
     logger,
-    gpCore,
   }
 }
 
@@ -36,112 +40,107 @@ function buildEvent(data: Record<string, unknown>) {
   }
 }
 
-describe("on-order-completed subscriber", () => {
-  it("handles Mercur payload format (order_ids array)", async () => {
+describe("on-order-completed subscriber (v1.9.0 wf5 no-op breadcrumb)", () => {
+  it("emits a single info breadcrumb with order count for Mercur payload", async () => {
     const container = buildMockContainer()
     await onOrderCompleted({
       event: buildEvent({ order_ids: ["ord-1", "ord-2"] }),
       container,
     } as any)
 
-    expect(container.gpCore!.createEntitlement).toHaveBeenCalledTimes(2)
-    expect(container.logger.warn).toHaveBeenCalledWith(
-      expect.stringContaining("stub")
+    expect(container.logger.info).toHaveBeenCalledTimes(1)
+    expect(container.logger.info).toHaveBeenCalledWith(
+      expect.stringContaining("order_count=2")
     )
+    expect(container.logger.warn).not.toHaveBeenCalled()
+    expect(container.logger.error).not.toHaveBeenCalled()
   })
 
-  it("handles standard MedusaJS payload format (single id)", async () => {
+  it("emits a single info breadcrumb for standard MedusaJS payload (single id)", async () => {
     const container = buildMockContainer()
     await onOrderCompleted({
       event: buildEvent({ id: "ord-single" }),
       container,
     } as any)
 
-    expect(container.gpCore!.createEntitlement).toHaveBeenCalledTimes(1)
-    expect(container.gpCore!.createEntitlement).toHaveBeenCalledWith(
-      expect.objectContaining({ order_id: "ord-single" })
+    expect(container.logger.info).toHaveBeenCalledTimes(1)
+    expect(container.logger.info).toHaveBeenCalledWith(
+      expect.stringContaining("order_count=1")
     )
   })
 
-  it("skips when no order IDs in payload", async () => {
+  it("emits a single info breadcrumb for v2 envelope (order_id + mor)", async () => {
     const container = buildMockContainer()
     await onOrderCompleted({
-      event: buildEvent({}),
+      event: buildEvent({
+        order_id: "ord-v2",
+        mor: { voucher_kind: "SPV" },
+      }),
       container,
     } as any)
 
-    expect(container.gpCore!.createEntitlement).not.toHaveBeenCalled()
-    expect(container.logger.warn).toHaveBeenCalledWith(
-      expect.stringContaining("no order IDs")
+    expect(container.logger.info).toHaveBeenCalledTimes(1)
+    expect(container.logger.info).toHaveBeenCalledWith(
+      expect.stringContaining("order_count=1")
     )
   })
 
-  it("logs NotImplementedError as warn, not error", async () => {
+  it("handles empty payload without throwing or emitting warn", async () => {
+    const container = buildMockContainer()
+    await expect(
+      onOrderCompleted({
+        event: buildEvent({}),
+        container,
+      } as any)
+    ).resolves.toBeUndefined()
+    expect(container.logger.info).toHaveBeenCalledTimes(1)
+    expect(container.logger.info).toHaveBeenCalledWith(
+      expect.stringContaining("order_count=0")
+    )
+  })
+
+  it("NEVER emits the Wave-B 'createEntitlement stub' warn line (regression guard)", async () => {
     const container = buildMockContainer()
     await onOrderCompleted({
       event: buildEvent({ order_ids: ["ord-1"] }),
       container,
     } as any)
 
-    expect(container.logger.warn).toHaveBeenCalledWith(
-      expect.stringContaining("stub")
+    expect(container.logger.warn).not.toHaveBeenCalled()
+    expect(container.logger.info).toHaveBeenCalledWith(
+      expect.not.stringContaining("createEntitlement stub")
     )
-    expect(container.logger.error).not.toHaveBeenCalled()
-  })
-
-  it("logs unexpected errors as error", async () => {
-    const container = buildMockContainer({
-      gpCore: {
-        createEntitlement: (jest.fn() as any).mockRejectedValue(new Error("DB down")),
-      },
-    })
-
-    await onOrderCompleted({
-      event: buildEvent({ order_ids: ["ord-1"] }),
-      container,
-    } as any)
-
-    expect(container.logger.error).toHaveBeenCalledWith(
-      expect.stringContaining("DB down")
+    expect(container.logger.info).toHaveBeenCalledWith(
+      expect.not.stringContaining("entitlement created for order")
     )
   })
 
-  it("continues processing remaining orders if one fails", async () => {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const createEntitlement = (jest.fn() as any)
-      .mockRejectedValueOnce(new Error("temporary"))
-      .mockRejectedValueOnce(new NotImplementedError("Story 1.3"))
-    const container = buildMockContainer({
-      gpCore: { createEntitlement },
+  it("NEVER calls gp_core service (call removed entirely per H-8 fix)", async () => {
+    const resolve = jest.fn((key: string) => {
+      if (key === "logger") return { info: jest.fn(), warn: jest.fn(), error: jest.fn() }
+      // If anything looks up gp_core, the test fails.
+      if (key === "gp_core") {
+        throw new Error(
+          "REGRESSION: on-order-completed must NEVER resolve gp_core (Wave-B recurrence guard)"
+        )
+      }
+      return null
     })
 
-    await onOrderCompleted({
-      event: buildEvent({ order_ids: ["ord-1", "ord-2"] }),
-      container,
-    } as any)
+    await expect(
+      onOrderCompleted({
+        event: buildEvent({ order_ids: ["ord-1"] }),
+        container: { resolve, logger: { info: jest.fn(), warn: jest.fn(), error: jest.fn() } },
+      } as any)
+    ).resolves.toBeUndefined()
 
-    expect(createEntitlement).toHaveBeenCalledTimes(2)
+    // Assert resolve was never called with "gp_core".
+    const gpCoreCalls = resolve.mock.calls.filter((c) => c[0] === "gp_core")
+    expect(gpCoreCalls).toEqual([])
   })
 
-  it("skips gracefully when GpCoreService not available", async () => {
-    const container = buildMockContainer({ gpCore: null })
-    await onOrderCompleted({
-      event: buildEvent({ order_ids: ["ord-1"] }),
-      container,
-    } as any)
-
-    expect(container.logger.warn).toHaveBeenCalledWith(
-      expect.stringContaining("not available")
-    )
-  })
-
-  it("does not throw — subscriber errors are caught", async () => {
-    const container = buildMockContainer({
-      gpCore: {
-        createEntitlement: (jest.fn() as any).mockRejectedValue(new Error("catastrophic")),
-      },
-    })
-
+  it("does not throw on any payload shape — subscriber errors are confined", async () => {
+    const container = buildMockContainer()
     await expect(
       onOrderCompleted({
         event: buildEvent({ order_ids: ["ord-1"] }),

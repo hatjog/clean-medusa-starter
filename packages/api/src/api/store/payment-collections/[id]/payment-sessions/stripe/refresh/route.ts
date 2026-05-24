@@ -152,10 +152,28 @@ export const POST = async (
         idempotencyKey,
         retryCount,
       }: CreateRetrySessionInput) => {
+        // v1.9.0 wf5 H-5 / F-CC1-006 fix: canonical Stripe provider id is
+        // `pp_stripe` (matches `GP/config/gp-dev/markets/bonbeauty/market.yaml`
+        // psp_provider_id and the resolver/storefront constants). The legacy
+        // `pp_stripe_stripe` was a Mercur 2 / Medusa 2.13 naming hypothesis
+        // disproven during Story 1.3 — using it as a fallback would create
+        // an unregistered-provider AwilixResolutionError (C4 violation) on
+        // null provider_id. Falling back to `pp_stripe` keeps the retry path
+        // aligned with what `medusa-config.ts` registers + the additional
+        // explicit log surfaces a data-corruption signal (null provider_id
+        // on a session should not happen in normal operation).
+        const providerId = currentSession.provider_id
+        if (!providerId) {
+          logger.warn?.(
+            `[payment-retry-refresh] payment_session_id=${currentSession.id} ` +
+              `has null provider_id — falling back to canonical 'pp_stripe' ` +
+              `but this is a data-corruption signal; investigate`
+          )
+        }
         const { result } = await createPaymentSessionsWorkflow(req.scope).run({
           input: {
             payment_collection_id: paymentCollectionId,
-            provider_id: currentSession.provider_id ?? "pp_stripe_stripe",
+            provider_id: providerId ?? "pp_stripe",
             customer_id: customerId,
             data: {
               gp_payment_retry: true,

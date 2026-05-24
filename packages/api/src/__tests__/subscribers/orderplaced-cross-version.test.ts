@@ -1,25 +1,29 @@
 /**
  * STORY-MIG-B AC #5 — Cross-version subscriber regression test.
  *
- * Matrix:
- *   1. v1 payload → v2-aware subscriber: defaults applied, no throw.
- *   2. v2 payload → v1-only subscriber:  v2-only fields ignored, core
- *      processing succeeds.
- *   3. v2 gift payload → v2-aware subscriber: recipient_locale +
- *      message_locale resolved per resolution rule (P-09 / D-58).
+ * v1.9.0 wf5 H-8 / CC-1 F-CC1-001 update: the v2-aware subscriber
+ * (`on-order-completed`) is now a NO-OP marker — gpCore.createEntitlement is
+ * removed entirely (entitlement creation is owned by `stripe-payment-audit`
+ * Path Y workflow per ADR-099 / ADR-118; webhook-before-order race recovery
+ * by `on-order-placed-stripe-retry`). The cross-version backward-compat
+ * contract still holds: the subscriber MUST accept v1 / standard / v2
+ * payloads without throwing. This test suite was rewritten to assert the
+ * runtime acceptance posture rather than the obsolete gp_core call.
  *
- * The "v1-only subscriber" is simulated by a thin wrapper that strictly types
- * the legacy payload shape (no `mor`, no locale fields). The wrapper running
- * against a v2 payload demonstrates that v2 fields don't break v1 readers.
+ * Matrix:
+ *   1. v1 payload → v2-aware subscriber: no throw, info breadcrumb.
+ *   2. v2 payload → v1-only subscriber:  v2-only fields ignored, core
+ *      processing succeeds (unchanged — this is a pure-function check).
+ *   3. v2 gift payload → v2-aware subscriber: no throw with mor/recipient
+ *      fields present.
  *
  * Invocation:
- *   cd GP/backend && yarn test:unit -- src/__tests__/subscribers/orderplaced-cross-version.test.ts
+ *   cd GP/backend && pnpm test:unit --testPathPattern="orderplaced-cross-version"
  */
 
 import { describe, it, expect, jest } from "@jest/globals"
 
 import onOrderCompleted from "../../subscribers/on-order-completed"
-import { NotImplementedError } from "../../modules/gp-core/service"
 
 import v1Sample from "../fixtures/events/orderplaced-v1-payload.sample.json"
 import v2Sample from "../fixtures/events/orderplaced-v2-payload.sample.json"
@@ -49,35 +53,23 @@ function v1OnlySubscriber(payload: V1OnlyPayload): {
   }
 }
 
-function buildContainer(overrides?: {
-  gpCore?: { createEntitlement: jest.Mock } | null
-}) {
+function buildContainer() {
   const logger = {
     info: jest.fn(),
     warn: jest.fn(),
     error: jest.fn(),
   }
-  const gpCore =
-    overrides?.gpCore !== undefined
-      ? overrides.gpCore
-      : {
-          createEntitlement: jest
-            .fn<(dto: unknown) => Promise<unknown>>()
-            .mockRejectedValue(new NotImplementedError("Story 1.3")),
-        }
   return {
     resolve: jest.fn((key: string) => {
       if (key === "logger") return logger
-      if (key === "gp_core") return gpCore
       return null
     }),
     logger,
-    gpCore,
   }
 }
 
 describe("STORY-MIG-B AC #5 — cross-version OrderPlaced subscribers", () => {
-  it("v1 payload → v2-aware subscriber: optional-chained reads default to null/false", async () => {
+  it("v1 payload → v2-aware no-op subscriber: info breadcrumb, no throw", async () => {
     const container = buildContainer()
     const v1Payload = (v1Sample as { payload: Record<string, unknown> }).payload
     await onOrderCompleted({
@@ -89,17 +81,10 @@ describe("STORY-MIG-B AC #5 — cross-version OrderPlaced subscribers", () => {
       container,
     } as any)
 
-    expect(container.gpCore!.createEntitlement).toHaveBeenCalledTimes(1)
-    expect(container.gpCore!.createEntitlement).toHaveBeenCalledWith(
-      expect.objectContaining({
-        order_id: v1Payload.order_id,
-        recipient_locale: null,
-        message_locale: null,
-        is_gift: false,
-        voucher_kind: "none",
-      })
-    )
     expect(container.logger.error).not.toHaveBeenCalled()
+    expect(container.logger.info).toHaveBeenCalledWith(
+      expect.stringContaining("order_count=1")
+    )
   })
 
   it("v2 payload → v1-only subscriber: v2 fields ignored, core fields processed", () => {
@@ -110,7 +95,7 @@ describe("STORY-MIG-B AC #5 — cross-version OrderPlaced subscribers", () => {
     expect(result.line_count).toBeGreaterThan(0)
   })
 
-  it("v2 gift payload → v2-aware subscriber: recipient_locale + is_gift propagated to entitlement DTO", async () => {
+  it("v2 gift payload → v2-aware no-op subscriber: no throw, info breadcrumb only", async () => {
     const container = buildContainer()
     const v2Payload = (v2Sample as { payload: Record<string, unknown> }).payload
     await onOrderCompleted({
@@ -128,45 +113,36 @@ describe("STORY-MIG-B AC #5 — cross-version OrderPlaced subscribers", () => {
       container,
     } as any)
 
-    expect(container.gpCore!.createEntitlement).toHaveBeenCalledWith(
-      expect.objectContaining({
-        order_id: v2Payload.order_id,
-        recipient_locale: "pl-PL",
-        is_gift: true,
-        voucher_kind: "MPV",
-      })
+    expect(container.logger.error).not.toHaveBeenCalled()
+    expect(container.logger.info).toHaveBeenCalledWith(
+      expect.stringContaining("order_count=1")
     )
   })
 
-  it("v2 payload with null message_locale falls back to recipient_locale per P-09 resolution rule", async () => {
+  it("v2 payload with null message_locale → subscriber tolerates the shape without throw", async () => {
     const container = buildContainer()
-    await onOrderCompleted({
-      event: {
-        name: "order.placed",
-        data: {
-          order_id: "ord-fallback",
-          recipient_locale: "en-GB",
-          message_locale: null,
-          is_gift: true,
-          mor: {
-            sale_mor: "operator",
-            service_mor: "vendor",
-            mor_policy_version: "1.0.0",
-            voucher_kind: "MPV",
-            breakage_policy_snapshot: {},
+    await expect(
+      onOrderCompleted({
+        event: {
+          name: "order.placed",
+          data: {
+            order_id: "ord-fallback",
+            recipient_locale: "en-GB",
+            message_locale: null,
+            is_gift: true,
+            mor: {
+              sale_mor: "operator",
+              service_mor: "vendor",
+              mor_policy_version: "1.0.0",
+              voucher_kind: "MPV",
+              breakage_policy_snapshot: {},
+            },
           },
+          metadata: {},
         },
-        metadata: {},
-      },
-      container,
-    } as any)
-
-    expect(container.gpCore!.createEntitlement).toHaveBeenCalledWith(
-      expect.objectContaining({
-        recipient_locale: "en-GB",
-        message_locale: "en-GB",
-      })
-    )
+        container,
+      } as any)
+    ).resolves.toBeUndefined()
   })
 
   it("v1-only subscriber does not throw when handed a v2 payload (regression for D-50 backward-compat)", () => {

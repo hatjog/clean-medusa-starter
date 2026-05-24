@@ -1,15 +1,9 @@
 import type { SubscriberArgs, SubscriberConfig } from "@medusajs/framework"
 
-import { NotImplementedError } from "../modules/gp-core/service"
-
 type LoggerLike = {
   info?: (message: string) => void
   warn?: (message: string) => void
   error?: (message: string) => void
-}
-
-type GpCoreServiceLike = {
-  createEntitlement: (dto: unknown) => Promise<unknown>
 }
 
 /**
@@ -62,19 +56,6 @@ function resolveLogger(container: Record<string, unknown> | undefined): LoggerLi
   return console
 }
 
-function resolveGpCore(container: Record<string, unknown> | undefined): GpCoreServiceLike | null {
-  const resolver = container?.resolve as ((key: string) => unknown) | undefined
-  if (typeof resolver === "function") {
-    try {
-      return resolver("gp_core") as GpCoreServiceLike | null
-    } catch {
-      return null
-    }
-  }
-
-  return (container?.gp_core as GpCoreServiceLike) ?? null
-}
-
 function extractOrderIds(data: OrderPlacedPayload): string[] {
   if (Array.isArray(data.order_ids) && data.order_ids.length > 0) {
     return data.order_ids
@@ -115,53 +96,43 @@ function detectPayloadShape(data: OrderPlacedPayload): string {
   return "unknown"
 }
 
+/**
+ * v1.9.0 wf5 H-8 / CC-1 F-CC1-001 (ra-E9 carry-out, DEC-A Option 2):
+ *
+ * This subscriber is now a NO-OP marker. The previous implementation called
+ * `gpCore.createEntitlement(...)` which throws `NotImplementedError` and was
+ * caught in a try/catch that logged a misleading "createEntitlement stub"
+ * warn — that same log line misled the Wave-B agent in v1.8.0 into
+ * reimplementing 787 lines of code in the wrong ADR-052 deprecation layer
+ * (legacy gp_core System 1) instead of ADR-099 Layer 4 (voucher module
+ * `entitlement_instance`). Recovery cost ~30h once and the failure mode
+ * survives validators/tests — so the call (and the warn) are removed
+ * entirely. Entitlement creation is owned by:
+ *
+ *   - Live capture: `subscribers/stripe-payment-audit.ts` → Path Y workflow →
+ *     `issueEntitlementsForAllLineItems` (ADR-099 Layer 4, ADR-118 Path Y).
+ *   - Webhook-before-order race recovery: `on-order-placed-stripe-retry.ts`
+ *     (v1.9.0 wf5 ra-E1 carry-out, ADR-107 §Etap-2).
+ *
+ * The subscriber is retained as a doc breadcrumb so future agents reading
+ * `order.placed` event flow find this comment instead of re-walking the
+ * Wave-B reasoning chain. Removing the file entirely would also work but
+ * the explicit no-op is a stronger signal.
+ *
+ * See: ADR-052 (gp_core voucher operations deprecation), ADR-099 (4-layer
+ * entitlement model), ADR-118 (Path Y subscriber pattern).
+ */
 async function onOrderCompleted({ event, container }: SubscriberArgs<OrderPlacedPayload>): Promise<void> {
   const logger = resolveLogger(container as unknown as Record<string, unknown>)
   const payloadShape = detectPayloadShape(event.data)
-
-  logger.info?.(`[gp_core] order.placed received — shape=${payloadShape}`)
-
   const orderIds = extractOrderIds(event.data)
-  if (orderIds.length === 0) {
-    logger.warn?.("[gp_core] order.placed — no order IDs in payload, skipping")
-    return
-  }
 
-  // v2 sense-check (AC #5) — accessed via optional chaining + sensible
-  // defaults so a v1 payload (no `mor`, no `recipient_locale`) does not throw.
-  // The values are surfaced for entitlement composition; v1 paths still run
-  // unchanged because every read is guarded by `?.` + nullish coalescing.
-  const recipientLocale = event.data?.recipient_locale ?? null
-  const messageLocale =
-    event.data?.message_locale ?? event.data?.recipient_locale ?? null
-  const isGift = event.data?.is_gift ?? recipientLocale !== null
-  const voucherKind = event.data?.mor?.voucher_kind ?? "none"
-
-  const gpCore = resolveGpCore(container as unknown as Record<string, unknown>)
-  if (!gpCore) {
-    logger.warn?.("[gp_core] order.placed — GpCoreService not available, skipping")
-    return
-  }
-
-  for (const orderId of orderIds) {
-    try {
-      await gpCore.createEntitlement({
-        order_id: orderId,
-        // v2 fields — pass-through with v1-safe defaults (D-50 backward compat).
-        recipient_locale: recipientLocale,
-        message_locale: messageLocale,
-        is_gift: isGift,
-        voucher_kind: voucherKind,
-      } as unknown)
-      logger.info?.(`[gp_core] order.placed — entitlement created for order ${orderId}`)
-    } catch (error) {
-      if (error instanceof NotImplementedError) {
-        logger.warn?.(`[gp_core] order.placed — createEntitlement stub (${error.message}), order ${orderId}`)
-      } else {
-        logger.error?.(`[gp_core] order.placed — error processing order ${orderId}: ${String(error)}`)
-      }
-    }
-  }
+  logger.info?.(
+    `[on-order-completed] order.placed received — shape=${payloadShape} ` +
+      `order_count=${orderIds.length} — entitlement creation owned by voucher ` +
+      `module via Path Y stripe-payment-audit subscriber (ADR-052 + ADR-099 + ` +
+      `ADR-118); this subscriber is intentionally a no-op marker.`
+  )
 }
 
 export default onOrderCompleted

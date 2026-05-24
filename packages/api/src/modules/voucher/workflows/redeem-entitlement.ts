@@ -23,6 +23,10 @@ import {
   snapshotPolicy,
   type EntitlementPolicySnapshot,
 } from "../models/entitlement"
+import {
+  assertTransferabilityAllowed,
+  type RedeemContext,
+} from "../entitlement-boundary"
 
 export const ENTITLEMENT_REDEEMED_EVENT_TYPE =
   "gp.entitlements.entitlement_redeemed.v1" as const
@@ -59,6 +63,12 @@ export type RedeemableEntitlement = {
   policy_snapshot: EntitlementPolicySnapshot
   order_id: string | null
   market_id?: string | null
+  /**
+   * v1.9.0 Wave F6 / HIGH-05: identity bound at ISSUED time. Drives
+   * `assertTransferabilityAllowed` enforcement for `personalized`/`hybrid`
+   * policies. Null = bearer-issued instance (legacy or explicit bearer).
+   */
+  recipient_customer_id?: string | null
 }
 
 export type RedeemEntitlementInput = {
@@ -78,6 +88,14 @@ export type RedeemEntitlementInput = {
   amount_minor?: number
   market_id?: string | null
   now?: Date
+  /**
+   * v1.9.0 Wave F6 / HIGH-05: identity of the party attempting redemption.
+   * Required for `personalized`/`hybrid` transferability enforcement. When the
+   * upstream booking-confirmation event lacks customer identity (anonymous
+   * bearer flows), pass `null` — `bearer` policies accept that; `personalized`
+   * policies throw `TransferabilityError`.
+   */
+  redeeming_customer_id?: string | null
 }
 
 export type RedeemEntitlementResult = {
@@ -132,6 +150,18 @@ export class RedeemEntitlementWorkflow {
     const result = await this.store.withTransaction(async (tx) => {
       const ent = await tx.getEntitlementForUpdate(input.entitlement_id)
       if (!ent) throw new EntitlementNotFoundError(input.entitlement_id)
+
+      // v1.9.0 Wave F6 HIGH-05 — enforce transferability AFTER lock acquisition,
+      // BEFORE any state transition. The guard reads from the immutable
+      // policy_snapshot per regulamin § 12 (NOT the live profile). Throws
+      // TransferabilityError on `personalized` mismatch; soft-flags `hybrid`
+      // mismatch via return value (currently unused in auto-redeem flow but
+      // captured for future audit hook).
+      const redeemCtx: RedeemContext = {
+        customer_id: input.redeeming_customer_id ?? null,
+        recipient_customer_id: ent.recipient_customer_id ?? null,
+      }
+      assertTransferabilityAllowed(ent.policy_snapshot, redeemCtx)
 
       // Idempotency: already REDEEMED_FULL → no-op, do not re-emit.
       if (ent.state === EntitlementInstanceState.REDEEMED_FULL) {
@@ -316,8 +346,11 @@ class PostgresRedeemEntitlementTx implements RedeemEntitlementTx {
   async getEntitlementForUpdate(
     id: string
   ): Promise<RedeemableEntitlement | null> {
+    // v1.9.0 Wave F6 HIGH-05 — surface recipient_customer_id so the
+    // transferability guard can resolve `personalized` mismatch at the
+    // redemption point.
     const result = await this.client.query<Record<string, unknown>>(
-      `SELECT id, state, policy_snapshot, order_id, market_id
+      `SELECT id, state, policy_snapshot, order_id, market_id, recipient_customer_id
          FROM entitlement_instance
         WHERE id = $1
         FOR UPDATE`,
@@ -343,6 +376,7 @@ class PostgresRedeemEntitlementTx implements RedeemEntitlementTx {
       policy_snapshot: snapshotPolicy(rawSnapshot as Record<string, unknown>),
       order_id: (row.order_id ?? null) as string | null,
       market_id: (row.market_id ?? null) as string | null,
+      recipient_customer_id: (row.recipient_customer_id ?? null) as string | null,
     }
   }
 

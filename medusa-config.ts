@@ -58,6 +58,14 @@ module.exports = withMercur({
         providers: [
           {
             resolve: "@medusajs/payment-stripe",
+            // v1.9.0 wf5 F-CC1-008 / H-5 fix: pin explicit `id: "stripe"` so
+            // the runtime provider key is `pp_stripe` (Medusa convention:
+            // `pp_<id>`) and matches `GP/config/gp-dev/markets/bonbeauty/
+            // market.yaml#psp_provider_id`. Without this, Medusa generates a
+            // plugin-name-derived id (`pp_stripe_stripe`) which diverges from
+            // the storefront `isStripe()` check and the retry-route default.
+            // Pinning here makes the single canonical id literal `pp_stripe`.
+            id: "stripe",
             options: {
               apiKey: process.env.STRIPE_SECRET_KEY_BONBEAUTY,
               webhookSecret: process.env.STRIPE_WEBHOOK_KEY_BONBEAUTY,

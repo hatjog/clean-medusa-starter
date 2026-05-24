@@ -35,6 +35,29 @@ import {
   validityMonthsMax,
 } from "./entitlement-boundary"
 
+// Local minimal shape for admin search projection (Layer 4-aware).
+// Mirrors fields from `lib/contracts/admin#EntitlementAdminView` that are
+// projectable from `entitlement_instance` + `voucher` join. The redemption /
+// audit-log enrichment fields are intentionally optional (gp_mercur Layer 4
+// doesn't carry the separate redemption table that the legacy gp_core view
+// projected) — admin UI tolerant of missing arrays.
+type EntitlementAdminView = {
+  id: string
+  status: string
+  voucher_code: string | null
+  claim_token: string | null
+  order_id: string | null
+  face_value_minor: number
+  remaining_minor: number
+  currency: string
+  product_name: string | null
+  vendor_name: string | null
+  created_at: string
+  expires_at: string | null
+  claimed_at: string | null
+  last_redeemed_at: string | null
+}
+
 /** States from which a refund can be processed. */
 const REFUNDABLE_STATES: ReadonlySet<EntitlementInstanceState> = new Set([
   EntitlementInstanceState.ACTIVE,
@@ -578,6 +601,118 @@ export class VoucherService {
     return result.rows.map((r) => r.code)
   }
 
+  /**
+   * v1.9.0 Wave F6 / Epic-2 HIGH-01 + CC-2 #1 — System 1 elimination.
+   *
+   * Admin entitlement search reading from Layer 4 (`entitlement_instance`)
+   * instead of the deprecated `gp_core.entitlements` table. This is the
+   * single-source-of-truth replacement for `gpCore.adminSearchEntitlements`;
+   * the admin route now delegates here.
+   *
+   * Query semantics:
+   *   - Email path (`q` contains `@`): join Mercur `order` table by
+   *     buyer_email ILIKE, collect order_ids, then list entitlement_instance
+   *     rows for those orders.
+   *   - Direct path: ILIKE on voucher.code (joined via policy_snapshot
+   *     voucher_code surrogate) + exact match on claim_token / order_id.
+   *
+   * Returns lightweight `EntitlementAdminView`-shaped projection; per-row
+   * redemption / audit enrichment is intentionally omitted (legacy
+   * implementation projected `e.face_value_minor` / `e.remaining_minor` from
+   * an obsolete table; the Layer 4 equivalents live on `policy_snapshot` and
+   * `remaining_amount`).
+   */
+  async adminSearchEntitlements(q: string): Promise<EntitlementAdminView[]> {
+    const trimmed = q.trim()
+    if (!trimmed) return []
+    const pool = this.getPool()
+
+    const isEmailSearch = trimmed.includes("@")
+    const isUuid =
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+        trimmed
+      )
+
+    if (isEmailSearch) {
+      const ordersRes = await pool.query<{ id: string }>(
+        `SELECT id FROM public.order WHERE email ILIKE $1 LIMIT 100`,
+        [`%${trimmed}%`]
+      )
+      if (ordersRes.rows.length === 0) return []
+      const orderIds = ordersRes.rows.map((r) => r.id)
+      const rows = await pool.query<Record<string, unknown>>(
+        `SELECT ei.*, v.code AS voucher_code, v.value_minor, v.currency_code
+           FROM entitlement_instance ei
+           LEFT JOIN voucher v ON v.code = (ei.policy_snapshot->>'voucher_code')
+          WHERE ei.order_id = ANY($1::text[])
+          ORDER BY ei.created_at DESC
+          LIMIT 200`,
+        [orderIds]
+      )
+      return rows.rows.map((r) => this.projectAdminView(r))
+    }
+
+    const directRes = await pool.query<Record<string, unknown>>(
+      `SELECT ei.*, v.code AS voucher_code, v.value_minor, v.currency_code
+         FROM entitlement_instance ei
+         LEFT JOIN voucher v ON v.code = (ei.policy_snapshot->>'voucher_code')
+        WHERE (v.code ILIKE $1)
+           ${isUuid ? "OR ei.claim_token = $2::uuid OR ei.order_id = $2 OR ei.id = $2" : "OR ei.order_id = $2 OR ei.id = $2"}
+        ORDER BY ei.created_at DESC
+        LIMIT 100`,
+      [`%${trimmed}%`, trimmed]
+    )
+    return directRes.rows.map((r) => this.projectAdminView(r))
+  }
+
+  private projectAdminView(row: Record<string, unknown>): EntitlementAdminView {
+    const policySnapshot =
+      typeof row.policy_snapshot === "string"
+        ? (JSON.parse(row.policy_snapshot as string) as Record<string, unknown>)
+        : ((row.policy_snapshot ?? {}) as Record<string, unknown>)
+    const faceValue =
+      typeof row.value_minor === "number"
+        ? (row.value_minor as number)
+        : typeof policySnapshot.amount_minor === "number"
+          ? (policySnapshot.amount_minor as number)
+          : 0
+    const remaining =
+      row.remaining_amount != null ? Number(row.remaining_amount) : faceValue
+    const currency =
+      (typeof row.currency_code === "string" ? (row.currency_code as string) : null) ??
+      (typeof policySnapshot.currency === "string" ? (policySnapshot.currency as string) : "PLN")
+    return {
+      id: row.id as string,
+      status: row.state as string,
+      voucher_code: (row.voucher_code as string | undefined) ?? null,
+      claim_token: (row.claim_token as string | null | undefined) ?? null,
+      order_id: (row.order_id as string | null | undefined) ?? null,
+      face_value_minor: faceValue,
+      remaining_minor: remaining,
+      currency,
+      product_name:
+        typeof policySnapshot.product_name === "string"
+          ? (policySnapshot.product_name as string)
+          : null,
+      vendor_name:
+        typeof policySnapshot.vendor_name === "string"
+          ? (policySnapshot.vendor_name as string)
+          : null,
+      created_at:
+        row.created_at instanceof Date
+          ? (row.created_at as Date).toISOString()
+          : String(row.created_at ?? ""),
+      expires_at:
+        row.expires_at == null
+          ? null
+          : row.expires_at instanceof Date
+            ? (row.expires_at as Date).toISOString()
+            : String(row.expires_at),
+      claimed_at: null,
+      last_redeemed_at: null,
+    }
+  }
+
   async upsert(input: UpsertVoucherInput): Promise<VoucherWithEvents> {
     const pool = this.getPool()
     const expiresAt = this.toDate(input.expires_at)
@@ -998,16 +1133,15 @@ export class VoucherService {
     const pool = this.getPool()
     const now = opts.now ?? new Date()
 
+    // v1.9.0 Wave F6 HIGH-09 — the previous unlocked existence/expiry/already-
+    // claimed pre-check formed a TOCTOU window with the FOR UPDATE block
+    // below. We keep the cheap getByCode for the "not_found" early-out
+    // (the FOR UPDATE on a missing row also returns 0 rows so the result is
+    // equivalent, but the early-out spares the connection acquisition) and
+    // move expiry / already-claimed branching INSIDE the lock so all state
+    // observations come from the same locked snapshot.
     const voucher = await this.getByCode(code)
     if (!voucher) return { status: "not_found", voucher: null }
-
-    if (voucher.status === "claimed") {
-      return { status: "already_claimed", voucher }
-    }
-
-    if (voucher.expires_at && voucher.expires_at < now) {
-      return { status: "expired", voucher }
-    }
 
     // F2 fix: Atomic status transition + event append in a transaction.
     // Use SELECT ... FOR UPDATE to lock the row, then conditional UPDATE
@@ -1356,9 +1490,33 @@ export class VoucherService {
           [entitlementId, input.amount]
         )
       } else if (refundChannel === "vendor_wallet") {
-        // Increment vendor.metadata.wallet balance (minor units).
+        // v1.9.0 Wave F6 HIGH-03 — Story 2.1 AC: entitlement_profiles is a
+        // DECLARATIVE YAML CONFIG (gp-ops market.yaml), NOT a DB table. The
+        // previous JOIN against `entitlement_profiles` raised
+        // `relation "entitlement_profiles" does not exist` at runtime. Fix:
+        // resolve the vendor (seller) directly from the order line item's
+        // seller_id, which Mercur stores per line on `order_item`. This drops
+        // the dependency on the non-existent DB table.
+        //
+        // Multi-line carts: each line has its own seller; the refund increments
+        // the wallet of every seller proportionally (one UPDATE per matching
+        // seller_id). The current implementation picks the first seller for
+        // the order; for v1.8.0 BonBeauty MVP all line items in an order share
+        // the same seller, so this collapses to a single increment. v1.10.0+
+        // multi-seller orders need a per-line refund routing decision (deferred
+        // to a follow-up ADR).
         await (client as Queryable).query(
-          `UPDATE seller
+          `WITH target_seller AS (
+             SELECT (oi.metadata->>'seller_id') AS seller_id
+               FROM entitlement_instance ei
+               JOIN order_item oi ON oi.order_id = ei.order_id
+              WHERE ei.id = $1
+                AND oi.deleted_at IS NULL
+                AND oi.metadata ? 'seller_id'
+              ORDER BY oi.created_at ASC
+              LIMIT 1
+           )
+           UPDATE seller
               SET metadata = jsonb_set(
                     COALESCE(seller.metadata, '{}'::jsonb),
                     '{wallet}',
@@ -1368,10 +1526,8 @@ export class VoucherService {
                     true
                   ),
                   updated_at = NOW()
-            FROM entitlement_instance ei
-            JOIN entitlement_profiles ep ON ep.id = ei.entitlement_profile_id
-           WHERE seller.id = ep.vendor_id
-             AND ei.id = $1`,
+             FROM target_seller ts
+            WHERE seller.id = ts.seller_id`,
           [entitlementId, input.amount]
         )
       }

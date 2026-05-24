@@ -328,6 +328,23 @@ export function generateMagicLinkWithClaims(
   }
 }
 
+/**
+ * @deprecated v1.9.0 Wave F6 / Epic-2 HIGH-06.
+ *
+ * Use `issueMagicLink(store, ...)` from
+ * `lib/auth/magic-link-revocation` instead. The runtime-singleton
+ * `recordIssued` resolution here is hidden plumbing — any new entry point that
+ * imports `generateMagicLink` directly and forgets to call
+ * `configureMagicLinkRuntime` first will silently lose the magic_link_issued
+ * ledger write, which in turn breaks revoke-all market-scope cross-checks.
+ * The store-bound `issueMagicLink` form makes the dependency a typed parameter
+ * the call site cannot forget.
+ *
+ * This function is preserved for the 2.14-reopen `/store/auth/magic-link`
+ * recover route + tests; new callers MUST go through `issueMagicLink`.
+ * `_grow/tools/validate_magic_link_callsites.py` (ra-5 carry-out follow-up)
+ * enforces the deprecation at CI time.
+ */
 export async function generateMagicLink(
   purpose: MagicLinkPurpose,
   subject: MagicLinkSubject,

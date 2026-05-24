@@ -86,33 +86,54 @@ class FakeClient implements PgClient {
     this.queries.push({ sql, params })
     const normalized = sql.replace(/\s+/g, " ").trim()
 
-    if (normalized.startsWith("SELECT id FROM entitlement_instance")) {
+    if (
+      normalized.startsWith("SELECT id FROM entitlement_instance") ||
+      normalized.startsWith("SELECT id, line_item_id FROM entitlement_instance")
+    ) {
       if (this.existingEntitlementId) {
-        return { rows: [{ id: this.existingEntitlementId }] as unknown as T[], rowCount: 1 }
+        return {
+          rows: [
+            { id: this.existingEntitlementId, line_item_id: null },
+          ] as unknown as T[],
+          rowCount: 1,
+        }
       }
       return { rows: [] as T[], rowCount: 0 }
     }
 
     if (normalized.includes("FROM order_item")) {
+      // v1.9.0 wf5 H-6 fix: issueEntitlementsForAllLineItems issues per-line
+      // and expects rows with both `line_item_id` AND `metadata`. The legacy
+      // single-line test path sets `orderLineMetadata`; emulate the new shape
+      // by synthesizing one row with a synthetic line_item_id.
       if (this.orderLineMetadata === null) {
         return { rows: [] as T[], rowCount: 0 }
       }
       return {
-        rows: [{ metadata: this.orderLineMetadata }] as unknown as T[],
+        rows: [
+          {
+            line_item_id: "line_item_synthetic",
+            metadata: this.orderLineMetadata,
+          },
+        ] as unknown as T[],
         rowCount: 1,
       }
     }
 
     if (normalized.startsWith("INSERT INTO entitlement_instance")) {
+      // v1.9.0 wf5 H-6: INSERT params are now [id, profile_id,
+      // entitlement_type, order_id, line_item_id, state, policy_snapshot,
+      // market_id, created_at] (9 params; line_item_id added at index 4).
       this.insertedEntitlementInstance = {
         id: params[0],
         entitlement_profile_id: params[1],
         entitlement_type: params[2],
         order_id: params[3],
-        state: params[4],
-        policy_snapshot: params[5],
-        market_id: params[6],
-        created_at: params[7],
+        line_item_id: params[4],
+        state: params[5],
+        policy_snapshot: params[6],
+        market_id: params[7],
+        created_at: params[8],
       }
       return { rows: [] as T[], rowCount: 1 }
     }
