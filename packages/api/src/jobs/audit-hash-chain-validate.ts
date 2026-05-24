@@ -45,6 +45,28 @@ interface QueryRunner {
   query(sql: string, params?: unknown[]): Promise<{ rows: Array<Record<string, unknown>> }>;
 }
 
+/**
+ * Medusa 2 `__pg_connection__` resolves to a Knex<any> instance which exposes
+ * `.raw(sql, bindings)` — NOT `.query()`. Knex's binding parser only accepts
+ * `?` (positional) or `:name` (named) placeholders; PostgreSQL native `$N` are
+ * treated as literal text and trigger "Expected N bindings, saw 0".
+ *
+ * Mirrors the `resolveQueryRunner` pattern in `canary-baseline-rolling.ts`
+ * (added by 7563432 fix(jobs): adapt canary baseline to knex connection).
+ * Confirmed root cause in SB-4 fix (f78b59d) where the same `$N`→`?` rewrite
+ * unblocked 6 API routes.
+ *
+ * SB-2 (v1.9.1 Wave G1) — scheduled job was crashing every tick because this
+ * adapter was missing here and `query.query()` is not a function on a Knex
+ * instance.
+ */
+interface KnexRawRunner {
+  raw(
+    sql: string,
+    bindings?: unknown[]
+  ): Promise<{ rows?: Array<Record<string, unknown>> } | Array<Record<string, unknown>>>;
+}
+
 interface PosthogClient {
   capture(args: { distinctId: string; event: string; properties?: Record<string, unknown> }): void;
 }
@@ -89,6 +111,63 @@ function _resolveOptional<T>(container: MedusaContainer | undefined, key: string
     return null;
   }
 }
+
+const _isQueryRunner = (value: unknown): value is QueryRunner =>
+  Boolean(value && typeof (value as QueryRunner).query === "function");
+
+const _isKnexRawRunner = (value: unknown): value is KnexRawRunner =>
+  Boolean(value && typeof (value as KnexRawRunner).raw === "function");
+
+const _toKnexRawSql = (
+  sql: string,
+  params: unknown[] = []
+): { sql: string; bindings: unknown[] } => {
+  const bindings: unknown[] = [];
+  const rewrittenSql = sql.replace(/\$(\d+)/g, (_match, index: string) => {
+    const paramIndex = Number(index) - 1;
+    bindings.push(params[paramIndex]);
+    return "?";
+  });
+
+  return {
+    sql: rewrittenSql,
+    bindings: bindings.length > 0 ? bindings : params,
+  };
+};
+
+const _normalizeRawRows = (
+  result: Awaited<ReturnType<KnexRawRunner["raw"]>>
+): Array<Record<string, unknown>> => {
+  if (Array.isArray(result)) return result;
+  if (Array.isArray(result.rows)) return result.rows;
+  return [];
+};
+
+/**
+ * Resolve a query runner from the Medusa container. Handles both the legacy
+ * `.query(sql, params)` shape and the Medusa 2 Knex `__pg_connection__`
+ * `.raw(sql, bindings)` shape (rewriting `$N` → `?`).
+ *
+ * Exported for unit-test parity with `canary-baseline-rolling#resolveQueryRunner`.
+ */
+export const resolveQueryRunner = (
+  container: MedusaContainer | undefined
+): QueryRunner | null => {
+  const connection = _resolveOptional<unknown>(container, "__pg_connection__");
+
+  if (_isQueryRunner(connection)) return connection;
+  if (_isKnexRawRunner(connection)) {
+    return {
+      query: async (sql: string, params?: unknown[]) => {
+        const raw = _toKnexRawSql(sql, params ?? []);
+        const result = await connection.raw(raw.sql, raw.bindings);
+        return { rows: _normalizeRawRows(result) };
+      },
+    };
+  }
+
+  return null;
+};
 
 interface ShardResult {
   table: string;
@@ -197,11 +276,14 @@ export default async function auditHashChainValidate(
   container: MedusaContainer
 ): Promise<void> {
   const logger = _resolveLogger(container);
-  // TODO(MEDUSA-2-SCHEDULED-JOB): confirm container resolution keys for the
-  // active Medusa 2 / Mercur fork. `__pg_connection__` is the documented Medusa 2
-  // QueryRunner; PostHog + Sentry keys may differ per loader registration.
-  // Falls back to no-op if missing — the job stays test-runnable.
-  const query = _resolveOptional<QueryRunner>(container, "__pg_connection__");
+  // SB-2 fix (v1.9.1 Wave G1): `__pg_connection__` in Medusa 2 resolves to a
+  // Knex<any> instance which exposes `.raw()`, NOT `.query()`. `resolveQueryRunner`
+  // adapts both shapes and rewrites PG-native `$N` placeholders → Knex `?`.
+  // Without this adapter the scheduled job crashed every tick with
+  // `query.query is not a function` (see SB-4 root-cause analysis in f78b59d).
+  // PostHog + Sentry keys may differ per loader registration — fall back to
+  // no-op if missing so the job stays test-runnable.
+  const query = resolveQueryRunner(container);
   const posthog = _resolveOptional<PosthogClient>(container, "posthog");
   const sentry = _resolveOptional<SentryClient>(container, "sentry");
 
