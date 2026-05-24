@@ -20,9 +20,12 @@ import {
 
 import {
   compensateIssuedEntitlement,
-  issueEntitlementWithinPaymentTransaction,
+  issueEntitlementsForAllLineItems,
   MissingEntitlementProfileError,
+  revokeEntitlementsOnRefund,
   type IssueEntitlementResult,
+  type MultiLineEntitlementResult,
+  type RefundEntitlementRevocationResult,
 } from "../entitlements/issue-entitlement"
 import type { EntitlementType } from "../../modules/voucher/models/entitlement"
 import { redactFailureCode } from "../../lib/payment/failure-classification"
@@ -88,6 +91,17 @@ export type PaymentAuditEnvelope = {
   // the structured key is the durable, queryable failure signal — replaces the
   // previous silent warn that violated Story 1.3 "Fail-loud, NIE silent".
   entitlement_issue_failed_reason?: string
+  /**
+   * v1.9.0 wf5 (H-2 / F-CC1-003): set when payment.captured arrived BEFORE
+   * the storefront finalized the order (no `order_id` on the payload). A
+   * downstream `order.placed` subscriber will scan this key and retroactively
+   * re-issue entitlement once the order materializes. Durable + queryable.
+   */
+  entitlement_issue_deferred_reason?: string
+  /** v1.9.0 wf5 H-3: count of entitlement rows transitioned ACTIVE→REFUNDED on payment.refunded. */
+  revoked_entitlement_count?: number
+  /** v1.9.0 wf5 H-3: count of already-terminal rows skipped during refund. */
+  already_terminal_entitlement_count?: number
 }
 
 // Reconcile-only result. There is no provider mutation on this path, so there
@@ -109,8 +123,18 @@ export type StripePaymentAuditResult = {
   event_id: string
   envelope: PaymentAuditEnvelope
   deduplicated: boolean
+  /**
+   * Backward-compat single-entitlement field. v1.9.0 H-6 multi-product cart
+   * fix: when multiple voucher lines yield N entitlements, this is the first
+   * issued instance and `entitlements_all` carries the full set. Single-line
+   * carts: `entitlement === entitlements_all[0]`.
+   */
   entitlement?: IssueEntitlementResult
+  /** v1.9.0 H-6: all entitlements issued for this payment (one per voucher line). */
+  entitlements_all?: IssueEntitlementResult[]
   refundReconcile?: StripeRefundReconcileResult
+  /** v1.9.0 wf5 (H-3 / F-CC1-002): entitlement revocation outcome for payment.refunded. */
+  refundRevocation?: RefundEntitlementRevocationResult
 }
 
 type QueryResult<T> = Promise<{ rows: T[]; rowCount?: number | null }>
@@ -177,41 +201,64 @@ export class StripePaymentAuditWorkflow {
 
     return this.withTransaction(async (client) => {
       let entitlement: IssueEntitlementResult | undefined
+      let entitlementsAll: IssueEntitlementResult[] | undefined
+      let refundRevocation: RefundEntitlementRevocationResult | undefined
       const inserted = await insertDedupRow(client, payload, envelope)
       if (!inserted) {
         return { event_id: eventId, envelope, deduplicated: true }
       }
 
+      // v1.9.0 wf5 (H-2 / F-CC1-003): webhook-before-order race fail-loud.
+      // Pre-fix: silent no-op when `payload.order_id` was absent (BLIK/P24
+      // instant payments often deliver the captured webhook before the
+      // storefront calls /carts/:id/complete). Customer paid, no entitlement,
+      // no queryable signal. Now: persist `entitlement_issue_deferred_reason`
+      // onto the dedup row envelope so a `order.placed` subscriber can find
+      // it later and replay; operator gets a durable audit signal.
+      if (eventType === "payment.captured" && !payload.order_id) {
+        envelope.entitlement_issue_deferred_reason = "webhook_before_order"
+        await persistAuditDeferredKey(
+          client,
+          payload.event_id as string,
+          "webhook_before_order"
+        )
+        this.logger?.warn?.(
+          `[stripe-payment-audit] payment.captured WITHOUT order_id (race) ` +
+            `payment_intent_id=${payload.payment_intent_id} — audit row persisted ` +
+            `with envelope.entitlement_issue_deferred_reason=webhook_before_order; ` +
+            `order.placed subscriber will retry entitlement issuance.`
+        )
+      }
+
       if (eventType === "payment.captured" && payload.order_id) {
         try {
-          entitlement = await issueEntitlementWithinPaymentTransaction(
-            client,
-            {
-              event_id: payload.event_id as string,
-              order_id: payload.order_id as string,
-              payment_id: payload.payment_id,
-              payment_intent_id: payload.payment_intent_id,
-              market_id: payload.market_id,
-              amount_minor: payload.amount_minor,
-              currency: payload.currency,
-              entitlement_profile: payload.entitlement_profile,
-            },
-            now
-          )
+          // v1.9.0 wf5 H-6 fix: iterate ALL voucher line items (multi-line
+          // carts) rather than collapsing to LIMIT 1.
+          const multi: MultiLineEntitlementResult =
+            await issueEntitlementsForAllLineItems(
+              client,
+              {
+                event_id: payload.event_id as string,
+                order_id: payload.order_id as string,
+                payment_id: payload.payment_id,
+                payment_intent_id: payload.payment_intent_id,
+                market_id: payload.market_id,
+                amount_minor: payload.amount_minor,
+                currency: payload.currency,
+                entitlement_profile: payload.entitlement_profile,
+              },
+              now
+            )
+          if (multi.results.length === 0) {
+            throw new MissingEntitlementProfileError(payload.order_id as string)
+          }
+          entitlementsAll = multi.results
+          entitlement = multi.results[0]
         } catch (err) {
           if (!(err instanceof MissingEntitlementProfileError)) {
             throw err
           }
-          // Story 1.10.1 GAP #3 — fail-loud per Q3 default (structured envelope key,
-          // NOT a separate table; defer table to v1.9.0+ if pattern recurs).
-          // Webhook still ack-OK (no rollback, audit row stays committed for dedup),
-          // but the failure is now durable + queryable via the envelope JSONB key
-          // rather than swallowed in a transient warn line. Story 1.3 "Fail-loud,
-          // NIE silent" (line 121) compliance.
           envelope.entitlement_issue_failed_reason = err.message
-          // Persist the failure key on the already-inserted dedup row so the
-          // signal survives webhook-dedup replay (the row is the durable audit
-          // truth; the in-memory envelope alone would be lost on re-delivery).
           await persistAuditFailureKey(
             client,
             payload.event_id as string,
@@ -226,7 +273,45 @@ export class StripePaymentAuditWorkflow {
         }
       }
 
-      return { event_id: eventId, envelope, deduplicated: false, entitlement }
+      // v1.9.0 wf5 H-3 / F-CC1-002 (P0_FINANCIAL_EXPOSURE): refund webhook
+      // transitions entitlement state ACTIVE → REFUNDED for ALL entitlement
+      // rows attached to the refunded order. Idempotent (terminal-state
+      // guard); runs in the SAME transaction as the audit-row insert so a
+      // half-applied refund is impossible. Closes the long-standing financial
+      // exposure where a refunded Stripe charge co-existed with an ACTIVE,
+      // redeemable voucher.
+      if (eventType === "payment.refunded" && payload.order_id) {
+        refundRevocation = await revokeEntitlementsOnRefund(
+          client,
+          payload.order_id as string,
+          now
+        )
+        envelope.revoked_entitlement_count =
+          refundRevocation.revoked_entitlement_ids.length
+        envelope.already_terminal_entitlement_count =
+          refundRevocation.already_terminal_entitlement_ids.length
+        // Persist the revocation summary onto the dedup row so the admin
+        // refund-history view (F-CC1-018) can join it.
+        await persistAuditRevocationKey(
+          client,
+          payload.event_id as string,
+          refundRevocation
+        )
+        this.logger?.info?.(
+          `[stripe-payment-audit] payment.refunded order_id=${payload.order_id} ` +
+            `revoked=${refundRevocation.revoked_entitlement_ids.length} ` +
+            `already_terminal=${refundRevocation.already_terminal_entitlement_ids.length}`
+        )
+      }
+
+      return {
+        event_id: eventId,
+        envelope,
+        deduplicated: false,
+        entitlement,
+        entitlements_all: entitlementsAll,
+        refundRevocation,
+      }
     })
   }
 
@@ -245,6 +330,25 @@ export class StripePaymentAuditWorkflow {
       await this.eventBus?.emit?.({
         name: "gp.payments.payment_failed.v1",
         data: buildPaymentFailedContractEvent(result, payload, now),
+      })
+    }
+    // v1.9.0 wf5 H-1 fix: wire the canonical payment_paid producer (was a
+    // dead contract — schema validated but zero emit calls). Mirrors the
+    // payment_failed pattern. Closes Epic-1 HIGH H-1 (Story 1.3 AC9 / FR1.4
+    // traceability) so downstream consumers (MoR reconciliation, analytics
+    // warehouse) see captured events for BonBeauty paid orders.
+    if (result.envelope.event_type === "payment.captured") {
+      await this.eventBus?.emit?.({
+        name: "gp.payments.payment_paid.v1",
+        data: buildPaymentPaidContractEvent(result, payload, now),
+      })
+    }
+    // v1.9.0 wf5 (companion to H-3): emit canonical payment_refunded for the
+    // refund webhook so downstream consumers can audit revocation in tandem.
+    if (result.envelope.event_type === "payment.refunded") {
+      await this.eventBus?.emit?.({
+        name: "gp.payments.payment_refunded.v1",
+        data: buildPaymentRefundedContractEvent(result, payload, now),
       })
     }
     if (result.entitlement) {
@@ -369,15 +473,15 @@ export function buildPaymentAuditEnvelope(
   const failureCode = redactFailureCode(payload.failure_code)
   if (failureCode) envelope.failure_code = failureCode
   if (payload.decline_code) envelope.decline_code = payload.decline_code
+  // v1.9.0 wf5 M-8 fix: persist currency for ALL outcomes (was refund-only).
+  // Downstream consumers (audit ingestion, MoR reconciliation, v1.10.0+
+  // multi-currency markets) need `currency` on the lifecycle_status=paid
+  // envelope too. Move out of the refund-only branch.
+  if (payload.currency) envelope.currency = payload.currency.toUpperCase()
   if (eventType === "payment.refunded") {
     if (payload.refund_id) envelope.refund_id = payload.refund_id
     envelope.refund_amount = payload.refund_amount ?? undefined
     envelope.refund_reason = payload.refund_reason ?? "unspecified"
-    // C6: persist the real currency code in the envelope so the admin
-    // refund-history route can render "amount + waluta" without abusing
-    // `market_id` as a currency. `currency` is hydrated from
-    // `payment.currency_code` by the subscriber translator.
-    if (payload.currency) envelope.currency = payload.currency.toUpperCase()
   }
   return envelope
 }
@@ -403,6 +507,10 @@ async function insertDedupRow(
  * survives webhook replay (the in-memory envelope is lost on re-delivery; the
  * row is the durable audit truth). JSONB merge preserves any other envelope
  * keys already written by `insertDedupRow`.
+ *
+ * v1.9.0 wf5 L-1 fix: only sets the key if it is not already present, so a
+ * future refactor cannot accidentally overwrite a different failure reason
+ * already recorded for the same event_id.
  */
 async function persistAuditFailureKey(
   client: PgClient,
@@ -412,8 +520,60 @@ async function persistAuditFailureKey(
   await client.query(
     `UPDATE webhook_event_processed
         SET envelope = envelope || jsonb_build_object('entitlement_issue_failed_reason', $2::text)
-      WHERE event_id = $1 AND provider = 'stripe'`,
+      WHERE event_id = $1
+        AND provider = 'stripe'
+        AND NOT (envelope ? 'entitlement_issue_failed_reason')`,
     [eventId, reason]
+  )
+}
+
+/**
+ * v1.9.0 wf5 (H-2 / F-CC1-003): persist deferred-reason on the dedup row when
+ * a `payment.captured` webhook arrived before the order was finalized. A
+ * downstream `order.placed` subscriber (see `on-order-placed-stripe-retry.ts`)
+ * scans this key and re-issues entitlement retroactively.
+ */
+async function persistAuditDeferredKey(
+  client: PgClient,
+  eventId: string,
+  reason: string
+): Promise<void> {
+  await client.query(
+    `UPDATE webhook_event_processed
+        SET envelope = envelope || jsonb_build_object('entitlement_issue_deferred_reason', $2::text)
+      WHERE event_id = $1
+        AND provider = 'stripe'
+        AND NOT (envelope ? 'entitlement_issue_deferred_reason')`,
+    [eventId, reason]
+  )
+}
+
+/**
+ * v1.9.0 wf5 (H-3 / F-CC1-002 P0): persist refund revocation summary onto the
+ * dedup row so the admin refund-history view can render the per-refund
+ * "voucher revoked ✓/✗" signal (F-CC1-018).
+ */
+async function persistAuditRevocationKey(
+  client: PgClient,
+  eventId: string,
+  revocation: RefundEntitlementRevocationResult
+): Promise<void> {
+  await client.query(
+    `UPDATE webhook_event_processed
+        SET envelope = envelope || jsonb_build_object(
+              'revoked_entitlement_ids', $2::jsonb,
+              'revoked_entitlement_count', $3::int,
+              'already_terminal_entitlement_ids', $4::jsonb,
+              'already_terminal_entitlement_count', $5::int
+            )
+      WHERE event_id = $1 AND provider = 'stripe'`,
+    [
+      eventId,
+      JSON.stringify(revocation.revoked_entitlement_ids),
+      revocation.revoked_entitlement_ids.length,
+      JSON.stringify(revocation.already_terminal_entitlement_ids),
+      revocation.already_terminal_entitlement_ids.length,
+    ]
   )
 }
 
@@ -453,6 +613,112 @@ export function buildPaymentFailedContractEvent(
         envelope.payment_method_type ?? payload.payment_method_type ?? "unknown",
       processing_country:
         envelope.processing_country ?? payload.processing_country ?? "unknown",
+    },
+  }
+}
+
+/**
+ * v1.9.0 wf5 H-1 fix — `gp.payments.payment_paid.v1` contract event builder.
+ *
+ * Schema: `specs/contracts/events/schemas/payloads/gp.payments.payment_paid.v1.schema.json`.
+ * Required fields: `payment_id`, `order_id`, `provider_id`, `currency`,
+ * `paid_amount_minor`.
+ *
+ * Provider id literal `stripe` (NOT `pp_stripe` / `pp_stripe_stripe`) per
+ * F-CC1-006/008 canonical-id decision (Stripe SDK provider name).
+ */
+export function buildPaymentPaidContractEvent(
+  result: StripePaymentAuditResult,
+  payload: StripePaymentAuditPayload,
+  now = new Date()
+): Record<string, unknown> {
+  const envelope = result.envelope
+  const marketId = payload.market_id ?? "unknown"
+  const paymentId = payload.payment_id ?? payload.payment_intent_id ?? "unknown"
+  const providerPaymentId = payload.payment_intent_id ?? paymentId
+  const currency = envelope.currency ?? payload.currency?.toUpperCase() ?? "PLN"
+  const paidAmountMinor = typeof payload.amount_minor === "number" ? payload.amount_minor : 0
+
+  return {
+    schema_version: "1",
+    event_type: "gp.payments.payment_paid.v1",
+    occurred_at: now.toISOString(),
+    actor: "system",
+    scope: {
+      instance_id: "gp-dev",
+      market_id: marketId,
+      vendor_id: null,
+      location_id: null,
+    },
+    idempotency_key: `${marketId}:${providerPaymentId}:payment_paid`,
+    correlation_id: payload.order_id ?? paymentId,
+    causation_id: `stripe:webhook:${result.event_id}`,
+    payload: {
+      payment_id: paymentId,
+      order_id: payload.order_id ?? paymentId,
+      provider_id: "stripe",
+      provider_payment_id: providerPaymentId,
+      request_id: envelope.request_id ?? payload.request_id ?? null,
+      method: payload.payment_method_type ?? null,
+      payment_method_type: envelope.payment_method_type ?? payload.payment_method_type ?? null,
+      processing_country: envelope.processing_country ?? payload.processing_country ?? null,
+      currency,
+      paid_amount_minor: paidAmountMinor,
+      fees_minor: null,
+      psp_occurred_at: now.toISOString(),
+    },
+  }
+}
+
+/**
+ * v1.9.0 wf5 — `gp.payments.payment_refunded.v1` contract event builder.
+ *
+ * Companion to H-1 (`gp.payments.payment_paid.v1` producer wiring). Closes
+ * the matching schema-without-producer gap on the refund side. Carries the
+ * revocation summary populated by `revokeEntitlementsOnRefund` so downstream
+ * consumers can correlate refund → entitlement revocation in one event.
+ */
+export function buildPaymentRefundedContractEvent(
+  result: StripePaymentAuditResult,
+  payload: StripePaymentAuditPayload,
+  now = new Date()
+): Record<string, unknown> {
+  const envelope = result.envelope
+  const marketId = payload.market_id ?? "unknown"
+  const paymentId = payload.payment_id ?? payload.payment_intent_id ?? "unknown"
+  const providerPaymentId = payload.payment_intent_id ?? paymentId
+  const currency = envelope.currency ?? payload.currency?.toUpperCase() ?? "PLN"
+  const refundAmountMinor =
+    typeof payload.refund_amount === "number" ? payload.refund_amount : 0
+
+  return {
+    schema_version: "1",
+    event_type: "gp.payments.payment_refunded.v1",
+    occurred_at: now.toISOString(),
+    actor: "system",
+    scope: {
+      instance_id: "gp-dev",
+      market_id: marketId,
+      vendor_id: null,
+      location_id: null,
+    },
+    idempotency_key: `${marketId}:${providerPaymentId}:payment_refunded:${
+      payload.refund_id ?? result.event_id
+    }`,
+    correlation_id: payload.order_id ?? paymentId,
+    causation_id: `stripe:webhook:${result.event_id}`,
+    payload: {
+      payment_id: paymentId,
+      order_id: payload.order_id ?? null,
+      provider_id: "stripe",
+      provider_payment_id: providerPaymentId,
+      refund_id: payload.refund_id ?? null,
+      refund_amount_minor: refundAmountMinor,
+      refund_reason: payload.refund_reason ?? envelope.refund_reason ?? "unspecified",
+      currency,
+      revoked_entitlement_ids: result.refundRevocation?.revoked_entitlement_ids ?? [],
+      revoked_entitlement_count:
+        result.refundRevocation?.revoked_entitlement_ids?.length ?? 0,
     },
   }
 }

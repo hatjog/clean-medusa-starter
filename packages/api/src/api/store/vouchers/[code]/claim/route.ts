@@ -77,11 +77,15 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
-/** Clamp-pad: ensure at least RESPONSE_FLOOR_MS has elapsed since `startedAt`. */
+/** v1.9.0 Wave F6 / Epic-2 LOW-04 — pad with ±25ms jitter to disrupt timing
+ * analysis tuning. The constant 200ms floor was discoverable by bisection. */
+const JITTER_MS = 25
 async function padToFloor(startedAt: number): Promise<void> {
   const elapsed = Date.now() - startedAt
-  if (elapsed < RESPONSE_FLOOR_MS) {
-    await delay(RESPONSE_FLOOR_MS - elapsed)
+  const jitter = Math.floor((Math.random() * 2 - 1) * JITTER_MS)
+  const target = RESPONSE_FLOOR_MS + jitter
+  if (elapsed < target) {
+    await delay(target - elapsed)
   }
 }
 
@@ -279,42 +283,14 @@ export async function POST(
     return
   }
 
-  // --- Server-side expiry pre-check ---
-  if (voucherForCheck.expires_at && voucherForCheck.expires_at < new Date()) {
-    await padToFloor(startedAt)
-    _auditLog.push({
-      idempotency_key: idempotencyKey,
-      code,
-      ip,
-      outcome: "expired",
-      occurred_at: new Date().toISOString(),
-    })
-    res.status(410).json({
-      type: "expired",
-      message: "Voucher has expired.",
-    })
-    return
-  }
-
-  // --- Already claimed check ---
-  if (voucherForCheck.status === "claimed") {
-    await padToFloor(startedAt)
-    _auditLog.push({
-      idempotency_key: idempotencyKey,
-      code,
-      ip,
-      outcome: "already_claimed",
-      occurred_at: new Date().toISOString(),
-    })
-    res.status(409).json({
-      type: "already_claimed",
-      message: "Voucher has already been claimed.",
-      state: "claimed",
-    })
-    return
-  }
-
-  // --- State transition: idle → claimed (atomic via voucherService.claim) ---
+  // v1.9.0 Wave F6 HIGH-09 — collapse the unlocked expiry/already-claimed
+  // pre-checks into the locked `voucherService.claim` call. The unlocked
+  // pre-checks here were a TOCTOU oracle: a concurrent claim could flip
+  // `status='claimed'` between the unlocked check and the FOR UPDATE inside
+  // claim(), causing this route to return "already_claimed" with the
+  // pre-check's stale `voucherForCheck` snapshot. claim() now returns
+  // structured `{status, voucher}` from inside the FOR UPDATE transaction;
+  // the route branches on that single source of truth.
   const claimResult = await voucherService.claim(code)
   const claimedAtIso = new Date().toISOString()
 

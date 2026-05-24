@@ -199,7 +199,7 @@ async function resolveEntitlementAuthorityById(
           ) = 'true'
         ) AS requires_age_check
        FROM entitlement_instance ei
-      WHERE ei.id = $1
+      WHERE ei.id = ?
       LIMIT 1`,
     [entitlementId]
   )
@@ -233,7 +233,7 @@ async function resolveEntitlementAuthorityByOrderId(
           false
         ) AS requires_age_check
        FROM entitlement_instance ei
-      WHERE ei.order_id = $1`,
+      WHERE ei.order_id = ?`,
     [orderId]
   )
 
@@ -254,15 +254,24 @@ async function resolveOrderIdByVoucherCode(
   db: Db,
   voucherCode: string
 ): Promise<{ order_id: string | null; market_id: string | null; sales_channel_id: string | null } | null> {
+  // v1.9.0 Wave F6 HIGH-01 / CC-2 #1 — System 1 elimination.
+  //
+  // Replaced cross-DB `gp_core.entitlements JOIN gp_core.markets` lookup with a
+  // single-DB read from Layer 4 (`entitlement_instance` joined on the voucher
+  // projection). `sales_channel_id` is not carried on entitlement_instance; for
+  // BonBeauty MVP every market has exactly one sales channel so the value can
+  // be resolved from the request's ALS market context — we surface NULL here
+  // and let the caller fall back to the ALS resolution path. Pre-F6 the only
+  // consumer that read `sales_channel_id` already coalesced with the ALS
+  // value.
   const result = await db.raw(
     `SELECT
-        ge.order_id,
-        gm.slug AS market_id,
-        gm.sales_channel_id
-       FROM gp_core.entitlements ge
-       JOIN gp_core.markets gm
-         ON gm.id = ge.market_id
-      WHERE ge.voucher_code_normalized = LOWER($1)
+        ei.order_id,
+        ei.market_id
+       FROM entitlement_instance ei
+       JOIN voucher v ON v.code = (ei.policy_snapshot->>'voucher_code')
+      WHERE LOWER(v.code) = LOWER(?)
+      ORDER BY ei.created_at DESC NULLS LAST
       LIMIT 1`,
     [voucherCode]
   )
@@ -277,10 +286,10 @@ async function resolveOrderIdByVoucherCode(
       typeof row.market_id === "string" && row.market_id.trim()
         ? row.market_id.trim()
         : null,
-    sales_channel_id:
-      typeof row.sales_channel_id === "string" && row.sales_channel_id.trim()
-        ? row.sales_channel_id.trim()
-        : null,
+    // F6 / System 1 elimination — sales_channel_id is no longer carried on
+    // the entitlement substrate; consumer falls back to the ALS market
+    // context resolution path (single-channel-per-market posture).
+    sales_channel_id: null,
   }
 }
 
@@ -425,8 +434,8 @@ async function consentStatus(
   const result = await db.raw(
     `SELECT status
        FROM voucher_consent
-      WHERE token_jti = $1
-        AND market_id = $2
+      WHERE token_jti = ?
+        AND market_id = ?
       LIMIT 1`,
     [tokenJti, marketId]
   )
@@ -453,7 +462,7 @@ async function recordConsentAttempt(args: {
         user_agent,
         created_at
       )
-      VALUES ($1, $2, $3, $4, $5::inet, $6, now())`,
+      VALUES (?, ?, ?, ?, ?::inet, ?, now())`,
     [
       args.tokenJti,
       args.recipientId,
@@ -473,8 +482,8 @@ async function countRecentBuyerInitiations(
   const result = await db.raw(
     `SELECT COUNT(*)::int AS attempts
        FROM voucher_consent_attempt
-      WHERE recipient_id = $1
-        AND market_id = $2
+      WHERE recipient_id = ?
+        AND market_id = ?
         AND created_at >= now() - interval '1 hour'`,
     [recipientId, marketId]
   )
@@ -486,7 +495,14 @@ async function verifyCaptchaToken(token: string | null, req: MedusaRequest): Pro
   if (!token) return false
   const secret = process.env.HCAPTCHA_SECRET
   if (!secret) {
-    return process.env.NODE_ENV !== "production" && token.length >= 8
+    // v1.9.0 Wave F6 / Epic-2 MED-16 — fail-closed in any non-test environment.
+    // Previously this returned `true` whenever NODE_ENV !== "production" and
+    // the token was 8+ chars; a staging container with NODE_ENV unset (or
+    // explicitly "staging" / "development") accepted any 8-char captcha
+    // response. Fail-closed posture: only `NODE_ENV === "test"` may bypass the
+    // captcha (unit/integration tests rely on it). Production loader-level
+    // assertion of HCAPTCHA_SECRET presence is a follow-up.
+    return process.env.NODE_ENV === "test" && token.length >= 8
   }
 
   const params = new URLSearchParams()
@@ -538,7 +554,7 @@ async function persistConsent(args: {
         created_at,
         updated_at
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::inet, $12, $13, now(), now())
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?::inet, ?, ?, now(), now())
       ON CONFLICT (market_id, token_jti) DO UPDATE SET
         consent_rodo = EXCLUDED.consent_rodo,
         consent_service_execution = EXCLUDED.consent_service_execution,
@@ -692,22 +708,29 @@ export async function POST(req: MedusaRequest, res: MedusaResponse): Promise<voi
     authority.age_check_required || ageCheckRequired(verification.subject)
   const recipientId = buyerAccountId(verification.subject, verification.token_jti)
 
-  await recordConsentAttempt({
-    db,
-    recipientId,
-    tokenJti: verification.token_jti,
-    market_id: marketContext.market_id,
-    sales_channel_id: marketContext.sales_channel_id,
-    ip_address: resolveIpAddress(req),
-    user_agent: resolveUserAgent(req),
-  })
+  // v1.9.0 Wave F6 HIGH-10/11 — reorder gates to prevent DoS write amplification
+  // and to keep `voucher_consent_attempt` audit signal clean:
+  //   1. Count first (cheap index seek) → 429 BEFORE INSERT.
+  //   2. Short-circuit duplicate-approved BEFORE INSERT.
+  //   3. Validate payload BEFORE INSERT — reject malformed bot bodies with 400.
+  //   4. Only after validation passes do we record the attempt + persist.
+  // The audit table now records only well-formed, post-rate-limit attempts.
+  // F6 MED-15: duplicate-approved still emits an audit breadcrumb so DPIA
+  // forensics can distinguish "user returned to a successful link" from
+  // "first-time consent".
+  //
+  // v1.9.1 Wave G2 — regression-guard tests pinned in
+  // `__tests__/api/store/voucher-consent.unit.spec.ts` (describe block
+  // "HIGH-10/11 write amplifier guard"): 100-request flood asserts zero
+  // INSERTs into `voucher_consent_attempt` for malformed + over-limit
+  // requests. Do not reorder steps 1-4 without updating those tests.
 
   const attempts = await countRecentBuyerInitiations(
     db,
     recipientId,
     marketContext.market_id
   )
-  if (attempts > RATE_LIMIT_MAX_PER_HOUR) {
+  if (attempts >= RATE_LIMIT_MAX_PER_HOUR) {
     res.setHeader("Retry-After", RETRY_AFTER_SECONDS)
     jsonError(res, 429, "RATE_LIMITED")
     return
@@ -719,6 +742,18 @@ export async function POST(req: MedusaRequest, res: MedusaResponse): Promise<voi
     marketContext.market_id
   )
   if (currentStatus === "approved" || currentStatus === "approved_by_guardian") {
+    // F6 MED-15: record a `duplicate_grant` breadcrumb attempt (does NOT
+    // re-run persistConsent) so audit log captures repeated visits to a
+    // successful consent link.
+    await recordConsentAttempt({
+      db,
+      recipientId,
+      tokenJti: verification.token_jti,
+      market_id: marketContext.market_id,
+      sales_channel_id: marketContext.sales_channel_id,
+      ip_address: resolveIpAddress(req),
+      user_agent: resolveUserAgent(req),
+    })
     res.status(200).json({
       status: currentStatus,
       redirect_url: "/voucher",
@@ -741,6 +776,18 @@ export async function POST(req: MedusaRequest, res: MedusaResponse): Promise<voi
     jsonError(res, 400, "CAPTCHA_REQUIRED")
     return
   }
+
+  // F6 HIGH-10/11 — record-after-validation: only well-formed, rate-limit-
+  // honouring attempts populate the audit table.
+  await recordConsentAttempt({
+    db,
+    recipientId,
+    tokenJti: verification.token_jti,
+    market_id: marketContext.market_id,
+    sales_channel_id: marketContext.sales_channel_id,
+    ip_address: resolveIpAddress(req),
+    user_agent: resolveUserAgent(req),
+  })
 
   const status: ConsentStatus = minorPath ? "approved_by_guardian" : "approved"
   await persistConsent({

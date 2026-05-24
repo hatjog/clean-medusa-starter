@@ -285,10 +285,21 @@ describe("VoucherService", () => {
   // (c) Claim already-claimed
   describe("(c) Claim already-claimed — idempotent no-op", () => {
     it("claim on already-claimed voucher returns status=already_claimed", async () => {
+      // v1.9.0 Wave F6 HIGH-09 — state observations now happen inside the
+      // FOR UPDATE transaction. Test stubs mirror the new sequence:
+      //   pool.query: initial getByCode (2 queries) + post-rollback getByCode (2 queries)
+      //   client.query: BEGIN / SELECT FOR UPDATE → claimed / ROLLBACK
       const pool = makeMockPool({
         queryResponses: [
           { rows: [CLAIMED_ROW] },
           { rows: [] },
+          { rows: [CLAIMED_ROW] },
+          { rows: [] },
+        ],
+        clientQueryResponses: [
+          { rows: [] }, // BEGIN
+          { rows: [{ status: "claimed", expires_at: CLAIMED_ROW.expires_at }] }, // SELECT FOR UPDATE
+          { rows: [] }, // ROLLBACK
         ],
       })
       const svc = makeService(pool)
@@ -303,10 +314,19 @@ describe("VoucherService", () => {
   // (d) Claim expired
   describe("(d) Claim expired — returns expired status", () => {
     it("claim on expired voucher returns status=expired", async () => {
+      // v1.9.0 Wave F6 HIGH-09 — expiry check moved INSIDE the FOR UPDATE
+      // transaction so the locked snapshot is the single source of truth.
       const pool = makeMockPool({
         queryResponses: [
           { rows: [EXPIRED_ROW] },
           { rows: [] },
+          { rows: [EXPIRED_ROW] },
+          { rows: [] },
+        ],
+        clientQueryResponses: [
+          { rows: [] }, // BEGIN
+          { rows: [{ status: "idle", expires_at: EXPIRED_ROW.expires_at }] }, // SELECT FOR UPDATE
+          { rows: [] }, // ROLLBACK
         ],
       })
       const svc = makeService(pool)

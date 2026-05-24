@@ -854,16 +854,32 @@ export default class GpCoreService {
   }
 
   /**
-   * adminSearchEntitlements — Operator entitlement lookup (Story 8.1, DD-16, CST-1).
+   * @deprecated v1.9.0 Wave F6 / Epic-2 HIGH-01 + CC-2 #1 — System 1
+   * elimination. Admin entitlement search has migrated to
+   * `VoucherService.adminSearchEntitlements` (Layer 4 / gp_mercur per
+   * ADR-099). This method is preserved as a runtime-rejected stub so any
+   * accidental re-wiring fails loud instead of silently re-querying the
+   * deprecated `gp_core.entitlements` table.
    *
-   * Two query paths:
-   * - Email path (contains "@"): Mercur orders WHERE buyer_email ILIKE → collect order_ids → gp_core entitlements.
-   *   Two separate DB connections — cross-DB FK is impossible (IP-2, DD-16).
-   * - Direct path: ILIKE on voucher_code, exact match on claim_token / order_id.
-   *
-   * Returns full EntitlementAdminView[] with redemption list + audit log.
+   * See:
+   * - `specs/adr/2026-05-24-entitlement-system-1-elimination.md` (proposed)
+   * - `api/v1/admin/entitlements/route.ts` (new System 2 wiring)
+   * - `GP/backend/packages/api/src/modules/voucher/service.ts#adminSearchEntitlements`
    */
-  async adminSearchEntitlements(q: string): Promise<import("@/lib/contracts/admin.js").EntitlementAdminView[]> {
+  async adminSearchEntitlements(
+    _q: string
+  ): Promise<import("@/lib/contracts/admin.js").EntitlementAdminView[]> {
+    throw new NotImplementedError(
+      "gpCore.adminSearchEntitlements is deprecated (ADR-052 + new ADR " +
+        "entitlement-system-1-elimination). Use VoucherService.adminSearchEntitlements."
+    )
+  }
+
+  /**
+   * @internal — preserved for legacy tests that exercise the email-path math.
+   * Production code does NOT reach this method.
+   */
+  async _legacyAdminSearchEntitlementsForTests(q: string): Promise<import("@/lib/contracts/admin.js").EntitlementAdminView[]> {
     const isEmailSearch = q.includes("@")
     const startMs = Date.now()
 

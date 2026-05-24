@@ -11,6 +11,7 @@ import type { MedusaRequest, MedusaResponse } from "@medusajs/framework/http"
 import { ContainerRegistrationKeys } from "@medusajs/framework/utils"
 import type { Knex } from "knex"
 
+import { extractActorIdOrThrow } from "../../../../lib/capability-check"
 import { computeCohortMetrics } from "../../../../lib/cohort-metrics-aggregator"
 import {
   computeSmokeGateState,
@@ -60,9 +61,14 @@ export async function POST(
     return
   }
 
-  const admin_id =
-    (req as unknown as { auth_context?: { actor_id?: string } }).auth_context
-      ?.actor_id ?? "admin"
+  // cc-4 F-01 + F-02: literal "admin" fallback removed; require real admin actor.
+  let admin_id: string
+  try {
+    admin_id = extractActorIdOrThrow(req)
+  } catch {
+    res.status(401).json({ error: "Valid admin session required" })
+    return
+  }
 
   try {
     const row = await ratifyVerdict(db, {

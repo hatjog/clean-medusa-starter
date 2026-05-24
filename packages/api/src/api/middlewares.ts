@@ -778,9 +778,17 @@ export default defineMiddlewares({
       matcher: "/auth/user/emailpass",
       middlewares: [requestLogMetricsMiddleware],
     },
+    // cc-4 F-01: /admin/operator/* GP operator surface MUST mount
+    // authenticate("user") + operatorAuthMiddleware so audit `actor_id` is
+    // always a real Medusa admin user, never the literal "admin" fallback,
+    // and customer/vendor JWTs cannot reach the handlers via cookie collisions.
     {
       matcher: "/admin/operator/*",
-      middlewares: [requestLogMetricsMiddleware],
+      middlewares: [
+        authenticate("user", ["session", "bearer"]),
+        operatorAuthMiddleware,
+        requestLogMetricsMiddleware,
+      ],
     },
     {
       matcher: "/v1/admin/*",

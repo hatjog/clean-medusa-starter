@@ -13,9 +13,11 @@ Related files:
 |-------|--------|------|-----------|------------|--------|
 | **public** | `/v1/health`, `/status`, `/api/v1/entitlements/claim` | None | (future: rate-limit) | Yes (future) | Existing endpoints, no auth required |
 | **storefront** | `/store/*` | Publishable API key | `marketContextMiddleware` → `marketGuardMiddleware` → `customerMarketGuardMiddleware` + route-specific overlays | Yes (future) | Fully implemented — see [MIDDLEWARE_STACK.md](MIDDLEWARE_STACK.md) |
-| **vendor** | `/vendor/*` | Mercur seller auth (`withVendorAuth`) | Native Mercur middleware | No | Native Mercur — no explicit GP middleware needed |
-| **admin** | `/admin/*` | Medusa admin auth | Native Medusa middleware | No | Native Medusa — no explicit GP middleware needed |
-| **operator** | `/api/v1/admin/*` | Medusa admin auth (`withOperatorAuth`) | `operatorAuthMiddleware` (Story 8.1) | No | GP operator API — `actor_type="user"` required; 401/403 fail-closed |
+| **vendor (GP-S2S-HMAC)** | `/vendor/competitive-insights`, `/vendor/training-cert/upload`, `/vendor/vouchers/:code/lookup`, `/vendor/vouchers/:code/redeem` | `withVendorAuth` (HMAC `x-vendor-signature` only; cc-4 F-10 removed the legacy `x-vendor-token` path) | Inline HOF in route handler | No | GP-owned S2S surface — vendor session derived from HMAC; cross-vendor lookups return 404 |
+| **vendor (Mercur-native)** | other `/vendor/*` routes shipped by upstream Mercur | Mercur seller cookie/session | Native Mercur middleware | No | Untouched — upstream contract preserved |
+| **admin (Medusa-native)** | `/admin/*` non-GP routes | Medusa admin auth | Native Medusa middleware | No | Native Medusa — no explicit GP middleware needed |
+| **admin (GP-custom UI)** | `/admin/operator/*`, `/admin/vendors/*` (POST/PATCH/PUT/DELETE), `/admin/entitlements/*` (POST), `/admin/magic-links/*` (POST), `/admin/sellers/:id/pause` | `authenticate("user", ["session","bearer"])` + `operatorAuthMiddleware` | Wired in `middlewares.ts` | No | GP custom operator surface — `actor_type="user"` enforced; cc-4 F-01 wired `operator/*` matcher |
+| **admin (v1 legacy)** | `/api/v1/admin/*` | Medusa admin auth (`withOperatorAuth`) | `operatorAuthMiddleware` (Story 8.1) | No | GP operator API legacy prefix — `actor_type="user"` required; 401/403 fail-closed |
 
 ## Auth Details
 
@@ -31,18 +33,34 @@ Related files:
 - Fail-closed: missing market context → 403
 - Full middleware chain documented in [MIDDLEWARE_STACK.md](MIDDLEWARE_STACK.md)
 
-### Vendor Group
-- Mercur native seller authentication (`withVendorAuth`)
-- GP routes under `/vendor/*`: entitlement verify/redeem
-- Spike-dependent: if Mercur seller auth works for gp_core → use native; otherwise custom auth (DD-25)
-- No explicit middleware in GP `middlewares.ts` — handled by Mercur framework
+### Vendor Group (GP S2S HMAC)
+- `withVendorAuth` HOF (HMAC `x-vendor-signature` only — cc-4 F-10 removed `x-vendor-token` legacy path).
+- GP routes under `/vendor/*`:
+  - `GET  /vendor/competitive-insights`
+  - `POST /vendor/training-cert/upload`
+  - `GET  /vendor/vouchers/:code/lookup` (cc-4 F-05 — Story 8.4 cross-actor handoff)
+  - `POST /vendor/vouchers/:code/redeem` (cc-4 F-05 — Story 8.4 cross-actor handoff)
+- Cross-vendor lookups return 404 (do NOT leak existence) — vendor scope enforced by `voucher.seller_id === req.vendorAuth.seller_id` check.
+- No explicit middleware in GP `middlewares.ts`; the HOF wraps the handler.
+
+### Vendor Group (Mercur-native)
+- Untouched upstream Mercur seller cookie flow.
+- All other `/vendor/*` routes that ship with `@mercurjs/core` follow Mercur's native middleware contract.
 
 ### Admin Group (Medusa native)
-- Medusa native admin authentication
-- Admin panel routes: `/admin/*`
-- No explicit middleware in GP `middlewares.ts` — handled by Medusa framework
+- Medusa native admin authentication.
+- Non-GP `/admin/*` routes.
 
-### Operator Group (GP custom admin API)
+### Admin Group (GP custom UI)
+- GP-owned admin routes consumed by `admin-panel`:
+  - `/admin/operator/*` — cc-4 F-01: now wired with `authenticate("user", ["session","bearer"])` + `operatorAuthMiddleware` + `requestLogMetricsMiddleware`. All operator routes call `extractActorIdOrThrow` (which now also asserts `actor_type === "user"`, cc-4 F-02).
+  - `/admin/vendors/*` (POST/PATCH/PUT/DELETE)
+  - `/admin/entitlements/*` (POST)
+  - `/admin/magic-links/*` (POST)
+  - `/admin/sellers/:id/pause`
+- All bind market context via `resolveAdminMarketContext` (`lib/admin-market-context.ts`, cc-4 F-03) — `x-gp-market-id` is verified server-side against `admin_market_grants` (super-admins bypass via `__super_admin__` capability).
+
+### Operator Group (GP v1 legacy admin API)
 - GP custom admin routes: `/api/v1/admin/*`
 - Middleware: `operatorAuthMiddleware` from `src/middlewares/with-operator-auth.ts`
 - Verifies `req.auth_context.actor_type === "user"` (Medusa admin user)

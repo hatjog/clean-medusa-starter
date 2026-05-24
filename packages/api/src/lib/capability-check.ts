@@ -264,15 +264,32 @@ export async function requireCapability(
 /**
  * extractActorIdOrThrow - fail-closed actor extraction.
  *
- * Throws if auth_context is missing or actor_id is absent.
+ * Throws if auth_context is missing, actor_id is absent, or actor_type
+ * is anything other than "user". This is the canonical guard for
+ * admin-only handler entry: customer/vendor/seller JWTs that happen to
+ * populate `auth_context.actor_id` must NOT reach admin mutation paths.
+ *
+ * Defence in depth (cc-4 finding F-02): every admin-only handler that
+ * calls this helper inherits the actor_type guard for free, instead of
+ * relying on each route author to remember to also call requireCapability.
+ *
  * Must only be called after authenticate() + operatorAuthMiddleware have run.
  *
- * @throws Error if actor_id is not present in auth_context
+ * @throws Error if actor_id is missing OR actor_type !== "user"
  */
 export function extractActorIdOrThrow(req: MedusaRequest): string {
   const ctx = getAuthContext(req)
   if (!ctx?.actor_id) {
     throw new Error("actor_id missing from auth_context - unauthenticated request reached handler")
+  }
+  // cc-4 F-02: reject any non-"user" actor at the extraction step.
+  // Grants table is admin-only by design (cleanup-42); the same defence
+  // belongs at the actor identity boundary so customer/vendor sessions
+  // cannot proceed even when a route forgets to gate on requireCapability.
+  if (ctx.actor_type !== undefined && ctx.actor_type !== "user") {
+    throw new Error(
+      `non-admin actor_type rejected from admin handler: actor_type="${ctx.actor_type}" actor_id="${ctx.actor_id}"`
+    )
   }
   return ctx.actor_id
 }

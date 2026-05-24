@@ -52,6 +52,8 @@ export interface VendorNotificationLogEntry {
     | "nudge_t3"
     | `nudge_${string}`
     | "competitive_insights_query"
+    // cc-4 F-05: vendor-side voucher redeem audit row.
+    | "voucher_redeem"
   sent_at: string // ISO 8601
   locale: "pl" | "en"
   recipient_email: string
