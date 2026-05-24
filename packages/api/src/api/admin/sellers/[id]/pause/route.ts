@@ -41,6 +41,10 @@ import { randomUUID } from "node:crypto"
 
 import { emitFlagPropagationT1, emitFlagPropagationT2 } from "../../../../../lib/instrumentation/flag-propagation"
 import { extractActorIdOrThrow, requireCapability } from "../../../../../lib/capability-check"
+import {
+  readMarketIdHeader,
+  resolveAdminMarketContext,
+} from "../../../../../lib/admin-market-context"
 
 /**
  * Minimum character length for an override reason (AC4).
@@ -90,10 +94,10 @@ type Logger = {
 const extractMarketId = (req: MedusaRequest): string => {
   // Mercur convention: market id is supplied via `X-Gp-Market-Id` header (Step 5
   // Supplement L1721) OR derived from the seller row in the same tx (fallback).
-  const header = req.headers["x-gp-market-id"]
-  if (typeof header === "string" && header.length > 0) return header
-  if (Array.isArray(header) && header[0]) return header[0]
-  return ""
+  // cc-4 F-03: the value is no longer used verbatim — `resolveAdminMarketContext`
+  // verifies the admin holds an `admin_market_grants` row for the requested
+  // market (super-admins bypass) before the tx proceeds.
+  return readMarketIdHeader(req) ?? ""
 }
 
 // @ar45-admin-exclusion: admin seller pause is cross-market by design per AR44
@@ -152,6 +156,18 @@ export async function POST(req: MedusaRequest, res: MedusaResponse): Promise<voi
     return
   }
 
+  // cc-4 F-03: verify the admin holds a grant for the requested market BEFORE
+  // any DB row-lock or audit emission. Without this, an authenticated admin
+  // could supply `x-gp-market-id: <any market>` and have audit rows attributed
+  // to a market they have no operational authority over.
+  const marketGuard = await resolveAdminMarketContext(req)
+  if (!marketGuard.ok) {
+    res.status(marketGuard.status).json({
+      code: marketGuard.code,
+      message: marketGuard.message,
+    })
+    return
+  }
   const marketId = extractMarketId(req)
   const logger = (req.scope.resolve(ContainerRegistrationKeys.LOGGER) as unknown as Logger | undefined) ?? {}
 
@@ -219,6 +235,25 @@ export async function POST(req: MedusaRequest, res: MedusaResponse): Promise<voi
     const sellerRow = sellerRows.rows[0]
     prevStatus = sellerRow.status
     const effectiveMarketId = marketId || sellerRow.market_id
+
+    // cc-4 F-03: if no header was supplied, the intrinsic seller.market_id
+    // still flows into audit — verify the admin has access to THAT market too.
+    // Super-admins bypass; non-super-admins without an admin_market_grants row
+    // for the seller's market are rejected here so cross-market admin actions
+    // cannot be laundered via "let the DB row decide".
+    if (!marketId && effectiveMarketId) {
+      const intrinsicGuard = await resolveAdminMarketContext(req, {
+        intrinsicMarketId: effectiveMarketId,
+      })
+      if (!intrinsicGuard.ok) {
+        await client.query("ROLLBACK")
+        res.status(intrinsicGuard.status).json({
+          code: intrinsicGuard.code,
+          message: intrinsicGuard.message,
+        })
+        return
+      }
+    }
 
     if (prevStatus === "suspended") {
       // Idempotent — abort silently, do not re-emit propagation event.

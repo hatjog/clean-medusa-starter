@@ -1,7 +1,7 @@
 /**
  * Story v160-8-8 — AC4: Test-only flag-toggle endpoint.
  *
- * POST /admin/test/flag-toggle
+ * POST /admin/e2e-flag-toggle
  *   Body: { to_state: 'off' | 'shadow' | 'on' }
  *   Headers: X-Test-Mode: true (required)
  *
@@ -59,7 +59,7 @@ export async function POST(
     res.status(403).json({
       error: "test_endpoint_disabled",
       detail:
-        "POST /admin/test/flag-toggle requires ALLOW_TEST_ENDPOINTS=true and NODE_ENV !== 'production'. " +
+        "POST /admin/e2e-flag-toggle requires ALLOW_TEST_ENDPOINTS=true and NODE_ENV !== 'production'. " +
         "Use POST /admin/operator/flag-flip for production flag transitions.",
     })
     return
@@ -134,7 +134,7 @@ export async function POST(
 }
 
 /**
- * GET /admin/test/flag-toggle — read current state (test convenience).
+ * GET /admin/e2e-flag-toggle — read current state (test convenience).
  * Same guards as POST.
  */
 export async function GET(

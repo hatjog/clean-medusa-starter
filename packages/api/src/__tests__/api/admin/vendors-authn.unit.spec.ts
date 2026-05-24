@@ -529,8 +529,12 @@ describe("admin vendors AuthN — fail-closed extractActorIdOrThrow", () => {
     expect(sellerModuleService.update).not.toHaveBeenCalled()
   })
 
-  // AC5 test 3 — 403 non-admin (lifecycle override capability denied for seller token)
-  it("POST lifecycle-status with override=true → 403 for seller actor_type", async () => {
+  // AC5 test 3 — 401 non-admin (cc-4 F-02 strengthened extractActorIdOrThrow;
+  // non-"user" actor_types are rejected at the extraction step BEFORE
+  // requireCapability runs, so the verdict is 401 UNAUTHORIZED rather than
+  // 403 capability denied. Either outcome closes the security gap; the
+  // earlier rejection avoids leaking capability-key existence to non-admins.
+  it("POST lifecycle-status with override=true → 401 for seller actor_type", async () => {
     const req = createReq({
       authContext: { actor_id: "seller_abc", actor_type: "seller" },
       body: { to_status: "open", override: true },
@@ -539,8 +543,8 @@ describe("admin vendors AuthN — fail-closed extractActorIdOrThrow", () => {
 
     await lifecycleStatusPOST(req, res as any)
 
-    expect(res.statusCode).toBe(403)
-    expect(res.body).toMatchObject({ error: expect.stringContaining("capability") })
+    expect(res.statusCode).toBe(401)
+    expect(res.body).toMatchObject({ error: expect.stringContaining("Valid admin session") })
   })
 
   // AC5 test 4 — 200 admin happy path (lifecycle-status transition by valid admin)
@@ -655,8 +659,11 @@ describe("admin vendors AuthN — fail-closed extractActorIdOrThrow", () => {
     expect(res.body).toMatchObject({ error: expect.stringContaining("current_metadata") })
   })
 
-  // AC5 test 6 — 403 override=true rejected for customer actor_type (non-admin)
-  it("POST lifecycle-status override=true → 403 for customer actor_type", async () => {
+  // AC5 test 6 — 401 customer actor_type rejected at extraction (cc-4 F-02).
+  // Pre-F-02 the route returned 403 with capability message; the strengthened
+  // extractActorIdOrThrow now rejects non-"user" actor_types BEFORE the
+  // capability lookup, fail-closing earlier.
+  it("POST lifecycle-status override=true → 401 for customer actor_type", async () => {
     const req = createReq({
       authContext: { actor_id: "cust_xyz", actor_type: "customer" },
       body: { to_status: "terminated", override: true },
@@ -665,8 +672,8 @@ describe("admin vendors AuthN — fail-closed extractActorIdOrThrow", () => {
 
     await lifecycleStatusPOST(req, res as any)
 
-    expect(res.statusCode).toBe(403)
-    expect(res.body).toMatchObject({ error: expect.stringContaining("capability") })
+    expect(res.statusCode).toBe(401)
+    expect(res.body).toMatchObject({ error: expect.stringContaining("Valid admin session") })
   })
 
   // AC5 test 7 — 200 override=true accepted for admin + alert emitted

@@ -8,6 +8,7 @@ import type { MedusaRequest, MedusaResponse } from "@medusajs/framework/http"
 import { ContainerRegistrationKeys } from "@medusajs/framework/utils"
 import type { Knex } from "knex"
 
+import { extractActorIdOrThrow } from "../../../../lib/capability-check"
 import {
   ALLOWED_TRANSITIONS,
   getAuditTrail,
@@ -48,9 +49,16 @@ export async function POST(
     res.status(400).json({ error: "to_state required" })
     return
   }
-  const triggered_by =
-    (req as unknown as { auth_context?: { actor_id?: string } }).auth_context
-      ?.actor_id ?? "admin"
+  // cc-4 F-01 + F-02: actor MUST be an authenticated admin (actor_type=user).
+  // Literal "admin" fallback removed — audit attribution now always points
+  // to a real user identity.
+  let triggered_by: string
+  try {
+    triggered_by = extractActorIdOrThrow(req)
+  } catch {
+    res.status(401).json({ error: "Valid admin session required" })
+    return
+  }
   const db = req.scope.resolve(ContainerRegistrationKeys.PG_CONNECTION) as Knex
   try {
     const result = await setState(body.to_state, {
