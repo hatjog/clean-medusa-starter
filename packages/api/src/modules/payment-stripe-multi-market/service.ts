@@ -156,15 +156,21 @@ function withResolverGate<TBase extends new (...args: any[]) => any>(
   Base: TBase,
   defaultMarketId: MarketId
 ) {
+  // TypeScript mixin classes require `constructor(...args: any[])` —
+  // we interpret args[0] as the Awilix cradle and args[1] as our
+  // StripeMultiMarketOptions, then pass the transformed upstream options
+  // to the base class.
   abstract class StripeMultiMarketMixin extends Base {
     private __cradle: MaybeSecretsCradle
     private __marketId: MarketId
     private __wrapperOptions: StripeMultiMarketOptions
 
-    constructor(cradle: MaybeSecretsCradle, options: StripeMultiMarketOptions) {
-      super(cradle, buildUpstreamOptions(options) as any)
-      this.__cradle = cradle ?? {}
-      this.__wrapperOptions = options ?? {}
+    constructor(...args: any[]) {
+      const cradle = (args[0] ?? {}) as MaybeSecretsCradle
+      const options = (args[1] ?? {}) as StripeMultiMarketOptions
+      super(cradle, buildUpstreamOptions(options))
+      this.__cradle = cradle
+      this.__wrapperOptions = options
       this.__marketId = (options?.marketId ?? defaultMarketId) as MarketId
       // If legacy explicit-keys mode is on, mark resolved immediately so
       // ensureResolved() short-circuits (test fixture path).
