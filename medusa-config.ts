@@ -57,7 +57,22 @@ module.exports = withMercur({
       options: {
         providers: [
           {
+<<<<<<< HEAD
             resolve: "@medusajs/payment-stripe",
+=======
+            // v1.9.1 wg7 F-CC1-001 fix: switch from bare @medusajs/payment-stripe
+            // to the GP wrapper that routes apiKey/webhookSecret resolution
+            // through SecretsAdapter + createMarketStripeResolver. The wrapper
+            // re-exports StripeProviderService/BlikService/Przelewy24Service
+            // with a lazy-init constructor that exercises the per-market gate
+            // (STRIPE_ENABLED_MARKETS) and the env-var contract before any
+            // Stripe SDK init. v1.9.x BonBeauty-only; v1.10.0+ extends to
+            // per-request market resolution via cart.metadata.market_id
+            // (ra-CC1-001 carry-out from ADR-100 amendment 2026-05-24).
+            // See: GP/backend/packages/api/src/modules/payment-stripe-multi-market/
+            //      specs/adr/2026-05-14-adr-100-stripe-provider-per-market-resolver.md
+            resolve: moduleRoot("payment-stripe-multi-market"),
+>>>>>>> fix/v191-wg7-stripe-resolver-wiring
             // v1.9.0 wf5 F-CC1-008 / H-5 fix: pin explicit `id: "stripe"` so
             // the runtime provider key is `pp_stripe` (Medusa convention:
             // `pp_<id>`) and matches `GP/config/gp-dev/markets/bonbeauty/
@@ -67,8 +82,11 @@ module.exports = withMercur({
             // Pinning here makes the single canonical id literal `pp_stripe`.
             id: "stripe",
             options: {
-              apiKey: process.env.STRIPE_SECRET_KEY_BONBEAUTY,
-              webhookSecret: process.env.STRIPE_WEBHOOK_KEY_BONBEAUTY,
+              // marketId omitted → defaults to "bonbeauty" (v1.9.x BonBeauty-
+              // only scope). v1.10.0+ multi-market activation will either pin
+              // per-provider here OR override per-request inside the wrapper.
+              // apiKey + webhookSecret are intentionally NOT read here — the
+              // wrapper resolves them via SecretsAdapter at first method call.
               capture: true,
             },
           },
