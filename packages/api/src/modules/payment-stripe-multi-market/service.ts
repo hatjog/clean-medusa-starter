@@ -145,6 +145,14 @@ function buildUpstreamOptions(
   }
 }
 
+function validateStripeMultiMarketOptions(
+  options: unknown = {}
+): void {
+  StripeProviderService.validateOptions(
+    buildUpstreamOptions((options ?? {}) as StripeMultiMarketOptions)
+  )
+}
+
 /**
  * Mixin that overrides every async method on the upstream class to first
  * `await ensureResolved(...)` before delegating. Implemented as a manual
@@ -272,18 +280,27 @@ class GpStripeProviderService extends withResolverGate(
   DEFAULT_MARKET_ID
 ) {
   static identifier = STRIPE_PROVIDER_IDENTIFIER
+  static validateOptions(options?: unknown): void {
+    validateStripeMultiMarketOptions(options)
+  }
 }
 class GpStripeBlikService extends withResolverGate(
   StripeBlikService,
   DEFAULT_MARKET_ID
 ) {
   static identifier = BLIK_PROVIDER_IDENTIFIER
+  static validateOptions(options?: unknown): void {
+    validateStripeMultiMarketOptions(options)
+  }
 }
 class GpStripePrzelewy24Service extends withResolverGate(
   StripePrzelewy24Service,
   DEFAULT_MARKET_ID
 ) {
   static identifier = P24_PROVIDER_IDENTIFIER
+  static validateOptions(options?: unknown): void {
+    validateStripeMultiMarketOptions(options)
+  }
 }
 
 export {

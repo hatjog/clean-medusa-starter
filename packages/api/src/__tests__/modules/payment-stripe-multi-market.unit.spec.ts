@@ -23,6 +23,9 @@ import {
   SENTINEL_KEY,
   SENTINEL_WEBHOOK_SECRET,
   ensureResolved,
+  GpStripeProviderService,
+  GpStripeBlikService,
+  GpStripePrzelewy24Service,
 } from "../../modules/payment-stripe-multi-market/service"
 import {
   resolveSecretsAdapter,
@@ -71,6 +74,19 @@ describe("buildUpstreamOptions — placeholder shape", () => {
     })
     expect(upstream.apiKey).toBe(SENTINEL_KEY)
     expect(upstream.webhookSecret).toBe(SENTINEL_WEBHOOK_SECRET)
+  })
+})
+
+describe("provider validateOptions — Medusa loader preflight", () => {
+  it.each([
+    ["stripe", GpStripeProviderService],
+    ["blik", GpStripeBlikService],
+    ["przelewy24", GpStripePrzelewy24Service],
+  ])("%s accepts resolver-backed options without raw apiKey", (_name, Service) => {
+    // moduleProviderLoader calls Service.validateOptions(provider.options)
+    // before constructing the service. The wrapper must therefore apply
+    // the same sentinel transformation used by the constructor.
+    expect(() => Service.validateOptions({ capture: true })).not.toThrow()
   })
 })
 
