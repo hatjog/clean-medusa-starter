@@ -1,6 +1,7 @@
 import type { MedusaRequest, MedusaResponse } from "@medusajs/framework/http"
 
 import { extractActorIdOrThrow } from "../../../../../lib/capability-check"
+import { resolveAdminMarketContext } from "../../../../../lib/admin-market-context"
 import {
   EntitlementNotFoundError,
   LostCodeReissueChainError,
@@ -13,13 +14,6 @@ type ReissueBody = {
   reason?: unknown
   reason_code?: unknown
   idempotency_key?: unknown
-}
-
-function marketIdFromHeader(req: MedusaRequest): string | null {
-  const header = req.headers["x-gp-market-id"]
-  if (typeof header === "string" && header.trim()) return header.trim()
-  if (Array.isArray(header) && header[0]?.trim()) return header[0].trim()
-  return null
 }
 
 export async function POST(
@@ -65,6 +59,18 @@ export async function POST(
     return
   }
 
+  // cc-4 F-03: market_id MUST come from the server-side admin context (header
+  // is allowed only when the actor holds the matching admin_market_grants
+  // row, OR is a super-admin). The raw header is no longer trusted verbatim.
+  const marketResult = await resolveAdminMarketContext(req)
+  if (!marketResult.ok) {
+    res.status(marketResult.status).json({
+      code: marketResult.code,
+      message: marketResult.message,
+    })
+    return
+  }
+
   let workflow
   try {
     workflow = createReissueLostCodeWorkflowFromScope(
@@ -85,7 +91,7 @@ export async function POST(
       reason_code: reasonCode,
       admin_user_id: adminUserId,
       idempotency_key: idempotencyKey,
-      market_id: marketIdFromHeader(req),
+      market_id: marketResult.market_id,
     })
 
     res.status(200).json({

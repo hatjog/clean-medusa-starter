@@ -13,7 +13,7 @@ import {
   getSellerById,
   readSellerGpMetadata,
 } from "../../../../../lib/vendor-decision-store"
-import { marketContextStorage } from "../../../../../lib/market-context"
+import { resolveAdminMarketContext } from "../../../../../lib/admin-market-context"
 
 type PauseGateDetailResponse = {
   vendor: {
@@ -39,7 +39,6 @@ export async function GET(
     res.status(401).json({ error: "Valid admin session required" })
     return
   }
-  const marketContext = marketContextStorage.getStore()
 
   const id = (req.params as { id?: string }).id
   if (!id) {
@@ -56,11 +55,26 @@ export async function GET(
     res.status(404).json({ error: `Vendor ${id} was not found` })
     return
   }
+
+  // cc-4 F-04: previous version read marketContextStorage.getStore() which
+  // is always undefined on /admin/* routes (the ALS is only populated by the
+  // /store/* middleware chain). The cross-market guard therefore never fired,
+  // and Story 8.4 AC2(d) "admin context-switch leak" was structurally
+  // unreachable. Replace with the admin-side market resolver: derive the
+  // admin's requested market and 404 on cross-market vendor lookups.
   const sellerMarketId = readSellerGpMetadata(seller).market_id
+  const adminMarket = await resolveAdminMarketContext(req)
+  if (!adminMarket.ok) {
+    res.status(adminMarket.status).json({ error: adminMarket.message })
+    return
+  }
+  // super-admins can read any market; otherwise enforce strict match.
   if (
-    marketContext?.market_id &&
+    !adminMarket.is_super_admin &&
     typeof sellerMarketId === "string" &&
-    sellerMarketId !== marketContext.market_id
+    sellerMarketId.length > 0 &&
+    adminMarket.market_id &&
+    sellerMarketId !== adminMarket.market_id
   ) {
     res.status(404).json({ error: `Vendor ${id} was not found` })
     return

@@ -2,10 +2,12 @@
  * withVendorAuth — Higher-Order Function for vendor authentication (DD-25).
  *
  * Decision: Extend Mercur seller auth (token-based federation per ADR-034).
- * - Enforced mode: `x-vendor-signature` header — HMAC-SHA256 signed payload
- * - Legacy transition mode: `x-vendor-token` header (VENDOR_HMAC_ENFORCED=false only)
+ * - Enforced mode (the only supported mode since cc-4 F-10): `x-vendor-signature`
+ *   header — HMAC-SHA256 signed payload.
  * - Flow: verify signature -> seller_id -> resolveVendorId(seller_id) -> vendor_id -> inject
  * - Fallback: graceful HTTP 501 when resolveVendorId is stub (NotImplementedError)
+ * - VENDOR_HMAC_ENFORCED=false: returns 503 (config error), never accepts
+ *   `x-vendor-token` as a seller_id substitute.
  *
  * v1.6.0 HMAC design notes (story: cleanup-48):
  *   - Single shared secret (VENDOR_HMAC_SECRET env var) — simplest viable for
@@ -22,8 +24,17 @@
  * - DD-25: Vendor auth decision — extend Mercur seller auth
  * - cleanup-48: This story — full HMAC validation implementation (TF-111 P0)
  *
- * TODO(v1.7.0): Remove VENDOR_HMAC_ENFORCED flag + legacy x-vendor-token path.
- * TODO(v1.7.0): Replace shared VENDOR_HMAC_SECRET with per-vendor secret store (ADR follow-up).
+ * cc-4 finding F-10 (v1.9.0): legacy `x-vendor-token` branch DELETED.
+ *   - The path previously accepted any string as `seller_id` with NO
+ *     signature verification when `VENDOR_HMAC_ENFORCED=false`.
+ *   - That allowed arbitrary vendor impersonation; the flag was marked
+ *     for removal in v1.7.0 cleanup notes and is now overdue (v1.9.0+).
+ *   - Setting `VENDOR_HMAC_ENFORCED=false` now FAILS CLOSED — the route
+ *     returns a 503 telling operators the legacy path is gone.
+ *   - The shared secret resolver (`vendor-hmac-config.ts`) still throws
+ *     on missing `VENDOR_HMAC_SECRET`, so a missing env var is still a
+ *     readable fatal at request time.
+ * TODO(v1.10.0+): Replace shared VENDOR_HMAC_SECRET with per-vendor secret store (ADR follow-up).
  *
  * @module vendor-auth
  */
@@ -44,7 +55,6 @@ import {
 } from "./vendor-hmac"
 import { resolveVendorHmacConfig } from "./vendor-hmac-config"
 
-const VENDOR_TOKEN_HEADER = "x-vendor-token"
 const VENDOR_SIGNATURE_HEADER = "x-vendor-signature"
 
 export type VendorAuthContext = {
@@ -111,61 +121,51 @@ function resolveSellerFromRequest(
     }
   }
 
-  if (config.enforced) {
-    // --- Enforced HMAC mode ---
-    const sigHeader = req.headers[VENDOR_SIGNATURE_HEADER]
-    const sigValue = Array.isArray(sigHeader) ? sigHeader[0] : sigHeader
-
-    const result = verifyVendorSignature(
-      sigValue,
-      config.secret,
-      Math.floor(Date.now() / 1000),
-      config.driftSeconds,
-      getSharedLru()
+  // cc-4 F-10: `VENDOR_HMAC_ENFORCED=false` is no longer honoured. The
+  // legacy `x-vendor-token` branch was deleted; the env var is left in
+  // place so misconfigured environments get a readable 503 instead of
+  // accepting unauthenticated seller_id impersonation.
+  if (!config.enforced) {
+    logger.error?.(
+      "[vendor-auth] VENDOR_HMAC_ENFORCED=false is no longer supported (cc-4 F-10). " +
+        "Remove the env var or set VENDOR_HMAC_ENFORCED=true and provide VENDOR_HMAC_SECRET."
     )
-
-    if (!result.ok) {
-      const messages: Record<string, string> = {
-        [VENDOR_AUTH_SIGNATURE_MISSING]: "Missing vendor signature header (x-vendor-signature)",
-        [VENDOR_AUTH_SIGNATURE_INVALID]: "Invalid vendor signature",
-        [VENDOR_AUTH_TIMESTAMP_EXPIRED]: "Vendor signature timestamp expired",
-        [VENDOR_AUTH_REPLAY_DETECTED]: "Vendor signature replay detected",
-      }
-      return {
-        ok: false,
-        status: 401,
-        code: result.code,
-        message: messages[result.code] ?? "Vendor authentication failed",
-      }
+    return {
+      ok: false,
+      status: 503,
+      code: "VENDOR_AUTH_CONFIG_ERROR",
+      message: "Vendor HMAC enforcement is required (legacy x-vendor-token path removed)",
     }
-
-    return { ok: true, sellerId: result.sellerId }
-  } else {
-    // --- Legacy transition window (VENDOR_HMAC_ENFORCED=false) ---
-    // TODO(v1.7.0): Remove this branch + VENDOR_HMAC_ENFORCED flag.
-    const vendorToken = req.headers[VENDOR_TOKEN_HEADER]
-    const tokenValue = Array.isArray(vendorToken) ? vendorToken[0] : vendorToken
-
-    if (!tokenValue) {
-      return {
-        ok: false,
-        status: 401,
-        code: "VENDOR_AUTH_SIGNATURE_MISSING",
-        message: "Missing vendor authentication (legacy x-vendor-token also absent)",
-      }
-    }
-
-    // Treat token as seller_id directly (legacy contract — insecure, transition only)
-    logger.warn?.(
-      JSON.stringify({
-        event: "vendor-auth.legacy-accept",
-        seller_id: tokenValue,
-        transition_window: true,
-      })
-    )
-
-    return { ok: true, sellerId: tokenValue }
   }
+
+  // --- Enforced HMAC mode ---
+  const sigHeader = req.headers[VENDOR_SIGNATURE_HEADER]
+  const sigValue = Array.isArray(sigHeader) ? sigHeader[0] : sigHeader
+
+  const result = verifyVendorSignature(
+    sigValue,
+    config.secret,
+    Math.floor(Date.now() / 1000),
+    config.driftSeconds,
+    getSharedLru()
+  )
+
+  if (!result.ok) {
+    const messages: Record<string, string> = {
+      [VENDOR_AUTH_SIGNATURE_MISSING]: "Missing vendor signature header (x-vendor-signature)",
+      [VENDOR_AUTH_SIGNATURE_INVALID]: "Invalid vendor signature",
+      [VENDOR_AUTH_TIMESTAMP_EXPIRED]: "Vendor signature timestamp expired",
+      [VENDOR_AUTH_REPLAY_DETECTED]: "Vendor signature replay detected",
+    }
+    return {
+      ok: false,
+      status: 401,
+      code: result.code,
+      message: messages[result.code] ?? "Vendor authentication failed",
+    }
+  }
+
+  return { ok: true, sellerId: result.sellerId }
 }
 
 /**

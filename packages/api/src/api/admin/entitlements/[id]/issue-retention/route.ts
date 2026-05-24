@@ -1,6 +1,7 @@
 import type { MedusaRequest, MedusaResponse } from "@medusajs/framework/http"
 
 import { extractActorIdOrThrow } from "../../../../../lib/capability-check"
+import { resolveAdminMarketContext } from "../../../../../lib/admin-market-context"
 import {
   EntitlementTransitionError,
   RetentionAmountBoundaryError,
@@ -13,13 +14,6 @@ type IssueRetentionBody = {
   reason?: unknown
   reason_code?: unknown
   retention_voucher_template_id?: unknown
-}
-
-function marketIdFromHeader(req: MedusaRequest): string | null {
-  const header = req.headers["x-gp-market-id"]
-  if (typeof header === "string" && header.trim()) return header.trim()
-  if (Array.isArray(header) && header[0]?.trim()) return header[0].trim()
-  return null
 }
 
 export async function POST(
@@ -79,6 +73,16 @@ export async function POST(
     return
   }
 
+  // cc-4 F-03: bind market_id server-side via admin_market_grants check.
+  const marketResult = await resolveAdminMarketContext(req)
+  if (!marketResult.ok) {
+    res.status(marketResult.status).json({
+      code: marketResult.code,
+      message: marketResult.message,
+    })
+    return
+  }
+
   let workflow
   try {
     workflow = createIssueRetentionWorkflowFromScope(
@@ -100,7 +104,7 @@ export async function POST(
       reason_code: reasonCode,
       retention_voucher_template_id: retentionVoucherTemplateId,
       admin_user_id: adminUserId,
-      market_id: marketIdFromHeader(req),
+      market_id: marketResult.market_id,
     })
 
     res.status(200).json({

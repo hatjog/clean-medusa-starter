@@ -7,6 +7,7 @@
  */
 
 import type { MedusaRequest, MedusaResponse } from "@medusajs/framework/http"
+import { extractActorIdOrThrow } from "../../../../lib/capability-check"
 import {
   verifyGate,
   verifyAllGates,
@@ -56,9 +57,14 @@ export async function POST(
   res: MedusaResponse,
 ): Promise<void> {
   const body = (req.body ?? {}) as { gate?: SecurityGate }
-  const actorId =
-    (req as unknown as { auth_context?: { actor_id?: string } }).auth_context
-      ?.actor_id ?? "admin"
+  // cc-4 F-01 + F-02: literal "admin" fallback removed; require real admin actor.
+  let actorId: string
+  try {
+    actorId = extractActorIdOrThrow(req)
+  } catch {
+    res.status(401).json({ error: "Valid admin session required" })
+    return
+  }
 
   if (body.gate) {
     const existing = _cache ?? (await verifyAllGates())
