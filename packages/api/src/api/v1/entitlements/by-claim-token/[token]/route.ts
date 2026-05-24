@@ -178,6 +178,11 @@ export async function GET(req: MedusaRequest, res: MedusaResponse): Promise<void
   // claim_token lives ONLY on entitlement_instance after migration
   // 1778926200000_add_claim_token_to_entitlement_instance.ts. The voucher join
   // (LEFT) backfills product_title / seller_handle for the rendering layer.
+  //
+  // SB-4 NOTE (v1.9.0): Knex `db.raw()` accepts `?` (positional) or `:name`
+  // (named) bindings only — PostgreSQL `$N` placeholders trigger
+  // `Expected N bindings, saw 0`. Use `?` here and across all
+  // PG_CONNECTION-backed API routes.
   const result = await db.raw(
     `SELECT ei.id,
             ei.state,
@@ -191,7 +196,7 @@ export async function GET(req: MedusaRequest, res: MedusaResponse): Promise<void
             v.currency_code AS currency
        FROM entitlement_instance ei
        LEFT JOIN voucher v ON v.code = (ei.policy_snapshot->>'voucher_code')
-      WHERE ei.claim_token = $1::uuid
+      WHERE ei.claim_token = ?::uuid
       LIMIT 1`,
     [token]
   )

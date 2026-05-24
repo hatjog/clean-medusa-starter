@@ -199,7 +199,7 @@ async function resolveEntitlementAuthorityById(
           ) = 'true'
         ) AS requires_age_check
        FROM entitlement_instance ei
-      WHERE ei.id = $1
+      WHERE ei.id = ?
       LIMIT 1`,
     [entitlementId]
   )
@@ -233,7 +233,7 @@ async function resolveEntitlementAuthorityByOrderId(
           false
         ) AS requires_age_check
        FROM entitlement_instance ei
-      WHERE ei.order_id = $1`,
+      WHERE ei.order_id = ?`,
     [orderId]
   )
 
@@ -270,7 +270,7 @@ async function resolveOrderIdByVoucherCode(
         ei.market_id
        FROM entitlement_instance ei
        JOIN voucher v ON v.code = (ei.policy_snapshot->>'voucher_code')
-      WHERE LOWER(v.code) = LOWER($1)
+      WHERE LOWER(v.code) = LOWER(?)
       ORDER BY ei.created_at DESC NULLS LAST
       LIMIT 1`,
     [voucherCode]
@@ -434,8 +434,8 @@ async function consentStatus(
   const result = await db.raw(
     `SELECT status
        FROM voucher_consent
-      WHERE token_jti = $1
-        AND market_id = $2
+      WHERE token_jti = ?
+        AND market_id = ?
       LIMIT 1`,
     [tokenJti, marketId]
   )
@@ -462,7 +462,7 @@ async function recordConsentAttempt(args: {
         user_agent,
         created_at
       )
-      VALUES ($1, $2, $3, $4, $5::inet, $6, now())`,
+      VALUES (?, ?, ?, ?, ?::inet, ?, now())`,
     [
       args.tokenJti,
       args.recipientId,
@@ -482,8 +482,8 @@ async function countRecentBuyerInitiations(
   const result = await db.raw(
     `SELECT COUNT(*)::int AS attempts
        FROM voucher_consent_attempt
-      WHERE recipient_id = $1
-        AND market_id = $2
+      WHERE recipient_id = ?
+        AND market_id = ?
         AND created_at >= now() - interval '1 hour'`,
     [recipientId, marketId]
   )
@@ -554,7 +554,7 @@ async function persistConsent(args: {
         created_at,
         updated_at
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::inet, $12, $13, now(), now())
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?::inet, ?, ?, now(), now())
       ON CONFLICT (market_id, token_jti) DO UPDATE SET
         consent_rodo = EXCLUDED.consent_rodo,
         consent_service_execution = EXCLUDED.consent_service_execution,

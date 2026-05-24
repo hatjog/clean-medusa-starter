@@ -361,7 +361,7 @@ async function lookupEntitlementByClaimToken(
       ei.policy_snapshot->>'buyer_email' AS buyer_email
     FROM entitlement_instance ei
     LEFT JOIN voucher v ON v.code = (ei.policy_snapshot->>'voucher_code')
-    WHERE ei.claim_token = $1::uuid
+    WHERE ei.claim_token = ?::uuid
       AND ei.claim_token_revoked_at IS NULL
     ORDER BY ei.created_at DESC NULLS LAST
     LIMIT 1
