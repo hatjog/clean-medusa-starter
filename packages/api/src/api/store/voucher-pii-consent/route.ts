@@ -328,19 +328,42 @@ async function lookupEntitlementByClaimToken(
   db: { raw: (sql: string, params?: unknown[]) => Promise<unknown> },
   token: string
 ): Promise<EntitlementConsentSnapshot | null> {
-  // Review F11: explicit ORDER BY makes the LIMIT 1 deterministic even if the
-  // UNIQUE invariant on claim_token is violated (tombstones, replication
-  // anomalies). Newest row wins.
+  // v1.9.0 Wave F6 HIGH-01 / CC-2 #1 — System 1 elimination.
+  //
+  // The legacy implementation read from `gp_core.entitlements` (ADR-052
+  // deprecated System 1) and ignored the Layer 4 substrate where Stripe Path Y
+  // actually writes. Result: a voucher issued by the live capture path was
+  // invisible to this consent lookup, so every recipient hitting the consent
+  // surface for a freshly-issued voucher fell through to the legacy table —
+  // empty — and got `404` even though the entitlement existed.
+  //
+  // Post-F6 we read from `entitlement_instance` (Layer 4 / gp_mercur), join
+  // the `voucher` projection for buyer-email surfacing, and resolve
+  // `buyer_is_recipient` from policy_snapshot. Migration
+  // `1778926200000_add_claim_token_to_entitlement_instance.ts` populates the
+  // column at issue-time. Legacy rows (pre-F6) carry NULL claim_token and are
+  // not reachable through this path — apps/web claim flow has been migrated
+  // accordingly (System 1 read-paths are now stubs).
+  //
+  // Review F11 (preserved): explicit ORDER BY makes the LIMIT 1 deterministic
+  // even if the UNIQUE invariant on claim_token is somehow violated. Newest
+  // row wins.
   const sql = `
     SELECT
-      entitlement_id::text AS entitlement_id,
-      market_id::text AS market_id,
-      order_id::text AS order_id,
-      buyer_email::text AS buyer_email,
-      COALESCE(buyer_is_recipient, false) AS buyer_is_recipient
-    FROM gp_core.entitlements
-    WHERE claim_token::text = $1
-    ORDER BY created_at DESC NULLS LAST
+      ei.id::text AS entitlement_id,
+      ei.market_id::text AS market_id,
+      ei.order_id::text AS order_id,
+      v.seller_handle AS buyer_email_hint,
+      COALESCE(
+        (ei.policy_snapshot->>'buyer_is_recipient')::boolean,
+        false
+      ) AS buyer_is_recipient,
+      ei.policy_snapshot->>'buyer_email' AS buyer_email
+    FROM entitlement_instance ei
+    LEFT JOIN voucher v ON v.code = (ei.policy_snapshot->>'voucher_code')
+    WHERE ei.claim_token = $1::uuid
+      AND ei.claim_token_revoked_at IS NULL
+    ORDER BY ei.created_at DESC NULLS LAST
     LIMIT 1
   `;
   const result = await db.raw(sql, [token]);
@@ -349,7 +372,9 @@ async function lookupEntitlementByClaimToken(
     : Array.isArray(result)
       ? (result as unknown[])
       : [];
-  const row = rows[0] as Partial<EntitlementConsentSnapshot> | undefined;
+  const row = rows[0] as
+    | (Partial<EntitlementConsentSnapshot> & { buyer_email_hint?: string | null })
+    | undefined;
   if (
     !row?.entitlement_id ||
     !row.market_id ||
@@ -357,11 +382,12 @@ async function lookupEntitlementByClaimToken(
   ) {
     return null;
   }
+  const buyerEmail = row.buyer_email ?? row.buyer_email_hint ?? null;
   return {
     entitlement_id: String(row.entitlement_id),
     market_id: String(row.market_id),
     order_id: String(row.order_id),
-    buyer_email: row.buyer_email == null ? null : String(row.buyer_email),
+    buyer_email: buyerEmail == null ? null : String(buyerEmail),
     buyer_is_recipient: Boolean(row.buyer_is_recipient),
   };
 }

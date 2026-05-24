@@ -43,13 +43,23 @@ function makeMockVoucherService(defaults?: {
   voucher?: VoucherWithEvents | null
 }): MockVoucherService {
   const voucher = defaults?.voucher ?? null
+  // v1.9.0 Wave F6 HIGH-09 — the route no longer pre-checks expiry/claimed
+  // outside the lock; the `claim()` mock must therefore reflect the
+  // voucher's own status / expiry so the route gets the same structured
+  // result it used to derive from the pre-check.
+  let claimResult: unknown
+  if (!voucher) {
+    claimResult = { status: "not_found", voucher: null }
+  } else if (voucher.status === "claimed") {
+    claimResult = { status: "already_claimed", voucher }
+  } else if (voucher.expires_at && voucher.expires_at < new Date()) {
+    claimResult = { status: "expired", voucher }
+  } else {
+    claimResult = { status: "claimed", voucher: { ...voucher, status: "claimed" } }
+  }
   return {
     getByCode: jest.fn().mockResolvedValue(voucher),
-    claim: jest.fn().mockResolvedValue(
-      voucher
-        ? { status: "claimed", voucher: { ...voucher, status: "claimed" } }
-        : { status: "not_found", voucher: null }
-    ),
+    claim: jest.fn().mockResolvedValue(claimResult),
   }
 }
 

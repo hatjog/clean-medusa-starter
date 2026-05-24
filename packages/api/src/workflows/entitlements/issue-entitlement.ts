@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto"
+import { createHash, randomUUID } from "node:crypto"
 import { ContainerRegistrationKeys } from "@medusajs/framework/utils"
 import {
   createStep,
@@ -41,6 +41,12 @@ export type EntitlementProfilePayload = {
   currency?: string
   amount_minor?: number
   line_item_id?: string | null
+  /**
+   * v1.9.0 Wave F6 / HIGH-05: recipient identity bound at issuance time.
+   * Drives `assertTransferabilityAllowed` enforcement for `personalized` and
+   * `hybrid` profiles. Null/undefined = bearer (unbound) — historical default.
+   */
+  recipient_customer_id?: string | null
 }
 
 export type IssueEntitlementInput = {
@@ -57,6 +63,13 @@ export type IssueEntitlementInput = {
 export type IssueEntitlementResult = {
   entitlement_id: string
   idempotent: boolean
+  /**
+   * v1.9.0 Wave F6 / HIGH-04: claim_token surfaced from issuance so the
+   * `apps/web` claim page + recipient email can deep-link to the Layer 4
+   * (gp_mercur) entitlement. Idempotent re-issues return the existing token
+   * (FOR UPDATE lock ensures a single token per entitlement).
+   */
+  claim_token: string
 }
 
 export class MissingEntitlementProfileError extends Error {
@@ -88,14 +101,37 @@ export async function issueEntitlementWithinPaymentTransaction(
   // We ONLY accept the legacy short-circuit when the existing row is itself
   // legacy (line_item_id IS NULL); a row with line_item_id is part of the
   // multi-line shape and a fresh call for a different line must proceed.
-  const legacy = await client.query<{ id: string; line_item_id: string | null }>(
-    `SELECT id, line_item_id FROM entitlement_instance
+  const legacy = await client.query<{
+    id: string
+    line_item_id: string | null
+    claim_token: string | null
+  }>(
+    `SELECT id, line_item_id, claim_token FROM entitlement_instance
        WHERE order_id = $1 AND line_item_id IS NULL
        LIMIT 1 FOR UPDATE`,
     [payload.order_id]
   )
   if (legacy.rows[0]?.id) {
-    return { entitlement_id: legacy.rows[0].id, idempotent: true }
+    const existingToken = legacy.rows[0].claim_token
+    let claimToken: string
+    if (existingToken) {
+      claimToken = existingToken
+    } else {
+      // Backfill claim_token on legacy idempotent re-issue if missing (pre-F6
+      // rows). Per CC-2 #1 elimination plan claim_token is the public handle
+      // referenced by storefront/apps/web claim pages.
+      claimToken = randomUUID()
+      await client.query(
+        `UPDATE entitlement_instance SET claim_token = $2, updated_at = NOW()
+           WHERE id = $1 AND claim_token IS NULL`,
+        [legacy.rows[0].id, claimToken]
+      )
+    }
+    return {
+      entitlement_id: legacy.rows[0].id,
+      idempotent: true,
+      claim_token: claimToken,
+    }
   }
 
   const multi = await issueEntitlementsForAllLineItems(client, payload, now)
@@ -211,21 +247,34 @@ async function issueSingleEntitlementRow(
   // before (one row per order). Multi-line carts MUST pass line_item_id so
   // each line gets its own row.
   const existing = lineItemId
-    ? await client.query<{ id: string }>(
-        `SELECT id FROM entitlement_instance
+    ? await client.query<{ id: string; claim_token: string | null }>(
+        `SELECT id, claim_token FROM entitlement_instance
            WHERE order_id = $1 AND line_item_id = $2
            LIMIT 1 FOR UPDATE`,
         [payload.order_id, lineItemId]
       )
-    : await client.query<{ id: string }>(
-        `SELECT id FROM entitlement_instance
+    : await client.query<{ id: string; claim_token: string | null }>(
+        `SELECT id, claim_token FROM entitlement_instance
            WHERE order_id = $1 AND line_item_id IS NULL
            LIMIT 1 FOR UPDATE`,
         [payload.order_id]
       )
 
   if (existing.rows[0]?.id) {
-    return { entitlement_id: existing.rows[0].id, idempotent: true }
+    let claimToken = existing.rows[0].claim_token
+    if (!claimToken) {
+      claimToken = randomUUID()
+      await client.query(
+        `UPDATE entitlement_instance SET claim_token = $2, updated_at = NOW()
+           WHERE id = $1 AND claim_token IS NULL`,
+        [existing.rows[0].id, claimToken]
+      )
+    }
+    return {
+      entitlement_id: existing.rows[0].id,
+      idempotent: true,
+      claim_token: claimToken,
+    }
   }
 
   // v1.9.0 wf5 (closes CC-1 F-CC1-015 / Epic-1 I-1): document that ISSUED is
@@ -247,11 +296,13 @@ async function issueSingleEntitlementRow(
     line_item_id: lineItemId,
   })
 
+  const claimToken = randomUUID()
   await client.query(
     `INSERT INTO entitlement_instance
        (id, entitlement_profile_id, entitlement_type, order_id, line_item_id,
-        state, policy_snapshot, market_id, created_at, updated_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $9)`,
+        state, policy_snapshot, market_id, claim_token, recipient_customer_id,
+        created_at, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11, $11)`,
     [
       entitlementId,
       profile.profile_id,
@@ -261,11 +312,17 @@ async function issueSingleEntitlementRow(
       EntitlementInstanceState.ACTIVE,
       JSON.stringify(snapshot),
       payload.market_id ?? null,
+      claimToken,
+      profile.recipient_customer_id ?? null,
       now,
     ]
   )
 
-  return { entitlement_id: entitlementId, idempotent: false }
+  return {
+    entitlement_id: entitlementId,
+    idempotent: false,
+    claim_token: claimToken,
+  }
 }
 
 function extractProfileFromMetadata(
@@ -304,6 +361,9 @@ function extractProfileFromMetadata(
         ? ((metadata as Record<string, unknown>).amount_minor as number)
         : fallbackAmount ?? undefined,
     line_item_id: readString((metadata as Record<string, unknown>).line_item_id),
+    recipient_customer_id: readString(
+      (metadata as Record<string, unknown>).recipient_customer_id
+    ),
   }
 }
 
