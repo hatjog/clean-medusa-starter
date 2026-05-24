@@ -718,6 +718,12 @@ export async function POST(req: MedusaRequest, res: MedusaResponse): Promise<voi
   // F6 MED-15: duplicate-approved still emits an audit breadcrumb so DPIA
   // forensics can distinguish "user returned to a successful link" from
   // "first-time consent".
+  //
+  // v1.9.1 Wave G2 — regression-guard tests pinned in
+  // `__tests__/api/store/voucher-consent.unit.spec.ts` (describe block
+  // "HIGH-10/11 write amplifier guard"): 100-request flood asserts zero
+  // INSERTs into `voucher_consent_attempt` for malformed + over-limit
+  // requests. Do not reorder steps 1-4 without updating those tests.
 
   const attempts = await countRecentBuyerInitiations(
     db,
