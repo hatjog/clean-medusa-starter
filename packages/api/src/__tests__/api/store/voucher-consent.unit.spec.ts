@@ -784,3 +784,46 @@ describe("POST /store/voucher-consent/:token — HIGH-10/11 write amplifier guar
     expect(countInsertAttemptCalls(db)).toBe(1)
   })
 })
+
+// ADR-125 (2026-05-25): canonical minor consent age threshold = 16 per RODO
+// Art. 8 + PL national derogation. Under 16 → guardian/parental consent
+// required (requires_age_check inferred true); 16+ → self-consent permitted
+// (requires_age_check inferred false unless other flags force it). Closes
+// v1.9.0 defect ledger entry L-V190-NEW-CC6-021 (Epic 2 open P1).
+describe("GET /store/voucher-consent/:token — ADR-125 minor age boundary", () => {
+  test.each([
+    [15, true, "15yo recipient (under 16) MUST require guardian consent"],
+    [16, false, "16yo recipient (at threshold) self-consent permitted"],
+    [17, false, "17yo recipient (above threshold) self-consent permitted"],
+    [18, false, "18yo recipient (legal adult) self-consent permitted"],
+  ])("recipient_age=%d → requires_age_check=%s (%s)", async (age, expectedRequiresAgeCheck) => {
+    const token = signedToken({
+      customer_id: "cus_age_boundary",
+      order_id: `ord_age_${age}`,
+      recipient_age: age,
+    })
+    // Authority row has requires_age_check: false from market config; the
+    // ADR-125 backend hook (ageCheckRequired) MUST infer age-check requirement
+    // purely from recipient_age < 16 when no other flags force it.
+    const db = dbWithRows(
+      [{ market_id: "bonbeauty", sales_channel_id: null, requires_age_check: false }],
+      [],
+      []
+    )
+    const res = response()
+
+    await withMarket(async () => {
+      await GET(
+        request({}, db, {}, token) as unknown as MedusaRequest,
+        res as unknown as MedusaResponse
+      )
+    })
+
+    expect(res.statusCode).toBe(200)
+    const body = res.body as Record<string, unknown> | undefined
+    // Response field per route.ts:677 is `age_check_required` (computed by
+    // ageCheckRequired() which applies ADR-125 `< 16` threshold). Authority
+    // row has requires_age_check:false; result purely reflects the age path.
+    expect(body?.age_check_required).toBe(expectedRequiresAgeCheck)
+  })
+})

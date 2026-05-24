@@ -140,10 +140,15 @@ function buyerAccountId(subject: MagicLinkSubject, tokenJti: string): string {
   )
 }
 
+// ADR-125 (2026-05-25): canonical minor consent age threshold is 16 per RODO
+// Art. 8 + PL national derogation (under 16 → guardian consent required;
+// 16+ → self-consent permitted). Was historically `< 18` (PRD v1.8.0 over-
+// conservative pre-ratify); flipped to `< 16` post legal alignment.
+// Boundary tests: voucher-consent.unit.spec.ts asserts 15/16/17/18.
 function ageCheckRequired(subject: MagicLinkSubject): boolean {
   const recipientAge = subject.recipient_age
   const ageRequiresGuardian =
-    typeof recipientAge === "number" && Number.isFinite(recipientAge) && recipientAge < 18
+    typeof recipientAge === "number" && Number.isFinite(recipientAge) && recipientAge < 16
 
   return (
     ageRequiresGuardian ||
