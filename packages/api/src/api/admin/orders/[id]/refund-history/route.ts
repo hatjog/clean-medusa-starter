@@ -13,6 +13,22 @@ type RefundRow = {
   currency: string | null
   received_at: string
   payment_intent_id: string | null
+  /**
+   * v1.9.0 wf5 (closes CC-1 F-CC1-018): count of entitlement_instance rows
+   * transitioned to REFUNDED by the refund webhook. Populated by
+   * `revokeEntitlementsOnRefund` and persisted on the audit envelope.
+   */
+  revoked_entitlement_count: number | null
+  already_terminal_entitlement_count: number | null
+  /**
+   * Live entitlement state aggregate for the order (joined at query time so
+   * the operator UI can render "Stripe refunded ✓ + entitlement REFUNDED ✓"
+   * vs "Stripe refunded ✓ + entitlement ACTIVE ✗" P0 financial-exposure
+   * signal).
+   */
+  live_entitlement_states: string[] | null
+  live_entitlement_count: number | null
+  live_active_entitlement_count: number | null
 }
 
 export async function GET(req: MedusaRequest, res: MedusaResponse): Promise<void> {
@@ -40,6 +56,14 @@ export async function GET(req: MedusaRequest, res: MedusaResponse): Promise<void
   // The JOIN matches the envelope `scope` (`payment_intent:<pi>`) against
   // `payment.data->>'id'`; if the Stripe payment-intent id cannot be derived
   // the row simply does not surface (admin-only, non-financial path).
+  //
+  // v1.9.0 wf5 (closes CC-1 F-CC1-018): LEFT JOIN entitlement_instance to
+  // expose the live entitlement state and the revocation summary persisted
+  // by the refund webhook handler (`revokeEntitlementsOnRefund`). The
+  // operator UI can now distinguish "Stripe refunded ✓ + entitlement REFUNDED
+  // ✓" (closed loop) from "Stripe refunded ✓ + entitlement ACTIVE ✗" (P0
+  // financial-exposure signal that ra-E5 closes structurally — this view
+  // surfaces the residual exposure for any pre-fix-era data).
   const result = await db.raw(
     `
     SELECT
@@ -49,7 +73,12 @@ export async function GET(req: MedusaRequest, res: MedusaResponse): Promise<void
       wep.envelope->>'refund_reason' AS refund_reason,
       wep.envelope->>'currency' AS currency,
       wep.received_at,
-      SUBSTRING(wep.envelope->>'scope' FROM 'payment_intent:(.+)') AS payment_intent_id
+      SUBSTRING(wep.envelope->>'scope' FROM 'payment_intent:(.+)') AS payment_intent_id,
+      (wep.envelope->>'revoked_entitlement_count')::int AS revoked_entitlement_count,
+      (wep.envelope->>'already_terminal_entitlement_count')::int AS already_terminal_entitlement_count,
+      ei_agg.live_states AS live_entitlement_states,
+      ei_agg.live_count AS live_entitlement_count,
+      ei_agg.active_count AS live_active_entitlement_count
     FROM webhook_event_processed wep
     JOIN payment p
       ON wep.envelope->>'scope' = 'payment_intent:' || (p.data->>'id')
@@ -57,6 +86,14 @@ export async function GET(req: MedusaRequest, res: MedusaResponse): Promise<void
     JOIN order_payment_collection opc
       ON opc.payment_collection_id = p.payment_collection_id
       AND opc.deleted_at IS NULL
+    LEFT JOIN LATERAL (
+      SELECT
+        array_agg(ei.state ORDER BY ei.created_at) AS live_states,
+        COUNT(*)::int AS live_count,
+        COUNT(*) FILTER (WHERE ei.state IN ('ACTIVE','ISSUED','REDEMPTION_REQUESTED'))::int AS active_count
+      FROM entitlement_instance ei
+      WHERE ei.order_id = opc.order_id
+    ) ei_agg ON true
     WHERE opc.order_id = ?
       AND wep.provider = 'stripe'
       AND wep.envelope->>'outcome' = 'refunded'
@@ -77,6 +114,20 @@ export async function GET(req: MedusaRequest, res: MedusaResponse): Promise<void
       currency: r.currency ?? null,
       received_at: r.received_at,
       payment_intent_id: r.payment_intent_id ?? null,
+      // v1.9.0 wf5 F-CC1-018: revocation surface for operator UI.
+      revocation: {
+        revoked_entitlement_count: r.revoked_entitlement_count ?? 0,
+        already_terminal_entitlement_count: r.already_terminal_entitlement_count ?? 0,
+        live_entitlement_count: r.live_entitlement_count ?? 0,
+        live_active_entitlement_count: r.live_active_entitlement_count ?? 0,
+        live_entitlement_states: r.live_entitlement_states ?? [],
+        // True when ALL entitlements are in a terminal-revoked state; False
+        // surfaces the residual financial-exposure (active voucher despite
+        // refunded payment).
+        all_revoked:
+          (r.live_active_entitlement_count ?? 0) === 0 &&
+          (r.live_entitlement_count ?? 0) > 0,
+      },
     })),
   })
 }
