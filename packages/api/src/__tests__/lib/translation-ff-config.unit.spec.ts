@@ -1,6 +1,5 @@
 import {
   buildTranslationModuleConfig,
-  STORE_SUPPORTED_LOCALES,
   TRANSLATION_ENTITY_SETTINGS,
 } from "../../lib/translation-ff-config"
 
@@ -25,7 +24,7 @@ describe("translation FF config", () => {
     expect(
       buildTranslationModuleConfig(
         { MEDUSA_FF_TRANSLATION: "false" },
-        ["node", "medusa", "db:rollback", "--modules", "translation"]
+        ["node", "medusa", "db:rollback", "--module", "translation"]
       )
     ).toEqual([
       {
@@ -37,7 +36,7 @@ describe("translation FF config", () => {
     expect(
       buildTranslationModuleConfig(
         { MEDUSA_FF_TRANSLATION: "false" },
-        ["node", "medusa", "db:rollback", "--modules=translation"]
+        ["node", "medusa", "db:rollback", "--module=@medusajs/translation"]
       )
     ).toEqual([
       {
@@ -47,13 +46,37 @@ describe("translation FF config", () => {
     ])
   })
 
-  it("publikuje dokladnie 4 canonical BCP 47 locale codes dla Store", () => {
-    expect(STORE_SUPPORTED_LOCALES.map((locale) => locale.code)).toEqual([
-      "pl-PL",
-      "en-US",
-      "uk-UA",
-      "de-DE",
+  it("laduje modul przy jawnym env rollback override", () => {
+    expect(
+      buildTranslationModuleConfig(
+        {
+          MEDUSA_FF_TRANSLATION: "false",
+          MEDUSA_TRANSLATION_ROLLBACK: "true",
+        },
+        ["node", "medusa", "db:rollback", "--modules", "translation"]
+      )
+    ).toEqual([
+      {
+        key: "translation",
+        resolve: "@medusajs/medusa/translation",
+      },
     ])
+  })
+
+  it("failuje przy nieobslugiwanym formacie rollbacku", () => {
+    expect(() =>
+      buildTranslationModuleConfig(
+        { MEDUSA_FF_TRANSLATION: "false" },
+        ["node", "medusa", "db:rollback", "--modules", "translation"]
+      )
+    ).toThrow(/Unsupported translation rollback command/)
+
+    expect(() =>
+      buildTranslationModuleConfig(
+        { MEDUSA_FF_TRANSLATION: "false" },
+        ["node", "medusa", "db:rollback"]
+      )
+    ).toThrow(/Unsupported translation rollback command/)
   })
 
   it("mapuje story label collection na techniczny ProductCollection entity type", () => {

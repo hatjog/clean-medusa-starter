@@ -1,9 +1,14 @@
 import type { ExecArgs } from "@medusajs/framework/types"
+import { ContainerRegistrationKeys } from "@medusajs/framework/utils"
 
-import { parseDryRunFlag } from "./gp-sync-dry-run"
+import fs from "node:fs/promises"
+import path from "node:path"
+
+import * as yaml from "js-yaml"
+
+import { parseDryRunFlag, parseOverwriteFlag } from "./gp-sync-dry-run"
 import {
   isTranslationFeatureFlagEnabled,
-  STORE_SUPPORTED_LOCALES,
   TRANSLATION_ENTITY_SETTINGS,
 } from "../lib/translation-ff-config"
 
@@ -34,13 +39,62 @@ type TranslationSettingsPlan = {
 }
 
 type SyncOptions = {
+  db?: AdvisoryLockDb
   dryRun?: boolean
+  overwrite?: boolean
+}
+
+type LocaleConfigOptions = {
+  configRoot?: string
+  instanceId?: string
+  marketId?: string
+}
+
+type SyncStoreOptions = {
+  bootstrapStore?: boolean
+  dryRun?: boolean
+  localeConfig?: LocaleConfigOptions
+}
+
+type AdvisoryLockConnection = {
+  query: (sql: string, params?: unknown[]) => Promise<unknown>
+}
+
+type AdvisoryLockDb = {
+  client?: {
+    acquireConnection: () => Promise<AdvisoryLockConnection>
+    releaseConnection: (connection: AdvisoryLockConnection) => Promise<void>
+  }
+}
+
+type TranslationSyncResult =
+  | {
+      ok: true
+      skipped: true
+      reason: string
+    }
+  | {
+      ok: true
+      dry_run: boolean
+      store: SyncStoreSummary
+      translation_settings: SyncTranslationSettingsSummary
+    }
+
+type TranslationEntrypointArgs = {
+  bootstrapStore: boolean
+  configRoot: string
+  dryRun: boolean
+  instanceId: string
+  marketId?: string
+  overwrite: boolean
 }
 
 type ListOptions = {
   filters?: Record<string, unknown>
   config?: Record<string, unknown>
 }
+
+const TRANSLATION_SETTINGS_ADVISORY_LOCK_ID = 210260021
 
 function resolveService(container: any, keysToTry: string[]): any {
   const errors: string[] = []
@@ -69,6 +123,34 @@ function firstFunction(obj: any, names: string[]) {
   return null
 }
 
+function parseBooleanFlag(args: string[] | undefined, flag: string): boolean {
+  return args?.includes(flag) === true
+}
+
+function parseEntrypointArgs(args: string[] | undefined): TranslationEntrypointArgs {
+  const instanceId = (args?.[0] ?? process.env.GP_INSTANCE_ID ?? "gp-dev").trim()
+  const marketId = (args?.[1] ?? process.env.GP_MARKET_ID)?.trim()
+  const configRoot = (
+    process.env.GP_CONFIG_ROOT ?? path.resolve(process.cwd(), "../config")
+  ).trim()
+
+  if (!instanceId) {
+    throw new Error("GP_INSTANCE_ID is required to resolve market.yaml supported_locales")
+  }
+  if (!configRoot) {
+    throw new Error("GP_CONFIG_ROOT is required to resolve market.yaml supported_locales")
+  }
+
+  return {
+    bootstrapStore: parseBooleanFlag(args, "--bootstrap-store"),
+    configRoot,
+    dryRun: parseDryRunFlag(args),
+    instanceId,
+    marketId,
+    overwrite: parseOverwriteFlag(args),
+  }
+}
+
 async function tryList(
   service: any,
   methods: string[],
@@ -91,6 +173,74 @@ function sameArray(left: readonly string[], right: readonly string[]): boolean {
   return left.length === right.length && left.every((value, index) => value === right[index])
 }
 
+function normalizeSupportedLocales(value: unknown, filePath: string): string[] {
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new Error(`market.yaml supported_locales is required: ${filePath}`)
+  }
+
+  return value.map((entry, index) => {
+    if (typeof entry !== "string" || entry.trim().length === 0) {
+      throw new Error(`market.yaml supported_locales[${index}] must be a non-empty string`)
+    }
+
+    return entry.trim()
+  })
+}
+
+export async function loadMarketSupportedLocaleCodes(
+  options: LocaleConfigOptions = {}
+): Promise<string[]> {
+  const marketId = (options.marketId ?? process.env.GP_MARKET_ID)?.trim()
+  if (!marketId) {
+    throw new Error("GP_MARKET_ID is required to resolve market.yaml supported_locales")
+  }
+
+  const instanceId = (options.instanceId ?? process.env.GP_INSTANCE_ID ?? "gp-dev").trim()
+  const configRoot = (
+    options.configRoot ?? process.env.GP_CONFIG_ROOT ?? path.resolve(process.cwd(), "../config")
+  ).trim()
+  const filePath = path.resolve(configRoot, instanceId, "markets", marketId, "market.yaml")
+
+  let raw: string
+  try {
+    raw = await fs.readFile(filePath, "utf8")
+  } catch (error: any) {
+    if (error?.code === "ENOENT") {
+      throw new Error(`market.yaml not found: ${filePath}`)
+    }
+    throw error
+  }
+
+  const doc = yaml.load(raw, { schema: yaml.JSON_SCHEMA })
+  if (!doc || typeof doc !== "object") {
+    throw new Error(`Invalid market.yaml document: ${filePath}`)
+  }
+
+  return normalizeSupportedLocales(
+    (doc as { supported_locales?: unknown }).supported_locales,
+    filePath
+  )
+}
+
+function mergeFields(
+  currentFields: readonly string[],
+  desiredFields: readonly string[],
+  overwrite: boolean
+): string[] {
+  if (overwrite) {
+    return [...desiredFields]
+  }
+
+  const merged = [...currentFields]
+  for (const field of desiredFields) {
+    if (!merged.includes(field)) {
+      merged.push(field)
+    }
+  }
+
+  return merged
+}
+
 function isDuplicateTranslationSettingsError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error)
   return /Translation settings with entity_type: .+ already exists/i.test(message)
@@ -108,7 +258,8 @@ async function listCurrentTranslationSettings(service: any): Promise<Translation
 }
 
 function buildTranslationSettingsPlan(
-  currentSettings: TranslationSettingRow[]
+  currentSettings: TranslationSettingRow[],
+  options: { overwrite: boolean }
 ): TranslationSettingsPlan {
   const byEntityType = new Map(
     currentSettings
@@ -131,14 +282,15 @@ function buildTranslationSettingsPlan(
     }
 
     const currentFields = Array.isArray(current.fields) ? current.fields : []
-    if (!sameArray(currentFields, fields) || current.is_active !== true) {
+    const targetFields = mergeFields(currentFields, fields, options.overwrite)
+    if (!sameArray(currentFields, targetFields) || current.is_active !== true) {
       if (!current.id) {
         throw new Error(`translation_settings row for ${setting.entity_type} has no id`)
       }
 
       updatePayload.push({
         id: current.id,
-        fields,
+        fields: targetFields,
         is_active: true,
       })
     }
@@ -149,13 +301,11 @@ function buildTranslationSettingsPlan(
 
 export async function syncStoreSupportedLocales(
   storeService: any,
-  options: SyncOptions = {}
+  options: SyncStoreOptions = {}
 ): Promise<SyncStoreSummary> {
   const dryRun = options.dryRun === true
-  const supportedLocales = STORE_SUPPORTED_LOCALES.map((locale) => ({
-    locale_code: locale.code,
-  }))
-  const codes = STORE_SUPPORTED_LOCALES.map((locale) => locale.code)
+  const codes = await loadMarketSupportedLocaleCodes(options.localeConfig)
+  const supportedLocales = codes.map((code) => ({ locale_code: code }))
   const stores = await tryList(storeService, [
     "listStores",
     "listAndCountStores",
@@ -166,6 +316,10 @@ export async function syncStoreSupportedLocales(
   })
 
   if (stores.length === 0) {
+    if (options.bootstrapStore !== true) {
+      throw new Error("no Store found; pass --bootstrap-store with separate evidence to create default")
+    }
+
     const createStores = firstFunction(storeService, ["createStores", "create"])
     if (!createStores) {
       throw new Error("No stores found and store service cannot create one")
@@ -215,27 +369,43 @@ export async function syncStoreSupportedLocales(
   }
 }
 
-export async function syncTranslationSettings(
-  translationService: any,
-  options: SyncOptions = {}
-): Promise<SyncTranslationSettingsSummary> {
-  const dryRun = options.dryRun === true
-  let plan = buildTranslationSettingsPlan(
-    await listCurrentTranslationSettings(translationService)
-  )
-  const created: string[] = []
-  const updated: string[] = []
-
-  if (dryRun) {
-    return {
-      story_labels: TRANSLATION_ENTITY_SETTINGS.map((setting) => setting.story_label),
-      entity_types: TRANSLATION_ENTITY_SETTINGS.map((setting) => setting.entity_type),
-      created: plan.createPayload.map((setting) => setting.entity_type),
-      updated: plan.updatePayload.map((setting) => setting.id),
-      dry_run: dryRun,
-    }
+async function withTranslationSettingsLock<T>(
+  db: AdvisoryLockDb | undefined,
+  action: () => Promise<T>
+): Promise<T> {
+  const client = db?.client
+  if (!client) {
+    throw new Error("PostgreSQL connection is required for translation_settings advisory lock")
   }
 
+  const connection = await client.acquireConnection()
+  let locked = false
+
+  try {
+    await connection.query("SELECT pg_advisory_lock($1)", [
+      TRANSLATION_SETTINGS_ADVISORY_LOCK_ID,
+    ])
+    locked = true
+    return await action()
+  } finally {
+    try {
+      if (locked) {
+        await connection.query("SELECT pg_advisory_unlock($1)", [
+          TRANSLATION_SETTINGS_ADVISORY_LOCK_ID,
+        ])
+      }
+    } finally {
+      await client.releaseConnection(connection)
+    }
+  }
+}
+
+async function applyTranslationSettingsPlan(
+  translationService: any,
+  plan: TranslationSettingsPlan,
+  summary: { created: string[]; updated: string[] },
+  options: { overwrite: boolean }
+): Promise<void> {
   if (plan.updatePayload.length) {
     const updateSettings = firstFunction(translationService, [
       "updateTranslationSettings",
@@ -245,89 +415,136 @@ export async function syncTranslationSettings(
       throw new Error("Translation service does not expose updateTranslationSettings/update")
     }
     await updateSettings(plan.updatePayload)
-    updated.push(...plan.updatePayload.map((setting) => setting.id))
+    summary.updated.push(...plan.updatePayload.map((setting) => setting.id))
   }
 
-  if (plan.createPayload.length) {
-    const createSettings = firstFunction(translationService, [
-      "createTranslationSettings",
-      "create",
-    ])
-    if (!createSettings) {
-      throw new Error("Translation service does not expose createTranslationSettings/create")
-    }
+  if (!plan.createPayload.length) {
+    return
+  }
 
-    let duplicateDuringCreate = false
-    for (const setting of plan.createPayload) {
-      try {
-        await createSettings(setting)
-        created.push(setting.entity_type)
-      } catch (error) {
-        if (!isDuplicateTranslationSettingsError(error)) {
-          throw error
-        }
-        duplicateDuringCreate = true
+  const createSettings = firstFunction(translationService, [
+    "createTranslationSettings",
+    "create",
+  ])
+  if (!createSettings) {
+    throw new Error("Translation service does not expose createTranslationSettings/create")
+  }
+
+  let duplicateDuringCreate = false
+  for (const setting of plan.createPayload) {
+    try {
+      await createSettings(setting)
+      summary.created.push(setting.entity_type)
+    } catch (error) {
+      if (!isDuplicateTranslationSettingsError(error)) {
+        throw error
       }
-    }
-
-    if (duplicateDuringCreate) {
-      plan = buildTranslationSettingsPlan(
-        await listCurrentTranslationSettings(translationService)
-      )
-
-      if (plan.updatePayload.length) {
-        const updateSettings = firstFunction(translationService, [
-          "updateTranslationSettings",
-          "update",
-        ])
-        if (!updateSettings) {
-          throw new Error("Translation service does not expose updateTranslationSettings/update")
-        }
-        await updateSettings(plan.updatePayload)
-        updated.push(...plan.updatePayload.map((setting) => setting.id))
-      }
-
-      const remainingCreates = plan.createPayload.filter(
-        (setting) => !created.includes(setting.entity_type)
-      )
-      for (const setting of remainingCreates) {
-        try {
-          await createSettings(setting)
-          created.push(setting.entity_type)
-        } catch (error) {
-          if (!isDuplicateTranslationSettingsError(error)) {
-            throw error
-          }
-        }
-      }
+      duplicateDuringCreate = true
     }
   }
 
-  return {
+  if (!duplicateDuringCreate) {
+    return
+  }
+
+  const remainingPlan = buildTranslationSettingsPlan(
+    await listCurrentTranslationSettings(translationService),
+    { overwrite: options.overwrite }
+  )
+  const remainingCreates = remainingPlan.createPayload.filter(
+    (setting) => !summary.created.includes(setting.entity_type)
+  )
+
+  if (remainingPlan.updatePayload.length || remainingCreates.length) {
+    await applyTranslationSettingsPlan(
+      translationService,
+      {
+        createPayload: remainingCreates,
+        updatePayload: remainingPlan.updatePayload,
+      },
+      summary,
+      options
+    )
+  }
+}
+
+export async function syncTranslationSettings(
+  translationService: any,
+  options: SyncOptions = {}
+): Promise<SyncTranslationSettingsSummary> {
+  const dryRun = options.dryRun === true
+  const overwrite = options.overwrite === true
+  const created: string[] = []
+  const updated: string[] = []
+  const common = {
     story_labels: TRANSLATION_ENTITY_SETTINGS.map((setting) => setting.story_label),
     entity_types: TRANSLATION_ENTITY_SETTINGS.map((setting) => setting.entity_type),
+  }
+
+  if (dryRun) {
+    const plan = buildTranslationSettingsPlan(
+      await listCurrentTranslationSettings(translationService),
+      { overwrite }
+    )
+
+    return {
+      ...common,
+      created: plan.createPayload.map((setting) => setting.entity_type),
+      updated: plan.updatePayload.map((setting) => setting.id),
+      dry_run: dryRun,
+    }
+  }
+
+  await withTranslationSettingsLock(options.db, async () => {
+    const plan = buildTranslationSettingsPlan(
+      await listCurrentTranslationSettings(translationService),
+      { overwrite }
+    )
+
+    const freshPlan = plan.updatePayload.length
+      ? buildTranslationSettingsPlan(
+          await listCurrentTranslationSettings(translationService),
+          { overwrite }
+        )
+      : plan
+
+    await applyTranslationSettingsPlan(
+      translationService,
+      freshPlan,
+      { created, updated },
+      { overwrite }
+    )
+  })
+
+  return {
+    ...common,
     created,
     updated,
     dry_run: dryRun,
   }
 }
 
-export async function gpConfigSyncTranslations({ container, args }: ExecArgs) {
-  const dryRun = parseDryRunFlag(args)
+export async function gpConfigSyncTranslations({
+  container,
+  args,
+}: ExecArgs): Promise<TranslationSyncResult> {
+  const parsedArgs = parseEntrypointArgs(args)
 
   if (!isTranslationFeatureFlagEnabled()) {
+    const result: TranslationSyncResult = {
+      ok: true,
+      skipped: true,
+      reason: "MEDUSA_FF_TRANSLATION is not true",
+    }
+
     console.log(
       JSON.stringify(
-        {
-          ok: true,
-          skipped: true,
-          reason: "MEDUSA_FF_TRANSLATION is not true",
-        },
+        result,
         null,
         2
       )
     )
-    return
+    return result
   }
 
   const storeService = resolveService(container, [
@@ -342,24 +559,40 @@ export async function gpConfigSyncTranslations({ container, args }: ExecArgs) {
     "ITranslationModuleService",
     "translation_module",
   ])
+  const db = resolveService(container, [
+    ContainerRegistrationKeys.PG_CONNECTION,
+    "pg_connection",
+  ])
 
-  const store = await syncStoreSupportedLocales(storeService, { dryRun })
-  const translation_settings = await syncTranslationSettings(translationService, {
-    dryRun,
+  const store = await syncStoreSupportedLocales(storeService, {
+    bootstrapStore: parsedArgs.bootstrapStore,
+    dryRun: parsedArgs.dryRun,
+    localeConfig: {
+      configRoot: parsedArgs.configRoot,
+      instanceId: parsedArgs.instanceId,
+      marketId: parsedArgs.marketId,
+    },
   })
+  const translation_settings = await syncTranslationSettings(translationService, {
+    db,
+    dryRun: parsedArgs.dryRun,
+    overwrite: parsedArgs.overwrite,
+  })
+  const result: TranslationSyncResult = {
+    ok: true,
+    dry_run: parsedArgs.dryRun,
+    store,
+    translation_settings,
+  }
 
   console.log(
     JSON.stringify(
-      {
-        ok: true,
-        dry_run: dryRun,
-        store,
-        translation_settings,
-      },
+      result,
       null,
       2
     )
   )
+  return result
 }
 
 export default gpConfigSyncTranslations

@@ -1,4 +1,5 @@
 import {
+  assertTranslationStageGate,
   buildHealthReport,
   callRevalidateAll,
   parseOrchestratorArgs,
@@ -61,6 +62,48 @@ describe("parseOrchestratorArgs", () => {
       })
     )
   })
+
+  it("parsuje flage allow-skip z argumentow", () => {
+    const result = parseOrchestratorArgs(["gp-stage", "mercur", "--allow-skip"])
+
+    expect(result.allowSkip).toBe(true)
+  })
+})
+
+describe("assertTranslationStageGate", () => {
+  it("blokuje staging/canary/production bez Translation FF i bez allow-skip", () => {
+    expect(() =>
+      assertTranslationStageGate(
+        { allowSkip: false },
+        {
+          MEDUSA_STAGE: "canary",
+          MEDUSA_FF_TRANSLATION: "false",
+        } as NodeJS.ProcessEnv
+      )
+    ).toThrow("FF translation gate required in stage canary; pass --allow-skip to override")
+  })
+
+  it("pozwala na override --allow-skip oraz lokalny stage", () => {
+    expect(() =>
+      assertTranslationStageGate(
+        { allowSkip: true },
+        {
+          MEDUSA_STAGE: "staging",
+          MEDUSA_FF_TRANSLATION: "false",
+        } as NodeJS.ProcessEnv
+      )
+    ).not.toThrow()
+
+    expect(() =>
+      assertTranslationStageGate(
+        { allowSkip: false },
+        {
+          MEDUSA_STAGE: "local",
+          MEDUSA_FF_TRANSLATION: "false",
+        } as NodeJS.ProcessEnv
+      )
+    ).not.toThrow()
+  })
 })
 
 describe("runStage", () => {
@@ -73,6 +116,20 @@ describe("runStage", () => {
 
     expect(result.status).toBe("ok")
     expect(result.message).toBe("done")
+  })
+
+  it("zwraca skipped dla pominietego etapu", async () => {
+    const result = await runStage({
+      name: "sync-translations",
+      required: true,
+      execute: async () => ({
+        status: "skipped",
+        message: "translations sync: SKIPPED (FF=false)",
+      }),
+    })
+
+    expect(result.status).toBe("skipped")
+    expect(result.message).toBe("translations sync: SKIPPED (FF=false)")
   })
 
   it("gracefully downgrades optional stage failure to warning", async () => {

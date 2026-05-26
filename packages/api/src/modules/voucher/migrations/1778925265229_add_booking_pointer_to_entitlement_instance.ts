@@ -1,69 +1,28 @@
 import { Migration } from "@medusajs/framework/mikro-orm/migrations"
 
 /**
- * Story v180-2-3: add service booking pointer and entitlement audit payloads.
+ * Story v180-2-3: dodaje booking pointer usługi i payloady audytu entitlement.
  *
- * Source: epics.md Story 2.3 BE-2 (FR1.13); ADR-099 Layer 4.
+ * Źródło: epics.md Story 2.3 BE-2 (FR1.13); ADR-099 Layer 4.
  *
- * AUTHORED Story 2.3; APPLY confirmed live infra / Epic 1 Story 1.3. Local
- * Medusa CLI generation was unavailable in this fresh submodule checkout
- * because dependencies were not installed, so this migration is authored in
- * the existing voucher migration class shape and kept idempotent.
+ * AUTHORED Story 2.3; APPLY potwierdzone dla live infra / Epic 1 Story 1.3.
+ * Lokalna generacja przez Medusa CLI była niedostępna w świeżym checkoutcie
+ * submodule, bo zależności nie były zainstalowane, więc migracja zachowuje
+ * istniejący kształt klasy migracji voucher i pozostaje idempotentna.
  *
- * M1 fix (code review): the original draft also ran DROP+ADD of
- * voucher_event_event_type_check with a specific enum value list.  That
- * full-replace pattern is NOT parallel-collision-safe: a sibling BE-x story
- * (2.2, 2.4–2.11) that ships its own DROP+ADD with a different value list
- * would silently drop any event types added here.  Instead this migration
- * only DROPs the restrictive CHECK (making the column open to any text) and
- * delegates allowed-value enforcement to the application layer
- * (VoucherService.emitEntitlementBookingCancelled).  The `voucher_code DROP
- * NOT NULL` relaxation is intentional: entitlement-lifecycle events have no
- * voucher code (they reference entitlement_id), so the column must be
- * nullable for this category of rows.
+ * Fix M1 z review: pierwszy szkic robił DROP+ADD
+ * voucher_event_event_type_check z konkretną listą wartości enum. Taki wzorzec
+ * full-replace nie jest odporny na równoległe kolizje: równoległa story BE-x
+ * (2.2, 2.4-2.11) z własnym DROP+ADD i inną listą wartości mogłaby po cichu
+ * usunąć typy eventów dodane tutaj. Ta migracja tylko usuwa restrykcyjny CHECK
+ * (kolumna akceptuje dowolny text), a walidację dozwolonych wartości deleguje
+ * do warstwy aplikacyjnej (VoucherService.emitEntitlementBookingCancelled).
+ * Poluzowanie `voucher_code DROP NOT NULL` jest celowe: eventy cyklu życia
+ * entitlement nie mają kodu vouchera, bo wskazują `entitlement_id`, więc ta
+ * kategoria wierszy wymaga nullable voucher_code.
  */
 export class Migration1778925265229 extends Migration {
   async up(): Promise<void> {
-    this.addSql(`
-      CREATE TABLE IF NOT EXISTS voucher (
-        code            text PRIMARY KEY,
-        market_id       text NULL,
-        seller_id       text NOT NULL,
-        seller_name     text NOT NULL,
-        seller_handle   text NOT NULL,
-        product_title   text NOT NULL,
-        value_minor     integer NOT NULL CHECK (value_minor >= 0),
-        currency_code   text NOT NULL,
-        status          text NOT NULL CHECK (status IN ('idle','consent_pending','claimed','withdrawn')),
-        expires_at      timestamptz NULL,
-        created_at      timestamptz NOT NULL DEFAULT now(),
-        updated_at      timestamptz NOT NULL DEFAULT now()
-      )
-    `)
-    this.addSql(`
-      CREATE INDEX IF NOT EXISTS voucher_seller_id_idx ON voucher (seller_id)
-    `)
-    this.addSql(`
-      CREATE INDEX IF NOT EXISTS voucher_market_id_idx ON voucher (market_id)
-        WHERE market_id IS NOT NULL
-    `)
-    this.addSql(`
-      CREATE INDEX IF NOT EXISTS voucher_expires_at_idx ON voucher (expires_at)
-        WHERE expires_at IS NOT NULL
-    `)
-    this.addSql(`
-      CREATE TABLE IF NOT EXISTS voucher_event (
-        id              text PRIMARY KEY,
-        voucher_code    text NOT NULL REFERENCES voucher(code) ON DELETE CASCADE,
-        event_type      text NOT NULL CHECK (event_type IN ('created','sent','opened','claimed','withdrawn')),
-        occurred_at     timestamptz NOT NULL,
-        created_at      timestamptz NOT NULL DEFAULT now()
-      )
-    `)
-    this.addSql(`
-      CREATE INDEX IF NOT EXISTS voucher_event_code_idx ON voucher_event (voucher_code, occurred_at)
-    `)
-
     this.addSql(`
       ALTER TABLE entitlement_instance
       ADD COLUMN IF NOT EXISTS booking_pointer text NULL
@@ -78,16 +37,16 @@ export class Migration1778925265229 extends Migration {
       ADD COLUMN IF NOT EXISTS payload jsonb NOT NULL DEFAULT '{}'::jsonb
     `)
 
-    // Allow entitlement-lifecycle events that have no voucher_code (they carry
-    // entitlement_id instead).  Intentional shared-table invariant relaxation.
+    // Eventy cyklu życia entitlement nie mają voucher_code, tylko entitlement_id.
+    // To celowe poluzowanie invariantów współdzielonej tabeli.
     this.addSql(`
       ALTER TABLE voucher_event
       ALTER COLUMN voucher_code DROP NOT NULL
     `)
 
-    // Drop the restrictive enum CHECK so parallel BE-x migrations can each add
-    // their own event types without a last-writer-wins collision on this
-    // constraint.  Application-layer code enforces valid values per call site.
+    // Usuwa restrykcyjny CHECK enum, żeby równoległe migracje BE-x mogły dodać
+    // własne typy eventów bez kolizji last-writer-wins na tym constraint.
+    // Warstwa aplikacyjna waliduje dozwolone wartości w miejscach wywołania.
     this.addSql(`
       ALTER TABLE voucher_event
       DROP CONSTRAINT IF EXISTS voucher_event_event_type_check
@@ -103,14 +62,65 @@ export class Migration1778925265229 extends Migration {
   async down(): Promise<void> {
     this.addSql(`DROP INDEX IF EXISTS voucher_event_entitlement_id_idx`)
 
-    // INTENTIONAL DESTRUCTIVE ROLLBACK: deletes audit rows for
-    // ENTITLEMENT_BOOKING_CANCELLED events before restoring the narrower CHECK
-    // constraint (which would otherwise reject those rows).  Audit events are
-    // append-only in production — do NOT run this down() against any
-    // environment that contains real audit data.
     this.addSql(`
-      DELETE FROM voucher_event
-      WHERE event_type = 'ENTITLEMENT_BOOKING_CANCELLED'
+      CREATE TABLE IF NOT EXISTS voucher_event_archive
+      (LIKE voucher_event INCLUDING ALL)
+    `)
+    this.addSql(`
+      ALTER TABLE voucher_event_archive
+      ADD COLUMN IF NOT EXISTS archived_at timestamptz NOT NULL DEFAULT now()
+    `)
+    this.addSql(`
+      DO $$
+      DECLARE
+        before_count integer;
+        archived_count integer;
+      BEGIN
+        SELECT COUNT(*)::integer
+          INTO before_count
+          FROM voucher_event
+         WHERE event_type = 'ENTITLEMENT_BOOKING_CANCELLED';
+
+        INSERT INTO voucher_event_archive (
+          id,
+          voucher_code,
+          event_type,
+          occurred_at,
+          created_at,
+          entitlement_id,
+          payload,
+          archived_at
+        )
+        SELECT
+          id,
+          voucher_code,
+          event_type,
+          occurred_at,
+          created_at,
+          entitlement_id,
+          payload,
+          now()
+        FROM voucher_event
+        WHERE event_type = 'ENTITLEMENT_BOOKING_CANCELLED'
+        ON CONFLICT (id) DO UPDATE SET
+          voucher_code = EXCLUDED.voucher_code,
+          event_type = EXCLUDED.event_type,
+          occurred_at = EXCLUDED.occurred_at,
+          created_at = EXCLUDED.created_at,
+          entitlement_id = EXCLUDED.entitlement_id,
+          payload = EXCLUDED.payload,
+          archived_at = EXCLUDED.archived_at;
+
+        GET DIAGNOSTICS archived_count = ROW_COUNT;
+        IF archived_count <> before_count THEN
+          RAISE EXCEPTION 'voucher_event rollback archive mismatch: archived %, expected %',
+            archived_count,
+            before_count;
+        END IF;
+
+        DELETE FROM voucher_event
+        WHERE event_type = 'ENTITLEMENT_BOOKING_CANCELLED';
+      END $$;
     `)
     this.addSql(`
       ALTER TABLE voucher_event
