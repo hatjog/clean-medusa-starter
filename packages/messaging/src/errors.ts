@@ -10,16 +10,17 @@ interface MessagingErrorOptions {
 export class MessagingError extends Error {
   readonly error_code: string;
   readonly audit_event?: AuditEnvelope;
-  readonly cause?: unknown;
   readonly status_code?: number;
 
   constructor(message: string, options: MessagingErrorOptions) {
-    super(message);
+    super(
+      message,
+      options.cause !== undefined ? { cause: options.cause } : undefined,
+    );
     this.name = new.target.name;
     this.error_code = options.error_code;
     this.audit_event = options.audit_event;
     this.status_code = options.status_code;
-    this.cause = options.cause;
   }
 }
 

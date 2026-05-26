@@ -76,6 +76,5 @@ export interface NotificationDeliveryEvent {
   event_type: NotificationDeliveryEventType;
   occurred_at: string;
   provider_event_id: string;
-  payload: Record<string, unknown>;
   raw_payload?: Record<string, unknown>;
 }

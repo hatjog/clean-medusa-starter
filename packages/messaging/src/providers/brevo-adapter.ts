@@ -47,6 +47,11 @@ export class BrevoAdapter implements IMessagingProvider {
     }
   }
 
+  /**
+   * F-06: publiczna metoda WYŁĄCZNIE dla testów jednostkowych mapowania payloadu.
+   * Produkcyjne callsite MUSZĄ wywoływać przez `MessagingGateway.send` — bezpośrednie
+   * użycie pomija invariant `audit_event` (gateway wzbogaca każdy throw o audit envelope).
+   */
   toBrevoPayload(intent: NotificationIntent): BrevoTransactionalEmailPayload {
     const recipientEmail = intent.recipient.email?.trim();
     if (!recipientEmail) {
@@ -85,12 +90,12 @@ export class BrevoAdapter implements IMessagingProvider {
         flow_id: intent.flow_id,
         market_id: intent.recipient.market_id,
       },
+      // F-09: `headers` w Brevo TransactionalEmailsApi to message headers (widoczne w `view source`
+       // wiadomości po stronie odbiorcy). Usunęliśmy X-GP-Flow-Id / X-GP-Template-Key / X-GP-Locale
+       // (PII/routing leak ryzyko). X-Mailin-Tag = udokumentowany Brevo tag wymagany dla downstream
+       // correlation w panelu Brevo. API-level idempotency hint nie jest natywnie wspierany przez
+       // sendTransacEmail — propagujemy idempotency_key w `params` (template-side, nie message headers).
       headers: {
-        "Idempotency-Key": intent.idempotency_key,
-        "X-GP-Flow-Id": intent.flow_id,
-        "X-GP-Market-Id": intent.recipient.market_id,
-        "X-GP-Template-Key": intent.template_key,
-        "X-GP-Locale": intent.locale,
         "X-Mailin-Tag": `${intent.recipient.market_id}:${intent.flow_id}:${intent.template_key}`,
       },
     };
@@ -116,7 +121,7 @@ function toMessagingProviderError(error: unknown): MessagingProviderError {
     extractNestedString(error, ["response", "body", "code"]) ??
     extractNestedString(error, ["body", "code"]) ??
     extractNestedString(error, ["code"]) ??
-    (statusCode ? `BREVO_${statusCode}` : "BREVO_PROVIDER_ERROR");
+    (statusCode ? `BREVO_HTTP_${statusCode}` : "BREVO_PROVIDER_ERROR");
   const message =
     extractNestedString(error, ["response", "body", "message"]) ??
     extractNestedString(error, ["body", "message"]) ??

@@ -178,6 +178,152 @@ describe("DefaultMessagingGateway", () => {
     });
   });
 
+  it("rzuca MessagingValidationError dla nieznanej wartości channel (poza email|sms|push)", async () => {
+    // F-04: Caller, który ominie TypeScript (np. JSON deserializacja z API), nie
+    // może dostać "Unsupported v1.10.0" myląc validation z roadmap-deferral.
+    const gateway = new DefaultMessagingGateway(
+      { brevo: makeProvider() },
+      "brevo",
+      () => fixedNow,
+      makeUuid(["invalid-dispatch-1", "audit-invalid-1"]),
+    );
+
+    await expect(
+      gateway.send(makeIntent({ channel: "webhook" as never })),
+    ).rejects.toMatchObject({
+      error_code: "MESSAGING_CHANNEL_INVALID",
+    });
+  });
+
+  it("hashRecipient jest deterministyczny i case-insensitive dla emaila", async () => {
+    // F-10: invariant dla Path Y subscriber correlation (hash dispatch ↔ delivery event).
+    const provider = makeProvider();
+    const gateway = new DefaultMessagingGateway(
+      { brevo: provider },
+      "brevo",
+      () => fixedNow,
+      makeUuid(["a1", "a2", "a3", "a4"]),
+    );
+
+    const first = await gateway.send(
+      makeIntent({
+        recipient: { email: "Buyer@Example.com", market_id: "pl" },
+        idempotency_key: "hash-1",
+      }),
+    );
+    const second = await gateway.send(
+      makeIntent({
+        recipient: { email: "buyer@example.com", market_id: "pl" },
+        idempotency_key: "hash-2",
+      }),
+    );
+    const third = await gateway.send(
+      makeIntent({
+        recipient: { email: "buyer@example.com", market_id: "pl" },
+        idempotency_key: "hash-3",
+      }),
+    );
+
+    expect(first.audit_event.hashed_recipient).toBe(
+      second.audit_event.hashed_recipient,
+    );
+    expect(second.audit_event.hashed_recipient).toBe(
+      third.audit_event.hashed_recipient,
+    );
+  });
+
+  it("v1.10.0: gateway NIE waliduje consent — marketing intent przechodzi do providera (boundary Story 5.4)", async () => {
+    // F-11: consent gating per flow per market = scope Story 5.4 (FF runtime).
+    // Gateway w v1.10.0 forwarduje wszystkie 4 consent_basis bez sprawdzenia consent record.
+    const provider = makeProvider();
+    const gateway = new DefaultMessagingGateway(
+      { brevo: provider },
+      "brevo",
+      () => fixedNow,
+      makeUuid(["marketing-audit-1"]),
+    );
+
+    const dispatch = await gateway.send(
+      makeIntent({ consent_basis: "marketing" }),
+    );
+
+    expect(provider.send).toHaveBeenCalledTimes(1);
+    expect(dispatch.audit_event.consent_basis).toBe("marketing");
+    expect(dispatch.status).toBe("queued");
+  });
+
+  it("ewikuje najstarszy wpis z cache po przekroczeniu maxCacheSize i pruneuje wygasłe", async () => {
+    // F-03: long-running worker memory bound — LRU eviction + sweep ekspiracji.
+    let now = fixedNow;
+    const provider = makeProvider();
+    const sendMock = provider.send as jest.MockedFunction<IMessagingProvider["send"]>;
+    sendMock.mockImplementation(async () => ({
+      dispatch_id: `dispatch-${sendMock.mock.calls.length}`,
+      status: "queued",
+    }));
+    const gateway = new DefaultMessagingGateway(
+      { brevo: provider },
+      "brevo",
+      () => now,
+      makeUuid([]),
+      60_000,
+      2, // maxCacheSize = 2 → trzeci wpis powinien ewikuować pierwszy.
+    );
+
+    await gateway.send(makeIntent({ idempotency_key: "k1" }));
+    await gateway.send(makeIntent({ idempotency_key: "k2" }));
+    await gateway.send(makeIntent({ idempotency_key: "k3" }));
+
+    // k1 powinien być ewikuowany — kolejny send z k1 wywołuje providera ponownie.
+    await gateway.send(makeIntent({ idempotency_key: "k1" }));
+    expect(provider.send).toHaveBeenCalledTimes(4);
+
+    // Test sweep: wygaszamy wszystkie po TTL — kolejny send z k3 też woła providera.
+    now = new Date(fixedNow.getTime() + 120_000);
+    await gateway.send(makeIntent({ idempotency_key: "k3" }));
+    expect(provider.send).toHaveBeenCalledTimes(5);
+  });
+
+  it("composite cache key blokuje cross-market kolizję dla tego samego idempotency_key", async () => {
+    // F-08: dwie intencje z różnym market_id ale samym idempotency_key dostają RÓŻNE dispatch_id.
+    const provider = makeProvider();
+    const sendMock = provider.send as jest.MockedFunction<IMessagingProvider["send"]>;
+    sendMock
+      .mockResolvedValueOnce({
+        dispatch_id: "pl-dispatch",
+        status: "queued",
+      })
+      .mockResolvedValueOnce({
+        dispatch_id: "de-dispatch",
+        status: "queued",
+      });
+    const gateway = new DefaultMessagingGateway(
+      { brevo: provider },
+      "brevo",
+      () => fixedNow,
+      makeUuid(["a1", "a2", "a3", "a4"]),
+    );
+
+    const plDispatch = await gateway.send(
+      makeIntent({
+        recipient: { email: "pl@example.com", market_id: "pl" },
+        idempotency_key: "shared-key",
+      }),
+    );
+    const deDispatch = await gateway.send(
+      makeIntent({
+        recipient: { email: "de@example.com", market_id: "de" },
+        idempotency_key: "shared-key",
+        locale: "de-DE",
+      }),
+    );
+
+    expect(provider.send).toHaveBeenCalledTimes(2);
+    expect(plDispatch.dispatch_id).toBe("pl-dispatch");
+    expect(deDispatch.dispatch_id).toBe("de-dispatch");
+    expect(plDispatch.dispatch_id).not.toBe(deDispatch.dispatch_id);
+  });
+
   it("blokuje sms i push jako unsupported channel w v1.10.0", async () => {
     const gateway = new DefaultMessagingGateway(
       { brevo: makeProvider() },

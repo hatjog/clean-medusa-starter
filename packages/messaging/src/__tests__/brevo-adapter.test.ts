@@ -106,14 +106,15 @@ describe("BrevoAdapter", () => {
 
     const payload = adapter.toBrevoPayload(makeIntent());
 
-    expect(payload.headers).toMatchObject({
-      "Idempotency-Key": "idem-1",
-      "X-GP-Flow-Id": "voucher_delivery_recipient",
-      "X-GP-Market-Id": "pl",
-      "X-GP-Template-Key": "voucher_delivery_recipient_email",
-      "X-GP-Locale": "pl-PL",
+    // F-09: tylko X-Mailin-Tag (Brevo's documented tag); X-GP-* / Idempotency-Key
+    // usunięte, żeby nie leakować routing/PII do message headers widzialnych w `view source`.
+    expect(payload.headers).toEqual({
       "X-Mailin-Tag": "pl:voucher_delivery_recipient:voucher_delivery_recipient_email",
     });
+    expect(payload.headers).not.toHaveProperty("X-GP-Flow-Id");
+    expect(payload.headers).not.toHaveProperty("X-GP-Template-Key");
+    expect(payload.headers).not.toHaveProperty("X-GP-Locale");
+    expect(payload.headers).not.toHaveProperty("Idempotency-Key");
   });
 
   it("obsługuje alternatywne pole message-id z odpowiedzi Brevo", async () => {
@@ -248,7 +249,7 @@ describe("BrevoAdapter", () => {
     const adapter = makeAdapter(client);
 
     await expect(adapter.send(makeIntent())).rejects.toMatchObject({
-      error_code: "BREVO_503",
+      error_code: "BREVO_HTTP_503",
       status_code: 503,
       message: "Service unavailable",
     });
