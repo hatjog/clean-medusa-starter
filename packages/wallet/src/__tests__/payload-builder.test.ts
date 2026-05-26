@@ -39,7 +39,7 @@ describe("DefaultWalletPayloadBuilder", () => {
       expires_at: "2026-12-31T23:59:59.000Z",
       deep_link: "https://bonbeauty.example/pl/vouchers/BB-2026-0001",
       barcode_spec: { format: "PDF417", value: "PDF417-BB-2026-0001" },
-      qr_code: "PDF417-BB-2026-0001",
+      qr_code: undefined,
       barcode: { format: "PDF417", value: "PDF417-BB-2026-0001" },
       branding: {
         logo_url: "https://assets.example/logo.svg",
@@ -112,6 +112,24 @@ describe("DefaultWalletPayloadBuilder", () => {
     expect(builder.build(entitlement, "pl-PL").status).toBe(expected)
   })
 
+  it("populates qr_code only when barcode_spec.format === 'QR'", () => {
+    const builder = new DefaultWalletPayloadBuilder()
+
+    const qr = builder.build(
+      { ...fullEntitlement, barcode_spec: { format: "QR", value: "QR-CODE-1" } },
+      "pl-PL"
+    )
+    expect(qr.qr_code).toBe("QR-CODE-1")
+    expect(qr.barcode).toBeUndefined()
+
+    const pdf = builder.build(
+      { ...fullEntitlement, barcode_spec: { format: "PDF417", value: "PDF-1" } },
+      "pl-PL"
+    )
+    expect(pdf.qr_code).toBeUndefined()
+    expect(pdf.barcode).toEqual({ format: "PDF417", value: "PDF-1" })
+  })
+
   it("uses wallet metadata projection before generic entitlement fields", () => {
     const builder = new DefaultWalletPayloadBuilder()
     const entitlement: EntitlementInstance = {
@@ -138,9 +156,8 @@ describe("DefaultWalletPayloadBuilder", () => {
     })
   })
 
-  it("reads only the Layer 4 read model in buildFromEntitlement", async () => {
+  it("reads only the Layer 4 read model in buildFromEntitlement (sanity)", async () => {
     const getById = jest.fn(async () => fullEntitlement)
-    const layer3Repository = { getById: jest.fn() }
     const readModel: EntitlementInstanceReadModel = { getById }
     const builder = new DefaultWalletPayloadBuilder(readModel)
 
@@ -148,7 +165,49 @@ describe("DefaultWalletPayloadBuilder", () => {
 
     expect(payload.code).toBe("BB-2026-0001")
     expect(getById).toHaveBeenCalledWith("ei_123")
-    expect(layer3Repository.getById).not.toHaveBeenCalled()
+  })
+
+  it("never accesses L3/L2/L1 methods on the injected dependency (invariant D-V180-ARCH-6)", async () => {
+    // Proxy traps any non-L4 method access. Layer 4 contract = `getById` only.
+    const allowed = new Set(["getById", "then"])
+    const accessed: string[] = []
+    const readModel = new Proxy(
+      { getById: jest.fn(async () => fullEntitlement) },
+      {
+        get(target, prop, receiver) {
+          if (typeof prop === "string") {
+            accessed.push(prop)
+            if (!allowed.has(prop)) {
+              throw new Error(
+                `Layer 4 isolation violated: builder accessed forbidden property "${prop}" on dependency`
+              )
+            }
+          }
+          return Reflect.get(target, prop, receiver)
+        },
+      }
+    ) as unknown as EntitlementInstanceReadModel
+    const builder = new DefaultWalletPayloadBuilder(readModel)
+
+    const payload = await builder.buildFromEntitlement("ei_123", "pl-PL")
+
+    expect(payload.entitlement_instance_id).toBe("ei_123")
+    expect(accessed.filter((p) => !allowed.has(p))).toEqual([])
+    // Explicitly confirm builder did NOT try common L3 repository names.
+    const forbidden = [
+      "find",
+      "findOne",
+      "list",
+      "save",
+      "create",
+      "update",
+      "delete",
+      "query",
+      "manager",
+      "em",
+      "knex",
+    ]
+    expect(accessed.filter((p) => forbidden.includes(p))).toEqual([])
   })
 
   it("throws typed error when entitlement instance is missing", async () => {

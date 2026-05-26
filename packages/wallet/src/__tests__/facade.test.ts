@@ -93,16 +93,113 @@ describe("DefaultWalletPassFacade", () => {
     ).not.toHaveBeenCalled()
   })
 
-  it("normalizes unsupported locale before delegating to builder and provider", async () => {
+  it("normalizes unsupported locale and records requested/effective in audit envelope (F-04)", async () => {
     const google = createProvider("https://pay.google.com/gp/v/save/token")
     const apple = createProvider("https://wallet.apple.example/pass/token")
     const builder = createBuilder()
     const facade = createFacade({ google, apple }, builder)
 
-    await facade.generatePass("ei_123", "google", "fr-FR")
+    // Cast simulates a non-canonical locale supplied via JS caller or loose cast.
+    const result = await facade.generatePass(
+      "ei_123",
+      "google",
+      "fr-FR" as never
+    )
 
     expect(builder.buildFromEntitlement).toHaveBeenCalledWith("ei_123", "pl-PL")
     expect(google.issueSaveUrl).toHaveBeenCalledWith(payload, "pl-PL")
+    expect(result.audit_event.requested_locale).toBe("fr-FR")
+    expect(result.audit_event.effective_locale).toBe("pl-PL")
+  })
+
+  it("preserves canonical locale in audit envelope when caller passes it cleanly", async () => {
+    const google = createProvider("https://pay.google.com/gp/v/save/token")
+    const apple = createProvider("https://wallet.apple.example/pass/token")
+    const facade = createFacade({ google, apple })
+
+    const result = await facade.generatePass("ei_123", "google", "en-US")
+
+    expect(result.audit_event.requested_locale).toBe("en-US")
+    expect(result.audit_event.effective_locale).toBe("en-US")
+  })
+
+  it("throws UnsupportedWalletProviderError with PROVIDER_NOT_REGISTERED when provider is missing in registry (F-01)", async () => {
+    // v1.10.0 Apple flag-off: DI registers only `google`.
+    const google = createProvider("https://pay.google.com/gp/v/save/token")
+    const facade = new DefaultWalletPassFacade({ google }, createBuilder(), {
+      now: () => new Date(timestamp),
+    })
+
+    await expect(facade.generatePass("ei_123", "apple", "pl-PL")).rejects.toMatchObject({
+      name: "UnsupportedWalletProviderError",
+      audit_event: {
+        event_type: "wallet.pass_failed",
+        entitlement_instance_id: "ei_123",
+        provider: "apple",
+        timestamp,
+        outcome: "failure",
+        error_code: "PROVIDER_NOT_REGISTERED",
+      },
+    } satisfies Partial<UnsupportedWalletProviderError>)
+  })
+
+  it("invalidatePass also raises PROVIDER_NOT_REGISTERED with reason in audit (F-01 invalidate path)", async () => {
+    const google = createProvider("https://pay.google.com/gp/v/save/token")
+    const facade = new DefaultWalletPassFacade({ google }, createBuilder(), {
+      now: () => new Date(timestamp),
+    })
+
+    await expect(
+      facade.invalidatePass("ei_123", "apple", "revoked")
+    ).rejects.toMatchObject({
+      name: "UnsupportedWalletProviderError",
+      audit_event: {
+        event_type: "wallet.pass_invalidation_failed",
+        provider: "apple",
+        reason: "revoked",
+        error_code: "PROVIDER_NOT_REGISTERED",
+      },
+    })
+  })
+
+  it.each([
+    ["", "generatePass"],
+    ["   ", "generatePass"],
+  ])(
+    "rejects empty entitlement_instance_id %p in generatePass with ENTITLEMENT_INSTANCE_ID_MISSING (F-06)",
+    async (id) => {
+      const facade = createFacade({
+        google: createProvider("https://pay.google.com/gp/v/save/token"),
+        apple: createProvider("https://wallet.apple.example/pass/token"),
+      })
+
+      await expect(facade.generatePass(id, "google", "pl-PL")).rejects.toMatchObject({
+        name: "WalletPassGenerationError",
+        audit_event: {
+          event_type: "wallet.pass_failed",
+          provider: "google",
+          outcome: "failure",
+          error_code: "ENTITLEMENT_INSTANCE_ID_MISSING",
+        },
+      })
+    }
+  )
+
+  it("rejects empty entitlement_instance_id in invalidatePass with ENTITLEMENT_INSTANCE_ID_MISSING (F-06)", async () => {
+    const facade = createFacade({
+      google: createProvider("https://pay.google.com/gp/v/save/token"),
+      apple: createProvider("https://wallet.apple.example/pass/token"),
+    })
+
+    await expect(facade.invalidatePass("", "google", "revoked")).rejects.toMatchObject({
+      name: "WalletPassInvalidationError",
+      audit_event: {
+        event_type: "wallet.pass_invalidation_failed",
+        provider: "google",
+        reason: "revoked",
+        error_code: "ENTITLEMENT_INSTANCE_ID_MISSING",
+      },
+    })
   })
 
   it("uses runtime clock when no fixed clock is injected", async () => {

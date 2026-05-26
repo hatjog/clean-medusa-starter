@@ -3,16 +3,27 @@ import {
   normalizeWalletLocale,
   type AuditEnvelope,
   type WalletInvalidationReason,
+  type WalletLocale,
   type WalletProviderKind,
 } from "./payload"
 import type { WalletPayloadBuilder } from "./payload-builder"
 import type { WalletPassProvider } from "./provider"
 
 export interface WalletPassFacade {
+  /**
+   * Generuje wallet pass dla danego entitlement_instance.
+   *
+   * @param entitlement_instance_id - L4 entitlement_instance ID (non-empty).
+   * @param provider - kanoniczny `WalletProviderKind` ("google" | "apple").
+   * @param locale - kanoniczny BCP 47 locale z `WALLET_LOCALES`. Jeśli caller
+   *   poda string spoza unionu (np. via cast / JS), facade zaaplikuje silent
+   *   fallback do "pl-PL" oraz oznaczy to w `audit_event.requested_locale`
+   *   oraz `audit_event.effective_locale`.
+   */
   generatePass(
     entitlement_instance_id: string,
     provider: WalletProviderKind,
-    locale: string
+    locale: WalletLocale
   ): Promise<{ save_url: string; audit_event: AuditEnvelope }>
 
   invalidatePass(
@@ -22,7 +33,9 @@ export interface WalletPassFacade {
   ): Promise<{ audit_event: AuditEnvelope }>
 }
 
-export type WalletProviderRegistry = Record<WalletProviderKind, WalletPassProvider>
+export type WalletProviderRegistry = Partial<
+  Record<WalletProviderKind, WalletPassProvider>
+>
 
 export interface WalletPassFacadeOptions {
   now?: () => Date
@@ -71,23 +84,31 @@ export class DefaultWalletPassFacade implements WalletPassFacade {
   async generatePass(
     entitlement_instance_id: string,
     provider: WalletProviderKind,
-    locale: string
+    locale: WalletLocale
   ): Promise<{ save_url: string; audit_event: AuditEnvelope }> {
+    this.requireEntitlementInstanceId(
+      entitlement_instance_id,
+      provider,
+      "wallet.pass_failed"
+    )
+
     const provider_impl = this.resolveProvider(
       entitlement_instance_id,
       provider,
       "wallet.pass_failed"
     )
 
+    const requested_locale = String(locale)
+    const effective_locale = normalizeWalletLocale(requested_locale)
+
     try {
-      const normalized_locale = normalizeWalletLocale(locale)
       const payload = await this.payload_builder.buildFromEntitlement(
         entitlement_instance_id,
-        normalized_locale
+        effective_locale
       )
       const { save_url } = await provider_impl.issueSaveUrl(
         payload,
-        normalized_locale
+        effective_locale
       )
       const audit_event = this.createAuditEvent({
         event_type: "wallet.pass_generated",
@@ -95,6 +116,8 @@ export class DefaultWalletPassFacade implements WalletPassFacade {
         provider,
         save_url,
         outcome: "success",
+        requested_locale,
+        effective_locale,
       })
 
       return { save_url, audit_event }
@@ -106,6 +129,8 @@ export class DefaultWalletPassFacade implements WalletPassFacade {
         outcome: "failure",
         error_code: errorName(error),
         error_message: errorMessage(error),
+        requested_locale,
+        effective_locale,
       })
       throw new WalletPassGenerationError(
         `Failed to generate wallet pass for entitlement_instance ${entitlement_instance_id}`,
@@ -120,10 +145,18 @@ export class DefaultWalletPassFacade implements WalletPassFacade {
     provider: WalletProviderKind,
     reason: WalletInvalidationReason
   ): Promise<{ audit_event: AuditEnvelope }> {
+    this.requireEntitlementInstanceId(
+      entitlement_instance_id,
+      provider,
+      "wallet.pass_invalidation_failed",
+      reason
+    )
+
     const provider_impl = this.resolveProvider(
       entitlement_instance_id,
       provider,
-      "wallet.pass_invalidation_failed"
+      "wallet.pass_invalidation_failed",
+      reason
     )
 
     try {
@@ -155,12 +188,45 @@ export class DefaultWalletPassFacade implements WalletPassFacade {
     }
   }
 
+  private requireEntitlementInstanceId(
+    entitlement_instance_id: string,
+    provider: WalletProviderKind,
+    failure_event_type:
+      | "wallet.pass_failed"
+      | "wallet.pass_invalidation_failed",
+    reason?: WalletInvalidationReason
+  ): void {
+    if (
+      typeof entitlement_instance_id !== "string" ||
+      entitlement_instance_id.trim().length === 0
+    ) {
+      const audit_event = this.createAuditEvent({
+        event_type: failure_event_type,
+        entitlement_instance_id: String(entitlement_instance_id ?? ""),
+        provider: String(provider),
+        outcome: "failure",
+        error_code: "ENTITLEMENT_INSTANCE_ID_MISSING",
+        error_message: "entitlement_instance_id is required and must be a non-empty string",
+        reason,
+      })
+      const ErrorCtor =
+        failure_event_type === "wallet.pass_failed"
+          ? WalletPassGenerationError
+          : WalletPassInvalidationError
+      throw new ErrorCtor(
+        "entitlement_instance_id is required and must be a non-empty string",
+        audit_event
+      )
+    }
+  }
+
   private resolveProvider(
     entitlement_instance_id: string,
     provider: WalletProviderKind,
     failure_event_type:
       | "wallet.pass_failed"
-      | "wallet.pass_invalidation_failed"
+      | "wallet.pass_invalidation_failed",
+    reason?: WalletInvalidationReason
   ): WalletPassProvider {
     if (!isWalletProviderKind(provider)) {
       const audit_event = this.createAuditEvent({
@@ -170,11 +236,26 @@ export class DefaultWalletPassFacade implements WalletPassFacade {
         outcome: "failure",
         error_code: "UNSUPPORTED_PROVIDER",
         error_message: `Unsupported wallet provider: ${String(provider)}`,
+        reason,
       })
       throw new UnsupportedWalletProviderError(audit_event)
     }
 
-    return this.providers[provider]
+    const impl = this.providers[provider]
+    if (!impl) {
+      const audit_event = this.createAuditEvent({
+        event_type: failure_event_type,
+        entitlement_instance_id,
+        provider,
+        outcome: "failure",
+        error_code: "PROVIDER_NOT_REGISTERED",
+        error_message: `Wallet provider not registered in DI: ${provider}`,
+        reason,
+      })
+      throw new UnsupportedWalletProviderError(audit_event)
+    }
+
+    return impl
   }
 
   private createAuditEvent(input: {
@@ -186,6 +267,8 @@ export class DefaultWalletPassFacade implements WalletPassFacade {
     reason?: WalletInvalidationReason
     error_code?: string
     error_message?: string
+    requested_locale?: string
+    effective_locale?: WalletLocale
   }): AuditEnvelope {
     return {
       event_type: input.event_type,
@@ -197,6 +280,8 @@ export class DefaultWalletPassFacade implements WalletPassFacade {
       outcome: input.outcome,
       error_code: input.error_code,
       error_message: input.error_message,
+      requested_locale: input.requested_locale,
+      effective_locale: input.effective_locale,
     }
   }
 }

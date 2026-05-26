@@ -129,7 +129,7 @@ export class DefaultWalletPayloadBuilder implements WalletPayloadBuilder {
       expires_at,
       deep_link,
       barcode_spec,
-      qr_code: barcode_spec.value,
+      qr_code: barcode_spec.format === "QR" ? barcode_spec.value : undefined,
       barcode: barcode_spec.format === "PDF417" ? barcode_spec : undefined,
       branding,
       locale: normalized_locale,
@@ -245,13 +245,18 @@ function resolveBarcodeSpec(
   }
 }
 
+function pickString(value: string | undefined, fallback: string): string {
+  const trimmed = value?.trim()
+  return trimmed && trimmed.length > 0 ? trimmed : fallback
+}
+
 function resolveBranding(
   branding: Partial<WalletBranding> | undefined,
   fallback: WalletBranding
 ): WalletBranding {
   return {
-    logo_url: branding?.logo_url?.trim() || fallback.logo_url,
-    primary_color: branding?.primary_color?.trim() || fallback.primary_color,
-    accent_color: branding?.accent_color?.trim() || fallback.accent_color,
+    logo_url: pickString(branding?.logo_url, fallback.logo_url),
+    primary_color: pickString(branding?.primary_color, fallback.primary_color),
+    accent_color: pickString(branding?.accent_color, fallback.accent_color),
   }
 }

@@ -27,7 +27,7 @@ export interface WalletPayload {
   expires_at: string
   deep_link: string
   barcode_spec: WalletBarcodeSpec
-  qr_code: string
+  qr_code?: string
   barcode?: WalletBarcodeSpec
   branding: WalletBranding
   locale: WalletLocale
@@ -41,7 +41,8 @@ export type WalletAuditEventType =
 
 export type WalletAuditOutcome = "success" | "failure"
 
-// TODO: migrate to shared @gp/audit when the audit package exists.
+// TODO(F-11, deferred architectural): migrate to shared @gp/audit when the
+// audit package consolidation lands (Epic J observability follow-up story).
 export interface AuditEnvelope {
   event_type: WalletAuditEventType
   entitlement_instance_id: string
@@ -52,6 +53,8 @@ export interface AuditEnvelope {
   outcome: WalletAuditOutcome
   error_code?: string
   error_message?: string
+  requested_locale?: string
+  effective_locale?: WalletLocale
 }
 
 export type AuditEvent = AuditEnvelope

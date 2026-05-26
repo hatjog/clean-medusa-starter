@@ -4,6 +4,11 @@ import type {
   WalletPayload,
 } from "./payload"
 
+/**
+ * Provider-neutral port dla wallet adaptera (Google / Apple).
+ * D-108 canonical name = `WalletPassProvider`. Story brief mówił `IWalletProvider`,
+ * ale w v1.10.0 trzymamy się jednego publicznego nazewnictwa zgodnego z architekturą.
+ */
 export interface WalletPassProvider {
   issueSaveUrl(
     payload: WalletPayload,
@@ -15,5 +20,3 @@ export interface WalletPassProvider {
     reason: WalletInvalidationReason
   ): Promise<void>
 }
-
-export type IWalletProvider = WalletPassProvider

@@ -17,7 +17,7 @@ export type {
   WalletPayloadBuilder,
   WalletPayloadBuilderOptions,
 } from "./payload-builder"
-export type { IWalletProvider, WalletPassProvider } from "./provider"
+export type { WalletPassProvider } from "./provider"
 export {
   WALLET_LOCALES,
   WALLET_PROVIDER_KINDS,
