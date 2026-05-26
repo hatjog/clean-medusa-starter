@@ -11,6 +11,7 @@ import { loadEnv } from "@medusajs/framework/utils";
 // Required: modules ARRAY form (wrapper iterates `.some()` on config.modules).
 // Conversion z record → array w tej commit.
 import { withMercur } from "@mercurjs/core/with-mercur";
+import { buildTranslationModuleConfig } from "./packages/api/src/lib/translation-ff-config";
 
 loadEnv(process.env.NODE_ENV || "development", process.cwd());
 
@@ -20,6 +21,7 @@ loadEnv(process.env.NODE_ENV || "development", process.cwd());
 // `src/` base (story v160-1-8 Patch #2).
 const moduleRoot = (subpath: string) =>
   path.resolve(__dirname, "packages/api/src/modules", subpath);
+const translationModules = buildTranslationModuleConfig(process.env, process.argv);
 
 module.exports = withMercur({
   // admin.disable defaults to true via withMercur wrapper (still set explicit
@@ -103,6 +105,7 @@ module.exports = withMercur({
         mercurDatabaseUrl: process.env.GP_MERCUR_DATABASE_URL || process.env.DATABASE_URL,
       },
     },
+    ...translationModules,
     // Mercur 2 admin_ui + vendor_ui dashboard modules disabled dla Phase A1
     // (frontend panels = Sprint 2 territory; bez disable Mercur 2
     // dashboardMiddleware crashes na "TypeError: app is not a function").

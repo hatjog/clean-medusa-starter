@@ -11,6 +11,7 @@ import { parseDryRunFlag, parseOverwriteFlag } from "./gp-sync-dry-run"
 import gpConfigSyncAccounts from "./gp-config-sync-accounts"
 import gpConfigSyncBlog from "./gp-config-sync-blog"
 import gpConfigSyncCatalog from "./gp-config-sync-catalog"
+import gpConfigSyncTranslations from "./gp-config-sync-translations"
 import gpConfigSyncMedia from "./gp-config-sync-media"
 import gpConfigSyncPayments from "./gp-config-sync-payments"
 import gpConfigSyncShipping from "./gp-config-sync-shipping"
@@ -548,6 +549,18 @@ export default async function gpConfigSyncOrchestrator({ container, args }: Exec
             await invokeStageEntrypoint(gpConfigSyncCatalog, container, stageArgs)
           })
           return "catalog sync completed"
+        },
+      },
+      {
+        name: "sync-translations",
+        required: true,
+        execute: async () => {
+          await withStageEnv(orchestratorArgs, async () => {
+            await invokeStageEntrypoint(gpConfigSyncTranslations, container, stageArgs)
+          })
+          return orchestratorArgs.dryRun
+            ? "translations dry-run completed"
+            : "translations sync completed"
         },
       },
       {
