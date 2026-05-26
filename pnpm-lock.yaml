@@ -139,6 +139,8 @@ importers:
         specifier: ^1.0.0-pre.53
         version: 1.0.0-pre.53
 
+  packages/messaging: {}
+
 packages:
 
   '@alloc/quick-lru@5.2.0':
