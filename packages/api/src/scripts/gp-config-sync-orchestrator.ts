@@ -11,15 +11,18 @@ import { parseDryRunFlag, parseOverwriteFlag } from "./gp-sync-dry-run"
 import gpConfigSyncAccounts from "./gp-config-sync-accounts"
 import gpConfigSyncBlog from "./gp-config-sync-blog"
 import gpConfigSyncCatalog from "./gp-config-sync-catalog"
+import gpConfigSyncTranslations from "./gp-config-sync-translations"
 import gpConfigSyncMedia from "./gp-config-sync-media"
 import gpConfigSyncPayments from "./gp-config-sync-payments"
 import gpConfigSyncShipping from "./gp-config-sync-shipping"
 import gpConfigSyncVendors from "./gp-config-sync-vendors"
+import { isTranslationFeatureFlagEnabled } from "../lib/translation-ff-config"
 
 const ADVISORY_LOCK_ID = 1234567890
 const SLUG_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/
 
 type OrchestratorArgs = {
+  allowSkip: boolean
   instanceId: string
   marketId: string
   configRoot: string
@@ -30,10 +33,18 @@ type OrchestratorArgs = {
 type StageRunResult = {
   name: string
   required: boolean
-  status: "ok" | "warning"
+  status: "ok" | "skipped" | "warning"
   duration_ms: number
   message?: string
 }
+
+type StageExecutionResult =
+  | string
+  | void
+  | {
+      status: "skipped"
+      message: string
+    }
 
 export type HealthReport = {
   totalProducts: number
@@ -91,12 +102,32 @@ export function parseOrchestratorArgs(args: string[] | undefined): OrchestratorA
   ).trim()
   const dryRun = parseDryRunFlag(args)
   const overwrite = parseOverwriteFlag(args)
+  const allowSkip = args?.includes("--allow-skip") === true
 
   if (!instanceId) throw new Error("instanceId is required (args[0] or GP_INSTANCE_ID)")
   if (!marketId) throw new Error("marketId is required (args[1] or GP_MARKET_ID)")
   if (!configRoot) throw new Error("configRoot is required (GP_CONFIG_ROOT)")
 
-  return { instanceId, marketId, configRoot, dryRun, overwrite }
+  return { allowSkip, instanceId, marketId, configRoot, dryRun, overwrite }
+}
+
+export function assertTranslationStageGate(
+  orchestratorArgs: Pick<OrchestratorArgs, "allowSkip">,
+  env: NodeJS.ProcessEnv = process.env
+): void {
+  const stage = env.MEDUSA_STAGE?.trim().toLowerCase()
+  const gatedStages = new Set(["staging", "canary", "production"])
+
+  if (
+    stage &&
+    gatedStages.has(stage) &&
+    !isTranslationFeatureFlagEnabled(env) &&
+    !orchestratorArgs.allowSkip
+  ) {
+    throw new Error(
+      `FF translation gate required in stage ${stage}; pass --allow-skip to override`
+    )
+  }
 }
 
 function resolveProductModuleService(container: any): any {
@@ -232,12 +263,23 @@ async function acquireAdvisoryLock(db: Knex, lockId: number): Promise<AdvisoryLo
 export async function runStage(stage: {
   name: string
   required: boolean
-  execute: () => Promise<string | void>
+  execute: () => Promise<StageExecutionResult>
 }): Promise<StageRunResult> {
   const started = Date.now()
 
   try {
-    const message = await stage.execute()
+    const result = await stage.execute()
+    if (result && typeof result === "object" && result.status === "skipped") {
+      return {
+        name: stage.name,
+        required: stage.required,
+        status: "skipped",
+        duration_ms: Date.now() - started,
+        message: result.message,
+      }
+    }
+
+    const message = typeof result === "string" ? result : undefined
     return {
       name: stage.name,
       required: stage.required,
@@ -310,16 +352,16 @@ async function withStageEnv<T>(
   }
 }
 
-async function invokeStageEntrypoint(
-  entrypoint: (ctx: ExecArgs) => Promise<void>,
+async function invokeStageEntrypoint<T>(
+  entrypoint: (ctx: ExecArgs) => Promise<T>,
   container: any,
   args: string[]
-): Promise<void> {
+): Promise<T> {
   const previousExitCode = process.exitCode
 
   try {
     process.exitCode = undefined
-    await entrypoint({ container, args })
+    return await entrypoint({ container, args })
   } finally {
     process.exitCode = previousExitCode
   }
@@ -521,6 +563,7 @@ function buildSlackSummary(summary: OrchestratorSummary): string {
 
 export default async function gpConfigSyncOrchestrator({ container, args }: ExecArgs) {
   const orchestratorArgs = parseOrchestratorArgs(args)
+  assertTranslationStageGate(orchestratorArgs)
   const db = container.resolve(ContainerRegistrationKeys.PG_CONNECTION) as Knex
   const productModuleService = resolveProductModuleService(container)
   const lock = await acquireAdvisoryLock(db, ADVISORY_LOCK_ID)
@@ -548,6 +591,32 @@ export default async function gpConfigSyncOrchestrator({ container, args }: Exec
             await invokeStageEntrypoint(gpConfigSyncCatalog, container, stageArgs)
           })
           return "catalog sync completed"
+        },
+      },
+      {
+        name: "sync-translations",
+        required: true,
+        execute: async () => {
+          const result = await withStageEnv(orchestratorArgs, async () => {
+            return await invokeStageEntrypoint(gpConfigSyncTranslations, container, stageArgs)
+          })
+
+          if ("skipped" in result && result.skipped) {
+            return {
+              status: "skipped" as const,
+              message: "translations sync: SKIPPED (FF=false)",
+            }
+          }
+
+          const completedResult = result as Extract<
+            Awaited<ReturnType<typeof gpConfigSyncTranslations>>,
+            { store: unknown }
+          >
+          const localeCount = completedResult.store.codes.length
+          const settingsCount = completedResult.translation_settings.entity_types.length
+          return orchestratorArgs.dryRun
+            ? `translations sync: COMPLETED (dry-run, FF=true, locales=${localeCount}, settings=${settingsCount})`
+            : `translations sync: COMPLETED (FF=true, locales=${localeCount}, settings=${settingsCount})`
         },
       },
       {
