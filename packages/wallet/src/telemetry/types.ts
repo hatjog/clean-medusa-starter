@@ -10,6 +10,10 @@ export type WalletCounter = (typeof WALLET_COUNTERS)[number]
 
 export type WalletFailureCode = "provider_error" | "network" | "policy_deny"
 
+// TODO(F13): re-export `WalletGateReason` from `@gp/wallet/policy` once Story
+// 3.4 (WalletFeaturePolicy) lands so this enum is not duplicated. Until then
+// keep this list in sync with the policy SSOT — adding a new reason here
+// without updating the policy will surface a TS error at the call site.
 export type WalletGateReason =
   | "market_not_pilot"
   | "apple_disabled"
@@ -41,6 +45,8 @@ export interface PostHogCaptureClient {
     event: string
     properties: Record<string, unknown>
   }): void
+  shutdown?(): Promise<void> | void
+  flush?(): Promise<void> | void
 }
 
 export interface SentryCaptureClient {

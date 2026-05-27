@@ -7,15 +7,35 @@ import type {
 
 let posthogClient: PostHogCaptureClient | null = null
 let sentryClient: SentryCaptureClient | null = null
+let envInitAttempted = false
 
 export function setWalletPostHogClient(
   client: PostHogCaptureClient | null
 ): void {
   posthogClient = client
+  // Reset env init guard so subsequent emits do not silently revive a
+  // process-wide singleton after test cleanup. (F12)
+  envInitAttempted = client !== null
 }
 
 export function setWalletSentryClient(client: SentryCaptureClient | null): void {
   sentryClient = client
+}
+
+export async function shutdownWalletPostHogClient(): Promise<void> {
+  const client = posthogClient
+  if (!client) return
+  try {
+    if (typeof client.shutdown === "function") {
+      await client.shutdown()
+    } else if (typeof client.flush === "function") {
+      await client.flush()
+    }
+  } catch (err) {
+    sentryClient?.captureMessage("posthog_emit_failed", {
+      extra: { counter: "shutdown", err },
+    })
+  }
 }
 
 export function emitWalletCounter(
@@ -26,16 +46,23 @@ export function emitWalletCounter(
     const client = posthogClient ?? createPostHogClientFromEnv()
     if (!client) return
 
+    const { error_message, gate_reason, ...rest } = props as WalletCounterProps & {
+      error_message?: string
+      gate_reason?: string
+    }
+
+    const properties: Record<string, unknown> = { ...rest }
+    if (typeof error_message === "string") {
+      properties.error_message = sanitizeWalletErrorMessage(error_message)
+    }
+    if (typeof gate_reason === "string") {
+      properties.gate_reason = gate_reason
+    }
+
     client.capture({
       distinctId: `actor:P4:${props.entitlement_instance_id}`,
       event: `wallet.${counter}`,
-      properties: {
-        ...props,
-        error_message:
-          "error_message" in props
-            ? sanitizeWalletErrorMessage(props.error_message)
-            : undefined,
-      },
+      properties,
     })
   } catch (err) {
     sentryClient?.captureMessage("posthog_emit_failed", {
@@ -57,20 +84,34 @@ export function sanitizeWalletErrorMessage(message: unknown): string {
 }
 
 function createPostHogClientFromEnv(): PostHogCaptureClient | null {
+  if (envInitAttempted) return posthogClient
+  envInitAttempted = true
+
   const apiKey = process.env.POSTHOG_API_KEY
   if (!apiKey) return null
 
   try {
-    // Optional runtime dependency from the backend workspace; keeping it lazy
-    // prevents tests and package consumers from needing PostHog configured.
+    // The @gp/wallet package is compiled to CommonJS (tsconfig module:Node16,
+    // no "type": "module" in backend package.json); `require` is therefore
+    // available at runtime. The dependency stays lazy so tests and consumers
+    // without PostHog configured do not pay an import cost.
     const { PostHog } = require("posthog-node") as {
       PostHog: new (
         key: string,
-        options?: { host?: string }
+        options?: {
+          host?: string
+          flushAt?: number
+          flushInterval?: number
+        }
       ) => PostHogCaptureClient
     }
+    // flushAt:1 ships counters immediately rather than buffering up to 20
+    // events (default), reducing event loss on SIGTERM in short-lived
+    // workers and avoiding flaky test timing.
     posthogClient = new PostHog(apiKey, {
       host: process.env.POSTHOG_HOST,
+      flushAt: 1,
+      flushInterval: 0,
     })
     return posthogClient
   } catch (err) {

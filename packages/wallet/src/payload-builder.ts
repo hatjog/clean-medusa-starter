@@ -154,7 +154,11 @@ function resolveEntitlementType(entitlement_instance: EntitlementInstance): stri
     wallet_metadata.entitlement_type ??
       entitlement_instance.metadata?.gp?.entitlement_type ??
       entitlement_instance.entitlement_type,
-    "voucher"
+    // Default to "unknown" (mirroring `resolveMarket`) so the dashboard can
+    // distinguish a missing projection field from an actual voucher
+    // entitlement. The story-level assumption that v1.10.0 only ships
+    // vouchers still holds, but conflating the two values would hide drift.
+    "unknown"
   )
 }
 
