@@ -142,7 +142,11 @@ importers:
         specifier: ^1.0.0-pre.53
         version: 1.0.0-pre.53
 
-  packages/messaging: {}
+  packages/messaging:
+    dependencies:
+      js-yaml:
+        specifier: ^4.1.1
+        version: 4.1.1
 
   packages/wallet:
     devDependencies:

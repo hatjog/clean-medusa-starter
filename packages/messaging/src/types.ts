@@ -51,6 +51,7 @@ export interface AuditEnvelope {
   occurred_at: string;
   error_code?: string;
   error_message?: string;
+  gate_source?: "feature_flag";
 }
 
 export interface NotificationDispatch {

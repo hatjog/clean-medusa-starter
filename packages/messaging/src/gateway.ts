@@ -6,6 +6,7 @@ import {
   UnsupportedChannelError,
   UnsupportedProviderError,
 } from "./errors";
+import type { ICommunicationFlowFlagResolver } from "./feature-flag-resolver";
 import type { IMessagingProvider } from "./provider";
 import type {
   AuditEnvelope,
@@ -37,20 +38,48 @@ export type MessagingProviderRegistry =
   | Map<string, IMessagingProvider>
   | Partial<Record<string, IMessagingProvider>>;
 
+export interface MessagingGatewayOptions {
+  flagResolver?: ICommunicationFlowFlagResolver;
+  clock?: () => Date;
+  uuid?: () => string;
+  idempotencyTtlMs?: number;
+  maxCacheSize?: number;
+}
+
 export class DefaultMessagingGateway implements MessagingGateway {
   private readonly idempotencyCache = new Map<string, CachedDispatch>();
   // F-12: Map storage zamiast Object — żaden prototypowy klucz (`__proto__`, `constructor`)
   // nie pollutuje lookup; klucze pochodzą wprost z rejestracji providerów.
   private readonly providers: Map<string, IMessagingProvider>;
+  private readonly clock: () => Date;
+  private readonly uuid: () => string;
+  private readonly idempotencyTtlMs: number;
+  private readonly maxCacheSize: number;
+  private readonly flagResolver?: ICommunicationFlowFlagResolver;
 
   constructor(
     providers: MessagingProviderRegistry,
     private readonly defaultProvider: NotificationProvider,
-    private readonly clock: () => Date = () => new Date(),
-    private readonly uuid: () => string = () => randomUUID(),
-    private readonly idempotencyTtlMs: number = DEFAULT_TTL_MS,
-    private readonly maxCacheSize: number = DEFAULT_MAX_CACHE_SIZE,
+    optionsOrClock: MessagingGatewayOptions | (() => Date) = {},
+    uuid?: () => string,
+    idempotencyTtlMs: number = DEFAULT_TTL_MS,
+    maxCacheSize: number = DEFAULT_MAX_CACHE_SIZE,
   ) {
+    const options =
+      typeof optionsOrClock === "function"
+        ? {
+            clock: optionsOrClock,
+            uuid,
+            idempotencyTtlMs,
+            maxCacheSize,
+          }
+        : optionsOrClock;
+
+    this.clock = options.clock ?? (() => new Date());
+    this.uuid = options.uuid ?? (() => randomUUID());
+    this.idempotencyTtlMs = options.idempotencyTtlMs ?? DEFAULT_TTL_MS;
+    this.maxCacheSize = options.maxCacheSize ?? DEFAULT_MAX_CACHE_SIZE;
+    this.flagResolver = options.flagResolver;
     this.providers =
       providers instanceof Map
         ? new Map(providers)
@@ -69,6 +98,11 @@ export class DefaultMessagingGateway implements MessagingGateway {
     const cached = this.getCachedDispatch(cacheKey);
     if (cached) {
       return cached;
+    }
+
+    const gatedDispatch = this.applyFeatureFlagGate(intent, cacheKey);
+    if (gatedDispatch) {
+      return gatedDispatch;
     }
 
     const provider = this.providers.get(this.defaultProvider);
@@ -255,6 +289,7 @@ export class DefaultMessagingGateway implements MessagingGateway {
     dispatch_id: string;
     error_code?: string;
     error_message?: string;
+    gate_source?: "feature_flag";
   }): AuditEnvelope {
     return {
       audit_id: this.uuid(),
@@ -273,7 +308,46 @@ export class DefaultMessagingGateway implements MessagingGateway {
       occurred_at: this.clock().toISOString(),
       error_code: input.error_code,
       error_message: input.error_message,
+      gate_source: input.gate_source,
     };
+  }
+
+  private applyFeatureFlagGate(
+    intent: NotificationIntent,
+    cacheKey: string,
+  ): NotificationDispatch | undefined {
+    if (!this.flagResolver) {
+      return undefined;
+    }
+
+    const flagState = this.flagResolver.resolve({
+      flow_id: intent.flow_id,
+      market_id: intent.recipient.market_id,
+    });
+
+    if (flagState.enabled) {
+      return undefined;
+    }
+
+    const dispatchId = this.uuid();
+    const dispatch: NotificationDispatch = {
+      dispatch_id: dispatchId,
+      provider: this.defaultProvider,
+      status: "failed",
+      audit_event: this.createAuditEvent({
+        intent,
+        provider: this.defaultProvider,
+        status: "failed",
+        dispatch_id: dispatchId,
+        error_code: "FLOW_DISABLED",
+        error_message: `Communication flow '${intent.flow_id}' is disabled for market '${intent.recipient.market_id}'`,
+        gate_source: "feature_flag",
+      }),
+    };
+
+    this.cacheDispatch(cacheKey, dispatch);
+
+    return dispatch;
   }
 }
 

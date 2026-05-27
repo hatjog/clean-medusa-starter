@@ -1,4 +1,5 @@
 export * from "./errors";
+export * from "./feature-flag-resolver";
 export * from "./gateway";
 export * from "./provider";
 export * from "./providers/brevo-adapter";
