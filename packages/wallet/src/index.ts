@@ -18,6 +18,8 @@ export type {
   WalletPayloadBuilderOptions,
 } from "./payload-builder"
 export type { WalletPassProvider } from "./provider"
+export { createWalletProviderRegistry } from "./registry"
+export type { CreateWalletProviderRegistryOptions } from "./registry"
 export {
   WALLET_LOCALES,
   WALLET_PROVIDER_KINDS,

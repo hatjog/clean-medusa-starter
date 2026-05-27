@@ -1,4 +1,5 @@
 import type {
+  AuditEnvelope,
   WalletInvalidationReason,
   WalletLocale,
   WalletPayload,
@@ -18,5 +19,5 @@ export interface WalletPassProvider {
   invalidate(
     entitlement_instance_id: string,
     reason: WalletInvalidationReason
-  ): Promise<void>
+  ): Promise<void | { audit_event: AuditEnvelope }>
 }
