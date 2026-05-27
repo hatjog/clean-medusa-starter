@@ -1,25 +1,44 @@
 import type {
   AuditEnvelope,
-  WalletPassStatus,
+  EntitlementLifecycleStatus,
+  WalletDenyReason,
+  WalletInvalidationReason,
   WalletProviderKind,
 } from "./payload"
 
-export type WalletDenyReason =
-  | "market_not_ratified"
-  | "release_not_promotable"
-  | "actor_not_p4_recipient"
-  | "lifecycle_not_active"
-  | "provider_disabled"
+export type { EntitlementLifecycleStatus, WalletDenyReason } from "./payload"
+
+// Persona aktora wallet — zamknięta lista czterech person zgodnych z architecture
+// §282 (P1 admin / P2 vendor / P3 buyer / P4 recipient). Gate akceptuje wyłącznie
+// `P4_recipient`; pozostałe → `actor_not_p4_recipient`. Lista zamknięta zapobiega
+// erozji typu przez literałową unię z `string`.
+export type WalletPersona =
+  | "P4_recipient"
+  | "P3_buyer"
+  | "P2_vendor"
+  | "P1_admin"
 
 export interface WalletActorContext {
   actor_id: string
-  persona: "P4_recipient" | string
+  persona: WalletPersona
 }
 
-export type EntitlementLifecycleStatus =
-  | WalletPassStatus
-  | "PARTIALLY_REDEEMED"
-  | "VOIDED"
+// Mapowanie `WalletInvalidationReason` (Story 3.6 subscriber) na lifecycle gate'a
+// D-110. Caller (route handler / subscriber) MUSI zmapować invalidation reason
+// na lifecycle przed wywołaniem `check()` — gate nie zna invalidation semantyki.
+export function mapWalletInvalidationReasonToLifecycle(
+  reason: WalletInvalidationReason
+): EntitlementLifecycleStatus {
+  switch (reason) {
+    case "expired":
+      return "EXPIRED"
+    case "revoked":
+    case "refunded":
+      // D-110 nie posiada osobnych statusów REVOKED/REFUNDED — oba reasony
+      // kończą lifecycle w stanie VOIDED (terminal, non-recoverable).
+      return "VOIDED"
+  }
+}
 
 export interface WalletFeaturePolicyInput {
   entitlement_instance_id: string
@@ -46,6 +65,9 @@ export interface ReleasePromotabilityProbe {
   isPromotable(release: string): Promise<boolean>
 }
 
+// F-10: sygnatura `isEnabled` jest async, ponieważ port docelowo może czytać ze
+// zdalnego flag store (np. Redis / gp-config IO); domyślna `EnvWalletProviderReadiness`
+// jest synchroniczna w środku, ale interfejs nie wymusza tego konsumentom.
 export interface WalletProviderReadiness {
   isEnabled(provider: WalletProviderKind): Promise<boolean>
 }
@@ -64,6 +86,10 @@ export class DefaultWalletFeaturePolicy implements WalletFeaturePolicy {
     this.clock = deps.clock ?? (() => new Date())
   }
 
+  // Side-effect free. Błąd portu (`marketRegistry`, `releasePromotability`,
+  // `providerReadiness`) propagowany jest do callera — caller jest odpowiedzialny
+  // za fail-closed obsługę (D-112): złapać wyjątek, wyemitować audit envelope
+  // `outcome: "failure"` oraz odpowiedzieć HTTP 5xx zamiast wpuszczać użytkownika.
   async check(
     input: WalletFeaturePolicyInput
   ): Promise<WalletFeaturePolicyResult> {
@@ -127,10 +153,35 @@ export class EnvWalletProviderReadiness implements WalletProviderReadiness {
   }
 }
 
-function parseWalletFlag(value: string | undefined, defaultValue: boolean): boolean {
+const TRUTHY_FLAG_VALUES = new Set(["1", "true", "yes", "on"])
+const FALSY_FLAG_VALUES = new Set(["0", "false", "no", "off"])
+
+// F-05: explicit allowlist + denylist. Pusty string oraz wartości spoza obu list
+// nie zmieniają defaultu — chroni przed nieintencjonalnym wyłączeniem providera
+// przez pomyłkowy `WALLET_GOOGLE_ENABLED=""` w `.env`. Nieznane wartości produkują
+// `console.warn`, aby ułatwić diagnostykę bez zatrzymywania startu procesu.
+export function parseWalletFlag(
+  value: string | undefined,
+  defaultValue: boolean
+): boolean {
   if (value === undefined) {
     return defaultValue
   }
 
-  return ["1", "true", "yes", "on"].includes(value.trim().toLowerCase())
+  const normalized = value.trim().toLowerCase()
+  if (normalized === "") {
+    return defaultValue
+  }
+  if (TRUTHY_FLAG_VALUES.has(normalized)) {
+    return true
+  }
+  if (FALSY_FLAG_VALUES.has(normalized)) {
+    return false
+  }
+
+  // eslint-disable-next-line no-console
+  console.warn(
+    `[wallet/policy] Nieznana wartość flagi providera: "${value}". Używam wartości domyślnej ${defaultValue}.`
+  )
+  return defaultValue
 }

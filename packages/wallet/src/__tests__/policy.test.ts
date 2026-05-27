@@ -1,6 +1,8 @@
 import {
   DefaultWalletFeaturePolicy,
   EnvWalletProviderReadiness,
+  mapWalletInvalidationReasonToLifecycle,
+  parseWalletFlag,
   type ReleasePromotabilityProbe,
   type WalletFeaturePolicyInput,
   type WalletMarketRegistry,
@@ -105,7 +107,11 @@ describe("DefaultWalletFeaturePolicy", () => {
     })
   })
 
-  it.each(["EXPIRED", "REVOKED", "VOIDED"] as const)(
+  // F-03/F-06: `EntitlementLifecycleStatus` D-110 zawiera tylko ACTIVE / PARTIALLY_REDEEMED
+  // / EXPIRED / VOIDED. `WalletInvalidationReason` (REVOKED/REFUNDED) jest mapowany
+  // na lifecycle VOIDED przez `mapWalletInvalidationReasonToLifecycle` PRZED wywołaniem
+  // `check()` — dlatego w `it.each` nie ma już "REVOKED"/"REFUNDED".
+  it.each(["EXPIRED", "VOIDED"] as const)(
     "odrzuca lifecycle_not_active dla statusu %s",
     async (lifecycle) => {
       const result = await createPolicy().check({ ...baseInput, lifecycle })
@@ -184,6 +190,107 @@ describe("DefaultWalletFeaturePolicy", () => {
       audit_event: {
         outcome: "rejected_market_not_ratified",
       },
+    })
+  })
+
+  // F-06: REVOKED i REFUNDED to `WalletInvalidationReason` (Story 3.6 subscriber);
+  // mapowane na VOIDED przez helper przed wejściem do gate'a. Test fixuje mapowanie
+  // i dowodzi że obie ścieżki kończą się tym samym `lifecycle_not_active` denial.
+  it("mapuje invalidation reason 'expired' na lifecycle EXPIRED", () => {
+    expect(mapWalletInvalidationReasonToLifecycle("expired")).toBe("EXPIRED")
+  })
+
+  it.each(["revoked", "refunded"] as const)(
+    "mapuje invalidation reason %s na VOIDED i odrzuca lifecycle_not_active",
+    async (reason) => {
+      const lifecycle = mapWalletInvalidationReasonToLifecycle(reason)
+      expect(lifecycle).toBe("VOIDED")
+
+      const result = await createPolicy().check({ ...baseInput, lifecycle })
+
+      expect(result).toMatchObject({
+        allowed: false,
+        reason: "lifecycle_not_active",
+        audit_event: {
+          outcome: "rejected_lifecycle_not_active",
+          lifecycle: "VOIDED",
+        },
+      })
+    }
+  )
+
+  // F-07: domyślny `clock` (gdy caller nie wstrzyknie własnego) musi produkować
+  // poprawny ISO 8601 timestamp w envelope; pokrywa default branch arrow function.
+  it("używa domyślnego zegara gdy nie wstrzyknięto override", async () => {
+    const policy = new DefaultWalletFeaturePolicy({
+      marketRegistry: { isWalletRatified: jest.fn(async () => false) },
+      releasePromotability: allowRelease,
+      providerReadiness: allowProvider,
+    })
+
+    const before = Date.now()
+    const result = await policy.check(baseInput)
+    const after = Date.now()
+
+    expect(result.allowed).toBe(false)
+    if (!result.allowed) {
+      expect(typeof result.audit_event.timestamp).toBe("string")
+      const parsed = Date.parse(result.audit_event.timestamp)
+      expect(Number.isNaN(parsed)).toBe(false)
+      expect(parsed).toBeGreaterThanOrEqual(before)
+      expect(parsed).toBeLessThanOrEqual(after)
+    }
+  })
+
+  // F-08: błąd portu propaguje się do callera — gate nie połyka wyjątku, caller
+  // jest odpowiedzialny za fail-closed obsługę (HTTP 5xx + envelope `outcome: failure`).
+  it("propaguje błąd portu zamiast cicho odrzucać (fail-closed po stronie callera)", async () => {
+    const boom = new Error("gp-config IO failure")
+    const policy = createPolicy({
+      marketRegistry: {
+        isWalletRatified: jest.fn(async () => {
+          throw boom
+        }),
+      },
+    })
+
+    await expect(policy.check(baseInput)).rejects.toBe(boom)
+  })
+
+  describe("parseWalletFlag (F-05)", () => {
+    it("zwraca defaultValue dla pustego stringa zamiast cichego false", () => {
+      expect(parseWalletFlag("", true)).toBe(true)
+      expect(parseWalletFlag("   ", true)).toBe(true)
+      expect(parseWalletFlag("", false)).toBe(false)
+    })
+
+    it.each(["0", "false", "no", "off", "FALSE", " no "])(
+      "interpretuje %s jako jawną wartość false",
+      (raw) => {
+        expect(parseWalletFlag(raw, true)).toBe(false)
+      }
+    )
+
+    it.each(["1", "true", "yes", "on", "TRUE"])(
+      "interpretuje %s jako jawną wartość true",
+      (raw) => {
+        expect(parseWalletFlag(raw, false)).toBe(true)
+      }
+    )
+
+    it("dla nieznanej wartości emituje ostrzeżenie i zwraca defaultValue", () => {
+      const warn = jest.spyOn(console, "warn").mockImplementation(() => {})
+
+      try {
+        expect(parseWalletFlag("maybe", true)).toBe(true)
+        expect(parseWalletFlag("maybe", false)).toBe(false)
+        expect(warn).toHaveBeenCalledTimes(2)
+        expect(warn).toHaveBeenLastCalledWith(
+          expect.stringContaining("Nieznana wartość flagi providera")
+        )
+      } finally {
+        warn.mockRestore()
+      }
     })
   })
 

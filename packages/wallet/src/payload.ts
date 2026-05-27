@@ -8,6 +8,26 @@ export type WalletPassStatus = "ACTIVE" | "EXPIRED" | "REVOKED" | "REFUNDED"
 export type WalletBarcodeFormat = "QR" | "PDF417"
 export type WalletInvalidationReason = "revoked" | "expired" | "refunded"
 
+// D-110 payload lifecycle (status) enum — wartości, które gate `WalletFeaturePolicy`
+// akceptuje jako `input.lifecycle`. Rozdzielone od `WalletPassStatus` (które dopuszcza
+// REVOKED/REFUNDED jako pochodne `WalletInvalidationReason`); caller MUSI zmapować
+// `WalletInvalidationReason` na ten typ przed wywołaniem `check()`.
+export type EntitlementLifecycleStatus =
+  | "ACTIVE"
+  | "PARTIALLY_REDEEMED"
+  | "EXPIRED"
+  | "VOIDED"
+
+// Closed union 5 deny reasons gate'a `WalletFeaturePolicy`. Definicja żyje tu, aby
+// `WalletAuditOutcome` mogła wykorzystać template-literal i wymusić zgodność
+// `rejected_<reason>` bez cyklu importów (`policy.ts` re-eksportuje ten typ).
+export type WalletDenyReason =
+  | "market_not_ratified"
+  | "release_not_promotable"
+  | "actor_not_p4_recipient"
+  | "lifecycle_not_active"
+  | "provider_disabled"
+
 export interface WalletBarcodeSpec {
   format: WalletBarcodeFormat
   value: string
@@ -40,10 +60,16 @@ export type WalletAuditEventType =
   | "wallet.pass_invalidation_failed"
   | "wallet.pass_gated"
 
-export type WalletAuditOutcome = "success" | "failure" | `rejected_${string}`
+export type WalletAuditOutcome =
+  | "success"
+  | "failure"
+  | `rejected_${WalletDenyReason}`
 
 // TODO(F-11, deferred architectural): migrate to shared @gp/audit when the
 // audit package consolidation lands (Epic J observability follow-up story).
+// TODO(F-09, deferred): pole `provider` jest dziś typu `string` aby zachować
+// backward-compat z istniejącymi callerami spoza gate path; docelowo zacieśnić
+// do `WalletProviderKind` w ramach F-11 migracji do `@gp/audit`.
 export interface AuditEnvelope {
   event_type: WalletAuditEventType
   entitlement_instance_id: string
