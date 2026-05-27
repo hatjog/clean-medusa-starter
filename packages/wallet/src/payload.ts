@@ -38,8 +38,9 @@ export type WalletAuditEventType =
   | "wallet.pass_failed"
   | "wallet.pass_invalidated"
   | "wallet.pass_invalidation_failed"
+  | "wallet.pass_gated"
 
-export type WalletAuditOutcome = "success" | "failure"
+export type WalletAuditOutcome = "success" | "failure" | `rejected_${string}`
 
 // TODO(F-11, deferred architectural): migrate to shared @gp/audit when the
 // audit package consolidation lands (Epic J observability follow-up story).
@@ -47,8 +48,13 @@ export interface AuditEnvelope {
   event_type: WalletAuditEventType
   entitlement_instance_id: string
   provider: string
+  market?: string
+  release?: string
+  actor_id?: string
+  lifecycle?: string
   save_url?: string
   reason?: WalletInvalidationReason
+  gate_reason?: string
   timestamp: string
   outcome: WalletAuditOutcome
   error_code?: string

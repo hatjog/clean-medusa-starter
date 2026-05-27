@@ -18,6 +18,19 @@ export type {
   WalletPayloadBuilderOptions,
 } from "./payload-builder"
 export type { WalletPassProvider } from "./provider"
+export { DefaultWalletFeaturePolicy, EnvWalletProviderReadiness } from "./policy"
+export type {
+  EntitlementLifecycleStatus,
+  ReleasePromotabilityProbe,
+  WalletActorContext,
+  WalletDenyReason,
+  WalletFeaturePolicy,
+  WalletFeaturePolicyDependencies,
+  WalletFeaturePolicyInput,
+  WalletFeaturePolicyResult,
+  WalletMarketRegistry,
+  WalletProviderReadiness,
+} from "./policy"
 export {
   WALLET_LOCALES,
   WALLET_PROVIDER_KINDS,
