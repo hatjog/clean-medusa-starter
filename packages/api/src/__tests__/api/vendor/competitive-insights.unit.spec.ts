@@ -2,44 +2,25 @@
  * Story v160-cleanup-38-jwt-vendor-scope — route unit tests.
  *
  * Test cases (7 required cases):
- *   C1  — Missing vendor signature → 401, no audit row, handler not invoked
- *   C2  — Invalid/expired vendor signature (wrong secret) → 401, no audit row
- *   C3  — Valid vendor token (vendor A), no body vendor scope → 200 + audit row sent
- *   C4  — Valid token (vendor A), body carries vendor_id = B → 403 cross_vendor_scope_mismatch + audit rejected
- *   C5  — Caller sets x-vendor-id: B AND uses vendor A's token → 200 scoped to A (header IGNORED)
+ *   C1  — Missing seller_context → 401, no audit row, handler cannot proceed
+ *   C2  — HMAC-only request without seller_context → 401, no audit row
+ *   C3  — Valid seller_context (vendor A), no body vendor scope → 200 + audit row sent
+ *   C4  — Valid seller_context (vendor A), body carries vendor_id = B → 403 cross_vendor_scope_mismatch + audit rejected
+ *   C5  — Caller sets x-vendor-id: B AND uses vendor A's seller_context → 200 scoped to A (header IGNORED)
  *   C6  — Aggregator invoked with snapshots from real Mercur 2 query path (data_source = mercur_query)
  *   C7  — Cross-vendor scope check is the FIRST guard after auth (regression guard)
  *
  * Strategy: test the business logic layer via guard-chain simulator.
- * C1/C2 exercise the real withVendorAuth HOF (HMAC mode, same as cleanup-39/cleanup-48).
+ * C1/C2 exercise the real route's defensive 401 path before audit/data access.
  * resolveInsightSnapshots and appendNotificationLog are mocked for the success path.
  */
 
-import { describe, it, expect, jest, beforeEach, afterEach } from "@jest/globals"
-import { buildVendorSignatureHeader } from "../../../../src/lib/vendor-hmac"
+import { describe, it, expect, jest, beforeEach } from "@jest/globals"
 
-// ---------------------------------------------------------------------------
-// HMAC env setup — cleanup-48: withVendorAuth now requires HMAC signature
-// ---------------------------------------------------------------------------
-
-const INSIGHTS_TEST_SECRET = "insights-test-hmac-secret-xxx"
-const INSIGHTS_TEST_SELLER = "insights-seller-test-uuid"
-
-const savedEnv: Record<string, string | undefined> = {}
-
-beforeEach(() => {
-  savedEnv.VENDOR_HMAC_SECRET = process.env.VENDOR_HMAC_SECRET
-  savedEnv.VENDOR_HMAC_ENFORCED = process.env.VENDOR_HMAC_ENFORCED
-  process.env.VENDOR_HMAC_SECRET = INSIGHTS_TEST_SECRET
-  process.env.VENDOR_HMAC_ENFORCED = "true"
-})
-
-afterEach(() => {
-  for (const [key, val] of Object.entries(savedEnv)) {
-    if (val === undefined) delete process.env[key]
-    else process.env[key] = val
-  }
-})
+const { GET } = require("../../../../src/api/vendor/competitive-insights/route")
+const { getCompetitiveInsights } = require(
+  "../../../../src/lib/competitive-insights-aggregator"
+)
 
 // ---------------------------------------------------------------------------
 // Mocks
@@ -63,7 +44,7 @@ const mockResolveSnapshots = jest.fn() as any
 const FAKE_SCOPE = { resolve: () => undefined }
 
 type SimulateOpts = {
-  /** vendorAuth injected by withVendorAuth (undefined = 401 path) */
+  /** vendorId resolved from seller_context via gp_core (undefined = 401 path) */
   vendorId?: string
   sellerId?: string
   bodyVendorId?: string | undefined
@@ -76,7 +57,7 @@ async function simulateRoute(opts: SimulateOpts): Promise<{
   statusCode: number
   body: Record<string, unknown>
 }> {
-  // 401 path: no vendorAuth (simulates withVendorAuth rejected the request)
+  // 401 path: no seller_context (Mercur middleware did not populate it)
   if (opts.vendorId === undefined) {
     return { statusCode: 401, body: { code: "vendor_auth_missing" } }
   }
@@ -113,9 +94,6 @@ async function simulateRoute(opts: SimulateOpts): Promise<{
   const { snapshots, data_source: dataSource } = sourceResult
 
   // Aggregation (real function — no need to mock pure computation)
-  const { getCompetitiveInsights } = await import(
-    "../../../../src/lib/competitive-insights-aggregator.js"
-  )
   const insightsData = getCompetitiveInsights(vendorId, snapshots)
 
   // Audit: success
@@ -167,64 +145,44 @@ describe("competitive-insights route — business logic", () => {
     } as any)
   })
 
-  // C1 — Missing vendor signature → 401, no audit row, handler not invoked
-  it("C1: missing vendor signature → 401, no audit row written (real withVendorAuth + HMAC)", async () => {
-    const { withVendorAuth } = await import("../../../../src/lib/vendor-auth.js")
-
-    const innerCalled = jest.fn()
-    const wrapped = withVendorAuth(async (_req, _res, _next) => {
-      innerCalled()
-      await mockAppendLog({}, { id: "must_not_run", status: "sent" })
-    })
-
+  // C1 — Missing seller_context → 401, no audit row.
+  it("C1: missing seller_context → 401, no audit row written", async () => {
     const statusCalls: number[] = []
     const req = {
-      headers: {}, // no x-vendor-signature
+      headers: {},
       scope: { resolve: () => undefined },
-    } as unknown as Parameters<typeof wrapped>[0]
+    } as unknown as Parameters<typeof GET>[0]
     const res = {
       status(code: number) { statusCalls.push(code); return this },
       json() { /* noop */ },
-    } as unknown as Parameters<typeof wrapped>[1]
+    } as unknown as Parameters<typeof GET>[1]
 
-    await wrapped(req, res, () => {})
+    await GET(req, res)
 
     expect(statusCalls[0]).toBe(401)
-    expect(innerCalled).not.toHaveBeenCalled()
     expect(mockAppendLog).not.toHaveBeenCalled()
   })
 
-  // C2 — Invalid vendor signature (wrong secret) → 401, no audit row
-  it("C2: invalid vendor signature (wrong secret) → 401, no audit row written", async () => {
-    const { withVendorAuth } = await import("../../../../src/lib/vendor-auth.js")
-
-    const innerCalled = jest.fn()
-    const wrapped = withVendorAuth(async (_req, _res, _next) => {
-      innerCalled()
-    })
-
-    // Build a header signed with the WRONG secret — HMAC mismatch → 401
-    const badHeader = buildVendorSignatureHeader(INSIGHTS_TEST_SELLER, "wrong-secret-xyz")
-
+  // C2 — HMAC-only request remains rejected because this route is JWT/seller-context only.
+  it("C2: HMAC-only request without seller_context → 401, no audit row written", async () => {
     const statusCalls: number[] = []
     const req = {
-      headers: { "x-vendor-signature": badHeader },
+      headers: { "x-vendor-signature": "v1:legacy-hmac-material" },
       scope: { resolve: () => undefined },
-    } as unknown as Parameters<typeof wrapped>[0]
+    } as unknown as Parameters<typeof GET>[0]
     const res = {
       status(code: number) { statusCalls.push(code); return this },
       json() { /* noop */ },
-    } as unknown as Parameters<typeof wrapped>[1]
+    } as unknown as Parameters<typeof GET>[1]
 
-    await wrapped(req, res, () => {})
+    await GET(req, res)
 
     expect(statusCalls[0]).toBe(401)
-    expect(innerCalled).not.toHaveBeenCalled()
     expect(mockAppendLog).not.toHaveBeenCalled()
   })
 
-  // C3 — Valid vendor token, no body/query vendor scope → 200 + audit row sent
-  it("C3: valid vendor token, no body scope → 200, audit row status=sent", async () => {
+  // C3 — Valid seller_context, no body/query vendor scope → 200 + audit row sent
+  it("C3: valid seller_context, no body scope → 200, audit row status=sent", async () => {
     const result = await simulateRoute({ vendorId: "vendor_A", sellerId: "seller_A" })
 
     expect(result.statusCode).toBe(200)
