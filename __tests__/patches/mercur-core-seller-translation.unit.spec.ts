@@ -48,6 +48,12 @@ describe("@mercurjs/core@2.1.1 patch - Seller translation metadata", () => {
       __dirname,
       "../../node_modules/@mercurjs/core/.medusa/server/src/modules/seller/models/seller.js"
     )
+    if (!fs.existsSync(sellerModelPath)) {
+      throw new Error(
+        `Patched Mercur seller model not found at ${sellerModelPath}. ` +
+          "Run `pnpm install --frozen-lockfile` (apply patches) przed `pnpm run test:patches`."
+      )
+    }
     delete require.cache[require.resolve(sellerModelPath)]
 
     require(sellerModelPath)

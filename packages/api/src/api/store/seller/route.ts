@@ -58,7 +58,7 @@ export async function GET(req: MedusaRequest, res: MedusaResponse) {
       options?: Record<string, unknown>
     ) => Promise<QueryGraphResult>;
   };
-  const locale = (req as MedusaRequest & { locale?: string }).locale;
+  const { locale } = req;
   const { data: sellers } = await query.graph(
     {
       entity: "seller",
