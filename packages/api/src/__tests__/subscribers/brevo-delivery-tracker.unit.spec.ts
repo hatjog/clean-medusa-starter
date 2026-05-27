@@ -67,7 +67,7 @@ describe("brevoDeliveryTracker", () => {
   })
 
   it("subskrybuje natywne eventy notification.* bez custom route", () => {
-    expect(config.event).toEqual(BREVO_NOTIFICATION_EVENTS)
+    expect(config.event).toEqual([...BREVO_NOTIFICATION_EVENTS])
     expect(BREVO_NOTIFICATION_EVENTS).toEqual([
       "notification.delivered",
       "notification.opened",
@@ -378,7 +378,7 @@ describe("brevoDeliveryTracker", () => {
       expect.stringContaining("\"outcome\":\"opted_out\""),
     )
     expect(logger.info).toHaveBeenCalledWith(
-      expect.stringContaining("\"recipient_hash\":\"unknown\""),
+      expect.stringContaining("\"recipient_hash\":\"__no_recipient__\""),
     )
   })
 
@@ -431,6 +431,177 @@ describe("brevoDeliveryTracker", () => {
     )
   })
 
+  it("deduplikuje concurrent handle() calls przez mark-before-emit ordering (F-03 race)", async () => {
+    const ctx = makeContainer()
+    const payload = {
+      provider_id: "brevo",
+      provider_event_id: "race-message",
+      dispatch_id: "dispatch-race",
+      event_type: "delivered",
+      occurred_at: "2026-05-27T08:10:00.000Z",
+      recipient_hash: "recipient-hash-race",
+    }
+
+    await Promise.all([
+      handleDelivery(payload, ctx.container),
+      handleDelivery(payload, ctx.container),
+    ])
+
+    expect(ctx.auditEvents).toHaveLength(1)
+  })
+
+  it("przywraca dedupe entry gdy sink rzuca — Medusa retry przejdzie jak fresh (F-07 rollback)", async () => {
+    const logger = {
+      info: jest.fn(),
+      warn: jest.fn(),
+      error: jest.fn(),
+    }
+    let attempt = 0
+    const sink = {
+      record: jest.fn(async (auditEvent: AuditEvent) => {
+        attempt += 1
+        if (attempt === 1) {
+          throw new Error("sink down")
+        }
+        attempts.push(auditEvent)
+      }),
+    }
+    const attempts: AuditEvent[] = []
+    const resolve = jest.fn((key: string) => {
+      if (key === "logger") return logger
+      if (key === "notification_delivery_audit_sink") return sink
+      throw new Error(`Unknown container key: ${key}`)
+    })
+
+    const payload = {
+      provider_id: "brevo",
+      provider_event_id: "retry-message",
+      dispatch_id: "dispatch-retry",
+      event_type: "delivered",
+    }
+
+    await expect(handleDelivery(payload, { resolve })).rejects.toThrow("sink down")
+    await handleDelivery(payload, { resolve })
+
+    expect(attempts).toHaveLength(1)
+    expect(sink.record).toHaveBeenCalledTimes(2)
+  })
+
+  it("audit_id jest deterministyczny per (provider_event_id, event_type) — F-08", async () => {
+    const ctx1 = makeContainer()
+    const ctx2 = makeContainer()
+    const payload = {
+      provider_id: "brevo",
+      provider_event_id: "deterministic-id-message",
+      dispatch_id: "dispatch-det",
+      event_type: "delivered",
+      occurred_at: "2026-05-27T08:11:00.000Z",
+      recipient_hash: "recipient-hash-det",
+    }
+
+    await handleDelivery(payload, ctx1.container)
+    __resetBrevoDeliveryTrackerForTests()
+    await handleDelivery(payload, ctx2.container)
+
+    expect(ctx1.auditEvents[0].audit_id).toBe(ctx2.auditEvents[0].audit_id)
+    expect(ctx1.auditEvents[0].audit_id).toMatch(/^[0-9a-f]{32}$/)
+  })
+
+  it("DB outage propaguje DISPATCH_LOOKUP_FAILED w audit envelope — F-06", async () => {
+    const auditEvents: AuditEvent[] = []
+    const logger = {
+      info: jest.fn(),
+      warn: jest.fn(),
+      error: jest.fn(),
+    }
+    const resolve = jest.fn((key: string) => {
+      if (key === "logger") return logger
+      if (key === "__pg_connection__") {
+        return {
+          raw: jest.fn(async () => {
+            const err = new Error("connection refused") as Error & { code?: string }
+            err.code = "ECONNREFUSED"
+            throw err
+          }),
+        }
+      }
+      if (key === "notification_delivery_audit_sink") {
+        return {
+          record: jest.fn(async (auditEvent: AuditEvent) => {
+            auditEvents.push(auditEvent)
+          }),
+        }
+      }
+      throw new Error(`Unknown container key: ${key}`)
+    })
+
+    await handleDelivery(
+      {
+        provider_id: "brevo",
+        provider_event_id: "db-outage-message",
+        event_type: "clicked",
+      },
+      { resolve },
+      "notification.clicked",
+    )
+
+    expect(auditEvents).toHaveLength(1)
+    expect(auditEvents[0]).toMatchObject({
+      provider_event_id: "db-outage-message",
+      correlation_state: "orphan",
+      error_code: "DISPATCH_LOOKUP_FAILED",
+    })
+    expect(logger.error).toHaveBeenCalledWith(
+      expect.stringContaining("notification_dispatches lookup failed"),
+    )
+  })
+
+  it("missing relation (42P01) traktowane jako clean orphan bez error_code — F-06", async () => {
+    const auditEvents: AuditEvent[] = []
+    const logger = {
+      info: jest.fn(),
+      warn: jest.fn(),
+      error: jest.fn(),
+    }
+    const resolve = jest.fn((key: string) => {
+      if (key === "logger") return logger
+      if (key === "__pg_connection__") {
+        return {
+          raw: jest.fn(async () => {
+            const err = new Error('relation "notification_dispatches" does not exist') as Error & { code?: string }
+            err.code = "42P01"
+            throw err
+          }),
+        }
+      }
+      if (key === "notification_delivery_audit_sink") {
+        return {
+          record: jest.fn(async (auditEvent: AuditEvent) => {
+            auditEvents.push(auditEvent)
+          }),
+        }
+      }
+      throw new Error(`Unknown container key: ${key}`)
+    })
+
+    await handleDelivery(
+      {
+        provider_id: "brevo",
+        provider_event_id: "missing-relation-message",
+        event_type: "clicked",
+      },
+      { resolve },
+      "notification.clicked",
+    )
+
+    expect(auditEvents).toHaveLength(1)
+    expect(auditEvents[0]).toMatchObject({
+      provider_event_id: "missing-relation-message",
+      correlation_state: "orphan",
+    })
+    expect(auditEvents[0].error_code).toBeUndefined()
+  })
+
   it("nie blokuje eventu, gdy lookup SQL jest niedostępny", async () => {
     const auditEvents: AuditEvent[] = []
     const logger = {
@@ -443,7 +614,9 @@ describe("brevoDeliveryTracker", () => {
       if (key === "__pg_connection__") {
         return {
           raw: jest.fn(async () => {
-            throw new Error("missing relation")
+            const err = new Error('relation "notification_dispatches" does not exist') as Error & { code?: string }
+            err.code = "42P01"
+            throw err
           }),
         }
       }

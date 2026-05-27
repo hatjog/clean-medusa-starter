@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto"
+import { createHash } from "node:crypto"
 
 import type { SubscriberArgs, SubscriberConfig } from "@medusajs/framework"
 import { ContainerRegistrationKeys } from "@medusajs/framework/utils"
@@ -11,14 +11,44 @@ import type {
   NotificationDeliveryEventType,
 } from "@gp/messaging"
 
-export const BREVO_NOTIFICATION_EVENTS = [
+/**
+ * Path Y Brevo delivery subscriber.
+ *
+ * Limitations (Story 5.5 — follow-up scoped do v1.11.0+ messaging persistence story):
+ * - Dedupe cache jest module-level Map → single-process semantics. Multi-instance
+ *   deployment (N replicas) NIE deduplikuje cross-replica; cold restart traci
+ *   cache → Brevo retry replay (do 7 dni) może wygenerować duplicate audit
+ *   envelopes. Pełna idempotency wymaga persistencji w
+ *   `notification_delivery_events` z UNIQUE constraint na `provider_event_id`
+ *   (follow-up story: v1.11.0-messaging-delivery-persistence — utworzyć w
+ *   Sprint 5 backlog).
+ * - Race-safety: `mark-before-emit` ordering eliminuje in-process race między
+ *   dwoma concurrent handle() calls dla tego samego `provider_event_id`, oraz
+ *   eliminuje double-emit gdy `emitAuditEvent` propaguje błąd sinka (rollback
+ *   dedupe entry w catch → next Medusa retry przejdzie jak fresh event).
+ * - Multi-event subscription (Medusa 2.14.2 `config.event: string[]`):
+ *   weryfikacja runtime live w follow-up smoke test (Story 5.9 lub Sprint 3
+ *   integration suite). Jeśli array form NIE supported → split do 6 plików
+ *   per event z shared handler.
+ * - DB lookup error semantics: missing relation (Postgres `42P01`) jest
+ *   traktowane jako clean orphan; pozostałe DB errors (outage, connection
+ *   drop) → `error_code: "DISPATCH_LOOKUP_FAILED"` w audit envelope dla
+ *   operator alert distinction.
+ */
+
+export const BREVO_NOTIFICATION_EVENTS = Object.freeze([
   "notification.delivered",
   "notification.opened",
   "notification.clicked",
   "notification.bounced",
   "notification.complaint",
   "notification.unsubscribed",
-] as const
+] as const)
+
+const NO_RECIPIENT_SENTINEL = "__no_recipient__"
+const UNKNOWN_FIELD_SENTINEL = "unknown"
+const DISPATCH_LOOKUP_FAILED_CODE = "DISPATCH_LOOKUP_FAILED"
+const POSTGRES_UNDEFINED_TABLE = "42P01"
 
 type BrevoDeliveryEventPayload = {
   provider_id?: "brevo"
@@ -105,6 +135,14 @@ type NormalizedBrevoDeliveryEvent = {
   source: BrevoDeliveryEventPayload
 }
 
+type CorrelatedDispatch = {
+  correlation_id: string
+  correlation_state: NotificationDeliveryCorrelationState
+  dispatch_id: string
+  dispatch?: DispatchRecord
+  lookup_error_code?: string
+}
+
 const DELIVERY_DEDUP_TTL_MS = 24 * 60 * 60 * 1000
 const DELIVERY_DEDUP_MAX = 10000
 const seenProviderEventIds = new Map<string, number>()
@@ -130,11 +168,20 @@ export default async function brevoDeliveryTracker({
     return
   }
 
-  const correlated = await correlateDispatch(runtimeContainer, normalized, logger)
-  const auditEvent = buildAuditEnvelope(normalized, correlated)
-
-  await emitAuditEvent(runtimeContainer, auditEvent, logger)
+  // F-03/F-07: mark BEFORE await — eliminuje in-process race + double-emit
+  // przy sink failure (compensating rollback w catch przywraca eligibility
+  // dla Medusa retry).
   markProviderEventSeen(normalized.provider_event_id)
+
+  try {
+    const correlated = await correlateDispatch(runtimeContainer, normalized, logger)
+    const auditEvent = buildAuditEnvelope(normalized, correlated)
+
+    await emitAuditEvent(runtimeContainer, auditEvent, logger)
+  } catch (error) {
+    seenProviderEventIds.delete(normalized.provider_event_id)
+    throw error
+  }
 }
 
 export const config: SubscriberConfig = {
@@ -197,12 +244,7 @@ async function correlateDispatch(
   container: ResolveContainer,
   normalized: NormalizedBrevoDeliveryEvent,
   logger: LoggerLike,
-): Promise<{
-  correlation_id: string
-  correlation_state: NotificationDeliveryCorrelationState
-  dispatch_id: string
-  dispatch?: DispatchRecord
-}> {
+): Promise<CorrelatedDispatch> {
   if (normalized.dispatch_id) {
     return {
       correlation_id: normalized.dispatch_id,
@@ -211,14 +253,14 @@ async function correlateDispatch(
     }
   }
 
-  const dispatch = await lookupDispatch(container, normalized.provider_event_id, logger)
-  const dispatchId = dispatch?.dispatch_id ?? dispatch?.id
+  const lookup = await lookupDispatch(container, normalized.provider_event_id, logger)
+  const dispatchId = lookup.dispatch?.dispatch_id ?? lookup.dispatch?.id
   if (dispatchId) {
     return {
       correlation_id: dispatchId,
       correlation_state: "matched",
       dispatch_id: dispatchId,
-      dispatch: dispatch ?? undefined,
+      dispatch: lookup.dispatch ?? undefined,
     }
   }
 
@@ -229,14 +271,20 @@ async function correlateDispatch(
     correlation_id: normalized.provider_event_id,
     correlation_state: "orphan",
     dispatch_id: normalized.provider_event_id,
+    lookup_error_code: lookup.error_code,
   }
+}
+
+type DispatchLookupResult = {
+  dispatch: DispatchRecord | null
+  error_code?: string
 }
 
 async function lookupDispatch(
   container: ResolveContainer,
   providerEventId: string,
   logger: LoggerLike,
-): Promise<DispatchRecord | null> {
+): Promise<DispatchLookupResult> {
   const service = resolveOptional<DispatchLookup>(container, [
     "notification_dispatches",
     "notificationDispatches",
@@ -245,21 +293,22 @@ async function lookupDispatch(
   ])
 
   if (service?.findByProviderMessageId) {
-    return service.findByProviderMessageId(providerEventId)
+    return { dispatch: await service.findByProviderMessageId(providerEventId) }
   }
   if (service?.findOneByProviderMessageId) {
-    return service.findOneByProviderMessageId(providerEventId)
+    return { dispatch: await service.findOneByProviderMessageId(providerEventId) }
   }
   if (service?.findOne) {
-    return service.findOne({ provider_message_id: providerEventId })
+    return { dispatch: await service.findOne({ provider_message_id: providerEventId }) }
   }
   if (service?.find) {
-    return (await service.find({ provider_message_id: providerEventId }))[0] ?? null
+    const rows = await service.find({ provider_message_id: providerEventId })
+    return { dispatch: rows[0] ?? null }
   }
 
   const db = resolvePgConnection(container)
   if (!db) {
-    return null
+    return { dispatch: null }
   }
 
   try {
@@ -279,29 +328,37 @@ async function lookupDispatch(
       `,
       [providerEventId],
     )
-    return (result.rows?.[0] as DispatchRecord | undefined) ?? null
+    return { dispatch: (result.rows?.[0] as DispatchRecord | undefined) ?? null }
   } catch (error) {
-    logger.warn?.(
-      `[brevo-delivery-tracker] notification_dispatches lookup unavailable provider_event_id=${providerEventId}`,
+    // F-06: differentiate missing relation (clean orphan) od DB outage (alert).
+    const pgCode = typeof (error as { code?: unknown }).code === "string"
+      ? ((error as { code?: string }).code as string)
+      : undefined
+    if (pgCode === POSTGRES_UNDEFINED_TABLE) {
+      logger.warn?.(
+        `[brevo-delivery-tracker] notification_dispatches lookup unavailable provider_event_id=${providerEventId}`,
+      )
+      return { dispatch: null }
+    }
+    const err = error as Error
+    logger.error?.(
+      `[brevo-delivery-tracker] notification_dispatches lookup failed provider_event_id=${providerEventId} code=${pgCode ?? "unknown"}: ${err.message}`,
     )
-    return null
+    return { dispatch: null, error_code: DISPATCH_LOOKUP_FAILED_CODE }
   }
 }
 
 function buildAuditEnvelope(
   normalized: NormalizedBrevoDeliveryEvent,
-  correlated: {
-    correlation_id: string
-    correlation_state: NotificationDeliveryCorrelationState
-    dispatch_id: string
-    dispatch?: DispatchRecord
-  },
+  correlated: CorrelatedDispatch,
 ): AuditEnvelope {
   const outcome = resolveOutcome(normalized.event_type)
   const dispatch = correlated.dispatch
 
   return {
-    audit_id: randomUUID(),
+    // F-08: deterministic audit_id — retry przez Medusa produkuje identyczny
+    // audit_id, downstream observability może deduplikować trace correlation.
+    audit_id: deriveAuditId(normalized.provider_event_id, normalized.event_type),
     event_type: "notification.delivery",
     status: resolveDeliveryStatus(normalized.event_type),
     dispatch_id: correlated.dispatch_id,
@@ -310,10 +367,10 @@ function buildAuditEnvelope(
     correlation_id: correlated.correlation_id,
     correlation_state: correlated.correlation_state,
     outcome,
-    flow_id: normalized.flow_id ?? dispatch?.flow_id ?? "unknown",
-    template_key: normalized.template_key ?? dispatch?.template_key ?? "unknown",
+    flow_id: normalized.flow_id ?? dispatch?.flow_id ?? UNKNOWN_FIELD_SENTINEL,
+    template_key: normalized.template_key ?? dispatch?.template_key ?? UNKNOWN_FIELD_SENTINEL,
     channel: "email",
-    market_id: normalized.market_id ?? dispatch?.market_id ?? "unknown",
+    market_id: normalized.market_id ?? dispatch?.market_id ?? UNKNOWN_FIELD_SENTINEL,
     locale: normalized.locale ?? dispatch?.locale ?? "pl-PL",
     consent_basis:
       normalized.consent_basis ?? dispatch?.consent_basis ?? "transactional_supportive",
@@ -322,9 +379,16 @@ function buildAuditEnvelope(
     hashed_recipient: normalized.recipient_hash,
     recipient_hash: normalized.recipient_hash,
     occurred_at: normalized.occurred_at,
-    error_code: normalized.error_code,
+    error_code: normalized.error_code ?? correlated.lookup_error_code,
     error_message: normalized.error_message,
   }
+}
+
+function deriveAuditId(providerEventId: string, eventType: NotificationDeliveryEventType): string {
+  return createHash("sha256")
+    .update(`${providerEventId}:${eventType}`)
+    .digest("hex")
+    .slice(0, 32)
 }
 
 async function emitAuditEvent(
@@ -511,7 +575,8 @@ function resolveRecipientHash(payload: BrevoDeliveryEventPayload): string {
     return createHash("sha256").update(email.trim().toLowerCase()).digest("hex")
   }
 
-  return "unknown"
+  // F-09: non-collidable sentinel (sha256 hex output never contains `_` or `:`).
+  return NO_RECIPIENT_SENTINEL
 }
 
 function resolveLogger(container: ResolveContainer): LoggerLike {
@@ -574,3 +639,4 @@ function markProviderEventSeen(providerEventId: string): void {
 function readString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined
 }
+

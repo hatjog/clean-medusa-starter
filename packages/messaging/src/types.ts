@@ -26,14 +26,18 @@ export type NotificationDeliveryCorrelationState =
   | "orphan"
   | "deduplicated";
 
+// Path Y subscriber (Story 5.5) chose silent-skip dla duplicate provider_event_id
+// zamiast emitować audit z outcome: "deduplicated". Architecture D-113 invariant
+// pozostaje spełniony przez idempotency — każdy unique event produkuje dokładnie
+// 1 audit entry. Jeśli future story zmieni tę decyzję, dopisać "deduplicated"
+// z powrotem i zaktualizować subscriber.
 export type NotificationDeliveryAuditOutcome =
   | "delivered"
   | "opened"
   | "engaged"
   | "failed"
   | "flagged"
-  | "opted_out"
-  | "deduplicated";
+  | "opted_out";
 
 export interface NotificationRecipient {
   email?: string;
@@ -53,6 +57,15 @@ export interface NotificationIntent {
 }
 
 // TODO(F-11/Epic J): migrate this local envelope to shared @gp/audit when it exists.
+//
+// Sentinel convention (Story 5.5 Path Y subscriber):
+// - Dla event_type: "notification.delivery" z correlation_state: "orphan" pola
+//   `flow_id`, `template_key`, `market_id` MOGĄ przyjmować wartość "unknown"
+//   gdy Brevo payload nie zawierał kontekstu, a `notification_dispatches` lookup
+//   nie znalazł dopasowania. Downstream consumers (PostHog dashboard Story 5.9)
+//   MUSZĄ traktować "unknown" jako known-unknown sentinel, nie real bucket.
+// - Dla `hashed_recipient` brak recipient hash + brak emaila → sentinel
+//   `__no_recipient__` (non-collidable z hex sha256 output).
 export interface AuditEnvelope {
   audit_id: string;
   event_type: "notification.dispatch" | "notification.delivery";
