@@ -1,11 +1,13 @@
 import type { SubscriberArgs, SubscriberConfig } from "@medusajs/framework"
 
 import {
+  WalletPassInvalidationError,
   isWalletProviderKind,
+  type AuditEnvelope as ProviderAuditEnvelope,
   type WalletInvalidationReason,
+  type WalletPassFacade,
   type WalletProviderKind,
-} from "../../../wallet/src"
-import type { WalletPassFacade } from "../../../wallet/src/facade"
+} from "@gp/wallet"
 
 export const ENTITLEMENT_LIFECYCLE_EVENTS = [
   "entitlement_instance.revoked",
@@ -22,9 +24,20 @@ const REASON_BY_EVENT: Record<
   "entitlement_instance.refunded": "refunded",
 }
 
-const RETRY_BACKOFF_MS = [1_000, 3_000, 9_000] as const
+// Wariant A (3 attempts = 1 initial + 2 retries): sleep [1s, 3s] = 4s budget
+// retry. Evidence + schema spójne. Patrz fr-c-6 evidence i runbook.
+const RETRY_DELAYS_BETWEEN_ATTEMPTS_MS = [1_000, 3_000] as const
+const MAX_ATTEMPTS = RETRY_DELAYS_BETWEEN_ATTEMPTS_MS.length + 1
 const DEFAULT_PROVIDER: WalletProviderKind = "google"
 const AUDIT_EVENT_TYPE = "wallet.pass_invalidated"
+// Distinct bus topic dla audit emission (M-I3); zapobiega kolizji z innym
+// subscriberem nasłuchującym na nazwie envelope.
+const AUDIT_BUS_TOPIC = "audit.wallet.pass_invalidated"
+
+// LRU cap dla in-process dedupe (M-M3). 10k entries × ~64B ≈ 0.6MB ceiling;
+// TTL 24h pokrywa redelivery window event-busa.
+const DEDUPE_MAX_ENTRIES = 10_000
+const DEDUPE_TTL_MS = 24 * 60 * 60 * 1_000
 
 type LoggerLike = {
   info?: (message: string) => void
@@ -80,18 +93,74 @@ export type WalletInvalidationAuditEnvelope = {
   latency_ms: number | null
   attempt: number
   error_code?: string
+  error_message?: string
   market_id: string
   gate_reason?: string
   next_retry_at?: string
+  was_deduplicated?: boolean
+  provider_audit_event?: ProviderAuditEnvelope
+}
+
+// Best-effort within-process dedupe. Prawdziwa idempotency = provider-side
+// (Google `objects.patch`). Mapa zachowuje oryginalny envelope per
+// idempotency key, żeby redelivery po `invalidation_gated` lub
+// `invalidation_failed` NIE raportowała fałszywego `invalidated` (H1).
+type DedupeEntry = {
+  envelope: WalletInvalidationAuditEnvelope
+  expires_at: number
+}
+
+export class WalletInvalidationDedupeStore {
+  private readonly entries = new Map<string, DedupeEntry>()
+
+  constructor(
+    private readonly maxEntries: number = DEDUPE_MAX_ENTRIES,
+    private readonly ttlMs: number = DEDUPE_TTL_MS,
+    private readonly now: () => number = () => Date.now()
+  ) {}
+
+  get(key: string): WalletInvalidationAuditEnvelope | undefined {
+    const entry = this.entries.get(key)
+    if (!entry) return undefined
+    if (entry.expires_at <= this.now()) {
+      this.entries.delete(key)
+      return undefined
+    }
+    // refresh LRU position
+    this.entries.delete(key)
+    this.entries.set(key, entry)
+    return entry.envelope
+  }
+
+  set(key: string, envelope: WalletInvalidationAuditEnvelope): void {
+    if (this.entries.has(key)) this.entries.delete(key)
+    this.entries.set(key, {
+      envelope,
+      expires_at: this.now() + this.ttlMs,
+    })
+    while (this.entries.size > this.maxEntries) {
+      const firstKey = this.entries.keys().next().value
+      if (firstKey === undefined) break
+      this.entries.delete(firstKey)
+    }
+  }
+
+  clear(): void {
+    this.entries.clear()
+  }
+
+  size(): number {
+    return this.entries.size
+  }
 }
 
 export type WalletInvalidationHandlerOptions = {
-  processedKeys?: Set<string>
+  dedupeStore?: WalletInvalidationDedupeStore
   now?: () => Date
   sleep?: (ms: number) => Promise<void>
 }
 
-const processedInvalidations = new Set<string>()
+const processedInvalidations = new WalletInvalidationDedupeStore()
 
 export function resetVoucherWalletInvalidationStateForTests(): void {
   processedInvalidations.clear()
@@ -117,8 +186,10 @@ export async function handleVoucherWalletInvalidation(
   options: WalletInvalidationHandlerOptions = {}
 ): Promise<WalletInvalidationAuditEnvelope> {
   const now = options.now ?? (() => new Date())
-  const sleep = options.sleep ?? ((ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)))
-  const processedKeys = options.processedKeys ?? processedInvalidations
+  const sleep =
+    options.sleep ??
+    ((ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)))
+  const dedupe = options.dedupeStore ?? processedInvalidations
   const logger = resolveLogger(input.container)
   const reason = resolveReason(input.eventName, input.payload)
   const entitlementInstanceId = resolveEntitlementInstanceId(input.payload)
@@ -142,22 +213,23 @@ export async function handleVoucherWalletInvalidation(
   }
 
   const provider = resolveProvider(input.payload)
-  const idempotencyKey = `${entitlementInstanceId}:${reason}`
+  // L4: provider w kluczu, żeby cross-provider redelivery (Google→Apple
+  // migracja) NIE deduplikowała się fałszywie.
+  const idempotencyKey = `${entitlementInstanceId}:${provider}:${reason}`
 
-  if (processedKeys.has(idempotencyKey)) {
-    const envelope = buildEnvelope({
-      entitlementInstanceId,
-      provider,
-      reason,
-      outcome: "invalidated",
-      attempt: 1,
-      marketId,
-      eventTimestamp,
-      now,
-    })
+  const previousEnvelope = dedupe.get(idempotencyKey)
+  if (previousEnvelope) {
+    // H1 + L1: replay oryginalnego envelope, oznacz was_deduplicated=true,
+    // latency_ms=null (nie wołamy providera, więc latency nie istnieje).
+    const envelope: WalletInvalidationAuditEnvelope = {
+      ...previousEnvelope,
+      timestamp: now().toISOString(),
+      latency_ms: null,
+      was_deduplicated: true,
+    }
     await publishAuditEnvelope(input.container, envelope, logger)
     logger.info?.(
-      `[voucher-wallet-invalidation] duplicate skipped entitlement_instance_id=${entitlementInstanceId} reason=${reason}`
+      `[voucher-wallet-invalidation] duplicate skipped entitlement_instance_id=${entitlementInstanceId} provider=${provider} reason=${reason} replayed_outcome=${previousEnvelope.outcome}`
     )
     return envelope
   }
@@ -175,7 +247,7 @@ export async function handleVoucherWalletInvalidation(
       errorCode: "APPLE_WALLET_DISABLED",
       gateReason: "wallet_apple_enabled_false",
     })
-    processedKeys.add(idempotencyKey)
+    // H1: NIE dodajemy gated do dedupe — flag flip ma umożliwić retry.
     await publishAuditEnvelope(input.container, envelope, logger)
     return envelope
   }
@@ -193,15 +265,19 @@ export async function handleVoucherWalletInvalidation(
       now,
       errorCode: "WALLET_PASS_FACADE_NOT_RESOLVED",
     })
+    // H1: facade-not-resolved to transient infra issue → NIE cache'ujemy.
     await publishAuditEnvelope(input.container, envelope, logger)
     return envelope
   }
 
   let lastEnvelope: WalletInvalidationAuditEnvelope | null = null
-  for (let index = 0; index < RETRY_BACKOFF_MS.length; index += 1) {
-    const attempt = index + 1
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
     try {
-      await facade.invalidatePass(entitlementInstanceId, provider, reason)
+      const { audit_event: providerEnvelope } = await facade.invalidatePass(
+        entitlementInstanceId,
+        provider,
+        reason
+      )
       const envelope = buildEnvelope({
         entitlementInstanceId,
         provider,
@@ -211,15 +287,22 @@ export async function handleVoucherWalletInvalidation(
         marketId,
         eventTimestamp,
         now,
+        providerAuditEvent: providerEnvelope,
       })
-      processedKeys.add(idempotencyKey)
+      // H1: cache'ujemy tylko sukces — kolejna redelivery zostanie zreplaywana.
+      dedupe.set(idempotencyKey, envelope)
       await publishAuditEnvelope(input.container, envelope, logger)
       return envelope
     } catch (error) {
-      const exhausted = attempt === RETRY_BACKOFF_MS.length
+      const exhausted = attempt === MAX_ATTEMPTS
+      const delayIndex = attempt - 1
       const nextRetryAt = exhausted
         ? undefined
-        : new Date(now().getTime() + RETRY_BACKOFF_MS[index]).toISOString()
+        : new Date(
+            now().getTime() + RETRY_DELAYS_BETWEEN_ATTEMPTS_MS[delayIndex]
+          ).toISOString()
+      const providerEnvelope =
+        error instanceof WalletPassInvalidationError ? error.audit_event : undefined
       lastEnvelope = buildEnvelope({
         entitlementInstanceId,
         provider,
@@ -231,12 +314,14 @@ export async function handleVoucherWalletInvalidation(
         marketId,
         eventTimestamp,
         now,
-        errorCode: errorName(error),
+        errorCode: providerEnvelope?.error_code ?? errorName(error),
+        errorMessage: providerEnvelope?.error_message ?? errorMessage(error),
         nextRetryAt,
+        providerAuditEvent: providerEnvelope,
       })
       await publishAuditEnvelope(input.container, lastEnvelope, logger)
       if (!exhausted) {
-        await sleep(RETRY_BACKOFF_MS[index])
+        await sleep(RETRY_DELAYS_BETWEEN_ATTEMPTS_MS[delayIndex])
       }
     }
   }
@@ -311,7 +396,9 @@ function parseEventTimestamp(
   payload: WalletInvalidationPayload,
   now: () => Date
 ): Date {
-  const raw = readNonEmptyString(payload.timestamp) ?? readNonEmptyString(payload.emitted_at)
+  const raw =
+    readNonEmptyString(payload.timestamp) ??
+    readNonEmptyString(payload.emitted_at)
   if (!raw) return now()
   const parsed = new Date(raw)
   return Number.isNaN(parsed.getTime()) ? now() : parsed
@@ -327,8 +414,10 @@ function buildEnvelope(input: {
   eventTimestamp: Date
   now: () => Date
   errorCode?: string
+  errorMessage?: string
   gateReason?: string
   nextRetryAt?: string
+  providerAuditEvent?: ProviderAuditEnvelope
 }): WalletInvalidationAuditEnvelope {
   const timestamp = input.now()
   const latencyMs =
@@ -346,9 +435,11 @@ function buildEnvelope(input: {
     latency_ms: latencyMs,
     attempt: input.attempt,
     error_code: input.errorCode,
+    error_message: input.errorMessage,
     market_id: input.marketId,
     gate_reason: input.gateReason,
     next_retry_at: input.nextRetryAt,
+    provider_audit_event: input.providerAuditEvent,
   }
 }
 
@@ -374,8 +465,11 @@ async function publishAuditEnvelope(
     "event_bus",
     "eventBus",
   ])
+  // M-I3: distinct topic `audit.wallet.pass_invalidated` (≠ AUDIT_EVENT_TYPE)
+  // dla audit emission, żeby konsument tej story (lifecycle subscriber) NIE
+  // mógł zarejestrować się na własny output i wpaść w pętlę.
   await eventBus?.emit?.({
-    name: AUDIT_EVENT_TYPE,
+    name: AUDIT_BUS_TOPIC,
     data: envelope,
   })
 
@@ -410,6 +504,10 @@ function readNonEmptyString(value: unknown): string | undefined {
 
 function errorName(error: unknown): string {
   return error instanceof Error ? error.name : "UNKNOWN_ERROR"
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
 }
 
 export const config: SubscriberConfig = {
