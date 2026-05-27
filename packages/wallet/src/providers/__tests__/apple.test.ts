@@ -1,5 +1,6 @@
 import crypto from "node:crypto"
 
+import forge from "node-forge"
 import JSZip from "jszip"
 
 import {
@@ -14,7 +15,12 @@ import { createWalletProviderRegistry } from "../../registry"
 import {
   AppleWalletProvider,
   createStubSigningContext,
+  __test_only__,
 } from "../apple"
+
+beforeAll(() => {
+  __test_only__.resetStubSigningContextCache()
+})
 
 const signingContext = createStubSigningContext()
 
@@ -63,6 +69,68 @@ describe("AppleWalletProvider", () => {
     await expectManifestHashesToMatch(zip, manifest)
   })
 
+  it("PKCS#7 messageDigest jest SHA-256 dokładnie tych bajtów manifest.json które są w archiwum (F-01)", async () => {
+    const provider = createAppleProvider()
+
+    const result = await provider.issueSaveUrl(payload, "pl-PL")
+    const zip = await unzipPkpass(result.save_url)
+    const manifestBytes = await zip.file("manifest.json")?.async("nodebuffer")
+    const signatureBytes = await zip.file("signature")?.async("nodebuffer")
+    expect(manifestBytes).toBeDefined()
+    expect(signatureBytes).toBeDefined()
+
+    const expectedDigest = crypto
+      .createHash("sha256")
+      .update(manifestBytes as Buffer)
+      .digest("hex")
+
+    const asn1 = forge.asn1.fromDer(
+      (signatureBytes as Buffer).toString("binary")
+    )
+    const digestHex = extractPkcs7MessageDigestHex(asn1)
+    expect(digestHex).toBe(expectedDigest)
+  })
+
+  it("używa stabilnych identyfikatorów LABEL_* w pass.strings i pass.json (F-08)", async () => {
+    const provider = createAppleProvider()
+
+    const result = await provider.issueSaveUrl(payload, "de-DE")
+    const zip = await unzipPkpass(result.save_url)
+    const passJson = await readJson(zip, "pass.json")
+    const deStrings = await zip.file("de.lproj/pass.strings")?.async("string")
+    const enStrings = await zip.file("en.lproj/pass.strings")?.async("string")
+
+    expect(deStrings).toContain('"LABEL_VOUCHER" = "Gutschein"')
+    expect(deStrings).toContain('"LABEL_CODE" = "Code"')
+    expect(enStrings).toContain('"LABEL_VOUCHER" = "Voucher"')
+    expect(passJson.storeCard.primaryFields[0].label).toBe("LABEL_VOUCHER")
+    expect(passJson.storeCard.secondaryFields[0].label).toBe("LABEL_CODE")
+    expect(passJson.storeCard.secondaryFields[1].label).toBe("LABEL_STATUS")
+  })
+
+  it("pomija webServiceURL w stub (F-09)", async () => {
+    const provider = createAppleProvider()
+    const result = await provider.issueSaveUrl(payload, "pl-PL")
+    const zip = await unzipPkpass(result.save_url)
+    const passJson = await readJson(zip, "pass.json")
+
+    expect(passJson.webServiceURL).toBeUndefined()
+    expect(passJson.relevantText).toBeUndefined()
+  })
+
+  it("waliduje brak barcode.value (F-07)", async () => {
+    const provider = createAppleProvider()
+    const broken: WalletPayload = {
+      ...payload,
+      barcode_spec: { format: "QR", value: "" },
+      barcode: undefined,
+    }
+
+    await expect(provider.issueSaveUrl(broken, "pl-PL")).rejects.toThrow(
+      /barcode_spec\.value/
+    )
+  })
+
   it("normalizuje locale poza kanoniczną czwórką do pl-PL w polu pomocniczym", async () => {
     const provider = createAppleProvider()
 
@@ -91,18 +159,12 @@ describe("AppleWalletProvider", () => {
     expect(passJson.expirationDate).toBe(expirationDate)
   })
 
-  it("zwraca audytowalny noop dla invalidate", async () => {
+  it("invalidate zwraca void (F-03 — port Story 3.1)", async () => {
     const provider = createAppleProvider()
 
-    const result = await provider.invalidate("ei_apple_123", "revoked")
-
-    expect(result.audit_event).toMatchObject({
-      event_type: "wallet.pass_invalidated",
-      entitlement_instance_id: "ei_apple_123",
-      provider: "apple",
-      reason: "revoked",
-      outcome: "success",
-    })
+    await expect(
+      provider.invalidate("ei_apple_123", "revoked")
+    ).resolves.toBeUndefined()
   })
 
   it("dostarcza audit envelope sukcesu przez WalletPassFacade", async () => {
@@ -155,6 +217,27 @@ describe("AppleWalletProvider", () => {
       },
     } satisfies Partial<WalletPassGenerationError>)
   })
+
+  it("wwdrCert jest osobnym cert ASN.1 od signerCert (F-02)", () => {
+    const ctx = createStubSigningContext()
+    const signerDer = forge.asn1
+      .toDer(forge.pki.certificateToAsn1(ctx.signerCert))
+      .getBytes()
+    const wwdrDer = forge.asn1
+      .toDer(forge.pki.certificateToAsn1(ctx.wwdrCert))
+      .getBytes()
+    expect(wwdrDer).not.toBe(signerDer)
+    expect(wwdrDer).not.toEqual(signerDer)
+    expect(ctx.wwdrCert.subject.getField("CN")?.value).toBe(
+      "GP-Apple-WWDR-Stub"
+    )
+  })
+
+  it("createStubSigningContext zwraca cache modułowy (F-10)", () => {
+    const a = createStubSigningContext()
+    const b = createStubSigningContext()
+    expect(a).toBe(b)
+  })
 })
 
 describe("createWalletProviderRegistry", () => {
@@ -167,6 +250,15 @@ describe("createWalletProviderRegistry", () => {
     )
 
     expect(registry.google).toBe(google)
+    expect(registry.apple).toBeUndefined()
+  })
+
+  it("ignoruje apple config gdy flag-off (F-06)", () => {
+    const registry = createWalletProviderRegistry(
+      { WALLET_APPLE_ENABLED: "false" },
+      { apple: { teamIdentifier: "IGNORED" } }
+    )
+
     expect(registry.apple).toBeUndefined()
   })
 
@@ -237,6 +329,31 @@ async function readJson(zip: JSZip, path: string) {
 async function hasNonEmptyFile(zip: JSZip, path: string): Promise<boolean> {
   const content = await zip.file(path)?.async("nodebuffer")
   return Boolean(content?.length)
+}
+
+function extractPkcs7MessageDigestHex(root: forge.asn1.Asn1): string {
+  // PKCS#7 SignedData → signerInfos → signerInfo → authenticatedAttributes →
+  // attribute(type=messageDigest) → SET OF OCTET STRING. Wystarczy znaleźć
+  // pierwszy OCTET STRING o długości 32 bajtów (SHA-256) w ASN.1 — w naszym
+  // single-signer envelope to messageDigest podpisanej zawartości.
+  const stack: forge.asn1.Asn1[] = [root]
+  while (stack.length) {
+    const node = stack.pop() as forge.asn1.Asn1
+    const value = node.value
+    if (
+      node.type === forge.asn1.Type.OCTETSTRING &&
+      typeof value === "string" &&
+      value.length === 32
+    ) {
+      return Buffer.from(value, "binary").toString("hex")
+    }
+    if (Array.isArray(value)) {
+      for (const child of value) {
+        stack.push(child)
+      }
+    }
+  }
+  throw new Error("Nie znaleziono SHA-256 messageDigest w PKCS#7 envelope")
 }
 
 async function expectManifestHashesToMatch(

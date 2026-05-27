@@ -3,7 +3,7 @@ import crypto from "node:crypto"
 import forge from "node-forge"
 import JSZip from "jszip"
 
-import { normalizeWalletLocale, type AuditEnvelope, type WalletBarcodeFormat, type WalletInvalidationReason, type WalletLocale, type WalletPayload } from "../payload"
+import { normalizeWalletLocale, type WalletBarcodeFormat, type WalletInvalidationReason, type WalletLocale, type WalletPayload } from "../payload"
 import type { WalletPassProvider } from "../provider"
 
 const PASS_MIME_TYPE = "application/vnd.apple.pkpass"
@@ -22,6 +22,13 @@ const LOCALE_DIRECTORIES: Record<WalletLocale, string> = {
   "de-DE": "de.lproj",
 }
 
+const LABEL_KEYS = {
+  VOUCHER: "LABEL_VOUCHER",
+  CODE: "LABEL_CODE",
+  STATUS: "LABEL_STATUS",
+  TITLE: "LABEL_TITLE",
+} as const
+
 export interface AppleWalletProviderConfig {
   passTypeIdentifier?: string
   teamIdentifier?: string
@@ -37,6 +44,15 @@ export interface AppleSigningContext {
 
 type PassFileMap = Record<string, Buffer>
 
+/**
+ * AppleWalletProvider — producer kontraktu `WalletPassProvider` dla Apple `.pkpass`.
+ *
+ * Kontrakt audytu: provider zwraca wyłącznie `{ save_url }`. Audytowalny
+ * `AuditEnvelope` (success/failure/invalidate) jest wytwarzany przez
+ * `WalletPassFacade`, nie przez provider. Producenci downstream MUSZĄ wywoływać
+ * provider tylko za pośrednictwem facade (per Story 3.1 D-108). Bezpośrednie
+ * wywołanie providera poza facade pomija envelope i telemetrię D-112.
+ */
 export class AppleWalletProvider implements WalletPassProvider {
   private readonly passTypeIdentifier: string
   private readonly teamIdentifier: string
@@ -59,13 +75,14 @@ export class AppleWalletProvider implements WalletPassProvider {
     const effective_locale = normalizeWalletLocale(locale)
     const files = this.createPassFiles(payload, effective_locale)
     const manifest = createManifest(files)
-    const signing_context = this.signingContextFactory()
-    const signature = signManifest(manifest, signing_context)
-
-    files["manifest.json"] = Buffer.from(
+    const manifestBytes = Buffer.from(
       JSON.stringify(manifest, null, 2),
       "utf8"
     )
+    const signing_context = this.signingContextFactory()
+    const signature = signManifest(manifestBytes, signing_context)
+
+    files["manifest.json"] = manifestBytes
     files.signature = signature
 
     const archive = await createPkpassArchive(files)
@@ -78,22 +95,14 @@ export class AppleWalletProvider implements WalletPassProvider {
   /**
    * Apple Wallet nie udostępnia odpowiednika Google REST invalidation dla lokalnego
    * `.pkpass`. Klient odświeża stan przy kolejnym pobraniu, więc v1.10.0 zwraca
-   * audytowalny noop zamiast udawać server-side revoke.
+   * void (noop) — audytowalny envelope produkuje `WalletPassFacade` zgodnie
+   * z portem `WalletPassProvider` ze Story 3.1.
    */
   async invalidate(
-    entitlement_instance_id: string,
-    reason: WalletInvalidationReason
-  ): Promise<{ audit_event: AuditEnvelope }> {
-    return {
-      audit_event: {
-        event_type: "wallet.pass_invalidated",
-        entitlement_instance_id,
-        provider: "apple",
-        reason,
-        timestamp: new Date().toISOString(),
-        outcome: "success",
-      },
-    }
+    _entitlement_instance_id: string,
+    _reason: WalletInvalidationReason
+  ): Promise<void> {
+    return
   }
 
   private createPassFiles(
@@ -119,6 +128,11 @@ export class AppleWalletProvider implements WalletPassProvider {
 
   private createPassJson(payload: WalletPayload, locale: WalletLocale) {
     const barcode = payload.barcode ?? payload.barcode_spec
+    if (!barcode || typeof barcode.value !== "string" || barcode.value.length === 0) {
+      throw new Error(
+        "WalletPayload.barcode_spec.value is required for Apple pass.json"
+      )
+    }
 
     return {
       formatVersion: 1,
@@ -133,8 +147,6 @@ export class AppleWalletProvider implements WalletPassProvider {
       labelColor: normalizeHexColor(payload.branding.accent_color),
       expirationDate: resolveExpirationDate(payload),
       voided: payload.status === "REVOKED" || payload.status === "REFUNDED",
-      webServiceURL: payload.deep_link,
-      relevantText: payload.deep_link,
       barcodes: [
         {
           format: toAppleBarcodeFormat(barcode.format),
@@ -147,19 +159,19 @@ export class AppleWalletProvider implements WalletPassProvider {
         primaryFields: [
           {
             key: "title",
-            label: "Voucher",
+            label: LABEL_KEYS.VOUCHER,
             value: payload.title,
           },
         ],
         secondaryFields: [
           {
             key: "code",
-            label: "Kod",
+            label: LABEL_KEYS.CODE,
             value: payload.code,
           },
           {
             key: "status",
-            label: "Status",
+            label: LABEL_KEYS.STATUS,
             value: payload.status,
           },
         ],
@@ -182,34 +194,65 @@ export class AppleWalletProvider implements WalletPassProvider {
   }
 }
 
+let cachedStubContext: AppleSigningContext | undefined
+
 /**
  * TODO(v1.11.0+): zastąpić stub realnym Apple-issued Pass Type ID Certificate,
  * kluczem prywatnym z Secret Managera i certyfikatem intermediate po Apple
  * Developer Program enrollment. Ten stub jest wyłącznie ścieżką code-complete
- * i testową dla `WALLET_APPLE_ENABLED=false`.
+ * i testową dla `WALLET_APPLE_ENABLED=false`. Cache modułowy unika regeneracji
+ * 2048-bitowego RSA keypair przy każdym wywołaniu (synchroniczne ~200-500ms).
+ *
+ * FIXME(v1.11.0+): replace `wwdrCert` (currently a second self-signed stub
+ * with distinct CN, NIE realny Apple WWDR intermediate) with the real Apple
+ * Worldwide Developer Relations Certification Authority intermediate cert
+ * before flipping `WALLET_APPLE_ENABLED=true`.
  */
 export function createStubSigningContext(): AppleSigningContext {
-  const keys = forge.pki.rsa.generateKeyPair({ bits: 2048, workers: 0 })
-  const signerCert = forge.pki.createCertificate()
-  signerCert.publicKey = keys.publicKey
-  signerCert.serialNumber = "01"
-  signerCert.validity.notBefore = new Date()
-  signerCert.validity.notAfter = new Date(
-    signerCert.validity.notBefore.getTime() + 365 * 24 * 60 * 60 * 1000
+  if (cachedStubContext) {
+    return cachedStubContext
+  }
+
+  const signerKeys = forge.pki.rsa.generateKeyPair({ bits: 2048, workers: 0 })
+  const signerCert = buildSelfSignedCertificate(signerKeys, {
+    commonName: "GP-Apple-Wallet-Stub",
+    serialNumber: "01",
+  })
+
+  const wwdrKeys = forge.pki.rsa.generateKeyPair({ bits: 2048, workers: 0 })
+  const wwdrCert = buildSelfSignedCertificate(wwdrKeys, {
+    commonName: "GP-Apple-WWDR-Stub",
+    serialNumber: "02",
+  })
+
+  cachedStubContext = {
+    signerCert,
+    signerKey: signerKeys.privateKey,
+    wwdrCert,
+  }
+
+  return cachedStubContext
+}
+
+function buildSelfSignedCertificate(
+  keys: forge.pki.rsa.KeyPair,
+  attrs: { commonName: string; serialNumber: string }
+): forge.pki.Certificate {
+  const cert = forge.pki.createCertificate()
+  cert.publicKey = keys.publicKey
+  cert.serialNumber = attrs.serialNumber
+  cert.validity.notBefore = new Date()
+  cert.validity.notAfter = new Date(
+    cert.validity.notBefore.getTime() + 365 * 24 * 60 * 60 * 1000
   )
-  const attrs = [
-    { name: "commonName", value: "GP-Apple-Wallet-Stub" },
+  const subject = [
+    { name: "commonName", value: attrs.commonName },
     { name: "organizationName", value: DEFAULT_ORGANIZATION_NAME },
   ]
-  signerCert.setSubject(attrs)
-  signerCert.setIssuer(attrs)
-  signerCert.sign(keys.privateKey, forge.md.sha256.create())
-
-  return {
-    signerCert,
-    signerKey: keys.privateKey,
-    wwdrCert: signerCert,
-  }
+  cert.setSubject(subject)
+  cert.setIssuer(subject)
+  cert.sign(keys.privateKey, forge.md.sha256.create())
+  return cert
 }
 
 function createManifest(files: PassFileMap): Record<string, string> {
@@ -222,11 +265,14 @@ function createManifest(files: PassFileMap): Record<string, string> {
 }
 
 function signManifest(
-  manifest: Record<string, string>,
+  manifestBytes: Buffer,
   context: AppleSigningContext
 ): Buffer {
   const p7 = forge.pkcs7.createSignedData()
-  p7.content = forge.util.createBuffer(JSON.stringify(manifest), "utf8")
+  p7.content = forge.util.createBuffer(
+    manifestBytes.toString("binary"),
+    "raw"
+  )
   p7.addCertificate(context.signerCert)
   p7.addCertificate(context.wwdrCert)
   p7.addSigner({
@@ -268,16 +314,16 @@ function createPassStrings(payload: WalletPayload, locale: WalletLocale): string
   const labels: Record<WalletLocale, Record<string, string>> = {
     "pl-PL": { voucher: "Voucher", code: "Kod", status: "Status" },
     "en-US": { voucher: "Voucher", code: "Code", status: "Status" },
-    "uk-UA": { voucher: "Voucher", code: "Kod", status: "Status" },
+    "uk-UA": { voucher: "Ваучер", code: "Код", status: "Статус" },
     "de-DE": { voucher: "Gutschein", code: "Code", status: "Status" },
   }
   const text = labels[locale]
 
   return [
-    `"Voucher" = "${escapePassString(text.voucher)}";`,
-    `"Kod" = "${escapePassString(text.code)}";`,
-    `"Status" = "${escapePassString(text.status)}";`,
-    `"Tytul" = "${escapePassString(payload.title)}";`,
+    `"${LABEL_KEYS.VOUCHER}" = "${escapePassString(text.voucher)}";`,
+    `"${LABEL_KEYS.CODE}" = "${escapePassString(text.code)}";`,
+    `"${LABEL_KEYS.STATUS}" = "${escapePassString(text.status)}";`,
+    `"${LABEL_KEYS.TITLE}" = "${escapePassString(payload.title)}";`,
   ].join("\n")
 }
 
@@ -299,4 +345,10 @@ function normalizeHexColor(color: string): string {
 
 function escapePassString(value: string): string {
   return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')
+}
+
+export const __test_only__ = {
+  resetStubSigningContextCache(): void {
+    cachedStubContext = undefined
+  },
 }
