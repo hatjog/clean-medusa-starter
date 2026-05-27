@@ -57,6 +57,28 @@ export class DefaultMessagingGateway implements MessagingGateway {
   private readonly maxCacheSize: number;
   private readonly flagResolver?: ICommunicationFlowFlagResolver;
 
+  // F-02: explicit overloady TS rozdzielają nowy options-object API od legacy
+  // positional sygnatury Story 5.1 — bez nich TS pozwalał skompilować mieszany
+  // call (object + dodatkowe argumenty) gdzie runtime po cichu ignorował uuid/ttl.
+  constructor(
+    providers: MessagingProviderRegistry,
+    defaultProvider: NotificationProvider,
+    options?: MessagingGatewayOptions,
+  );
+  /**
+   * @deprecated Sygnatura pozycyjna zachowana dla Story 5.1 callsites; preferuj
+   * przekazanie `MessagingGatewayOptions`. Pozycyjne argumenty po `clock` (`uuid`,
+   * `idempotencyTtlMs`, `maxCacheSize`) działają TYLKO gdy 3-ci argument jest
+   * funkcją; w połączeniu z options-objectem są ignorowane.
+   */
+  constructor(
+    providers: MessagingProviderRegistry,
+    defaultProvider: NotificationProvider,
+    clock: () => Date,
+    uuid?: () => string,
+    idempotencyTtlMs?: number,
+    maxCacheSize?: number,
+  );
   constructor(
     providers: MessagingProviderRegistry,
     private readonly defaultProvider: NotificationProvider,
@@ -94,15 +116,18 @@ export class DefaultMessagingGateway implements MessagingGateway {
   async send(intent: NotificationIntent): Promise<NotificationDispatch> {
     this.validateIntent(intent);
 
+    // F-01: gate ZAWSZE eval przed cache lookup — config flag może się zmienić
+    // pomiędzy dwoma send-ami (operator flipuje enabled OFF→ON); gated denial
+    // NIE jest cache'owany, żeby kolejny send dostał świeży resolve i flow ruszył.
+    const gatedDispatch = this.applyFeatureFlagGate(intent);
+    if (gatedDispatch) {
+      return gatedDispatch;
+    }
+
     const cacheKey = buildCacheKey(intent);
     const cached = this.getCachedDispatch(cacheKey);
     if (cached) {
       return cached;
-    }
-
-    const gatedDispatch = this.applyFeatureFlagGate(intent, cacheKey);
-    if (gatedDispatch) {
-      return gatedDispatch;
     }
 
     const provider = this.providers.get(this.defaultProvider);
@@ -314,7 +339,6 @@ export class DefaultMessagingGateway implements MessagingGateway {
 
   private applyFeatureFlagGate(
     intent: NotificationIntent,
-    cacheKey: string,
   ): NotificationDispatch | undefined {
     if (!this.flagResolver) {
       return undefined;
@@ -329,8 +353,13 @@ export class DefaultMessagingGateway implements MessagingGateway {
       return undefined;
     }
 
+    // F-01: gated denial NIE jest cache'owany — operator flip OFF→ON musi natychmiast
+    // odblokować flow bez czekania na TTL idempotency cache. Tradeoff: kolejne retry
+    // dla disabled flow generują nowy dispatch_id, ale to akceptowalne dla denial path
+    // (consumer i tak nie dostarcza wiadomości; idempotency invariant Story 5.1 zachowany
+    // dla success/queued dispatchy).
     const dispatchId = this.uuid();
-    const dispatch: NotificationDispatch = {
+    return {
       dispatch_id: dispatchId,
       provider: this.defaultProvider,
       status: "failed",
@@ -344,10 +373,6 @@ export class DefaultMessagingGateway implements MessagingGateway {
         gate_source: "feature_flag",
       }),
     };
-
-    this.cacheDispatch(cacheKey, dispatch);
-
-    return dispatch;
   }
 }
 

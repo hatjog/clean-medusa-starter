@@ -186,7 +186,7 @@ describe("DefaultMessagingGateway feature flag gate", () => {
     expect(dispatch.status).toBe("queued");
   });
 
-  it("cacheuje gated dispatch dla tego samego idempotency_key", async () => {
+  it("ponownie ewaluuje resolver przy kazdym send dla disabled flow (F-01 — operator flip OFF→ON natychmiastowy)", async () => {
     const provider = makeProvider();
     const resolver = {
       resolve: jest.fn().mockReturnValue({
@@ -200,7 +200,12 @@ describe("DefaultMessagingGateway feature flag gate", () => {
     const gateway = new DefaultMessagingGateway({ brevo: provider }, "brevo", {
       flagResolver: resolver,
       clock: () => fixedNow,
-      uuid: makeUuid(["gated-dispatch", "audit-gated"]),
+      uuid: makeUuid([
+        "gated-dispatch-1",
+        "audit-gated-1",
+        "gated-dispatch-2",
+        "audit-gated-2",
+      ]),
     });
 
     const intent = makeIntent({
@@ -211,8 +216,45 @@ describe("DefaultMessagingGateway feature flag gate", () => {
     const second = await gateway.send(intent);
 
     expect(provider.send).not.toHaveBeenCalled();
-    expect(resolver.resolve).toHaveBeenCalledTimes(1);
-    expect(second).toBe(first);
+    expect(resolver.resolve).toHaveBeenCalledTimes(2);
+    expect(first.audit_event.error_code).toBe("FLOW_DISABLED");
     expect(second.audit_event.error_code).toBe("FLOW_DISABLED");
+    expect(first.dispatch_id).not.toBe(second.dispatch_id);
+  });
+
+  it("po flip resolverze enabled→true kolejny send dla tego samego idempotency_key idzie do providera (gate NIE cachowany)", async () => {
+    const provider = makeProvider();
+    const resolveMock = jest
+      .fn()
+      .mockReturnValueOnce({
+        enabled: false,
+        consent_basis: "lifecycle_consented",
+        source: "default",
+        flow_id: "voucher_reminder_t7",
+        market_id: "bonevent",
+      })
+      .mockReturnValue({
+        enabled: true,
+        consent_basis: "lifecycle_consented",
+        source: "market_override",
+        flow_id: "voucher_reminder_t7",
+        market_id: "bonevent",
+      });
+    const gateway = new DefaultMessagingGateway({ brevo: provider }, "brevo", {
+      flagResolver: { resolve: resolveMock },
+      clock: () => fixedNow,
+      uuid: makeUuid(["gated-dispatch", "audit-gated", "audit-provider"]),
+    });
+
+    const intent = makeIntent({
+      flow_id: "voucher_reminder_t7",
+      consent_basis: "lifecycle_consented",
+    });
+    const denied = await gateway.send(intent);
+    const delivered = await gateway.send(intent);
+
+    expect(denied.status).toBe("failed");
+    expect(delivered.status).toBe("queued");
+    expect(provider.send).toHaveBeenCalledTimes(1);
   });
 });

@@ -1,5 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
-import { createRequire } from "node:module";
+
+import * as yaml from "js-yaml";
 
 import {
   CommunicationConfigNotFoundError,
@@ -8,15 +9,19 @@ import {
 } from "./errors";
 import type { ConsentBasis } from "./types";
 
-const requireYaml = createRequire(__filename);
-const yaml = requireYaml("js-yaml") as { load(source: string): unknown };
-
 const CONSENT_BASIS_VALUES = new Set<ConsentBasis>([
   "transactional_critical",
   "transactional_supportive",
   "lifecycle_consented",
   "marketing",
 ]);
+
+// F-04: ten sam regex co Python validator (`_grow/tools/validate_communication_flag_consistency.py`)
+// — TS loader jest pierwszym gate, validator drugim. Snake_case enforced runtime.
+const FLOW_ID_RE = /^[a-z][a-z0-9_]{2,63}$/;
+const MARKET_ID_RE = /^[a-z][a-z0-9_-]{1,63}$/;
+
+const SUPPORTED_SCHEMA_VERSION = 1;
 
 export interface FlagResolverInput {
   flow_id: string;
@@ -37,7 +42,9 @@ export interface CommunicationFlowDefaults {
 }
 
 export interface CommunicationDefaultsConfig {
-  version: 1;
+  // F-08: loose-typed number + runtime check vs literal `1` — schema bump (v2)
+  // wymusza explicit migration error zamiast nieczytelnego type mismatch.
+  version: number;
   flows: Record<string, CommunicationFlowDefaults>;
 }
 
@@ -46,7 +53,7 @@ export interface MarketFlowOverride {
 }
 
 export interface MarketFlowsConfig {
-  version: 1;
+  version: number;
   market_id: string;
   overrides: Record<string, MarketFlowOverride>;
 }
@@ -58,10 +65,25 @@ export interface ICommunicationFlowFlagResolver {
 export class StaticCommunicationFlowFlagResolver
   implements ICommunicationFlowFlagResolver
 {
+  private readonly defaults: CommunicationDefaultsConfig;
+  private readonly marketOverrides: Map<string, MarketFlowsConfig>;
+
   constructor(
-    private readonly defaults: CommunicationDefaultsConfig,
-    private readonly marketOverrides: Map<string, MarketFlowsConfig>,
-  ) {}
+    defaults: CommunicationDefaultsConfig,
+    marketOverrides: Map<string, MarketFlowsConfig>,
+  ) {
+    // F-06: defensive deep-freeze konstruktora — caller mutujący przekazany
+    // `defaults`/`marketOverrides` po construct NIE może zmienić decyzji
+    // resolvera (cache-busting backdoor). Resolver jest static-only, ale gdy
+    // kiedyś dojdzie hot-reload, freeze utrzyma invariant.
+    this.defaults = deepFreezeDefaults(defaults);
+    this.marketOverrides = new Map(
+      Array.from(marketOverrides.entries(), ([marketId, cfg]) => [
+        marketId,
+        deepFreezeMarketFlows(cfg),
+      ]),
+    );
+  }
 
   resolve(input: FlagResolverInput): FlowFlagState {
     const defaultFlow = this.defaults.flows[input.flow_id];
@@ -69,7 +91,10 @@ export class StaticCommunicationFlowFlagResolver
       throw new UnknownFlowError(
         `Communication flow '${input.flow_id}' is not defined in defaults`,
         {
-          error_code: "COMMUNICATION_FLOW_UNKNOWN",
+          // F-07: ujednolicony namespace `FLOW_*` (parity z `FLOW_DISABLED`
+          // w gateway gated denial) — downstream analytics / runbook trzyma
+          // jeden prefix dla domain flow concepts.
+          error_code: "FLOW_UNKNOWN",
         },
       );
     }
@@ -80,12 +105,33 @@ export class StaticCommunicationFlowFlagResolver
 
     return {
       enabled: hasMarketOverride ? marketOverride.enabled : defaultFlow.enabled,
+      // F-09 invariant: `consent_basis` ZAWSZE z defaults, nigdy z override
+      // (governance FR-E.8) — nawet jeśli ktoś bypass-uje loader i programatycznie
+      // wstrzyknie `consent_basis` w override obiekt.
       consent_basis: defaultFlow.consent_basis,
       source: hasMarketOverride ? "market_override" : "default",
       flow_id: input.flow_id,
       market_id: input.market_id,
     };
   }
+}
+
+function deepFreezeDefaults(
+  cfg: CommunicationDefaultsConfig,
+): CommunicationDefaultsConfig {
+  for (const flow of Object.values(cfg.flows)) {
+    Object.freeze(flow);
+  }
+  Object.freeze(cfg.flows);
+  return Object.freeze(cfg);
+}
+
+function deepFreezeMarketFlows(cfg: MarketFlowsConfig): MarketFlowsConfig {
+  for (const override of Object.values(cfg.overrides)) {
+    Object.freeze(override);
+  }
+  Object.freeze(cfg.overrides);
+  return Object.freeze(cfg);
 }
 
 export function loadCommunicationDefaults(
@@ -121,15 +167,18 @@ function parseDefaults(
   yamlPath: string,
 ): CommunicationDefaultsConfig {
   const root = expectRecord(value, yamlPath);
-
-  if (root.version !== 1) {
-    throw validationError(yamlPath, "version must equal 1");
-  }
+  assertSchemaVersion(root.version, yamlPath);
 
   const flowsRoot = expectRecord(root.flows, yamlPath, "flows");
   const flows: Record<string, CommunicationFlowDefaults> = {};
 
   for (const [flowId, rawFlow] of Object.entries(flowsRoot)) {
+    if (!FLOW_ID_RE.test(flowId)) {
+      throw validationError(
+        yamlPath,
+        `flows.${flowId} key must match ${FLOW_ID_RE} (snake_case, 3-64 chars)`,
+      );
+    }
     const flow = expectRecord(rawFlow, yamlPath, `flows.${flowId}`);
     if (typeof flow.enabled !== "boolean") {
       throw validationError(yamlPath, `flows.${flowId}.enabled must be boolean`);
@@ -146,7 +195,7 @@ function parseDefaults(
     };
   }
 
-  return { version: 1, flows };
+  return { version: SUPPORTED_SCHEMA_VERSION, flows };
 }
 
 function parseMarketFlows(
@@ -155,9 +204,13 @@ function parseMarketFlows(
   yamlPath: string,
 ): MarketFlowsConfig {
   const root = expectRecord(value, yamlPath);
+  assertSchemaVersion(root.version, yamlPath);
 
-  if (root.version !== 1) {
-    throw validationError(yamlPath, "version must equal 1");
+  if (!MARKET_ID_RE.test(marketId)) {
+    throw validationError(
+      yamlPath,
+      `market_id parameter '${marketId}' must match ${MARKET_ID_RE}`,
+    );
   }
 
   if (root.market_id !== marketId) {
@@ -172,6 +225,12 @@ function parseMarketFlows(
   const overrides: Record<string, MarketFlowOverride> = {};
 
   for (const [flowId, rawOverride] of Object.entries(overridesRoot)) {
+    if (!FLOW_ID_RE.test(flowId)) {
+      throw validationError(
+        yamlPath,
+        `overrides.${flowId} key must match ${FLOW_ID_RE}`,
+      );
+    }
     const override = expectRecord(rawOverride, yamlPath, `overrides.${flowId}`);
     if (typeof override.enabled !== "boolean") {
       throw validationError(
@@ -190,7 +249,22 @@ function parseMarketFlows(
     };
   }
 
-  return { version: 1, market_id: marketId, overrides };
+  return { version: SUPPORTED_SCHEMA_VERSION, market_id: marketId, overrides };
+}
+
+function assertSchemaVersion(rawVersion: unknown, yamlPath: string): void {
+  if (typeof rawVersion !== "number") {
+    throw validationError(yamlPath, "version must be a number");
+  }
+  if (rawVersion !== SUPPORTED_SCHEMA_VERSION) {
+    // F-08: explicit migration hint zamiast generic "version mismatch" — compiler 5.3
+    // może w przyszłości wystawiać v2 schema; resolver musi failować z czytelnym
+    // komunikatem zamiast nieczytelnego TS literal error.
+    throw validationError(
+      yamlPath,
+      `expected schema version ${SUPPORTED_SCHEMA_VERSION}, got ${rawVersion}; bump @gp/messaging to read new schema`,
+    );
+  }
 }
 
 function expectRecord(
