@@ -16,6 +16,8 @@
     "baseUrl": "./",
     "ignoreDeprecations": "5.0",
     "paths": {
+      "@gp/messaging": ["packages/messaging/src/index.ts"],
+      "@gp/messaging/*": ["packages/messaging/src/*"],
       "@/*": ["packages/api/src/*"]
     },
     "jsx": "react-jsx",

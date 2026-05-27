@@ -26,6 +26,9 @@ importers:
 
   .:
     dependencies:
+      '@gp/messaging':
+        specifier: workspace:*
+        version: link:packages/messaging
       '@medusajs/admin-sdk':
         specifier: 2.14.2
         version: 2.14.2
@@ -138,6 +141,8 @@ importers:
       yalc:
         specifier: ^1.0.0-pre.53
         version: 1.0.0-pre.53
+
+  packages/messaging: {}
 
   packages/wallet:
     devDependencies:

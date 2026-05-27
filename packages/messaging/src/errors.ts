@@ -11,16 +11,17 @@ export class MessagingError extends Error {
   readonly error_code: string;
   readonly audit_event?: AuditEnvelope;
   readonly status_code?: number;
+  readonly cause?: unknown;
 
   constructor(message: string, options: MessagingErrorOptions) {
-    super(
-      message,
-      options.cause !== undefined ? { cause: options.cause } : undefined,
-    );
+    super(message);
     this.name = new.target.name;
     this.error_code = options.error_code;
     this.audit_event = options.audit_event;
     this.status_code = options.status_code;
+    if (options.cause !== undefined) {
+      this.cause = options.cause;
+    }
   }
 }
 

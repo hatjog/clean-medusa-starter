@@ -41,6 +41,7 @@
     "test:patches": "TEST_TYPE=patches NODE_OPTIONS=--experimental-vm-modules jest --silent=false --runInBand --forceExit"
   },
   "dependencies": {
+    "@gp/messaging": "workspace:*",
     "@medusajs/admin-sdk": "2.14.2",
     "@medusajs/cli": "2.14.2",
     "@medusajs/framework": "2.14.2",
