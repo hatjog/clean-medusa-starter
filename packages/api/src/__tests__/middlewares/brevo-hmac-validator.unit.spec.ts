@@ -208,10 +208,24 @@ describe("Brevo webhook HMAC middleware", () => {
     expect(nextCalled).toBe(false)
     expect(res.statusCode).toBe(401)
     expect(timingSafeEqual).toHaveBeenCalled()
+    // F-13: prove the real compare path executed by checking that at least
+    // one invocation passed two *distinct* buffers (the decoy call passes
+    // the expected buffer to itself; only the genuine real-compare branch
+    // compares against the attacker-supplied signature).
+    const realCompareCall = timingSafeEqual.mock.calls.find(
+      ([a, b]) =>
+        Buffer.isBuffer(a) &&
+        Buffer.isBuffer(b) &&
+        a.length === b.length &&
+        !a.equals(b),
+    )
+    expect(realCompareCall).toBeDefined()
     expect(auditEvents[0]).toMatchObject({
       error_code: "BREVO_HMAC_SIGNATURE_MISMATCH",
       outcome: "rejected",
     })
+    // F-10: signature_hash was removed from reject envelope.
+    expect(auditEvents[0].signature_hash).toBeUndefined()
   })
 
   it("malformed hex signature returns 401 without raw payload leakage", async () => {
@@ -524,6 +538,106 @@ describe("Brevo webhook HMAC middleware", () => {
       "[brevo-hmac-validator] audit sink unavailable",
       expect.objectContaining({ error_code: "BREVO_HMAC_SIGNATURE_MISMATCH" }),
     )
+  })
+
+  it("missing BREVO_HMAC_SECRET does NOT count toward circuit-breaker failures (F-03)", async () => {
+    delete process.env.BREVO_HMAC_SECRET
+    const rawBody = JSON.stringify({ event: "delivered" })
+    const ip = "203.0.113.30"
+
+    // Send exactly CIRCUIT_FAILURE_THRESHOLD (5) misconfigured requests; if 503
+    // SECRET_UNSET counted as failure, the circuit would now be open.
+    for (let i = 0; i < 5; i += 1) {
+      const { req } = makeRequest({ rawBody, signature: sign(rawBody), ip })
+      const { res } = await invokeFullChain(req)
+      expect(res.statusCode).toBe(503)
+    }
+
+    // Advance past rate-limit window so the next request is not blocked by
+    // the per-IP per-second cap; circuit state is what we are exercising here.
+    nowMs += 2 * 1000
+
+    process.env.BREVO_HMAC_SECRET = TEST_SECRET
+    const { req } = makeRequest({ rawBody, signature: sign(rawBody), ip })
+    const { res, nextCalled } = await invokeFullChain(req, (response) => {
+      response.status(204)
+      response.emit("finish")
+    })
+
+    expect(nextCalled).toBe(true)
+    expect(res.statusCode).toBe(204)
+  })
+
+  it("missing raw body fails closed with 503 BREVO_HMAC_RAW_BODY_UNAVAILABLE (F-04)", async () => {
+    const rawBody = JSON.stringify({ event: "delivered" })
+    const { req, auditEvents } = makeRequest({ rawBody, signature: sign(rawBody) })
+    delete req.rawBody
+    // Provide an already-parsed body — production fallback used to
+    // JSON.stringify(req.body) here, which would silently break HMAC.
+    req.body = { event: "delivered" }
+
+    const { res, nextCalled } = await invokeFullChain(req)
+
+    expect(nextCalled).toBe(false)
+    expect(res.statusCode).toBe(503)
+    expect(auditEvents.at(-1)).toMatchObject({
+      error_code: "BREVO_HMAC_RAW_BODY_UNAVAILABLE",
+      outcome: "rejected",
+    })
+  })
+
+  it("reject envelope uses sentinel dispatch_id, locale, hashed_recipient and deterministic idempotency_key (F-06/F-07/F-08)", async () => {
+    const rawBody = JSON.stringify({ event: "bounced" })
+    const auditEvents: AuditEvent[] = []
+    const ip = "203.0.113.40"
+
+    for (let i = 0; i < 3; i += 1) {
+      const { req } = makeRequest({
+        rawBody,
+        signature: sign(rawBody, "wrong-secret"),
+        ip,
+        auditEvents,
+      })
+      await invokeFullChain(req)
+    }
+
+    const idempotencyKeys = new Set(
+      auditEvents.map((event) => event.idempotency_key as string),
+    )
+    expect(idempotencyKeys.size).toBe(1)
+    expect(auditEvents[0]).toMatchObject({
+      dispatch_id: "__pre_dispatch__",
+      locale: "__unknown__",
+      hashed_recipient: "__no_recipient__",
+    })
+    expect(auditEvents[0].correlation_id).toBeUndefined()
+  })
+
+  it("logs info on accepted webhook (F-15)", async () => {
+    const rawBody = JSON.stringify({ event: "delivered" })
+    const { req, logger } = makeRequest({ rawBody, signature: sign(rawBody) })
+
+    const { nextCalled } = await invokeFullChain(req)
+
+    expect(nextCalled).toBe(true)
+    expect(logger.info).toHaveBeenCalledWith(
+      "[brevo-hmac-validator] accepted",
+      expect.objectContaining({ body_byte_length: Buffer.byteLength(rawBody) }),
+    )
+  })
+
+  it("test-only export refuses to run outside NODE_ENV=test (F-01)", () => {
+    const previous = process.env.NODE_ENV
+    process.env.NODE_ENV = "production"
+    try {
+      expect(() => __resetBrevoWebhookSecurityForTests()).toThrow(/test-only/)
+      expect(() =>
+        __setBrevoWebhookSecurityClockForTests(() => 0),
+      ).toThrow(/test-only/)
+    } finally {
+      process.env.NODE_ENV = previous
+      __setBrevoWebhookSecurityClockForTests(() => nowMs)
+    }
   })
 
   it("reject audit events never include raw body, email, or secret", async () => {
