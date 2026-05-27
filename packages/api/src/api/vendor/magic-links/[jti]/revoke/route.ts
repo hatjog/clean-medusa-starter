@@ -1,6 +1,7 @@
 import type { MedusaRequest, MedusaResponse } from "@medusajs/framework/http"
 import { ContainerRegistrationKeys } from "@medusajs/framework/utils"
 import type { Knex } from "knex"
+import { z } from "zod"
 
 import {
   PostgresMagicLinkStore,
@@ -24,12 +25,8 @@ type RevokeAuditOutcome =
   | "rejected_rate_limited"
 
 type LoggerLike = {
-  info?: (message: string, context?: Record<string, unknown>) => void
+  info: (message: string, context?: Record<string, unknown>) => void
   warn?: (message: string, context?: Record<string, unknown>) => void
-}
-
-type ResponseWithHeaders = MedusaResponse & {
-  setHeader?: (name: string, value: string) => void
 }
 
 type RateLimitAdapter = {
@@ -44,13 +41,18 @@ const RATE_LIMIT_BUCKET_SIZE = 3
 const RATE_LIMIT_REFILL_PER_MIN = 3
 const RATE_LIMIT_PREFIX = "magic-link-revoke:jti:"
 
-let rateLimiter = new InMemoryTokenBucketAdapter()
+// Fallback adapter for environments where the container does not expose a
+// shared `rate_limit_token_bucket` (eg. dev/test runs without redis).
+// Tests inject their own adapter via the scope resolver so each suite gets
+// explicit control over bucket state.
+const FALLBACK_RATE_LIMITER = new InMemoryTokenBucketAdapter()
 
-export function __setMagicLinkRevokeRateLimiterForTests(
-  adapter: InMemoryTokenBucketAdapter
-): void {
-  rateLimiter = adapter
-}
+const RevokeBodySchema = z
+  .object({
+    confirm: z.literal(true),
+    current_session: z.boolean().optional(),
+  })
+  .strict()
 
 function resolveDb(req: MedusaRequest): Knex | null {
   try {
@@ -62,10 +64,14 @@ function resolveDb(req: MedusaRequest): Knex | null {
 
 function resolveLogger(req: MedusaRequest): LoggerLike {
   try {
-    return (req.scope.resolve("logger") as LoggerLike | undefined) ?? console
+    const resolved = req.scope.resolve("logger") as LoggerLike | undefined
+    if (resolved && typeof resolved.info === "function") {
+      return resolved
+    }
   } catch {
-    return console
+    // fall through to console
   }
+  return console as unknown as LoggerLike
 }
 
 function resolveRateLimiter(req: MedusaRequest): RateLimitAdapter {
@@ -73,9 +79,11 @@ function resolveRateLimiter(req: MedusaRequest): RateLimitAdapter {
     const resolved = req.scope.resolve("rate_limit_token_bucket") as
       | RateLimitAdapter
       | undefined
-    return typeof resolved?.consume === "function" ? resolved : rateLimiter
+    return typeof resolved?.consume === "function"
+      ? resolved
+      : FALLBACK_RATE_LIMITER
   } catch {
-    return rateLimiter
+    return FALLBACK_RATE_LIMITER
   }
 }
 
@@ -90,12 +98,6 @@ function resolveSellerId(req: MedusaRequest): string | null {
   return actorId || null
 }
 
-function resolveBody(req: MedusaRequest): Record<string, unknown> {
-  return req.body && typeof req.body === "object" && !Array.isArray(req.body)
-    ? (req.body as Record<string, unknown>)
-    : {}
-}
-
 function recordAudit(
   req: MedusaRequest,
   input: {
@@ -103,17 +105,21 @@ function recordAudit(
     jti: string
     seller_id: string
     current_session_revoke?: boolean
-    subject_seller_id_hashed?: string
+    subject_seller_id_hashed?: string | null
   }
 ): void {
-  resolveLogger(req).info?.("[magic-link-revoke] audit", {
+  // `info` is required on LoggerLike — no optional chain so a missing
+  // method is a loud failure instead of a silent audit drop.
+  resolveLogger(req).info("[magic-link-revoke] audit", {
     event: "magic_link_revoke",
     actor_type: "vendor",
     seller_id: input.seller_id,
     token_jti: input.jti,
     outcome: input.outcome,
     current_session_revoke: input.current_session_revoke ?? false,
-    subject_seller_id_hashed: input.subject_seller_id_hashed,
+    // Always emit the key (null when not applicable) so dashboards can
+    // rely on a stable envelope schema regardless of outcome.
+    subject_seller_id_hashed: input.subject_seller_id_hashed ?? null,
   })
 }
 
@@ -143,22 +149,31 @@ export async function POST(
   const jti = (req.params as { jti?: string })?.jti ?? ""
   const sellerId = resolveSellerId(req)
 
-  if (!isValidMagicLinkJti(jti)) {
-    if (sellerId) {
-      recordAudit(req, {
-        outcome: "rejected_jti_invalid",
-        jti,
-        seller_id: sellerId,
-      })
-    }
-    res.status(400).json({ code: "INVALID_JTI" })
-    return
-  }
-
+  // Require seller authentication before exposing JTI validity status.
   if (!sellerId) {
     res.status(401).json({ code: "UNAUTHORIZED" })
     return
   }
+
+  if (!isValidMagicLinkJti(jti)) {
+    recordAudit(req, {
+      outcome: "rejected_jti_invalid",
+      jti,
+      seller_id: sellerId,
+    })
+    res.status(400).json({ code: "INVALID_JTI" })
+    return
+  }
+
+  // Strict body validation: rejects non-boolean fields and extraneous keys.
+  // Body check sits BEFORE rate-limit consume so a `{confirm:false}` spam
+  // from an authenticated bystander cannot DoS the legit owner's bucket.
+  const parsedBody = RevokeBodySchema.safeParse(req.body)
+  if (!parsedBody.success) {
+    res.status(400).json({ code: "CONFIRM_REQUIRED" })
+    return
+  }
+  const currentSessionRevoke = parsedBody.data.current_session === true
 
   const rateLimit = await consumeRateLimit(req, jti)
   if (!rateLimit.allowed) {
@@ -166,22 +181,14 @@ export async function POST(
       outcome: "rejected_rate_limited",
       jti,
       seller_id: sellerId,
+      current_session_revoke: currentSessionRevoke,
     })
-    const responseWithHeaders = res as ResponseWithHeaders
-    responseWithHeaders.setHeader?.(
-      "Retry-After",
-      String(rateLimit.retry_after_seconds)
-    )
+    // Express alias on MedusaResponse — typed, no defensive cast needed.
+    res.set("Retry-After", String(rateLimit.retry_after_seconds))
     res.status(429).json({
       code: "RATE_LIMITED",
       retry_after_seconds: rateLimit.retry_after_seconds,
     })
-    return
-  }
-
-  const body = resolveBody(req)
-  if (body.confirm !== true) {
-    res.status(400).json({ code: "CONFIRM_REQUIRED" })
     return
   }
 
@@ -191,30 +198,34 @@ export async function POST(
     return
   }
 
-  const currentSessionRevoke = body.current_session === true
   const lookup = await lookupSellerJti(db, jti)
   const subjectSellerId = lookup.subject_seller_id
-  const rejectedOutcome =
-    lookup.found && subjectSellerId !== sellerId
-      ? "rejected_cross_tenant"
-      : "rejected_jti_invalid"
 
-  if (!lookup.found || subjectSellerId !== sellerId) {
+  // ADR-112 constant-time invariant: always run the SHA-256 hash so the
+  // `found:false` and `found:true,mismatch` paths share identical CPU work
+  // before branching on the outcome. Hash output is only surfaced in the
+  // cross-tenant audit envelope; otherwise the computed value is discarded.
+  const hashedSubject = hashSellerId(subjectSellerId ?? "")
+  const matchedOwner = lookup.found && subjectSellerId === sellerId
+
+  if (!matchedOwner) {
+    const isCrossTenant =
+      lookup.found && subjectSellerId !== null && subjectSellerId !== sellerId
     recordAudit(req, {
-      outcome: rejectedOutcome,
+      outcome: isCrossTenant ? "rejected_cross_tenant" : "rejected_jti_invalid",
       jti,
       seller_id: sellerId,
       current_session_revoke: currentSessionRevoke,
-      subject_seller_id_hashed:
-        subjectSellerId && subjectSellerId !== sellerId
-          ? hashSellerId(subjectSellerId)
-          : undefined,
+      // PII minimisation: only expose hashed subject for true cross-tenant
+      // attempts; jti_not_found uses the audit-envelope null sentinel.
+      subject_seller_id_hashed: isCrossTenant ? hashedSubject : null,
     })
+    // Story D-117 SSOT explicitly enumerates both reasons; the constant-time
+    // mitigation lives in the CPU path above (always-on hash), not in the
+    // response body — operators need the distinct reason to triage support
+    // tickets vs cross-tenant probes.
     res.status(403).json({
-      reason:
-        rejectedOutcome === "rejected_cross_tenant"
-          ? "cross_tenant"
-          : "jti_not_found",
+      reason: isCrossTenant ? "cross_tenant" : "jti_not_found",
     })
     return
   }

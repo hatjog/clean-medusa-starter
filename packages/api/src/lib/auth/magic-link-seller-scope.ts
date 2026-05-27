@@ -14,7 +14,6 @@ export type SellerJtiLookupResult = {
 type MagicLinkIssuedSellerRow = {
   token_jti?: string | null
   subject_seller_id?: string | null
-  subject?: Record<string, unknown> | null
 }
 
 function fixedUuidBuffer(value: string): Buffer {
@@ -33,12 +32,7 @@ export function timingSafeJtiEqual(left: string, right: string): boolean {
 
 function resolveSubjectSellerId(row: MagicLinkIssuedSellerRow | undefined): string | null {
   const direct = row?.subject_seller_id
-  if (typeof direct === "string" && direct.trim()) {
-    return direct.trim()
-  }
-
-  const nested = row?.subject?.seller_id
-  return typeof nested === "string" && nested.trim() ? nested.trim() : null
+  return typeof direct === "string" && direct.trim() ? direct.trim() : null
 }
 
 export function hashSellerId(value: string): string {
@@ -50,7 +44,7 @@ export async function lookupSellerJti(
   jti: string
 ): Promise<SellerJtiLookupResult> {
   const row = await db("magic_link_issued")
-    .select("token_jti", "subject_seller_id", "subject")
+    .select("token_jti", "subject_seller_id")
     .where({ token_jti: jti })
     .first<MagicLinkIssuedSellerRow>()
 

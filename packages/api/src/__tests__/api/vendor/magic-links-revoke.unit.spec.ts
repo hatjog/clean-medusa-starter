@@ -1,9 +1,6 @@
 import type { MedusaRequest, MedusaResponse } from "@medusajs/framework/http"
 
-import {
-  POST,
-  __setMagicLinkRevokeRateLimiterForTests,
-} from "../../../api/vendor/magic-links/[jti]/revoke/route"
+import { POST } from "../../../api/vendor/magic-links/[jti]/revoke/route"
 import { PostgresMagicLinkStore } from "../../../lib/auth/magic-link-revocation"
 import { InMemoryTokenBucketAdapter } from "../../../lib/rate-limit-token-bucket"
 
@@ -21,6 +18,10 @@ function response() {
     },
     json(payload: unknown) {
       this.body = payload
+      return this
+    },
+    set(name: string, value: string) {
+      this.headers[name] = value
       return this
     },
     setHeader(name: string, value: string) {
@@ -49,9 +50,11 @@ function request(args: {
   body?: Record<string, unknown>
   issuedRow?: Record<string, unknown>
   logger?: { info: jest.Mock }
+  rateLimiter?: InMemoryTokenBucketAdapter
 }): MedusaRequest {
   const db = dbWithIssuedRow(args.issuedRow)
   const logger = args.logger ?? { info: jest.fn() }
+  const rateLimiter = args.rateLimiter ?? new InMemoryTokenBucketAdapter()
 
   return {
     params: { jti: args.jti ?? VALID_JTI },
@@ -63,6 +66,7 @@ function request(args: {
       resolve: jest.fn((key: string) => {
         if (key === "__pg_connection__") return db
         if (key === "logger") return logger
+        if (key === "rate_limit_token_bucket") return rateLimiter
         return {}
       }),
     },
@@ -73,7 +77,6 @@ describe("POST /vendor/magic-links/:jti/revoke", () => {
   let revokeSpy: jest.SpiedFunction<PostgresMagicLinkStore["revokeJti"]>
 
   beforeEach(() => {
-    __setMagicLinkRevokeRateLimiterForTests(new InMemoryTokenBucketAdapter())
     revokeSpy = jest
       .spyOn(PostgresMagicLinkStore.prototype, "revokeJti")
       .mockResolvedValue()
@@ -111,6 +114,7 @@ describe("POST /vendor/magic-links/:jti/revoke", () => {
         actor_type: "vendor",
         outcome: "revoked",
         current_session_revoke: true,
+        subject_seller_id_hashed: null,
       })
     )
   })
@@ -140,7 +144,7 @@ describe("POST /vendor/magic-links/:jti/revoke", () => {
     )
   })
 
-  it("rejects missing seller JTI as jti_not_found", async () => {
+  it("rejects missing seller JTI as jti_not_found with null hashed subject", async () => {
     const logger = { info: jest.fn() }
     const res = response()
 
@@ -153,7 +157,10 @@ describe("POST /vendor/magic-links/:jti/revoke", () => {
     expect(res.body).toEqual({ reason: "jti_not_found" })
     expect(logger.info).toHaveBeenCalledWith(
       "[magic-link-revoke] audit",
-      expect.objectContaining({ outcome: "rejected_jti_invalid" })
+      expect.objectContaining({
+        outcome: "rejected_jti_invalid",
+        subject_seller_id_hashed: null,
+      })
     )
   })
 
@@ -187,13 +194,16 @@ describe("POST /vendor/magic-links/:jti/revoke", () => {
     expect(logger.info).not.toHaveBeenCalled()
   })
 
-  it("rate limits the fourth attempt per JTI per minute", async () => {
+  it("rate limits the fourth attempt per JTI per minute via shared scope adapter", async () => {
+    const sharedRateLimiter = new InMemoryTokenBucketAdapter()
+
     for (let index = 0; index < 3; index += 1) {
       await POST(
         request({
           jti: OTHER_JTI,
           sellerId: "seller_1",
           issuedRow: { token_jti: OTHER_JTI, subject_seller_id: "seller_1" },
+          rateLimiter: sharedRateLimiter,
         }),
         response() as unknown as MedusaResponse
       )
@@ -207,6 +217,7 @@ describe("POST /vendor/magic-links/:jti/revoke", () => {
         sellerId: "seller_1",
         issuedRow: { token_jti: OTHER_JTI, subject_seller_id: "seller_1" },
         logger,
+        rateLimiter: sharedRateLimiter,
       }),
       res as unknown as MedusaResponse
     )
@@ -220,13 +231,48 @@ describe("POST /vendor/magic-links/:jti/revoke", () => {
     )
   })
 
-  it("requires explicit confirmation before DB lookup/revoke", async () => {
+  it("requires explicit confirmation before consuming rate-limit bucket", async () => {
+    const sharedRateLimiter = new InMemoryTokenBucketAdapter()
+    const res = response()
+
+    // 5 malformed requests with confirm:false must NOT drain the bucket —
+    // verifies F-01 fix (confirm check sits BEFORE consumeRateLimit).
+    for (let index = 0; index < 5; index += 1) {
+      const r = response()
+      await POST(
+        request({
+          sellerId: "seller_1",
+          body: { confirm: false },
+          issuedRow: { token_jti: VALID_JTI, subject_seller_id: "seller_1" },
+          rateLimiter: sharedRateLimiter,
+        }),
+        r as unknown as MedusaResponse
+      )
+      expect(r.statusCode).toBe(400)
+    }
+
+    // The legit owner attempt that follows must still succeed (bucket unspent).
+    await POST(
+      request({
+        sellerId: "seller_1",
+        body: { confirm: true },
+        issuedRow: { token_jti: VALID_JTI, subject_seller_id: "seller_1" },
+        rateLimiter: sharedRateLimiter,
+      }),
+      res as unknown as MedusaResponse
+    )
+
+    expect(res.statusCode).toBe(200)
+    expect(revokeSpy).toHaveBeenCalled()
+  })
+
+  it("rejects unknown body fields with 400 (strict schema)", async () => {
     const res = response()
 
     await POST(
       request({
         sellerId: "seller_1",
-        body: { confirm: false },
+        body: { confirm: true, malicious_field: "x" },
         issuedRow: { token_jti: VALID_JTI, subject_seller_id: "seller_1" },
       }),
       res as unknown as MedusaResponse
@@ -234,6 +280,22 @@ describe("POST /vendor/magic-links/:jti/revoke", () => {
 
     expect(res.statusCode).toBe(400)
     expect(res.body).toEqual({ code: "CONFIRM_REQUIRED" })
+    expect(revokeSpy).not.toHaveBeenCalled()
+  })
+
+  it("rejects non-boolean current_session with 400", async () => {
+    const res = response()
+
+    await POST(
+      request({
+        sellerId: "seller_1",
+        body: { confirm: true, current_session: "true" },
+        issuedRow: { token_jti: VALID_JTI, subject_seller_id: "seller_1" },
+      }),
+      res as unknown as MedusaResponse
+    )
+
+    expect(res.statusCode).toBe(400)
     expect(revokeSpy).not.toHaveBeenCalled()
   })
 })
