@@ -53,15 +53,22 @@ export async function GET(req: MedusaRequest, res: MedusaResponse) {
   }
 
   const query = req.scope.resolve(ContainerRegistrationKeys.QUERY) as {
-    graph: (input: Record<string, unknown>) => Promise<QueryGraphResult>;
+    graph: (
+      input: Record<string, unknown>,
+      options?: Record<string, unknown>
+    ) => Promise<QueryGraphResult>;
   };
-  const { data: sellers } = await query.graph({
-    entity: "seller",
-    fields: [...SELLER_LIST_FIELDS],
-    filters: {
-      id: sellerIds,
+  const locale = (req as MedusaRequest & { locale?: string }).locale;
+  const { data: sellers } = await query.graph(
+    {
+      entity: "seller",
+      fields: [...SELLER_LIST_FIELDS],
+      filters: {
+        id: sellerIds,
+      },
     },
-  });
+    { locale }
+  );
 
   // Note: cast to ProductCountRow[] required — Knex countDistinct generic is single-row but
   // groupBy returns multiple rows.

@@ -89,17 +89,24 @@ export async function GET(req: MedusaRequest, res: MedusaResponse) {
   }
 
   const query = req.scope.resolve(ContainerRegistrationKeys.QUERY) as {
-    graph: (input: Record<string, unknown>) => Promise<QueryGraphResult>;
+    graph: (
+      input: Record<string, unknown>,
+      options?: Record<string, unknown>
+    ) => Promise<QueryGraphResult>;
   };
+  const locale = (req as MedusaRequest & { locale?: string }).locale;
   const {
     data: [rawSeller],
-  } = await query.graph({
-    entity: "seller",
-    fields: [...SELLER_PROFILE_FIELDS],
-    filters: {
-      id: sellerId,
+  } = await query.graph(
+    {
+      entity: "seller",
+      fields: [...SELLER_PROFILE_FIELDS],
+      filters: {
+        id: sellerId,
+      },
     },
-  });
+    { locale }
+  );
 
   if (!rawSeller) {
     throw new MedusaError(

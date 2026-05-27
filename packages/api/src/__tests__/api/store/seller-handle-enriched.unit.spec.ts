@@ -119,9 +119,21 @@ describe("GET /store/seller/[handle] — enriched profile", () => {
       if (key === "query") return mockQuery;
       return undefined;
     });
+    (req as unknown as { locale?: string }).locale = "de-DE";
     const res = createResponse();
 
     await GET(req, res as unknown as Parameters<typeof GET>[1]);
+
+    expect(mockQuery.graph).toHaveBeenCalledWith(
+      {
+        entity: "seller",
+        fields: ["id", "name", "handle", "description", "photo", "metadata"],
+        filters: {
+          id: "seller_123",
+        },
+      },
+      { locale: "de-DE" }
+    );
 
     const body = res.body as { seller: Record<string, unknown> };
     expect(body.seller.id).toBe("seller_123");

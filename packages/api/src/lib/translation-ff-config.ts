@@ -26,6 +26,11 @@ export const TRANSLATION_ENTITY_SETTINGS = [
     entity_type: "product_collection",
     fields: ["title"],
   },
+  {
+    story_label: "seller",
+    entity_type: "seller",
+    fields: ["name", "description"],
+  },
 ] as const
 
 export function isTranslationFeatureFlagEnabled(
