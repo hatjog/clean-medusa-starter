@@ -1,132 +1,121 @@
 /**
  * Story 6.2 browser-shape guard for /vendor/competitive-insights.
  *
- * This is a route-level integration simulator: it exercises the same
- * auth-derived seller/vendor scope, cross-vendor guard, snapshot source,
- * aggregation, and audit envelope sequence expected from the real handler.
+ * Drives the REAL exported `GET` handler from
+ * `src/api/vendor/competitive-insights/route.ts` with a request object
+ * shaped like the browser bearer-token flow (Mercur
+ * `ensureSellerMiddleware` already populated `seller_context`). This
+ * closes the F-14 anti-regression gate: any drift in route auth, scope
+ * guard, snapshot source, aggregation, or audit envelope is caught here
+ * — no parallel simulator copy.
+ *
+ * Mocked dependencies (closest to the real handler):
+ *   - `../../../lib/competitive-insights-source.resolveInsightSnapshots`
+ *   - `../../../lib/vendor-notification-log.appendNotificationLog`
+ * The aggregator (`competitive-insights-aggregator`) runs unmocked
+ * because it is pure computation.
  */
 
 import { describe, it, expect, jest, beforeEach } from "@jest/globals"
 
-import { getCompetitiveInsights } from "../../../../src/lib/competitive-insights-aggregator"
+// ---------------------------------------------------------------------------
+// Module mocks — must precede the route import.
+// ---------------------------------------------------------------------------
 
-const auditLog: Array<Record<string, unknown>> = []
-const mockAppendNotificationLog = jest.fn(async (_scope: unknown, input: Record<string, unknown>) => {
-  auditLog.push({ ...input })
-  return { id: "audit_1", ...input }
-})
-const mockResolveInsightSnapshots = jest.fn()
+jest.mock("../../../../src/lib/competitive-insights-source", () => ({
+  resolveInsightSnapshots: jest.fn(),
+}))
+jest.mock("../../../../src/lib/vendor-notification-log", () => ({
+  appendNotificationLog: jest.fn(),
+}))
 
-type BrowserRequestShape = {
-  headers: Record<string, string>
-  seller_context?: { seller_id?: string }
-  auth_context?: { actor_id?: string }
-  body?: Record<string, unknown>
-  query: Record<string, unknown>
-  scope: {
-    resolve: (key: string) => unknown
-  }
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const { GET } = require("../../../../src/api/vendor/competitive-insights/route")
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const {
+  resolveInsightSnapshots: mockResolveInsightSnapshots,
+} = require("../../../../src/lib/competitive-insights-source") as {
+  resolveInsightSnapshots: jest.Mock
+}
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const {
+  appendNotificationLog: mockAppendNotificationLog,
+} = require("../../../../src/lib/vendor-notification-log") as {
+  appendNotificationLog: jest.Mock
 }
 
-async function simulateBrowserRoute(req: BrowserRequestShape) {
-  const sellerId = req.seller_context?.seller_id
-  if (!sellerId) {
-    return {
-      statusCode: 401,
-      body: { code: "UNAUTHORIZED", message: "Seller context not present" },
-    }
-  }
+// ---------------------------------------------------------------------------
+// Request / response builders mirroring Mercur browser bearer transport.
+// ---------------------------------------------------------------------------
 
-  const gpCore = req.scope.resolve("gp_core") as {
-    resolveVendorId: (sellerId: string) => Promise<string>
-  }
-  const vendorId = await gpCore.resolveVendorId(sellerId)
+type CapturedResponse = {
+  statusCode: number
+  body: unknown
+}
 
-  const requestedVendorId =
-    (req.body?.["vendor_id"] as string | undefined) ??
-    (req.query["vendor_id"] as string | undefined)
-
-  if (requestedVendorId !== undefined && requestedVendorId !== vendorId) {
-    await mockAppendNotificationLog(req.scope, {
-      vendor_id: vendorId,
-      notification_type: "competitive_insights_query",
-      locale: "pl",
-      recipient_email: "system",
-      status: "rejected",
-      error_message: "cross_vendor_scope_mismatch",
-      triggered_by: vendorId,
-      metadata: { requested_vendor_id: requestedVendorId },
-    })
-    return {
-      statusCode: 403,
-      body: { code: "cross_vendor_scope_mismatch" },
-    }
-  }
-
-  const { snapshots, data_source: dataSource } = await mockResolveInsightSnapshots(
-    req.scope,
-    [sellerId],
-  ) as {
-    snapshots: Array<{
-      vendor_id: string
-      category_id: string
-      category_name: string
-      price: number
-    }>
-    data_source: "mercur_query"
-  }
-  const insightsData = getCompetitiveInsights(vendorId, snapshots)
-
-  await mockAppendNotificationLog(req.scope, {
-    vendor_id: vendorId,
-    notification_type: "competitive_insights_query",
-    locale: "pl",
-    recipient_email: "system",
-    status: "sent",
-    triggered_by: vendorId,
-    metadata: {
-      category_count: insightsData.categories.length,
-      data_source: dataSource,
-    },
-  })
-
+function createGpCoreScope() {
   return {
-    statusCode: 200,
-    body: { ...insightsData, data_source: dataSource },
+    resolve: (key: string) => {
+      if (key === "gp_core") {
+        return {
+          resolveVendorId: async (sellerId: string) => {
+            expect(sellerId).toBe("sel_browser_1")
+            return "ven_browser_1"
+          },
+        }
+      }
+      if (key === "logger") return console
+      return undefined
+    },
   }
 }
 
-function createBrowserRequest(options?: { bodyVendorId?: string }): BrowserRequestShape {
+function createBrowserRequest(options?: {
+  bodyVendorId?: string
+  noSeller?: boolean
+}) {
+  const sellerId = options?.noSeller ? undefined : "sel_browser_1"
   return {
     headers: {
       authorization: "Bearer seller-session.jwt",
       "x-publishable-api-key": "pk_test",
       "x-seller-id": "sel_browser_1",
     },
-    seller_context: { seller_id: "sel_browser_1" },
+    seller_context: sellerId ? { seller_id: sellerId } : undefined,
     auth_context: { actor_id: "member_browser_1" },
     body: options?.bodyVendorId ? { vendor_id: options.bodyVendorId } : undefined,
     query: {},
-    scope: {
-      resolve: (key: string) => {
-        if (key === "gp_core") {
-          return {
-            resolveVendorId: async (sellerId: string) => {
-              expect(sellerId).toBe("sel_browser_1")
-              return "ven_browser_1"
-            },
-          }
-        }
-        return undefined
-      },
-    },
-  }
+    scope: createGpCoreScope(),
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  } as any
 }
 
-describe("GET /vendor/competitive-insights — browser JWT bearer shape", () => {
+function createResponseCapture(): { res: unknown; captured: CapturedResponse } {
+  const captured: CapturedResponse = { statusCode: 0, body: undefined }
+  const res = {
+    status(code: number) {
+      captured.statusCode = code
+      return this
+    },
+    json(body: unknown) {
+      captured.body = body
+      return this
+    },
+  }
+  return { res, captured }
+}
+
+// ---------------------------------------------------------------------------
+// Tests — drive the real GET handler.
+// ---------------------------------------------------------------------------
+
+describe("GET /vendor/competitive-insights — browser JWT bearer shape (real route)", () => {
   beforeEach(() => {
     jest.clearAllMocks()
-    auditLog.length = 0
+    mockAppendNotificationLog.mockImplementation(async (_scope, input) => ({
+      id: "audit_1",
+      ...(input as Record<string, unknown>),
+    }))
     mockResolveInsightSnapshots.mockResolvedValue({
       data_source: "mercur_query",
       snapshots: [
@@ -148,19 +137,30 @@ describe("GET /vendor/competitive-insights — browser JWT bearer shape", () => 
 
   it("accepts bearer + publishable key + x-seller-id without x-vendor-signature", async () => {
     const req = createBrowserRequest()
+    const { res, captured } = createResponseCapture()
+    captured.statusCode = 200 // default for res.json() without explicit status
 
-    const result = await simulateBrowserRoute(req)
+    await GET(req, res)
 
     expect(req.headers["x-vendor-signature"]).toBeUndefined()
-    expect(result.statusCode).toBe(200)
-    expect(result.body).toMatchObject({
+    expect(captured.statusCode).toBe(200)
+    expect(captured.body).toMatchObject({
       vendor_id: "ven_browser_1",
       data_source: "mercur_query",
     })
-    expect(Array.isArray((result.body as { categories?: unknown[] }).categories)).toBe(true)
-    expect((result.body as { categories: unknown[] }).categories.length).toBeGreaterThan(0)
-    expect(mockResolveInsightSnapshots).toHaveBeenCalledWith(req.scope, ["sel_browser_1"])
-    expect(auditLog[0]).toMatchObject({
+    expect(
+      Array.isArray((captured.body as { categories?: unknown[] }).categories),
+    ).toBe(true)
+    expect(
+      (captured.body as { categories: unknown[] }).categories.length,
+    ).toBeGreaterThan(0)
+    expect(mockResolveInsightSnapshots).toHaveBeenCalledWith(req.scope, [
+      "sel_browser_1",
+    ])
+    const auditCall = mockAppendNotificationLog.mock.calls[0]?.[1] as
+      | Record<string, unknown>
+      | undefined
+    expect(auditCall).toMatchObject({
       vendor_id: "ven_browser_1",
       notification_type: "competitive_insights_query",
       status: "sent",
@@ -169,17 +169,32 @@ describe("GET /vendor/competitive-insights — browser JWT bearer shape", () => 
 
   it("rejects cross-vendor body scope before querying snapshots and writes rejected audit", async () => {
     const req = createBrowserRequest({ bodyVendorId: "ven_other" })
+    const { res, captured } = createResponseCapture()
 
-    const result = await simulateBrowserRoute(req)
+    await GET(req, res)
 
-    expect(result.statusCode).toBe(403)
-    expect(result.body).toMatchObject({ code: "cross_vendor_scope_mismatch" })
+    expect(captured.statusCode).toBe(403)
+    expect(captured.body).toMatchObject({ code: "cross_vendor_scope_mismatch" })
     expect(mockResolveInsightSnapshots).not.toHaveBeenCalled()
-    expect(auditLog[0]).toMatchObject({
+    const auditCall = mockAppendNotificationLog.mock.calls[0]?.[1] as
+      | Record<string, unknown>
+      | undefined
+    expect(auditCall).toMatchObject({
       vendor_id: "ven_browser_1",
       status: "rejected",
       error_message: "cross_vendor_scope_mismatch",
       metadata: { requested_vendor_id: "ven_other" },
     })
+  })
+
+  it("returns 401 when seller_context is missing (Mercur middleware did not populate it)", async () => {
+    const req = createBrowserRequest({ noSeller: true })
+    const { res, captured } = createResponseCapture()
+
+    await GET(req, res)
+
+    expect(captured.statusCode).toBe(401)
+    expect(mockResolveInsightSnapshots).not.toHaveBeenCalled()
+    expect(mockAppendNotificationLog).not.toHaveBeenCalled()
   })
 })
