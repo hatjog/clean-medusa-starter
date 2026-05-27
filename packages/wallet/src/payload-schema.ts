@@ -57,6 +57,12 @@ const WALLET_STATUSES = new Set(["ACTIVE", "EXPIRED", "REVOKED", "REFUNDED"])
 const WALLET_LOCALES = new Set(["pl-PL", "en-US", "uk-UA", "de-DE"])
 const BARCODE_FORMATS = new Set(["QR", "PDF417"])
 
+// Parytet semantyczny z JSON Schema (F-05): expires_at = ISO-8601 date-time,
+// branding colors = #RRGGBB. Defense-in-depth ma dwa miecze tej samej dlugosci.
+const ISO_DATETIME_PATTERN =
+  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/
+const HEX_COLOR_PATTERN = /^#[0-9A-Fa-f]{6}$/
+
 type UnknownRecord = Record<string, unknown>
 
 function asRecord(value: unknown): UnknownRecord | null {
@@ -133,6 +139,14 @@ function assertBranding(value: unknown): void {
       )
     }
   }
+  for (const colorField of ["primary_color", "accent_color"] as const) {
+    if (!HEX_COLOR_PATTERN.test(String(branding[colorField]))) {
+      throw new WalletPayloadError(
+        "WALLET_PAYLOAD_REQUIRED_FIELD_INVALID",
+        `wallet payload field branding.${colorField} must match #RRGGBB`
+      )
+    }
+  }
 }
 
 export function assertWalletPayloadSchema(
@@ -188,6 +202,12 @@ export function assertWalletPayloadSchema(
       "wallet payload field locale is invalid"
     )
   }
+  if (!ISO_DATETIME_PATTERN.test(String(record.expires_at))) {
+    throw new WalletPayloadError(
+      "WALLET_PAYLOAD_REQUIRED_FIELD_INVALID",
+      "wallet payload field expires_at must be ISO-8601 date-time"
+    )
+  }
 
   assertBarcodeSpec(record.barcode_spec, "barcode_spec")
   if (record.barcode !== undefined) assertBarcodeSpec(record.barcode, "barcode")
@@ -195,13 +215,20 @@ export function assertWalletPayloadSchema(
   assertBranding(record.branding)
 }
 
+/**
+ * Runtime guard fail-closed by default we wszystkich srodowiskach (F-01 fix).
+ *
+ * Per D-110 + FR-C.12 hardening:adversarial-review (GDPR Art. 5), trzecia
+ * warstwa defense-in-depth MUSI dzialac w produkcji. Koszt walidacji jest
+ * milisekundowy (Object.keys + Set lookup), wiec domyslnie waliduje takze
+ * `NODE_ENV === "production"`. Awaryjny opt-out (gdy hot-fix wymaga skip)
+ * jest jawny: `GP_WALLET_PAYLOAD_SCHEMA_VALIDATION=off`. Reviewer gate w
+ * `wallet-pii-audit.md` wymaga ze produkcyjny deploy NIE ustawia opt-out.
+ */
 export function validateWalletPayloadInCurrentEnv(
   payload: WalletPayload
 ): WalletPayload {
-  if (
-    process.env.NODE_ENV === "production" &&
-    process.env.GP_WALLET_PAYLOAD_SCHEMA_VALIDATION !== "on"
-  ) {
+  if (process.env.GP_WALLET_PAYLOAD_SCHEMA_VALIDATION === "off") {
     return payload
   }
 
