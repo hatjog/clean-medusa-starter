@@ -17,6 +17,8 @@ const payload: WalletPayload = {
   title: "BonBeauty voucher",
   status: "ACTIVE",
   expires_at: "2026-12-31T23:59:59.000Z",
+  salon_name: "BonBeauty Warszawa Mokotów",
+  salon_address: "ul. Puławska 123, Warszawa",
   deep_link: "https://bonbeauty.example/pl/vouchers/BB-2026-0001",
   barcode_spec: { format: "QR", value: "BB-2026-0001" },
   qr_code: "BB-2026-0001",
@@ -99,7 +101,7 @@ describe("DefaultWalletPassFacade", () => {
     const builder = createBuilder()
     const facade = createFacade({ google, apple }, builder)
 
-    // Cast simulates a non-canonical locale supplied via JS caller or loose cast.
+    // Cast symuluje niekanoniczny locale z JS callera albo luznego rzutowania.
     const result = await facade.generatePass(
       "ei_123",
       "google",
@@ -124,7 +126,7 @@ describe("DefaultWalletPassFacade", () => {
   })
 
   it("throws UnsupportedWalletProviderError with PROVIDER_NOT_REGISTERED when provider is missing in registry (F-01)", async () => {
-    // v1.10.0 Apple flag-off: DI registers only `google`.
+    // v1.10.0 Apple flag-off: DI rejestruje tylko `google`.
     const google = createProvider("https://pay.google.com/gp/v/save/token")
     const facade = new DefaultWalletPassFacade({ google }, createBuilder(), {
       now: () => new Date(timestamp),
