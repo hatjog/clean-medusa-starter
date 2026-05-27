@@ -1,9 +1,16 @@
+import { generateKeyPairSync } from "node:crypto"
 import { performance } from "node:perf_hooks"
 
 import {
   GoogleWalletConfigMissingError,
   type GoogleWalletProviderConfig,
 } from "../google-config"
+
+const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 })
+const privateKeyPem = privateKey.export({
+  type: "pkcs8",
+  format: "pem",
+}) as string
 import {
   GoogleWalletProvider,
   GoogleWalletProviderInvalidationError,
@@ -16,7 +23,7 @@ import type { WalletPayload } from "../../payload"
 const config: GoogleWalletProviderConfig = {
   issuer_id: "3388000000022223333",
   service_account_email: "wallet-demo@example.iam.gserviceaccount.com",
-  private_key: "fake-private-key",
+  private_key: privateKeyPem,
   class_id_template: "{issuer_id}.{market_code}_voucher_v1",
   origin_save_base: "https://pay.google.com/gp/v/save/",
   market_code: "bonbeauty",
@@ -85,7 +92,7 @@ describe("GoogleWalletProvider", () => {
         redemptionCode: "BB-2026-0001",
       }),
       expect.objectContaining({ issuer_id: "3388000000022223333" }),
-      expect.objectContaining({ offerClass: expect.any(Object) })
+      expect.objectContaining({ now: expect.any(Function) })
     )
   })
 
@@ -236,6 +243,8 @@ describe("GoogleWalletProvider", () => {
 
     await provider.issueSaveUrl(payload, "pl-PL")
 
-    expect(performance.now() - started).toBeLessThan(200)
+    // I4: 1000ms threshold zamiast 200ms — daje budżet pod cold CI runner load
+    // (shared Node start). NFR4.1 p95 ≤3s weryfikowany osobno e2e benchmarkiem.
+    expect(performance.now() - started).toBeLessThan(1000)
   })
 })

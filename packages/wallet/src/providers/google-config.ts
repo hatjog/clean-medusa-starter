@@ -83,6 +83,9 @@ export function resolveGoogleWalletProviderConfig(
 export function buildGoogleWalletClassId(
   config: GoogleWalletProviderConfig
 ): string {
+  // I2: w v1.10.0 BonBeauty obsługuje wyłącznie voucher passes — placeholder
+  // {wallet_product} jest expanded do "voucher" bezwarunkowo. Pillar C
+  // extension (np. loyalty cards) wymagać będzie parametryzacji per pass kind.
   const expanded = config.class_id_template
     .replaceAll("{issuer_id}", config.issuer_id)
     .replaceAll("{market_code}", sanitizeWalletIdPart(config.market_code))
@@ -131,10 +134,15 @@ function normalizePrivateKey(value: unknown): string | undefined {
 
   try {
     const decoded = Buffer.from(escaped, "base64").toString("utf8")
-    return decoded.includes("-----BEGIN") ? decoded : escaped
+    if (decoded.includes("-----BEGIN")) return decoded
   } catch {
-    return escaped
+    // intentionally swallowed — fail-fast poniżej
   }
+
+  // L5 fail-fast: ani escaped, ani base64-decoded nie zawiera PEM headera —
+  // bootstrap powinien zobaczyć GOOGLE_WALLET_CONFIG_MISSING zamiast cichego
+  // przejścia do GOOGLE_WALLET_SIGNING_FAILED w runtime.
+  throw new GoogleWalletConfigMissingError(["private_key (not PEM)"])
 }
 
 function parseOptionalInteger(value: unknown): number | undefined {

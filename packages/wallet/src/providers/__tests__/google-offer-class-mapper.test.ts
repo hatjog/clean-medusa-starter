@@ -47,7 +47,7 @@ const branding: GoogleWalletMarketBranding = {
 }
 
 describe("Google Wallet OfferClass mapper", () => {
-  it("mapuje WalletPayload na OfferObject z kodem, terminem, lokalizacja i brandingiem", () => {
+  it("mapuje WalletPayload na lean OfferObject (per-pass), branding pozostaje w OfferClass", () => {
     const offerObject = buildOfferClassPayload(payload, "pl-PL", branding)
 
     expect(offerObject).toMatchObject({
@@ -60,8 +60,6 @@ describe("Google Wallet OfferClass mapper", () => {
         start: { date: "2026-05-27T10:00:00.000Z" },
         end: { date: "2026-12-31T23:59:59.000Z" },
       },
-      provider: "BonBeauty Mokotow",
-      hexBackgroundColor: "#F5E6D3",
       barcode: {
         type: "QR_CODE",
         value: "QR-BB-2026-0001",
@@ -74,17 +72,25 @@ describe("Google Wallet OfferClass mapper", () => {
           },
         ],
       },
-      merchantLocations: [
-        {
-          address: "ul. Testowa 1, Warszawa",
-          latitude: 52.2297,
-          longitude: 21.0122,
-        },
-      ],
+      locations: [{ latitude: 52.2297, longitude: 21.0122 }],
     })
+    // M1: branding (provider, hexBackgroundColor, titleImage, merchantLocations,
+    // localizedTitle) leci wyłącznie w OfferClass, nie w OfferObject.
+    expect(
+      (offerObject as unknown as Record<string, unknown>).provider
+    ).toBeUndefined()
+    expect(
+      (offerObject as unknown as Record<string, unknown>).hexBackgroundColor
+    ).toBeUndefined()
+    expect(
+      (offerObject as unknown as Record<string, unknown>).merchantLocations
+    ).toBeUndefined()
+    expect(
+      (offerObject as unknown as Record<string, unknown>).classReference
+    ).toBeUndefined()
   })
 
-  it("ustawia OfferClass z localizedTitle dla czterech kanonicznych locale", () => {
+  it("ustawia OfferClass z brandingiem (color/logo/provider/merchantLocations) + localizedTitle 4 locale", () => {
     const offerClass = buildGoogleOfferClass(payload, "pl-PL", branding)
 
     expect(offerClass).toMatchObject({
@@ -93,9 +99,17 @@ describe("Google Wallet OfferClass mapper", () => {
       provider: "BonBeauty Mokotow",
       reviewStatus: "UNDER_REVIEW",
       redemptionChannel: "BOTH",
+      hexBackgroundColor: "#F5E6D3",
       titleImage: {
         sourceUri: { uri: "https://assets.example/wallet-logo.png" },
       },
+      merchantLocations: [
+        {
+          address: "ul. Testowa 1, Warszawa",
+          latitude: 52.2297,
+          longitude: 21.0122,
+        },
+      ],
     })
     expect(offerClass.localizedTitle?.translatedValues).toEqual([
       { language: "pl-PL", value: "Voucher spa" },
@@ -105,8 +119,8 @@ describe("Google Wallet OfferClass mapper", () => {
     ])
   })
 
-  it("uzywa warm cream fallback i pomija logo, gdy market nie ma wallet branding", () => {
-    const offerObject = buildOfferClassPayload(
+  it("uzywa warm cream fallback i pomija logo w OfferClass, gdy market nie ma wallet branding", () => {
+    const offerClass = buildGoogleOfferClass(
       {
         ...payload,
         branding: { ...payload.branding, logo_url: "" },
@@ -122,8 +136,53 @@ describe("Google Wallet OfferClass mapper", () => {
       }
     )
 
-    expect(offerObject.hexBackgroundColor).toBe(GOOGLE_WALLET_DEFAULT_BACKGROUND)
-    expect(offerObject.logo).toBeUndefined()
+    expect(offerClass.hexBackgroundColor).toBe(GOOGLE_WALLET_DEFAULT_BACKGROUND)
+    expect(offerClass.titleImage).toBeUndefined()
+  })
+
+  it("M2: mapWalletStatus rozróżnia EXPIRED od INACTIVE (REVOKED/REFUNDED → INACTIVE)", () => {
+    const cases: Array<["ACTIVE" | "EXPIRED" | "REVOKED" | "REFUNDED", string]> = [
+      ["ACTIVE", "ACTIVE"],
+      ["EXPIRED", "EXPIRED"],
+      ["REVOKED", "INACTIVE"],
+      ["REFUNDED", "INACTIVE"],
+    ]
+    for (const [status, expected] of cases) {
+      const offerObject = buildOfferClassPayload(
+        { ...payload, status },
+        "pl-PL",
+        branding
+      )
+      expect(offerObject.state).toBe(expected)
+    }
+  })
+
+  it("L4: fail-closed gdy expires_at jest pusty albo malformed", () => {
+    expect(() =>
+      buildOfferClassPayload(
+        { ...payload, expires_at: "" },
+        "pl-PL",
+        branding
+      )
+    ).toThrow(
+      expect.objectContaining({
+        name: "GoogleWalletPayloadError",
+        error_code: "GOOGLE_WALLET_EXPIRES_AT_INVALID",
+      } satisfies Partial<GoogleWalletPayloadError>)
+    )
+
+    expect(() =>
+      buildOfferClassPayload(
+        { ...payload, expires_at: "yesterday" },
+        "pl-PL",
+        branding
+      )
+    ).toThrow(
+      expect.objectContaining({
+        name: "GoogleWalletPayloadError",
+        error_code: "GOOGLE_WALLET_EXPIRES_AT_INVALID",
+      } satisfies Partial<GoogleWalletPayloadError>)
+    )
   })
 
   it("nie serializuje PII odbiorcy nawet gdy read model dostarczy nadmiarowe pola", () => {

@@ -1,9 +1,6 @@
 import { createSign } from "node:crypto"
 
-import type { walletobjects_v1 } from "googleapis"
-
 import type { GoogleWalletProviderConfig } from "./google-config"
-import { resolveGoogleWalletProviderConfig } from "./google-config"
 import type { GoogleOfferObject } from "./google-offer-class-mapper"
 
 export interface GoogleWalletJWTClaims {
@@ -14,12 +11,10 @@ export interface GoogleWalletJWTClaims {
   origins?: string[]
   payload: {
     offerObjects: GoogleOfferObject[]
-    offerClasses?: walletobjects_v1.Schema$OfferClass[]
   }
 }
 
 export interface SignSaveJWTOptions {
-  offerClass?: walletobjects_v1.Schema$OfferClass
   now?: () => Date
   origins?: string[]
 }
@@ -36,12 +31,15 @@ export class GoogleWalletSigningError extends Error {
   }
 }
 
+// M3: signer przyjmuje już-zresolvowany config (provider robi resolve raz w
+// konstruktorze) — eliminuje powtórzoną walidację konfiguracji per request.
+// L3: payload.offerClasses zostało usunięte z JWT — OfferClass leci wyłącznie
+// HTTP-em (upsertOfferClass z idempotency 409→success), jeden kanał mutacji.
 export function signSaveJWT(
   offerObject: GoogleOfferObject,
-  configInput: Partial<GoogleWalletProviderConfig>,
+  config: GoogleWalletProviderConfig,
   options: SignSaveJWTOptions = {}
 ): string {
-  const config = resolveGoogleWalletProviderConfig(configInput)
   const issuedAt = Math.floor((options.now?.() ?? new Date()).getTime() / 1_000)
   const claims: GoogleWalletJWTClaims = {
     iss: config.service_account_email,
@@ -51,16 +49,21 @@ export function signSaveJWT(
     origins: options.origins,
     payload: {
       offerObjects: [offerObject],
-      offerClasses: options.offerClass ? [options.offerClass] : undefined,
     },
   }
 
   try {
-    return [
-      base64UrlEncode({ alg: "RS256", typ: "JWT" }),
-      base64UrlEncode(removeUndefined(claims)),
-      signPayload(claims, config.private_key),
-    ].join(".")
+    // L1: jeden punkt serializacji unsigned segmentu — header i claims używają
+    // identycznej ścieżki encodingu (no drift między tym co kodujemy a tym co
+    // podpisujemy).
+    const encodedHeader = serializeUnsignedSegment({ alg: "RS256", typ: "JWT" })
+    const encodedClaims = serializeUnsignedSegment(claims)
+    const signer = createSign("RSA-SHA256")
+    signer.update(`${encodedHeader}.${encodedClaims}`)
+    signer.end()
+    const signature = signer.sign(config.private_key).toString("base64url")
+
+    return [encodedHeader, encodedClaims, signature].join(".")
   } catch (error) {
     throw new GoogleWalletSigningError(
       "Google Wallet save JWT could not be signed with RS256",
@@ -69,17 +72,7 @@ export function signSaveJWT(
   }
 }
 
-function signPayload(claims: GoogleWalletJWTClaims, privateKey: string): string {
-  const encodedHeader = base64UrlEncode({ alg: "RS256", typ: "JWT" })
-  const encodedClaims = base64UrlEncode(removeUndefined(claims))
-  const signer = createSign("RSA-SHA256")
-  signer.update(`${encodedHeader}.${encodedClaims}`)
-  signer.end()
-
-  return signer.sign(privateKey).toString("base64url")
-}
-
-function base64UrlEncode(value: unknown): string {
+function serializeUnsignedSegment(value: unknown): string {
   return Buffer.from(JSON.stringify(removeUndefined(value))).toString(
     "base64url"
   )

@@ -1,7 +1,6 @@
 import { google, type walletobjects_v1 } from "googleapis"
 
 import type { GoogleWalletProviderConfig } from "./google-config"
-import { resolveGoogleWalletProviderConfig } from "./google-config"
 
 export const GOOGLE_WALLET_OBJECTS_SCOPE =
   "https://www.googleapis.com/auth/wallet_object.issuer"
@@ -54,11 +53,13 @@ export class GoogleWalletApiClient {
   private walletobjects?: GoogleWalletApiSurface
   private readonly upserted_class_ids = new Set<string>()
 
+  // M3: konstruktor przyjmuje już-zresolvowany config (provider robi resolve raz
+  // i przekazuje wynik) — eliminuje powtórzoną walidację per request.
   constructor(
-    configInput: Partial<GoogleWalletProviderConfig>,
+    config: GoogleWalletProviderConfig,
     options: GoogleWalletApiClientOptions = {}
   ) {
-    this.config = resolveGoogleWalletProviderConfig(configInput)
+    this.config = config
     this.walletobjects = options.walletobjects
     this.retry_delay_ms = options.retry_delay_ms ?? 250
     this.delay = options.delay ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)))

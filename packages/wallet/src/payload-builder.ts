@@ -120,6 +120,18 @@ export class DefaultWalletPayloadBuilder implements WalletPayloadBuilder {
       wallet_metadata.branding ?? entitlement_instance.branding,
       this.default_branding
     )
+    const salon_name = pickOptionalString(
+      wallet_metadata.salon_name ?? entitlement_instance.salon_name
+    )
+    const salon_address = pickOptionalString(
+      wallet_metadata.salon_address ?? entitlement_instance.salon_address
+    )
+    const latitude = pickOptionalNumber(
+      wallet_metadata.latitude ?? entitlement_instance.latitude
+    )
+    const longitude = pickOptionalNumber(
+      wallet_metadata.longitude ?? entitlement_instance.longitude
+    )
 
     return {
       entitlement_instance_id: entitlement_instance.id,
@@ -133,6 +145,10 @@ export class DefaultWalletPayloadBuilder implements WalletPayloadBuilder {
       barcode: barcode_spec.format === "PDF417" ? barcode_spec : undefined,
       branding,
       locale: normalized_locale,
+      salon_name,
+      salon_address,
+      latitude,
+      longitude,
     }
   }
 }
@@ -243,6 +259,16 @@ function resolveBarcodeSpec(
       "wallet barcode value is required"
     ),
   }
+}
+
+function pickOptionalString(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined
+  const trimmed = value.trim()
+  return trimmed.length > 0 ? trimmed : undefined
+}
+
+function pickOptionalNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined
 }
 
 function pickString(value: string | undefined, fallback: string): string {

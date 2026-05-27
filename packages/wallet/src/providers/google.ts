@@ -89,7 +89,6 @@ export class GoogleWalletProviderInvalidationError extends Error {
 }
 
 export class GoogleWalletProvider implements WalletPassProvider {
-  private readonly config_input: Partial<GoogleWalletProviderConfig>
   private readonly now: () => Date
   private readonly signer: typeof signSaveJWT
   private readonly injected_api_client?: Pick<
@@ -97,13 +96,19 @@ export class GoogleWalletProvider implements WalletPassProvider {
     "upsertOfferClass" | "patchOfferObject"
   >
   private readonly market_branding: Partial<GoogleWalletMarketBranding>
+  // M3: config jest resolvowany leniwie (raz, przy pierwszym wywołaniu) i
+  // cache'owany — eliminuje potrójną walidację (provider + signer + api-client)
+  // i jednocześnie zachowuje audit envelope na fail-closed config.
+  private cached_config?: GoogleWalletProviderConfig
+  private cached_config_error?: GoogleWalletConfigMissingError
+  private readonly raw_config: Partial<GoogleWalletProviderConfig>
   private api_client?: Pick<GoogleWalletApiClient, "upsertOfferClass" | "patchOfferObject">
 
   constructor(
     config: Partial<GoogleWalletProviderConfig>,
     options: GoogleWalletProviderOptions = {}
   ) {
-    this.config_input = config
+    this.raw_config = config
     this.now = options.now ?? (() => new Date())
     this.signer = options.signer ?? signSaveJWT
     this.injected_api_client = options.api_client
@@ -115,7 +120,7 @@ export class GoogleWalletProvider implements WalletPassProvider {
     locale: WalletLocale
   ): Promise<GoogleWalletIssueResult> {
     try {
-      const config = resolveGoogleWalletProviderConfig(this.config_input)
+      const config = this.resolveConfig()
       const class_id = buildGoogleWalletClassId(config)
       const object_id = buildGoogleWalletObjectId(
         class_id,
@@ -123,12 +128,20 @@ export class GoogleWalletProvider implements WalletPassProvider {
       )
       const branding = this.buildBranding(config, class_id, object_id)
       const offerClass = buildGoogleOfferClass(payload, locale, branding)
-      const offerObject = buildOfferClassPayload(payload, locale, branding)
+      // L2: przekazujemy zbudowany OfferClass jako prebuilt, żeby
+      // buildOfferClassPayload nie powtarzał pracy po raz drugi.
+      const offerObject = buildOfferClassPayload(
+        payload,
+        locale,
+        branding,
+        offerClass
+      )
 
       await this.getApiClient(config).upsertOfferClass(offerClass)
 
+      // L3: signer już nie dostaje offerClass — JWT przenosi tylko offerObject,
+      // OfferClass leci wyłącznie kanałem HTTP (upsertOfferClass).
       const jwt = this.signer(offerObject, config, {
-        offerClass,
         now: this.now,
       })
       const save_url = `${config.origin_save_base ?? GOOGLE_WALLET_SAVE_BASE}${jwt}`
@@ -150,7 +163,7 @@ export class GoogleWalletProvider implements WalletPassProvider {
     reason: WalletInvalidationReason
   ): Promise<GoogleWalletInvalidateResult> {
     try {
-      const config = resolveGoogleWalletProviderConfig(this.config_input)
+      const config = this.resolveConfig()
       const class_id = buildGoogleWalletClassId(config)
       const object_id = buildGoogleWalletObjectId(
         class_id,
@@ -173,6 +186,22 @@ export class GoogleWalletProvider implements WalletPassProvider {
     } catch (error) {
       throw this.invalidationError(entitlement_instance_id, reason, error)
     }
+  }
+
+  private resolveConfig(): GoogleWalletProviderConfig {
+    if (this.cached_config_error) throw this.cached_config_error
+    if (this.cached_config) return this.cached_config
+
+    try {
+      this.cached_config = resolveGoogleWalletProviderConfig(this.raw_config)
+    } catch (error) {
+      if (error instanceof GoogleWalletConfigMissingError) {
+        this.cached_config_error = error
+      }
+      throw error
+    }
+
+    return this.cached_config
   }
 
   private getApiClient(

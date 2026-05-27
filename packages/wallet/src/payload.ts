@@ -31,6 +31,12 @@ export interface WalletPayload {
   barcode?: WalletBarcodeSpec
   branding: WalletBranding
   locale: WalletLocale
+  // Merchant view (PII-neutralny) projektowany dla wallet renderera; mapper Google
+  // Wallet wymaga salon_name/salon_address fail-closed (per AC4 story 3.2).
+  salon_name?: string
+  salon_address?: string
+  latitude?: number
+  longitude?: number
 }
 
 export type WalletAuditEventType =
@@ -72,6 +78,10 @@ export interface EntitlementInstanceWalletMetadata {
   deep_link?: string
   barcode_spec?: WalletBarcodeSpec
   branding?: Partial<WalletBranding>
+  salon_name?: string
+  salon_address?: string
+  latitude?: number
+  longitude?: number
 }
 
 // TODO: replace with @gp/voucher L4 read model once wallet projection fields land.
@@ -85,6 +95,10 @@ export interface EntitlementInstance {
   deep_link?: string
   barcode_spec?: WalletBarcodeSpec
   branding?: Partial<WalletBranding>
+  salon_name?: string
+  salon_address?: string
+  latitude?: number
+  longitude?: number
   metadata?: {
     wallet?: EntitlementInstanceWalletMetadata
     gp?: {
