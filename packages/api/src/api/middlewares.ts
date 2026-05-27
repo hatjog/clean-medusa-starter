@@ -40,6 +40,7 @@ type PublishableApiKeyRecord = {
 type AuthContext = {
   auth_identity_id?: string;
   actor_id?: string;
+  actor_type?: string;
 };
 
 type RequestExtensions = {
@@ -772,6 +773,11 @@ export default defineMiddlewares({
       method: ["POST"],
       matcher: "/store/account/magic-links/revoke-all",
       middlewares: [authenticate("customer", ["session", "bearer"])],
+    },
+    {
+      method: ["POST"],
+      matcher: "/vendor/magic-links/:jti/revoke",
+      middlewares: [authenticate("seller", ["bearer"])],
     },
     {
       method: ["POST"],

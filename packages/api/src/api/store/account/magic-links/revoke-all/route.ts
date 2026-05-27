@@ -95,6 +95,7 @@ export async function POST(
     market_id: marketId,
     reason: "user_revoke",
     revoked_by: customerId,
+    actor_type: "customer",
   })
 
   res.status(200).json({ success: true })

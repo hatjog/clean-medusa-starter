@@ -96,6 +96,7 @@ describe("POST /store/account/magic-links/revoke-all", () => {
       market_id: "bonbeauty",
       reason: "user_revoke",
       revoked_by: "cus_1",
+      actor_type: "customer",
     })
   })
 

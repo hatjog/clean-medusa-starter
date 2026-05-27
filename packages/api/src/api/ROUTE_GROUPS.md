@@ -13,6 +13,7 @@ Related files:
 |-------|--------|------|-----------|------------|--------|
 | **public** | `/v1/health`, `/status`, `/api/v1/entitlements/claim` | None | (future: rate-limit) | Yes (future) | Existing endpoints, no auth required |
 | **storefront** | `/store/*` | Publishable API key | `marketContextMiddleware` → `marketGuardMiddleware` → `customerMarketGuardMiddleware` + route-specific overlays | Yes (future) | Fully implemented — see [MIDDLEWARE_STACK.md](MIDDLEWARE_STACK.md) |
+| **vendor (GP browser JWT)** | `/vendor/magic-links/:jti/revoke` | `authenticate("seller", ["bearer"])` + handler `actor_type="seller"` guard | Wired in `middlewares.ts` | No | Browser-initiated magic-link revoke; JTI-scoped seller validation, constant-time lookup, 3/min/JTI rate limit |
 | **vendor (GP-S2S-HMAC)** | `/vendor/competitive-insights`, `/vendor/training-cert/upload`, `/vendor/vouchers/:code/lookup`, `/vendor/vouchers/:code/redeem` | `withVendorAuth` (HMAC `x-vendor-signature` only; cc-4 F-10 removed the legacy `x-vendor-token` path) | Inline HOF in route handler | No | GP-owned S2S surface — vendor session derived from HMAC; cross-vendor lookups return 404 |
 | **vendor (Mercur-native)** | other `/vendor/*` routes shipped by upstream Mercur | Mercur seller cookie/session | Native Mercur middleware | No | Untouched — upstream contract preserved |
 | **admin (Medusa-native)** | `/admin/*` non-GP routes | Medusa admin auth | Native Medusa middleware | No | Native Medusa — no explicit GP middleware needed |
@@ -36,6 +37,7 @@ Related files:
 ### Vendor Group (GP S2S HMAC)
 - `withVendorAuth` HOF (HMAC `x-vendor-signature` only — cc-4 F-10 removed `x-vendor-token` legacy path).
 - GP routes under `/vendor/*`:
+  - `POST /vendor/magic-links/:jti/revoke`
   - `GET  /vendor/competitive-insights`
   - `POST /vendor/training-cert/upload`
   - `GET  /vendor/vouchers/:code/lookup` (cc-4 F-05 — Story 8.4 cross-actor handoff)
