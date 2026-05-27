@@ -8,6 +8,7 @@ import {
 } from "./payload"
 import type { WalletPayloadBuilder } from "./payload-builder"
 import type { WalletPassProvider } from "./provider"
+import { emitWalletCounter, sanitizeWalletErrorMessage } from "./telemetry"
 
 export interface WalletPassFacade {
   /**
@@ -119,6 +120,14 @@ export class DefaultWalletPassFacade implements WalletPassFacade {
         requested_locale,
         effective_locale,
       })
+      emitWalletCounter("pass_generated", {
+        provider,
+        market: payload.market,
+        locale: effective_locale,
+        actor: "P4",
+        entitlement_type: payload.entitlement_type,
+        entitlement_instance_id,
+      })
 
       return { save_url, audit_event }
     } catch (error) {
@@ -131,6 +140,16 @@ export class DefaultWalletPassFacade implements WalletPassFacade {
         error_message: errorMessage(error),
         requested_locale,
         effective_locale,
+      })
+      emitWalletCounter("pass_failed", {
+        provider,
+        market: "unknown",
+        locale: effective_locale,
+        actor: "P4",
+        entitlement_type: "voucher",
+        entitlement_instance_id,
+        failure_code: "provider_error",
+        error_message: sanitizeWalletErrorMessage(errorMessage(error)),
       })
       throw new WalletPassGenerationError(
         `Failed to generate wallet pass for entitlement_instance ${entitlement_instance_id}`,

@@ -24,6 +24,21 @@ export {
   isWalletProviderKind,
   normalizeWalletLocale,
 } from "./payload"
+export {
+  emitWalletCounter,
+  sanitizeWalletErrorMessage,
+  setWalletPostHogClient,
+  setWalletSentryClient,
+} from "./telemetry"
+export type {
+  PostHogCaptureClient,
+  SentryCaptureClient,
+  WalletCounter,
+  WalletCounterCommonProps,
+  WalletCounterProps,
+  WalletFailureCode,
+  WalletGateReason,
+} from "./telemetry"
 export type {
   AuditEnvelope,
   AuditEvent,
