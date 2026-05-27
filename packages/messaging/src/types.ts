@@ -24,7 +24,8 @@ export type NotificationDispatchStatus =
 export type NotificationDeliveryCorrelationState =
   | "matched"
   | "orphan"
-  | "deduplicated";
+  | "deduplicated"
+  | "rejected_pre_dispatch";
 
 // Path Y subscriber (Story 5.5) chose silent-skip dla duplicate provider_event_id
 // zamiast emitować audit z outcome: "deduplicated". Architecture D-113 invariant
@@ -37,7 +38,8 @@ export type NotificationDeliveryAuditOutcome =
   | "engaged"
   | "failed"
   | "flagged"
-  | "opted_out";
+  | "opted_out"
+  | "rejected";
 
 export interface NotificationRecipient {
   email?: string;
@@ -88,6 +90,10 @@ export interface AuditEnvelope {
   occurred_at: string;
   error_code?: string;
   error_message?: string;
+  request_id?: string;
+  body_byte_length?: number;
+  signature_hash?: string;
+  source_ip_hash?: string;
 }
 
 export interface NotificationDispatch {

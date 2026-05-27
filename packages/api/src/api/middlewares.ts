@@ -13,6 +13,12 @@ import {
 } from "@medusajs/framework/utils";
 import { vendorMetaMiddleware } from "./store/products/vendor-meta-middleware";
 import {
+  BREVO_PROVIDER_ROUTE_MATCHER,
+  brevoHmacValidatorMiddleware,
+  brevoWebhookCircuitBreakerMiddleware,
+  brevoWebhookRateLimitMiddleware,
+} from "./middlewares/brevo-hmac-validator";
+import {
   CUSTOMER_MARKET_FORBIDDEN_MESSAGE,
   isScopedToMarket,
   mergeCustomerMarketMetadata,
@@ -746,6 +752,16 @@ export default defineMiddlewares({
     {
       method: ["POST"],
       matcher: "/webhooks/stripe",
+    },
+    {
+      method: ["POST"],
+      matcher: BREVO_PROVIDER_ROUTE_MATCHER,
+      bodyParser: { preserveRawBody: true },
+      middlewares: [
+        brevoWebhookRateLimitMiddleware,
+        brevoWebhookCircuitBreakerMiddleware,
+        brevoHmacValidatorMiddleware,
+      ],
     },
     {
       method: ["GET"],
