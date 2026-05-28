@@ -22,3 +22,5 @@ export { default as orderGroupCartLink } from "@mercurjs/core/links/order-group-
 export { default as orderPayoutLink } from "@mercurjs/core/links/order-payout-link"
 export { default as priceListSellerLink } from "@mercurjs/core/links/price-list-seller-link"
 export { default as sellerMemberRbacRoleLink } from "@mercurjs/core/links/seller-member-rbac-role"
+export { default as entitlementInstanceProductLink } from "./entitlement-instance-product"
+export { default as entitlementInstanceSellerLink } from "./entitlement-instance-seller"

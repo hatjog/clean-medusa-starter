@@ -1,6 +1,5 @@
 import type { SubscriberArgs, SubscriberConfig } from "@medusajs/framework"
 import { ContainerRegistrationKeys, Modules } from "@medusajs/framework/utils"
-import type { Knex } from "knex"
 import { randomUUID } from "node:crypto"
 
 import {
@@ -72,6 +71,31 @@ type NotificationModuleLike = {
   send?: (data: unknown, ...rest: unknown[]) => Promise<unknown>
 }
 
+type QueryGraphLike = {
+  graph(input: {
+    entity: string
+    fields: string[]
+    filters?: Record<string, unknown>
+    pagination?: Record<string, unknown>
+  }): Promise<{ data?: Array<Record<string, unknown>> }>
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== "object") return null
+  return value as Record<string, unknown>
+}
+
+function firstRecord(value: unknown): Record<string, unknown> | null {
+  if (Array.isArray(value)) {
+    return asRecord(value[0])
+  }
+  return asRecord(value)
+}
+
+function stringOrNull(value: unknown): string | null {
+  return typeof value === "string" && value.length > 0 ? value : null
+}
+
 function extractNotificationId(value: unknown): string | null {
   if (!value) return null
 
@@ -99,43 +123,61 @@ function extractNotificationId(value: unknown): string | null {
 }
 
 function createVoucherClaimAuditFetcher(
-  db: Knex,
+  container: SubscriberArgs<VoucherClaimedEventPayload>["container"],
   eventPayload: VoucherClaimedEventPayload,
 ): VoucherClaimAuditFetcher {
   return {
     async fetchVoucherClaimSource(voucher_id: string) {
+      const query = container.resolve(ContainerRegistrationKeys.QUERY) as QueryGraphLike
       const lookupVoucherCode = eventPayload.voucher_code ?? voucher_id
-      const result = await db.raw(
-        `
-          SELECT
-            e.buyer_email,
-            e.voucher_code,
-            s.name AS seller_name,
-            s.handle AS seller_handle,
-            p.title AS service_title
-          FROM gp_core.entitlements e
-          LEFT JOIN public.seller s ON s.id = e.vendor_id
-          LEFT JOIN public.product p ON p.id = e.product_id
-          WHERE CAST(e.id AS text) = ?
-             OR e.voucher_code = ?
-          LIMIT 1
-        `,
-        [voucher_id, lookupVoucherCode],
-      )
+      const result = await query.graph({
+        entity: "entitlement_instance",
+        fields: [
+          "id",
+          "buyer_email",
+          "claimed_at",
+          "policy_snapshot",
+          "seller.name",
+          "seller.handle",
+          "product.title",
+          "voucher.code",
+        ],
+        filters: {
+          $or: [
+            { id: voucher_id },
+            { voucher: { code: lookupVoucherCode } },
+            { policy_snapshot: { voucher_code: lookupVoucherCode } },
+          ],
+        },
+        pagination: { take: 1, skip: 0 },
+      })
 
-      const row = (result as { rows?: Array<Record<string, unknown>> })?.rows?.[0]
+      const row = result.data?.[0]
       if (!row) {
         return null
       }
 
+      const seller = firstRecord(row.seller)
+      const product = firstRecord(row.product)
+      const voucher = firstRecord(row.voucher)
+      const snapshot = asRecord(row.policy_snapshot)
+      const claimedAt =
+        stringOrNull(row.claimed_at) ??
+        (row.claimed_at instanceof Date ? row.claimed_at.toISOString() : null) ??
+        eventPayload.claimed_at ??
+        null
+
       return {
-        buyer_email: typeof row.buyer_email === "string" ? row.buyer_email : null,
+        buyer_email: stringOrNull(row.buyer_email),
         buyer_locale: null,
-        seller_name: typeof row.seller_name === "string" ? row.seller_name : null,
-        seller_handle: typeof row.seller_handle === "string" ? row.seller_handle : null,
-        service_title: typeof row.service_title === "string" ? row.service_title : null,
-        claimed_at: eventPayload.claimed_at ?? null,
-        voucher_code: typeof row.voucher_code === "string" ? row.voucher_code : null,
+        seller_name: stringOrNull(seller?.name),
+        seller_handle: stringOrNull(seller?.handle),
+        service_title: stringOrNull(product?.title),
+        claimed_at: claimedAt,
+        voucher_code:
+          stringOrNull(voucher?.code) ??
+          stringOrNull(snapshot?.voucher_code) ??
+          lookupVoucherCode,
       }
     },
   }
@@ -304,9 +346,8 @@ export default async function voucherClaimedBuyerNotificationSubscriber({
     "logger",
   )
 
-  const db = container.resolve(ContainerRegistrationKeys.PG_CONNECTION) as Knex
   const fetcher = createVoucherClaimAuditFetcher(
-    db,
+    container,
     event.data as VoucherClaimedEventPayload,
   )
   const notificationModule = container.resolve(Modules.NOTIFICATION) as NotificationModuleLike
