@@ -23,6 +23,8 @@ export interface WalletPayload {
   entitlement_instance_id: string
   code: string
   title: string
+  market: string
+  entitlement_type: string
   status: WalletPassStatus
   expires_at: string
   deep_link: string
@@ -67,6 +69,7 @@ export type LocalizedWalletText =
 export interface EntitlementInstanceWalletMetadata {
   code?: string
   title?: LocalizedWalletText
+  entitlement_type?: string
   status?: WalletPassStatus
   expires_at?: string | Date | null
   deep_link?: string
@@ -79,6 +82,8 @@ export interface EntitlementInstance {
   id: string
   code?: string
   title?: LocalizedWalletText
+  market_id?: string
+  entitlement_type?: string
   status?: WalletPassStatus
   state?: string
   expires_at?: string | Date | null
@@ -88,6 +93,8 @@ export interface EntitlementInstance {
   metadata?: {
     wallet?: EntitlementInstanceWalletMetadata
     gp?: {
+      market_id?: string
+      entitlement_type?: string
       wallet?: EntitlementInstanceWalletMetadata
     }
   } & Record<string, unknown>

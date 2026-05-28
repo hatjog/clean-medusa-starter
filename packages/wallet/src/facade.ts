@@ -8,6 +8,7 @@ import {
 } from "./payload"
 import type { WalletPayloadBuilder } from "./payload-builder"
 import type { WalletPassProvider } from "./provider"
+import { emitWalletCounter, sanitizeWalletErrorMessage } from "./telemetry"
 
 export interface WalletPassFacade {
   /**
@@ -101,11 +102,20 @@ export class DefaultWalletPassFacade implements WalletPassFacade {
     const requested_locale = String(locale)
     const effective_locale = normalizeWalletLocale(requested_locale)
 
+    // F2: capture market / entitlement_type as soon as the payload is built so
+    // that the catch path can report the best known values instead of falling
+    // back to "unknown" on every provider failure (which destroys per-market
+    // breakdown of `wallet.pass_failed`).
+    let market = "unknown"
+    let entitlement_type = "unknown"
+
     try {
       const payload = await this.payload_builder.buildFromEntitlement(
         entitlement_instance_id,
         effective_locale
       )
+      market = payload.market
+      entitlement_type = payload.entitlement_type
       const { save_url } = await provider_impl.issueSaveUrl(
         payload,
         effective_locale
@@ -119,6 +129,14 @@ export class DefaultWalletPassFacade implements WalletPassFacade {
         requested_locale,
         effective_locale,
       })
+      emitWalletCounter("pass_generated", {
+        provider,
+        market: payload.market,
+        locale: effective_locale,
+        actor: "P4",
+        entitlement_type: payload.entitlement_type,
+        entitlement_instance_id,
+      })
 
       return { save_url, audit_event }
     } catch (error) {
@@ -131,6 +149,16 @@ export class DefaultWalletPassFacade implements WalletPassFacade {
         error_message: errorMessage(error),
         requested_locale,
         effective_locale,
+      })
+      emitWalletCounter("pass_failed", {
+        provider,
+        market,
+        locale: effective_locale,
+        actor: "P4",
+        entitlement_type,
+        entitlement_instance_id,
+        failure_code: "provider_error",
+        error_message: sanitizeWalletErrorMessage(errorMessage(error)),
       })
       throw new WalletPassGenerationError(
         `Failed to generate wallet pass for entitlement_instance ${entitlement_instance_id}`,

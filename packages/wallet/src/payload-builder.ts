@@ -100,6 +100,8 @@ export class DefaultWalletPayloadBuilder implements WalletPayloadBuilder {
       normalized_locale,
       this.fallback_locale
     )
+    const market = resolveMarket(entitlement_instance)
+    const entitlement_type = resolveEntitlementType(entitlement_instance)
     const status = resolveStatus(
       wallet_metadata.status ?? entitlement_instance.status,
       entitlement_instance.state
@@ -125,6 +127,8 @@ export class DefaultWalletPayloadBuilder implements WalletPayloadBuilder {
       entitlement_instance_id: entitlement_instance.id,
       code,
       title,
+      market,
+      entitlement_type,
       status,
       expires_at,
       deep_link,
@@ -135,6 +139,27 @@ export class DefaultWalletPayloadBuilder implements WalletPayloadBuilder {
       locale: normalized_locale,
     }
   }
+}
+
+function resolveMarket(entitlement_instance: EntitlementInstance): string {
+  return pickString(
+    entitlement_instance.metadata?.gp?.market_id ?? entitlement_instance.market_id,
+    "unknown"
+  )
+}
+
+function resolveEntitlementType(entitlement_instance: EntitlementInstance): string {
+  const wallet_metadata = resolveWalletMetadata(entitlement_instance)
+  return pickString(
+    wallet_metadata.entitlement_type ??
+      entitlement_instance.metadata?.gp?.entitlement_type ??
+      entitlement_instance.entitlement_type,
+    // Default to "unknown" (mirroring `resolveMarket`) so the dashboard can
+    // distinguish a missing projection field from an actual voucher
+    // entitlement. The story-level assumption that v1.10.0 only ships
+    // vouchers still holds, but conflating the two values would hide drift.
+    "unknown"
+  )
 }
 
 function resolveWalletMetadata(
