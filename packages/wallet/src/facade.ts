@@ -88,16 +88,40 @@ export class DefaultWalletPassFacade implements WalletPassFacade {
     locale: WalletLocale
   ): Promise<{ save_url: string; audit_event: AuditEnvelope }> {
     const requested_locale = String(locale)
-    const effective_locale = normalizeWalletLocale(requested_locale)
+    // R-H2 (phase-4): extract a safe stringified id once and reuse in every
+    // pre-payload guard catch path. The previous code passed the raw
+    // `entitlement_instance_id` variable into the second guard's emit, which
+    // for non-string truthy inputs (object/number) produced distinct_ids like
+    // `actor:P4:[object Object]` and broke the funnel-join contract.
+    const safeInstanceId = String(entitlement_instance_id ?? "")
+
+    // R-H6 (phase-4): `normalizeWalletLocale` can throw on unknown locales,
+    // and it used to run BEFORE the P2 try/catch — silently swallowing the
+    // very pre-payload failure P2 was supposed to surface. Wrap it; on
+    // throw, emit pass_failed (failure_code='client_error', locale='unknown'),
+    // then re-throw.
+    let effective_locale: WalletLocale
+    try {
+      effective_locale = normalizeWalletLocale(requested_locale)
+    } catch (error) {
+      emitWalletCounter("pass_failed", {
+        provider,
+        market: "unknown",
+        locale: "pl-PL",
+        actor: "P4",
+        entitlement_type: "unknown",
+        entitlement_instance_id: safeInstanceId,
+        failure_code: "client_error",
+        error_message: sanitizeWalletErrorMessage("invalid_locale"),
+      })
+      throw error
+    }
 
     // P2: emit `pass_failed` for pre-payload-build failures too. The previous
     // implementation threw out of `requireEntitlementInstanceId` /
     // `resolveProvider` BEFORE entering the try/catch block, so failures
     // from missing entitlement id, unsupported provider, or unregistered DI
-    // never surfaced on the PostHog counter. We catch the throw, emit a
-    // counter with `failure_code='provider_error'` (or 'client_error' for
-    // shape problems), then re-throw the original error so callers /
-    // audit-envelope semantics are preserved.
+    // never surfaced on the PostHog counter.
     try {
       this.requireEntitlementInstanceId(
         entitlement_instance_id,
@@ -111,7 +135,7 @@ export class DefaultWalletPassFacade implements WalletPassFacade {
         locale: effective_locale,
         actor: "P4",
         entitlement_type: "unknown",
-        entitlement_instance_id: String(entitlement_instance_id ?? ""),
+        entitlement_instance_id: safeInstanceId,
         failure_code: "client_error",
         error_message: sanitizeWalletErrorMessage(errorMessage(error)),
       })
@@ -132,7 +156,8 @@ export class DefaultWalletPassFacade implements WalletPassFacade {
         locale: effective_locale,
         actor: "P4",
         entitlement_type: "unknown",
-        entitlement_instance_id,
+        // R-H2 (phase-4): consistent safe stringified id (was raw variable).
+        entitlement_instance_id: safeInstanceId,
         failure_code: "provider_error",
         error_message: sanitizeWalletErrorMessage(errorMessage(error)),
       })
@@ -210,19 +235,55 @@ export class DefaultWalletPassFacade implements WalletPassFacade {
     provider: WalletProviderKind,
     reason: WalletInvalidationReason
   ): Promise<{ audit_event: AuditEnvelope }> {
-    this.requireEntitlementInstanceId(
-      entitlement_instance_id,
-      provider,
-      "wallet.pass_invalidation_failed",
-      reason
-    )
+    // R-H3 (phase-4): mirror P2 pre-payload guard wrapping for
+    // `invalidatePass`. Previously these guards threw outside any try/catch
+    // and bypassed telemetry entirely on missing id / unsupported provider /
+    // unregistered DI. Emit `pass_failed` (re-using the v1.10.0 enum since
+    // there is no separate `pass_invalidation_failed` counter), then re-throw.
+    const safeInstanceId = String(entitlement_instance_id ?? "")
 
-    const provider_impl = this.resolveProvider(
-      entitlement_instance_id,
-      provider,
-      "wallet.pass_invalidation_failed",
-      reason
-    )
+    try {
+      this.requireEntitlementInstanceId(
+        entitlement_instance_id,
+        provider,
+        "wallet.pass_invalidation_failed",
+        reason
+      )
+    } catch (error) {
+      emitWalletCounter("pass_failed", {
+        provider,
+        market: "unknown",
+        locale: "pl-PL",
+        actor: "P4",
+        entitlement_type: "unknown",
+        entitlement_instance_id: safeInstanceId,
+        failure_code: "client_error",
+        error_message: sanitizeWalletErrorMessage(errorMessage(error)),
+      })
+      throw error
+    }
+
+    let provider_impl: WalletPassProvider
+    try {
+      provider_impl = this.resolveProvider(
+        entitlement_instance_id,
+        provider,
+        "wallet.pass_invalidation_failed",
+        reason
+      )
+    } catch (error) {
+      emitWalletCounter("pass_failed", {
+        provider,
+        market: "unknown",
+        locale: "pl-PL",
+        actor: "P4",
+        entitlement_type: "unknown",
+        entitlement_instance_id: safeInstanceId,
+        failure_code: "provider_error",
+        error_message: sanitizeWalletErrorMessage(errorMessage(error)),
+      })
+      throw error
+    }
 
     try {
       await provider_impl.invalidate(entitlement_instance_id, reason)
