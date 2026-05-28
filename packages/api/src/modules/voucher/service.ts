@@ -602,6 +602,137 @@ export class VoucherService {
   }
 
   /**
+   * v1.10.0 Story 9.3 — Buyer claim notification source fetcher.
+   *
+   * Read-only helper resolving the AR45 source record for a voucher claim,
+   * sourced exclusively from Layer 4 (`entitlement_instance`) + `voucher`
+   * + `voucher_event` + `public.order`. Replaces the legacy
+   * `gp_core.entitlements` direct SQL read from the buyer-notification
+   * subscriber (ADR-052 cutover, sunset clause closure).
+   *
+   * Lookup strategy (first row wins):
+   *   1. by entitlement_instance.id (when `voucher_id` is a Layer 4 PK), or
+   *   2. by policy_snapshot->>'voucher_code' / voucher.code = lookupCode.
+   *
+   * Joins:
+   *   - voucher v ON v.code = (ei.policy_snapshot->>'voucher_code') — gives
+   *     seller_name / seller_handle / product_title / voucher.code
+   *     (voucher row carries those denormalized columns).
+   *   - public.order o ON o.id = ei.order_id — gives buyer email (when
+   *     order is wired post-payment, FR1.22).
+   *   - voucher_event ve ON ve.voucher_code = v.code AND
+   *     ve.event_type='claimed' — gives the claimed_at timestamp (latest
+   *     event wins).
+   *
+   * Buyer email resolution priority:
+   *   1. policy_snapshot->>'buyer_email' (canonical PII per pii-consent
+   *      route), then
+   *   2. public.order.email (Mercur Layer baseline).
+   *
+   * buyer_locale projection: policy_snapshot->>'buyer_locale' (nullable;
+   * downstream `resolveLocale` falls back to 'pl').
+   *
+   * Returns null when no matching entitlement_instance / voucher row is
+   * found — caller emits audit_status='failed' with
+   * error_message='voucher source not found'.
+   */
+  async findBuyerClaimSource(
+    voucher_id: string,
+    voucher_code: string | null,
+  ): Promise<{
+    buyer_email: string | null
+    buyer_locale: string | null
+    seller_name: string | null
+    seller_handle: string | null
+    service_title: string | null
+    claimed_at: string | null
+    voucher_code: string | null
+  } | null> {
+    const lookupCode = voucher_code ?? voucher_id
+    const pool = this.getPool()
+    const res = await pool.query<Record<string, unknown>>(
+      `SELECT
+         ei.id                                       AS ei_id,
+         ei.policy_snapshot                          AS policy_snapshot,
+         ei.order_id                                 AS order_id,
+         v.code                                      AS voucher_code,
+         v.seller_name                               AS seller_name,
+         v.seller_handle                             AS seller_handle,
+         v.product_title                             AS product_title,
+         o.email                                     AS order_email,
+         (
+           SELECT ve.occurred_at FROM voucher_event ve
+            WHERE ve.voucher_code = v.code
+              AND ve.event_type = 'claimed'
+            ORDER BY ve.occurred_at DESC
+            LIMIT 1
+         )                                           AS claimed_at
+       FROM entitlement_instance ei
+       LEFT JOIN voucher v ON v.code = (ei.policy_snapshot->>'voucher_code')
+       LEFT JOIN public.order o ON o.id = ei.order_id
+       WHERE ei.id = $1
+          OR (ei.policy_snapshot->>'voucher_code') = $2
+          OR v.code = $2
+       ORDER BY ei.created_at DESC
+       LIMIT 1`,
+      [voucher_id, lookupCode],
+    )
+
+    const row = res.rows[0]
+    if (!row) return null
+
+    const snapshot =
+      typeof row.policy_snapshot === "string"
+        ? (JSON.parse(row.policy_snapshot as string) as Record<string, unknown>)
+        : ((row.policy_snapshot ?? {}) as Record<string, unknown>)
+
+    const snapshotEmail =
+      typeof snapshot.buyer_email === "string" && (snapshot.buyer_email as string).length > 0
+        ? (snapshot.buyer_email as string)
+        : null
+    const orderEmail =
+      typeof row.order_email === "string" && (row.order_email as string).length > 0
+        ? (row.order_email as string)
+        : null
+    const snapshotLocale =
+      typeof snapshot.buyer_locale === "string" && (snapshot.buyer_locale as string).length > 0
+        ? (snapshot.buyer_locale as string)
+        : null
+    const claimedAt =
+      row.claimed_at instanceof Date
+        ? row.claimed_at.toISOString()
+        : typeof row.claimed_at === "string" && (row.claimed_at as string).length > 0
+          ? (row.claimed_at as string)
+          : null
+
+    return {
+      buyer_email: snapshotEmail ?? orderEmail,
+      buyer_locale: snapshotLocale,
+      seller_name:
+        typeof row.seller_name === "string" && (row.seller_name as string).length > 0
+          ? (row.seller_name as string)
+          : null,
+      seller_handle:
+        typeof row.seller_handle === "string" && (row.seller_handle as string).length > 0
+          ? (row.seller_handle as string)
+          : null,
+      service_title:
+        typeof row.product_title === "string" && (row.product_title as string).length > 0
+          ? (row.product_title as string)
+          : null,
+      claimed_at: claimedAt,
+      voucher_code:
+        (typeof row.voucher_code === "string" && (row.voucher_code as string).length > 0
+          ? (row.voucher_code as string)
+          : null) ??
+        (typeof snapshot.voucher_code === "string"
+          ? (snapshot.voucher_code as string)
+          : null) ??
+        lookupCode,
+    }
+  }
+
+  /**
    * v1.9.0 Wave F6 / Epic-2 HIGH-01 + CC-2 #1 — System 1 elimination.
    *
    * Admin entitlement search reading from Layer 4 (`entitlement_instance`)

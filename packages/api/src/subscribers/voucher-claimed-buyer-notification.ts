@@ -1,5 +1,5 @@
 import type { SubscriberArgs, SubscriberConfig } from "@medusajs/framework"
-import { ContainerRegistrationKeys, Modules } from "@medusajs/framework/utils"
+import { Modules } from "@medusajs/framework/utils"
 import { randomUUID } from "node:crypto"
 
 import {
@@ -11,6 +11,7 @@ import {
   renderBuyerClaimSubject,
   renderBuyerClaimText,
 } from "../modules/vendor-notifications/email-templates/buyer-claim/i18n"
+import { VOUCHER_MODULE } from "../modules/voucher"
 
 /**
  * voucher-claimed-buyer-notification — Story v160-6-6 backend subscriber.
@@ -71,29 +72,17 @@ type NotificationModuleLike = {
   send?: (data: unknown, ...rest: unknown[]) => Promise<unknown>
 }
 
-type QueryGraphLike = {
-  graph(input: {
-    entity: string
-    fields: string[]
-    filters?: Record<string, unknown>
-    pagination?: Record<string, unknown>
-  }): Promise<{ data?: Array<Record<string, unknown>> }>
-}
-
-function asRecord(value: unknown): Record<string, unknown> | null {
-  if (!value || typeof value !== "object") return null
-  return value as Record<string, unknown>
-}
-
-function firstRecord(value: unknown): Record<string, unknown> | null {
-  if (Array.isArray(value)) {
-    return asRecord(value[0])
-  }
-  return asRecord(value)
-}
-
-function stringOrNull(value: unknown): string | null {
-  return typeof value === "string" && value.length > 0 ? value : null
+/**
+ * Voucher module service surface required by the buyer-notification
+ * subscriber. Only `findBuyerClaimSource` is consumed here; broader
+ * `IVoucherModuleService` is intentionally not referenced to keep the
+ * coupling narrow and to make unit-test mocking trivial.
+ */
+type VoucherModuleSourceReader = {
+  findBuyerClaimSource(
+    voucher_id: string,
+    voucher_code: string | null,
+  ): Promise<VoucherClaimSourceRecord | null>
 }
 
 function extractNotificationId(value: unknown): string | null {
@@ -128,56 +117,32 @@ function createVoucherClaimAuditFetcher(
 ): VoucherClaimAuditFetcher {
   return {
     async fetchVoucherClaimSource(voucher_id: string) {
-      const query = container.resolve(ContainerRegistrationKeys.QUERY) as QueryGraphLike
-      const lookupVoucherCode = eventPayload.voucher_code ?? voucher_id
-      const result = await query.graph({
-        entity: "entitlement_instance",
-        fields: [
-          "id",
-          "buyer_email",
-          "claimed_at",
-          "policy_snapshot",
-          "seller.name",
-          "seller.handle",
-          "product.title",
-          "voucher.code",
-        ],
-        filters: {
-          $or: [
-            { id: voucher_id },
-            { voucher: { code: lookupVoucherCode } },
-            { policy_snapshot: { voucher_code: lookupVoucherCode } },
-          ],
-        },
-        pagination: { take: 1, skip: 0 },
-      })
+      // Story 9.3 — ADR-052 cutover, Layer 4 read path (per AC1(b)
+      // preferred ścieżka). Source = `VoucherService.findBuyerClaimSource`
+      // (SQL JOIN entitlement_instance × voucher × public.order × voucher_event).
+      // Module link query.graph traversals were rejected (review F-01/F-02):
+      // entitlement_instance has no buyer_email / claimed_at / seller_id /
+      // product_id columns, so `query.graph({ fields: ["seller.name", ...] })`
+      // would always project nulls. SQL path is the functionally-correct
+      // mitigation logged in story Dev Notes §R3.
+      const voucherService = container.resolve(VOUCHER_MODULE) as VoucherModuleSourceReader
+      const lookupVoucherCode = eventPayload.voucher_code ?? null
+      const source = await voucherService.findBuyerClaimSource(
+        voucher_id,
+        lookupVoucherCode,
+      )
 
-      const row = result.data?.[0]
-      if (!row) {
-        return null
-      }
-
-      const seller = firstRecord(row.seller)
-      const product = firstRecord(row.product)
-      const voucher = firstRecord(row.voucher)
-      const snapshot = asRecord(row.policy_snapshot)
-      const claimedAt =
-        stringOrNull(row.claimed_at) ??
-        (row.claimed_at instanceof Date ? row.claimed_at.toISOString() : null) ??
-        eventPayload.claimed_at ??
-        null
+      if (!source) return null
 
       return {
-        buyer_email: stringOrNull(row.buyer_email),
-        buyer_locale: null,
-        seller_name: stringOrNull(seller?.name),
-        seller_handle: stringOrNull(seller?.handle),
-        service_title: stringOrNull(product?.title),
-        claimed_at: claimedAt,
+        buyer_email: source.buyer_email,
+        buyer_locale: source.buyer_locale,
+        seller_name: source.seller_name,
+        seller_handle: source.seller_handle,
+        service_title: source.service_title,
+        claimed_at: source.claimed_at ?? eventPayload.claimed_at ?? null,
         voucher_code:
-          stringOrNull(voucher?.code) ??
-          stringOrNull(snapshot?.voucher_code) ??
-          lookupVoucherCode,
+          source.voucher_code ?? eventPayload.voucher_code ?? voucher_id,
       }
     },
   }
