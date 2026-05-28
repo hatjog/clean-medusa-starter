@@ -140,7 +140,12 @@ function createVoucherClaimAuditFetcher(
         seller_name: source.seller_name,
         seller_handle: source.seller_handle,
         service_title: source.service_title,
-        claimed_at: source.claimed_at ?? eventPayload.claimed_at ?? null,
+        // F-2-03 phase-3 fix: prefer eventPayload.claimed_at (on-the-wire
+        // truth of the event that triggered this subscriber) per AR45
+        // "audit reflects the actual event". voucher_event scan in
+        // VoucherService.findBuyerClaimSource returns the latest claimed
+        // event globally — which may diverge on replay/withdraw→reclaim.
+        claimed_at: eventPayload.claimed_at ?? source.claimed_at ?? null,
         voucher_code:
           source.voucher_code ?? eventPayload.voucher_code ?? voucher_id,
       }

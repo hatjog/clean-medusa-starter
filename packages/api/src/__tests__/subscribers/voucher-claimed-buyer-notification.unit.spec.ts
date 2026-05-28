@@ -88,15 +88,13 @@ describe("voucher-claimed-buyer-notification subscriber", () => {
       claimed_at: null,
       voucher_code: null,
     }))
-    const dispatch = jest.fn(async () => ({ notificationId: "noti_fb" }))
+    const createNotifications = jest.fn(async () => ({ id: "noti_fb" }))
 
     const container = buildContainer(
       { findBuyerClaimSource },
-      { createNotifications: jest.fn(async () => ({ id: "n" })) },
+      { createNotifications },
     )
 
-    // Test fetcher contract directly via subscriber default export — we
-    // observe the dispatched payload to confirm fallback works end-to-end.
     await voucherClaimedBuyerNotification({
       event: buildEvent({
         voucher_id: "ent_inst_fb",
@@ -105,11 +103,21 @@ describe("voucher-claimed-buyer-notification subscriber", () => {
       }),
       container,
     } as any)
-    // dispatcher gets called once with voucher_id only — assertion remains
-    // that the call succeeded (no error thrown by projection on null
-    // voucher_code fallback).
+
     expect(findBuyerClaimSource).toHaveBeenCalledWith("ent_inst_fb", "FB-VC")
-    void dispatch // unused — happy path uses createNotifications above
+    expect(createNotifications).toHaveBeenCalledTimes(1)
+    const notificationCalls = createNotifications.mock.calls as unknown as Array<
+      [Record<string, any>]
+    >
+    const dispatched = notificationCalls[0][0]
+    // F-2-01 phase-3 fix: assert the event-payload fallback projects into
+    // the rendered notification body when VoucherService returns null
+    // voucher_code (source.voucher_code ?? eventPayload.voucher_code path).
+    // The voucher_code is hydrated into the email template (text/html),
+    // not dispatched as a top-level data field — see i18n.ts hydrate step.
+    expect(typeof dispatched.data.text).toBe("string")
+    expect(dispatched.data.text).toContain("FB-VC")
+    expect(dispatched.data.html).toContain("FB-VC")
   })
 
   it("returns failed audit entry when entitlement_instance is missing", async () => {
