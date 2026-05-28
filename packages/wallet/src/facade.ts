@@ -87,20 +87,57 @@ export class DefaultWalletPassFacade implements WalletPassFacade {
     provider: WalletProviderKind,
     locale: WalletLocale
   ): Promise<{ save_url: string; audit_event: AuditEnvelope }> {
-    this.requireEntitlementInstanceId(
-      entitlement_instance_id,
-      provider,
-      "wallet.pass_failed"
-    )
-
-    const provider_impl = this.resolveProvider(
-      entitlement_instance_id,
-      provider,
-      "wallet.pass_failed"
-    )
-
     const requested_locale = String(locale)
     const effective_locale = normalizeWalletLocale(requested_locale)
+
+    // P2: emit `pass_failed` for pre-payload-build failures too. The previous
+    // implementation threw out of `requireEntitlementInstanceId` /
+    // `resolveProvider` BEFORE entering the try/catch block, so failures
+    // from missing entitlement id, unsupported provider, or unregistered DI
+    // never surfaced on the PostHog counter. We catch the throw, emit a
+    // counter with `failure_code='provider_error'` (or 'client_error' for
+    // shape problems), then re-throw the original error so callers /
+    // audit-envelope semantics are preserved.
+    try {
+      this.requireEntitlementInstanceId(
+        entitlement_instance_id,
+        provider,
+        "wallet.pass_failed"
+      )
+    } catch (error) {
+      emitWalletCounter("pass_failed", {
+        provider,
+        market: "unknown",
+        locale: effective_locale,
+        actor: "P4",
+        entitlement_type: "unknown",
+        entitlement_instance_id: String(entitlement_instance_id ?? ""),
+        failure_code: "client_error",
+        error_message: sanitizeWalletErrorMessage(errorMessage(error)),
+      })
+      throw error
+    }
+
+    let provider_impl: WalletPassProvider
+    try {
+      provider_impl = this.resolveProvider(
+        entitlement_instance_id,
+        provider,
+        "wallet.pass_failed"
+      )
+    } catch (error) {
+      emitWalletCounter("pass_failed", {
+        provider,
+        market: "unknown",
+        locale: effective_locale,
+        actor: "P4",
+        entitlement_type: "unknown",
+        entitlement_instance_id,
+        failure_code: "provider_error",
+        error_message: sanitizeWalletErrorMessage(errorMessage(error)),
+      })
+      throw error
+    }
 
     // F2: capture market / entitlement_type as soon as the payload is built so
     // that the catch path can report the best known values instead of falling

@@ -26,9 +26,11 @@ export {
 } from "./payload"
 export {
   emitWalletCounter,
+  resetWalletPostHogEnvInit,
   sanitizeWalletErrorMessage,
   setWalletPostHogClient,
   setWalletSentryClient,
+  shutdownWalletPostHogClient,
 } from "./telemetry"
 export type {
   PostHogCaptureClient,
