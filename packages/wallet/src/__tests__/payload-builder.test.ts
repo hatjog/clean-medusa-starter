@@ -243,4 +243,32 @@ describe("DefaultWalletPayloadBuilder", () => {
       })
     )
   })
+
+  it("P22: metadata.gp.market_id takes precedence over top-level market_id", () => {
+    const builder = new DefaultWalletPayloadBuilder()
+    const entitlement = {
+      ...fullEntitlement,
+      market_id: "bonbeauty",
+      metadata: {
+        gp: { market_id: "bonevent" },
+      },
+    } as EntitlementInstance
+
+    const payload = builder.build(entitlement, "pl-PL")
+
+    expect(payload.market).toBe("bonevent")
+  })
+
+  it("P22: falls back to top-level market_id when metadata.gp.market_id missing", () => {
+    const builder = new DefaultWalletPayloadBuilder()
+    const entitlement = {
+      ...fullEntitlement,
+      market_id: "bonbeauty",
+      metadata: { gp: {} },
+    } as EntitlementInstance
+
+    const payload = builder.build(entitlement, "pl-PL")
+
+    expect(payload.market).toBe("bonbeauty")
+  })
 })

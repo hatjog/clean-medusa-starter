@@ -8,7 +8,18 @@ export const WALLET_COUNTERS = [
 
 export type WalletCounter = (typeof WALLET_COUNTERS)[number]
 
-export type WalletFailureCode = "provider_error" | "network" | "policy_deny"
+// P25 (D2): extended with `auth_expired` and `client_error` to disambiguate
+// non-network catch-all paths in apps/web `classifyHttpFailureCode`. Keep this
+// in lockstep with the duplicates in
+//   apps/web/src/lib/telemetry/wallet.ts
+//   GP/storefront/src/lib/telemetry/wallet.ts
+// and the runbook property schema enumeration.
+export type WalletFailureCode =
+  | "provider_error"
+  | "network"
+  | "policy_deny"
+  | "auth_expired"
+  | "client_error"
 
 // TODO(F13): re-export `WalletGateReason` from `@gp/wallet/policy` once Story
 // 3.4 (WalletFeaturePolicy) lands so this enum is not duplicated. Until then

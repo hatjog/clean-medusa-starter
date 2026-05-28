@@ -1,8 +1,10 @@
 export {
   emitWalletCounter,
+  resetWalletPostHogEnvInit,
   sanitizeWalletErrorMessage,
   setWalletPostHogClient,
   setWalletSentryClient,
+  shutdownWalletPostHogClient,
 } from "./posthog"
 export type {
   PostHogCaptureClient,

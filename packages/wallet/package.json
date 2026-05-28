@@ -5,6 +5,10 @@
   "description": "Provider-neutral wallet pass facade for GP voucher entitlement instances.",
   "main": "src/index.ts",
   "types": "src/index.ts",
+  "sideEffects": [
+    "./src/telemetry/posthog.ts",
+    "./src/telemetry/posthog.js"
+  ],
   "scripts": {
     "test": "jest --runInBand --forceExit",
     "typecheck": "tsc --noEmit -p tsconfig.json"
