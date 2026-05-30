@@ -9,6 +9,11 @@ export const WALLET_PAYLOAD_ALLOWED_FIELDS = [
   "entitlement_instance_id",
   "code",
   "title",
+  // market + entitlement_type są wymaganymi, PII-neutralnymi polami WalletPayload
+  // (dryf schema-vs-type po Stage-2 re-integration: typ je wymagał, lista allowed/
+  // required ich nie miała → walidator fail-closed odrzucał poprawne payloady).
+  "market",
+  "entitlement_type",
   "status",
   "expires_at",
   "salon_name",
@@ -19,6 +24,10 @@ export const WALLET_PAYLOAD_ALLOWED_FIELDS = [
   "barcode",
   "branding",
   "locale",
+  // opcjonalne pola geolokalizacji merchant view (emitowane przez payload-builder
+  // jako klucze nawet gdy undefined) — PII-neutralne, dozwolone.
+  "latitude",
+  "longitude",
 ] as const
 
 export const WALLET_PAYLOAD_FORBIDDEN_FIELDS = [
@@ -43,6 +52,8 @@ const REQUIRED_FIELDS = [
   "entitlement_instance_id",
   "code",
   "title",
+  "market",
+  "entitlement_type",
   "status",
   "expires_at",
   "salon_name",
@@ -182,6 +193,8 @@ export function assertWalletPayloadSchema(
     "entitlement_instance_id",
     "code",
     "title",
+    "market",
+    "entitlement_type",
     "expires_at",
     "salon_name",
     "salon_address",
