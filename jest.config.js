@@ -22,6 +22,12 @@ module.exports = {
   // Mapujemy go na reczny mock CJS oparty o Node crypto tylko w test env.
   moduleNameMapper: {
     "^@noble/ed25519$": "<rootDir>/__mocks__/@noble/ed25519.js",
+    // Node16/NodeNext ESM source uses explicit `.js` extensions on relative imports
+    // (e.g. `import x from "../foo.js"`), but the files are authored as `.ts` and Just
+    // (@swc/jest, CJS) resolves bare specifiers via `moduleFileExtensions`. Strip the
+    // `.js` so `../foo.js` → `../foo` → resolved to the real `.ts`. Without this, the
+    // unit suites using ESM-style imports fail with MODULE_NOT_FOUND.
+    "^(\\.{1,2}/.*)\\.js$": "$1",
   },
   testEnvironment: "node",
   // Preferuj zrodla TS zamiast wygenerowanych JS przy testach sibling packages.

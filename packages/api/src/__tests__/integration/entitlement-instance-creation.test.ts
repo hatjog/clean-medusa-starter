@@ -86,19 +86,32 @@ class FakeClient implements PgClient {
     this.queries.push({ sql, params })
     const normalized = sql.replace(/\s+/g, " ").trim()
 
+    // Idempotency probe SELECT. The column list has evolved over time
+    // (`id` → `id, line_item_id` → `id, claim_token` per Story 1.10.1's
+    // claim-token backfill), so match on the table rather than an exact
+    // column tuple to stay resilient to future column additions.
     if (
-      normalized.startsWith("SELECT id FROM entitlement_instance") ||
-      normalized.startsWith("SELECT id, line_item_id FROM entitlement_instance")
+      normalized.startsWith("SELECT id") &&
+      normalized.includes("FROM entitlement_instance")
     ) {
       if (this.existingEntitlementId) {
         return {
           rows: [
-            { id: this.existingEntitlementId, line_item_id: null },
+            {
+              id: this.existingEntitlementId,
+              line_item_id: null,
+              claim_token: null,
+            },
           ] as unknown as T[],
           rowCount: 1,
         }
       }
       return { rows: [] as T[], rowCount: 0 }
+    }
+
+    // Story 1.10.1 claim-token backfill on an existing row.
+    if (normalized.startsWith("UPDATE entitlement_instance SET claim_token")) {
+      return { rows: [] as T[], rowCount: this.existingEntitlementId ? 1 : 0 }
     }
 
     if (normalized.includes("FROM order_item")) {
