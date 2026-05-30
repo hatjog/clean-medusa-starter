@@ -59,8 +59,6 @@ export interface WalletPayload {
   entitlement_type: string
   status: WalletPassStatus
   expires_at: string
-  salon_name: string
-  salon_address: string
   deep_link: string
   barcode_spec: WalletBarcodeSpec
   qr_code?: string
@@ -129,8 +127,6 @@ export interface EntitlementInstanceWalletMetadata {
   deep_link?: string
   barcode_spec?: WalletBarcodeSpec
   branding?: Partial<WalletBranding>
-  salon_name?: string
-  salon_address?: string
   latitude?: number
   longitude?: number
 }
@@ -150,8 +146,6 @@ export interface EntitlementInstance {
   deep_link?: string
   barcode_spec?: WalletBarcodeSpec
   branding?: Partial<WalletBranding>
-  salon_name?: string
-  salon_address?: string
   latitude?: number
   longitude?: number
   metadata?: {

@@ -137,16 +137,6 @@ export class DefaultWalletPayloadBuilder implements WalletPayloadBuilder {
       entitlement_type,
       status,
       expires_at,
-      salon_name: requireString(
-        wallet_metadata.salon_name ?? entitlement_instance.salon_name,
-        "SALON_NAME_MISSING",
-        "entitlement_instance wallet salon_name is required"
-      ),
-      salon_address: requireString(
-        wallet_metadata.salon_address ?? entitlement_instance.salon_address,
-        "SALON_ADDRESS_MISSING",
-        "entitlement_instance wallet salon_address is required"
-      ),
       deep_link,
       barcode_spec,
       qr_code: barcode_spec.format === "QR" ? barcode_spec.value : undefined,
