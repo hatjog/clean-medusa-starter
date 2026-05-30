@@ -37,6 +37,7 @@ describe("PostgresMagicLinkStore", () => {
         email: "Customer@Example.test",
       },
       subject_customer_id: "cus_1",
+      subject_seller_id: null,
       subject_email: "customer@example.test",
       market_id: "bonbeauty",
       issued_at: new Date("2026-05-18T08:00:00.000Z"),
@@ -125,14 +126,16 @@ describe("PostgresMagicLinkStore", () => {
     expect(insert).toHaveBeenCalledWith([
       {
         token_jti: "00000000-0000-4000-8000-000000000001",
-        reason: "user_revoke",
-        revoked_by: "cus_1",
-      },
-      {
-        token_jti: "00000000-0000-4000-8000-000000000002",
-        reason: "user_revoke",
-        revoked_by: "cus_1",
-      },
+          reason: "user_revoke",
+          revoked_by: "cus_1",
+          actor_type: "customer",
+        },
+        {
+          token_jti: "00000000-0000-4000-8000-000000000002",
+          reason: "user_revoke",
+          revoked_by: "cus_1",
+          actor_type: "customer",
+        },
     ])
     expect(onConflict).toHaveBeenCalledWith("token_jti")
     expect(ignore).toHaveBeenCalledTimes(1)
@@ -214,6 +217,7 @@ describe("createMagicLinkRuntimeBindings", () => {
         email: "customer@example.test",
       },
       subject_customer_id: "cus_1",
+      subject_seller_id: null,
       subject_email: "customer@example.test",
       market_id: "bonbeauty",
       issued_at: new Date("2025-05-18T08:26:40.000Z"),
