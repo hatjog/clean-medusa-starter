@@ -210,8 +210,15 @@ export class DefaultMessagingGateway implements MessagingGateway {
       return dispatch;
     } catch (error) {
       if (error instanceof MessagingProviderError) {
-        const dispatchId = this.uuid();
-        return {
+        // R2-M1: provider error (np. timeout-after-send) jest niejednoznaczny —
+        // wiadomość mogła zostać faktycznie wysłana. Cache'ujemy failed dispatch
+        // pod tym samym idempotency cache key, żeby retry z tym samym
+        // idempotency_key NIE re-inwokował providera (ryzyko duplikatu), tylko
+        // zwrócił deterministyczny ten sam wynik. dispatch_id jest stabilnie
+        // wyprowadzony z cache key (a nie losowy uuid), więc jest powtarzalny
+        // nawet gdyby cache wygasł i provider zwrócił ten sam błąd ponownie.
+        const dispatchId = deriveFailedDispatchId(cacheKey);
+        const failedDispatch: NotificationDispatch = {
           dispatch_id: dispatchId,
           provider: provider.key,
           status: "failed",
@@ -224,6 +231,10 @@ export class DefaultMessagingGateway implements MessagingGateway {
             error_message: error.message,
           }),
         };
+
+        this.cacheDispatch(cacheKey, failedDispatch);
+
+        return failedDispatch;
       }
 
       throw error;
@@ -516,18 +527,41 @@ function buildCacheKey(intent: NotificationIntent): string {
   ].join("|");
 }
 
-// H1: dispatch lifecycle → KPI source event_type. queued/sent zasilają denominator
-// delivered_rate (sent); delivered zasila delivered + opt_out denominator +
-// time_to_delivery. failed nie emituje KPI (brak dostarczenia).
+// R2-M1: deterministyczny dispatch_id dla failed dispatch wyprowadzony z cache key,
+// żeby retry tego samego intentu (po wygaśnięciu cache lub w nowym procesie) dał
+// powtarzalny identyfikator zamiast losowego uuid — eliminuje niedeterminizm
+// i ułatwia korelację duplikatów w audicie.
+function deriveFailedDispatchId(cacheKey: string): string {
+  const digest = createHash("sha256").update(cacheKey).digest("hex");
+  // Format jako UUID-podobny (8-4-4-4-12) z deterministycznego hasha.
+  return [
+    digest.slice(0, 8),
+    digest.slice(8, 12),
+    digest.slice(12, 16),
+    digest.slice(16, 20),
+    digest.slice(20, 32),
+  ].join("-");
+}
+
+// H1 / R2-M2: dispatch lifecycle jest JEDYNYM autorytatywnym źródłem KPI `sent`
+// (zasila denominator delivered_rate). NIE emituje `delivered` z czasu dispatchu —
+// nawet gdy provider zwróci synchronicznie status "delivered", liczymy go tylko jako
+// `sent`, bo autorytatywnym źródłem `delivered`/`clicked` jest znormalizowane
+// zdarzenie webhooka (recordDeliveryEvent / mapDeliveryEventType). Bez tego ta sama
+// logiczna dostawa byłaby liczona dwa razy w dwóch różnych namespace'ach
+// idempotency key (dispatch audit envelope vs normalized event store) i dedupe
+// flow-KPI by jej nie scalił → inflacja delivered_rate.
+// R2-L2: `queued` jest świadomie mapowany na `sent` — w modelu KPI v1.10.0 nie ma
+// osobnego "enqueued" eventu; wystawienie do providera (queued|sent) liczymy jako
+// jedno zdarzenie "sent" zasilające denominator. failed nie emituje KPI (brak dostawy).
 function mapDispatchStatus(
   status: NotificationDispatchStatus,
 ): CommunicationKpiSourceEventType | null {
   switch (status) {
     case "queued":
     case "sent":
-      return "sent";
     case "delivered":
-      return "delivered";
+      return "sent";
     default:
       return null;
   }

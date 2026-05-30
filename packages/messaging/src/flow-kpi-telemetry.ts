@@ -32,7 +32,9 @@ export const FLOW_KPI_NFR20_ALERT_EVENT_NAME =
 // znaczy "spadek o ponad 5 pp". Spójne z R20 (architecture.md:2252) i artefaktami
 // (alert `semantics: percentage_points_absolute`). PRD §5.3 zapisuje to skrótowo jako ">5%".
 export const NFR20_REGRESSION_THRESHOLD_PCT = 5 as const;
-const NFR20_REGRESSION_THRESHOLD_FRACTION = 0.05;
+// R2-L1: wyprowadzamy fraction z PCT (single source of truth), żeby zmiana progu
+// w jednym miejscu nie rozjechała się z drugą stałą (PCT 5 ↔ FRACTION 0.05).
+const NFR20_REGRESSION_THRESHOLD_FRACTION = NFR20_REGRESSION_THRESHOLD_PCT / 100;
 
 const APPROVER_ROLES = [
   "business",
@@ -731,24 +733,56 @@ function assertNoRawPii(sourceEvent: CommunicationKpiSourceEvent): void {
   assertPropertiesNoRawPii(sourceEvent.properties ?? {});
 }
 
+// R2-M3: pola properties, które z definicji są już PII-neutralne (zahashowane lub
+// strukturalne) i nigdy nie powinny być traktowane jako kandydaci na raw PII —
+// wykluczamy je ze skanu, żeby nie produkować false-positives (denial-of-telemetry).
+const PII_NEUTRAL_PROPERTY_KEYS: ReadonlySet<string> = new Set([
+  "recipient_hash", // już sha256:<hex>
+  "occurred_at", // ISO-8601 timestamp
+  "source_event_id", // provider/internal event id
+  "source_event_type",
+  "source",
+  "flow_id",
+  "market",
+  "locale",
+  "provider",
+]);
+
+// R2-M3: precyzyjny e-mail (local@domain.tld) — NIE samo `@`, żeby Slack handle
+// (`@channel`), mention czy `key@v1` nie blokowały emisji.
+const RAW_EMAIL_PATTERN =
+  /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i;
+// R2-M3: realny numer telefonu — wymaga sygnału telefonu (wiodący `+` ALBO grupowanie
+// spacją/myślnikiem/nawiasem), 8-15 cyfr. Czysty ciąg cyfr bez separatorów (epoch ms,
+// numer zamówienia) NIE jest traktowany jako telefon.
+const RAW_PHONE_PATTERN =
+  /(?:\+\d[\d\s().-]{7,}\d)|(?:\b\d{1,4}[\s().-]\d[\d\s().-]{5,}\d\b)/;
+
 function assertPropertiesNoRawPii(properties: Record<string, unknown>): void {
-  if (containsRawPii(JSON.stringify(properties))) {
-    throw new Error("flow KPI telemetry properties must not contain raw PII");
+  for (const [key, value] of Object.entries(properties)) {
+    if (PII_NEUTRAL_PROPERTY_KEYS.has(key)) continue;
+    if (valueContainsRawPii(value)) {
+      throw new Error("flow KPI telemetry properties must not contain raw PII");
+    }
   }
 }
 
-function containsRawPii(payload: string): boolean {
-  // L1/L2: zanim sprawdzisz wzorzec telefonu, usuń ze stringa tokeny strukturalne,
-  // które legalnie zawierają długie ciągi cyfr i dawałyby false-positive:
-  //  - zahashowane identyfikatory (`sha256:<hex>` oraz bare 64-hex) — L1,
-  //  - timestampy ISO-8601 (occurred_at itp.) — emitowane properties je zawierają (L2).
-  // E-mail (zawiera `@`, którego hash/timestamp nie ma) sprawdzamy na surowym tekście.
-  if (/@/.test(payload)) return true;
-  const sanitized = payload
-    .replace(/sha256:[a-f0-9]+/gi, "")
-    .replace(/\b[a-f0-9]{64}\b/gi, "")
-    .replace(/\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?)?/g, "");
-  return /\b\+?\d[\d\s.-]{7,}\d\b/.test(sanitized);
+// R2-M3: skanuj PII per-wartość (nie na zestringowanym całym bagu), tylko na
+// wartościach typu string — tak by structural tokeny (epoch ms, order number,
+// Slack handle) w innych polach nie generowały false-positive.
+function valueContainsRawPii(value: unknown): boolean {
+  if (typeof value === "string") {
+    return RAW_EMAIL_PATTERN.test(value) || RAW_PHONE_PATTERN.test(value);
+  }
+  if (Array.isArray(value)) {
+    return value.some(valueContainsRawPii);
+  }
+  if (value && typeof value === "object") {
+    return Object.values(value as Record<string, unknown>).some(
+      valueContainsRawPii,
+    );
+  }
+  return false;
 }
 
 function rate(numerator: number, denominator: number): number {

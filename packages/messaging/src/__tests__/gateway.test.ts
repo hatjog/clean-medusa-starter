@@ -129,13 +129,14 @@ describe("DefaultMessagingGateway", () => {
       { brevo: provider },
       "brevo",
       () => fixedNow,
-      makeUuid(["failed-dispatch-1", "audit-failed-1"]),
+      // R2-M1: dispatch_id failed dispatchu jest deterministycznie wyprowadzony
+      // z cache key (nie z sekwencji uuid); pierwszy uuid zasila audit_id.
+      makeUuid(["audit-failed-1"]),
     );
 
     const dispatch = await gateway.send(makeIntent());
 
     expect(dispatch).toMatchObject({
-      dispatch_id: "failed-dispatch-1",
       provider: "brevo",
       status: "failed",
       audit_event: {
@@ -145,6 +146,36 @@ describe("DefaultMessagingGateway", () => {
         error_message: "Brevo rejected payload",
       },
     });
+    // R2-M1: dispatch_id jest stabilny (deterministyczny hash cache key), nie losowy.
+    expect(dispatch.dispatch_id).toMatch(
+      /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/,
+    );
+    expect(dispatch.dispatch_id).toBe(dispatch.audit_event.dispatch_id);
+  });
+
+  it("R2-M1: retry z tym samym idempotency_key po błędzie providera nie re-inwokuje providera", async () => {
+    const provider = makeProvider();
+    const sendMock = provider.send as jest.MockedFunction<IMessagingProvider["send"]>;
+    // Provider zawodzi tylko raz; gdyby retry re-inwokował providera (np. po
+    // timeout-after-send), drugie wywołanie mogłoby zdublować realną wysyłkę.
+    sendMock.mockRejectedValueOnce(
+      new MessagingProviderError("Brevo timeout", {
+        error_code: "provider_timeout",
+      }),
+    );
+    const gateway = new DefaultMessagingGateway(
+      { brevo: provider },
+      "brevo",
+      () => fixedNow,
+      makeUuid(["audit-failed-1", "audit-failed-2"]),
+    );
+
+    const first = await gateway.send(makeIntent());
+    const second = await gateway.send(makeIntent());
+
+    expect(sendMock).toHaveBeenCalledTimes(1);
+    expect(second).toEqual(first);
+    expect(second.status).toBe("failed");
   });
 
   it("rzuca MessagingValidationError dla email channel bez recipient.email", async () => {
