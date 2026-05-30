@@ -116,11 +116,19 @@ export class DefaultWalletPayloadBuilder implements WalletPayloadBuilder {
       wallet_metadata.branding ?? entitlement_instance.branding,
       this.default_branding
     )
-    const salon_name = pickOptionalString(
-      wallet_metadata.salon_name ?? entitlement_instance.salon_name
+    // Fail-closed per Story 3.2 AC4 (Robert ratify 2026-05-30): a salon-based
+    // wallet pass MUST carry salon_name/salon_address; the builder throws rather
+    // than emit a pass with missing merchant identity. (Base WalletPayload keeps
+    // these optional; the builder enforces presence at construction time.)
+    const salon_name = requireString(
+      wallet_metadata.salon_name ?? entitlement_instance.salon_name,
+      "SALON_NAME_MISSING",
+      "entitlement_instance wallet salon_name is required"
     )
-    const salon_address = pickOptionalString(
-      wallet_metadata.salon_address ?? entitlement_instance.salon_address
+    const salon_address = requireString(
+      wallet_metadata.salon_address ?? entitlement_instance.salon_address,
+      "SALON_ADDRESS_MISSING",
+      "entitlement_instance wallet salon_address is required"
     )
     const latitude = pickOptionalNumber(
       wallet_metadata.latitude ?? entitlement_instance.latitude
@@ -280,12 +288,6 @@ function resolveBarcodeSpec(
       "wallet barcode value is required"
     ),
   }
-}
-
-function pickOptionalString(value: unknown): string | undefined {
-  if (typeof value !== "string") return undefined
-  const trimmed = value.trim()
-  return trimmed.length > 0 ? trimmed : undefined
 }
 
 function pickOptionalNumber(value: unknown): number | undefined {

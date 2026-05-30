@@ -1,4 +1,5 @@
 export * from "./errors";
+export * from "./feature-flag-resolver";
 export * from "./flow-kpi-telemetry";
 export * from "./gateway";
 export * from "./provider";

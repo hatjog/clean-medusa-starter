@@ -17,6 +17,8 @@ describeLive("GoogleWalletProvider live Demo Issuer smoke", () => {
       entitlement_instance_id: `ei_live_${Date.now()}`,
       code: "BB-LIVE-0001",
       title: "Voucher testowy BonBeauty",
+      market: "bonbeauty",
+      entitlement_type: "voucher",
       status: "ACTIVE",
       expires_at: new Date(Date.now() + 86_400_000).toISOString(),
       deep_link: "https://bonbeauty.example/pl/vouchers/BB-LIVE-0001",

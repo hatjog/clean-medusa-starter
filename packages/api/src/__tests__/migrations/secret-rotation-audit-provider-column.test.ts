@@ -45,7 +45,13 @@ describe("Migration20260527083000SecretRotationAuditProviderColumn", () => {
   let migration: RecordingMigration
 
   beforeEach(() => {
-    migration = new RecordingMigration()
+    // MikroORM Migration ctor wymaga (driver, config); runtime jest mockowany
+    // zero-arg MigrationStub (patrz jest.mock powyzej), wiec przekazujemy stuby
+    // tylko po to, by spelnic kontrakt typow bazowej klasy.
+    migration = new RecordingMigration(
+      undefined as unknown as ConstructorParameters<typeof Migration20260527083000SecretRotationAuditProviderColumn>[0],
+      undefined as unknown as ConstructorParameters<typeof Migration20260527083000SecretRotationAuditProviderColumn>[1],
+    )
   })
 
   it("up() tworzy tabele secret_rotation_audit z wymaganym provider", async () => {

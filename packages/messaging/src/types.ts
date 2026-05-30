@@ -97,6 +97,7 @@ export interface AuditEnvelope {
   body_byte_length?: number;
   signature_hash?: string;
   source_ip_hash?: string;
+  gate_source?: "feature_flag";
 }
 
 export interface NotificationDispatch {

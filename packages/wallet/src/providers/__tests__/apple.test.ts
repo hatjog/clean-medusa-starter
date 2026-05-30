@@ -28,6 +28,8 @@ const payload: WalletPayload = {
   entitlement_instance_id: "ei_apple_123",
   code: "TESTCODE1",
   title: "Test voucher PL",
+  market: "bonbeauty",
+  entitlement_type: "voucher",
   status: "ACTIVE",
   expires_at: "2027-01-01T00:00:00.000Z",
   deep_link: "https://gp.example/voucher/TESTCODE1",

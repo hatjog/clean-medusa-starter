@@ -14,6 +14,8 @@ const payload: WalletPayload & GoogleWalletPayloadFields = {
   entitlement_instance_id: "ei_123",
   code: "BB-2026-0001",
   title: "Voucher spa",
+  market: "bonbeauty",
+  entitlement_type: "voucher",
   status: "ACTIVE",
   expires_at: "2026-12-31T23:59:59.000Z",
   deep_link: "https://bonbeauty.example/pl/vouchers/BB-2026-0001",
