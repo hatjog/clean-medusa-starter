@@ -1,6 +1,7 @@
 {
   "compilerOptions": {
     "target": "ES2021",
+    "lib": ["ES2022", "DOM"],
     "esModuleInterop": true,
     "module": "Node16",
     "moduleResolution": "Node16",
@@ -16,6 +17,8 @@
     "baseUrl": "./",
     "ignoreDeprecations": "5.0",
     "paths": {
+      "@gp/messaging": ["packages/messaging/src/index.ts"],
+      "@gp/messaging/*": ["packages/messaging/src/*"],
       "@/*": ["packages/api/src/*"]
     },
     "jsx": "react-jsx",

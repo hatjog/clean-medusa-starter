@@ -747,17 +747,6 @@ export default defineMiddlewares({
       method: ["POST"],
       matcher: "/webhooks/stripe",
     },
-    // v1.7.0 B6-WEBHOOK-IMPL: Brevo transactional callback receiver.
-    // Brevo bearer token verification (Authorization: Bearer ...); body parses
-    // as JSON via default Medusa parser — Brevo does not require raw-body HMAC
-    // (shared-secret-in-header is the canonical Brevo verified_callback pattern).
-    // Route is outside /store/* so it bypasses marketGuardMiddleware
-    // (Brevo callbacks do not carry x-publishable-api-key).
-    // See specs/operator/brevo-webhook-runbook.md for deployment guide.
-    {
-      method: ["POST"],
-      matcher: "/webhooks/brevo",
-    },
     {
       method: ["GET"],
       matcher: "/store/orders/:id/payment-status",

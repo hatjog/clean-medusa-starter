@@ -19,16 +19,16 @@ overrides:
 
 patchedDependencies:
   '@mercurjs/core@2.1.1':
-    hash: 140a8c80aef78a07b1a649ef9fd115b5558bd4e8563fae75fc322cb2b49b70a2
+    hash: 983879590b87210048e85d9c8333294a01ea6c7f62a5baf7fade668d8a71d602
     path: patches/@mercurjs__core@2.1.1.patch
 
 importers:
 
   .:
     dependencies:
-      '@gp/wallet':
+      '@gp/messaging':
         specifier: workspace:*
-        version: link:packages/wallet
+        version: link:packages/messaging
       '@medusajs/admin-sdk':
         specifier: 2.14.2
         version: 2.14.2
@@ -52,7 +52,7 @@ importers:
         version: 2.1.1(@medusajs/cli@2.14.2(@types/node@22.19.17))(@types/node@22.19.17)(@types/react-dom@18.3.7(@types/react@18.3.28))(@types/react@18.3.28)(esbuild@0.21.5)(ioredis@5.10.1)(picomatch@4.0.4)
       '@mercurjs/core':
         specifier: 2.1.1
-        version: 2.1.1(patch_hash=140a8c80aef78a07b1a649ef9fd115b5558bd4e8563fae75fc322cb2b49b70a2)(@medusajs/admin-sdk@2.14.2)(@medusajs/cli@2.14.2(@types/node@22.19.17))(@medusajs/framework@2.14.2(@medusajs/cli@2.14.2(@types/node@22.19.17))(@types/node@22.19.17)(ioredis@5.10.1)(vite@5.4.21(@types/node@22.19.17))(zod@4.2.0))(@medusajs/icons@2.14.2(react@18.3.1))(@medusajs/medusa@2.14.2)(@medusajs/test-utils@2.14.2)(express@4.22.1)
+        version: 2.1.1(patch_hash=983879590b87210048e85d9c8333294a01ea6c7f62a5baf7fade668d8a71d602)(@medusajs/admin-sdk@2.14.2)(@medusajs/cli@2.14.2(@types/node@22.19.17))(@medusajs/framework@2.14.2(@medusajs/cli@2.14.2(@types/node@22.19.17))(@types/node@22.19.17)(ioredis@5.10.1)(vite@5.4.21(@types/node@22.19.17))(zod@4.2.0))(@medusajs/icons@2.14.2(react@18.3.1))(@medusajs/medusa@2.14.2)(@medusajs/test-utils@2.14.2)(express@4.22.1)
       '@mercurjs/types':
         specifier: 2.1.1
         version: 2.1.1(ioredis@5.10.1)(vite@5.4.21(@types/node@22.19.17))
@@ -9636,7 +9636,7 @@ snapshots:
       - tsx
       - yaml
 
-  '@mercurjs/core@2.1.1(patch_hash=140a8c80aef78a07b1a649ef9fd115b5558bd4e8563fae75fc322cb2b49b70a2)(@medusajs/admin-sdk@2.14.2)(@medusajs/cli@2.14.2(@types/node@22.19.17))(@medusajs/framework@2.14.2(@medusajs/cli@2.14.2(@types/node@22.19.17))(@types/node@22.19.17)(ioredis@5.10.1)(vite@5.4.21(@types/node@22.19.17))(zod@4.2.0))(@medusajs/icons@2.14.2(react@18.3.1))(@medusajs/medusa@2.14.2)(@medusajs/test-utils@2.14.2)(express@4.22.1)':
+  '@mercurjs/core@2.1.1(patch_hash=983879590b87210048e85d9c8333294a01ea6c7f62a5baf7fade668d8a71d602)(@medusajs/admin-sdk@2.14.2)(@medusajs/cli@2.14.2(@types/node@22.19.17))(@medusajs/framework@2.14.2(@medusajs/cli@2.14.2(@types/node@22.19.17))(@types/node@22.19.17)(ioredis@5.10.1)(vite@5.4.21(@types/node@22.19.17))(zod@4.2.0))(@medusajs/icons@2.14.2(react@18.3.1))(@medusajs/medusa@2.14.2)(@medusajs/test-utils@2.14.2)(express@4.22.1)':
     dependencies:
       '@medusajs/admin-sdk': 2.14.2
       '@medusajs/cli': 2.14.2(@types/node@22.19.17)
