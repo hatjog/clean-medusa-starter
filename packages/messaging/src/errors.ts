@@ -13,10 +13,14 @@ export class MessagingError extends Error {
   readonly status_code?: number;
 
   constructor(message: string, options: MessagingErrorOptions) {
-    super(
-      message,
-      options.cause !== undefined ? { cause: options.cause } : undefined,
-    );
+    // Root tsconfig targets ES2021 (lib.es2021) where Error constructor
+    // signature is `(message?: string)` — `{ cause }` ErrorOptions arrived
+    // in ES2022. Set `cause` post-construction to stay compatible with the
+    // shared baseline without touching the package-level `lib` override.
+    super(message);
+    if (options.cause !== undefined) {
+      (this as { cause?: unknown }).cause = options.cause;
+    }
     this.name = new.target.name;
     this.error_code = options.error_code;
     this.audit_event = options.audit_event;
