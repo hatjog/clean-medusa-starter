@@ -36,6 +36,12 @@ Po globalnym chainie dokładane są middleware specyficzne dla wybranych ścież
 | `/store/orders*` `ALL` | `customerResponseSanitizerMiddleware` | Ten sam cel co wyżej dla odpowiedzi order/customer. |
 | `/store/carts*` `ALL` | `cartMarketGuardMiddleware` -> `customerResponseSanitizerMiddleware` | Domyka read-path cartów po `sales_channel_id` i dalej sanitizuje payload customer-related. |
 
+## Webhook security overlays
+
+| Matcher | Middleware | Cel |
+|---|---|---|
+| `/hooks/notifications/brevo*` `POST` | `bodyParser.preserveRawBody` + `brevoWebhookRateLimitMiddleware` -> `brevoWebhookCircuitBreakerMiddleware` -> `brevoHmacValidatorMiddleware` | Medusa-native Brevo notification provider prefix. Chroni Path Y delivery ingestion przed DoS i fail-closed odrzuca requesty bez valid `X-Mailin-Custom-Signature`, emitując audit envelope bez raw body/PII. |
+
 ## Powiązane auth routes
 
 Poniższe trasy nie są pod `/store/*`, ale należą do tego samego modelu izolacji customerów:
