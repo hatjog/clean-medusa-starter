@@ -10,6 +10,10 @@ import {
   type WalletPassStatus,
   type WalletPayload,
 } from "./payload"
+import { validateWalletPayloadInCurrentEnv } from "./payload-schema"
+import { WalletPayloadError } from "./errors"
+
+export { WalletPayloadError } from "./errors"
 
 const DEFAULT_BRANDING: WalletBranding = {
   logo_url: "https://assets.growplatform.local/bonbeauty/logo.svg",
@@ -38,16 +42,6 @@ export interface WalletPayloadBuilder {
 export interface WalletPayloadBuilderOptions {
   fallback_locale?: WalletLocale
   default_branding?: WalletBranding
-}
-
-export class WalletPayloadError extends Error {
-  constructor(
-    readonly code: string,
-    message: string
-  ) {
-    super(message)
-    this.name = "WalletPayloadError"
-  }
 }
 
 export class DefaultWalletPayloadBuilder implements WalletPayloadBuilder {
@@ -123,7 +117,7 @@ export class DefaultWalletPayloadBuilder implements WalletPayloadBuilder {
       this.default_branding
     )
 
-    return {
+    const payload: WalletPayload = {
       entitlement_instance_id: entitlement_instance.id,
       code,
       title,
@@ -131,6 +125,16 @@ export class DefaultWalletPayloadBuilder implements WalletPayloadBuilder {
       entitlement_type,
       status,
       expires_at,
+      salon_name: requireString(
+        wallet_metadata.salon_name ?? entitlement_instance.salon_name,
+        "SALON_NAME_MISSING",
+        "entitlement_instance wallet salon_name is required"
+      ),
+      salon_address: requireString(
+        wallet_metadata.salon_address ?? entitlement_instance.salon_address,
+        "SALON_ADDRESS_MISSING",
+        "entitlement_instance wallet salon_address is required"
+      ),
       deep_link,
       barcode_spec,
       qr_code: barcode_spec.format === "QR" ? barcode_spec.value : undefined,
@@ -138,6 +142,8 @@ export class DefaultWalletPayloadBuilder implements WalletPayloadBuilder {
       branding,
       locale: normalized_locale,
     }
+
+    return validateWalletPayloadInCurrentEnv(payload)
   }
 }
 

@@ -19,6 +19,18 @@ export interface WalletBranding {
   accent_color: string
 }
 
+/**
+ * Zminimalizowany payload portfela zgodny z D-110.
+ *
+ * Dozwolone pola provider-facing: `code`, `title`, `status`, `expires_at`,
+ * `salon_name`, `salon_address`, `deep_link`, `qr_code`, `branding`.
+ * Pola techniczne `entitlement_instance_id`, `barcode_spec`, `barcode` i
+ * `locale` zostają wyłącznie w granicy backendowego `@gp/wallet`, żeby adapter
+ * providerów mógł deterministycznie zbudować identyfikatory i kod kreskowy.
+ *
+ * Zabronione: email, imię i nazwisko, telefon lub adres odbiorcy, buyer Anna
+ * PII, customer email/phone, IP address oraz device fingerprint.
+ */
 export interface WalletPayload {
   entitlement_instance_id: string
   code: string
@@ -27,6 +39,8 @@ export interface WalletPayload {
   entitlement_type: string
   status: WalletPassStatus
   expires_at: string
+  salon_name: string
+  salon_address: string
   deep_link: string
   barcode_spec: WalletBarcodeSpec
   qr_code?: string
@@ -43,8 +57,8 @@ export type WalletAuditEventType =
 
 export type WalletAuditOutcome = "success" | "failure"
 
-// TODO(F-11, deferred architectural): migrate to shared @gp/audit when the
-// audit package consolidation lands (Epic J observability follow-up story).
+// TODO(F-11, deferred architectural): przenieść do shared @gp/audit po
+// konsolidacji pakietu audytu w follow-upie Epic J observability.
 export interface AuditEnvelope {
   event_type: WalletAuditEventType
   entitlement_instance_id: string
@@ -72,12 +86,14 @@ export interface EntitlementInstanceWalletMetadata {
   entitlement_type?: string
   status?: WalletPassStatus
   expires_at?: string | Date | null
+  salon_name?: string
+  salon_address?: string
   deep_link?: string
   barcode_spec?: WalletBarcodeSpec
   branding?: Partial<WalletBranding>
 }
 
-// TODO: replace with @gp/voucher L4 read model once wallet projection fields land.
+// TODO: zastąpić read modelem L4 z @gp/voucher, gdy projekcja wallet wyląduje.
 export interface EntitlementInstance {
   id: string
   code?: string
@@ -87,6 +103,8 @@ export interface EntitlementInstance {
   status?: WalletPassStatus
   state?: string
   expires_at?: string | Date | null
+  salon_name?: string
+  salon_address?: string
   deep_link?: string
   barcode_spec?: WalletBarcodeSpec
   branding?: Partial<WalletBranding>

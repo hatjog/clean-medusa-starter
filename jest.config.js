@@ -1,10 +1,10 @@
 const { loadEnv } = require("@medusajs/utils");
 loadEnv("test", process.cwd());
 
-// NOTE: Some unit tests (init-market.unit.spec.ts) import from ../portal/ (sibling module in monorepo).
-// These tests MUST be run from within the GP/ monorepo context (cd GP/backend && yarn test:unit).
-// Running this submodule standalone (outside the monorepo) will fail with MODULE_NOT_FOUND.
-// This is a known monorepo coupling — the test belongs conceptually to GP/portal but requires Jest mocking.
+// UWAGA: czesc testow unit (init-market.unit.spec.ts) importuje z ../portal/.
+// Te testy musza isc z kontekstu monorepo GP (`GP/backend && yarn test:unit`).
+// Samodzielny checkout submodulu poza monorepo zakonczy sie MODULE_NOT_FOUND.
+// To znane sprzezenie monorepo: test konceptualnie nalezy do GP/portal, ale wymaga mockow Jest.
 
 module.exports = {
   transform: {
@@ -18,13 +18,13 @@ module.exports = {
       },
     ],
   },
-  // @noble/ed25519 v2 is ESM-only and cannot be required() in Jest CJS mode.
-  // Map it to a manual CJS mock backed by Node built-in crypto (test env only).
+  // @noble/ed25519 v2 jest ESM-only i nie przechodzi przez require() w Jest CJS.
+  // Mapujemy go na reczny mock CJS oparty o Node crypto tylko w test env.
   moduleNameMapper: {
     "^@noble/ed25519$": "<rootDir>/__mocks__/@noble/ed25519.js",
   },
   testEnvironment: "node",
-  // Prefer TS sources over generated JS when tests reach into sibling packages.
+  // Preferuj zrodla TS zamiast wygenerowanych JS przy testach sibling packages.
   moduleFileExtensions: ["ts", "js", "json"],
   modulePathIgnorePatterns: ["dist/", "<rootDir>/.medusa/"],
   setupFiles: ["./integration-tests/setup.js"],
@@ -39,9 +39,10 @@ if (process.env.TEST_TYPE === "integration:http") {
     "**/packages/api/src/**/__tests__/**/*.unit.spec.[jt]s",
     "**/packages/api/src/**/__tests__/**/*.idempotency.spec.[jt]s",
     "**/packages/api/src/**/__tests__/**/*.test.[jt]s",
+    "**/packages/wallet/src/**/__tests__/**/*.test.[jt]s",
   ];
 } else if (process.env.TEST_TYPE === "patches") {
-  // Patch regression tests — no live DB required, mock-based, fast.
-  // Run with: pnpm test:patches
+  // Patch regression tests: bez live DB, oparte o mocki, szybkie.
+  // Uruchomienie: pnpm test:patches
   module.exports.testMatch = ["**/__tests__/patches/**/*.spec.[jt]s"];
 }

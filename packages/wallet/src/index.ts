@@ -19,6 +19,16 @@ export type {
 } from "./payload-builder"
 export type { WalletPassProvider } from "./provider"
 export {
+  assertWalletPayloadSchema,
+  validateWalletPayloadInCurrentEnv,
+  WALLET_PAYLOAD_ALLOWED_FIELDS,
+  WALLET_PAYLOAD_FORBIDDEN_FIELDS,
+} from "./payload-schema"
+export type {
+  WalletPayloadSchemaBarcodeSpec,
+  WalletPayloadSchemaBranding,
+} from "./payload-schema"
+export {
   WALLET_LOCALES,
   WALLET_PROVIDER_KINDS,
   isWalletProviderKind,
