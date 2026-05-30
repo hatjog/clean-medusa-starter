@@ -36,3 +36,9 @@ export class MessagingProviderError extends MessagingError {}
 export class UnsupportedProviderError extends MessagingError {}
 
 export class UnsupportedChannelError extends MessagingError {}
+
+export class CommunicationConfigNotFoundError extends MessagingError {}
+
+export class CommunicationConfigValidationError extends MessagingError {}
+
+export class UnknownFlowError extends MessagingError {}

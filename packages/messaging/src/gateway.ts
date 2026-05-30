@@ -6,6 +6,7 @@ import {
   UnsupportedChannelError,
   UnsupportedProviderError,
 } from "./errors";
+import type { ICommunicationFlowFlagResolver } from "./feature-flag-resolver";
 import type {
   CommunicationKpiSourceEvent,
   CommunicationKpiSourceEventType,
@@ -59,6 +60,18 @@ export type MessagingProviderRegistry =
   | Map<string, IMessagingProvider>
   | Partial<Record<string, IMessagingProvider>>;
 
+export interface MessagingGatewayOptions {
+  flagResolver?: ICommunicationFlowFlagResolver;
+  // H1 (5-9): opcjonalny hook telemetryczny KPI. Gdy wstrzyknięty (loader Medusa
+  // wiąże go przez createFlowKpiTelemetryHook z approvalLookup z 5-8), gateway
+  // realnie emituje KPI w lifecycle wysyłki — emitter nie jest martwym kodem.
+  flowKpiTelemetry?: FlowKpiTelemetryHook;
+  clock?: () => Date;
+  uuid?: () => string;
+  idempotencyTtlMs?: number;
+  maxCacheSize?: number;
+}
+
 export class DefaultMessagingGateway implements MessagingGateway {
   private readonly idempotencyCache = new Map<string, CachedDispatch>();
   // H1: bounded korelacja dispatch_id → kontekst flow, by recordDeliveryEvent()
@@ -68,19 +81,66 @@ export class DefaultMessagingGateway implements MessagingGateway {
   // F-12: Map storage zamiast Object — żaden prototypowy klucz (`__proto__`, `constructor`)
   // nie pollutuje lookup; klucze pochodzą wprost z rejestracji providerów.
   private readonly providers: Map<string, IMessagingProvider>;
+  private readonly clock: () => Date;
+  private readonly uuid: () => string;
+  private readonly idempotencyTtlMs: number;
+  private readonly maxCacheSize: number;
+  private readonly flagResolver?: ICommunicationFlowFlagResolver;
+  private readonly flowKpiTelemetry?: FlowKpiTelemetryHook;
 
+  // F-02: explicit overloady TS rozdzielają nowy options-object API od legacy
+  // positional sygnatury Story 5.1 — bez nich TS pozwalał skompilować mieszany
+  // call (object + dodatkowe argumenty) gdzie runtime po cichu ignorował uuid/ttl.
+  constructor(
+    providers: MessagingProviderRegistry,
+    defaultProvider: NotificationProvider,
+    options?: MessagingGatewayOptions,
+  );
+  /**
+   * @deprecated Sygnatura pozycyjna zachowana dla Story 5.1 callsites; preferuj
+   * przekazanie `MessagingGatewayOptions`. Pozycyjne argumenty po `clock` (`uuid`,
+   * `idempotencyTtlMs`, `maxCacheSize`) działają TYLKO gdy 3-ci argument jest
+   * funkcją; w połączeniu z options-objectem są ignorowane.
+   */
+  constructor(
+    providers: MessagingProviderRegistry,
+    defaultProvider: NotificationProvider,
+    clock: () => Date,
+    uuid?: () => string,
+    idempotencyTtlMs?: number,
+    maxCacheSize?: number,
+    // H1 (5-9): legacy positional hook telemetryczny KPI (7-my argument).
+    flowKpiTelemetry?: FlowKpiTelemetryHook,
+  );
   constructor(
     providers: MessagingProviderRegistry,
     private readonly defaultProvider: NotificationProvider,
-    private readonly clock: () => Date = () => new Date(),
-    private readonly uuid: () => string = () => randomUUID(),
-    private readonly idempotencyTtlMs: number = DEFAULT_TTL_MS,
-    private readonly maxCacheSize: number = DEFAULT_MAX_CACHE_SIZE,
-    // H1: opcjonalny hook telemetryczny KPI. Gdy wstrzyknięty (loader Medusa wiąże
-    // go przez createFlowKpiTelemetryHook z approvalLookup z 5-8), gateway realnie
-    // emituje KPI w lifecycle wysyłki — emitter nie jest martwym kodem biblioteki.
-    private readonly flowKpiTelemetry?: FlowKpiTelemetryHook,
+    optionsOrClock: MessagingGatewayOptions | (() => Date) = {},
+    uuid?: () => string,
+    idempotencyTtlMs: number = DEFAULT_TTL_MS,
+    maxCacheSize: number = DEFAULT_MAX_CACHE_SIZE,
+    // H1 (5-9): w wariancie pozycyjnym (legacy Story 5.1/5.9 callsites) hook
+    // telemetryczny KPI przychodzi jako 7-my argument; w wariancie options-object
+    // (5-4) pochodzi z options.flowKpiTelemetry.
+    flowKpiTelemetry?: FlowKpiTelemetryHook,
   ) {
+    const options =
+      typeof optionsOrClock === "function"
+        ? {
+            clock: optionsOrClock,
+            uuid,
+            idempotencyTtlMs,
+            maxCacheSize,
+            flowKpiTelemetry,
+          }
+        : optionsOrClock;
+
+    this.clock = options.clock ?? (() => new Date());
+    this.uuid = options.uuid ?? (() => randomUUID());
+    this.idempotencyTtlMs = options.idempotencyTtlMs ?? DEFAULT_TTL_MS;
+    this.maxCacheSize = options.maxCacheSize ?? DEFAULT_MAX_CACHE_SIZE;
+    this.flagResolver = options.flagResolver;
+    this.flowKpiTelemetry = options.flowKpiTelemetry;
     this.providers =
       providers instanceof Map
         ? new Map(providers)
@@ -94,6 +154,14 @@ export class DefaultMessagingGateway implements MessagingGateway {
 
   async send(intent: NotificationIntent): Promise<NotificationDispatch> {
     this.validateIntent(intent);
+
+    // F-01: gate ZAWSZE eval przed cache lookup — config flag może się zmienić
+    // pomiędzy dwoma send-ami (operator flipuje enabled OFF→ON); gated denial
+    // NIE jest cache'owany, żeby kolejny send dostał świeży resolve i flow ruszył.
+    const gatedDispatch = this.applyFeatureFlagGate(intent);
+    if (gatedDispatch) {
+      return gatedDispatch;
+    }
 
     const cacheKey = buildCacheKey(intent);
     const cached = this.getCachedDispatch(cacheKey);
@@ -375,6 +443,7 @@ export class DefaultMessagingGateway implements MessagingGateway {
     dispatch_id: string;
     error_code?: string;
     error_message?: string;
+    gate_source?: "feature_flag";
   }): AuditEnvelope {
     return {
       audit_id: this.uuid(),
@@ -393,6 +462,45 @@ export class DefaultMessagingGateway implements MessagingGateway {
       occurred_at: this.clock().toISOString(),
       error_code: input.error_code,
       error_message: input.error_message,
+      gate_source: input.gate_source,
+    };
+  }
+
+  private applyFeatureFlagGate(
+    intent: NotificationIntent,
+  ): NotificationDispatch | undefined {
+    if (!this.flagResolver) {
+      return undefined;
+    }
+
+    const flagState = this.flagResolver.resolve({
+      flow_id: intent.flow_id,
+      market_id: intent.recipient.market_id,
+    });
+
+    if (flagState.enabled) {
+      return undefined;
+    }
+
+    // F-01: gated denial NIE jest cache'owany — operator flip OFF→ON musi natychmiast
+    // odblokować flow bez czekania na TTL idempotency cache. Tradeoff: kolejne retry
+    // dla disabled flow generują nowy dispatch_id, ale to akceptowalne dla denial path
+    // (consumer i tak nie dostarcza wiadomości; idempotency invariant Story 5.1 zachowany
+    // dla success/queued dispatchy).
+    const dispatchId = this.uuid();
+    return {
+      dispatch_id: dispatchId,
+      provider: this.defaultProvider,
+      status: "failed",
+      audit_event: this.createAuditEvent({
+        intent,
+        provider: this.defaultProvider,
+        status: "failed",
+        dispatch_id: dispatchId,
+        error_code: "FLOW_DISABLED",
+        error_message: `Communication flow '${intent.flow_id}' is disabled for market '${intent.recipient.market_id}'`,
+        gate_source: "feature_flag",
+      }),
     };
   }
 }
