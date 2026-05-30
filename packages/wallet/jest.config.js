@@ -12,12 +12,13 @@ module.exports = {
     ],
   },
   testEnvironment: "node",
-  testMatch: ["<rootDir>/src/__tests__/**/*.test.ts"],
+  testMatch: ["<rootDir>/src/**/__tests__/**/*.test.ts"],
   moduleFileExtensions: ["ts", "js", "json"],
   collectCoverageFrom: [
     "src/facade.ts",
     "src/payload-builder.ts",
     "src/telemetry/*.ts",
+    "src/providers/google*.ts",
   ],
   coverageThreshold: {
     global: {

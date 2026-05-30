@@ -17,7 +17,11 @@ export type {
   WalletPayloadBuilder,
   WalletPayloadBuilderOptions,
 } from "./payload-builder"
-export type { WalletPassProvider } from "./provider"
+export type {
+  WalletPassIssueResult,
+  WalletPassInvalidateResult,
+  WalletPassProvider,
+} from "./provider"
 export {
   assertWalletPayloadSchema,
   validateWalletPayloadInCurrentEnv,
@@ -69,3 +73,50 @@ export type {
   WalletPayload,
   WalletProviderKind,
 } from "./payload"
+export {
+  GoogleWalletConfigMissingError,
+  buildGoogleWalletClassId,
+  buildGoogleWalletObjectId,
+  loadGoogleWalletProviderConfigFromEnv,
+  resolveGoogleWalletProviderConfig,
+} from "./providers/google-config"
+export type { GoogleWalletProviderConfig } from "./providers/google-config"
+export {
+  GOOGLE_WALLET_DEFAULT_BACKGROUND,
+  GoogleWalletPayloadError,
+  assertNoForbiddenPii,
+  buildGoogleOfferClass,
+  buildOfferClassPayload,
+} from "./providers/google-offer-class-mapper"
+export type {
+  GoogleOfferClass,
+  GoogleOfferObject,
+  GoogleWalletMarketBranding,
+  GoogleWalletMerchantLocation,
+} from "./providers/google-offer-class-mapper"
+export {
+  GOOGLE_WALLET_OBJECTS_SCOPE,
+  GoogleWalletApiClient,
+  GoogleWalletApiError,
+  statusOf,
+} from "./providers/google-api-client"
+export {
+  GoogleWalletSigningError,
+  signSaveJWT,
+} from "./providers/google-jwt-signer"
+export type {
+  GoogleWalletJWTClaims,
+  SignSaveJWTOptions,
+} from "./providers/google-jwt-signer"
+export {
+  GoogleWalletProvider,
+  GoogleWalletProviderInvalidationError,
+  GoogleWalletProviderIssueError,
+} from "./providers/google"
+export type {
+  GoogleWalletInvalidateResult,
+  GoogleWalletIssueResult,
+  GoogleWalletProviderAuditEnvelope,
+  GoogleWalletProviderAuditEventType,
+  GoogleWalletProviderOptions,
+} from "./providers/google"
