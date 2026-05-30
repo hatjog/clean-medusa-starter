@@ -35,6 +35,25 @@ export type {
 export { createWalletProviderRegistry } from "./registry"
 export type { CreateWalletProviderRegistryOptions } from "./registry"
 export {
+  DefaultWalletFeaturePolicy,
+  EnvWalletProviderReadiness,
+  mapWalletInvalidationReasonToLifecycle,
+  parseWalletFlag,
+} from "./policy"
+export type {
+  EntitlementLifecycleStatus,
+  ReleasePromotabilityProbe,
+  WalletActorContext,
+  WalletDenyReason,
+  WalletFeaturePolicy,
+  WalletFeaturePolicyDependencies,
+  WalletFeaturePolicyInput,
+  WalletFeaturePolicyResult,
+  WalletMarketRegistry,
+  WalletPersona,
+  WalletProviderReadiness,
+} from "./policy"
+export {
   WALLET_LOCALES,
   WALLET_PROVIDER_KINDS,
   isWalletProviderKind,

@@ -21,6 +21,7 @@ module.exports = {
     "src/providers/google*.ts",
     "src/providers/apple.ts",
     "src/registry.ts",
+    "src/policy.ts",
   ],
   coverageThreshold: {
     global: {
