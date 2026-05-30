@@ -22,5 +22,16 @@ export { default as orderGroupCartLink } from "@mercurjs/core/links/order-group-
 export { default as orderPayoutLink } from "@mercurjs/core/links/order-payout-link"
 export { default as priceListSellerLink } from "@mercurjs/core/links/price-list-seller-link"
 export { default as sellerMemberRbacRoleLink } from "@mercurjs/core/links/seller-member-rbac-role"
-export { default as entitlementInstanceProductLink } from "./entitlement-instance-product"
-export { default as entitlementInstanceSellerLink } from "./entitlement-instance-seller"
+
+/**
+ * NOTE (v1.10.0 boot-fix): the Story 9.3 `entitlement_instance ↔ {seller,product}`
+ * module links were removed here. The voucher module is SQL-backed and does NOT
+ * expose a real Medusa linkable surface for `entitlement_instance`, so the
+ * hand-rolled literal linkable was rejected by Medusa 2.14.2's link loader at boot
+ * ("Key entitlement_instance_id is not linkable on service voucher"), crashing
+ * `medusa develop`. These links were documented as forward-compat only and were
+ * NOT consumed at runtime (Story 9.3 reads via `VoucherService.findBuyerClaimSource`
+ * SQL JOIN). Re-introduce them under ADR-099 Layer 4 once `entitlement_instance`
+ * gains a real linkable surface (physical FKs or a pivot table). See git history of
+ * `entitlement-instance-{seller,product}.ts` for the original rationale.
+ */
