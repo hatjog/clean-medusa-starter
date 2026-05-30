@@ -162,13 +162,18 @@ describe("gp-config-sync-translations", () => {
         is_active: true,
       },
     ])
-    expect(translationService.createTranslationSettings).toHaveBeenCalledTimes(4)
+    expect(translationService.createTranslationSettings).toHaveBeenCalledTimes(5)
+    expect(translationService.createTranslationSettings).toHaveBeenCalledWith({
+      entity_type: "seller",
+      fields: ["name", "description"],
+    })
     expect(summary.story_labels).toEqual([
       "product",
       "product_category",
       "product_type",
       "product_variant",
       "collection",
+      "seller",
     ])
   })
 
@@ -220,6 +225,10 @@ describe("gp-config-sync-translations", () => {
         is_active: true,
       },
     ])
+    expect(translationService.createTranslationSettings).toHaveBeenCalledWith({
+      entity_type: "seller",
+      fields: ["name", "description"],
+    })
   })
 
   it("usuwa nadmiarowe fields tylko przy --overwrite", async () => {
@@ -334,6 +343,7 @@ describe("gp-config-sync-translations", () => {
       "product_type",
       "product_variant",
       "product_collection",
+      "seller",
     ])
     expect(summary.updated).toEqual(["trset_product"])
   })
