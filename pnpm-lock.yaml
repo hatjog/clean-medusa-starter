@@ -26,6 +26,9 @@ importers:
 
   .:
     dependencies:
+      '@gp/wallet':
+        specifier: workspace:*
+        version: link:packages/wallet
       '@medusajs/admin-sdk':
         specifier: 2.14.2
         version: 2.14.2

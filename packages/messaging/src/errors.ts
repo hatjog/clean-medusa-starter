@@ -1,3 +1,4 @@
+/// <reference lib="es2022.error" />
 import type { AuditEnvelope } from "./types";
 
 interface MessagingErrorOptions {
