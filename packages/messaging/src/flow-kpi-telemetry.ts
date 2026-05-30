@@ -27,6 +27,13 @@ export const FLOW_KPI_GATED_EVENT_NAME = "gp.messaging.flow_kpi.gated";
 export const FLOW_KPI_NFR20_ALERT_EVENT_NAME =
   "gp.messaging.flow_kpi.nfr20_regression_alert";
 
+// I2: próg NFR20 jest wyrażony w PUNKTACH PROCENTOWYCH (absolutna różnica
+// delivery-rate baseline − rolling), NIE jako 5% względne. `adjusted_regression > 0.05`
+// znaczy "spadek o ponad 5 pp". Spójne z R20 (architecture.md:2252) i artefaktami
+// (alert `semantics: percentage_points_absolute`). PRD §5.3 zapisuje to skrótowo jako ">5%".
+export const NFR20_REGRESSION_THRESHOLD_PCT = 5 as const;
+const NFR20_REGRESSION_THRESHOLD_FRACTION = 0.05;
+
 const APPROVER_ROLES = [
   "business",
   "copy",
@@ -38,6 +45,8 @@ const APPROVER_ROLES = [
 export type FlowApprovalRole = (typeof APPROVER_ROLES)[number];
 export type FlowApprovalStatus = "green" | "pending" | "rejected";
 
+export type FlowLifecycleState = "rolled_out" | "rolled_back";
+
 export interface FlowApprovalRoleEntry {
   status: FlowApprovalStatus;
   approver?: string;
@@ -46,6 +55,10 @@ export interface FlowApprovalRoleEntry {
 
 export interface FlowApprovalEntry {
   governed_fields_digest?: string;
+  // M3: jawny stan lifecycle z kontraktu 5-8. Brak pola == `rolled_out`
+  // (kontrakt: 5-role green = approved & rolled-out). `rolled_back` wyklucza
+  // emisję KPI mimo historycznie zielonych ról.
+  lifecycle_state?: FlowLifecycleState;
   roles?: Partial<Record<FlowApprovalRole, FlowApprovalRoleEntry>>;
 }
 
@@ -59,6 +72,9 @@ export interface PostHogCaptureClient {
     distinctId: string;
     event: string;
     properties: Record<string, unknown>;
+    // M1: top-level `uuid` włącza natywną deduplikację PostHog (przeżywa restart
+    // procesu / drugą instancję), czego in-memory `Set` nie gwarantuje.
+    uuid?: string;
   }): void;
   shutdown?(): Promise<void>;
   flush?(): Promise<void>;
@@ -86,6 +102,10 @@ export interface CommunicationKpiSourceEvent {
   idempotency_key?: string;
   provider?: "brevo" | "resend" | "none" | string;
   outcome?: string;
+  // M3: digest governed-fields aktualnie wdrożonej treści flow. Gdy podany,
+  // gate porównuje go z zatwierdzonym `governed_fields_digest` z kontraktu 5-8
+  // i wyklucza emisję przy dryfcie post-approval.
+  governed_fields_digest?: string;
   properties?: Record<string, unknown>;
 }
 
@@ -93,7 +113,9 @@ export type FlowRegistryStatus =
   | "approved"
   | "unapproved"
   | "unknown"
-  | "contract_missing";
+  | "contract_missing"
+  | "governed_fields_drift"
+  | "rolled_back";
 
 export interface FlowApprovalDecision {
   status: FlowRegistryStatus;
@@ -111,6 +133,10 @@ export interface FlowKpiPostHogEvent {
 export interface FlowKpiEmissionResult {
   emitted: FlowKpiPostHogEvent[];
   skipped_duplicate: string[];
+  // M2: zdarzenia których NIE oznaczono jako wyemitowane (brak klienta lub błąd
+  // wysyłki) — klucz NIE jest spalony w dedupeStore, więc ponowne przetworzenie
+  // (np. po skonfigurowaniu klienta) wyemituje je bez utraty KPI.
+  not_emitted: string[];
   gated: boolean;
   flow_registry_status: FlowRegistryStatus;
   missing_roles: FlowApprovalRole[];
@@ -121,6 +147,9 @@ export interface FlowKpiEmitterOptions {
   approvalLookup?: FlowApprovalLookup;
   dedupeStore?: Set<string>;
   now?: () => Date;
+  // M3: obserwowany digest governed-fields wdrożonego flow (gdy nie podany w
+  // sourceEvent). Mismatch względem kontraktu 5-8 → wykluczenie (drift).
+  governedFieldsDigest?: string;
 }
 
 export interface Nfr20BaselineMarket {
@@ -202,6 +231,7 @@ export function classifyFlowApproval(
   market: string,
   flowId: string,
   approvalLookup?: FlowApprovalLookup,
+  observedGovernedFieldsDigest?: string,
 ): FlowApprovalDecision {
   if (!approvalLookup) {
     return {
@@ -235,11 +265,31 @@ export function classifyFlowApproval(
     return approval?.status !== "green" || !approval.approver || !approval.approved_at;
   });
 
-  return {
-    status: missing.length === 0 ? "approved" : "unapproved",
-    missing_roles: missing,
-    telemetry_excluded: missing.length > 0,
-  };
+  if (missing.length > 0) {
+    return { status: "unapproved", missing_roles: missing, telemetry_excluded: true };
+  }
+
+  // M3: flow wycofany (rolled-back) nie emituje KPI mimo zielonych ról.
+  if (entry.lifecycle_state === "rolled_back") {
+    return { status: "rolled_back", missing_roles: [], telemetry_excluded: true };
+  }
+
+  // M3: egzekwuj governed_fields_digest z kontraktu 5-8 — jeśli zatwierdzony digest
+  // istnieje, a obserwowana treść flow ma inny digest, to post-approval drift
+  // (dokładnie scenariusz, przed którym digest chroni) → wyklucz emisję.
+  if (
+    entry.governed_fields_digest &&
+    observedGovernedFieldsDigest &&
+    entry.governed_fields_digest !== observedGovernedFieldsDigest
+  ) {
+    return {
+      status: "governed_fields_drift",
+      missing_roles: [],
+      telemetry_excluded: true,
+    };
+  }
+
+  return { status: "approved", missing_roles: [], telemetry_excluded: false };
 }
 
 export function emitFlowKpiTelemetry(
@@ -251,21 +301,26 @@ export function emitFlowKpiTelemetry(
 
   const client = options.client ?? posthogClient ?? createPostHogClientFromEnv();
   const dedupeStore = options.dedupeStore ?? defaultDedupeStore;
+  const observedDigest =
+    options.governedFieldsDigest ?? sourceEvent.governed_fields_digest;
   const decision = classifyFlowApproval(
     sourceEvent.market,
     sourceEvent.flow_id,
     options.approvalLookup,
+    observedDigest,
   );
 
   const emitted: FlowKpiPostHogEvent[] = [];
   const skippedDuplicate: string[] = [];
+  const notEmitted: string[] = [];
 
   if (decision.telemetry_excluded) {
     const gated = buildGatedEvent(sourceEvent, decision, options.now?.() ?? new Date());
-    captureIfUnique(client, dedupeStore, gated, emitted, skippedDuplicate);
+    captureIfUnique(client, dedupeStore, gated, emitted, skippedDuplicate, notEmitted);
     return {
       emitted,
       skipped_duplicate: skippedDuplicate,
+      not_emitted: notEmitted,
       gated: true,
       flow_registry_status: decision.status,
       missing_roles: decision.missing_roles,
@@ -273,12 +328,13 @@ export function emitFlowKpiTelemetry(
   }
 
   for (const event of buildKpiEvents(sourceEvent)) {
-    captureIfUnique(client, dedupeStore, event, emitted, skippedDuplicate);
+    captureIfUnique(client, dedupeStore, event, emitted, skippedDuplicate, notEmitted);
   }
 
   return {
     emitted,
     skipped_duplicate: skippedDuplicate,
+    not_emitted: notEmitted,
     gated: false,
     flow_registry_status: decision.status,
     missing_roles: [],
@@ -319,7 +375,7 @@ export function evaluateNfr20Guard(
   }
 
   const status: Nfr20GuardStatus =
-    adjustedRegression > 0.05 ? "alert" : "pass";
+    adjustedRegression > NFR20_REGRESSION_THRESHOLD_FRACTION ? "alert" : "pass";
 
   return {
     market: rolling.market,
@@ -341,9 +397,15 @@ export function emitNfr20GuardResult(
   client: PostHogCaptureClient | null = posthogClient ?? createPostHogClientFromEnv(),
 ): boolean {
   if (!client || result.status !== "alert") return false;
+  const idempotencyKey = sha256Hex([
+    "flow-kpi-nfr20",
+    result.market,
+    result.adjusted_regression_pct,
+  ]);
   client.capture({
     distinctId: `market:${result.market}`,
     event: FLOW_KPI_NFR20_ALERT_EVENT_NAME,
+    uuid: deterministicEventUuid(idempotencyKey),
     properties: {
       market: result.market,
       flow_id: "__all_flows__",
@@ -358,9 +420,96 @@ export function emitNfr20GuardResult(
       sample_n: result.sample_n,
       sample_floor: result.sample_floor,
       window_days: 7,
+      $insert_id: idempotencyKey,
     },
   });
   return true;
+}
+
+// H1 (AC3): scheduler/cron hook — wykonuje guard NFR20 na oknie rolling 7d per
+// rynek i emituje alert tylko gdy status=alert. To realny konsument
+// `evaluateNfr20Guard`/`emitNfr20GuardResult` (cron job woła tę funkcję na danych
+// z baseline + rolling window store).
+export interface Nfr20GuardSweepInput {
+  baselines: Nfr20BaselineMarket[];
+  rollingWindows: Nfr20RollingMarketWindow[];
+  controls?: Nfr20ControlDelta[];
+}
+
+export interface Nfr20GuardSweepResult {
+  results: Nfr20GuardResult[];
+  alerts_emitted: number;
+}
+
+export function runNfr20GuardSweep(
+  input: Nfr20GuardSweepInput,
+  client: PostHogCaptureClient | null = posthogClient ?? createPostHogClientFromEnv(),
+): Nfr20GuardSweepResult {
+  const baselineByMarket = new Map(input.baselines.map((b) => [b.market, b]));
+  const controls = input.controls ?? deriveControlDeltas(input);
+  const results: Nfr20GuardResult[] = [];
+  let alertsEmitted = 0;
+
+  for (const rolling of input.rollingWindows) {
+    const baseline = baselineByMarket.get(rolling.market);
+    if (!baseline) continue;
+    // Rynki kontrolne nie alertują na własnym delcie — służą wyłącznie jako
+    // proxy sezonowości dla rynków produkcyjnych.
+    const marketControls = controls.filter((c) => c.market !== rolling.market);
+    const result = evaluateNfr20Guard(baseline, rolling, marketControls);
+    results.push(result);
+    if (emitNfr20GuardResult(result, client)) alertsEmitted += 1;
+  }
+
+  return { results, alerts_emitted: alertsEmitted };
+}
+
+function deriveControlDeltas(input: Nfr20GuardSweepInput): Nfr20ControlDelta[] {
+  const rollingByMarket = new Map(input.rollingWindows.map((r) => [r.market, r]));
+  const deltas: Nfr20ControlDelta[] = [];
+  for (const baseline of input.baselines) {
+    if (baseline.control_group !== true) continue;
+    const rolling = rollingByMarket.get(baseline.market);
+    if (!rolling) continue;
+    deltas.push({
+      market: baseline.market,
+      baseline_delivery_rate: baseline.delivery_rate,
+      rolling_delivery_rate: rate(rolling.delivered, rolling.sent),
+    });
+  }
+  return deltas;
+}
+
+// H1 (AC1): hook telemetryczny wstrzykiwany do messaging-gateway. Sprawia, że
+// `emitFlowKpiTelemetry` jest realnie wołany w lifecycle wysyłki/eventów (gateway
+// `send()` + `recordDeliveryEvent()`), a nie pozostaje martwym kodem biblioteki.
+// Trwały dedupeStore współdzielony per-proces; natywny dedup PostHog (uuid) chroni
+// cross-proces (M1).
+export interface FlowKpiTelemetryHook {
+  emit(sourceEvent: CommunicationKpiSourceEvent): FlowKpiEmissionResult;
+}
+
+export interface CreateFlowKpiTelemetryHookOptions {
+  approvalLookup?: FlowApprovalLookup;
+  client?: PostHogCaptureClient | null;
+  dedupeStore?: Set<string>;
+  now?: () => Date;
+}
+
+export function createFlowKpiTelemetryHook(
+  options: CreateFlowKpiTelemetryHookOptions = {},
+): FlowKpiTelemetryHook {
+  const dedupeStore = options.dedupeStore ?? new Set<string>();
+  return {
+    emit(sourceEvent: CommunicationKpiSourceEvent): FlowKpiEmissionResult {
+      return emitFlowKpiTelemetry(sourceEvent, {
+        client: options.client,
+        approvalLookup: options.approvalLookup,
+        dedupeStore,
+        now: options.now,
+      });
+    },
+  };
 }
 
 function buildKpiEvents(sourceEvent: CommunicationKpiSourceEvent): FlowKpiPostHogEvent[] {
@@ -430,13 +579,14 @@ function buildGatedEvent(
   decision: FlowApprovalDecision,
   now: Date,
 ): FlowKpiPostHogEvent {
-  const idempotencyKey = [
+  // I1: spójny format idempotency key z eventami KPI (sha256), zamiast plain join.
+  const idempotencyKey = sha256Hex([
     "flow-kpi-gated",
     sourceEvent.market,
     sourceEvent.flow_id,
     sourceEvent.event_id,
     decision.status,
-  ].join(":");
+  ]);
 
   return {
     distinctId: buildDistinctId(sourceEvent),
@@ -479,19 +629,45 @@ function captureIfUnique(
   event: FlowKpiPostHogEvent,
   emitted: FlowKpiPostHogEvent[],
   skippedDuplicate: string[],
+  notEmitted: string[],
 ): void {
   if (dedupeStore.has(event.idempotencyKey)) {
     skippedDuplicate.push(event.idempotencyKey);
     return;
   }
 
+  // L2: skanuj PII na FINALNYM obiekcie properties, który realnie trafia do PostHog,
+  // nie tylko na wejściowym (i nieemitowanym) bagu sourceEvent.properties.
+  assertPropertiesNoRawPii(event.properties);
+
+  // M2: brak klienta (graceful degradation, np. brak POSTHOG_API_KEY) NIE spala klucza
+  // dedup ani nie oznacza eventu jako wyemitowanego — po późniejszym skonfigurowaniu
+  // klienta to samo źródłowe zdarzenie zostanie wyemitowane (brak silent loss KPI).
+  if (!client) {
+    notEmitted.push(event.idempotencyKey);
+    return;
+  }
+
+  try {
+    client.capture({
+      distinctId: event.distinctId,
+      event: event.event,
+      // M1: natywny dedup PostHog po uuid (+ $insert_id) — odporne na restart/instancje.
+      uuid: deterministicEventUuid(event.idempotencyKey),
+      properties: {
+        ...event.properties,
+        $insert_id: event.idempotencyKey,
+      },
+    });
+  } catch {
+    // M2: wysyłka się nie powiodła → NIE oznaczaj jako skonsumowane (umożliw retry).
+    notEmitted.push(event.idempotencyKey);
+    return;
+  }
+
+  // Oznacz dopiero po udanej wysyłce.
   dedupeStore.add(event.idempotencyKey);
   emitted.push(event);
-  client?.capture({
-    distinctId: event.distinctId,
-    event: event.event,
-    properties: event.properties,
-  });
 }
 
 function buildDistinctId(sourceEvent: CommunicationKpiSourceEvent): string {
@@ -504,18 +680,31 @@ function buildIdempotencyKey(
   kpi: FlowKpiName,
   outcome: string,
 ): string {
-  return createHash("sha256")
-    .update(
-      [
-        "flow-kpi",
-        sourceEvent.idempotency_key ?? sourceEvent.event_id,
-        sourceEvent.market,
-        sourceEvent.flow_id,
-        kpi,
-        outcome,
-      ].join("|"),
-    )
-    .digest("hex");
+  return sha256Hex([
+    "flow-kpi",
+    sourceEvent.idempotency_key ?? sourceEvent.event_id,
+    sourceEvent.market,
+    sourceEvent.flow_id,
+    kpi,
+    outcome,
+  ]);
+}
+
+function sha256Hex(parts: (string | number)[]): string {
+  return createHash("sha256").update(parts.join("|")).digest("hex");
+}
+
+// M1: deterministyczny UUID (v8-style) wyprowadzony z idempotency key, by PostHog
+// natywnie deduplikował to samo źródłowe zdarzenie niezależnie od in-memory store.
+function deterministicEventUuid(idempotencyKey: string): string {
+  const hex = createHash("sha256").update(idempotencyKey).digest("hex");
+  return [
+    hex.slice(0, 8),
+    hex.slice(8, 12),
+    hex.slice(12, 16),
+    hex.slice(16, 20),
+    hex.slice(20, 32),
+  ].join("-");
 }
 
 function normalizeRecipientHash(value: string): string {
@@ -539,10 +728,27 @@ function assertNormalizedSource(sourceEvent: CommunicationKpiSourceEvent): void 
 }
 
 function assertNoRawPii(sourceEvent: CommunicationKpiSourceEvent): void {
-  const payload = JSON.stringify(sourceEvent.properties ?? {});
-  if (/@/.test(payload) || /\b\+?\d[\d\s.-]{7,}\d\b/.test(payload)) {
+  assertPropertiesNoRawPii(sourceEvent.properties ?? {});
+}
+
+function assertPropertiesNoRawPii(properties: Record<string, unknown>): void {
+  if (containsRawPii(JSON.stringify(properties))) {
     throw new Error("flow KPI telemetry properties must not contain raw PII");
   }
+}
+
+function containsRawPii(payload: string): boolean {
+  // L1/L2: zanim sprawdzisz wzorzec telefonu, usuń ze stringa tokeny strukturalne,
+  // które legalnie zawierają długie ciągi cyfr i dawałyby false-positive:
+  //  - zahashowane identyfikatory (`sha256:<hex>` oraz bare 64-hex) — L1,
+  //  - timestampy ISO-8601 (occurred_at itp.) — emitowane properties je zawierają (L2).
+  // E-mail (zawiera `@`, którego hash/timestamp nie ma) sprawdzamy na surowym tekście.
+  if (/@/.test(payload)) return true;
+  const sanitized = payload
+    .replace(/sha256:[a-f0-9]+/gi, "")
+    .replace(/\b[a-f0-9]{64}\b/gi, "")
+    .replace(/\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?)?/g, "");
+  return /\b\+?\d[\d\s.-]{7,}\d\b/.test(sanitized);
 }
 
 function rate(numerator: number, denominator: number): number {

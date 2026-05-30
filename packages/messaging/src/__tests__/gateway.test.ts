@@ -5,7 +5,14 @@ import {
   UnsupportedChannelError,
   UnsupportedProviderError,
 } from "../index";
-import type { IMessagingProvider, NotificationIntent } from "../index";
+import type {
+  CommunicationKpiSourceEvent,
+  FlowKpiEmissionResult,
+  FlowKpiTelemetryHook,
+  IMessagingProvider,
+  NotificationDeliveryEvent,
+  NotificationIntent,
+} from "../index";
 
 const fixedNow = new Date("2026-05-26T12:00:00.000Z");
 
@@ -52,6 +59,22 @@ function makeProvider(): IMessagingProvider {
       provider_message_id: "brevo-message-1",
       sent_at: fixedNow.toISOString(),
     }),
+  };
+}
+
+function makeRecordingHook(sink: CommunicationKpiSourceEvent[]): FlowKpiTelemetryHook {
+  return {
+    emit: (event: CommunicationKpiSourceEvent): FlowKpiEmissionResult => {
+      sink.push(event);
+      return {
+        emitted: [],
+        skipped_duplicate: [],
+        not_emitted: [],
+        gated: false,
+        flow_registry_status: "approved",
+        missing_roles: [],
+      };
+    },
   };
 }
 
@@ -407,6 +430,92 @@ describe("DefaultMessagingGateway", () => {
     );
 
     await expect(gateway.send(makeIntent())).rejects.toThrow("unexpected");
+  });
+
+  it("H1: emituje KPI source event (sent) w lifecycle send() przez wstrzyknięty hook", async () => {
+    const emitted: CommunicationKpiSourceEvent[] = [];
+    const hook = makeRecordingHook(emitted);
+    const provider = makeProvider();
+    const gateway = new DefaultMessagingGateway(
+      { brevo: provider },
+      "brevo",
+      () => fixedNow,
+      makeUuid(["audit-1"]),
+      undefined,
+      undefined,
+      hook,
+    );
+
+    await gateway.send(makeIntent());
+
+    expect(emitted).toHaveLength(1);
+    expect(emitted[0]).toMatchObject({
+      source: "delivery_audit_envelope",
+      event_type: "sent",
+      flow_id: "voucher_delivery_recipient",
+      market: "pl",
+      locale: "pl-PL",
+    });
+  });
+
+  it("H1: recordDeliveryEvent koreluje znormalizowane zdarzenie delivery → KPI", async () => {
+    const emitted: CommunicationKpiSourceEvent[] = [];
+    const hook = makeRecordingHook(emitted);
+    const provider = makeProvider();
+    const gateway = new DefaultMessagingGateway(
+      { brevo: provider },
+      "brevo",
+      () => fixedNow,
+      makeUuid(["audit-1"]),
+      undefined,
+      undefined,
+      hook,
+    );
+
+    await gateway.send(makeIntent());
+    const deliveryEvent: NotificationDeliveryEvent = {
+      dispatch_id: "provider-dispatch-1",
+      provider: "brevo",
+      event_type: "delivered",
+      occurred_at: fixedNow.toISOString(),
+      provider_event_id: "brevo-event-1",
+    };
+
+    const result = gateway.recordDeliveryEvent(deliveryEvent);
+
+    expect(result).not.toBeNull();
+    expect(emitted).toHaveLength(2);
+    expect(emitted[1]).toMatchObject({
+      source: "normalized_event_store",
+      event_type: "delivered",
+      flow_id: "voucher_delivery_recipient",
+      market: "pl",
+    });
+  });
+
+  it("H1: recordDeliveryEvent degraduje kontrolowanie przy nieznanej korelacji (zwraca null)", () => {
+    const emitted: CommunicationKpiSourceEvent[] = [];
+    const hook = makeRecordingHook(emitted);
+    const gateway = new DefaultMessagingGateway(
+      { brevo: makeProvider() },
+      "brevo",
+      () => fixedNow,
+      makeUuid(["audit-1"]),
+      undefined,
+      undefined,
+      hook,
+    );
+
+    const result = gateway.recordDeliveryEvent({
+      dispatch_id: "never-seen",
+      provider: "brevo",
+      event_type: "delivered",
+      occurred_at: fixedNow.toISOString(),
+      provider_event_id: "evt-x",
+    });
+
+    expect(result).toBeNull();
+    expect(emitted).toHaveLength(0);
   });
 
   it("rzuca UnsupportedProviderError z audit envelope dla nieznanego providera", async () => {

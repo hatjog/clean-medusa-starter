@@ -6,10 +6,17 @@ import {
   UnsupportedChannelError,
   UnsupportedProviderError,
 } from "./errors";
+import type {
+  CommunicationKpiSourceEvent,
+  CommunicationKpiSourceEventType,
+  FlowKpiTelemetryHook,
+} from "./flow-kpi-telemetry";
 import type { IMessagingProvider } from "./provider";
 import type {
   AuditEnvelope,
   Channel,
+  NotificationDeliveryEvent,
+  NotificationDeliveryEventType,
   NotificationDispatch,
   NotificationDispatchStatus,
   NotificationIntent,
@@ -20,8 +27,23 @@ export interface MessagingGateway {
   send(intent: NotificationIntent): Promise<NotificationDispatch>;
 }
 
+// H1: kontekst korelacji dispatch → KPI (flow_id/market/locale/recipient_hash),
+// uchwycony przy send() i odtwarzany przy normalizowanym zdarzeniu delivery/engagement.
+export interface DispatchKpiContext {
+  flow_id: string;
+  market: string;
+  locale: string;
+  recipient_hash?: string;
+  dispatch_time?: string;
+}
+
 interface CachedDispatch {
   dispatch: NotificationDispatch;
+  expires_at_ms: number;
+}
+
+interface CachedDispatchContext {
+  context: DispatchKpiContext;
   expires_at_ms: number;
 }
 
@@ -39,6 +61,10 @@ export type MessagingProviderRegistry =
 
 export class DefaultMessagingGateway implements MessagingGateway {
   private readonly idempotencyCache = new Map<string, CachedDispatch>();
+  // H1: bounded korelacja dispatch_id → kontekst flow, by recordDeliveryEvent()
+  // mógł zbudować KPI dla zdarzeń webhooka (delivered/clicked/unsubscribed),
+  // które niosą tylko dispatch_id. LRU/TTL współdzieli granicę z idempotencyCache.
+  private readonly dispatchContext = new Map<string, CachedDispatchContext>();
   // F-12: Map storage zamiast Object — żaden prototypowy klucz (`__proto__`, `constructor`)
   // nie pollutuje lookup; klucze pochodzą wprost z rejestracji providerów.
   private readonly providers: Map<string, IMessagingProvider>;
@@ -50,6 +76,10 @@ export class DefaultMessagingGateway implements MessagingGateway {
     private readonly uuid: () => string = () => randomUUID(),
     private readonly idempotencyTtlMs: number = DEFAULT_TTL_MS,
     private readonly maxCacheSize: number = DEFAULT_MAX_CACHE_SIZE,
+    // H1: opcjonalny hook telemetryczny KPI. Gdy wstrzyknięty (loader Medusa wiąże
+    // go przez createFlowKpiTelemetryHook z approvalLookup z 5-8), gateway realnie
+    // emituje KPI w lifecycle wysyłki — emitter nie jest martwym kodem biblioteki.
+    private readonly flowKpiTelemetry?: FlowKpiTelemetryHook,
   ) {
     this.providers =
       providers instanceof Map
@@ -106,6 +136,8 @@ export class DefaultMessagingGateway implements MessagingGateway {
       };
 
       this.cacheDispatch(cacheKey, dispatch);
+      this.rememberDispatchContext(dispatch);
+      this.emitDispatchKpi(dispatch);
 
       return dispatch;
     } catch (error) {
@@ -248,6 +280,94 @@ export class DefaultMessagingGateway implements MessagingGateway {
     }
   }
 
+  // H1 (AC1): realny konsument znormalizowanego strumienia delivery/engagement
+  // (Story 5.5). Wołany przez subscriber webhooka Brevo po normalizacji zdarzenia;
+  // mapuje typ zdarzenia → KPI source event i emituje przez hook telemetryczny.
+  // Brak korelacji (nieznany dispatch_id, brak kontekstu) → kontrolowana degradacja
+  // (zwraca null, nie crashuje) zamiast cichego liczenia bez flow_id.
+  recordDeliveryEvent(
+    event: NotificationDeliveryEvent,
+    context?: DispatchKpiContext,
+  ): ReturnType<FlowKpiTelemetryHook["emit"]> | null {
+    if (!this.flowKpiTelemetry) return null;
+
+    const kpiType = mapDeliveryEventType(event.event_type);
+    if (!kpiType) return null;
+
+    const resolved = context ?? this.getDispatchContext(event.dispatch_id);
+    if (!resolved) return null;
+
+    const sourceEvent: CommunicationKpiSourceEvent = {
+      source: "normalized_event_store",
+      event_id: event.provider_event_id,
+      event_type: kpiType,
+      occurred_at: event.occurred_at,
+      flow_id: resolved.flow_id,
+      market: resolved.market,
+      locale: resolved.locale,
+      recipient_hash: resolved.recipient_hash,
+      dispatch_time: resolved.dispatch_time,
+      provider_timestamp: event.occurred_at,
+      idempotency_key: `${event.dispatch_id}:${event.provider_event_id}`,
+      provider: event.provider,
+    };
+
+    return this.flowKpiTelemetry.emit(sourceEvent);
+  }
+
+  private emitDispatchKpi(dispatch: NotificationDispatch): void {
+    if (!this.flowKpiTelemetry) return;
+    const kpiType = mapDispatchStatus(dispatch.status);
+    if (!kpiType) return;
+
+    const audit = dispatch.audit_event;
+    const sourceEvent: CommunicationKpiSourceEvent = {
+      source: "delivery_audit_envelope",
+      event_id: audit.dispatch_id,
+      event_type: kpiType,
+      occurred_at: audit.occurred_at,
+      flow_id: audit.flow_id,
+      market: audit.market_id,
+      locale: audit.locale,
+      recipient_hash: audit.hashed_recipient,
+      dispatch_time: dispatch.sent_at ?? audit.occurred_at,
+      provider_timestamp: dispatch.sent_at ?? audit.occurred_at,
+      idempotency_key: audit.idempotency_key,
+      provider: audit.provider,
+    };
+
+    this.flowKpiTelemetry.emit(sourceEvent);
+  }
+
+  private rememberDispatchContext(dispatch: NotificationDispatch): void {
+    const audit = dispatch.audit_event;
+    while (this.dispatchContext.size >= this.maxCacheSize) {
+      const oldestKey = this.dispatchContext.keys().next().value;
+      if (oldestKey === undefined) break;
+      this.dispatchContext.delete(oldestKey);
+    }
+    this.dispatchContext.set(dispatch.dispatch_id, {
+      context: {
+        flow_id: audit.flow_id,
+        market: audit.market_id,
+        locale: audit.locale,
+        recipient_hash: audit.hashed_recipient,
+        dispatch_time: dispatch.sent_at ?? audit.occurred_at,
+      },
+      expires_at_ms: this.clock().getTime() + this.idempotencyTtlMs,
+    });
+  }
+
+  private getDispatchContext(dispatchId: string): DispatchKpiContext | undefined {
+    const cached = this.dispatchContext.get(dispatchId);
+    if (!cached) return undefined;
+    if (cached.expires_at_ms <= this.clock().getTime()) {
+      this.dispatchContext.delete(dispatchId);
+      return undefined;
+    }
+    return cached.context;
+  }
+
   private createAuditEvent(input: {
     intent: NotificationIntent;
     provider: NotificationProvider;
@@ -286,6 +406,40 @@ function buildCacheKey(intent: NotificationIntent): string {
     intent.channel,
     intent.idempotency_key,
   ].join("|");
+}
+
+// H1: dispatch lifecycle → KPI source event_type. queued/sent zasilają denominator
+// delivered_rate (sent); delivered zasila delivered + opt_out denominator +
+// time_to_delivery. failed nie emituje KPI (brak dostarczenia).
+function mapDispatchStatus(
+  status: NotificationDispatchStatus,
+): CommunicationKpiSourceEventType | null {
+  switch (status) {
+    case "queued":
+    case "sent":
+      return "sent";
+    case "delivered":
+      return "delivered";
+    default:
+      return null;
+  }
+}
+
+// H1: znormalizowane zdarzenie engagement (webhook) → KPI source event_type.
+// opened/bounced/spam nie mapują się na żaden z 5 KPI w v1.10.0.
+function mapDeliveryEventType(
+  type: NotificationDeliveryEventType,
+): CommunicationKpiSourceEventType | null {
+  switch (type) {
+    case "delivered":
+      return "delivered";
+    case "clicked":
+      return "clicked";
+    case "unsubscribed":
+      return "unsubscribed";
+    default:
+      return null;
+  }
 }
 
 function hashRecipient(intent: NotificationIntent): string {

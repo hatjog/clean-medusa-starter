@@ -16,6 +16,7 @@ interface CapturedCall {
   distinctId: string;
   event: string;
   properties: Record<string, unknown>;
+  uuid?: string;
 }
 
 const approvedEntry: FlowApprovalEntry = {
@@ -215,6 +216,129 @@ describe("flow KPI PostHog emission", () => {
         },
       ),
     ).toThrow("normalized event-store");
+  });
+});
+
+describe("flow KPI M3 governed_fields_digest + lifecycle gate", () => {
+  beforeEach(() => {
+    __resetFlowKpiTelemetryForTests();
+  });
+
+  const approvedWithDigest: FlowApprovalEntry = {
+    ...approvedEntry,
+    governed_fields_digest: "a".repeat(64),
+  };
+
+  it("emituje KPI gdy obserwowany digest zgadza się z kontraktem 5-8", () => {
+    const stub = makePostHogStub();
+    const result = emitFlowKpiTelemetry(sourceEvent(), {
+      client: stub.client,
+      approvalLookup: () => approvedWithDigest,
+      governedFieldsDigest: "a".repeat(64),
+    });
+
+    expect(result.gated).toBe(false);
+    expect(result.flow_registry_status).toBe("approved");
+    expect(result.emitted.length).toBeGreaterThan(0);
+  });
+
+  it("wyklucza emisję (governed_fields_drift) gdy obserwowany digest nie zgadza się z zatwierdzonym", () => {
+    const stub = makePostHogStub();
+    const result = emitFlowKpiTelemetry(
+      sourceEvent({ governed_fields_digest: "b".repeat(64) }),
+      {
+        client: stub.client,
+        approvalLookup: () => approvedWithDigest,
+      },
+    );
+
+    expect(result.gated).toBe(true);
+    expect(result.flow_registry_status).toBe("governed_fields_drift");
+    expect(stub.calls).toHaveLength(1);
+    expect(stub.calls[0].event).toBe(FLOW_KPI_GATED_EVENT_NAME);
+    expect(stub.calls[0].properties.flow_registry_status).toBe("governed_fields_drift");
+  });
+
+  it("wyklucza emisję dla flow rolled_back mimo 5-role green", () => {
+    const stub = makePostHogStub();
+    const result = emitFlowKpiTelemetry(sourceEvent(), {
+      client: stub.client,
+      approvalLookup: () => ({ ...approvedWithDigest, lifecycle_state: "rolled_back" }),
+    });
+
+    expect(result.gated).toBe(true);
+    expect(result.flow_registry_status).toBe("rolled_back");
+    expect(stub.calls[0].properties.telemetry_excluded).toBe(true);
+  });
+});
+
+describe("flow KPI M1/M2 dedup i graceful degradation", () => {
+  beforeEach(() => {
+    __resetFlowKpiTelemetryForTests();
+  });
+
+  it("M1: przekazuje deterministyczny uuid do capture dla natywnego dedup PostHog", () => {
+    const stub = makePostHogStub();
+    emitFlowKpiTelemetry(sourceEvent({ event_type: "clicked" }), {
+      client: stub.client,
+      approvalLookup: () => approvedEntry,
+    });
+
+    expect(stub.calls).toHaveLength(1);
+    expect(stub.calls[0].uuid).toMatch(
+      /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/,
+    );
+    expect(stub.calls[0].properties.$insert_id).toEqual(
+      stub.calls[0].properties.idempotency_key,
+    );
+  });
+
+  it("M2: brak klienta NIE spala dedup — po skonfigurowaniu klienta KPI są emitowane", () => {
+    const dedupeStore = new Set<string>();
+
+    const noClient = emitFlowKpiTelemetry(sourceEvent({ event_type: "clicked" }), {
+      client: null,
+      approvalLookup: () => approvedEntry,
+      dedupeStore,
+    });
+    expect(noClient.emitted).toHaveLength(0);
+    expect(noClient.not_emitted).toHaveLength(1);
+    expect(dedupeStore.size).toBe(0);
+
+    const stub = makePostHogStub();
+    const withClient = emitFlowKpiTelemetry(sourceEvent({ event_type: "clicked" }), {
+      client: stub.client,
+      approvalLookup: () => approvedEntry,
+      dedupeStore,
+    });
+    expect(withClient.emitted).toHaveLength(1);
+    expect(stub.calls).toHaveLength(1);
+  });
+
+  it("M2: błąd capture NIE oznacza klucza jako skonsumowanego (retry możliwy)", () => {
+    const dedupeStore = new Set<string>();
+    const throwingClient: PostHogCaptureClient = {
+      capture: () => {
+        throw new Error("posthog down");
+      },
+    };
+
+    const failed = emitFlowKpiTelemetry(sourceEvent({ event_type: "clicked" }), {
+      client: throwingClient,
+      approvalLookup: () => approvedEntry,
+      dedupeStore,
+    });
+    expect(failed.emitted).toHaveLength(0);
+    expect(failed.not_emitted).toHaveLength(1);
+    expect(dedupeStore.size).toBe(0);
+
+    const stub = makePostHogStub();
+    const retried = emitFlowKpiTelemetry(sourceEvent({ event_type: "clicked" }), {
+      client: stub.client,
+      approvalLookup: () => approvedEntry,
+      dedupeStore,
+    });
+    expect(retried.emitted).toHaveLength(1);
   });
 });
 
