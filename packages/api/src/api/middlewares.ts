@@ -13,6 +13,12 @@ import {
 } from "@medusajs/framework/utils";
 import { vendorMetaMiddleware } from "./store/products/vendor-meta-middleware";
 import {
+  BREVO_PROVIDER_ROUTE_MATCHER,
+  brevoHmacValidatorMiddleware,
+  brevoWebhookCircuitBreakerMiddleware,
+  brevoWebhookRateLimitMiddleware,
+} from "./middlewares/brevo-hmac-validator";
+import {
   CUSTOMER_MARKET_FORBIDDEN_MESSAGE,
   isScopedToMarket,
   mergeCustomerMarketMetadata,
@@ -40,6 +46,7 @@ type PublishableApiKeyRecord = {
 type AuthContext = {
   auth_identity_id?: string;
   actor_id?: string;
+  actor_type?: string;
 };
 
 type RequestExtensions = {
@@ -747,16 +754,15 @@ export default defineMiddlewares({
       method: ["POST"],
       matcher: "/webhooks/stripe",
     },
-    // v1.7.0 B6-WEBHOOK-IMPL: Brevo transactional callback receiver.
-    // Brevo bearer token verification (Authorization: Bearer ...); body parses
-    // as JSON via default Medusa parser — Brevo does not require raw-body HMAC
-    // (shared-secret-in-header is the canonical Brevo verified_callback pattern).
-    // Route is outside /store/* so it bypasses marketGuardMiddleware
-    // (Brevo callbacks do not carry x-publishable-api-key).
-    // See specs/operator/brevo-webhook-runbook.md for deployment guide.
     {
       method: ["POST"],
-      matcher: "/webhooks/brevo",
+      matcher: BREVO_PROVIDER_ROUTE_MATCHER,
+      bodyParser: { preserveRawBody: true },
+      middlewares: [
+        brevoWebhookRateLimitMiddleware,
+        brevoWebhookCircuitBreakerMiddleware,
+        brevoHmacValidatorMiddleware,
+      ],
     },
     {
       method: ["GET"],
@@ -772,6 +778,11 @@ export default defineMiddlewares({
       method: ["POST"],
       matcher: "/store/account/magic-links/revoke-all",
       middlewares: [authenticate("customer", ["session", "bearer"])],
+    },
+    {
+      method: ["POST"],
+      matcher: "/vendor/magic-links/:jti/revoke",
+      middlewares: [authenticate("seller", ["bearer"])],
     },
     {
       method: ["POST"],

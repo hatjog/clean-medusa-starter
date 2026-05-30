@@ -41,12 +41,14 @@
     "test:patches": "TEST_TYPE=patches NODE_OPTIONS=--experimental-vm-modules jest --silent=false --runInBand --forceExit"
   },
   "dependencies": {
+    "@gp/messaging": "workspace:*",
     "@medusajs/admin-sdk": "2.14.2",
     "@medusajs/cli": "2.14.2",
     "@medusajs/framework": "2.14.2",
     "@medusajs/icons": "2.14.2",
     "@medusajs/medusa": "2.14.2",
     "@medusajs/ui": "4.0.25",
+    "@gp/wallet": "workspace:*",
     "@mercurjs/cli": "2.1.1",
     "@mercurjs/core": "2.1.1",
     "@mercurjs/types": "2.1.1",

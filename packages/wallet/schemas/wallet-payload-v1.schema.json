@@ -1,0 +1,133 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://growplatform.local/schemas/wallet/wallet-payload-v1.schema.json",
+  "title": "GP WalletPayload v1",
+  "description": "Schemat zminimalizowanego payloadu wallet pass. Pola recipient/buyer/customer PII sa zabronione; unknown fields fail-closed przez additionalProperties=false.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "entitlement_instance_id",
+    "code",
+    "title",
+    "status",
+    "expires_at",
+    "salon_name",
+    "salon_address",
+    "deep_link",
+    "barcode_spec",
+    "branding",
+    "locale"
+  ],
+  "properties": {
+    "entitlement_instance_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Techniczny identyfikator L4 entitlement_instance; nie jest wysylany jako PII do providera."
+    },
+    "code": {
+      "type": "string",
+      "minLength": 1
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1
+    },
+    "status": {
+      "type": "string",
+      "enum": ["ACTIVE", "EXPIRED", "REVOKED", "REFUNDED"]
+    },
+    "expires_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "salon_name": {
+      "type": "string",
+      "minLength": 1
+    },
+    "salon_address": {
+      "type": "string",
+      "minLength": 1
+    },
+    "deep_link": {
+      "type": "string",
+      "minLength": 1
+    },
+    "barcode_spec": {
+      "$ref": "#/$defs/barcode_spec"
+    },
+    "qr_code": {
+      "type": "string",
+      "minLength": 1
+    },
+    "barcode": {
+      "$ref": "#/$defs/barcode_spec"
+    },
+    "branding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["logo_url", "primary_color", "accent_color"],
+      "properties": {
+        "logo_url": {
+          "type": "string",
+          "minLength": 1
+        },
+        "primary_color": {
+          "type": "string",
+          "pattern": "^#[0-9A-Fa-f]{6}$"
+        },
+        "accent_color": {
+          "type": "string",
+          "pattern": "^#[0-9A-Fa-f]{6}$"
+        }
+      }
+    },
+    "locale": {
+      "type": "string",
+      "enum": ["pl-PL", "en-US", "uk-UA", "de-DE"]
+    }
+  },
+  "$defs": {
+    "barcode_spec": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["format", "value"],
+      "properties": {
+        "format": {
+          "type": "string",
+          "enum": ["QR", "PDF417"]
+        },
+        "value": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    }
+  },
+  "x-gp-forbidden-fields": [
+    "recipient_email",
+    "recipient_full_name",
+    "recipient_name",
+    "recipient_phone",
+    "recipient_address",
+    "buyer_email",
+    "buyer_full_name",
+    "buyer_phone",
+    "buyer_address",
+    "buyer_anna_pii",
+    "customer_email",
+    "customer_phone",
+    "ip_address",
+    "device_fingerprint"
+  ],
+  "x-gp-provider-facing-fields": [
+    "code",
+    "title",
+    "status",
+    "expires_at",
+    "salon_name",
+    "salon_address",
+    "deep_link",
+    "qr_code",
+    "branding"
+  ]
+}

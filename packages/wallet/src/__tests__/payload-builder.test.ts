@@ -1,4 +1,5 @@
 import {
+  assertWalletPayloadSchema,
   DefaultWalletPayloadBuilder,
   WalletPayloadError,
   type EntitlementInstance,
@@ -18,6 +19,8 @@ const fullEntitlement: EntitlementInstance = {
   },
   status: "ACTIVE",
   expires_at: new Date("2026-12-31T23:59:59.000Z"),
+  salon_name: "BonBeauty Warszawa Mokotów",
+  salon_address: "ul. Puławska 123, Warszawa",
   deep_link: "https://bonbeauty.example/pl/vouchers/BB-2026-0001",
   barcode_spec: { format: "PDF417", value: "PDF417-BB-2026-0001" },
   branding: {
@@ -41,6 +44,8 @@ describe("DefaultWalletPayloadBuilder", () => {
       entitlement_type: "voucher",
       status: "ACTIVE",
       expires_at: "2026-12-31T23:59:59.000Z",
+      salon_name: "BonBeauty Warszawa Mokotów",
+      salon_address: "ul. Puławska 123, Warszawa",
       deep_link: "https://bonbeauty.example/pl/vouchers/BB-2026-0001",
       barcode_spec: { format: "PDF417", value: "PDF417-BB-2026-0001" },
       qr_code: undefined,
@@ -73,6 +78,8 @@ describe("DefaultWalletPayloadBuilder", () => {
       title: { "pl-PL": "Bon podarunkowy" },
       status: "ACTIVE",
       expires_at: "2026-12-01",
+      salon_name: "BonBeauty Warszawa Centrum",
+      salon_address: "ul. Marszałkowska 10, Warszawa",
       deep_link: "https://bonbeauty.example/pl/vouchers/BB-2026-0002",
     }
 
@@ -142,6 +149,8 @@ describe("DefaultWalletPayloadBuilder", () => {
         wallet: {
           code: "META-CODE",
           title: { "en-US": "Metadata title", "pl-PL": "Tytuł metadata" },
+          salon_name: "BonBeauty Metadata",
+          salon_address: "ul. Metadanych 1, Warszawa",
           deep_link: "https://bonbeauty.example/en/vouchers/META-CODE",
           barcode_spec: { format: "QR", value: "META-CODE" },
           branding: { accent_color: "#0000FF" },
@@ -154,6 +163,8 @@ describe("DefaultWalletPayloadBuilder", () => {
     expect(payload).toMatchObject({
       code: "META-CODE",
       title: "Metadata title",
+      salon_name: "BonBeauty Metadata",
+      salon_address: "ul. Metadanych 1, Warszawa",
       deep_link: "https://bonbeauty.example/en/vouchers/META-CODE",
       barcode_spec: { format: "QR", value: "META-CODE" },
       branding: { accent_color: "#0000FF" },
@@ -172,7 +183,7 @@ describe("DefaultWalletPayloadBuilder", () => {
   })
 
   it("never accesses L3/L2/L1 methods on the injected dependency (invariant D-V180-ARCH-6)", async () => {
-    // Proxy traps any non-L4 method access. Layer 4 contract = `getById` only.
+    // Proxy blokuje kazdy dostep poza L4. Kontrakt Layer 4 = tylko `getById`.
     const allowed = new Set(["getById", "then"])
     const accessed: string[] = []
     const readModel = new Proxy(
@@ -197,7 +208,7 @@ describe("DefaultWalletPayloadBuilder", () => {
 
     expect(payload.entitlement_instance_id).toBe("ei_123")
     expect(accessed.filter((p) => !allowed.has(p))).toEqual([])
-    // Explicitly confirm builder did NOT try common L3 repository names.
+    // Jawnie potwierdzamy, ze builder NIE probowal typowych nazw repozytorium L3.
     const forbidden = [
       "find",
       "findOne",
@@ -225,11 +236,37 @@ describe("DefaultWalletPayloadBuilder", () => {
     } satisfies Partial<WalletPayloadError>)
   })
 
+  it("validates generated payload against the WalletPayload schema in test mode", () => {
+    const builder = new DefaultWalletPayloadBuilder()
+
+    const payload = builder.build(fullEntitlement, "pl-PL")
+
+    expect(() => assertWalletPayloadSchema(payload)).not.toThrow()
+  })
+
+  it.each([
+    [{ recipient_email: "ania@example.test" }, "WALLET_PAYLOAD_UNKNOWN_FIELD"],
+    [{ foo: "bar" }, "WALLET_PAYLOAD_UNKNOWN_FIELD"],
+    [{ code: undefined }, "WALLET_PAYLOAD_REQUIRED_FIELD_MISSING"],
+  ])("rejects schema violation %s", (patch, expectedCode) => {
+    const builder = new DefaultWalletPayloadBuilder()
+    const payload = { ...builder.build(fullEntitlement, "pl-PL"), ...patch }
+
+    expect(() => assertWalletPayloadSchema(payload)).toThrow(
+      expect.objectContaining({
+        name: "WalletPayloadError",
+        code: expectedCode,
+      })
+    )
+  })
+
   it.each([
     [{ code: "" }, "CODE_MISSING"],
     [{ title: {} }, "TITLE_MISSING"],
     [{ status: undefined, state: "DISPUTED" }, "STATUS_UNSUPPORTED"],
     [{ expires_at: "not-a-date" }, "EXPIRES_AT_INVALID"],
+    [{ salon_name: "" }, "SALON_NAME_MISSING"],
+    [{ salon_address: "" }, "SALON_ADDRESS_MISSING"],
     [{ deep_link: "" }, "DEEP_LINK_MISSING"],
     [{ barcode_spec: { format: "AZTEC", value: "x" } }, "BARCODE_FORMAT_UNSUPPORTED"],
   ])("throws %s for invalid projection", (patch, expectedCode) => {

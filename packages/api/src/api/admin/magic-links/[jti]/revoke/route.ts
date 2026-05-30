@@ -54,6 +54,7 @@ export async function POST(
     token_jti: jti,
     reason: "admin_revoke",
     revoked_by: adminUserId,
+    actor_type: "admin",
   })
 
   res.status(200).json({ success: true })

@@ -30,10 +30,17 @@ Po globalnym chainie dokładane są middleware specyficzne dla wybranych ścież
 |---|---|---|
 | `/store/payment-collections/:id/payment-sessions/stripe/refresh` `POST` | `authenticate("customer", ["session", "bearer"])` | Mutacyjna ścieżka retry płatności; wymaga właściciela zamówienia zanim route atomowo utworzy nową próbę płatności. |
 | `/store/account/magic-links/revoke-all` `POST` | `authenticate("customer", ["session", "bearer"])` | Customer self-service revocation; global `/store/*` chain nadal dostarcza market/RLS context, a auth dostarcza `customer_id` do idempotentnego revoke-all. |
+| `/vendor/magic-links/:jti/revoke` `POST` | `authenticate("seller", ["bearer"])` | Vendor self-service magic-link revoke; handler dodatkowo wymusza `auth_context.actor_type === "seller"` i JTI-scoped seller validation. |
 | `/store/customers` `POST` | `customerRegistrationMarketGuardMiddleware` -> `customerScopedCustomerCreateMiddleware` -> `customerResponseSanitizerMiddleware` | Pilnuje zgodności auth identity z marketem, scopinguje email/metadata przy tworzeniu customera i usuwa prefix email z odpowiedzi. |
 | `/store/customers/me*` `ALL` | `customerResponseSanitizerMiddleware` | Usuwa `{market_id}::` z pól email przed wysłaniem payloadu do klienta. |
 | `/store/orders*` `ALL` | `customerResponseSanitizerMiddleware` | Ten sam cel co wyżej dla odpowiedzi order/customer. |
 | `/store/carts*` `ALL` | `cartMarketGuardMiddleware` -> `customerResponseSanitizerMiddleware` | Domyka read-path cartów po `sales_channel_id` i dalej sanitizuje payload customer-related. |
+
+## Webhook security overlays
+
+| Matcher | Middleware | Cel |
+|---|---|---|
+| `/hooks/notifications/brevo*` `POST` | `bodyParser.preserveRawBody` + `brevoWebhookRateLimitMiddleware` -> `brevoWebhookCircuitBreakerMiddleware` -> `brevoHmacValidatorMiddleware` | Medusa-native Brevo notification provider prefix. Chroni Path Y delivery ingestion przed DoS i fail-closed odrzuca requesty bez valid `X-Mailin-Custom-Signature`, emitując audit envelope bez raw body/PII. |
 
 ## Powiązane auth routes
 
@@ -68,6 +75,7 @@ GP backend API is organized into four route groups with distinct auth and middle
 |-------|--------|------|--------------|
 | public | `/v1/health`, `/status` | None | — |
 | storefront | `/store/*` | Publishable key | marketContext → marketGuard → customerMarketGuard (see above) |
+| vendor | `/vendor/magic-links/:jti/revoke` | JWT bearer seller auth | `authenticate("seller", ["bearer"])` + handler guard (Story 6.3: 3/min/JTI rate limit, audit envelope) |
 | vendor | `/vendor/*` | Mercur seller auth | Native Mercur (no GP middleware) |
 | admin | `/admin/*` | Medusa admin auth | Native Medusa (no GP middleware) |
 | operator | `/api/v1/admin/*` | Medusa admin auth | `operatorAuthMiddleware` — verifies `actor_type="user"`, 401/403 fail-closed |

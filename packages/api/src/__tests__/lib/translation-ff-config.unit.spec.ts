@@ -79,13 +79,14 @@ describe("translation FF config", () => {
     ).toThrow(/Unsupported translation rollback command/)
   })
 
-  it("mapuje story label collection na techniczny ProductCollection entity type", () => {
+  it("mapuje story label collection oraz seller na techniczne entity types", () => {
     expect(TRANSLATION_ENTITY_SETTINGS.map((setting) => setting.story_label)).toEqual([
       "product",
       "product_category",
       "product_type",
       "product_variant",
       "collection",
+      "seller",
     ])
 
     expect(
@@ -93,5 +94,13 @@ describe("translation FF config", () => {
         (setting) => setting.story_label === "collection"
       )?.entity_type
     ).toBe("product_collection")
+
+    expect(
+      TRANSLATION_ENTITY_SETTINGS.find((setting) => setting.story_label === "seller")
+    ).toEqual({
+      story_label: "seller",
+      entity_type: "seller",
+      fields: ["name", "description"],
+    })
   })
 })

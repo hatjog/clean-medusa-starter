@@ -79,6 +79,7 @@ describe("POST /admin/magic-links/:jti/revoke", () => {
       token_jti: VALID_JTI,
       reason: "admin_revoke",
       revoked_by: "admin_1",
+      actor_type: "admin",
     })
   })
 })

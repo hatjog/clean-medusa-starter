@@ -1,5 +1,5 @@
 diff --git a/.medusa/server/src/api/store/products/middlewares.js b/.medusa/server/src/api/store/products/middlewares.js
-index 16832022edcf42233f25a1a49251775a359d8d28..b68668b808d198d2585c013d46caed32a02526a0 100644
+index 16832022edcf42233f25a1a49251775a359d8d28..b92dbf9530744fb51034c92821e47d2f63d2c042 100644
 --- a/.medusa/server/src/api/store/products/middlewares.js
 +++ b/.medusa/server/src/api/store/products/middlewares.js
 @@ -2,20 +2,61 @@
@@ -80,3 +80,48 @@ index 16832022edcf42233f25a1a49251775a359d8d28..b68668b808d198d2585c013d46caed32
  ];
 \ No newline at end of file
 -//# sourceMappingURL=data:application/json;base64,eyJ2ZXJzaW9uIjozLCJmaWxlIjoibWlkZGxld2FyZXMuanMiLCJzb3VyY2VSb290IjoiIiwic291cmNlcyI6WyIuLi8uLi8uLi8uLi8uLi8uLi9zcmMvYXBpL3N0b3JlL3Byb2R1Y3RzL21pZGRsZXdhcmVzLnRzIl0sIm5hbWVzIjpbXSwibWFwcGluZ3MiOiI7OztBQU1BLDJDQUE4QztBQUU5Qzs7Ozs7R0FLRztBQUNILFNBQVMsMkJBQTJCLENBQ2xDLEdBQWtCLEVBQ2xCLElBQW9CLEVBQ3BCLElBQXdCO0lBRXhCLE1BQU0sR0FBRyxHQUFHLElBQUksSUFBSSxFQUFFLENBQUE7SUFFdEIsTUFBTSxnQkFBZ0IsR0FBRyxDQUFDLEdBQUcsQ0FBQyxnQkFBZ0IsS0FBSyxFQUdsRCxDQUFDLENBQUE7SUFFRixNQUFNLFlBQVksR0FBRyxDQUFDLGdCQUFnQixDQUFDLE1BQU0sS0FBSyxFQUFFLENBQXdCLENBQUE7SUFDNUUsWUFBWSxDQUFDLE1BQU0sR0FBRyxvQkFBWSxDQUFDLElBQUksQ0FBQTtJQUV2QyxNQUFNLFNBQVMsR0FBRyxDQUFDLFlBQVksQ0FBQyxJQUFJLEtBQUssRUFBRSxDQUFVLENBQUE7SUFDckQsU0FBUyxDQUFDLElBQUksQ0FDWixFQUFFLEdBQUcsRUFBRSxDQUFDLEVBQUUsV0FBVyxFQUFFLElBQUksRUFBRSxFQUFFLEVBQUUsV0FBVyxFQUFFLEVBQUUsR0FBRyxFQUFFLEdBQUcsRUFBRSxFQUFFLENBQUMsRUFBRSxFQUMvRCxFQUFFLEdBQUcsRUFBRSxDQUFDLEVBQUUsU0FBUyxFQUFFLElBQUksRUFBRSxFQUFFLEVBQUUsU0FBUyxFQUFFLEVBQUUsR0FBRyxFQUFFLEdBQUcsRUFBRSxFQUFFLENBQUMsRUFBRSxDQUM1RCxDQUFBO0lBRUQsSUFBSSxFQUFFLENBQUE7QUFDUixDQUFDO0FBRVksUUFBQSx3QkFBd0IsR0FBc0I7SUFDekQ7UUFDRSxNQUFNLEVBQUUsQ0FBQyxLQUFLLENBQUM7UUFDZixPQUFPLEVBQUUsaUJBQWlCO1FBQzFCLFdBQVcsRUFBRSxDQUFDLDJCQUEyQixDQUFDO0tBQzNDO0lBQ0Q7UUFDRSxNQUFNLEVBQUUsQ0FBQyxLQUFLLENBQUM7UUFDZixPQUFPLEVBQUUscUJBQXFCO1FBQzlCLFdBQVcsRUFBRSxDQUFDLDJCQUEyQixDQUFDO0tBQzNDO0NBQ0YsQ0FBQSJ9
+\ No newline at end of file
+diff --git a/.medusa/server/src/api/store/sellers/[id]/route.js b/.medusa/server/src/api/store/sellers/[id]/route.js
+index 30044f1badda5f46ad4b37f9eedfccc0eda80919..b927abdec7f542d4bec39eb9534818962b4f2b29 100644
+--- a/.medusa/server/src/api/store/sellers/[id]/route.js
++++ b/.medusa/server/src/api/store/sellers/[id]/route.js
+@@ -11,6 +11,8 @@ const GET = async (req, res) => {
+             id: req.params.id,
+             ...req.filterableFields,
+         },
++    }, {
++        locale: req.locale,
+     });
+     const seller = sellers[0];
+     if (!seller) {
+diff --git a/.medusa/server/src/api/store/sellers/route.js b/.medusa/server/src/api/store/sellers/route.js
+index 6e63b2ba479d4c25fdc85aca5bf323810d7c778f..7116bfe393c8d75af74888e077e61fe8523a1299 100644
+--- a/.medusa/server/src/api/store/sellers/route.js
++++ b/.medusa/server/src/api/store/sellers/route.js
+@@ -9,6 +9,8 @@ const GET = async (req, res) => {
+         fields: req.queryConfig.fields,
+         filters: req.filterableFields,
+         pagination: req.queryConfig.pagination,
++    }, {
++        locale: req.locale,
+     });
+     res.json({
+         sellers,
+diff --git a/.medusa/server/src/modules/seller/models/seller.js b/.medusa/server/src/modules/seller/models/seller.js
+index 695944ebfdee2cb851fbca2c8e878623178300f7..d9bcacee578596ed333e896051fcbc1faa1b6454 100644
+--- a/.medusa/server/src/modules/seller/models/seller.js
++++ b/.medusa/server/src/modules/seller/models/seller.js
+@@ -14,11 +14,11 @@ const member_invite_1 = __importDefault(require("./member-invite"));
+ const Seller = utils_1.model
+     .define("Seller", {
+     id: utils_1.model.id({ prefix: "sel" }).primaryKey(),
+-    name: utils_1.model.text().searchable(),
++    name: utils_1.model.text().searchable().translatable(),
+     handle: utils_1.model.text().searchable(),
+     email: utils_1.model.text().searchable(),
+     phone: utils_1.model.text().nullable(),
+-    description: utils_1.model.text().nullable(),
++    description: utils_1.model.text().translatable().nullable(),
+     logo: utils_1.model.text().nullable(),
+     banner: utils_1.model.text().nullable(),
+     website_url: utils_1.model.text().searchable().nullable(),

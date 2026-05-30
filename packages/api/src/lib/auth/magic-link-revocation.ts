@@ -5,6 +5,7 @@ import {
   getMagicLinkSubjectEmail,
   getMagicLinkSubjectCustomerId,
   getMagicLinkSubjectMarketId,
+  getMagicLinkSubjectSellerId,
   isValidMagicLinkJti as isValidJwtMagicLinkJti,
   type GeneratedMagicLink,
   type MagicLinkOptions,
@@ -16,14 +17,18 @@ import {
 export type MagicLinkRevocationReason =
   | "user_revoke"
   | "admin_revoke"
+  | "seller_revoke"
   | "auto_expired"
   | "security_response"
+
+export type MagicLinkRevocationActorType = "customer" | "admin" | "seller"
 
 export type RecordIssuedMagicLinkInput = {
   token_jti: string
   purpose: MagicLinkPurpose
   subject?: MagicLinkSubject | null
   subject_customer_id?: string | null
+  subject_seller_id?: string | null
   subject_email?: string | null
   market_id?: string | null
   issued_at: Date
@@ -34,6 +39,7 @@ export type RevokeMagicLinkInput = {
   token_jti: string
   reason: MagicLinkRevocationReason
   revoked_by?: string | null
+  actor_type?: MagicLinkRevocationActorType | null
 }
 
 export type RevokePendingCustomerMagicLinksInput = {
@@ -42,6 +48,7 @@ export type RevokePendingCustomerMagicLinksInput = {
   market_id: string
   reason: "user_revoke"
   revoked_by: string
+  actor_type?: "customer"
   now?: Date
 }
 
@@ -104,6 +111,7 @@ export class PostgresMagicLinkStore implements MagicLinkRevocationStore {
         purpose: input.purpose,
         subject: input.subject ?? null,
         subject_customer_id: toNullableString(input.subject_customer_id ?? null),
+        subject_seller_id: toNullableString(input.subject_seller_id ?? null),
         subject_email: normalizeEmail(input.subject_email),
         market_id: toNullableString(input.market_id ?? null),
         issued_at: input.issued_at,
@@ -119,6 +127,7 @@ export class PostgresMagicLinkStore implements MagicLinkRevocationStore {
         token_jti: input.token_jti,
         reason: input.reason,
         revoked_by: input.revoked_by ?? null,
+        actor_type: input.actor_type ?? null,
       })
       .onConflict("token_jti")
       .ignore()
@@ -173,6 +182,7 @@ export class PostgresMagicLinkStore implements MagicLinkRevocationStore {
           token_jti: row.token_jti,
           reason: input.reason,
           revoked_by: input.revoked_by,
+          actor_type: input.actor_type ?? "customer",
         }))
       )
       .onConflict("token_jti")
@@ -207,6 +217,7 @@ function recordIssuedFromGenerated(
     purpose: generated.claims.purpose,
     subject: generated.claims.subject,
     subject_customer_id: getMagicLinkSubjectCustomerId(generated.claims.subject),
+    subject_seller_id: getMagicLinkSubjectSellerId(generated.claims.subject),
     subject_email: getMagicLinkSubjectEmail(generated.claims.subject),
     market_id: getMagicLinkSubjectMarketId(generated.claims.subject),
     issued_at: new Date(generated.claims.iat * 1000),

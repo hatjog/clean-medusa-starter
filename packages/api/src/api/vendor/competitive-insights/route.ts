@@ -1,24 +1,22 @@
 /**
- * GET /vendor/competitive-insights — JWT-derived vendor scope.
+ * GET /vendor/competitive-insights — Mercur seller-context vendor scope.
  *
  * Story v160-cleanup-38-jwt-vendor-scope (TF-92, TF-103, TF-110):
  *
- *   AC1  — withVendorAuth HOF wraps handler; token required, no fallback.
+ *   AC1  — JWT bearer route; Mercur ensureSellerMiddleware provides seller context.
  *   AC2  — x-vendor-id header COMPLETELY IGNORED; vendor scope comes from
- *          req.vendorAuth.vendor_id (JWT-derived via resolveVendorId).
+ *          req.seller_context.seller_id resolved through gp_core.resolveVendorId.
  *   AC3  — cross-vendor scope guard: if caller passes vendor_id in body/query
  *          that differs from authenticated vendor_id → 403 immediately.
  *   AC4  — real Mercur 2 query via resolveInsightSnapshots (Knex loader);
  *          no dev-fixture path in this handler.
- *   AC5  — 401 outcomes are NOT written to audit log (withVendorAuth handles
- *          these before the handler is invoked).
+ *   AC5  — 401 outcomes are NOT written to audit log.
  *   AC6  — every successful query and every 403 rejection writes a row to
  *          vendor_notification_log with notification_type='competitive_insights_query'.
  *
  * References:
  *   - ADR-025: "vendor" in GP core; "seller" only in Mercur auth context
- *   - ADR-034: Federated sessions; HMAC backend-to-backend
- *   - cleanup-39/48: withVendorAuth HOF (x-vendor-token / HMAC validation)
+ *   - ADR-109a V3 / Story 6.2: browser-context vendor widget uses JWT bearer only.
  */
 
 import type { MedusaRequest, MedusaResponse } from "@medusajs/framework/http"
@@ -28,12 +26,22 @@ import {
   type CompetitiveInsightsData,
 } from "../../../lib/competitive-insights-aggregator"
 import { resolveInsightSnapshots } from "../../../lib/competitive-insights-source"
-import { withVendorAuth } from "../../../lib/vendor-auth"
-import type { VendorAuthContext } from "../../../lib/vendor-auth"
+import { NotImplementedError } from "../../../modules/gp-core/service"
 import { appendNotificationLog } from "../../../lib/vendor-notification-log"
 
-type RequestWithVendorAuth = MedusaRequest & {
-  vendorAuth?: VendorAuthContext
+type RequestWithSellerContext = MedusaRequest & {
+  seller_context?: {
+    seller_id?: string
+  }
+}
+
+type GpCoreServiceLike = {
+  resolveVendorId: (sellerId: string) => Promise<string>
+}
+
+type LoggerLike = {
+  warn?: (message: string) => void
+  error?: (message: string) => void
 }
 
 type CompetitiveInsightsResponse = CompetitiveInsightsData & {
@@ -46,16 +54,74 @@ type ErrorResponse = {
   message: string
 }
 
+function resolveLogger(scope: MedusaRequest["scope"] | undefined): LoggerLike {
+  if (!scope) return console
+
+  try {
+    return (scope.resolve("logger") as LoggerLike | undefined) ?? console
+  } catch {
+    return console
+  }
+}
+
+function resolveGpCore(scope: MedusaRequest["scope"] | undefined): GpCoreServiceLike | null {
+  if (!scope) return null
+
+  try {
+    return scope.resolve("gp_core") as GpCoreServiceLike | null
+  } catch {
+    return null
+  }
+}
+
 /**
  * GET handler — must be exported as a named `GET` constant (not a function declaration)
  * so Medusa's file-based router picks it up correctly.
  */
-export const GET = withVendorAuth(async (
-  req: RequestWithVendorAuth,
+export const GET = async (
+  req: RequestWithSellerContext,
   res: MedusaResponse<CompetitiveInsightsResponse>,
 ): Promise<void> => {
-  // vendorAuth is guaranteed to be present here — withVendorAuth returns 401 otherwise.
-  const { vendor_id: vendorId, seller_id: sellerId } = req.vendorAuth!
+  const sellerId = req.seller_context?.seller_id
+  if (!sellerId) {
+    res.status(401).json({
+      code: "UNAUTHORIZED",
+      message: "Seller context not present",
+    } as unknown as ErrorResponse & CompetitiveInsightsResponse)
+    return
+  }
+
+  const logger = resolveLogger(req.scope)
+  const gpCore = resolveGpCore(req.scope)
+  if (!gpCore) {
+    logger.warn?.("[competitive-insights] gp_core service not available")
+    res.status(503).json({
+      code: "vendor_auth_service_unavailable",
+      message: "Vendor authentication service unavailable",
+    } as unknown as ErrorResponse & CompetitiveInsightsResponse)
+    return
+  }
+
+  let vendorId: string
+  try {
+    vendorId = await gpCore.resolveVendorId(sellerId)
+  } catch (error) {
+    if (error instanceof NotImplementedError) {
+      logger.warn?.(`[competitive-insights] resolveVendorId stub: ${error.message}`)
+      res.status(501).json({
+        code: "vendor_id_resolution_not_implemented",
+        message: "Vendor ID resolution not yet implemented",
+      } as unknown as ErrorResponse & CompetitiveInsightsResponse)
+      return
+    }
+
+    logger.error?.(`[competitive-insights] resolveVendorId failed: ${String(error)}`)
+    res.status(500).json({
+      code: "vendor_auth_failed",
+      message: "Vendor authentication failed",
+    } as unknown as ErrorResponse & CompetitiveInsightsResponse)
+    return
+  }
 
   // AC3 — cross-vendor scope guard.
   // If the caller supplied a vendor_id in the body or query string that differs
@@ -129,4 +195,4 @@ export const GET = withVendorAuth(async (
   })
 
   res.json({ ...insightsData, data_source: dataSource })
-})
+}

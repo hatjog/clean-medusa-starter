@@ -10,6 +10,10 @@ import {
   type WalletPassStatus,
   type WalletPayload,
 } from "./payload"
+import { validateWalletPayloadInCurrentEnv } from "./payload-schema"
+import { WalletPayloadError } from "./errors"
+
+export { WalletPayloadError } from "./errors"
 
 const DEFAULT_BRANDING: WalletBranding = {
   logo_url: "https://assets.growplatform.local/bonbeauty/logo.svg",
@@ -38,16 +42,6 @@ export interface WalletPayloadBuilder {
 export interface WalletPayloadBuilderOptions {
   fallback_locale?: WalletLocale
   default_branding?: WalletBranding
-}
-
-export class WalletPayloadError extends Error {
-  constructor(
-    readonly code: string,
-    message: string
-  ) {
-    super(message)
-    this.name = "WalletPayloadError"
-  }
 }
 
 export class DefaultWalletPayloadBuilder implements WalletPayloadBuilder {
@@ -122,8 +116,20 @@ export class DefaultWalletPayloadBuilder implements WalletPayloadBuilder {
       wallet_metadata.branding ?? entitlement_instance.branding,
       this.default_branding
     )
+    const salon_name = pickOptionalString(
+      wallet_metadata.salon_name ?? entitlement_instance.salon_name
+    )
+    const salon_address = pickOptionalString(
+      wallet_metadata.salon_address ?? entitlement_instance.salon_address
+    )
+    const latitude = pickOptionalNumber(
+      wallet_metadata.latitude ?? entitlement_instance.latitude
+    )
+    const longitude = pickOptionalNumber(
+      wallet_metadata.longitude ?? entitlement_instance.longitude
+    )
 
-    return {
+    const payload: WalletPayload = {
       entitlement_instance_id: entitlement_instance.id,
       code,
       title,
@@ -137,7 +143,13 @@ export class DefaultWalletPayloadBuilder implements WalletPayloadBuilder {
       barcode: barcode_spec.format === "PDF417" ? barcode_spec : undefined,
       branding,
       locale: normalized_locale,
+      salon_name,
+      salon_address,
+      latitude,
+      longitude,
     }
+
+    return validateWalletPayloadInCurrentEnv(payload)
   }
 }
 
@@ -268,6 +280,16 @@ function resolveBarcodeSpec(
       "wallet barcode value is required"
     ),
   }
+}
+
+function pickOptionalString(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined
+  const trimmed = value.trim()
+  return trimmed.length > 0 ? trimmed : undefined
+}
+
+function pickOptionalNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined
 }
 
 function pickString(value: string | undefined, fallback: string): string {

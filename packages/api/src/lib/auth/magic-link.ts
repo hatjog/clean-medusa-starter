@@ -277,6 +277,13 @@ export function getMagicLinkSubjectCustomerId(
   return typeof value === "string" && value.trim() ? value.trim() : null
 }
 
+export function getMagicLinkSubjectSellerId(
+  subject: MagicLinkSubject
+): string | null {
+  const value = subject.seller_id
+  return typeof value === "string" && value.trim() ? value.trim() : null
+}
+
 export function getMagicLinkSubjectMarketId(
   subject: MagicLinkSubject
 ): string | null {

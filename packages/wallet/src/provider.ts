@@ -1,8 +1,18 @@
 import type {
+  AuditEnvelope,
   WalletInvalidationReason,
   WalletLocale,
   WalletPayload,
 } from "./payload"
+
+export interface WalletPassIssueResult {
+  save_url: string
+  audit_event?: AuditEnvelope | unknown
+}
+
+export interface WalletPassInvalidateResult {
+  audit_event?: AuditEnvelope | unknown
+}
 
 /**
  * Provider-neutral port dla wallet adaptera (Google / Apple).
@@ -13,10 +23,10 @@ export interface WalletPassProvider {
   issueSaveUrl(
     payload: WalletPayload,
     locale: WalletLocale
-  ): Promise<{ save_url: string }>
+  ): Promise<WalletPassIssueResult>
 
   invalidate(
     entitlement_instance_id: string,
     reason: WalletInvalidationReason
-  ): Promise<void>
+  ): Promise<void | WalletPassInvalidateResult>
 }
