@@ -19,6 +19,8 @@ module.exports = {
     "src/payload-builder.ts",
     "src/telemetry/*.ts",
     "src/providers/google*.ts",
+    "src/providers/apple.ts",
+    "src/registry.ts",
   ],
   coverageThreshold: {
     global: {

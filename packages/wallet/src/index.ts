@@ -32,6 +32,8 @@ export type {
   WalletPayloadSchemaBarcodeSpec,
   WalletPayloadSchemaBranding,
 } from "./payload-schema"
+export { createWalletProviderRegistry } from "./registry"
+export type { CreateWalletProviderRegistryOptions } from "./registry"
 export {
   WALLET_LOCALES,
   WALLET_PROVIDER_KINDS,
