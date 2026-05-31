@@ -7,7 +7,8 @@ import { Migration } from "@medusajs/framework/mikro-orm/migrations"
  * a single rollback story (drop the new column / restore the old CHECK).
  *
  * --- HIGH-08: voucher.status CHECK does not include 'expired' ---
- *   The Story 2.1 migration `Migration20260507000000.ts` constrained
+ *   The Story 2.1 migration `1778112000000_create_voucher_and_voucher_event_tables.ts`
+ *   (formerly `Migration20260507000000.ts`) constrained
  *   `voucher.status` to `('idle','consent_pending','claimed','withdrawn')`. The
  *   service-layer `claim()` returns `{ status: 'expired', voucher }` to
  *   callers but never persists the terminal state — the voucher row stays

@@ -8,7 +8,7 @@ import { Migration } from "@medusajs/framework/mikro-orm/migrations"
  * authored per Story 2.1 AC4 field spec — F-NEW-L1 ships verbatim DDL only for
  * webhook_event_processed / magic_link_revocation / payment_session, NOT for
  * entitlement_instance; this migration mirrors the idempotent class shape of
- * Migration20260507000000.ts.
+ * 1778112000000_create_voucher_and_voucher_event_tables.ts.
  *
  * Layer 1 entitlement_type and Layer 4 state are enforced as CHECK
  * constraints (text + CHECK, same posture as the voucher table). Layer 3
