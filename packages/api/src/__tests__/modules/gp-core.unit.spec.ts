@@ -9,7 +9,10 @@ import {
   seedGpCoreFromFixtures,
 } from "../../scripts/seed-gp-core"
 
-const BACKEND_ROOT = path.resolve(__dirname, "../../../")
+// __dirname = packages/api/src/__tests__/modules → 5 levels up = GP/backend root.
+// (Was "../../../" which stopped at packages/api, making REPO_ROOT resolve to the
+// submodule instead of the monorepo root where infra/ + config/ live.)
+const BACKEND_ROOT = path.resolve(__dirname, "../../../../../")
 const REPO_ROOT = path.resolve(BACKEND_ROOT, "../..")
 const CONFIG_ROOT = path.resolve(BACKEND_ROOT, "../config")
 const SQL_PATH = path.resolve(REPO_ROOT, "infra/postgres/init/02-gp-core-tables.sql")

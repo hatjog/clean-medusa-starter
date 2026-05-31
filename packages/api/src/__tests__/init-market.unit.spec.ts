@@ -26,11 +26,23 @@ let buildMarketConfigCreateData: (args: {
   vendor: Record<string, unknown>
 }) => Record<string, unknown>
 
-function loadPortalInitMarketModule(): Promise<{
+async function loadPortalInitMarketModule(): Promise<{
   initMarket: typeof initMarket
   buildMarketConfigCreateData: typeof buildMarketConfigCreateData
 }> {
-  return eval('import("../../../portal/src/lib/initMarket.js")')
+  // GP/portal is a sibling of GP/backend (5 levels up from this test, not 3 —
+  // the path predates the packages/api restructure which moved src two levels deeper).
+  const mod = (await eval(
+    'import("../../../../../portal/src/lib/initMarket.js")'
+  )) as Record<string, unknown>
+  // CJS↔ESM interop under jest's experimental-vm-modules can surface the named
+  // exports nested under `.default`; normalize so destructuring finds them.
+  return (
+    typeof mod.initMarket === "function" ? mod : (mod.default as unknown)
+  ) as {
+    initMarket: typeof initMarket
+    buildMarketConfigCreateData: typeof buildMarketConfigCreateData
+  }
 }
 
 beforeAll(async () => {

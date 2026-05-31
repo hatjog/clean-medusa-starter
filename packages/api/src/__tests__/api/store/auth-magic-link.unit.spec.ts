@@ -81,6 +81,29 @@ function signedRecoverToken(
 }
 
 beforeEach(() => {
+  // Pin the system clock to NOW (only Date — leave timer fns real) so the verify
+  // route, which calls verifyMagicLink() with the real clock, evaluates tokens
+  // minted at `now: NOW` as still within their short magic-link TTL. Without this
+  // the suite time-bombs once wall-clock passes NOW + TTL.
+  jest
+    .useFakeTimers({
+      doNotFake: [
+        "nextTick",
+        "setImmediate",
+        "setInterval",
+        "setTimeout",
+        "clearInterval",
+        "clearTimeout",
+        "queueMicrotask",
+        "requestAnimationFrame",
+        "cancelAnimationFrame",
+        "requestIdleCallback",
+        "cancelIdleCallback",
+        "hrtime",
+        "performance",
+      ],
+    })
+    .setSystemTime(NOW)
   process.env.JWT_SECRET = JWT_SECRET
   process.env.STOREFRONT_URL = "https://storefront.example.test"
   configureMagicLinkRuntime({
@@ -90,6 +113,7 @@ beforeEach(() => {
 })
 
 afterEach(() => {
+  jest.useRealTimers()
   resetMagicLinkRuntime()
   delete process.env.JWT_SECRET
   delete process.env.STOREFRONT_URL

@@ -27,7 +27,9 @@ class RecordingEventBus {
   }
 }
 
-const BACKEND_ROOT = path.resolve(__dirname, "../../../")
+// 5 levels up from __tests__/modules = GP/backend root (was "../../../" =
+// packages/api, which mis-resolved REPO_ROOT to the submodule, not the monorepo).
+const BACKEND_ROOT = path.resolve(__dirname, "../../../../../")
 const REPO_ROOT = path.resolve(BACKEND_ROOT, "../..")
 const SQL_PATH = path.resolve(REPO_ROOT, "infra/postgres/init/02-gp-core-tables.sql")
 

@@ -47,6 +47,13 @@ if (process.env.TEST_TYPE === "integration:http") {
     "**/packages/api/src/**/__tests__/**/*.test.[jt]s",
     "**/packages/wallet/src/**/__tests__/**/*.test.[jt]s",
   ];
+  // `*.integration.test.ts` need a live PG_CONNECTION + seeded capability grants
+  // (e.g. sellers/[id]/pause), so they must NOT run in the DB-less unit suite where
+  // they fail-closed. They belong to an integration invocation, not `test:unit`.
+  module.exports.testPathIgnorePatterns = [
+    "/node_modules/",
+    "\\.integration\\.test\\.[jt]s$",
+  ];
 } else if (process.env.TEST_TYPE === "patches") {
   // Patch regression tests: bez live DB, oparte o mocki, szybkie.
   // Uruchomienie: pnpm test:patches
