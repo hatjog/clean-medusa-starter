@@ -7,8 +7,19 @@ import { Migration } from "@medusajs/framework/mikro-orm/migrations"
  * Reverse: drops both tables (CASCADE).
  *
  * Migration is idempotent (CREATE TABLE IF NOT EXISTS).
+ *
+ * Ordering fix (v1.10.0 ra-1 clean-boot): originally named
+ * `Migration20260507000000` (YYYYMMDDHHMMSS). MikroORM sorts migrations by the
+ * numeric version, and 20260507000000 (~2.0e13) is LARGER than the voucher
+ * module's epoch-millisecond migrations (~1.7e12), so this table-CREATE sorted
+ * AFTER the migrations that ALTER voucher_event (e.g. 1778925265229 booking
+ * pointer) — fine on incremental DBs (tables already existed) but it broke a
+ * clean `db:migrate` ("relation voucher_event does not exist"). Renamed to the
+ * epoch-ms equivalent of 2026-05-07 (1778112000000) so the CREATE precedes the
+ * ALTERs. CREATE TABLE IF NOT EXISTS keeps it safe to re-run on databases that
+ * already applied the old class name.
  */
-export class Migration20260507000000 extends Migration {
+export class Migration1778112000000 extends Migration {
   async up(): Promise<void> {
     this.addSql(`
       CREATE TABLE IF NOT EXISTS voucher (
