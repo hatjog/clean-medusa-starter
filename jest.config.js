@@ -22,6 +22,12 @@ module.exports = {
   // Mapujemy go na reczny mock CJS oparty o Node crypto tylko w test env.
   moduleNameMapper: {
     "^@noble/ed25519$": "<rootDir>/__mocks__/@noble/ed25519.js",
+    // Node16/NodeNext ESM source uses explicit `.js` extensions on relative imports
+    // (e.g. `import x from "../foo.js"`), but the files are authored as `.ts` and Just
+    // (@swc/jest, CJS) resolves bare specifiers via `moduleFileExtensions`. Strip the
+    // `.js` so `../foo.js` → `../foo` → resolved to the real `.ts`. Without this, the
+    // unit suites using ESM-style imports fail with MODULE_NOT_FOUND.
+    "^(\\.{1,2}/.*)\\.js$": "$1",
   },
   testEnvironment: "node",
   // Preferuj zrodla TS zamiast wygenerowanych JS przy testach sibling packages.
@@ -40,6 +46,13 @@ if (process.env.TEST_TYPE === "integration:http") {
     "**/packages/api/src/**/__tests__/**/*.idempotency.spec.[jt]s",
     "**/packages/api/src/**/__tests__/**/*.test.[jt]s",
     "**/packages/wallet/src/**/__tests__/**/*.test.[jt]s",
+  ];
+  // `*.integration.test.ts` need a live PG_CONNECTION + seeded capability grants
+  // (e.g. sellers/[id]/pause), so they must NOT run in the DB-less unit suite where
+  // they fail-closed. They belong to an integration invocation, not `test:unit`.
+  module.exports.testPathIgnorePatterns = [
+    "/node_modules/",
+    "\\.integration\\.test\\.[jt]s$",
   ];
 } else if (process.env.TEST_TYPE === "patches") {
   // Patch regression tests: bez live DB, oparte o mocki, szybkie.

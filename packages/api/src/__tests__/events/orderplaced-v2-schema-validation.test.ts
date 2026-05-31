@@ -25,7 +25,9 @@ import {
   type OrderPlacedComposeInput,
 } from "../../lib/events/orderplaced-v2-publisher"
 
-const REPO_ROOT = path.resolve(__dirname, "../../../../..")
+// 7 levels up from __tests__/events = monorepo root (was "../../../../.." which
+// stopped at the GP/backend submodule; specs/ lives one repo level above).
+const REPO_ROOT = path.resolve(__dirname, "../../../../../../..")
 const SCHEMA_PATH = path.resolve(
   REPO_ROOT,
   "specs/contracts/events/schemas/order_placed.v2.schema.json"

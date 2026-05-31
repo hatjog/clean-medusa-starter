@@ -80,8 +80,29 @@ type ValidationIssue = {
   message: string
 }
 
-const REPO_ROOT = path.resolve(__dirname, "../../../../../")
-const EVENT_CONTRACTS_ROOT = path.resolve(REPO_ROOT, "specs/contracts/events")
+// Walk up from this module to the directory that actually holds the event
+// contracts. The previous hardcoded `../../../../../` resolved to the GP/backend
+// submodule root, but `specs/` lives at the monorepo root (one level up again),
+// so the schema path pointed at a non-existent file — a latent runtime failure
+// the moment a market-lifecycle event needed envelope validation. The walk-up is
+// layout-agnostic: it finds `specs/contracts/events` wherever it sits above us.
+function resolveEventContractsRoot(start: string): string {
+  let current = path.resolve(start)
+  while (true) {
+    const candidate = path.join(current, "specs/contracts/events")
+    if (fs.existsSync(candidate)) {
+      return candidate
+    }
+    const parent = path.dirname(current)
+    if (parent === current) {
+      // Fall back to the historical relative path so error messages stay sane.
+      return path.resolve(start, "../../../../../", "specs/contracts/events")
+    }
+    current = parent
+  }
+}
+
+const EVENT_CONTRACTS_ROOT = resolveEventContractsRoot(__dirname)
 const ENVELOPE_SCHEMA_PATH = path.resolve(
   EVENT_CONTRACTS_ROOT,
   "schemas/envelope.v1.schema.json"

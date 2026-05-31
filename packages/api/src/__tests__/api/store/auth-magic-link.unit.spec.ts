@@ -64,27 +64,56 @@ function configModule() {
   }
 }
 
+// Magic-link jti must be a UUID (MAGIC_LINK_JTI_UUID_RE, source change 6afbe4f
+// 2026-05-30). Use fixed valid v4 UUIDs so the revocation matcher is deterministic.
+const VALID_JTI = "00000000-0000-4000-8000-000000000001"
+const REVOKED_JTI = "00000000-0000-4000-8000-000000000002"
+
 function signedRecoverToken(
   subject: Record<string, string | number | boolean | null>,
   options: { jti?: string; now?: Date } = {}
 ): string {
   return generateMagicLinkWithClaims("recover", subject, {
     secret: JWT_SECRET,
-    jti: options.jti ?? "jti-123",
+    jti: options.jti ?? VALID_JTI,
     now: options.now ?? NOW,
   }).token
 }
 
 beforeEach(() => {
+  // Pin the system clock to NOW (only Date — leave timer fns real) so the verify
+  // route, which calls verifyMagicLink() with the real clock, evaluates tokens
+  // minted at `now: NOW` as still within their short magic-link TTL. Without this
+  // the suite time-bombs once wall-clock passes NOW + TTL.
+  jest
+    .useFakeTimers({
+      doNotFake: [
+        "nextTick",
+        "setImmediate",
+        "setInterval",
+        "setTimeout",
+        "clearInterval",
+        "clearTimeout",
+        "queueMicrotask",
+        "requestAnimationFrame",
+        "cancelAnimationFrame",
+        "requestIdleCallback",
+        "cancelIdleCallback",
+        "hrtime",
+        "performance",
+      ],
+    })
+    .setSystemTime(NOW)
   process.env.JWT_SECRET = JWT_SECRET
   process.env.STOREFRONT_URL = "https://storefront.example.test"
   configureMagicLinkRuntime({
-    isJtiRevoked: async (jti) => jti === "revoked-jti",
+    isJtiRevoked: async (jti) => jti === REVOKED_JTI,
     recordIssued: async () => undefined,
   })
 })
 
 afterEach(() => {
+  jest.useRealTimers()
   resetMagicLinkRuntime()
   delete process.env.JWT_SECRET
   delete process.env.STOREFRONT_URL
@@ -272,7 +301,7 @@ describe("POST /store/auth/magic-link/verify", () => {
       "revoked",
       signedRecoverToken(
         { customer_id: "cus_1", market_id: "bonbeauty" },
-        { jti: "revoked-jti" }
+        { jti: REVOKED_JTI }
       ),
       { valid: false, reason: "revoked" },
     ],

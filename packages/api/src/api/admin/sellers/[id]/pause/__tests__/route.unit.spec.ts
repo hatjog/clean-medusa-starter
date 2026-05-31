@@ -31,6 +31,15 @@ jest.mock("../../../../../../lib/capability-check", () => ({
   extractActorIdOrThrow: (...args: unknown[]) => mockExtractActorIdOrThrow(...args),
 }))
 
+// cc-4 F-03 added a market-authorization guard (`resolveAdminMarketContext`) that
+// runs BEFORE the capability gate. Stub it open so these AC1–AC5 tests exercise the
+// capability logic they target rather than 401-ing on the (separately-tested) market
+// guard. `readMarketIdHeader` returns the seeded seller's market.
+jest.mock("../../../../../../lib/admin-market-context", () => ({
+  resolveAdminMarketContext: jest.fn().mockResolvedValue({ ok: true }),
+  readMarketIdHeader: jest.fn().mockReturnValue("mkt-1"),
+}))
+
 // Medusa framework stubs.
 jest.mock("@medusajs/framework/utils", () => ({
   ContainerRegistrationKeys: {
