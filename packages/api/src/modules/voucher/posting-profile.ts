@@ -145,6 +145,18 @@ export type VoucherPostingInput = {
   vat_minor: number
   /** REDEEMED: zrealizowane brutto w tym evencie (proporcjonalnie), minor units. */
   redeemed_gross_minor?: number
+  /**
+   * REDEEMED/EXPIRED: SKUMULOWANE zrealizowane brutto PRZED tym eventem
+   * (redeemed-to-date, bez bieżącego eventu), minor units. Default 0.
+   *
+   * Niezbędne do KUMULATYWNEGO rozpoznania VAT (VER-H1): rozpoznany output VAT
+   * tego eventu = `round(vat·(prior+this)/gross) − round(vat·prior/gross)`, dzięki
+   * czemu dla DOWOLNEGO podziału partial-redeemów Σ recognized == suspended
+   * (`vat:output:suspense` netuje do 0 po pełnym redeemie, ostatni event absorbuje
+   * resztę zaokrąglenia). Przy EXPIRED służy do policzenia rezydualnego
+   * zawieszonego VAT (vat − recognized-to-date) oraz egzekucji Σ ≤ brutto.
+   */
+  redeemed_gross_to_date_minor?: number
   /** EXPIRED: niewykorzystane brutto na moment wygaśnięcia (breakage), minor units. */
   remaining_gross_minor?: number
   // koperta `ledger-transaction.v1`
@@ -182,10 +194,16 @@ export class VoucherPostingGuardError extends Error {
   }
 }
 
-/** Pierwszy segment namespace (`<klasa>` przed pierwszym `:`). */
+/**
+ * Pierwszy segment namespace (`<klasa>` przed pierwszym `:`), znormalizowany do
+ * lowercase. Dzięki temu warianty wielkości liter (`CASH`, `Cash:settlement`)
+ * są klasyfikowane jako konto pieniężne (kind=`money_account`), a nie wpadają w
+ * ogólny `account_outside_namespace` — taksonomia błędów wiarygodna dla
+ * telemetrii D-2 (LOW).
+ */
 function accountClass(account: string): string {
   const idx = account.indexOf(":")
-  return idx === -1 ? account : account.slice(0, idx)
+  return (idx === -1 ? account : account.slice(0, idx)).toLowerCase()
 }
 
 /** Czy konto należy do zakazanej klasy pieniężnej (fail-closed). */
@@ -398,11 +416,18 @@ function generateRedeemed(input: VoucherPostingInput): VoucherPostingResult {
   assertNonNegativeInteger(input.net_minor, "net_minor")
   const redeemedGross = input.redeemed_gross_minor ?? 0
   assertNonNegativeInteger(redeemedGross, "redeemed_gross_minor")
+  const priorRedeemedGross = input.redeemed_gross_to_date_minor ?? 0
+  assertNonNegativeInteger(priorRedeemedGross, "redeemed_gross_to_date_minor")
 
   const totalGross = input.net_minor + input.vat_minor
-  if (redeemedGross > totalGross) {
+  // Σ-enforcement (launcher MEDIUM): redeemed-to-date + ten event NIE może
+  // przekroczyć brutto vouchera — over-redeem odrzucany fail-closed. Pełna
+  // egzekucja idempotencji/append-only po transaction_id należy do warstwy
+  // wołającej / maszyny stanów (Story 3.x); tu minimalny guard kumulatywny.
+  const cumulativeRedeemedGross = priorRedeemedGross + redeemedGross
+  if (cumulativeRedeemedGross > totalGross) {
     throw new VoucherPostingInvariantError(
-      `redeemed_gross_minor (${redeemedGross}) > brutto vouchera (${totalGross})`
+      `over-redeem: redeemed-to-date (${priorRedeemedGross}) + redeemed_gross_minor (${redeemedGross}) = ${cumulativeRedeemedGross} > brutto vouchera (${totalGross})`
     )
   }
 
@@ -414,8 +439,13 @@ function generateRedeemed(input: VoucherPostingInput): VoucherPostingResult {
     }
   }
 
-  // MPV: rozpoznanie zawieszonego VAT proporcjonalnie do zrealizowanego brutto.
-  const vatRedeemed = proportionalVat(input.vat_minor, redeemedGross, totalGross)
+  // MPV: KUMULATYWNE rozpoznanie zawieszonego VAT (VER-H1). VAT rozpoznany w
+  // tym evencie = round(vat·skumulowane/gross) − round(vat·prior/gross), więc
+  // dla DOWOLNEGO podziału partial-redeemów Σ recognized == suspended (ostatni
+  // event absorbuje resztę zaokrąglenia, suspense netuje do 0 po pełnym redeemie).
+  const vatRedeemed =
+    proportionalVat(input.vat_minor, cumulativeRedeemedGross, totalGross) -
+    proportionalVat(input.vat_minor, priorRedeemedGross, totalGross)
   if (vatRedeemed === 0) {
     return {
       posted: false,
@@ -463,11 +493,21 @@ function generateBreakage(input: VoucherPostingInput): VoucherPostingResult {
   assertNonNegativeInteger(input.net_minor, "net_minor")
   const remainingGross = input.remaining_gross_minor ?? 0
   assertNonNegativeInteger(remainingGross, "remaining_gross_minor")
+  const priorRedeemedGross = input.redeemed_gross_to_date_minor ?? 0
+  assertNonNegativeInteger(priorRedeemedGross, "redeemed_gross_to_date_minor")
 
   const totalGross = input.net_minor + input.vat_minor
   if (remainingGross > totalGross) {
     throw new VoucherPostingInvariantError(
       `remaining_gross_minor (${remainingGross}) > brutto vouchera (${totalGross})`
+    )
+  }
+  // Σ-enforcement (launcher MEDIUM): derecognition (redeemed-to-date + breakage
+  // niewykorzystanego salda) NIE może przekroczyć liability brutto. Pełna
+  // egzekucja należy do maszyny stanów (Story 3.x); tu minimalny guard.
+  if (priorRedeemedGross + remainingGross > totalGross) {
+    throw new VoucherPostingInvariantError(
+      `derecognition > liability: redeemed-to-date (${priorRedeemedGross}) + remaining_gross_minor (${remainingGross}) = ${priorRedeemedGross + remainingGross} > brutto vouchera (${totalGross})`
     )
   }
 
@@ -478,11 +518,21 @@ function generateBreakage(input: VoucherPostingInput): VoucherPostingResult {
     }
   }
 
-  const vatRemaining = proportionalVat(input.vat_minor, remainingGross, totalGross)
-  const netRemaining = remainingGross - vatRemaining
-
   if (input.vat_classification === "SPV") {
-    // SPV: VAT już rozpoznany przy emisji — breakage tylko z netto.
+    // SPV: VAT już rozpoznany przy emisji — breakage tylko z netto
+    // niewykorzystanego salda (proporcjonalnie; brak konta suspense).
+    const vatRemaining = proportionalVat(input.vat_minor, remainingGross, totalGross)
+    const netRemaining = remainingGross - vatRemaining
+    if (netRemaining === 0) {
+      // Degenerate (np. salda w całości VAT-only): brak netto liability do
+      // derecognition; VAT już rozpoznany przy emisji → no-op księgowy (LOW:
+      // nie tworzymy linii zero/zero, która łamałaby assertBalanced).
+      return {
+        posted: false,
+        reason:
+          "SPV EXPIRED: netto niewykorzystanego salda = 0 (saldo w całości VAT, rozpoznany przy emisji): no-op księgowy",
+      }
+    }
     const lines: LedgerLine[] = [
       line(
         input,
@@ -505,18 +555,35 @@ function generateBreakage(input: VoucherPostingInput): VoucherPostingResult {
   }
 
   // MPV unused = bez VAT (art. 73a): zawieszony VAT niewykorzystanego salda
-  // wpada do breakage (NIE staje się output VAT). 3 linie, samobilansujące:
-  // Dr liability(netto) + Dr suspense(vat) = Cr breakage(netto+vat).
-  const lines: LedgerLine[] = [
-    line(
-      input,
-      "breakage-liability",
-      VOUCHER_LEDGER_ACCOUNTS.CONTRACT_LIABILITY,
-      "debit",
-      netRemaining,
-      "MPV breakage: derecognition niewykorzystanej liability netto"
-    ),
-  ]
+  // wpada do breakage (NIE staje się output VAT). REZYDUALNY zawieszony VAT =
+  // vat − recognized-to-date (kumulatywnie, VER-H1), dzięki czemu po pełnym
+  // lifecycle (redeemy + breakage reszty) `vat:output:suspense` netuje do 0.
+  // Samobilansujące: Dr liability(netto) + Dr suspense(vat) = Cr breakage(brutto).
+  const recognizedToDate = proportionalVat(input.vat_minor, priorRedeemedGross, totalGross)
+  const vatRemaining = input.vat_minor - recognizedToDate
+  const netRemaining = remainingGross - vatRemaining
+  if (netRemaining < 0) {
+    // Niespójne wejście: rezydualny VAT > niewykorzystane brutto (np. prior
+    // redeemed niespójny z remaining). Fail-closed zamiast linii ujemnej.
+    throw new VoucherPostingInvariantError(
+      `MPV breakage: rezydualny zawieszony VAT (${vatRemaining}) > niewykorzystane brutto (${remainingGross}) — niespójne redeemed-to-date/remaining`
+    )
+  }
+
+  // LOW: pomijamy linie o kwocie 0 (zero/zero łamałoby assertBalanced).
+  const lines: LedgerLine[] = []
+  if (netRemaining > 0) {
+    lines.push(
+      line(
+        input,
+        "breakage-liability",
+        VOUCHER_LEDGER_ACCOUNTS.CONTRACT_LIABILITY,
+        "debit",
+        netRemaining,
+        "MPV breakage: derecognition niewykorzystanej liability netto"
+      )
+    )
+  }
   if (vatRemaining > 0) {
     lines.push(
       line(
@@ -525,7 +592,7 @@ function generateBreakage(input: VoucherPostingInput): VoucherPostingResult {
         VOUCHER_LEDGER_ACCOUNTS.VAT_OUTPUT_SUSPENSE,
         "debit",
         vatRemaining,
-        "MPV unused: zdjęcie zawieszonego VAT bez rozpoznania output (art. 73a)"
+        "MPV unused: zdjęcie REZYDUALNEGO zawieszonego VAT bez rozpoznania output (art. 73a)"
       )
     )
   }

@@ -117,6 +117,9 @@ describe("posting profile voucher_liability_only_v1", () => {
       expect(accounts).not.toContain(VOUCHER_LEDGER_ACCOUNTS.VAT_OUTPUT)
       const vatLine = tx.lines.find((l) => l.account === VOUCHER_LEDGER_ACCOUNTS.VAT_OUTPUT_EMISSION)!
       expect(vatLine.credit_minor).toBe(VAT)
+      // Carve-out: liability debetowane WARTOŚCIĄ VAT (liability brutto → netto).
+      const liabLine = tx.lines.find((l) => l.account === VOUCHER_LEDGER_ACCOUNTS.CONTRACT_LIABILITY)!
+      expect(liabLine.debit_minor).toBe(VAT)
     })
 
     it("MPV: bez VAT przy emisji (suspense, NIE emission/output), double-entry", () => {
@@ -129,6 +132,11 @@ describe("posting profile voucher_liability_only_v1", () => {
       // MPV przy emisji NIE rozpoznaje output VAT.
       expect(accounts).not.toContain(VOUCHER_LEDGER_ACCOUNTS.VAT_OUTPUT_EMISSION)
       expect(accounts).not.toContain(VOUCHER_LEDGER_ACCOUNTS.VAT_OUTPUT)
+      // Carve-out: suspense kredytowane WARTOŚCIĄ VAT, liability debetowane VAT.
+      const suspLine = tx.lines.find((l) => l.account === VOUCHER_LEDGER_ACCOUNTS.VAT_OUTPUT_SUSPENSE)!
+      expect(suspLine.credit_minor).toBe(VAT)
+      const liabLine = tx.lines.find((l) => l.account === VOUCHER_LEDGER_ACCOUNTS.CONTRACT_LIABILITY)!
+      expect(liabLine.debit_minor).toBe(VAT)
     })
 
     it("liability:contract_liability:voucher to NIE konto przychodu (IFRS 15)", () => {
@@ -265,13 +273,15 @@ describe("posting profile voucher_liability_only_v1", () => {
     })
 
     it("forfeiture/partial NIE reklasyfikują: breakage liczony WYŁĄCZNIE od salda niewykorzystanego", () => {
-      // Połowa zrealizowana, połowa wygasa → breakage tylko od remaining 6150.
+      // Połowa zrealizowana (redeemed-to-date), połowa wygasa → breakage tylko od
+      // remaining 6150; rezydualny zawieszony VAT = 2300 − recognized(6150)=1150.
       const remaining = GROSS / 2
       const tx = expectPosted(
         generateVoucherPosting(
           baseInput({
             lifecycle_event: "EXPIRED",
             vat_classification: "MPV",
+            redeemed_gross_to_date_minor: GROSS / 2,
             remaining_gross_minor: remaining,
           })
         )
@@ -279,6 +289,9 @@ describe("posting profile voucher_liability_only_v1", () => {
       assertContractConformance(tx)
       const breakageLine = tx.lines.find((l) => l.account === VOUCHER_LEDGER_ACCOUNTS.BREAKAGE)!
       expect(breakageLine.credit_minor).toBe(remaining)
+      // Rezydualny zawieszony VAT = 1150 (połowa rozpoznana przy redeemie).
+      const suspLine = tx.lines.find((l) => l.account === VOUCHER_LEDGER_ACCOUNTS.VAT_OUTPUT_SUSPENSE)!
+      expect(suspLine.debit_minor).toBe(1150)
     })
   })
 
@@ -333,6 +346,148 @@ describe("posting profile voucher_liability_only_v1", () => {
           for (const a of accountsTouched(result.transaction)) {
             expect(isMoneyAccount(a)).toBe(false)
           }
+        }
+      }
+    })
+  })
+
+  describe("VER-H1/VER-M1 — kumulatywny VAT multi-installment + Σ-enforcement", () => {
+    // Voucher z VAT NIEDZIELĄCYM się równo na raty: net=100 vat=23 gross=123.
+    const M_NET = 100
+    const M_VAT = 23
+    const M_GROSS = M_NET + M_VAT // 123
+
+    function redeemEvent(redeemed: number, toDate: number): VoucherPostingResult {
+      return generateVoucherPosting(
+        baseInput({
+          lifecycle_event: "REDEEMED",
+          vat_classification: "MPV",
+          net_minor: M_NET,
+          vat_minor: M_VAT,
+          redeemed_gross_minor: redeemed,
+          redeemed_gross_to_date_minor: toDate,
+        })
+      )
+    }
+
+    function recognisedVat(result: VoucherPostingResult): number {
+      if (!result.posted) return 0
+      const out = result.transaction.lines.find(
+        (l) => l.account === VOUCHER_LEDGER_ACCOUNTS.VAT_OUTPUT
+      )
+      return out ? out.credit_minor : 0
+    }
+
+    it("3×41 (PoC VER-H1): Σ recognized output VAT == 23 (suspense netuje do 0)", () => {
+      // round-niezależny dawałby 3×round(23·41/123)=3×8=24 ≠ 23 (suspense=-1).
+      // Kumulatywny: 8 + 7 + 8 = 23.
+      const e1 = redeemEvent(41, 0)
+      const e2 = redeemEvent(41, 41)
+      const e3 = redeemEvent(41, 82)
+      const total = recognisedVat(e1) + recognisedVat(e2) + recognisedVat(e3)
+      expect(total).toBe(M_VAT)
+      // każdy posted wpis jest wewnętrznie zbilansowany
+      for (const e of [e1, e2, e3]) {
+        if (e.posted) assertContractConformance(e.transaction)
+      }
+    })
+
+    it("niesymetryczny podział (1 + 1 + 121): Σ recognized == 23", () => {
+      const e1 = redeemEvent(1, 0) // round(23·1/123)=0 → no-op
+      const e2 = redeemEvent(1, 1) // round(23·2/123)=0 → no-op
+      const e3 = redeemEvent(121, 2) // round(23·123/123)−round(23·2/123)=23−0=23
+      const total = recognisedVat(e1) + recognisedVat(e2) + recognisedVat(e3)
+      expect(total).toBe(M_VAT)
+    })
+
+    it("redeem po 1 minor aż do pełna: Σ recognized == 23 (nigdy stranded)", () => {
+      let total = 0
+      for (let i = 0; i < M_GROSS; i++) {
+        total += recognisedVat(redeemEvent(1, i))
+      }
+      expect(total).toBe(M_VAT)
+    })
+
+    it("over-redeem (redeemed-to-date + ten event > brutto) ⇒ fail-closed", () => {
+      expect(() => redeemEvent(42, 82)).toThrow(VoucherPostingInvariantError) // 82+42=124 > 123
+    })
+
+    it("over-derecognition przy breakage (prior + remaining > brutto) ⇒ fail-closed", () => {
+      expect(() =>
+        generateVoucherPosting(
+          baseInput({
+            lifecycle_event: "EXPIRED",
+            vat_classification: "MPV",
+            net_minor: M_NET,
+            vat_minor: M_VAT,
+            redeemed_gross_to_date_minor: 100,
+            remaining_gross_minor: 24, // 100+24=124 > 123
+          })
+        )
+      ).toThrow(VoucherPostingInvariantError)
+    })
+
+    it("pełny lifecycle (2 partial redeemy + breakage reszty): suspense netuje do 0", () => {
+      // gross 123: redeem 41, redeem 41, breakage remaining 41.
+      const r1 = recognisedVat(redeemEvent(41, 0)) // 8
+      const r2 = recognisedVat(redeemEvent(41, 41)) // 7
+      const breakage = generateVoucherPosting(
+        baseInput({
+          lifecycle_event: "EXPIRED",
+          vat_classification: "MPV",
+          net_minor: M_NET,
+          vat_minor: M_VAT,
+          redeemed_gross_to_date_minor: 82,
+          remaining_gross_minor: 41,
+        })
+      )
+      const susp = expectPosted(breakage).lines.find(
+        (l) => l.account === VOUCHER_LEDGER_ACCOUNTS.VAT_OUTPUT_SUSPENSE
+      )!
+      // suspense zdjęty: r1+r2 (output) + breakage-suspense == 23 (zawieszone przy emisji)
+      expect(r1 + r2 + susp.debit_minor).toBe(M_VAT)
+    })
+  })
+
+  describe("LOW — edge cases (zero-line / case-variant cash)", () => {
+    it("breakage netRemaining==0 (saldo w całości VAT) ⇒ no-op, NIE linia zero/zero", () => {
+      // net=0, vat=50, gross=50, remaining=całość → netto remaining = 0.
+      const spv = generateVoucherPosting(
+        baseInput({
+          lifecycle_event: "EXPIRED",
+          vat_classification: "SPV",
+          net_minor: 0,
+          vat_minor: 50,
+          remaining_gross_minor: 50,
+        })
+      )
+      expect(spv.posted).toBe(false) // no-op zamiast assertBalanced crash
+
+      // MPV: netRemaining 0, ale rezydualny VAT 50 → 2 linie (suspense/breakage), NIE crash.
+      const mpv = generateVoucherPosting(
+        baseInput({
+          lifecycle_event: "EXPIRED",
+          vat_classification: "MPV",
+          net_minor: 0,
+          vat_minor: 50,
+          remaining_gross_minor: 50,
+        })
+      )
+      const tx = expectPosted(mpv)
+      assertContractConformance(tx)
+      expect(tx.lines.length).toBe(2)
+      expect(tx.lines.some((l) => l.account === VOUCHER_LEDGER_ACCOUNTS.CONTRACT_LIABILITY)).toBe(false)
+    })
+
+    it("guard klasyfikuje warianty wielkości liter konta pieniężnego jako money_account", () => {
+      for (const cash of ["CASH", "Cash", "Cash:settlement", "CASH_CLEARING:psp"]) {
+        expect(isMoneyAccount(cash)).toBe(true)
+        try {
+          assertPostingAccountsAllowed([{ account: cash }, { account: VOUCHER_LEDGER_ACCOUNTS.BREAKAGE }])
+          throw new Error("oczekiwano rzutu")
+        } catch (e) {
+          expect(e).toBeInstanceOf(VoucherPostingGuardError)
+          expect((e as VoucherPostingGuardError).kind).toBe("money_account")
         }
       }
     })
