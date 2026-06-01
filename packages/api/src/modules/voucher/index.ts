@@ -77,6 +77,14 @@ export type {
   AutoRedeemPolicy,
 } from "./models/entitlement"
 export {
+  VAT_CLASSIFICATION_SNAPSHOT_RULE,
+  resolveVatClassification,
+} from "./vat-resolver"
+export type {
+  ResolveVatClassificationInput,
+  VatClassification,
+} from "./vat-resolver"
+export {
   ENTITLEMENT_BOUNDARY,
   LOST_CODE_REISSUE_WINDOW_DAYS,
   RETENTION_AMOUNT_PCT_MIN,
