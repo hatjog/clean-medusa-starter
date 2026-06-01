@@ -84,6 +84,22 @@ export type {
   ResolveVatClassificationInput,
   VatClassification,
 } from "./vat-resolver"
+// Story 2.4: read-only telemetry capability over entitlement lifecycle events.
+export {
+  LNE_EARLY_WARN_RATIO,
+  LNE_THRESHOLD_EUR_MINOR,
+  redemptionVelocity,
+  rollingVolumeLNE,
+} from "./telemetry"
+export type {
+  RedemptionVelocityBucket,
+  RedemptionVelocityOptions,
+  RedemptionVelocityResult,
+  RollingVolumeLNEOptions,
+  RollingVolumeLNEResult,
+  VoucherTelemetryEvent,
+  VoucherTelemetryLifecycle,
+} from "./telemetry"
 // Story 2.3: posting profile voucher_liability_only_v1 (AUTHORED, runtime_enabled:FALSE
 // per ADR-133 §P6 — eksport dostarcza ZDOLNOŚĆ, NIE aktywuje profilu w runtime).
 export {
