@@ -18,6 +18,10 @@ export type VoucherTelemetryEvent = {
   currency?: string
   amount_minor?: number
   gross_minor?: number
+  /** Brutto wyemitowane vouchera (face value) — alias źródła wolumenu LNE; patrz `voucher.value_minor`. */
+  face_value_minor?: number
+  /** Wartość vouchera w minor units (`voucher.value_minor`) — alias brutto. */
+  value_minor?: number
   is_lne?: boolean
   lne?: boolean
   regulatory_model?: string
@@ -56,7 +60,13 @@ export type RollingVolumeLNEResult = {
   profile: string
   window: {
     start_at: string
-    start_inclusive: true
+    /**
+     * Okno rolling-12m jest PÓŁOTWARTE `(start, asOf]` — początek EKSKLUZYWNY,
+     * koniec INKLUZYWNY (standard rolling-window). Dzięki temu event dokładnie na
+     * granicy `windowStart` NIE jest liczony dwukrotnie w dwóch sąsiednich
+     * przebiegach raportowania (eliminuje double-count w czasie; review MEDIUM).
+     */
+    start_inclusive: false
     end_at: string
     end_inclusive: true
   }
@@ -73,13 +83,25 @@ export type RollingVolumeLNEResult = {
   alert: boolean
   events_included_count: number
   data_quality: {
+    /**
+     * Eventy bez `posting_profile` doliczone do KAŻDEGO odpytywanego profilu
+     * (fail-safe: niejasny profil nie ukrywa wolumenu). Licznik jest ROZŁĄCZNY —
+     * konsument (6.4) sumujący wolumeny per-profil MUSI odjąć te eventy, by
+     * uniknąć cross-profil over-count (review LOW).
+     */
     ambiguous_profile_included_count: number
     ambiguous_lne_scope_included_count: number
     ambiguous_lifecycle_included_count: number
     ambiguous_currency_included_count: number
     non_eur_currency_included_count: number
+    /** Eventy non-EUR przeliczone na EUR po wstrzykniętym kursie referencyjnym. */
+    fx_converted_count: number
+    /** Eventy non-EUR BEZ dostępnego kursu FX → fail-safe (alert), NIE sumowane jako EUR. */
+    non_eur_missing_fx_count: number
     unknown_timestamp_included_count: number
     fail_safe_missing_amount_count: number
+    /** Duplikaty ISSUED (ten sam `entitlement_id`) pominięte — replay-safe, spójne z velocity. */
+    duplicate_issued_skipped_count: number
     explicit_non_lne_excluded_count: number
     events_outside_window_count: number
     events_skipped_profile_count: number
@@ -96,6 +118,17 @@ export type RollingVolumeLNEOptions = {
   asOf: string | number | Date
   threshold_minor?: number
   early_warn_ratio?: number
+  /**
+   * Tabela kursów referencyjnych do EUR (DI — deterministyczna, np. EBC/NBP na
+   * `asOf`): `{ "PLN": 0.23, "GBP": 1.17 }` = wartość 1 jednostki waluty w EUR.
+   * Próg LNE jest stricte EUR (ADR-134), platforma operuje domyślnie w PLN, więc
+   * kwoty non-EUR MUSZĄ być przeliczone PRZED sumowaniem. Założenie: jednakowa
+   * liczba miejsc po przecinku (minor exponent = 2) dla EUR/PLN/GBP — kurs major
+   * stosowany wprost do minor units. Brak kursu dla waluty non-EUR (lub waluta
+   * nieznana/`null`) ⇒ event NIE jest sumowany jako EUR, lecz wymusza fail-safe
+   * (alert) — nigdy ciche dodanie groszy jako eurocentów (review HIGH-2/VER-H1).
+   */
+  fx_rates_to_eur?: Readonly<Record<string, number>>
 }
 
 const DAY_MS = 24 * 60 * 60 * 1000
@@ -241,8 +274,11 @@ export function rollingVolumeLNE(
     ambiguous_lifecycle_included_count: 0,
     ambiguous_currency_included_count: 0,
     non_eur_currency_included_count: 0,
+    fx_converted_count: 0,
+    non_eur_missing_fx_count: 0,
     unknown_timestamp_included_count: 0,
     fail_safe_missing_amount_count: 0,
+    duplicate_issued_skipped_count: 0,
     explicit_non_lne_excluded_count: 0,
     events_outside_window_count: 0,
     events_skipped_profile_count: 0,
@@ -251,6 +287,9 @@ export function rollingVolumeLNE(
   let volumeMinor = 0
   let includedCount = 0
   let failSafeAlert = false
+  // Dedup ISSUED per entitlement_id (VER-M1) — spójne z redemptionVelocity.
+  // At-least-once feed/replay nie może zawyżyć wolumenu regulacyjnego.
+  const seenIssued = new Set<string>()
 
   for (const event of events) {
     const normalized = normalizeEvent(event)
@@ -276,34 +315,60 @@ export function rollingVolumeLNE(
       dataQuality.ambiguous_lne_scope_included_count += 1
     }
 
+    // Okno PÓŁOTWARTE `(start, asOf]`: początek ekskluzywny, koniec inkluzywny
+    // (eliminuje double-count eventu na granicy między sąsiednimi przebiegami).
     if (normalized.timestampMs == null) {
       dataQuality.unknown_timestamp_included_count += 1
     } else if (
-      normalized.timestampMs < windowStartMs ||
+      normalized.timestampMs <= windowStartMs ||
       normalized.timestampMs > asOfMs
     ) {
       dataQuality.events_outside_window_count += 1
       continue
     }
 
-    if (normalized.currency == null) {
-      dataQuality.ambiguous_currency_included_count += 1
-    } else if (normalized.currency !== "EUR") {
-      dataQuality.non_eur_currency_included_count += 1
+    // Dedup po przejściu bramek profile/lifecycle/lne/window: duplikat ISSUED
+    // tego samego entitlementu jest pomijany (replay-safe). Eventy bez
+    // entitlement_id nie są deduplikowane (każdy liczony — fail-safe ku alertowi).
+    if (normalized.entitlementId != null) {
+      if (seenIssued.has(normalized.entitlementId)) {
+        dataQuality.duplicate_issued_skipped_count += 1
+        continue
+      }
+      seenIssued.add(normalized.entitlementId)
     }
 
     includedCount += 1
 
-    if (normalized.amountMinor == null) {
+    // VER-M2: brak kwoty LUB kwota 0 (bez dodatniego brutto) jest niejednoznaczna
+    // dla progu LNE → fail-safe (alert), nigdy ciche under-count jako 0.
+    if (normalized.amountMinor == null || normalized.amountMinor === 0) {
       dataQuality.fail_safe_missing_amount_count += 1
       failSafeAlert = true
       continue
     }
 
-    volumeMinor += normalized.amountMinor
+    // HIGH-2/VER-H1: przelicz na EUR PRZED sumowaniem; brak kursu / waluta
+    // nieznana ⇒ fail-safe (alert), nie ciche dodanie do sumy EUR.
+    const eurMinor = convertToEurMinor(
+      normalized.currency,
+      normalized.amountMinor,
+      options.fx_rates_to_eur,
+      dataQuality
+    )
+    if (eurMinor == null) {
+      failSafeAlert = true
+      continue
+    }
+
+    volumeMinor += eurMinor
   }
 
   const earlyWarnMinor = Math.ceil(thresholdMinor * earlyWarnRatio)
+  // Próg `alert` jest ściśle `>` (regulacyjne „przekroczenie" 1 mln EUR; story
+  // AC2 / ADR-134 — LNE art. 6c UUP). `early_warn` (≥80%) i fail-safe i tak
+  // zapalają się wcześniej, więc dokładny grosz == próg daje early_warn bez
+  // twardego alertu — świadomy, udokumentowany wybór (review MEDIUM `>` vs `≥`).
   const alert = volumeMinor > thresholdMinor || failSafeAlert
   const earlyWarn = volumeMinor >= earlyWarnMinor || alert
 
@@ -311,7 +376,7 @@ export function rollingVolumeLNE(
     profile: options.profile,
     window: {
       start_at: toIso(windowStartMs),
-      start_inclusive: true,
+      start_inclusive: false,
       end_at: toIso(asOfMs),
       end_inclusive: true,
     },
@@ -333,14 +398,7 @@ export function rollingVolumeLNE(
 
 function normalizeEvent(event: VoucherTelemetryEvent): NormalizedEvent {
   const lifecycle = normalizeLifecycle(event)
-  const amountMinor = readInteger(
-    event.amount_minor,
-    readPayload(event, "amount_minor"),
-    readMetadata(event, "amount_minor"),
-    event.gross_minor,
-    readPayload(event, "gross_minor"),
-    readMetadata(event, "gross_minor")
-  )
+  const amountMinor = readVolumeMinor(event)
 
   return {
     lifecycle,
@@ -471,22 +529,30 @@ function isCompletedRedeem(event: VoucherTelemetryEvent): boolean {
     return remainingMinor === 0
   }
 
+  // Domyślnie `true`: kanoniczny event `gp.entitlements.entitlement_redeemed.v1`
+  // ZAWSZE niesie `new_status` + `remaining_minor_after`, więc partial jest
+  // rozpoznawany explicite powyżej. Default dotyczy wyłącznie eventów bez tych
+  // pól (legacy/niepełne) — REDEEMED bez sygnału partial = pełny redeem (review LOW).
   return true
 }
 
 function classifyLne(event: VoucherTelemetryEvent): "yes" | "no" | "unknown" {
-  const boolFlag = readBoolean(
+  // Konflikt flag (np. top-level `is_lne:false` vs `payload.is_lne:true`):
+  // INKLUZJA wygrywa — dowolne źródło `true` ⇒ LNE (fail-safe ku monitoringowi
+  // progu KNF; review LOW). `false` tylko gdy ŻADNE źródło nie twierdzi `true`.
+  const booleans = [
     event.is_lne,
     event.lne,
     readPayload(event, "is_lne"),
     readPayload(event, "lne"),
     readMetadata(event, "is_lne"),
-    readMetadata(event, "lne")
-  )
-  if (boolFlag === true) {
+    readMetadata(event, "lne"),
+  ].filter((value): value is boolean => typeof value === "boolean")
+
+  if (booleans.some((value) => value === true)) {
     return "yes"
   }
-  if (boolFlag === false) {
+  if (booleans.some((value) => value === false)) {
     return "no"
   }
 
@@ -630,11 +696,76 @@ function readInteger(...values: unknown[]): number | null {
   return null
 }
 
-function readBoolean(...values: unknown[]): boolean | null {
-  for (const value of values) {
-    if (typeof value === "boolean") {
-      return value
+/**
+ * Wolumen LNE = BRUTTO WYEMITOWANE vouchera (stored-value, ADR-134). Źródła w
+ * kolejności preferencji brutto: `gross_minor` / `face_value_minor` / `value_minor`
+ * (`voucher.value_minor`), a dopiero potem `amount_minor` (pole kanonicznego eventu
+ * `gp.entitlements.entitlement_issued.v1` = kwota wyemitowana). Czytamy z top-level
+ * / `payload` / `metadata` i bierzemy MAKSIMUM dostępnych kandydatów — dzięki temu
+ * `amount_minor:0` maskujące dodatnie `gross_minor` NIE zaniża wolumenu (VER-M2),
+ * a kierunek niejednoznaczności jest ku wyższej sumie (fail-safe ku alertowi;
+ * review LOW „amount source").
+ *
+ * UWAGA (HIGH-1): kanoniczny envelope `ledger-transaction.v1` dla ENTITLEMENT_ISSUED
+ * niesie w `lines[]` WYŁĄCZNIE carve-out VAT (debet liability = `vat_minor`), NIE
+ * brutto stored-value (noga rozpoznania brutto żyje w money-ledger / Story 2.5).
+ * Taki envelope nie ma żadnego z pól brutto powyżej ⇒ `null` ⇒ ścieżka fail-safe
+ * w `rollingVolumeLNE` (alert, nie ciche `volume=0`). Brutto pochodzi z domenowego
+ * eventu lifecycle `entitlement_issued.v1` (`payload.amount_minor`).
+ */
+function readVolumeMinor(event: VoucherTelemetryEvent): number | null {
+  const candidates = [
+    event.gross_minor,
+    readPayload(event, "gross_minor"),
+    readMetadata(event, "gross_minor"),
+    event.face_value_minor,
+    readPayload(event, "face_value_minor"),
+    readMetadata(event, "face_value_minor"),
+    event.value_minor,
+    readPayload(event, "value_minor"),
+    readMetadata(event, "value_minor"),
+    event.amount_minor,
+    readPayload(event, "amount_minor"),
+    readMetadata(event, "amount_minor"),
+  ]
+  let max: number | null = null
+  for (const value of candidates) {
+    if (typeof value === "number" && Number.isInteger(value) && value >= 0) {
+      if (max == null || value > max) {
+        max = value
+      }
     }
   }
+  return max
+}
+
+/**
+ * Przelicza kwotę minor w danej walucie na EUR-minor wg wstrzykniętej tabeli FX
+ * (HIGH-2/VER-H1). Zwraca `null` (sygnał fail-safe dla wołającego), gdy waluta jest
+ * nieznana (`null`) albo non-EUR bez dostępnego kursu — wtedy kwoty NIE wolno
+ * dodać do sumy EUR (próg LNE jest stricte EUR; ADR-134). EUR zwracane wprost.
+ */
+function convertToEurMinor(
+  currency: string | null,
+  amountMinor: number,
+  fxRates: Readonly<Record<string, number>> | undefined,
+  dataQuality: RollingVolumeLNEResult["data_quality"]
+): number | null {
+  if (currency == null) {
+    dataQuality.ambiguous_currency_included_count += 1
+    return null
+  }
+  if (currency === "EUR") {
+    return amountMinor
+  }
+
+  dataQuality.non_eur_currency_included_count += 1
+  const rate = fxRates?.[currency]
+  if (typeof rate === "number" && Number.isFinite(rate) && rate > 0) {
+    dataQuality.fx_converted_count += 1
+    return Math.round(amountMinor * rate)
+  }
+
+  dataQuality.non_eur_missing_fx_count += 1
   return null
 }

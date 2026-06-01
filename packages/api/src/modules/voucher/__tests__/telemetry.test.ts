@@ -138,17 +138,21 @@ describe("voucher telemetry redemptionVelocity", () => {
 })
 
 describe("voucher telemetry rollingVolumeLNE", () => {
-  it("uses an inclusive 12-month UTC rolling window and excludes events just outside it", () => {
+  it("uses a half-open (start, asOf] 12-month UTC rolling window — start exclusive, end inclusive", () => {
     const asOf = "2026-06-01T12:00:00Z"
-    const boundary = "2025-06-01T12:00:00Z"
-    const justBeforeBoundary = "2025-06-01T11:59:59.999Z"
+    const windowStart = "2025-06-01T12:00:00Z"
+    const justAfterStart = "2025-06-01T12:00:00.001Z"
     const justAfterAsOf = "2026-06-01T12:00:00.001Z"
 
     const result = rollingVolumeLNE(
       [
-        issued("ent_before", justBeforeBoundary, 100_00),
-        issued("ent_boundary", boundary, 200_00),
+        // start EKSKLUZYWNY: event dokładnie na windowStart NIE jest liczony
+        // (eliminuje double-count na granicy między sąsiednimi przebiegami).
+        issued("ent_at_start", windowStart, 100_00),
+        issued("ent_just_after_start", justAfterStart, 200_00),
         issued("ent_inside", "2026-02-01T00:00:00+01:00", 300_00),
+        // koniec INKLUZYWNY: event dokładnie na asOf jest liczony.
+        issued("ent_at_asof", asOf, 150_00),
         issued("ent_after", justAfterAsOf, 400_00),
       ],
       { profile: PROFILE, asOf }
@@ -156,12 +160,14 @@ describe("voucher telemetry rollingVolumeLNE", () => {
 
     expect(result.window).toEqual({
       start_at: "2025-06-01T12:00:00.000Z",
-      start_inclusive: true,
+      start_inclusive: false,
       end_at: "2026-06-01T12:00:00.000Z",
       end_inclusive: true,
     })
-    expect(result.volume).toEqual({ currency: "EUR", minor: 500_00 })
-    expect(result.events_included_count).toBe(2)
+    // included = just-after-start (200_00) + inside (300_00) + at-asOf (150_00)
+    expect(result.volume).toEqual({ currency: "EUR", minor: 650_00 })
+    expect(result.events_included_count).toBe(3)
+    expect(result.data_quality.events_outside_window_count).toBe(2)
   })
 
   it("sets early_warn at 80 percent and alert only above 1M EUR", () => {
@@ -245,5 +251,228 @@ describe("voucher telemetry rollingVolumeLNE", () => {
     const options = { profile: PROFILE, asOf: "2026-06-01T00:00:00Z" }
 
     expect(rollingVolumeLNE(events, options)).toEqual(rollingVolumeLNE(events, options))
+  })
+})
+
+describe("voucher telemetry rollingVolumeLNE — real canonical event shapes (HIGH-1)", () => {
+  // Dokładny kształt z specs/contracts/events/examples/entitlement_issued.example.json
+  // (gp.entitlements.entitlement_issued.v1): brutto = payload.amount_minor, waluta
+  // = payload.currency (PLN), occurred_at top-level; BEZ is_lne/posting_profile.
+  const canonicalDomainIssued: VoucherTelemetryEvent = {
+    schema_version: "1",
+    event_type: "gp.entitlements.entitlement_issued.v1",
+    occurred_at: "2026-01-31T12:01:00Z",
+    actor: "system",
+    scope: {
+      instance_id: "gp-dev",
+      market_id: "pl",
+      vendor_id: "vendor_abc",
+      location_id: "loc_001",
+    },
+    idempotency_key: "entitlement:ent_001",
+    payload: {
+      entitlement_id: "ent_001",
+      order_id: "ord_123",
+      payment_id: "pay_123",
+      line_item_id: "li_001",
+      entitlement_type: "VOUCHER_AMOUNT",
+      currency: "PLN",
+      amount_minor: 19900,
+      items_count: 1,
+    },
+  }
+
+  it("PoC: real domain entitlement_issued.v1 event yields volume>0 (FX PLN→EUR), not vacuous 0", () => {
+    const result = rollingVolumeLNE([canonicalDomainIssued], {
+      profile: PROFILE,
+      asOf: "2026-06-01T00:00:00Z",
+      fx_rates_to_eur: { PLN: 0.23 },
+    })
+
+    // 19900 grosz * 0.23 = 4577 EUR-minor — wolumen jest NIEZEROWY i policzony
+    // z realnego pola payload.amount_minor (nie z wymyślonego kształtu).
+    expect(result.volume).toEqual({ currency: "EUR", minor: 4577 })
+    expect(result.events_included_count).toBe(1)
+    expect(result.alert).toBe(false)
+    expect(result.data_quality.fail_safe_missing_amount_count).toBe(0)
+    expect(result.data_quality.fx_converted_count).toBe(1)
+    // brak posting_profile w domenowym evencie → fail-safe include
+    expect(result.data_quality.ambiguous_profile_included_count).toBe(1)
+    // brak is_lne/regulatory_model → unknown → include (monitoring fail-safe)
+    expect(result.data_quality.ambiguous_lne_scope_included_count).toBe(1)
+  })
+
+  it("canonical ledger-transaction.v1 ENTITLEMENT_ISSUED VAT carve-out has no gross → fail-safe (not silent 0)", () => {
+    // Dokładny kształt z specs/contracts/ledger/examples/
+    // ledger-transaction.v1.entitlement_issued.example.json — lines[] niosą TYLKO
+    // carve-out VAT (debet liability=2300 / kredyt vat:output:emission=2300),
+    // brutto stored-value NIE istnieje w entitlement-ledgerze (money-ledger / 2.5).
+    const ledgerIssued: VoucherTelemetryEvent = {
+      transaction_id: "ltx_entitlement_2001",
+      occurred_at: "2026-01-31T09:15:00Z",
+      scope: { instance_id: "gp-dev", market_id: "pl" },
+      currency: "PLN",
+      entry_type: "ENTITLEMENT_ISSUED",
+      lines: [
+        {
+          ledger_entry_id: "le_2001",
+          account: "liability:contract_liability:voucher",
+          debit_minor: 2300,
+          credit_minor: 0,
+        },
+        {
+          ledger_entry_id: "le_2002",
+          account: "vat:output:emission",
+          debit_minor: 0,
+          credit_minor: 2300,
+        },
+      ],
+      metadata: {
+        posting_profile: "voucher_liability_only_v1",
+        vat_classification: "SPV",
+        lifecycle_event: "ISSUED",
+      },
+    }
+
+    const result = rollingVolumeLNE([ledgerIssued], {
+      profile: PROFILE,
+      asOf: "2026-06-01T00:00:00Z",
+      fx_rates_to_eur: { PLN: 0.23 },
+    })
+
+    expect(result.volume.minor).toBe(0)
+    expect(result.alert).toBe(true)
+    expect(result.data_quality.fail_safe_missing_amount_count).toBe(1)
+    // profil dopasowany z metadata.posting_profile (nie pominięty)
+    expect(result.data_quality.events_skipped_profile_count).toBe(0)
+    expect(result.data_quality.ambiguous_profile_included_count).toBe(0)
+  })
+})
+
+describe("voucher telemetry rollingVolumeLNE — FX/fail-safe non-EUR (HIGH-2/VER-H1)", () => {
+  const gbpIssued = (id: string, amountMinor: number): VoucherTelemetryEvent => ({
+    event_type: "gp.entitlements.entitlement_issued.v1",
+    occurred_at: "2026-05-01T00:00:00Z",
+    posting_profile: PROFILE,
+    payload: {
+      entitlement_id: id,
+      currency: "GBP",
+      amount_minor: amountMinor,
+      is_lne: true,
+    },
+  })
+
+  it("PoC: 900k GBP without FX rate fails safe (alert) — never silently under-counts an LNE breach", () => {
+    const result = rollingVolumeLNE([gbpIssued("ent_gbp", 900_000_00)], {
+      profile: PROFILE,
+      asOf: "2026-06-01T00:00:00Z",
+    })
+
+    expect(result.alert).toBe(true)
+    expect(result.volume.minor).toBe(0)
+    expect(result.data_quality.non_eur_missing_fx_count).toBe(1)
+  })
+
+  it("PoC: 900k GBP with FX → ~1.05M EUR → alert via converted volume", () => {
+    const result = rollingVolumeLNE([gbpIssued("ent_gbp", 900_000_00)], {
+      profile: PROFILE,
+      asOf: "2026-06-01T00:00:00Z",
+      fx_rates_to_eur: { GBP: 1.17 },
+    })
+
+    // 90_000_000 minor * 1.17 = 105_300_000 EUR-minor > 100_000_000 próg
+    expect(result.volume.minor).toBe(105_300_000)
+    expect(result.alert).toBe(true)
+    expect(result.data_quality.fx_converted_count).toBe(1)
+    expect(result.data_quality.non_eur_missing_fx_count).toBe(0)
+  })
+})
+
+describe("voucher telemetry rollingVolumeLNE — dedup + zero-amount (VER-M1/VER-M2 + LOW)", () => {
+  it("VER-M1: deduplicates replayed ISSUED per entitlement_id (no inflated volume / false alert)", () => {
+    const result = rollingVolumeLNE(
+      [
+        issued("ent_dup", "2026-05-01T00:00:00Z", 60_000_000),
+        // replay tego samego ISSUED (at-least-once feed) — NIE może podwoić wolumenu
+        issued("ent_dup", "2026-05-02T00:00:00Z", 60_000_000),
+      ],
+      { profile: PROFILE, asOf: "2026-06-01T00:00:00Z" }
+    )
+
+    expect(result.volume.minor).toBe(60_000_000)
+    expect(result.alert).toBe(false)
+    expect(result.data_quality.duplicate_issued_skipped_count).toBe(1)
+    expect(result.events_included_count).toBe(1)
+  })
+
+  it("VER-M2: amount_minor 0 masking a positive gross_minor uses the gross (no under-count)", () => {
+    const result = rollingVolumeLNE(
+      [
+        {
+          event_type: "gp.entitlements.entitlement_issued.v1",
+          occurred_at: "2026-05-01T00:00:00Z",
+          posting_profile: PROFILE,
+          payload: {
+            entitlement_id: "ent_zero_gross",
+            currency: "EUR",
+            amount_minor: 0,
+            gross_minor: 200_000_000,
+            is_lne: true,
+          },
+        },
+      ],
+      { profile: PROFILE, asOf: "2026-06-01T00:00:00Z" }
+    )
+
+    expect(result.volume.minor).toBe(200_000_000)
+    expect(result.alert).toBe(true)
+    expect(result.data_quality.fail_safe_missing_amount_count).toBe(0)
+  })
+
+  it("VER-M2: amount_minor 0 with no gross is ambiguous → fail-safe (alert)", () => {
+    const result = rollingVolumeLNE(
+      [
+        {
+          event_type: "gp.entitlements.entitlement_issued.v1",
+          occurred_at: "2026-05-01T00:00:00Z",
+          posting_profile: PROFILE,
+          payload: {
+            entitlement_id: "ent_zero",
+            currency: "EUR",
+            amount_minor: 0,
+            is_lne: true,
+          },
+        },
+      ],
+      { profile: PROFILE, asOf: "2026-06-01T00:00:00Z" }
+    )
+
+    expect(result.volume.minor).toBe(0)
+    expect(result.alert).toBe(true)
+    expect(result.data_quality.fail_safe_missing_amount_count).toBe(1)
+  })
+
+  it("LOW: conflicting is_lne (top false vs payload true) resolves to LNE inclusion (fail-safe)", () => {
+    const result = rollingVolumeLNE(
+      [
+        {
+          event_type: "gp.entitlements.entitlement_issued.v1",
+          occurred_at: "2026-05-01T00:00:00Z",
+          posting_profile: PROFILE,
+          is_lne: false,
+          payload: {
+            entitlement_id: "ent_conflict",
+            currency: "EUR",
+            amount_minor: 50_000_000,
+            is_lne: true,
+          },
+        },
+      ],
+      { profile: PROFILE, asOf: "2026-06-01T00:00:00Z" }
+    )
+
+    expect(result.volume.minor).toBe(50_000_000)
+    expect(result.data_quality.explicit_non_lne_excluded_count).toBe(0)
+    expect(result.data_quality.ambiguous_lne_scope_included_count).toBe(0)
   })
 })
