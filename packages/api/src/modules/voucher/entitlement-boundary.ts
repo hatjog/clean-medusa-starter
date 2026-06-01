@@ -105,6 +105,19 @@ export const KYBC_VERIFICATION_METHODS = ["a_plus_c", "a", "c"] as const
 export type KybcVerificationMethod =
   (typeof KYBC_VERIFICATION_METHODS)[number]
 
+/** Required `policy.kybc` fields for vendor KYBC completeness (DSA art. 30). */
+export const KYBC_REQUIRED_FIELDS = [
+  "traceability_required",
+  "legal_name_collected",
+  "registration_number_collected",
+  "contact_details_collected",
+  "payment_account_collected",
+  "self_certification_collected",
+  "verification_method",
+  "retention_months",
+] as const
+export type KybcRequiredField = (typeof KYBC_REQUIRED_FIELDS)[number]
+
 /** Allowed `policy.regulatory_basis.kind` values (EMI — ADR-134 capability). */
 export const REGULATORY_BASIS_KINDS = [
   "emi_license_ref",
@@ -168,6 +181,8 @@ export const ENTITLEMENT_BOUNDARY = {
     kybc: {
       /** Allowed KYBC verification methods (DSA art. 30). */
       verification_method: KYBC_VERIFICATION_METHODS,
+      /** Required KYBC fields when a vendor profile declares `policy.kybc`. */
+      required_fields: KYBC_REQUIRED_FIELDS,
       /** KYBC data retention floor (months, inclusive minimum). */
       retention_months_min: 6,
     },
@@ -472,6 +487,15 @@ export function checkPolicyAgainstBoundary(
 
   const kybc = policy.kybc as Record<string, unknown> | undefined
   if (kybc) {
+    const missing = B.policy.kybc.required_fields.filter(
+      (field) => kybc[field] === undefined
+    )
+    if (missing.length > 0) {
+      v.push({
+        field: "policy.kybc",
+        message: `kybc missing required fields for DSA art. 30 (FR50.6): [${missing.join(", ")}]`,
+      })
+    }
     if (
       kybc.verification_method !== undefined &&
       !inEnum(B.policy.kybc.verification_method, kybc.verification_method)
