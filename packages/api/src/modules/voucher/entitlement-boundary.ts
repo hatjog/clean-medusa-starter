@@ -58,6 +58,60 @@ export const REFUND_CHANNELS = [
 ] as const
 export type RefundChannel = (typeof REFUND_CHANNELS)[number]
 
+// ---------------------------------------------------------------------------
+// v1.11.0 Story 1.1 / ADR-136 D-9 — policy-extension enum SSOT (3-copy / NFR4).
+//
+// Each `export const ... as const` below is a single-source mirror of the
+// matching Python tuple in `_grow/tools/validate_entitlement_profiles.py`.
+// Set-equality is enforced by `validate_entitlement_boundary_parity.py`
+// (extend its CONSTANTS tuple when adding a new pair here). Drift between these
+// two files is the most common defect class (cc-2-voucher-coherence).
+// ---------------------------------------------------------------------------
+
+/** Allowed `policy.bonus.mode` values (ADR-136 §Decyzja pkt 1). */
+export const BONUS_MODES = [
+  "none",
+  "balance_topup",
+  "separate_grant",
+  "in_kind",
+] as const
+export type BonusMode = (typeof BONUS_MODES)[number]
+
+/** Allowed `policy.withdrawal.basis` values (research §6.2 — art. 38 pkt 1). */
+export const WITHDRAWAL_BASIS_VALUES = [
+  "art_38_pkt_1_full_performance",
+] as const
+export type WithdrawalBasis = (typeof WITHDRAWAL_BASIS_VALUES)[number]
+
+/** Allowed `policy.withdrawal.terminating_event` values. */
+export const WITHDRAWAL_TERMINATING_EVENTS = ["REDEEMED_FULL"] as const
+export type WithdrawalTerminatingEvent =
+  (typeof WITHDRAWAL_TERMINATING_EVENTS)[number]
+
+/**
+ * Allowed `policy.on_expiry_convert_to` values. Forfeiture/przepadek is
+ * deliberately absent — it is an abusive clause (art. 385¹ KC) and the
+ * defensive FAIL lives in Story 1.2, not here.
+ */
+export const ON_EXPIRY_CONVERT_TARGETS = [
+  "extend",
+  "refund",
+  "store_credit",
+] as const
+export type OnExpiryConvertTarget = (typeof ON_EXPIRY_CONVERT_TARGETS)[number]
+
+/** Allowed `policy.kybc.verification_method` values (DSA art. 30 — a+c). */
+export const KYBC_VERIFICATION_METHODS = ["a_plus_c", "a", "c"] as const
+export type KybcVerificationMethod =
+  (typeof KYBC_VERIFICATION_METHODS)[number]
+
+/** Allowed `policy.regulatory_basis.kind` values (EMI — ADR-134 capability). */
+export const REGULATORY_BASIS_KINDS = [
+  "emi_license_ref",
+  "emi_agent_ref",
+] as const
+export type RegulatoryBasisKind = (typeof REGULATORY_BASIS_KINDS)[number]
+
 /**
  * Hardcoded GP platform boundary. Numeric fields are inclusive bounds; enum
  * fields list the only permitted values. A Layer 3 profile violates the
@@ -93,6 +147,34 @@ export const ENTITLEMENT_BOUNDARY = {
     transferability: TRANSFERABILITY_VALUES,
     /** Allowed refund channel enum values. */
     refund_channel: REFUND_CHANNELS,
+    // --- v1.11.0 Story 1.1 / ADR-136 D-9 additions ---
+    withdrawal: {
+      basis: WITHDRAWAL_BASIS_VALUES,
+      terminating_event: WITHDRAWAL_TERMINATING_EVENTS,
+    },
+    renewal: {
+      /** reminder_before_renewal_days domain [1, 90]. */
+      reminder_days_min: 1,
+      reminder_days_max: 90,
+    },
+    bonus: {
+      /** Allowed bonus mode enum values. */
+      mode: BONUS_MODES,
+    },
+    /** reissue validity floor (days, inclusive minimum). */
+    reissue_validity_floor_days_min: 30,
+    /** Allowed on_expiry conversion targets (forfeiture excluded). */
+    on_expiry_convert_to: ON_EXPIRY_CONVERT_TARGETS,
+    kybc: {
+      /** Allowed KYBC verification methods (DSA art. 30). */
+      verification_method: KYBC_VERIFICATION_METHODS,
+      /** KYBC data retention floor (months, inclusive minimum). */
+      retention_months_min: 6,
+    },
+    regulatory_basis: {
+      /** Allowed regulatory basis kinds (EMI). */
+      kind: REGULATORY_BASIS_KINDS,
+    },
   },
 } as const
 
@@ -312,6 +394,121 @@ export function checkPolicyAgainstBoundary(
       })
     }
   }
+
+  // --- v1.11.0 Story 1.1 / ADR-136 D-9 — new policy fields (mirror of the
+  //     Python governance gate `_check_policy_boundary`). Pure + enum/bound
+  //     checks only; absent fields are a no-op (additive, optional). ---
+  const inEnum = (vals: readonly string[], x: unknown): boolean =>
+    vals.includes(x as string)
+
+  const withdrawal = policy.withdrawal as Record<string, unknown> | undefined
+  if (withdrawal) {
+    if (
+      withdrawal.basis !== undefined &&
+      !inEnum(WITHDRAWAL_BASIS_VALUES, withdrawal.basis)
+    ) {
+      v.push({
+        field: "policy.withdrawal.basis",
+        message: `withdrawal.basis '${String(withdrawal.basis)}' not in [${WITHDRAWAL_BASIS_VALUES.join(", ")}]`,
+      })
+    }
+    if (
+      withdrawal.terminating_event !== undefined &&
+      !inEnum(WITHDRAWAL_TERMINATING_EVENTS, withdrawal.terminating_event)
+    ) {
+      v.push({
+        field: "policy.withdrawal.terminating_event",
+        message: `withdrawal.terminating_event '${String(withdrawal.terminating_event)}' not in [${WITHDRAWAL_TERMINATING_EVENTS.join(", ")}]`,
+      })
+    }
+  }
+
+  const renewal = policy.renewal as Record<string, unknown> | undefined
+  if (renewal && renewal.reminder_before_renewal_days !== undefined) {
+    const rd = num(renewal.reminder_before_renewal_days)
+    if (
+      rd === undefined ||
+      rd < B.policy.renewal.reminder_days_min ||
+      rd > B.policy.renewal.reminder_days_max
+    ) {
+      v.push({
+        field: "policy.renewal.reminder_before_renewal_days",
+        message: `renewal.reminder_before_renewal_days ${String(renewal.reminder_before_renewal_days)} outside [${B.policy.renewal.reminder_days_min}, ${B.policy.renewal.reminder_days_max}]`,
+      })
+    }
+  }
+
+  const bonus = policy.bonus as Record<string, unknown> | undefined
+  if (
+    bonus &&
+    bonus.mode !== undefined &&
+    !inEnum(B.policy.bonus.mode, bonus.mode)
+  ) {
+    v.push({
+      field: "policy.bonus.mode",
+      message: `bonus.mode '${String(bonus.mode)}' not in [${B.policy.bonus.mode.join(", ")}]`,
+    })
+  }
+
+  if (policy.reissue_validity_floor_days !== undefined) {
+    const rf = num(policy.reissue_validity_floor_days)
+    if (rf === undefined || rf < B.policy.reissue_validity_floor_days_min) {
+      v.push({
+        field: "policy.reissue_validity_floor_days",
+        message: `reissue_validity_floor_days ${String(policy.reissue_validity_floor_days)} below minimum ${B.policy.reissue_validity_floor_days_min}`,
+      })
+    }
+  }
+
+  if (
+    policy.on_expiry_convert_to !== undefined &&
+    !inEnum(B.policy.on_expiry_convert_to, policy.on_expiry_convert_to)
+  ) {
+    v.push({
+      field: "policy.on_expiry_convert_to",
+      message: `on_expiry_convert_to '${String(policy.on_expiry_convert_to)}' not in [${B.policy.on_expiry_convert_to.join(", ")}] (forfeiture excluded — defensive FAIL in Story 1.2)`,
+    })
+  }
+
+  const kybc = policy.kybc as Record<string, unknown> | undefined
+  if (kybc) {
+    if (
+      kybc.verification_method !== undefined &&
+      !inEnum(B.policy.kybc.verification_method, kybc.verification_method)
+    ) {
+      v.push({
+        field: "policy.kybc.verification_method",
+        message: `kybc.verification_method '${String(kybc.verification_method)}' not in [${B.policy.kybc.verification_method.join(", ")}]`,
+      })
+    }
+    if (kybc.retention_months !== undefined) {
+      const rm = num(kybc.retention_months)
+      if (rm === undefined || rm < B.policy.kybc.retention_months_min) {
+        v.push({
+          field: "policy.kybc.retention_months",
+          message: `kybc.retention_months ${String(kybc.retention_months)} below minimum ${B.policy.kybc.retention_months_min} (DSA art. 30)`,
+        })
+      }
+    }
+  }
+
+  const regulatory = policy.regulatory_basis as
+    | Record<string, unknown>
+    | undefined
+  if (
+    regulatory &&
+    regulatory.kind !== undefined &&
+    !inEnum(B.policy.regulatory_basis.kind, regulatory.kind)
+  ) {
+    v.push({
+      field: "policy.regulatory_basis.kind",
+      message: `regulatory_basis.kind '${String(regulatory.kind)}' not in [${B.policy.regulatory_basis.kind.join(", ")}]`,
+    })
+  }
+
+  // Boolean policy toggles (consent_snapshot, auto_renew, payment_gating, …)
+  // are type-checked at the schema layer (copy 1); the runtime boundary cares
+  // only about enum membership + numeric bounds.
 
   return v
 }
