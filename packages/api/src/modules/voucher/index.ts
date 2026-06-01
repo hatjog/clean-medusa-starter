@@ -77,6 +77,52 @@ export type {
   AutoRedeemPolicy,
 } from "./models/entitlement"
 export {
+  VAT_CLASSIFICATION_SNAPSHOT_RULE,
+  resolveVatClassification,
+} from "./vat-resolver"
+export type {
+  ResolveVatClassificationInput,
+  VatClassification,
+} from "./vat-resolver"
+// Story 2.4: read-only telemetry capability over entitlement lifecycle events.
+export {
+  LNE_EARLY_WARN_RATIO,
+  LNE_THRESHOLD_EUR_MINOR,
+  redemptionVelocity,
+  rollingVolumeLNE,
+} from "./telemetry"
+export type {
+  RedemptionVelocityBucket,
+  RedemptionVelocityOptions,
+  RedemptionVelocityResult,
+  RollingVolumeLNEOptions,
+  RollingVolumeLNEResult,
+  VoucherTelemetryEvent,
+  VoucherTelemetryLifecycle,
+} from "./telemetry"
+// Story 2.3: posting profile voucher_liability_only_v1 (AUTHORED, runtime_enabled:FALSE
+// per ADR-133 §P6 — eksport dostarcza ZDOLNOŚĆ, NIE aktywuje profilu w runtime).
+export {
+  VOUCHER_POSTING_PROFILE_ID,
+  VOUCHER_LEDGER_ACCOUNTS,
+  VOUCHER_LIABILITY_ONLY_V1,
+  VoucherPostingGuardError,
+  VoucherPostingInvariantError,
+  isMoneyAccount,
+  assertPostingAccountsAllowed,
+  assertBalanced,
+  generateVoucherPosting,
+} from "./posting-profile"
+export type {
+  LedgerScope,
+  LedgerLine,
+  LedgerTransactionV1,
+  VoucherEntryType,
+  VoucherLifecycleEvent,
+  VoucherPostingInput,
+  VoucherPostingResult,
+} from "./posting-profile"
+export {
   ENTITLEMENT_BOUNDARY,
   LOST_CODE_REISSUE_WINDOW_DAYS,
   RETENTION_AMOUNT_PCT_MIN,
