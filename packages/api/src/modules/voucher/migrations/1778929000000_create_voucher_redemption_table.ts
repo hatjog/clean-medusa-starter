@@ -61,6 +61,9 @@ export class Migration1778929000000 extends Migration {
                                 CHECK (resulting_state IN ('REDEEMED_PARTIAL','REDEEMED_FULL')),
         -- saldo po redeemie (minor units), nieujemne (NIGDY < 0, AC1).
         remaining_after_minor bigint NOT NULL CHECK (remaining_after_minor >= 0),
+        -- brutto całego vouchera przy emisji (net+vat, minor units) — źródło prawdy
+        -- dla walidacji spójności net/vat między ratami (VER-H1 fail-closed, L3).
+        issued_gross_minor    bigint NOT NULL CHECK (issued_gross_minor > 0),
         -- epoch-ms pierwszego redeemu (konflikt PK zachowuje pierwotny).
         created_at            bigint NOT NULL CHECK (created_at > 0),
         CONSTRAINT voucher_redemption_pkey PRIMARY KEY (entitlement_id, idempotency_key)

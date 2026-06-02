@@ -221,6 +221,12 @@ export type RedemptionRecord = {
   amount_minor: number
   resulting_state: RedeemOutcome
   remaining_after_minor: number
+  /**
+   * Brutto całego vouchera przy emisji (net+vat, minor units). Źródło prawdy
+   * dla walidacji spójności net/vat między ratami (L3, VER-H1 fail-closed).
+   * Przechowywane przy pierwszym redeem; kolejne raty muszą mieć ten sam totalGross.
+   */
+  issued_gross_minor: number
   created_at: number
 }
 
@@ -232,6 +238,12 @@ export type RedeemableAmountEntitlement = {
   remaining_amount: number | null
   policy_snapshot: EntitlementPolicySnapshot
   vat_classification: VatClassification | null
+  /**
+   * Waluta emisji vouchera — źródło prawdy dla currency consistency guard writera (L2).
+   * Czytana z `policy_snapshot.currency_code` lub kolumny emisji. Gdy null:
+   * guard cofa się do waluty inputu (PLN-only bonbeauty — latent).
+   */
+  issued_amount_currency?: string | null
   market_id: string | null
   sales_channel_id: string | null
   vendor_id?: string | null
@@ -251,6 +263,14 @@ export interface RedeemPartialTx {
   findRedemption(
     entitlementId: string,
     idempotencyKey: string
+  ): Promise<RedemptionRecord | null>
+  /**
+   * Zwraca DOWOLNY istniejący record dla danego entitlementu (pierwsza rata
+   * multi-installment). Używany do walidacji spójności net/vat (L3, VER-H1).
+   * Wywołanie TYLKO gdy `findRedemption` zwróciło null (poza ścieżką replay).
+   */
+  findAnyRedemptionByEntitlementId(
+    entitlementId: string
   ): Promise<RedemptionRecord | null>
   /**
    * Idempotentny zapis record dedupe (ON CONFLICT (entitlement_id,
@@ -328,6 +348,17 @@ export class RedeemPartialEntitlementOperation {
       // salda ponownie; zwraca skutek pierwszego redeemu deterministycznie.
       const prior = await tx.findRedemption(input.entitlement_id, idempotencyKey)
       if (prior) {
+        // L6: wykryj dryf parametrów — reużyty idempotency_key z innym amount_minor
+        // to sygnał błędu po stronie callera (fail-loud, NIE cichy pierwszy-skutek).
+        if (prior.amount_minor !== input.amount_minor) {
+          throw new RedeemAmountError(
+            `redeem: param drift — idempotency_key=${idempotencyKey} już użyty z ` +
+              `amount_minor=${prior.amount_minor}, teraz podano ${input.amount_minor} ` +
+              `(dryf parametrów; fail-closed, AC2)`,
+            input.amount_minor,
+            prior.remaining_after_minor + prior.amount_minor
+          )
+        }
         return { kind: "replay" as const, record: prior }
       }
 
@@ -388,6 +419,27 @@ export class RedeemPartialEntitlementOperation {
       // Redeemed-to-date PRZED tym eventem (VER-H1, kumulatywny VAT). Saldo brutto
       // śledzi zrealizowane brutto: prior = totalGross − remainingBefore.
       const totalGross = input.voucher_net_minor + input.voucher_vat_minor
+
+      // L3: walidacja spójności net/vat między ratami multi-installment (VER-H1).
+      // Sprawdź czy issued_gross_minor z poprzedniej raty zgadza się z totalGross.
+      // Niespójność (caller zmienił net/vat między ratami) ⇒ fail-closed.
+      const anyPriorRedemption = await tx.findAnyRedemptionByEntitlementId(
+        input.entitlement_id
+      )
+      if (
+        anyPriorRedemption !== null &&
+        anyPriorRedemption.issued_gross_minor !== totalGross
+      ) {
+        throw new RedeemAmountError(
+          `redeem: niespójne wejście — totalGross (${totalGross}) różni się od ` +
+            `wartości emisji z poprzedniej raty (${anyPriorRedemption.issued_gross_minor}); ` +
+            `voucher_net_minor/voucher_vat_minor muszą być spójne we wszystkich ` +
+            `ratach (VER-H1 fail-closed)`,
+          amount,
+          remainingBefore
+        )
+      }
+
       const priorRedeemedGross = totalGross - remainingBefore
       if (priorRedeemedGross < 0) {
         throw new RedeemAmountError(
@@ -398,6 +450,8 @@ export class RedeemPartialEntitlementOperation {
         )
       }
 
+      // L4: scope postingu dziedziczy vendor_id/location_id z entitlement_instance
+      // (nie tylko z inputu callera). Zapis entitlementu jest źródłem prawdy.
       const scope: TransitionScope = {
         instance_id: ent.id,
         market_id: (input.market_id ?? ent.market_id) ?? "unknown",
@@ -442,10 +496,48 @@ export class RedeemPartialEntitlementOperation {
         now
       )
 
+      // ── L1: dedupe-first (ADR-139 D2/D3) — INSERT record PRZED postingiem ──
+      // insertRedemption i updateRemaining POPRZEDZAJĄ posting hook (krok 2).
+      // Zapobiega rozjazdowi state↔ledger po aktywacji: jeśli INSERT rzuci
+      // (anomalia serializacji), rollback cofa mutacje stanu, a posting NIE nastąpił.
+      const record: RedemptionRecord = {
+        entitlement_id: ent.id,
+        idempotency_key: idempotencyKey,
+        redemption_id: redemptionId,
+        amount_minor: amount,
+        resulting_state: outcome,
+        remaining_after_minor: remainingAfter,
+        issued_gross_minor: totalGross,
+        created_at: now.getTime(),
+      }
+      const ins = await tx.insertRedemption(record)
+      if (!ins.inserted) {
+        // Backstop: row-lock FOR UPDATE serializuje redeemy — ten konflikt = anomalia
+        // serializacji. Fail-closed: RZUĆ (rollback. Retry trafi w replay).
+        throw new RedeemAmountError(
+          `redeem: konflikt dedupe (entitlement_id=${ent.id}, idempotency_key=` +
+            `${idempotencyKey}) przed postingiem — rollback fail-closed`,
+          amount,
+          remainingBefore
+        )
+      }
+      await tx.updateEntitlementRemainingAndState(
+        ent.id,
+        EntitlementInstanceState.REDEMPTION_REQUESTED,
+        outcome,
+        remainingAfter,
+        now
+      )
+
       // ── Krok 2: REDEMPTION_REQUESTED → REDEEMED_* (FINANSOWY: derecognition) ─
+      // OSTATNIA operacja w tx (L1 fix): dedupe i saldo utrwalone PRZED postingiem.
       // Posting hook woła generateVoucherPosting() REDEEMED (2.3) → ledger-writer
       // (2.6). Derecognition PROPORCJONALNA (redeemed_gross_minor / to-date).
       // Bramkowany: runtime_enabled=false ⇒ audit-only/no-op (ZERO zapisu ledger).
+      //
+      // L2: expected_currency = waluta emisji z entitlementu (NIE tautologia).
+      // Gdy issued_amount_currency=null (snapshot bez waluty): cofa się do currency
+      // inputu (PLN-only bonbeauty — latent do czasu wzbogacenia snapshotu).
       const step2 = await wireEntitlementTransitionPersisted(wiringDeps, {
         from: EntitlementInstanceState.REDEMPTION_REQUESTED,
         to: outcome,
@@ -464,41 +556,9 @@ export class RedeemPartialEntitlementOperation {
           redeemed_gross_to_date_minor: priorRedeemedGross,
           redemption_id: redemptionId,
           currency,
-          expected_currency: currency,
+          expected_currency: ent.issued_amount_currency ?? currency,
         },
       })
-      await tx.updateEntitlementRemainingAndState(
-        ent.id,
-        EntitlementInstanceState.REDEMPTION_REQUESTED,
-        outcome,
-        remainingAfter,
-        now
-      )
-
-      // ── Zapis record dedupe domeny (ON CONFLICT DO NOTHING — backstop) ─────
-      const record: RedemptionRecord = {
-        entitlement_id: ent.id,
-        idempotency_key: idempotencyKey,
-        redemption_id: redemptionId,
-        amount_minor: amount,
-        resulting_state: outcome,
-        remaining_after_minor: remainingAfter,
-        created_at: now.getTime(),
-      }
-      const ins = await tx.insertRedemption(record)
-      if (!ins.inserted) {
-        // Backstop unique (entitlement_id, idempotency_key). Row-lock FOR UPDATE
-        // serializuje redeemy na tym entitlemencie, więc replay jest złapany na
-        // górze przez findRedemption — ten konflikt sygnalizuje anomalię
-        // serializacji. Fail-closed: RZUĆ (rollback wycofa już naniesione
-        // mutacje stanu/salda — NIE podwajamy skutku). Retry trafi w replay.
-        throw new RedeemAmountError(
-          `redeem: konflikt dedupe (entitlement_id=${ent.id}, idempotency_key=` +
-            `${idempotencyKey}) po naniesieniu mutacji — rollback fail-closed`,
-          amount,
-          remainingBefore
-        )
-      }
 
       return {
         kind: "applied" as const,
@@ -576,6 +636,19 @@ export class RedeemPartialEntitlementOperation {
 // Postgres store (production wiring)
 // ──────────────────────────────────────────────────────────────────────────
 
+function mapRedemptionRow(row: Record<string, unknown>): RedemptionRecord {
+  return {
+    entitlement_id: row.entitlement_id as string,
+    idempotency_key: row.idempotency_key as string,
+    redemption_id: row.redemption_id as string,
+    amount_minor: Number(row.amount_minor),
+    resulting_state: row.resulting_state as RedeemOutcome,
+    remaining_after_minor: Number(row.remaining_after_minor),
+    issued_gross_minor: Number(row.issued_gross_minor),
+    created_at: Number(row.created_at),
+  }
+}
+
 type QueryResult<T> = Promise<{ rows: T[]; rowCount?: number | null }>
 type PgClient = {
   query: <T = Record<string, unknown>>(
@@ -615,9 +688,11 @@ class PostgresRedeemPartialTx implements RedeemPartialTx {
   async getEntitlementForUpdate(
     id: string
   ): Promise<RedeemableAmountEntitlement | null> {
+    // L4: SELECT zawiera vendor_id/location_id (dziedziczone do scope postingu).
     const res = await this.client.query<Record<string, unknown>>(
       `SELECT id, entitlement_type, state, remaining_amount, policy_snapshot,
-              vat_classification, market_id, sales_channel_id, recipient_customer_id
+              vat_classification, market_id, sales_channel_id,
+              vendor_id, location_id, recipient_customer_id
          FROM entitlement_instance
         WHERE id = $1
         FOR UPDATE`,
@@ -636,17 +711,23 @@ class PostgresRedeemPartialTx implements RedeemPartialTx {
         `entitlement_instance ${row.id as string}: policy_snapshot nie jest obiektem`
       )
     }
+    const snap = rawSnapshot as Record<string, unknown>
     return {
       id: row.id as string,
       entitlement_type: row.entitlement_type as EntitlementType,
       state: row.state as EntitlementInstanceState,
       remaining_amount:
         row.remaining_amount != null ? Number(row.remaining_amount) : null,
-      policy_snapshot: snapshotPolicy(rawSnapshot as Record<string, unknown>),
+      policy_snapshot: snapshotPolicy(snap),
       vat_classification:
         (row.vat_classification ?? null) as VatClassification | null,
+      // L2: waluta emisji z policy_snapshot (źródło prawdy dla currency guard writera).
+      issued_amount_currency:
+        typeof snap.currency_code === "string" ? snap.currency_code : null,
       market_id: (row.market_id ?? null) as string | null,
       sales_channel_id: (row.sales_channel_id ?? null) as string | null,
+      vendor_id: (row.vendor_id ?? null) as string | null,
+      location_id: (row.location_id ?? null) as string | null,
       recipient_customer_id: (row.recipient_customer_id ?? null) as
         | string
         | null,
@@ -659,22 +740,30 @@ class PostgresRedeemPartialTx implements RedeemPartialTx {
   ): Promise<RedemptionRecord | null> {
     const res = await this.client.query<Record<string, unknown>>(
       `SELECT entitlement_id, idempotency_key, redemption_id, amount_minor,
-              resulting_state, remaining_after_minor, created_at
+              resulting_state, remaining_after_minor, issued_gross_minor, created_at
          FROM ${VOUCHER_REDEMPTION_TABLE}
         WHERE entitlement_id = $1 AND idempotency_key = $2`,
       [entitlementId, idempotencyKey]
     )
     const row = res.rows[0]
     if (!row) return null
-    return {
-      entitlement_id: row.entitlement_id as string,
-      idempotency_key: row.idempotency_key as string,
-      redemption_id: row.redemption_id as string,
-      amount_minor: Number(row.amount_minor),
-      resulting_state: row.resulting_state as RedeemOutcome,
-      remaining_after_minor: Number(row.remaining_after_minor),
-      created_at: Number(row.created_at),
-    }
+    return mapRedemptionRow(row)
+  }
+
+  async findAnyRedemptionByEntitlementId(
+    entitlementId: string
+  ): Promise<RedemptionRecord | null> {
+    const res = await this.client.query<Record<string, unknown>>(
+      `SELECT entitlement_id, idempotency_key, redemption_id, amount_minor,
+              resulting_state, remaining_after_minor, issued_gross_minor, created_at
+         FROM ${VOUCHER_REDEMPTION_TABLE}
+        WHERE entitlement_id = $1
+        LIMIT 1`,
+      [entitlementId]
+    )
+    const row = res.rows[0]
+    if (!row) return null
+    return mapRedemptionRow(row)
   }
 
   async insertRedemption(
@@ -683,8 +772,8 @@ class PostgresRedeemPartialTx implements RedeemPartialTx {
     const res = await this.client.query(
       `INSERT INTO ${VOUCHER_REDEMPTION_TABLE}
          (entitlement_id, idempotency_key, redemption_id, amount_minor,
-          resulting_state, remaining_after_minor, created_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7)
+          resulting_state, remaining_after_minor, issued_gross_minor, created_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
        ON CONFLICT (entitlement_id, idempotency_key) DO NOTHING`,
       [
         record.entitlement_id,
@@ -693,6 +782,7 @@ class PostgresRedeemPartialTx implements RedeemPartialTx {
         record.amount_minor,
         record.resulting_state,
         record.remaining_after_minor,
+        record.issued_gross_minor,
         record.created_at,
       ]
     )
@@ -744,14 +834,17 @@ class PostgresRedeemPartialTx implements RedeemPartialTx {
     // Append-only audit envelope (niemutowalny ślad) do voucher_event, spójnie z
     // istniejącymi emiterami service.ts (id, voucher_code NULL, entitlement_id,
     // event_type, payload jsonb). Atomowy ze zmianą stanu (ta sama tx).
+    // L5: occurred_at z envelope (czas zdarzenia, nie zegar DB). created_at = NOW()
+    // (czas zapisu do DB — może różnić się od occurred_at przy retry/replay).
     await this.client.query(
       `INSERT INTO voucher_event (id, voucher_code, entitlement_id, event_type, payload, occurred_at, created_at)
-       VALUES ($1, NULL, $2, $3, $4::jsonb, NOW(), NOW())`,
+       VALUES ($1, NULL, $2, $3, $4::jsonb, $5, NOW())`,
       [
         audit.idempotency_key,
         audit.entitlement_id,
         audit.event_type,
         JSON.stringify(audit),
+        audit.occurred_at,
       ]
     )
   }
@@ -828,7 +921,19 @@ class InMemoryRedeemPartialTx implements RedeemPartialTx {
     id: string
   ): Promise<RedeemableAmountEntitlement | null> {
     const row = this.rows.get(id)
-    return row ? { ...row } : null
+    if (!row) return null
+    // L2: derywuj issued_amount_currency z policy_snapshot.currency_code jeśli brak
+    // explicite ustawionego pola (testy mogą override przez makeEntitlement).
+    const snap = row.policy_snapshot as Record<string, unknown>
+    const derivedCurrency =
+      typeof snap.currency_code === "string" ? snap.currency_code : null
+    return {
+      ...row,
+      issued_amount_currency:
+        row.issued_amount_currency !== undefined
+          ? row.issued_amount_currency
+          : derivedCurrency,
+    }
   }
 
   async findRedemption(
@@ -839,6 +944,15 @@ class InMemoryRedeemPartialTx implements RedeemPartialTx {
       inMemoryRedemptionKey(entitlementId, idempotencyKey)
     )
     return r ? { ...r } : null
+  }
+
+  async findAnyRedemptionByEntitlementId(
+    entitlementId: string
+  ): Promise<RedemptionRecord | null> {
+    for (const record of this.redemptions.values()) {
+      if (record.entitlement_id === entitlementId) return { ...record }
+    }
+    return null
   }
 
   async insertRedemption(

@@ -53,6 +53,12 @@ describe("Story 4.1 AC2 — migracja voucher_redemption (dedupe domeny)", () => 
     expect(up).toMatch(/redemption_id\s+text NOT NULL/)
   })
 
+  it("issued_gross_minor NOT NULL > 0 — spójność net/vat między ratami (VER-H1, L3)", () => {
+    expect(up).toMatch(
+      /issued_gross_minor\s+bigint NOT NULL CHECK \(issued_gross_minor > 0\)/
+    )
+  })
+
   it("down() NON-DESTRUKCYJNY — NIE DROP/DELETE/TRUNCATE (dedupe append-only)", () => {
     const down = collectSql("down")
     expect(down).not.toMatch(/DROP TABLE/i)
