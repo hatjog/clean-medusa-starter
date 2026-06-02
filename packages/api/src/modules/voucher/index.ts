@@ -137,6 +137,50 @@ export type {
   VoucherLedgerWriteRequest,
   VoucherLedgerWriteResult,
 } from "./ledger-writer"
+// Story 3.4: okablowanie maszyny stanów L4 → event + audit + posting hook
+// (ADR-137 / ADR-139 D3/D5). JEDNOLITY punkt: dozwolona tranzycja → (1) event
+// envelope.v1 (best-effort post-COMMIT) + (2) append-only audit + (3) posting hook
+// bramkowany dwuwarstwowo (runtime_enabled + per-market; inert gdy off). Eksport
+// dostarcza OKABLOWANIE, NIE aktywuje postingu (runtime_enabled zostaje false, flip = E6/P6).
+export {
+  ENTITLEMENT_STATE_CHANGED_EVENT_TYPE,
+  ENTITLEMENT_GENESIS,
+  EntitlementGenesisError,
+  assertWiringTransition,
+  defaultPostingActivationGate,
+  buildTransitionEnvelopes,
+  buildGenesisIssuedTransition,
+  runTransitionPostingHook,
+  wireEntitlementTransitionPersisted,
+  emitTransitionEventAfterCommit,
+  wireEntitlementTransition,
+} from "./entitlement-transition-wiring"
+export type {
+  TransitionActor,
+  TransitionFromState,
+  TransitionScope,
+  TransitionEventEnvelope,
+  TransitionAuditEnvelope,
+  TransitionPostingPayload,
+  PostingActivationGate,
+  TransitionPostingResult,
+  TransitionLedgerWriter,
+  TransitionInput,
+  GenesisIssuedArgs,
+  TransitionWiringDeps,
+  TransitionWiringResult,
+} from "./entitlement-transition-wiring"
+// Story 3.2: event-level idempotencja konsumpcji eventów (ADR-137 DEC-5 pkt 3.i).
+// Warstwa danych pod live-issue Path Y (subscriber = 3.3). Eksport dostarcza
+// kontrakt tabeli `event_processed` + prymityw dedupe (ON CONFLICT DO NOTHING),
+// NIE subscriber / NIE posting hook / NIE aktywację postingu.
+export {
+  EVENT_PROCESSED_TABLE,
+  EVENT_PROCESSED_PK_COLUMNS,
+  buildEventProcessedDedupeInsert,
+  applyEventProcessedDedup,
+} from "./models/event-processed"
+export type { EventProcessedRow } from "./models/event-processed"
 export {
   ENTITLEMENT_BOUNDARY,
   LOST_CODE_REISSUE_WINDOW_DAYS,
