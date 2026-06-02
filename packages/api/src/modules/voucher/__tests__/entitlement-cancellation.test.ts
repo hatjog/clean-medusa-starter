@@ -18,9 +18,11 @@ import { describe, it, expect } from "@jest/globals"
 import {
   CANCELLATION_CUTOFF_HOURS,
   CANCELLATION_ACTIVE_THRESHOLD_HOURS,
+  CANCELLATION_DISALLOWED_STATES,
   CancellationCutoffError,
   CancellationIdempotencyMissingError,
   CancellationHoursInvalidError,
+  CancellationPreconditionError,
   RebookExpiryShorteningError,
   ForfeitureCopyError,
   determineCancellationOutcome,
@@ -280,6 +282,49 @@ describe("idempotencja — replay ⇒ no-op, klucz wymagany (T3)", () => {
 })
 
 // ---------------------------------------------------------------------------
+// CR-1 — kontrakt directive: replay-po-cutoff ⇒ directive:"noop" (nie "nowa determinacja")
+// ---------------------------------------------------------------------------
+
+describe("directive — kontrakt CR-1: replay-po-cutoff ⇒ noop", () => {
+  it("nowe żądanie ⇒ directive:\"apply\" (caller może aplikować zmianę)", () => {
+    const d = determineCancellationOutcome({
+      hours_before_appointment: 48,
+      idempotency_key: KEY,
+    })
+    expect(d.directive).toBe("apply")
+    expect(d.idempotent_replay).toBe(false)
+  })
+
+  it("replay-po-cutoff (11h, ten sam klucz) ⇒ directive:\"noop\", caller NIE MOŻE aplikować", () => {
+    // 11h byłoby po cutoff dla nowego żądania — replay omija gate (operacja już zaszła).
+    // directive:"noop" sygnalizuje warstwie operacji: zwróć cached result, nie aplikuj.
+    const d = determineCancellationOutcome({
+      hours_before_appointment: 11,
+      idempotency_key: KEY,
+      last_applied_idempotency_key: KEY,
+    })
+    expect(d.directive).toBe("noop")
+    expect(d.idempotent_replay).toBe(true)
+    expect(d.value_preserved).toBe(true)
+  })
+
+  it("no-show replay ⇒ directive:\"noop\"", () => {
+    const d = determineNoShowOutcome({
+      idempotency_key: KEY,
+      last_applied_idempotency_key: KEY,
+    })
+    expect(d.directive).toBe("noop")
+    expect(d.idempotent_replay).toBe(true)
+  })
+
+  it("no-show nowe żądanie ⇒ directive:\"apply\"", () => {
+    const d = determineNoShowOutcome({ idempotency_key: KEY })
+    expect(d.directive).toBe("apply")
+    expect(d.idempotent_replay).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Copy — anti-forfeiture (egzekwowane mechanicznie, AC2 / Anti-patterns)
 // ---------------------------------------------------------------------------
 
@@ -456,6 +501,119 @@ describe("buildCancellationWiring — audit envelope + posting audit-only (AC1/T
       }
     )
     expect(res.emitFailed).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// CR-3 — precondition stanu: terminalne/zrealizowane ⇒ CancellationPreconditionError
+// ---------------------------------------------------------------------------
+
+describe("buildCancellationTransitionInput — CR-3: precondition stanu (fail-closed na terminalnych)", () => {
+  const DISALLOWED = [
+    EntitlementInstanceState.REDEEMED_FULL,
+    EntitlementInstanceState.SETTLED,
+    EntitlementInstanceState.CLOSED,
+    EntitlementInstanceState.VOIDED,
+    EntitlementInstanceState.EXPIRED,
+    EntitlementInstanceState.REFUNDED,
+  ]
+
+  it.each(DISALLOWED)(
+    "stan '%s' ⇒ CancellationPreconditionError (anulacja bezprzedmiotowa)",
+    (state) => {
+      expect(() =>
+        buildCancellationTransitionInput({
+          entitlement_id: "ent_cancel_001",
+          state,
+          scope: SCOPE,
+          kind: "cancellation",
+          cancellation_seq: "seq-1",
+        })
+      ).toThrow(CancellationPreconditionError)
+    }
+  )
+
+  it("CANCELLATION_DISALLOWED_STATES zawiera dokładnie te stany (spójność zestawu i testów)", () => {
+    for (const s of DISALLOWED) {
+      expect(CANCELLATION_DISALLOWED_STATES.has(s)).toBe(true)
+    }
+  })
+
+  it("stany aktywne/bookingowe (ACTIVE/ISSUED/REDEMPTION_REQUESTED) NIE rzucają precondition", () => {
+    const allowed = [
+      EntitlementInstanceState.ACTIVE,
+      EntitlementInstanceState.ISSUED,
+      EntitlementInstanceState.REDEMPTION_REQUESTED,
+      EntitlementInstanceState.REDEEMED_PARTIAL,
+      EntitlementInstanceState.PENDING_VENDOR_DECISION,
+    ]
+    for (const state of allowed) {
+      expect(() =>
+        buildCancellationTransitionInput({
+          entitlement_id: "ent_cancel_001",
+          state,
+          scope: SCOPE,
+          kind: "cancellation",
+          cancellation_seq: "seq-1",
+        })
+      ).not.toThrow()
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// CR-4 — posting audit-only NAWET z bramką symulowaną ON (defense-in-depth)
+// ---------------------------------------------------------------------------
+
+describe("buildCancellationWiring — CR-4: posting no-op z bramką ON (brak payloadu ⇒ attempted:false)", () => {
+  it("bramka ON (runtimeEnabled:true + isMarketActivated:true) + writer + brak payloadu ⇒ attempted:false (NIE księguje)", async () => {
+    // Symulacja stanu PO flipie P6 — bramka aktywna. Anulacja nadal NIE powinna próbować
+    // bookować (brak payloadu postingu ⇒ wczesny return w hooku PRZED jakąkolwiek bramką).
+    // To dominujący dowód że 4.6 nigdy nie wycieknie do voucher_ledger_* nawet po flipie.
+    const writerCalls: unknown[] = []
+    const res = await buildCancellationWiring(
+      {
+        postingActivation: { runtimeEnabled: true, isMarketActivated: () => true },
+        ledgerWriter: {
+          write: async (req) => {
+            writerCalls.push(req)
+            return { applied: false, deduped: false, transaction_id: "x" }
+          },
+        },
+        clock: () => new Date("2026-06-02T12:00:00.000Z"),
+      },
+      {
+        entitlement_id: "ent_cancel_001",
+        state: EntitlementInstanceState.ACTIVE,
+        scope: SCOPE,
+        kind: "cancellation",
+        tier: "full_active",
+        cancellation_seq: "seq-gate-on",
+      }
+    )
+    // Brak payloadu ⇒ hook nie osiąga bramki → attempted:false, writer nie wołany.
+    expect(res.posting.attempted).toBe(false)
+    expect(res.posting.activated).toBe(false)
+    expect(res.posting.persisted).toBe(false)
+    expect(writerCalls).toHaveLength(0)
+  })
+
+  it("no-show + bramka ON ⇒ też attempted:false (brak payloadu, niezależnie od runtime_enabled)", async () => {
+    const res = await buildCancellationWiring(
+      {
+        postingActivation: { runtimeEnabled: true, isMarketActivated: () => true },
+        clock: () => new Date("2026-06-02T12:00:00.000Z"),
+      },
+      {
+        entitlement_id: "ent_cancel_001",
+        state: EntitlementInstanceState.ACTIVE,
+        scope: SCOPE,
+        kind: "no_show",
+        cancellation_seq: "seq-ns-gate-on",
+      }
+    )
+    expect(res.posting.attempted).toBe(false)
+    expect(res.posting.persisted).toBe(false)
   })
 })
 

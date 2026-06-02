@@ -171,6 +171,47 @@ export class RebookExpiryShorteningError extends Error {
 }
 
 // ──────────────────────────────────────────────────────────────────────────
+// Precondition stanu — anulacja/no-show niedozwolona na stanach terminalnych (CR-3)
+// ──────────────────────────────────────────────────────────────────────────
+
+/**
+ * Stany L4 NIEDOZWOLONE jako źródło anulacji/no-show/rebook (CR-3, fail-closed):
+ * terminalne (CLOSED/VOIDED/REFUNDED) + zrealizowane bez możliwości rebooku
+ * (REDEEMED_FULL/SETTLED) + wygasły (EXPIRED). Anulacja/no-show na tych stanach
+ * jest bezprzedmiotowa i produkowałaby mylący ślad audytowy. Warstwa operacji musi
+ * gwarantować precondition stanu PRZED wywołaniem `buildCancellationTransitionInput`.
+ */
+export const CANCELLATION_DISALLOWED_STATES: ReadonlySet<EntitlementInstanceState> =
+  new Set([
+    EntitlementInstanceState.REDEEMED_FULL,
+    EntitlementInstanceState.SETTLED,
+    EntitlementInstanceState.CLOSED,
+    EntitlementInstanceState.VOIDED,
+    EntitlementInstanceState.EXPIRED,
+    EntitlementInstanceState.REFUNDED,
+  ])
+
+/**
+ * Rzucany gdy anulacja/no-show/rebook żądana na niedozwolonym stanie L4 (CR-3,
+ * precondition fail-closed). Stany terminalne i zrealizowane ⇒ anulacja bezprzedmiotowa
+ * (produkowałaby mylący ślad audytowy bez efektu wartościowego). Warstwa operacji
+ * MUSI sprawdzić stan vouchera przed wywołaniem okablowania 4.6.
+ */
+export class CancellationPreconditionError extends Error {
+  readonly state: EntitlementInstanceState
+  constructor(state: EntitlementInstanceState) {
+    super(
+      `cancellation/no-show: niedozwolony stan źródłowy '${state}' — ` +
+        `anulacja/no-show dozwolona wyłącznie ze stanów aktywnych/bookingowych ` +
+        `(NIE: ${[...CANCELLATION_DISALLOWED_STATES].join("/")}). ` +
+        `Warstwa operacji musi gwarantować precondition stanu przed wołaniem 4.6.`
+    )
+    this.name = "CancellationPreconditionError"
+    this.state = state
+  }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
 // (1)/(2) Determinacja czasowa anulacji — cutoff + próg ≥24h, idempotentna
 // ──────────────────────────────────────────────────────────────────────────
 
@@ -192,6 +233,16 @@ export type CancellationDetermination = {
   kind: CancellationKind
   /** Próg czasowy (AC1 full_active / AC2 value_preserved). */
   tier: CancellationTier
+  /**
+   * Dyrektywa dla warstwy operacji (CR-1 kontrakt):
+   *   `"apply"`  — nowe żądanie, caller powinien zaaplikować zmianę.
+   *   `"noop"`   — `idempotent_replay:true`, caller MUSI zwrócić ZAPAMIĘTANY wynik
+   *                i NIE aplikować zmiany ponownie. Cutoff jest pomijany w replay
+   *                bo operacja już raz zaszła — `tier`/pola są wyliczone z bieżących
+   *                wejść ALE NIE powinny być traktowane jako „nowa determinacja".
+   *                NIGDY nie aplikuj zmiany gdy `directive === "noop"`.
+   */
+  directive: "apply" | "noop"
   /** Zawsze true — wartość vouchera ZAWSZE zachowana (anti-forfeiture, FR19). */
   value_preserved: true
   /** Zawsze false — anulacja/no-show NIE generuje derecognition (liability bez zmiany). */
@@ -231,6 +282,13 @@ function resolveReplay(
  * zastosowany) ⇒ `idempotent_replay:true` i POMIJA gate cutoffu (operacja już raz
  * zaszła — no-op, NIE re-throw). Persystencja idempotencji delegowana do warstwy
  * operacji/writera (deterministyczny klucz, replay ⇒ no-op).
+ *
+ * KONTRAKT REPLAY (CR-1): gdy `directive === "noop"` (`idempotent_replay:true`),
+ * warstwa operacji MUSI zwrócić ZAPAMIĘTANY (pierwotny) wynik i NIE aplikować zmiany.
+ * `tier`/pola przy replay są obliczone z BIEŻĄCYCH wejść (nie z pierwotnego snapshot) —
+ * to celowo: gate cutoffu jest pominięty, bo operacja już raz zaszła. Caller NIE MOŻE
+ * traktować `directive:"noop"` jako „nowej determinacji" — musi sprawdzić pole i zwrócić
+ * cached result zamiast aplikować zmianę po raz drugi.
  */
 export function determineCancellationOutcome(
   input: CancellationDeterminationInput
@@ -260,6 +318,7 @@ export function determineCancellationOutcome(
   return {
     kind: "cancellation",
     tier,
+    directive: replay ? "noop" : "apply",
     value_preserved: true,
     derecognition: false,
     remaining_changed: false,
@@ -298,6 +357,7 @@ export function determineNoShowOutcome(
   return {
     kind: "no_show",
     tier: "value_preserved",
+    directive: replay ? "noop" : "apply",
     value_preserved: true,
     derecognition: false,
     remaining_changed: false,
@@ -473,6 +533,10 @@ export type BuildCancellationWiringInput = {
 export function buildCancellationTransitionInput(
   input: BuildCancellationWiringInput
 ): TransitionInput {
+  // CR-3: precondition fail-closed — terminalne/zrealizowane stany odrzucone.
+  if (CANCELLATION_DISALLOWED_STATES.has(input.state)) {
+    throw new CancellationPreconditionError(input.state)
+  }
   return {
     from: input.state,
     to: input.state,
@@ -507,6 +571,13 @@ export type CancellationWiringResult = {
  * (`from === to` — booking pointer op, NIE krawędź grafu; assercję grafu rezerwujemy dla
  * realnych tranzycji stanu, D-5). Mirror `buildExtendWiring` (4.4). Reużywa zegara z
  * `deps.clock` (testowalność).
+ *
+ * KONTRAKT POST-COMMIT (CR-2, AI-Review-3, 3.4): dla ścieżek z REALNĄ DB-tx
+ * (zwalnianie booking pointera) POMIŃ parametr `emitEvent` i emituj dopiero PO
+ * commit: `emitTransitionEventAfterCommit(emit, res.event)`. Gdy `emitEvent` podany,
+ * emit jest wołany PRZED commitem callera ⇒ rollback tx = phantom-event „cancelled"
+ * dla anulacji, która się nie zacommitowała (ryzyko błędnego zwolnienia slotu kalendarza
+ * E5). Dla testów / in-memory (bez granicy commit) użycie `emitEvent` jest OK.
  */
 export async function buildCancellationWiring(
   deps: Pick<
@@ -520,9 +591,13 @@ export async function buildCancellationWiring(
      */
     appendAudit?: (audit: TransitionAuditEnvelope) => Promise<void>
     /**
-     * Best-effort emit eventu tranzycji (wołany po hooku, idealnie post-COMMIT). Gdy
-     * podany, emit wołany przez `emitTransitionEventAfterCommit` (retry 2×, NIE rzuca).
-     * Fail NIE blokuje — kompletność = reconciliation 2.6.
+     * Best-effort emit eventu tranzycji (wołany po hooku). Gdy podany, emit wołany
+     * przez `emitTransitionEventAfterCommit` (retry 2×, NIE rzuca). Fail NIE blokuje
+     * — kompletność = reconciliation 2.6.
+     *
+     * UWAGA POST-COMMIT (CR-2): dla ścieżek z DB-tx POMIŃ ten parametr i wołaj
+     * `emitTransitionEventAfterCommit(emit, res.event)` DOPIERO PO commit callera.
+     * Inaczej rollback tx pozostawi phantom-event (emit przed commitem).
      */
     emitEvent?: (event: TransitionEventEnvelope) => Promise<void>
   },
