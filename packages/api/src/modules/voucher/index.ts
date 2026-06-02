@@ -434,6 +434,56 @@ export type {
   RefundEntitlementDeps,
 } from "./workflows/refund-entitlement"
 
+// Story 4.4 (Epic 4 / Wave 4 — lifecycle L4 extend): POLITYKA + OKABLOWANIE
+// przedłużenia ważności. DWA tryby (FR18): (1) pierwszy extend NIEODPŁATNY 1×
+// (licznik `unpaid_extension_count` 0→1, idempotentny — replay NIE podwaja) + (2)
+// ODPŁATNY 5–15% (boundary L2 fail-closed) ZAWSZE z RÓWNORZĘDNĄ, BEZPŁATNĄ opcją
+// zwrotu salda (parytet, anti-dark-pattern; brak ⇒ ExtendParityError). Copy NIGDY
+// „przepadnie"/„zapłać albo strać" (assertExtendCopySafe). `expires_at` clamp do
+// boundary (≤24 mies. od emisji, NIGDY poza). KRYTYCZNE (ADR-139 D5): extend =
+// entitlement liability BEZ ZMIANY ⇒ audit-only (BRAK payloadu postingu); opłata =
+// money-ledger (deferred, wymaga osobnego ADR + E6/P6). Tranzycja routuje przez
+// JEDNOLITY punkt okablowania (3.4) — from===to (extend NIE zmienia stanu, D-5,
+// taksonomia 13 stanów niezmieniona). NIE flipuje runtime_enabled (E6/P6).
+export {
+  EXTEND_FEE_PCT_MIN,
+  EXTEND_FEE_PCT_MAX,
+  MAX_FREE_EXTENDS,
+  FORBIDDEN_COERCION_TOKENS,
+  EXTEND_FEE_POSTING_REQUIRED_ADR,
+  EXTEND_POSTING_DEFERRAL_REASON,
+  FreeExtendExhaustedError,
+  ExtendFeeBoundaryError,
+  ExtendParityError,
+  ExtendCoercionCopyError,
+  ExtendProfileError,
+  determineExtendMode,
+  computeExtendedExpiresAt,
+  buildExtendIdempotencyKey,
+  assertNoCoercionExtendCopy,
+  assertExtendCopySafe,
+  defaultPaidExtendMessage,
+  buildPaidExtendOffer,
+  assertExtendProfileActivatable,
+  buildExtendPostingDeferral,
+  extendActorHint,
+  buildExtendTransitionInput,
+  buildExtendWiring,
+} from "./entitlement-extend"
+export type {
+  ExtendMode,
+  ExtendDeterminationInput,
+  ExtendDetermination,
+  ComputeExtendedExpiresAtInput,
+  ExtendOptionKind,
+  ExtendOption,
+  ExtendOffer,
+  BuildPaidExtendOfferInput,
+  ExtendPostingDeferral,
+  BuildExtendWiringInput,
+  ExtendWiringResult,
+} from "./entitlement-extend"
+
 export default Module(VOUCHER_MODULE, {
   service: VoucherService,
   loaders: [voucherSeedFixturesLoader],
