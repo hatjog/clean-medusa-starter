@@ -45,6 +45,7 @@ import {
   RefundAmountError,
   RefundChannelError,
   RefundCopyAmbiguityError,
+  RefundBalanceInvariantError,
 } from "../entitlement-refund"
 import type {
   TransitionEventEnvelope,
@@ -560,5 +561,142 @@ describe("entitlement-refund — czyste helpery", () => {
         now: NOW,
       })
     ).toThrow(RefundWithdrawalWindowError)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// M1 — inwariant remaining ≤ issued_gross (fail-closed, over-refund niemożliwy)
+// ---------------------------------------------------------------------------
+
+describe("refund M1 — inwariant remaining ≤ issued_gross", () => {
+  it("determineRefundMechanism: remaining > issued_gross ⇒ RefundBalanceInvariantError", () => {
+    expect(() =>
+      determineRefundMechanism({
+        requested: "withdrawal",
+        state: EntitlementInstanceState.ACTIVE,
+        remaining_minor: 12000, // > issued_gross
+        issued_gross_minor: 10000,
+        issued_at: NOW,
+        now: NOW,
+      })
+    ).toThrow(RefundBalanceInvariantError)
+  })
+
+  it("over-refund przez caller: remaining > issued_gross z redemption ⇒ fail-closed", async () => {
+    // remaining=10000, issuedGross=8000 (z redempcji) ⇒ naruszony inwariant
+    const store = new InMemoryRefundEntitlementStore(
+      [makeEntitlement({ remaining_amount: 10000 })],
+      { ent_refund_001: 8000 } // issued_gross < remaining
+    )
+    const { op } = makeOp(store)
+    await expect(
+      op.refund({
+        entitlement_id: "ent_refund_001",
+        refund_id: "rf_overrefund",
+        mechanism: "withdrawal",
+      })
+    ).rejects.toBeInstanceOf(RefundBalanceInvariantError)
+    // fail-closed: ZERO efektów ubocznych
+    expect(store.listAudits()).toHaveLength(0)
+    expect(store.get("ent_refund_001")?.state).toBe(EntitlementInstanceState.ACTIVE)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// M2 — granularność idempotencji domena (REFUNDED) vs refund_id (payment key)
+// ---------------------------------------------------------------------------
+
+describe("refund M2 — granularność idempotencji domena↔płatność", () => {
+  it("replay z innym refund_id na REFUNDED ⇒ fail-closed (EntitlementNotRefundableError)", async () => {
+    const store = new InMemoryRefundEntitlementStore([makeEntitlement()])
+    const { op } = makeOp(store)
+
+    // Pierwsza operacja — sukces
+    await op.refund({
+      entitlement_id: "ent_refund_001",
+      refund_id: "rf_original",
+      mechanism: "withdrawal",
+    })
+
+    // Replay z INNYM refund_id ⇒ fail-closed (ryzyko podwójnego zwrotu płatności po E6)
+    await expect(
+      op.refund({
+        entitlement_id: "ent_refund_001",
+        refund_id: "rf_different", // ← inny refund_id na REFUNDED
+        mechanism: "withdrawal",
+      })
+    ).rejects.toBeInstanceOf(EntitlementNotRefundableError)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// L1 — replay zwraca wartości oryginalnego refundu (NIE bieżącego inputu)
+// ---------------------------------------------------------------------------
+
+describe("refund L1 — replay echo oryginalnych wartości", () => {
+  it("replay zwraca mechanizm/kwotę z utrwalonej koperty, nie z bieżącego inputu", async () => {
+    const store = new InMemoryRefundEntitlementStore([makeEntitlement()])
+    const { op } = makeOp(store)
+
+    // Pierwsza operacja — withdrawal, kwota 10000
+    const original = await op.refund({
+      entitlement_id: "ent_refund_001",
+      refund_id: "rf_l1_orig",
+      mechanism: "withdrawal",
+    })
+
+    // Replay z tym samym refund_id, ale innym mechanism w parametrach (ignorowany)
+    const replay = await op.refund({
+      entitlement_id: "ent_refund_001",
+      refund_id: "rf_l1_orig", // ten sam
+      mechanism: "balance", // ← inny, ignorowany — zwróć ORYGINALNY
+    })
+
+    expect(replay.idempotent).toBe(true)
+    expect(replay.mechanism).toBe(original.mechanism) // "withdrawal", nie "balance"
+    expect(replay.refunded_amount_minor).toBe(original.refunded_amount_minor) // 10000 z oryginału
+    expect(replay.copy.basis).toBe(original.copy.basis) // oryginalna podstawa
+  })
+})
+
+// ---------------------------------------------------------------------------
+// L2 — remaining_amount zerowane przy REFUNDED (defense-in-depth)
+// ---------------------------------------------------------------------------
+
+describe("refund L2 — remaining_amount = 0 po REFUNDED", () => {
+  it("po przejściu do REFUNDED remaining_amount wynosi 0 (spójność stan↔saldo)", async () => {
+    const store = new InMemoryRefundEntitlementStore(
+      [makeEntitlement({ remaining_amount: 4000 })],
+      { ent_refund_001: 10000 }
+    )
+    const { op } = makeOp(store)
+
+    await op.refund({
+      entitlement_id: "ent_refund_001",
+      refund_id: "rf_l2",
+      mechanism: "balance",
+    })
+
+    const ent = store.get("ent_refund_001")
+    expect(ent?.state).toBe(EntitlementInstanceState.REFUNDED)
+    expect(ent?.remaining_amount).toBe(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// L3 — granica okna 14 dni (dokładnie 14 dób inclusive, +1ms poza)
+// ---------------------------------------------------------------------------
+
+describe("refund L3 — granica okna 14 dni (isWithinWithdrawalWindow)", () => {
+  it("dokładnie 14 × DAY_MS od emisji = inclusive (mieści się)", () => {
+    const issued = new Date("2026-06-01T00:00:00.000Z")
+    const exactly14 = new Date(issued.getTime() + WITHDRAWAL_WINDOW_DAYS * DAY_MS)
+    expect(isWithinWithdrawalWindow(issued, exactly14)).toBe(true)
+  })
+
+  it("14 × DAY_MS + 1ms od emisji = poza oknem (fail-closed)", () => {
+    const issued = new Date("2026-06-01T00:00:00.000Z")
+    const over14 = new Date(issued.getTime() + WITHDRAWAL_WINDOW_DAYS * DAY_MS + 1)
+    expect(isWithinWithdrawalWindow(issued, over14)).toBe(false)
   })
 })

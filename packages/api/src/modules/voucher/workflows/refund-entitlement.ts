@@ -247,6 +247,18 @@ export interface RefundEntitlementTx {
   appendRefundEvent(
     envelope: RefundLifecycleEnvelope
   ): Promise<{ inserted: boolean }>
+  /**
+   * Odczyt oryginalnej koperty rich-audytu refundu (replay L1/M2 — oryginalne
+   * wartości i refund_id). Null ⇒ brak utrwalonego refundu dla entitlementu.
+   */
+  findRefundEnvelope(
+    entitlementId: string
+  ): Promise<RefundLifecycleEnvelope | null>
+  /**
+   * Zerowanie remaining_amount przy przejściu do REFUNDED (defense-in-depth L2).
+   * Stan terminalny ⇒ saldo = 0 (spójność stan↔saldo, reconciliation/raportowanie).
+   */
+  zeroRemainingAmount(id: string): Promise<void>
 }
 
 export interface RefundEntitlementStore {
@@ -311,7 +323,10 @@ export class RefundEntitlementOperation {
       // REFUNDED jest terminalnym markerem: replay widzi REFUNDED ⇒ no-op (ZERO
       // ponownej tranzycji/eventu/zwrotu). Tranzycja jest jednokierunkowa.
       if (ent.state === EntitlementInstanceState.REFUNDED) {
-        return { kind: "replay" as const, ent }
+        // L1/M2: odczytaj oryginalną kopertę — używana do weryfikacji refund_id (M2)
+        // i zwracania oryginalnych wartości na ścieżce replay (L1).
+        const originalEnvelope = await tx.findRefundEnvelope(ent.id)
+        return { kind: "replay" as const, ent, originalEnvelope }
       }
 
       // Scope: voucher KWOTOWY z saldem `remaining` (spójnie z redeem 4.1 / expire 4.2).
@@ -460,6 +475,8 @@ export class RefundEntitlementOperation {
         EntitlementInstanceState.REFUNDED,
         now
       )
+      // L2: zeruj remaining_amount przy REFUNDED (defense-in-depth — spójność stan↔saldo)
+      await tx.zeroRemainingAmount(ent.id)
       events.push(step2.event)
 
       // ── Rich audit refundu (ON CONFLICT id = refund idempotency_key) ───────
@@ -512,34 +529,64 @@ export class RefundEntitlementOperation {
 
     if (txOut.kind === "replay") {
       // Replay domeny: stan był już REFUNDED ⇒ ZERO ponownego zwrotu/tranzycji/eventu.
-      const remaining = Math.max(0, txOut.ent.remaining_amount ?? 0)
-      const refundChannelReplay = resolveRefundChannel(txOut.ent.policy_snapshot)
-      const copyReplay = buildRefundCopy({
-        mechanism: input.mechanism,
-        refunded_amount_minor: remaining,
-        currency,
-      })
-      const deferralReplay = buildRefundPostingDeferral({
-        mechanism: input.mechanism,
-        unposted_amount_minor: remaining,
-        currency,
-      })
-      return {
-        entitlement_id: txOut.ent.id,
-        refund_id: input.refund_id,
-        mechanism: input.mechanism,
-        refund_channel: refundChannelReplay,
-        refunded_amount_minor: remaining,
-        currency,
-        fully_unused: false,
-        withdrawal_right_extinguished: false,
-        new_state: EntitlementInstanceState.REFUNDED,
-        copy: copyReplay,
-        dsar_carry_forward: buildDsarCarryForward({
+      const origEnv = txOut.originalEnvelope
+
+      // M2: fail-closed gdy inny refund_id na REFUNDED (granularność idempotencji
+      // domena↔płatność — różne refund_id generują różne payment keys, ryzyko
+      // podwójnego zwrotu płatności po aktywacji Stripe / E6).
+      if (origEnv && origEnv.payload.refund_id !== input.refund_id) {
+        throw new EntitlementNotRefundableError(
+          `refund: entitlement ${txOut.ent.id} już REFUNDED z refund_id=` +
+            `${origEnv.payload.refund_id}; żądany refund_id=${input.refund_id} ` +
+            `nie pasuje — fail-closed (granularność idempotencji domena↔płatność, M2)`
+        )
+      }
+
+      // L1: zwracamy wartości ORYGINALNEGO refundu (utrwalone w rich-audycie),
+      // NIE bieżącego inputu (który może mieć inny mechanism/kwotę, wprowadzając w błąd).
+      const origMechanism = origEnv?.payload.mechanism ?? input.mechanism
+      const origAmount =
+        origEnv?.payload.refunded_amount_minor ??
+        Math.max(0, txOut.ent.remaining_amount ?? 0)
+      const origCopy =
+        origEnv?.payload.copy ??
+        buildRefundCopy({
+          mechanism: origMechanism,
+          refunded_amount_minor: origAmount,
+          currency,
+        })
+      const origDsar =
+        origEnv?.payload.dsar_carry_forward ??
+        buildDsarCarryForward({
           market_id: input.market_id ?? txOut.ent.market_id ?? "unknown",
           sales_channel_id:
             input.sales_channel_id ?? txOut.ent.sales_channel_id ?? null,
-        }),
+        })
+      const origPostingDeferral =
+        origEnv?.payload.posting_deferred ??
+        buildRefundPostingDeferral({
+          mechanism: origMechanism,
+          unposted_amount_minor: origAmount,
+          currency,
+        })
+      const origPaymentKey =
+        origEnv?.payload.payment_refund_idempotency_key ?? paymentRefundKey
+      const origFullyUnused = origEnv?.payload.fully_unused ?? false
+      const origWithdrawalExtinguished =
+        origEnv?.payload.withdrawal_right_extinguished ?? false
+
+      return {
+        entitlement_id: txOut.ent.id,
+        refund_id: input.refund_id,
+        mechanism: origMechanism,
+        refund_channel: resolveRefundChannel(txOut.ent.policy_snapshot),
+        refunded_amount_minor: origAmount,
+        currency,
+        fully_unused: origFullyUnused,
+        withdrawal_right_extinguished: origWithdrawalExtinguished,
+        new_state: EntitlementInstanceState.REFUNDED,
+        copy: origCopy,
+        dsar_carry_forward: origDsar,
         posting: {
           attempted: false,
           activated: false,
@@ -548,8 +595,8 @@ export class RefundEntitlementOperation {
           reason:
             "domain replay — entitlement już REFUNDED; jeden refund (NIE podwaja zwrotu/tranzycji); posting derecognition deferowany (ADR-139 §Granice)",
         },
-        posting_deferred: deferralReplay,
-        payment_refund_idempotency_key: paymentRefundKey,
+        posting_deferred: origPostingDeferral,
+        payment_refund_idempotency_key: origPaymentKey,
         idempotent: true,
         emit_failed: false,
       }
@@ -760,6 +807,27 @@ class PostgresRefundEntitlementTx implements RefundEntitlementTx {
     )
     return { inserted: (res.rowCount ?? 0) === 1 }
   }
+
+  async findRefundEnvelope(
+    entitlementId: string
+  ): Promise<RefundLifecycleEnvelope | null> {
+    const res = await this.client.query<{ payload: unknown }>(
+      `SELECT payload FROM voucher_event
+       WHERE entitlement_id = $1
+         AND event_type = $2
+       LIMIT 1`,
+      [entitlementId, ENTITLEMENT_REFUNDED_EVENT_TYPE]
+    )
+    const row = res.rows[0]
+    return row ? (row.payload as RefundLifecycleEnvelope) : null
+  }
+
+  async zeroRemainingAmount(id: string): Promise<void> {
+    await this.client.query(
+      `UPDATE entitlement_instance SET remaining_amount = 0 WHERE id = $1`,
+      [id]
+    )
+  }
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -882,6 +950,24 @@ class InMemoryRefundEntitlementTx implements RefundEntitlementTx {
     }
     this.refundEvents.set(envelope.idempotency_key, envelope)
     return { inserted: true }
+  }
+
+  async findRefundEnvelope(
+    entitlementId: string
+  ): Promise<RefundLifecycleEnvelope | null> {
+    for (const envelope of this.refundEvents.values()) {
+      if (envelope.payload.entitlement_id === entitlementId) {
+        return envelope
+      }
+    }
+    return null
+  }
+
+  async zeroRemainingAmount(id: string): Promise<void> {
+    const row = this.rows.get(id)
+    if (row) {
+      this.rows.set(id, { ...row, remaining_amount: 0 })
+    }
   }
 }
 

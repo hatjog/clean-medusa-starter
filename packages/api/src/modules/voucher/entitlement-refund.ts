@@ -201,6 +201,29 @@ export class RefundAmountError extends Error {
   }
 }
 
+/**
+ * Rzucany gdy inwariant `remaining ≤ issued_gross` jest naruszony (fail-closed).
+ * Sytuacja: saldo vouchera przekracza brutto emisji — niespójny stan DB / błąd
+ * callera. Math.max(0, …) cichym clampem maskowałby over-refund; jawny guard
+ * zapobiega zwrotowi większemu niż realna wartość (money invariant).
+ */
+export class RefundBalanceInvariantError extends Error {
+  readonly entitlement_id: string
+  readonly remaining: number
+  readonly issued_gross: number
+  constructor(entitlementId: string, remaining: number, issuedGross: number) {
+    super(
+      `refund: inwariant salda naruszony — remaining=${remaining} > ` +
+        `issued_gross=${issuedGross} (fail-closed; niespójny stan vouchera ` +
+        `${entitlementId}; over-refund niemożliwy)`
+    )
+    this.name = "RefundBalanceInvariantError"
+    this.entitlement_id = entitlementId
+    this.remaining = remaining
+    this.issued_gross = issuedGross
+  }
+}
+
 // ──────────────────────────────────────────────────────────────────────────
 // Determinacja mechanizmu (czysta) — rozłączne warunki wejścia (a)/(b)
 // ──────────────────────────────────────────────────────────────────────────
@@ -252,8 +275,17 @@ export function determineRefundMechanism(
 ): RefundDetermination {
   const remaining = Math.max(0, input.remaining_minor)
   const issuedGross = Math.max(0, input.issued_gross_minor)
+  // M1: jawny inwariant — remaining nigdy > issued_gross (fail-closed).
+  // Math.max(0, …) maskowałby over-refund; chcemy fail-closed zamiast cichego clampa.
+  if (remaining > issuedGross) {
+    throw new RefundBalanceInvariantError(
+      "(determination)",
+      remaining,
+      issuedGross
+    )
+  }
   // redeemed-to-date (kumulatywnie zrealizowane brutto) = brutto emisji − saldo.
-  const redeemedToDate = Math.max(0, issuedGross - remaining)
+  const redeemedToDate = issuedGross - remaining // safe: remaining ≤ issuedGross (inwariant powyżej)
   const fullyUnused = redeemedToDate === 0
   const extinguished = isWithdrawalRightExtinguished(input.state)
   const windowDays = input.window_days ?? WITHDRAWAL_WINDOW_DAYS
