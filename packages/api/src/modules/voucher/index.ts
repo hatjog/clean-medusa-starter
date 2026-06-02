@@ -532,6 +532,52 @@ export type {
   ClaimWiringResult,
 } from "./entitlement-transfer"
 
+// Story 4.6 (Epic 4 / Wave 4 — lifecycle L4 cancellation / no-show): POLITYKA
+// anulacji/no-show + REBOOK na booking pointerze (v1.6.0). CUTOFF min 12h (jawna
+// anulacja dozwolona do 12h przed terminem, po cutoff fail-closed); anulacja ≥24h ⇒
+// voucher W PEŁNI AKTYWNY (`remaining`/`expires_at` niezmienione, AC1, FR19); anulacja
+// <24h / no-show ⇒ WARTOŚĆ ZACHOWANA + rebook (AC2). INWARIANT UX-DR-14 M-5: rebook NIE
+// skraca `expires_at` (ważność = pierwotna polityka 4.2, NIGDY od daty rebooku;
+// `computeRebookExpiresAt` identity + `assertRebookPreservesExpiry` defense). Copy NIGDY
+// „przepadnie" (reuse `assertNoForfeitureCopy` 4.2). Idempotencja (replay ⇒ no-op):
+// idempotency_key WYMAGANY (fail-closed). KRYTYCZNE (ADR-139 D5): anulacja/no-show/rebook
+// ZWALNIA booking, liability BEZ ZMIANY ⇒ BRAK postingu (audit-only, posting payload
+// CELOWO pominięty); runtime_enabled zostaje false (flip = E6/P6). Tranzycja routuje przez
+// JEDNOLITY punkt okablowania (3.4) — `from === to` (NIE zmienia stanu, D-5, taksonomia 13
+// stanów niezmieniona). NIE rusza hard-gate'ów MPV_MULTI_VENDOR/SUBSCRIPTION_B2C.
+export {
+  CANCELLATION_CUTOFF_HOURS,
+  CANCELLATION_ACTIVE_THRESHOLD_HOURS,
+  CANCELLATION_POSTING_NOOP_REASON,
+  CancellationCutoffError,
+  CancellationIdempotencyMissingError,
+  CancellationHoursInvalidError,
+  RebookExpiryShorteningError,
+  determineCancellationOutcome,
+  determineNoShowOutcome,
+  computeRebookExpiresAt,
+  assertRebookPreservesExpiry,
+  buildCancellationIdempotencyKey,
+  buildRebookIdempotencyKey,
+  defaultCancellationMessage,
+  defaultRebookMessage,
+  assertCancellationCopySafe,
+  buildCancellationPostingNoop,
+  cancellationActorHint,
+  buildCancellationTransitionInput,
+  buildCancellationWiring,
+} from "./entitlement-cancellation"
+export type {
+  CancellationKind,
+  CancellationTier,
+  CancellationDeterminationInput,
+  CancellationDetermination,
+  NoShowDeterminationInput,
+  CancellationPostingNoop,
+  BuildCancellationWiringInput,
+  CancellationWiringResult,
+} from "./entitlement-cancellation"
+
 export default Module(VOUCHER_MODULE, {
   service: VoucherService,
   loaders: [voucherSeedFixturesLoader],
