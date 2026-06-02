@@ -24,6 +24,9 @@ import {
   LostCodeIdempotencyMissingError,
   LostCodePreconditionError,
   LostCodeBalanceTransferError,
+  LostCodeFutureDateError,
+  LostCodeLostBeforeIssuedError,
+  LostCodeWiringDirectiveError,
   isWithinReportWindow,
   isWithinDecisionWindow,
   buildLostCodeRecoveryId,
@@ -32,6 +35,7 @@ import {
   computeRecoveryExpiresAt,
   determineLostCodeRecoveryOutcome,
   buildLostCodePostingNoop,
+  buildLostCodeAtomicWriteSeam,
   lostCodeVoidActorHint,
   lostCodeReissueActorHint,
   buildLostCodeVoidTransitionInput,
@@ -44,6 +48,7 @@ import {
   EntitlementTransitionError,
   ENTITLEMENT_GENESIS,
   ENTITLEMENT_STATE_CHANGED_EVENT_TYPE,
+  type LostCodeRecoveryDetermination,
   type TransitionAuditEnvelope,
   type TransitionEventEnvelope,
 } from ".."
@@ -57,10 +62,22 @@ const SCOPE = {
 const OLD_ID = "ent_lost_001"
 const REC = buildLostCodeRecoveryId(OLD_ID, "seq-1")
 
-// Standardowe daty: utrata → zgłoszenie (w oknie) → decyzja (w oknie).
+// Standardowe daty: utrata → zgłoszenie (w oknie) → decyzja (w oknie) → now.
 const LOST_AT = new Date("2026-06-01T00:00:00.000Z")
 const REPORTED_AT = new Date("2026-06-10T00:00:00.000Z") // 9 dni po utracie (<30)
 const DECIDED_AT = new Date("2026-06-13T00:00:00.000Z") // 3 dni po zgłoszeniu (<7)
+const NOW_AT = new Date("2026-06-15T00:00:00.000Z") // 2 dni po decided_at (≥ decided_at)
+
+// Precomputed determination (directive:"apply") używany przez testy okablowania.
+const DETERMINATION: LostCodeRecoveryDetermination = determineLostCodeRecoveryOutcome({
+  old_state: EntitlementInstanceState.ISSUED,
+  remaining_old: 8000,
+  lost_at: LOST_AT,
+  reported_at: REPORTED_AT,
+  decided_at: DECIDED_AT,
+  now_at: NOW_AT,
+  recovery_id: REC,
+})
 
 // ---------------------------------------------------------------------------
 // Okna czasowe — zgłoszenie 30 dni + decyzja ≤7 dni (boundary, fail-closed)
@@ -178,6 +195,7 @@ describe("determineLostCodeRecoveryOutcome — happy path (AC1)", () => {
       lost_at: LOST_AT,
       reported_at: REPORTED_AT,
       decided_at: DECIDED_AT,
+      now_at: NOW_AT,
       recovery_id: REC,
     })
     expect(d.directive).toBe("apply")
@@ -195,6 +213,7 @@ describe("determineLostCodeRecoveryOutcome — happy path (AC1)", () => {
       lost_at: LOST_AT,
       reported_at: REPORTED_AT,
       decided_at: DECIDED_AT,
+      now_at: NOW_AT,
       recovery_id: REC,
     })
     expect(d.directive).toBe("apply")
@@ -210,6 +229,7 @@ describe("determineLostCodeRecoveryOutcome — fail-closed okna (AC1)", () => {
         lost_at: LOST_AT,
         reported_at: new Date("2026-07-05T00:00:00.000Z"), // 34 dni po utracie
         decided_at: new Date("2026-07-06T00:00:00.000Z"),
+        now_at: new Date("2026-07-10T00:00:00.000Z"),
         recovery_id: REC,
       })
     ).toThrow(LostCodeReportWindowError)
@@ -223,6 +243,7 @@ describe("determineLostCodeRecoveryOutcome — fail-closed okna (AC1)", () => {
         lost_at: LOST_AT,
         reported_at: REPORTED_AT,
         decided_at: new Date("2026-06-20T00:00:00.000Z"), // 10 dni po zgłoszeniu
+        now_at: new Date("2026-06-25T00:00:00.000Z"),
         recovery_id: REC,
       })
     ).toThrow(LostCodeDecisionWindowError)
@@ -250,6 +271,7 @@ describe("determineLostCodeRecoveryOutcome — precondition stanu (fail-closed)"
           lost_at: LOST_AT,
           reported_at: REPORTED_AT,
           decided_at: DECIDED_AT,
+          now_at: NOW_AT,
           recovery_id: REC,
         })
       ).toThrow(LostCodePreconditionError)
@@ -280,6 +302,7 @@ describe("idempotencja — recovery_id (T1)", () => {
         lost_at: LOST_AT,
         reported_at: REPORTED_AT,
         decided_at: DECIDED_AT,
+        now_at: NOW_AT,
       })
     ).toThrow(LostCodeIdempotencyMissingError)
   })
@@ -291,6 +314,7 @@ describe("idempotencja — recovery_id (T1)", () => {
       lost_at: LOST_AT,
       reported_at: REPORTED_AT,
       decided_at: DECIDED_AT,
+      now_at: NOW_AT,
       recovery_id: REC,
       last_applied_recovery_id: REC,
     })
@@ -305,6 +329,7 @@ describe("idempotencja — recovery_id (T1)", () => {
       lost_at: LOST_AT,
       reported_at: REPORTED_AT,
       decided_at: new Date("2026-08-01T00:00:00.000Z"), // poza oknem dla nowego żądania
+      now_at: new Date("2026-08-05T00:00:00.000Z"),
       recovery_id: REC,
       last_applied_recovery_id: REC,
     })
@@ -320,6 +345,7 @@ describe("idempotencja — recovery_id (T1)", () => {
       lost_at: LOST_AT,
       reported_at: REPORTED_AT,
       decided_at: DECIDED_AT,
+      now_at: NOW_AT,
       recovery_id: REC,
       last_applied_recovery_id: buildLostCodeRecoveryId(OLD_ID, "seq-2"),
     })
@@ -361,6 +387,7 @@ describe("buildLostCode*TransitionInput — krawędzie grafu (D-5) + posting pom
     scope: SCOPE,
     recovery_id: REC,
     operator_id: "op_42",
+    determination: DETERMINATION,
   }
 
   it("void: from=stan, to=VOIDED, posting pominięty, actor=admin, transition_seq=recovery_id", () => {
@@ -408,12 +435,22 @@ describe("buildLostCode*TransitionInput — krawędzie grafu (D-5) + posting pom
 })
 
 describe("buildLostCodeRecoveryWiring — para audytowana + posting audit-only (AC2)", () => {
+  const wiringActive = determineLostCodeRecoveryOutcome({
+    old_state: EntitlementInstanceState.ACTIVE,
+    remaining_old: 8000,
+    lost_at: LOST_AT,
+    reported_at: REPORTED_AT,
+    decided_at: DECIDED_AT,
+    now_at: NOW_AT,
+    recovery_id: REC,
+  })
   const wiring = {
     old_entitlement_id: OLD_ID,
     old_state: EntitlementInstanceState.ACTIVE,
     scope: SCOPE,
     recovery_id: REC,
     operator_id: "op_42",
+    determination: wiringActive,
   }
 
   it("void(old) + issue(new): obie nogi audytowane, posting audit-only (NIE księguje)", async () => {
@@ -477,7 +514,7 @@ describe("buildLostCodeRecoveryWiring — para audytowana + posting audit-only (
   it("custom new_entitlement_id respektowane (override deterministycznego id)", async () => {
     const res = await buildLostCodeRecoveryWiring(
       { clock: () => new Date("2026-06-13T12:00:00.000Z") },
-      { ...wiring, new_entitlement_id: "ent_custom_new" }
+      { ...wiring, new_entitlement_id: "ent_custom_new", determination: wiringActive }
     )
     expect(res.new_entitlement_id).toBe("ent_custom_new")
     expect(res.issue.audit.entitlement_id).toBe("ent_custom_new")
@@ -489,6 +526,16 @@ describe("buildLostCodeRecoveryWiring — para audytowana + posting audit-only (
 // ---------------------------------------------------------------------------
 
 describe("anti-double-spend — void(old) przed issue(new) (KRYTYCZNE)", () => {
+  const detActive = determineLostCodeRecoveryOutcome({
+    old_state: EntitlementInstanceState.ACTIVE,
+    remaining_old: 5000,
+    lost_at: LOST_AT,
+    reported_at: REPORTED_AT,
+    decided_at: DECIDED_AT,
+    now_at: NOW_AT,
+    recovery_id: REC,
+  })
+
   it("kolejność okablowania: void NAJPIERW, issue PO (nigdy 2 ważne kody)", async () => {
     const order: string[] = []
     await buildLostCodeRecoveryWiring(
@@ -505,6 +552,7 @@ describe("anti-double-spend — void(old) przed issue(new) (KRYTYCZNE)", () => {
         old_state: EntitlementInstanceState.ACTIVE,
         scope: SCOPE,
         recovery_id: REC,
+        determination: detActive,
       }
     )
     expect(order).toEqual(["void", "issue"])
@@ -518,13 +566,22 @@ describe("anti-double-spend — void(old) przed issue(new) (KRYTYCZNE)", () => {
         old_state: EntitlementInstanceState.ISSUED,
         scope: SCOPE,
         recovery_id: REC,
+        determination: DETERMINATION,
       }
     )
     expect(res.void.audit.to_state).toBe(EntitlementInstanceState.VOIDED)
   })
 
   it("void(old) z niedozwolonej krawędzi rzuca PRZED issue (geneza nie powstaje)", async () => {
-    // VOIDED → VOIDED jest niedozwolone (terminal); precondition łapie to wcześniej.
+    // VOIDED → VOIDED jest niedozwolone (terminal); defense-in-depth: precondition
+    // w buildLostCodeVoidTransitionInput łapie zły stan nawet z hand-crafted determination.
+    const fakeDetermination: LostCodeRecoveryDetermination = {
+      directive: "apply",
+      transfer: computeRecoveryBalanceTransfer(5000),
+      derecognition: false,
+      net_zero: true,
+      idempotent_replay: false,
+    }
     await expect(
       buildLostCodeRecoveryWiring(
         { clock: () => new Date("2026-06-13T12:00:00.000Z") },
@@ -533,6 +590,7 @@ describe("anti-double-spend — void(old) przed issue(new) (KRYTYCZNE)", () => {
           old_state: EntitlementInstanceState.VOIDED,
           scope: SCOPE,
           recovery_id: REC,
+          determination: fakeDetermination,
         }
       )
     ).rejects.toThrow(LostCodePreconditionError)
@@ -557,6 +615,15 @@ describe("posting GATED — brak nowego postingu/derecognition (ADR-139 D5)", ()
     // (brak payloadu ⇒ wczesny return w hooku PRZED bramką). Dominujący dowód: 4.7
     // nigdy nie wycieknie do voucher_ledger_* nawet po flipie.
     const writerCalls: unknown[] = []
+    const detActive = determineLostCodeRecoveryOutcome({
+      old_state: EntitlementInstanceState.ACTIVE,
+      remaining_old: 8000,
+      lost_at: LOST_AT,
+      reported_at: REPORTED_AT,
+      decided_at: DECIDED_AT,
+      now_at: NOW_AT,
+      recovery_id: REC,
+    })
     const res = await buildLostCodeRecoveryWiring(
       {
         postingActivation: { runtimeEnabled: true, isMarketActivated: () => true },
@@ -573,6 +640,7 @@ describe("posting GATED — brak nowego postingu/derecognition (ADR-139 D5)", ()
         old_state: EntitlementInstanceState.ACTIVE,
         scope: SCOPE,
         recovery_id: REC,
+        determination: detActive,
       }
     )
     expect(res.void.posting.attempted).toBe(false)
@@ -595,6 +663,274 @@ describe("cloneRecoveryPolicySnapshot — kontynuacja polityki (nowy id, ta sama
     expect(next).toEqual(oldSnap)
     expect(next).not.toBe(oldSnap)
     expect(Object.isFrozen(next)).toBe(true)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// M1 — sprzężenie gard-wiring (AI-Review-1): wiring bez determination ⇒ fail-closed
+// ---------------------------------------------------------------------------
+
+describe("M1 — sprzężenie gardów okien/idempotencji ze ścieżką side-effect (AI-Review-1)", () => {
+  it("wiring z directive:noop ⇒ LostCodeWiringDirectiveError (gardy nie pozwalają na side-effect)", async () => {
+    const noopDetermination = determineLostCodeRecoveryOutcome({
+      old_state: EntitlementInstanceState.ISSUED,
+      remaining_old: 5000,
+      lost_at: LOST_AT,
+      reported_at: REPORTED_AT,
+      decided_at: DECIDED_AT,
+      now_at: NOW_AT,
+      recovery_id: REC,
+      last_applied_recovery_id: REC, // ← replay ⇒ noop
+    })
+    expect(noopDetermination.directive).toBe("noop")
+    await expect(
+      buildLostCodeRecoveryWiring(
+        { clock: () => new Date("2026-06-13T12:00:00.000Z") },
+        {
+          old_entitlement_id: OLD_ID,
+          old_state: EntitlementInstanceState.ISSUED,
+          scope: SCOPE,
+          recovery_id: REC,
+          determination: noopDetermination,
+        }
+      )
+    ).rejects.toThrow(LostCodeWiringDirectiveError)
+  })
+
+  it("wiring bez przejścia gardów (hand-crafted noop) ⇒ LostCodeWiringDirectiveError", async () => {
+    const noopDetermination: LostCodeRecoveryDetermination = {
+      directive: "noop",
+      transfer: computeRecoveryBalanceTransfer(5000),
+      derecognition: false,
+      net_zero: true,
+      idempotent_replay: true,
+    }
+    await expect(
+      buildLostCodeRecoveryWiring(
+        { clock: () => new Date("2026-06-13T12:00:00.000Z") },
+        {
+          old_entitlement_id: OLD_ID,
+          old_state: EntitlementInstanceState.ISSUED,
+          scope: SCOPE,
+          recovery_id: REC,
+          determination: noopDetermination,
+        }
+      )
+    ).rejects.toThrow(LostCodeWiringDirectiveError)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// M2 — atomowość void+issue: write_seam zawiera wszystkie dane do jednej DB-tx
+// ---------------------------------------------------------------------------
+
+describe("M2 — atomowy seam zapisu void+issue (AI-Review-2)", () => {
+  it("write_seam zawiera old_id, new_id, remaining_new, expires_at, recovery_id (kontrakt atomowej tx)", async () => {
+    const expiresAt = new Date("2027-12-01T00:00:00.000Z")
+    const res = await buildLostCodeRecoveryWiring(
+      { clock: () => new Date("2026-06-13T12:00:00.000Z") },
+      {
+        old_entitlement_id: OLD_ID,
+        old_state: EntitlementInstanceState.ISSUED,
+        scope: SCOPE,
+        recovery_id: REC,
+        determination: DETERMINATION,
+        old_expires_at: expiresAt,
+      }
+    )
+    expect(res.write_seam.old_entitlement_id).toBe(OLD_ID)
+    expect(res.write_seam.new_entitlement_id).toBe(res.new_entitlement_id)
+    expect(res.write_seam.remaining_new).toBe(DETERMINATION.transfer.remaining_new)
+    expect(res.write_seam.expires_at?.getTime()).toBe(expiresAt.getTime())
+    expect(res.write_seam.recovery_id).toBe(REC)
+  })
+
+  it("write_seam.expires_at = null gdy brak ważności (przeniesione 1:1)", async () => {
+    const res = await buildLostCodeRecoveryWiring(
+      { clock: () => new Date("2026-06-13T12:00:00.000Z") },
+      {
+        old_entitlement_id: OLD_ID,
+        old_state: EntitlementInstanceState.ISSUED,
+        scope: SCOPE,
+        recovery_id: REC,
+        determination: DETERMINATION,
+        old_expires_at: null,
+      }
+    )
+    expect(res.write_seam.expires_at).toBeNull()
+  })
+
+  it("transfer w wyniku wiring = determination.transfer (net-zero, spójność danych)", async () => {
+    const res = await buildLostCodeRecoveryWiring(
+      { clock: () => new Date("2026-06-13T12:00:00.000Z") },
+      {
+        old_entitlement_id: OLD_ID,
+        old_state: EntitlementInstanceState.ISSUED,
+        scope: SCOPE,
+        recovery_id: REC,
+        determination: DETERMINATION,
+      }
+    )
+    expect(res.transfer.remaining_new).toBe(DETERMINATION.transfer.remaining_new)
+    expect(res.transfer.net_zero).toBe(true)
+  })
+
+  it("buildLostCodeAtomicWriteSeam: remaining_new z determination.transfer, expires_at = computeRecoveryExpiresAt", () => {
+    const expiresAt = new Date("2027-06-01T00:00:00.000Z")
+    const seam = buildLostCodeAtomicWriteSeam(
+      {
+        old_entitlement_id: OLD_ID,
+        determination: DETERMINATION,
+        old_expires_at: expiresAt,
+        recovery_id: REC,
+      },
+      "new_ent_001"
+    )
+    expect(seam.old_entitlement_id).toBe(OLD_ID)
+    expect(seam.new_entitlement_id).toBe("new_ent_001")
+    expect(seam.remaining_new).toBe(DETERMINATION.transfer.remaining_new)
+    expect(seam.expires_at?.getTime()).toBe(expiresAt.getTime())
+    expect(seam.recovery_id).toBe(REC)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// L3 — replay short-circuit przed obliczeniem transferu (AI-Review-3)
+// ---------------------------------------------------------------------------
+
+describe("L3 — replay short-circuit przed obliczeniem transferu (AI-Review-3)", () => {
+  it("replay z nieprawidłowym remaining_old (ujemnym) NIE rzuca LostCodeBalanceTransferError", () => {
+    // Garda salda jest POMIJANA na replay (short-circuit PRZED computeRecoveryBalanceTransfer).
+    // Caller i tak używa zapamiętanego wyniku, nie tego transferu.
+    const d = determineLostCodeRecoveryOutcome({
+      old_state: EntitlementInstanceState.ISSUED,
+      remaining_old: -999, // nieprawidłowe, ale replay POMIJA walidację salda
+      lost_at: LOST_AT,
+      reported_at: REPORTED_AT,
+      decided_at: DECIDED_AT,
+      now_at: NOW_AT,
+      recovery_id: REC,
+      last_applied_recovery_id: REC,
+    })
+    expect(d.directive).toBe("noop")
+    expect(d.idempotent_replay).toBe(true)
+    // transfer jest informacyjny — wartości mogą być ujemne, ale to nie przeszkadza
+    // bo caller używa zapamiętanego wyniku
+    expect(d.transfer.remaining_old).toBe(-999)
+  })
+
+  it("NIE-replay z nieprawidłowym remaining_old ⇒ LostCodeBalanceTransferError (garda aktywna)", () => {
+    expect(() =>
+      determineLostCodeRecoveryOutcome({
+        old_state: EntitlementInstanceState.ISSUED,
+        remaining_old: -999,
+        lost_at: LOST_AT,
+        reported_at: REPORTED_AT,
+        decided_at: DECIDED_AT,
+        now_at: NOW_AT,
+        recovery_id: REC,
+        // brak last_applied_recovery_id ⇒ nie jest replay
+      })
+    ).toThrow(LostCodeBalanceTransferError)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// L4 — granice czasowe anti-fraud: reported_at/decided_at ≤ now + lost_at ≥ issued_at
+// ---------------------------------------------------------------------------
+
+describe("L4 — granice czasowe anti-fraud (AI-Review-4)", () => {
+  it("reported_at w przyszłości ⇒ LostCodeFutureDateError", () => {
+    const futureReported = new Date("2026-07-01T00:00:00.000Z")
+    expect(() =>
+      determineLostCodeRecoveryOutcome({
+        old_state: EntitlementInstanceState.ISSUED,
+        remaining_old: 5000,
+        lost_at: LOST_AT,
+        reported_at: futureReported,
+        decided_at: new Date("2026-07-02T00:00:00.000Z"),
+        now_at: new Date("2026-06-20T00:00:00.000Z"), // now PRZED reported_at
+        recovery_id: REC,
+      })
+    ).toThrow(LostCodeFutureDateError)
+  })
+
+  it("decided_at w przyszłości ⇒ LostCodeFutureDateError", () => {
+    const futureDecided = new Date("2026-07-01T00:00:00.000Z")
+    expect(() =>
+      determineLostCodeRecoveryOutcome({
+        old_state: EntitlementInstanceState.ISSUED,
+        remaining_old: 5000,
+        lost_at: LOST_AT,
+        reported_at: REPORTED_AT,
+        decided_at: futureDecided,
+        now_at: new Date("2026-06-15T00:00:00.000Z"), // now PRZED decided_at
+        recovery_id: REC,
+      })
+    ).toThrow(LostCodeFutureDateError)
+  })
+
+  it("reported_at = now_at (granica inkluzywna) ⇒ nie rzuca", () => {
+    const exactNow = new Date("2026-06-15T00:00:00.000Z")
+    expect(() =>
+      determineLostCodeRecoveryOutcome({
+        old_state: EntitlementInstanceState.ISSUED,
+        remaining_old: 5000,
+        lost_at: LOST_AT,
+        reported_at: REPORTED_AT,
+        decided_at: DECIDED_AT,
+        now_at: DECIDED_AT, // now = decided_at (granica)
+        recovery_id: REC,
+      })
+    ).not.toThrow(LostCodeFutureDateError)
+  })
+
+  it("lost_at przed issued_at ⇒ LostCodeLostBeforeIssuedError (anti-fraud)", () => {
+    const issuedAt = new Date("2026-06-05T00:00:00.000Z")
+    expect(() =>
+      determineLostCodeRecoveryOutcome({
+        old_state: EntitlementInstanceState.ISSUED,
+        remaining_old: 5000,
+        lost_at: new Date("2026-06-03T00:00:00.000Z"), // przed wystawieniem
+        reported_at: REPORTED_AT,
+        decided_at: DECIDED_AT,
+        now_at: NOW_AT,
+        recovery_id: REC,
+        entitlement_issued_at: issuedAt,
+      })
+    ).toThrow(LostCodeLostBeforeIssuedError)
+  })
+
+  it("lost_at = issued_at (granica inkluzywna) ⇒ nie rzuca", () => {
+    const issuedAt = new Date("2026-06-01T00:00:00.000Z")
+    expect(() =>
+      determineLostCodeRecoveryOutcome({
+        old_state: EntitlementInstanceState.ISSUED,
+        remaining_old: 5000,
+        lost_at: issuedAt, // dokładnie data wystawienia
+        reported_at: REPORTED_AT,
+        decided_at: DECIDED_AT,
+        now_at: NOW_AT,
+        recovery_id: REC,
+        entitlement_issued_at: issuedAt,
+      })
+    ).not.toThrow(LostCodeLostBeforeIssuedError)
+  })
+
+  it("brak entitlement_issued_at ⇒ pominięcie walidacji lost_at (opcjonalna)", () => {
+    // Bez issued_at nie ma podstawy do walidacji — nie rzuca.
+    expect(() =>
+      determineLostCodeRecoveryOutcome({
+        old_state: EntitlementInstanceState.ISSUED,
+        remaining_old: 5000,
+        lost_at: new Date("2020-01-01T00:00:00.000Z"), // bardzo stare, ale brak issued_at
+        reported_at: REPORTED_AT,
+        decided_at: DECIDED_AT,
+        now_at: NOW_AT,
+        recovery_id: REC,
+        // entitlement_issued_at: undefined — opcjonalne
+      })
+    ).not.toThrow(LostCodeLostBeforeIssuedError)
   })
 })
 

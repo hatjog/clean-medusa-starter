@@ -254,6 +254,44 @@ export class LostCodeBalanceTransferError extends Error {
   }
 }
 
+/**
+ * Rzucany gdy `reported_at` lub `decided_at` jest w przyszłości (anti-fraud, L4).
+ * Daty atestowane przez operatora nie mogą wybiegać w przyszłość — fail-closed.
+ */
+export class LostCodeFutureDateError extends Error {
+  readonly field: string
+  readonly date: string
+  readonly now: string
+  constructor(field: string, date: Date, now: Date) {
+    super(
+      `lost-code: data '${field}' ${date.toISOString()} jest w przyszłości ` +
+        `(now=${now.toISOString()}) — fail-closed anti-fraud (L4).`
+    )
+    this.name = "LostCodeFutureDateError"
+    this.field = field
+    this.date = date.toISOString()
+    this.now = now.toISOString()
+  }
+}
+
+/**
+ * Rzucany gdy `lost_at` poprzedza datę wystawienia vouchera (anti-fraud, L4).
+ * Kod nie mógł zostać zgubiony przed wystawieniem — fail-closed.
+ */
+export class LostCodeLostBeforeIssuedError extends Error {
+  readonly lost_at: string
+  readonly issued_at: string
+  constructor(lostAt: Date, issuedAt: Date) {
+    super(
+      `lost-code: lost_at ${lostAt.toISOString()} jest przed datą wystawienia ` +
+        `issued_at ${issuedAt.toISOString()} — fail-closed anti-fraud (L4).`
+    )
+    this.name = "LostCodeLostBeforeIssuedError"
+    this.lost_at = lostAt.toISOString()
+    this.issued_at = issuedAt.toISOString()
+  }
+}
+
 // ──────────────────────────────────────────────────────────────────────────
 // Idempotencja — deterministyczny recovery_id + deterministyczny nowy kod
 // ──────────────────────────────────────────────────────────────────────────
@@ -349,6 +387,16 @@ export type LostCodeRecoveryDeterminationInput = {
   reported_at: Date
   /** Moment decyzji operatora/PO (`decided_at`) — w oknie ≤7 dni od `reported_at`. */
   decided_at: Date
+  /**
+   * Bieżący czas (WYMAGANY, fail-closed anti-fraud): `reported_at` i `decided_at`
+   * muszą być ≤ `now_at` (daty nie mogą wybiegać w przyszłość — L4).
+   */
+  now_at: Date
+  /**
+   * Data wystawienia vouchera (opcjonalna, anti-fraud L4): `lost_at` musi być
+   * ≥ `entitlement_issued_at` (kod nie mógł zostać zgubiony przed wystawieniem).
+   */
+  entitlement_issued_at?: Date
   /** Deterministyczny `recovery_id` bieżącego żądania (WYMAGANY, idempotencja). */
   recovery_id?: string
   /** `recovery_id` ostatnio ZASTOSOWANEGO odzysku (detekcja replay → no-op). */
@@ -381,13 +429,15 @@ export type LostCodeRecoveryDetermination = {
  * Rozstrzyga EFEKT odzysku (czysta funkcja, fail-closed). Kolejność gardów:
  *
  *   1. `recovery_id` WYMAGANY ({@link LostCodeIdempotencyMissingError}).
- *   2. Replay (ten sam `recovery_id` co ostatnio zastosowany) ⇒ `idempotent_replay:true`,
- *      `directive:"noop"` — POMIJA gardy okien/precondition (operacja już raz zaszła,
- *      no-op; caller zwraca cached wynik, NIE re-throw).
- *   3. Precondition stanu ({@link LostCodePreconditionError}) — stary kod recoverable.
- *   4. Okno zgłoszenia 30 dni ({@link LostCodeReportWindowError}) — PRZED efektami ubocznymi.
- *   5. Okno decyzji ≤7 dni ({@link LostCodeDecisionWindowError}) — PRZED efektami ubocznymi.
- *   6. Transfer salda 1:1 ({@link computeRecoveryBalanceTransfer}, dyscyplina 4.1).
+ *   2. Replay ⇒ `directive:"noop"`, POMIJA gardy okien/precondition/salda.
+ *      Transfer na replay jest informacyjny — caller MUSI zwrócić ZAPAMIĘTANY wynik.
+ *   3. Anti-fraud: `reported_at` ≤ `now_at` ({@link LostCodeFutureDateError}).
+ *   4. Anti-fraud: `decided_at` ≤ `now_at` ({@link LostCodeFutureDateError}).
+ *   5. Anti-fraud: `lost_at` ≥ `entitlement_issued_at` ({@link LostCodeLostBeforeIssuedError}).
+ *   6. Precondition stanu ({@link LostCodePreconditionError}) — stary kod recoverable.
+ *   7. Okno zgłoszenia 30 dni ({@link LostCodeReportWindowError}) — PRZED efektami ubocznymi.
+ *   8. Okno decyzji ≤7 dni ({@link LostCodeDecisionWindowError}) — PRZED efektami ubocznymi.
+ *   9. Transfer salda 1:1 ({@link computeRecoveryBalanceTransfer}, dyscyplina 4.1).
  *
  * KONTRAKT REPLAY: gdy `directive:"noop"`, warstwa operacji MUSI zwrócić ZAPAMIĘTANY
  * (pierwotny) wynik i NIE aplikować void/issue ponownie (mirror 4.6 CR-1).
@@ -401,22 +451,52 @@ export function determineLostCodeRecoveryOutcome(
 
   const replay = input.recovery_id === input.last_applied_recovery_id
 
-  // Transfer salda liczony zawsze (kształt wyniku stały) — fail-closed na złym saldzie
-  // niezależnie od replay (replay też zwraca spójny transfer net-zero).
-  const transfer = computeRecoveryBalanceTransfer(input.remaining_old)
-
   if (replay) {
-    // Replay: operacja już raz zaszła — no-op, POMIJA gardy okien/precondition.
+    // Replay short-circuit PRZED obliczeniem transferu (L3): operacja już raz zaszła —
+    // no-op, POMIJA gardy okien/precondition/salda. Transfer informacyjny (bypass
+    // computeRecoveryBalanceTransfer) — caller MUSI zwrócić ZAPAMIĘTANY wynik, NIE
+    // polegać na tym transferze.
     return {
       directive: "noop",
-      transfer,
+      transfer: {
+        remaining_old: input.remaining_old,
+        remaining_new: input.remaining_old,
+        net_zero: true,
+      },
       derecognition: false,
       net_zero: true,
       idempotent_replay: true,
     }
   }
 
-  // 3. Precondition stanu — stary kod musi być recoverable (z saldem).
+  // 3–4. Anti-fraud: reported_at i decided_at nie mogą być w przyszłości (L4).
+  if (input.reported_at.getTime() > input.now_at.getTime()) {
+    throw new LostCodeFutureDateError(
+      "reported_at",
+      input.reported_at,
+      input.now_at
+    )
+  }
+  if (input.decided_at.getTime() > input.now_at.getTime()) {
+    throw new LostCodeFutureDateError(
+      "decided_at",
+      input.decided_at,
+      input.now_at
+    )
+  }
+
+  // 5. Anti-fraud: lost_at nie może być przed datą wystawienia vouchera (L4).
+  if (
+    input.entitlement_issued_at != null &&
+    input.lost_at.getTime() < input.entitlement_issued_at.getTime()
+  ) {
+    throw new LostCodeLostBeforeIssuedError(
+      input.lost_at,
+      input.entitlement_issued_at
+    )
+  }
+
+  // 6. Precondition stanu — stary kod musi być recoverable (z saldem).
   if (!LOST_CODE_RECOVERABLE_STATES.has(input.old_state)) {
     throw new LostCodePreconditionError(input.old_state)
   }
@@ -425,7 +505,7 @@ export function determineLostCodeRecoveryOutcome(
   const decisionWindow =
     input.decision_window_days ?? LOST_CODE_DECISION_WINDOW_DAYS
 
-  // 4. Okno zgłoszenia 30 dni (od utraty) — PRZED efektami ubocznymi.
+  // 7. Okno zgłoszenia 30 dni (od utraty) — PRZED efektami ubocznymi.
   if (!isWithinReportWindow(input.lost_at, input.reported_at, reportWindow)) {
     throw new LostCodeReportWindowError(
       input.lost_at,
@@ -434,7 +514,7 @@ export function determineLostCodeRecoveryOutcome(
     )
   }
 
-  // 5. Okno decyzji ≤7 dni (od zgłoszenia) — PRZED efektami ubocznymi.
+  // 8. Okno decyzji ≤7 dni (od zgłoszenia) — PRZED efektami ubocznymi.
   if (
     !isWithinDecisionWindow(input.reported_at, input.decided_at, decisionWindow)
   ) {
@@ -444,6 +524,9 @@ export function determineLostCodeRecoveryOutcome(
       decisionWindow
     )
   }
+
+  // 9. Transfer salda 1:1 (fail-closed na złym saldzie — dyscyplina 4.1).
+  const transfer = computeRecoveryBalanceTransfer(input.remaining_old)
 
   return {
     directive: "apply",
@@ -484,6 +567,25 @@ export function buildLostCodePostingNoop(): LostCodePostingNoop {
   return { noop: true, reason: LOST_CODE_POSTING_NOOP_REASON }
 }
 
+/**
+ * Rzucany gdy `buildLostCodeRecoveryWiring` wywołane bez poprawnej determinacji
+ * (`directive !== "apply"`). Strukturalne sprzężenie gardów ze ścieżką side-effect
+ * (AI-Review-1): caller MUSI wołać `determineLostCodeRecoveryOutcome` przed okablowaniem
+ * i przekazać wynik z `directive:"apply"`. Replay/noop NIE może przejść przez wiring.
+ */
+export class LostCodeWiringDirectiveError extends Error {
+  readonly directive: string
+  constructor(directive: string) {
+    super(
+      `lost-code: buildLostCodeRecoveryWiring wymaga determination.directive:"apply" — ` +
+        `otrzymano "${directive}". Caller MUSI wołać determineLostCodeRecoveryOutcome przed ` +
+        `okablowaniem i przekazać wynik z directive:"apply"; replay/noop NIE wykonuje void+issue.`
+    )
+    this.name = "LostCodeWiringDirectiveError"
+    this.directive = directive
+  }
+}
+
 // ──────────────────────────────────────────────────────────────────────────
 // Okablowanie pary tranzycji — JEDNOLITY punkt (3.4), audit-only, void→issue order
 // ──────────────────────────────────────────────────────────────────────────
@@ -516,12 +618,24 @@ export type BuildLostCodeWiringInput = {
   scope: TransitionScope
   /** Deterministyczny `recovery_id` (cykl-safe key + dyskryminator audytu/idempotencji). */
   recovery_id: string
+  /**
+   * WYMAGANY — wynik `determineLostCodeRecoveryOutcome` z `directive:"apply"`.
+   * Strukturalne sprzężenie gardów okien/idempotencji ze ścieżką side-effect (AI-Review-1):
+   * `buildLostCodeRecoveryWiring` fail-closed jeśli `directive !== "apply"`.
+   */
+  determination: LostCodeRecoveryDetermination
   /** Operator/PO podejmujący decyzję (audit hint; id-only, RODO minimal). */
   operator_id?: string | null
   /** Aktor tranzycji (envelope.v1). Domyślnie `admin` (operator unieważnia/wystawia). */
   actor?: TransitionActor
   /** Czas wystąpienia (ISO). Domyślnie `now` w builderze kopert. */
   occurred_at?: string
+  /**
+   * Data ważności starego kodu (dla atomowego zapisu: `write_seam.expires_at` =
+   * `computeRecoveryExpiresAt(old_expires_at)`). Przeniesiona 1:1 na nowy kod
+   * (anti-forfeiture — ważność NIE liczona od daty odzysku).
+   */
+  old_expires_at?: Date | null
 }
 
 /**
@@ -579,6 +693,48 @@ export function buildLostCodeReissueGenesisInput(
   })
 }
 
+/**
+ * Atomowy seam zapisu warstwy operacji (kontrakt, nie persystencja). Dostarcza WSZYSTKIE
+ * dane potrzebne do JEDNEJ atomowej DB-tx spinającej void(old)→VOIDED + INSERT nowego
+ * wiersza z przeniesionym saldem/ważnością (AI-Review-2). Warstwa operacji MUSI:
+ *   (1) BEGIN tx,
+ *   (2) UPDATE old_entitlement → VOIDED (terminalny, anti-double-spend),
+ *   (3) INSERT new_entitlement z `remaining_new` + `expires_at`,
+ *   (4) COMMIT (JEDNO commit, NIE dwa osobne — brak atomowości = okno double-spend).
+ * `computeRecoveryBalanceTransfer`/`computeRecoveryExpiresAt` (czyste funkcje) dostarczyły
+ * wartości; ta struktura pełni rolę jawnego handoffu do warstwy persystencji.
+ */
+export type LostCodeAtomicWriteSeam = {
+  old_entitlement_id: string
+  new_entitlement_id: string
+  /** Saldo nowego kodu = `determination.transfer.remaining_new` (1:1 z starego). */
+  remaining_new: number
+  /** Ważność nowego kodu = `computeRecoveryExpiresAt(old_expires_at)` (identity, NIE od daty odzysku). */
+  expires_at: Date | null
+  recovery_id: string
+}
+
+/**
+ * Buduje atomowy seam zapisu z wymaganych pól okablowania (AI-Review-2).
+ * `remaining_new` pochodzi z `determination.transfer` (wynik gardów); `expires_at`
+ * z `computeRecoveryExpiresAt(old_expires_at)` (identity, anti-forfeiture).
+ */
+export function buildLostCodeAtomicWriteSeam(
+  input: Pick<
+    BuildLostCodeWiringInput,
+    "old_entitlement_id" | "determination" | "old_expires_at" | "recovery_id"
+  >,
+  newEntitlementId: string
+): LostCodeAtomicWriteSeam {
+  return {
+    old_entitlement_id: input.old_entitlement_id,
+    new_entitlement_id: newEntitlementId,
+    remaining_new: input.determination.transfer.remaining_new,
+    expires_at: computeRecoveryExpiresAt(input.old_expires_at ?? null),
+    recovery_id: input.recovery_id,
+  }
+}
+
 /** Wynik okablowania POJEDYNCZEJ tranzycji odzysku (void lub issue). */
 export type LostCodeLegResult = {
   event: TransitionEventEnvelope
@@ -592,6 +748,17 @@ export type LostCodeLegResult = {
 export type LostCodeRecoveryWiringResult = {
   /** Id nowego (recovery) kodu (deterministyczny per recovery_id). */
   new_entitlement_id: string
+  /**
+   * Transfer salda net-zero (z determinacji) — ops layer MUSI persystować
+   * `transfer.remaining_new` na nowym wierszu jako część atomowej tx (patrz {@link write_seam}).
+   */
+  transfer: RecoveryBalanceTransfer
+  /**
+   * Atomowy seam zapisu (kontrakt warstwy operacji, AI-Review-2): void old + INSERT new
+   * z `remaining_new` + `expires_at` w JEDNEJ DB-tx. Oba lub żaden (podwójny zapis
+   * bez atomowości = okno double-spend).
+   */
+  write_seam: LostCodeAtomicWriteSeam
   /** Okablowanie `void(old)` — wykonane PIERWSZE (anti-double-spend). */
   void: LostCodeLegResult
   /** Okablowanie `issue(new)` — wykonane PO void (stary już terminalny). */
@@ -614,9 +781,10 @@ export type LostCodeRecoveryWiringResult = {
  * i emituj `res.void.event` / `res.issue.event` DOPIERO PO commit (inaczej rollback =
  * phantom-event). Dla testów / in-memory (bez granicy commit) użycie `emitEvent` jest OK.
  *
- * Determinacja okien/precondition/idempotencji deleguje do {@link determineLostCodeRecoveryOutcome}
- * (woła PRZED okablowaniem, fail-closed). Ta funkcja zakłada `directive:"apply"` (replay no-op
- * obsługiwany przez warstwę operacji — NIE woła okablowania).
+ * KONTRAKT SPRZĘŻENIA (AI-Review-1): `input.determination.directive` MUSI być `"apply"` —
+ * weryfikowane fail-closed na wejściu. Caller MUSI wołać
+ * `determineLostCodeRecoveryOutcome` przed okablowaniem i przekazać wynik z
+ * `directive:"apply"`. Replay (noop) NIE może przejść przez wiring.
  */
 export async function buildLostCodeRecoveryWiring(
   deps: Pick<
@@ -630,8 +798,15 @@ export async function buildLostCodeRecoveryWiring(
   },
   input: BuildLostCodeWiringInput
 ): Promise<LostCodeRecoveryWiringResult> {
+  // Strukturalne sprzężenie gardów — fail-closed jeśli determinacja nie przeszła (AI-Review-1).
+  if (input.determination.directive !== "apply") {
+    throw new LostCodeWiringDirectiveError(input.determination.directive)
+  }
+
   const newEntitlementId =
     input.new_entitlement_id ?? deriveRecoveryEntitlementId(input.recovery_id)
+
+  const writeSeam = buildLostCodeAtomicWriteSeam(input, newEntitlementId)
 
   const persistDeps: Pick<
     TransitionWiringDeps,
@@ -672,6 +847,8 @@ export async function buildLostCodeRecoveryWiring(
 
   return {
     new_entitlement_id: newEntitlementId,
+    transfer: input.determination.transfer,
+    write_seam: writeSeam,
     void: {
       event: voidWired.event,
       audit: voidWired.audit,
