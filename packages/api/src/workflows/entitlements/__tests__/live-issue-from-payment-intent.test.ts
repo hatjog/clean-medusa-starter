@@ -271,3 +271,121 @@ describe("Story 3.3 — non-voucher SKU pomijane (issue tylko dla linii vouchero
     expect(entitlements.size).toBe(0)
   })
 })
+
+describe("Story 3.3 H1 — sales_channel_id fail-loud (deferred-from-3.2)", () => {
+  it("rzuca gdy order nie niesie sales_channel_id (NIE cichy zapis z null)", async () => {
+    const { client, entitlements } = makeFakeClient(
+      { sales_channel_id: null, metadata: { gp: { market_id: "bonbeauty" } } },
+      [singleVoucherLine()]
+    )
+    await expect(
+      liveIssueEntitlementsWithinTx(client, baseInput(), NOW)
+    ).rejects.toThrow(/sales_channel_id nierozwiązywalny/)
+    expect(entitlements.size).toBe(0) // fail-closed: żaden wiersz nie powstał
+  })
+
+  it("przechodzi gdy sales_channel_id rozwiązany (issue z niepustym scope)", async () => {
+    const { client, entitlements } = makeFakeClient(
+      { sales_channel_id: "sc_bonbeauty", metadata: { gp: { market_id: "bonbeauty" } } },
+      [singleVoucherLine()]
+    )
+    const r = await liveIssueEntitlementsWithinTx(client, baseInput(), NOW)
+    expect(r.issued).toHaveLength(1)
+    expect([...entitlements.values()][0].sales_channel_id).toBe("sc_bonbeauty")
+  })
+})
+
+describe("Story 3.3 H2 — voucher-intent bez profilu = fail-loud (silent-loss guard)", () => {
+  it("linia z markerem entitlement ale niekompletnym profilem ⇒ rzuca (NIE silent processed)", async () => {
+    const { client, entitlements } = makeFakeClient(
+      { sales_channel_id: "sc_x", metadata: { gp: { market_id: "bonbeauty" } } },
+      // marker entitlement_type obecny, ale brak profile_id + policy ⇒ anomalia
+      [{ line_item_id: "li_broken", metadata: { entitlement_type: "VOUCHER_SERVICE" } }]
+    )
+    await expect(
+      liveIssueEntitlementsWithinTx(client, baseInput(), NOW)
+    ).rejects.toThrow(/NIEKOMPLETNY|fail-loud/)
+    expect(entitlements.size).toBe(0)
+  })
+
+  it("linia bez żadnego markera entitlement ⇒ legalne pominięcie (non-voucher)", async () => {
+    const { client } = makeFakeClient(
+      { sales_channel_id: "sc_x", metadata: { gp: { market_id: "bonbeauty" } } },
+      [{ line_item_id: "li_plain", metadata: { sku: "TOWAR", note: "x" } }]
+    )
+    const r = await liveIssueEntitlementsWithinTx(client, baseInput(), NOW)
+    expect(r.event_processed).toBe(true)
+    expect(r.issued).toHaveLength(0)
+  })
+})
+
+describe("Story 3.3 L4 — walidacja entitlement_type przed INSERT (fail-closed)", () => {
+  it("nieznany entitlement_type ⇒ rzuca (poza taksonomią ADR-099)", async () => {
+    const { client, entitlements } = makeFakeClient(
+      { sales_channel_id: "sc_x", metadata: { gp: { market_id: "bonbeauty" } } },
+      [
+        {
+          line_item_id: "li_x",
+          metadata: {
+            entitlement_profile_id: "p",
+            entitlement_type: "BOGUS_TYPE",
+            policy: { vat_rate_uniqueness: true },
+          },
+        },
+      ]
+    )
+    await expect(
+      liveIssueEntitlementsWithinTx(client, baseInput(), NOW)
+    ).rejects.toThrow(/nieznany entitlement_type/)
+    expect(entitlements.size).toBe(0)
+  })
+
+  it("nieaktywny typ (SUBSCRIPTION_B2C hard-gate) ⇒ rzuca (NIEAKTYWNY)", async () => {
+    const { client, entitlements } = makeFakeClient(
+      { sales_channel_id: "sc_x", metadata: { gp: { market_id: "bonbeauty" } } },
+      [
+        {
+          line_item_id: "li_sub",
+          metadata: {
+            entitlement_profile_id: "p",
+            entitlement_type: "SUBSCRIPTION_B2C",
+            policy: { vat_rate_uniqueness: true },
+          },
+        },
+      ]
+    )
+    await expect(
+      liveIssueEntitlementsWithinTx(client, baseInput(), NOW)
+    ).rejects.toThrow(/NIEAKTYWNY/)
+    expect(entitlements.size).toBe(0)
+  })
+})
+
+describe("Story 3.3 L1 — PK id = pełny digest (bez truncacji do 24 hex)", () => {
+  it("entitlement_id = ent_<pełny 64-hex dedupe_key>", async () => {
+    const { client } = makeFakeClient(
+      { sales_channel_id: "sc_x", metadata: { gp: { market_id: "bonbeauty" } } },
+      [singleVoucherLine()]
+    )
+    const r = await liveIssueEntitlementsWithinTx(client, baseInput(), NOW)
+    const { entitlement_id, entitlement_dedupe_key } = r.issued[0]
+    expect(entitlement_dedupe_key).toHaveLength(64)
+    expect(entitlement_id).toBe(`ent_${entitlement_dedupe_key}`)
+    expect(entitlement_id).toHaveLength(68) // ent_ + 64 hex (brak truncacji)
+  })
+})
+
+describe("Story 3.3 M2 — market_id fail-loud w writerze (defense-in-depth)", () => {
+  it("brak market_id (scope + order.metadata) ⇒ rzuca przed INSERT (nie poison-retry)", async () => {
+    const { client, entitlements } = makeFakeClient(
+      { sales_channel_id: "sc_x", metadata: null },
+      [singleVoucherLine()]
+    )
+    const input = baseInput()
+    input.scope = { instance_id: "gp-dev" } // brak market_id w scope
+    await expect(
+      liveIssueEntitlementsWithinTx(client, input, NOW)
+    ).rejects.toThrow(/market_id nierozwiązywalny/)
+    expect(entitlements.size).toBe(0)
+  })
+})

@@ -74,6 +74,60 @@ describe("Story 3.3 AC5 — scanForForbiddenIssuePaths (wykrywa Path X)", () => 
     ]
     expect(scanForForbiddenIssuePaths(files)).toHaveLength(0)
   })
+
+  // ── M1: realistyczne obejścia (false-negatives w starym checkerze) ──────────
+  it("(M1) flaguje INSERT entitlement_instance w SUBSCRIBERZE poza Path Y (nie tylko route)", () => {
+    const files: SourceFile[] = [
+      {
+        path: "packages/api/src/subscribers/rogue-issuer.ts",
+        content: `export default async function () {
+          await client.query("INSERT INTO entitlement_instance (id, state) VALUES ($1,'ISSUED')")
+        }`,
+      },
+    ]
+    const findings = scanForForbiddenIssuePaths(files)
+    expect(findings.some((f) => f.rule === "non-allowlisted-entitlement-insert")).toBe(true)
+  })
+
+  it("(M1) flaguje INSERT przez module-service / repository (workflow voucher poza allow-listą)", () => {
+    const files: SourceFile[] = [
+      {
+        path: "packages/api/src/modules/voucher/workflows/sneaky-issue.ts",
+        content: `await this.manager_.execute("INSERT INTO entitlement_instance (id) VALUES ($1)")`,
+      },
+    ]
+    const findings = scanForForbiddenIssuePaths(files)
+    expect(findings.some((f) => f.rule === "non-allowlisted-entitlement-insert")).toBe(true)
+  })
+
+  it("(M1) flaguje createEntitlementInstances(...) (auto-generowana metoda module-service Medusy)", () => {
+    const files: SourceFile[] = [
+      {
+        path: "packages/api/src/subscribers/evil-service.ts",
+        content: `await voucherModuleService.createEntitlementInstances([{ order_id }])`,
+      },
+    ]
+    const findings = scanForForbiddenIssuePaths(files)
+    expect(findings.some((f) => f.rule === "create-entitlement-issue-callsite")).toBe(true)
+  })
+
+  it("(M1) NIE flaguje legalnych writerów z allow-listy (captured/reissue/retention)", () => {
+    const files: SourceFile[] = [
+      {
+        path: "packages/api/src/workflows/entitlements/issue-entitlement.ts",
+        content: `await client.query("INSERT INTO entitlement_instance (...) VALUES (...)")`,
+      },
+      {
+        path: "packages/api/src/modules/voucher/workflows/reissue-lost-code.ts",
+        content: `await client.query(\`INSERT INTO entitlement_instance (\${columns}) VALUES (...)\`)`,
+      },
+      {
+        path: "packages/api/src/modules/voucher/workflows/issue-retention.ts",
+        content: `await client.query(\`INSERT INTO entitlement_instance (\${columns}) VALUES (...)\`)`,
+      },
+    ]
+    expect(scanForForbiddenIssuePaths(files)).toHaveLength(0)
+  })
 })
 
 describe("Story 3.3 AC5 — realne drzewo źródeł GP respektuje wyłączność Path Y", () => {

@@ -48,6 +48,16 @@ describe("Story 3.3 — toLiveIssueInput (mapowanie envelope.v1, fail-loud NFR4)
     expect(config.event).toBe(PAYMENT_INTENT_SUCCEEDED_EVENT)
     expect(PAYMENT_INTENT_SUCCEEDED_EVENT).toBe("gp.stripe.payment_intent_succeeded.v1")
   })
+
+  it("(M2) rzuca przy braku scope.market_id (fail-loud PRZED tx, nie poison-retry)", () => {
+    const noMarket = { ...envelope, scope: { instance_id: "gp-dev" } }
+    expect(() => toLiveIssueInput("e", noMarket as never)).toThrow(/scope\.market_id/)
+  })
+
+  it("(M2) rzuca przy pustym scope.market_id", () => {
+    const blankMarket = { ...envelope, scope: { instance_id: "gp-dev", market_id: "  " } }
+    expect(() => toLiveIssueInput("e", blankMarket as never)).toThrow(/scope\.market_id/)
+  })
 })
 
 /** Fake pool/client z obsługą BEGIN/COMMIT + minimalnej semantyki ON CONFLICT. */

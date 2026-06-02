@@ -136,22 +136,31 @@ export function toLiveIssueInput(
   data: PaymentIntentEnvelope | undefined
 ): LiveIssueInput {
   const payload = data?.payload ?? {}
+  const scope = data?.scope ?? {}
   const missing: string[] = []
   if (!payload.payment_intent_id) missing.push("payment_intent_id")
   if (!payload.order_id) missing.push("order_id")
   if (!payload.currency) missing.push("currency")
   if (typeof payload.amount_minor !== "number") missing.push("amount_minor")
   if (!payload.psp_occurred_at) missing.push("psp_occurred_at")
+  // M2: `scope.market_id` wymagany w envelope (kontrakt 3.1, ontologia 3.2) —
+  // fail-loud PRZED otwarciem DB-tx. Subscriber jest granicą zaufania dla
+  // event-busa (inni emitenci / replay / testy); bez tej walidacji brak
+  // `market_id` degraduje do naruszenia `market_scope_chk` w pętli writera ⇒
+  // tx abort ⇒ `event_processed` rollback ⇒ poison-retry zamiast czytelnego błędu.
+  const marketId =
+    typeof scope.market_id === "string" ? scope.market_id.trim() : ""
+  if (!marketId) missing.push("scope.market_id")
   if (missing.length > 0) {
     throw new Error(
-      `[voucher-live-issue] envelope payload niekompletny: brak ${missing.join(",")} ` +
+      `[voucher-live-issue] envelope niekompletny: brak ${missing.join(",")} ` +
         `(kontrakt Story 3.1 gp.stripe.payment_intent_succeeded.v1)`
     )
   }
 
   return {
     event_type: data?.event_type ?? eventName,
-    scope: data?.scope ?? {},
+    scope,
     payload: payload as PaymentIntentSucceededPayload,
   }
 }
@@ -184,6 +193,16 @@ export default async function voucherLiveIssueSubscriber({
     // ── side-effecty PO commit (compensation step) ──────────────────────────
     // Story 3.3: side-effecty (email/.ics/MinIO) jeszcze nieaktywne (3.4+).
     // Tu wyłącznie strukturalne, audytowalne logowanie — NIE I/O domenowe.
+    //
+    // KONTRAKT FORWARD dla Story 3.4 (finding L-3): event-level dedupe
+    // (`event_processed`) zwraca `event_processed:false` przy KAŻDYM retry po
+    // pierwszym commicie. Gdy 3.4 doda realne side-effecty (email/.ics/MinIO)
+    // PO commit, a któryś zawiedzie, retry trafi w event-level no-op ⇒
+    // side-effect NIGDY nie zostanie odtworzony (cicha utrata powiadomienia).
+    // 3.4 MUSI zatem prowadzić idempotencję side-effectów ODDZIELNIE od
+    // event-level dedupe (outbox / per-side-effect "delivered" marker), NIE
+    // polegać na ponownym przejściu tej ścieżki. W 3.3 ryzyko jest zerowe
+    // (side-effect = wyłącznie log), ale kontrakt jest tu zadeklarowany jawnie.
     if (!result.event_processed) {
       logger.info?.(
         `[voucher-live-issue] payment_intent=${input.payload.payment_intent_id} ` +

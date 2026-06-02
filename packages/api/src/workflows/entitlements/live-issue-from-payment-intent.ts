@@ -2,6 +2,9 @@ import { createHash } from "node:crypto"
 
 import {
   EntitlementInstanceState,
+  EntitlementType,
+  isActiveEntitlementType,
+  isEntitlementType,
   snapshotPolicy,
   type EntitlementPolicySnapshot,
 } from "../../modules/voucher/models/entitlement"
@@ -32,8 +35,13 @@ import {
  *      (external_id = payment_intent_id, event_type) `ON CONFLICT DO NOTHING`
  *      jako PIERWSZY krok transakcji. 0 affected ⇒ event już skonsumowany ⇒
  *      pomiń tworzenie entitlementów (replay/multi-replica = no-op).
- *   2. Czyta IMMUTABLE recipientów z line-item metadata (zamrożeni w momencie
- *      płatności — precondition ADR-137); `recipient_index` deterministyczny.
+ *   2. Czyta recipientów + profil z line-item metadata. ŹRÓDŁO ZAMROŻENIA (finding
+ *      L-2): NIE payload płatności (envelope niesie wyłącznie payment_intent_id /
+ *      order_id / currency / amount_minor / psp_occurred_at), lecz IMMUTABLE
+ *      `order_line_item.metadata` czytane z bieżącego stanu DB. Determinizm
+ *      `recipient_index`/`dedupe_key` opiera się na PRECONDITION ADR-137: metadata
+ *      linii (profil + recipients) jest NIEMUTOWALNA po `payment_intent.succeeded`.
+ *      Ścieżka redemption/refund/edycji metadata NIE mutuje tych pól (regulamin § 12).
  *   3. Dla każdej (line_item × recipient_index): liczy `entitlement_dedupe_key`
  *      (PEŁNY sha256, finding L-2), snapshotuje `policy_snapshot` + `vat_classification`
  *      (resolver 2.2), wypełnia `market_id` + `sales_channel_id` (ontologia 3.2),
@@ -191,8 +199,51 @@ export async function liveIssueEntitlementsWithinTx(
   for (const line of lines.rows) {
     const profile = extractProfile(line.metadata, payload)
     if (!profile) {
-      continue // non-voucher SKU — pomiń
+      // H2 (silent-failure na ścieżce finansowej): rozróżnij "linia non-voucher
+      // (legalne pominięcie)" od "linia voucherowa bez kompletnego profilu
+      // (anomalia)". Voucher-intent (metadata niesie KTÓRYKOLWIEK marker
+      // entitlement) BEZ kompletnego profilu ⇒ FAIL-LOUD: rzut wycofuje CAŁĄ tx
+      // (w tym `event_processed`), więc Medusa ponawia event / kieruje do DLQ.
+      // NIGDY cichy `processed` z zero entitlementów na OPŁACONEJ linii voucherowej
+      // (to byłaby utrata realizacji opłaconej usługi — silent financial loss).
+      if (hasVoucherIntent(line.metadata)) {
+        throw new Error(
+          `liveIssueEntitlementsWithinTx: linia voucherowa ${line.line_item_id} ` +
+            `(payment_intent ${payload.payment_intent_id}) niesie markery entitlement, ` +
+            `ale profil jest NIEKOMPLETNY (brak profile_id/entitlement_type/policy) — ` +
+            `fail-loud (retry/DLQ), NIE ciche pominięcie`
+        )
+      }
+      continue // linia faktycznie non-voucher (zero markerów) — legalne pominięcie
     }
+
+    // L4: entitlement_type MUSI być znanym, AKTYWNYM typem PRZED INSERT — zła
+    // wartość inaczej rzuca check_violation w DB ⇒ rollback ⇒ poison-retry. Tu
+    // fail-closed z czytelnym komunikatem (nieznany typ poza taksonomią ADR-099
+    // ALBO nieaktywny np. SUBSCRIPTION_B2C hard-gate ⇒ odrzut).
+    assertIssuableEntitlementType(profile.entitlement_type, line.line_item_id, payload)
+
+    // H1 (deferred-from-3.2): live-issue MUSI nieść sales_channel_id — fail-loud
+    // gdy nierozwiązywalny (NIE `null` silent). Brak źródła ⇒ błąd + retry, NIE
+    // wystawienie z `sales_channel_id = NULL` (cicha luka izolacji per-channel,
+    // NFR3). Egzekwowane PRZED INSERT (spójnie z CHECK migracji 1778928300000).
+    const resolvedSalesChannelId = assertScopeResolved(
+      salesChannelId,
+      "sales_channel_id",
+      line.line_item_id,
+      payload
+    )
+
+    // M2: `market_id` wymagany — defense-in-depth (subscriber waliduje
+    // `scope.market_id` PRZED tx; tu last-resort dla writer-direct/replay).
+    // Fail-loud PRZED INSERT zamiast poison-retry na `market_scope_chk` w pętli.
+    const resolvedMarketId = assertScopeResolved(
+      marketId,
+      "market_id",
+      line.line_item_id,
+      payload
+    )
+
     const recipients = extractFrozenRecipients(line.metadata)
 
     for (const recipient of recipients) {
@@ -204,8 +255,8 @@ export async function liveIssueEntitlementsWithinTx(
           lineItemId: line.line_item_id,
           recipient,
           profile,
-          marketId,
-          salesChannelId,
+          marketId: resolvedMarketId,
+          salesChannelId: resolvedSalesChannelId,
         },
         now
       )
@@ -216,12 +267,87 @@ export async function liveIssueEntitlementsWithinTx(
   return { event_processed: true, issued }
 }
 
+/**
+ * Markery "voucher-intent" w line-item metadata (H2). Obecność KTÓREGOKOLWIEK
+ * oznacza, że linia MIAŁA być voucherem — brak kompletnego profilu to anomalia
+ * (fail-loud), nie legalne pominięcie. Linia bez żadnego markera = faktyczny
+ * non-voucher SKU (pomijana cicho — poprawnie).
+ */
+const VOUCHER_INTENT_KEYS = [
+  "entitlement_profile",
+  "entitlement_profile_id",
+  "profile_id",
+  "entitlement_type",
+  "entitlement_policy",
+  "recipients",
+] as const
+
+function hasVoucherIntent(
+  metadata: Record<string, unknown> | null | undefined
+): boolean {
+  if (!metadata || typeof metadata !== "object") return false
+  return VOUCHER_INTENT_KEYS.some(
+    (k) => (metadata as Record<string, unknown>)[k] != null
+  )
+}
+
+/**
+ * Walidacja typu entitlementu względem taksonomii (L4). Nieznany (poza enumem
+ * ADR-099) LUB nieaktywny (poza `ACTIVE_ENTITLEMENT_TYPES`, np. hard-gate
+ * SUBSCRIPTION_B2C) ⇒ fail-closed PRZED INSERT, NIE poison-retry na check_violation.
+ */
+function assertIssuableEntitlementType(
+  entitlementType: string,
+  lineItemId: string,
+  payload: PaymentIntentSucceededPayload
+): void {
+  if (!isEntitlementType(entitlementType)) {
+    throw new Error(
+      `liveIssueEntitlementsWithinTx: nieznany entitlement_type "${entitlementType}" ` +
+        `(linia ${lineItemId}, payment_intent ${payload.payment_intent_id}) — odrzucony ` +
+        `fail-closed przed INSERT (poza taksonomią ADR-099)`
+    )
+  }
+  if (!isActiveEntitlementType(entitlementType as EntitlementType)) {
+    throw new Error(
+      `liveIssueEntitlementsWithinTx: entitlement_type "${entitlementType}" jest NIEAKTYWNY ` +
+        `(linia ${lineItemId}, payment_intent ${payload.payment_intent_id}) — live-issue ` +
+        `dozwolony wyłącznie dla aktywnych typów (bonbeauty SPV/MPV); hard-gate'y ` +
+        `(np. SUBSCRIPTION_B2C) pozostają zamknięte`
+    )
+  }
+}
+
+/**
+ * Fail-loud na nierozwiązany komponent scope (H1 `sales_channel_id` / M2
+ * `market_id`) PRZED INSERT. Zwraca niepustą wartość lub rzuca — eliminuje
+ * zapis z `NULL`/pustym scope (poison-retry na constraint w pętli, NFR3).
+ */
+function assertScopeResolved(
+  value: string | null,
+  field: "market_id" | "sales_channel_id",
+  lineItemId: string,
+  payload: PaymentIntentSucceededPayload
+): string {
+  const resolved = readString(value)
+  if (!resolved) {
+    throw new Error(
+      `liveIssueEntitlementsWithinTx: ${field} nierozwiązywalny na ścieżce live ` +
+        `(linia ${lineItemId}, order ${payload.order_id}, payment_intent ` +
+        `${payload.payment_intent_id}) — fail-loud przed INSERT (retry), NIE zapis ` +
+        `z null (NFR3 fail-closed izolacja)`
+    )
+  }
+  return resolved
+}
+
 type IssueRowContext = {
   lineItemId: string
   recipient: FrozenRecipient
   profile: ResolvedProfile
-  marketId: string | null
-  salesChannelId: string | null
+  // H1/M2: rozwiązane fail-loud PRZED wejściem tu (niepuste, nigdy null).
+  marketId: string
+  salesChannelId: string
 }
 
 async function issueSingleIssuedRow(
@@ -304,9 +430,15 @@ async function issueSingleIssuedRow(
   }
 }
 
-/** Deterministyczny id entitlementu z klucza dedupe (stabilny przy retry). */
+/**
+ * Deterministyczny id entitlementu z klucza dedupe (stabilny przy retry).
+ * PEŁNY digest (finding L-1/L-2) — BEZ truncacji: id jest 1:1 z `dedupe_key`
+ * (oba pełne sha256, 64 hex), więc dwa różne klucze NIE mogą skolidować na PK
+ * przez wspólny 24-hex prefiks. Retry trafia w `ON CONFLICT (entitlement_dedupe_key)`
+ * (no-op) ZANIM dojdzie do jakiejkolwiek kolizji PK.
+ */
 function buildIssuedEntitlementId(dedupeKey: string): string {
-  return `ent_${dedupeKey.slice(0, 24)}`
+  return `ent_${dedupeKey}`
 }
 
 type ResolvedProfile = {

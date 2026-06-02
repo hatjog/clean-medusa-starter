@@ -22,6 +22,7 @@ import { Pool, type PoolClient } from "pg"
 
 import { Migration1778928100000 } from "../../modules/voucher/migrations/1778928100000_add_vat_classification_and_ontology_fk"
 import { Migration1778928200000 } from "../../modules/voucher/migrations/1778928200000_add_entitlement_dedupe_key_and_recipient_index"
+import { Migration1778928300000 } from "../../modules/voucher/migrations/1778928300000_tighten_sales_channel_scope_live_issue"
 import { buildEntitlementDedupeKey } from "../../modules/voucher/models/entitlement-dedupe"
 
 function collectUpSql(MigrationClass: { prototype: unknown }): string[] {
@@ -74,6 +75,7 @@ maybe("Story 3.3 — live-issue na realnym PG (AC3 vat-stability + AC4 dedupe)",
       for (const sql of [
         ...collectUpSql(Migration1778928100000),
         ...collectUpSql(Migration1778928200000),
+        ...collectUpSql(Migration1778928300000),
       ]) {
         await client.query(sql)
       }
@@ -116,9 +118,9 @@ maybe("Story 3.3 — live-issue na realnym PG (AC3 vat-stability + AC4 dedupe)",
         c.query(
           `INSERT INTO entitlement_instance
              (id, entitlement_profile_id, entitlement_type, order_id, line_item_id,
-              market_id, vat_classification, entitlement_dedupe_key, recipient_index,
-              state, policy_snapshot)
-           VALUES ($1,'p','VOUCHER_SERVICE','order_d','li_1','bonbeauty','SPV',$2,0,
+              market_id, sales_channel_id, vat_classification, entitlement_dedupe_key,
+              recipient_index, state, policy_snapshot)
+           VALUES ($1,'p','VOUCHER_SERVICE','order_d','li_1','bonbeauty','sc_1','SPV',$2,0,
                    'ISSUED','{}'::jsonb)
            ON CONFLICT (entitlement_dedupe_key) DO NOTHING`,
           [id, key]
@@ -143,9 +145,9 @@ maybe("Story 3.3 — live-issue na realnym PG (AC3 vat-stability + AC4 dedupe)",
         c.query(
           `INSERT INTO entitlement_instance
              (id, entitlement_profile_id, entitlement_type, order_id, line_item_id,
-              market_id, vat_classification, entitlement_dedupe_key, recipient_index,
-              state, policy_snapshot)
-           VALUES ($1,'p','VOUCHER_SERVICE','order_m','li_g','bonbeauty','MPV',$2,$3,
+              market_id, sales_channel_id, vat_classification, entitlement_dedupe_key,
+              recipient_index, state, policy_snapshot)
+           VALUES ($1,'p','VOUCHER_SERVICE','order_m','li_g','bonbeauty','sc_1','MPV',$2,$3,
                    'ISSUED','{}'::jsonb)
            ON CONFLICT (entitlement_dedupe_key) DO NOTHING`,
           [`ent_r${idx}`, buildEntitlementDedupeKey("pi_multi", "li_g", idx), idx]
@@ -161,14 +163,61 @@ maybe("Story 3.3 — live-issue na realnym PG (AC3 vat-stability + AC4 dedupe)",
     })
   })
 
+  it("(H1) live-issued (dedupe_key) Z sales_channel_id PRZECHODZI", async () => {
+    await withMigratedTx(async (c) => {
+      const r = await c.query(
+        `INSERT INTO entitlement_instance
+           (id, entitlement_profile_id, entitlement_type, order_id, line_item_id,
+            market_id, sales_channel_id, vat_classification, entitlement_dedupe_key,
+            recipient_index, state, policy_snapshot)
+         VALUES ('ent_h1_ok','p','VOUCHER_SERVICE','order_h1','li_1','bonbeauty','sc_1','SPV',$1,0,
+                 'ISSUED','{}'::jsonb)`,
+        [buildEntitlementDedupeKey("pi_h1", "li_1", 0)]
+      )
+      expect(r.rowCount).toBe(1)
+    })
+  })
+
+  it("(H1) live-issued (dedupe_key) BEZ sales_channel_id ODRZUCONY (fail-closed scope)", async () => {
+    await withMigratedTx(async (c) => {
+      await expect(
+        c.query(
+          `INSERT INTO entitlement_instance
+             (id, entitlement_profile_id, entitlement_type, order_id, line_item_id,
+              market_id, vat_classification, entitlement_dedupe_key, recipient_index,
+              state, policy_snapshot)
+           VALUES ('ent_h1_bad','p','VOUCHER_SERVICE','order_h1b','li_1','bonbeauty','SPV',$1,0,
+                   'ISSUED','{}'::jsonb)`,
+          [buildEntitlementDedupeKey("pi_h1b", "li_1", 0)]
+        )
+      ).rejects.toThrow(/entitlement_instance_sales_channel_scope_chk/)
+    })
+  })
+
+  it("(H1) captured-path (dedupe_key NULL) BEZ sales_channel_id wciąż PRZECHODZI (brak regresji v1.9.0 H-6)", async () => {
+    await withMigratedTx(async (c) => {
+      // ścieżka payment.captured (issue-entitlement.ts) ustawia order_id+market_id,
+      // ale NIE sales_channel_id ani entitlement_dedupe_key — MUSI nadal działać.
+      const r = await c.query(
+        `INSERT INTO entitlement_instance
+           (id, entitlement_profile_id, entitlement_type, order_id, line_item_id,
+            market_id, state, policy_snapshot)
+         VALUES ('ent_captured','p','VOUCHER_SERVICE','order_cap','li_c','bonbeauty',
+                 'ACTIVE','{}'::jsonb)`
+      )
+      expect(r.rowCount).toBe(1)
+    })
+  })
+
   it("(AC4) recipient_index < 0 ODRZUCONY (CHECK domena nieujemna)", async () => {
     await withMigratedTx(async (c) => {
       await expect(
         c.query(
           `INSERT INTO entitlement_instance
              (id, entitlement_profile_id, entitlement_type, order_id, market_id,
-              vat_classification, entitlement_dedupe_key, recipient_index, state, policy_snapshot)
-           VALUES ('ent_neg','p','VOUCHER_SERVICE','order_n','bonbeauty','SPV','k_neg',-1,
+              sales_channel_id, vat_classification, entitlement_dedupe_key, recipient_index,
+              state, policy_snapshot)
+           VALUES ('ent_neg','p','VOUCHER_SERVICE','order_n','bonbeauty','sc_1','SPV','k_neg',-1,
                    'ISSUED','{}'::jsonb)`
         )
       ).rejects.toThrow(/entitlement_instance_recipient_index_chk/)
