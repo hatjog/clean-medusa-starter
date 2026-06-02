@@ -68,6 +68,9 @@ importers:
       '@sentry/node':
         specifier: ^9.0.0
         version: 9.47.1
+      '@touch4it/ical-timezones':
+        specifier: ^1.9.0
+        version: 1.9.0
       awilix:
         specifier: ^8.0.1
         version: 8.0.1
@@ -76,7 +79,7 @@ importers:
         version: 3.0.5
       ical-generator:
         specifier: 10.2.0
-        version: 10.2.0(@types/node@22.19.17)(luxon@3.7.2)
+        version: 10.2.0(@touch4it/ical-timezones@1.9.0)(@types/node@22.19.17)(luxon@3.7.2)
       js-yaml:
         specifier: ^4.1.1
         version: 4.1.1
@@ -3472,6 +3475,10 @@ packages:
 
   '@tanstack/virtual-core@3.14.0':
     resolution: {integrity: sha512-JLANqGy/D6k4Ujmh8Tr25lGimuOXNiaVyXaCAZS0W+1390sADdGnyUdSWNIfd49gebtIxGMij4IktRVzrdr12Q==}
+
+  '@touch4it/ical-timezones@1.9.0':
+    resolution: {integrity: sha512-UAiZMrFlgMdOIaJDPsKu5S7OecyMLr3GGALJTYkRgHmsHAA/8Ixm1qD09ELP2X7U1lqgrctEgvKj9GzMbczC+g==}
+    engines: {node: '>= 14.0.0'}
 
   '@ts-morph/common@0.28.1':
     resolution: {integrity: sha512-W74iWf7ILp1ZKNYXY5qbddNaml7e9Sedv5lvU1V8lftlitkc9Pq1A+jlH23ltDgWYeZFFEqGCD1Ies9hqu3O+g==}
@@ -12090,6 +12097,8 @@ snapshots:
 
   '@tanstack/virtual-core@3.14.0': {}
 
+  '@touch4it/ical-timezones@1.9.0': {}
+
   '@ts-morph/common@0.28.1':
     dependencies:
       minimatch: 10.2.5
@@ -13831,8 +13840,9 @@ snapshots:
     dependencies:
       '@babel/runtime': 7.29.2
 
-  ical-generator@10.2.0(@types/node@22.19.17)(luxon@3.7.2):
+  ical-generator@10.2.0(@touch4it/ical-timezones@1.9.0)(@types/node@22.19.17)(luxon@3.7.2):
     optionalDependencies:
+      '@touch4it/ical-timezones': 1.9.0
       '@types/node': 22.19.17
       luxon: 3.7.2
 
