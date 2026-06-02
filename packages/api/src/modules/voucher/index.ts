@@ -137,6 +137,17 @@ export type {
   VoucherLedgerWriteRequest,
   VoucherLedgerWriteResult,
 } from "./ledger-writer"
+// Story 3.2: event-level idempotencja konsumpcji eventów (ADR-137 DEC-5 pkt 3.i).
+// Warstwa danych pod live-issue Path Y (subscriber = 3.3). Eksport dostarcza
+// kontrakt tabeli `event_processed` + prymityw dedupe (ON CONFLICT DO NOTHING),
+// NIE subscriber / NIE posting hook / NIE aktywację postingu.
+export {
+  EVENT_PROCESSED_TABLE,
+  EVENT_PROCESSED_PK_COLUMNS,
+  buildEventProcessedDedupeInsert,
+  applyEventProcessedDedup,
+} from "./models/event-processed"
+export type { EventProcessedRow } from "./models/event-processed"
 export {
   ENTITLEMENT_BOUNDARY,
   LOST_CODE_REISSUE_WINDOW_DAYS,

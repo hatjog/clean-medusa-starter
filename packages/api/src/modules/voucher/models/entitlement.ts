@@ -20,6 +20,8 @@
  * subscriber/workflow.
  */
 
+import type { VatClassification } from "../vat-resolver"
+
 // ---------------------------------------------------------------------------
 // Layer 1 — entitlement_type canonical taxonomy
 // ---------------------------------------------------------------------------
@@ -385,6 +387,21 @@ export interface EntitlementInstanceRow {
   entitlement_type: EntitlementType
   /** Nullable until Epic 1 Story 1.3 wires live issue post-payment. */
   order_id: string | null
+  /**
+   * Ontologia scope (Story 3.2, FR21). Live-wystawiona encja (order_id != null)
+   * MUSI nieść niepuste market_id + sales_channel_id (CHECK fail-closed, NFR3);
+   * legacy/authored (order_id null) zwolnione. Nullable na poziomie typu dla
+   * wierszy legacy.
+   */
+  market_id: string | null
+  /** Ontologia scope (Story 3.2, FR21) — patrz market_id. */
+  sales_channel_id: string | null
+  /**
+   * Snapshot klasyfikacji VAT (SPV/MPV). Kolumnę dodaje Story 3.2; WYPEŁNIENIE
+   * (snapshot przy ISSUED + inwariant niereklasyfikacji, FR32) = Story 3.3.
+   * Null do czasu snapshotu.
+   */
+  vat_classification: VatClassification | null
   state: EntitlementInstanceState
   // BE-2 (Story 2.3): active service-booking pointer; reset on cancel_booking.
   booking_pointer: string | null
