@@ -265,6 +265,38 @@ export type {
   RedeemEntitlementEventEmitter,
 } from "./workflows/redeem-entitlement"
 
+// Story 4.1 (Epic 4 / Wave 4 — lifecycle): redeem (partial + full) idempotentny
+// z derecognition. Partial obniża `remaining` na TYM SAMYM entitlement_id (NIE
+// reissue, NIGDY > remaining); tranzycja routuje przez wireEntitlementTransition
+// Persisted (3.4); posting = DERECOGNITION proporcjonalna (generateVoucherPosting
+// 2.3 → ledger-writer 2.6). Idempotencja DWUWARSTWOWA (idempotency_key+
+// entitlement_id domena + transaction_id writera). Withdrawal (art. 38 pkt 1)
+// gaśnie WYŁĄCZNIE przy REDEEMED_FULL. Posting GATED (runtime_enabled=false ⇒
+// audit-only/no-op; flip = E6/P6, NIE tutaj).
+export {
+  VOUCHER_REDEMPTION_TABLE,
+  RedeemPartialEntitlementOperation,
+  RedeemEntitlementNotFoundError as RedeemPartialEntitlementNotFoundError,
+  RedeemAmountError,
+  RedeemNotRedeemableError,
+  PostgresRedeemPartialStore,
+  InMemoryRedeemPartialStore,
+  createRedeemPartialOperationFromScope,
+  isWithdrawalRightExtinguished,
+  buildRedemptionId,
+} from "./workflows/redeem-partial-entitlement"
+export type {
+  RedeemOutcome,
+  RedeemPartialInput,
+  RedeemPartialResult,
+  RedemptionRecord,
+  RedeemableAmountEntitlement,
+  RedeemPartialTx,
+  RedeemPartialStore,
+  RedeemPartialEventEmitter,
+  RedeemPartialDeps,
+} from "./workflows/redeem-partial-entitlement"
+
 export default Module(VOUCHER_MODULE, {
   service: VoucherService,
   loaders: [voucherSeedFixturesLoader],
