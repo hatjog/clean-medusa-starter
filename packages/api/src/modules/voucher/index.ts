@@ -364,6 +364,76 @@ export type {
   PreExpiryNotifyResult,
 } from "./workflows/expire-entitlement"
 
+// Story 4.3 (Epic 4 / Wave 4 — lifecycle L4 refund): DWA mechanizmy zwrotu —
+// (a) odstąpienie 14 dni (pełny zwrot niewykorzystanego, art. 38 pkt 1; prawo
+// gaśnie WYŁĄCZNIE przy REDEEMED_FULL — reuse 4.1) + (b) zwrot salda `remaining`
+// (dozwolony także po partial, art. 385¹ KC). Copy rozróżnia (a)/(b) (UX-DR-14,
+// anti-forfeiture). RODO art. 26 carry-forward KONSUMUJE istniejący kontrakt DSAR
+// (ADR-069, NIE buduje nowego). KRYTYCZNE (ADR-139 §Granice): refund posting =
+// NO posting + alarm (REFUNDED nieznane profilowi) ⇒ DEFEROWANY architektonicznie,
+// wymaga OSOBNEGO ADR; tranzycja routuje przez wireEntitlementTransition (3.4) dla
+// event+audit (gated/audit-only). NIE flipuje runtime_enabled (E6/P6).
+export {
+  WITHDRAWAL_WINDOW_DAYS,
+  WITHDRAWAL_BASIS_LABEL,
+  BALANCE_BASIS_LABEL,
+  DSAR_CONTRACT_REF,
+  DSAR_CARRY_FORWARD_ADR,
+  REFUND_POSTING_REQUIRED_ADR,
+  REFUND_POSTING_DEFERRAL_REASON,
+  REFUND_TERMINAL_STATE,
+  RefundChannelError,
+  RefundWithdrawalWindowError,
+  RefundMechanismError,
+  RefundAmountError,
+  RefundCopyAmbiguityError,
+  resolveRefundWindowDays,
+  isWithinWithdrawalWindow,
+  resolveRefundChannel,
+  determineRefundMechanism,
+  buildRefundCopy,
+  assertRefundCopyDistinct,
+  buildDsarCarryForward,
+  buildRefundPostingDeferral,
+  buildPaymentRefundIdempotencyKey,
+} from "./entitlement-refund"
+export type {
+  RefundMechanism,
+  RefundDeterminationInput,
+  RefundDetermination,
+  RefundCopy,
+  DsarCarryForward,
+  RefundPostingDeferral,
+} from "./entitlement-refund"
+
+// Story 4.3: operacja refund (dwa mechanizmy) routowana przez wireEntitlement
+// TransitionPersisted (3.4) → REFUND_REQUESTED → REFUNDED. Posting derecognition
+// FAIL-CLOSED (ADR-139 §Granice): BRAK payloadu postingu (audit-only) + marker
+// deferralu (wymaga osobnego ADR). Idempotentny (REFUNDED terminal marker; refund_id
+// dyskryminator audytu + seam zwrotu płatności — Stripe NIE aktywowany, scope window).
+export {
+  REFUND_SOURCE_STATES,
+  ENTITLEMENT_REFUNDED_EVENT_TYPE,
+  REFUND_POSTING_DEFERRED_EVENT_TYPE,
+  RefundEntitlementOperation,
+  RefundEntitlementNotFoundError,
+  EntitlementNotRefundableError,
+  PostgresRefundEntitlementStore,
+  InMemoryRefundEntitlementStore,
+  createRefundEntitlementOperationFromScope,
+} from "./workflows/refund-entitlement"
+export type {
+  RefundEntitlementInput,
+  RefundEntitlementResult,
+  RefundLifecycleEnvelope,
+  RefundableEntitlement,
+  RefundEntitlementTx,
+  RefundEntitlementStore,
+  RefundEntitlementEventEmitter,
+  RefundPostingDeferralSink,
+  RefundEntitlementDeps,
+} from "./workflows/refund-entitlement"
+
 export default Module(VOUCHER_MODULE, {
   service: VoucherService,
   loaders: [voucherSeedFixturesLoader],
