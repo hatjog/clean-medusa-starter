@@ -47,13 +47,24 @@ describe("Story 3.2 AC1 — kolumny ontologii + vat_classification na entitlemen
 describe("Story 3.2 AC2 — izolacja per market FAIL-CLOSED (FR21/NFR3)", () => {
   const up = collectSql("up")
 
-  it("CHECK scope: live-issued (order_id NOT NULL) MUSI mieć niepusty market_id i sales_channel_id", () => {
-    // encja live bez scope ⇒ odrzucona; legacy (order_id NULL) zwolniona.
+  it("CHECK scope: live-issued (order_id NOT NULL) MUSI mieć niepusty market_id", () => {
+    // encja live bez market_id ⇒ odrzucona; legacy (order_id NULL) zwolniona.
     expect(up).toMatch(/entitlement_instance_market_scope_chk/)
     expect(up).toMatch(/order_id IS NULL\s*OR \(/)
     expect(up).toMatch(/market_id IS NOT NULL AND char_length\(market_id\) > 0/)
+  })
+
+  it("AI-01 (HIGH): CHECK NIE wymaga sales_channel_id na live-issued (aktywny writer go nie wypełnia; wymóg → 3.3)", () => {
+    // sales_channel_id NOT NULL w CHECK złamałby realny db:migrate live-issue.
+    // Kolumna jest dodana (warstwa danych pod 3.3), ale NIE w CHECK market_scope.
+    const scopeCheck =
+      up.match(/entitlement_instance_market_scope_chk[\s\S]*?NOT VALID/)?.[0] ?? ""
+    expect(scopeCheck).not.toMatch(/sales_channel_id/)
+  })
+
+  it("kolumna sales_channel_id dodana mimo braku w CHECK (warstwa danych pod 3.3)", () => {
     expect(up).toMatch(
-      /sales_channel_id IS NOT NULL AND char_length\(sales_channel_id\) > 0/
+      /ALTER TABLE IF EXISTS entitlement_instance\s+ADD COLUMN IF NOT EXISTS sales_channel_id text NULL/
     )
   })
 

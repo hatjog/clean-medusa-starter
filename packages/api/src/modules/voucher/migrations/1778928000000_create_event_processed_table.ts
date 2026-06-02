@@ -40,6 +40,17 @@ import { Migration } from "@medusajs/framework/mikro-orm/migrations"
  * NFR6 (cross-modułowość): tabela jest tworzona w module `voucher` i NIE odwołuje
  * się FK do tabel innych modułów (izolacja modułów Medusa 2) — migracja
  * single-module, brak triggera STOP-i-pytaj.
+ *
+ * RELACJA DO `webhook_event_processed` (review AI-02 / MEDIUM): `event_processed`
+ * (PK `external_id`+`event_type` = dedupe KONSUMPCJI biznesowej / issuance) jest
+ * KOMPLEMENTARNA, NIE redundantna, wobec istniejącej `webhook_event_processed`
+ * (PK `event_id`+`provider` = dedupe DOSTAWY webhooka). Różne klucze, różne warstwy
+ * — pełny kontrakt + kolejność użycia w 3.3 patrz docstring `models/event-processed.ts`.
+ *
+ * SEMANTYKA ROLLBACK (review AI-05 / LOW): `down()` tej tabeli jest forward-fix-only
+ * (no-op, NIE DROP) — usunięcie rejestru groziłoby reprocessem. To NOWA tabela (brak
+ * wcześniejszych migracji o mieszanej semantyce), więc rollback jest jednolicie
+ * append-only (w odróżnieniu od `entitlement_instance` — patrz migracja `1778928100000`).
  */
 export class Migration1778928000000 extends Migration {
   async up(): Promise<void> {

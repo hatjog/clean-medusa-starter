@@ -15,6 +15,41 @@
  * GRANICA (E3): to WARSTWA DANYCH / prymityw idempotencji. NIE jest subscriberem
  * Path Y (3.3), NIE okablowuje maszyny stanów (3.4), NIE aktywuje postingu. Dedupe
  * PER-ENTITLEMENT (`entitlement_dedupe_key`, FR10) jest oddzielny i należy do 3.3.
+ *
+ * ── RELACJA DO `webhook_event_processed` (review AI-02 / MEDIUM) ─────────────
+ * Istnieje JUŻ aktywna tabela `webhook_event_processed`
+ * (`packages/api/src/migrations/Migration20260516000000StripePathYWebhookEventProcessed.ts`,
+ * PK `(event_id, provider)`), wpięta w żywą ścieżkę Path Y (`stripe-payment-audit.ts`,
+ * `on-order-placed-stripe-retry.ts`). `event_processed` (ta story, PK
+ * `(external_id, event_type)`) jest wobec niej KOMPLEMENTARNA, NIE redundantna —
+ * to DWIE ORTOGONALNE WARSTWY idempotencji z RÓŻNYMI kluczami:
+ *
+ *   • `webhook_event_processed`  — dedupe DOSTAWY WEBHOOKA (transport).
+ *       Klucz: Stripe `event_id` (`evt_...`) + `provider`. Chroni przed ponowną
+ *       dostawą tego samego webhooka (retry Stripe, multi-replica). Warstwa
+ *       transportowa: „czy ten konkretny pakiet webhooka był już odebrany?".
+ *
+ *   • `event_processed`          — dedupe KONSUMPCJI BIZNESOWEJ (issuance).
+ *       Klucz: `external_id` (= `payment_intent.id`, `pi_...`) + `event_type`.
+ *       Chroni przed PODWOJENIEM ISSUE dla tego samego faktu płatności, nawet
+ *       gdy dotarł innym kanałem/innym `event_id` (np. webhook vs reconcile job).
+ *       Warstwa domenowa: „czy ten payment_intent był już skonsumowany do issue?".
+ *
+ * Klucze są semantycznie ROZŁĄCZNE (`evt_...` ≠ `pi_...`): jeden `payment_intent.id`
+ * może pojawić się w wielu Stripe `event_id`, więc dedupe webhooka NIE wystarcza do
+ * idempotencji issuance i odwrotnie. Audyt ADR-137 („brak `event_processed`") był
+ * literalnie poprawny (brak tabeli o tej nazwie), ale `webhook_event_processed`
+ * istniał — stąd to doprecyzowanie.
+ *
+ * KONTRAKT DLA 3.3 (subscriber Path Y) — używa OBU warstw, w kolejności:
+ *   1. `webhook_event_processed` (event_id+provider) — wczesny guard transportu
+ *      (już dziś wpięty w stripe-payment-audit, story 3.3 go NIE zastępuje);
+ *   2. `event_processed` (external_id+event_type) — guard konsumpcji jako PIERWSZY
+ *      krok transakcji issuance (INSERT ... ON CONFLICT DO NOTHING; 0 affected ⇒
+ *      event już skonsumowany ⇒ pomiń tworzenie entitlementów);
+ *   3. `entitlement_dedupe_key` unique (per-entitlement, FR10) — ostatnia bariera
+ *      przed podwojeniem pojedynczego entitlementu (Story 3.3).
+ * `event_processed` NIE zastępuje `webhook_event_processed` — warstwy współistnieją.
  */
 
 /** Nazwa tabeli event-level idempotencji (zgodna z migracją + allowlistą). */
