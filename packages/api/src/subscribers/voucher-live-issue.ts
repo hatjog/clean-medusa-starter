@@ -7,17 +7,26 @@
  * CAŁĄ biznes-logikę do rdzenia `liveIssueEntitlementsWithinTx` (issue → ISSUED,
  * dwupoziomowa idempotencja DEC-5). To JEDYNA droga do ISSUED (Path Y, ADR-052/118).
  *
- * Atomicity (ADR-137 DEC pkt 3): `event_processed` + INSERT-y entitlementów w JEDNEJ
- * DB-tx (BEGIN/COMMIT tutaj); side-effecty (email/.ics/MinIO) PO commit jako
- * compensation step. W tej story side-effecty są jeszcze nieaktywne (3.4+) — po
- * commit wykonujemy wyłącznie strukturalne logowanie wyniku.
+ * Atomicity (ADR-137 DEC pkt 3): `event_processed` + INSERT-y entitlementów +
+ * OKABLOWANIE GENEZY ISSUED (audit append-only + posting hook) w JEDNEJ DB-tx
+ * (BEGIN/COMMIT tutaj); EVENT okablowania emitowany PO commit (best-effort,
+ * AI-Review-3 kontrakt post-COMMIT). Rollback ⇒ brak phantom-eventu.
  *
- * GRANICA (E3 — issue ≠ posting): stan = ISSUED, NIE okablowuje maszyny stanów
- * (3.4), NIE woła `ledger-writer.ts` (2.6), NIE aktywuje postingu (`runtime_enabled`
- * = `false`, flip = E6/P6), NIE rusza hard-gate'ów MPV_MULTI_VENDOR/SUBSCRIPTION_B2C.
+ * OKABLOWANIE (Story 3.4): geneza ISSUED każdego nowo utworzonego wiersza
+ * przechodzi przez JEDNOLITY punkt `wireEntitlementTransitionPersisted`
+ * (`from = ENTITLEMENT_GENESIS`, `to = ISSUED`) → (1) event envelope.v1 +
+ * (2) append-only audit + (3) posting hook. To realizuje AC1 w runtime (Path Y
+ * ISSUED audytowalna + księgowalna przez ten sam punkt; pozostałe tranzycje = E4
+ * przez TEN SAM punkt, egzekwowane checkerem `entitlement-transition-routing.ts`).
+ *
+ * GRANICA (E3 — hook ≠ aktywacja): posting hook jest WYWOŁANY ale `runtime_enabled`
+ * = `false` ⇒ persystencja ledgera INERT (writer NIE wołany, zero zapisu
+ * `voucher_ledger_*`; flip = E6/P6). Hook NIE dostaje fabrykowanego payloadu
+ * finansowego (rozpoznanie liability ISSUED = money-ledger / E4). NIE rusza
+ * hard-gate'ów MPV_MULTI_VENDOR/SUBSCRIPTION_B2C.
  */
 import type { SubscriberArgs, SubscriberConfig } from "@medusajs/framework"
-import { ContainerRegistrationKeys } from "@medusajs/framework/utils"
+import { ContainerRegistrationKeys, Modules } from "@medusajs/framework/utils"
 
 import {
   liveIssueEntitlementsWithinTx,
@@ -26,6 +35,14 @@ import {
   type LiveIssueScope,
   type PaymentIntentSucceededPayload,
 } from "../workflows/entitlements/live-issue-from-payment-intent"
+import {
+  wireEntitlementTransitionPersisted,
+  emitTransitionEventAfterCommit,
+  buildGenesisIssuedTransition,
+  ENTITLEMENT_STATE_CHANGED_EVENT_TYPE,
+  type TransitionEventEnvelope,
+  type TransitionAuditEnvelope,
+} from "../modules/voucher/entitlement-transition-wiring"
 
 /** event_type kontraktu Story 3.1 (AR-EVENTS). */
 export const PAYMENT_INTENT_SUCCEEDED_EVENT =
@@ -83,6 +100,37 @@ function resolveDb(scope: { resolve: (key: string) => unknown }): PgPool | KnexL
 
 function isPgPool(value: PgPool | KnexLike): value is PgPool {
   return typeof (value as PgPool).connect === "function"
+}
+
+type EventBusLike = { emit: (event: { name: string; data: unknown }) => Promise<unknown> }
+
+/** Resolve Medusa event bus (best-effort); `null` gdy niedostępny (emit no-op). */
+function resolveEventBus(
+  scope: { resolve: (key: string) => unknown } | undefined
+): EventBusLike | null {
+  const resolver = scope?.resolve
+  if (typeof resolver !== "function") return null
+  try {
+    const bus = resolver.call(scope, Modules.EVENT_BUS) as EventBusLike | undefined
+    return bus && typeof bus.emit === "function" ? bus : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Append-only sink audytu tranzycji (Story 3.4). W tej fazie (`runtime_enabled=false`,
+ * side-effecty issue jeszcze nie persystowane w dedykowanej tabeli) audyt jest
+ * strukturalnym, append-only logiem (spójnie z deklaracją 3.3 „strukturalne,
+ * audytowalne logowanie"). KONTRAKT FORWARD (E4/E6): durable audit-table / outbox
+ * podmienia TEN sink BEZ zmiany kontraktu okablowania (envelope niezmienny).
+ */
+function makeTransitionAuditSink(
+  logger: LoggerLike
+): (audit: TransitionAuditEnvelope) => Promise<void> {
+  return async (audit) => {
+    logger.info?.(`[entitlement-transition-audit] ${JSON.stringify(audit)}`)
+  }
 }
 
 function createKnexPgClient(db: KnexLike): PgClient {
@@ -184,26 +232,54 @@ export default async function voucherLiveIssueSubscriber({
 
   const scope = container as unknown as { resolve: (key: string) => unknown }
   const db = resolveDb(scope)
+  const now = new Date()
+  // M2: `scope.market_id` zwalidowany w `toLiveIssueInput` (niepusty) — bezpieczne
+  // źródło scope audytu/eventu okablowania (spójne z market_id użytym do INSERT).
+  const marketId = String(input.scope.market_id)
 
   try {
-    const result = await withTransaction(db, (client) =>
-      liveIssueEntitlementsWithinTx(client, input, new Date())
-    )
+    // ── (A) issue + OKABLOWANIE GENEZY ISSUED w JEDNEJ DB-tx (atomicity) ──────
+    // Audyt (append-only) + posting hook (bramkowany, inert przy
+    // runtime_enabled=false) wykonywane W TEJ tx (atomowo ze zmianą stanu, AI-Review-3).
+    // Eventy zbierane do emisji POST-COMMIT (kontrakt atomowości okablowania).
+    const wired = await withTransaction(db, async (client) => {
+      const result = await liveIssueEntitlementsWithinTx(client, input, now)
+      const events: TransitionEventEnvelope[] = []
+      const appendAudit = makeTransitionAuditSink(logger)
+      // Okabluj WYŁĄCZNIE nowo utworzone wiersze (`created=true`). Replay
+      // (`created=false`, event-level/per-entitlement dedupe) NIE re-audytuje
+      // / NIE re-emituje (idempotencja). Posting hook NIE dostaje payloadu
+      // finansowego (rozpoznanie liability ISSUED = money-ledger / E4) — hook
+      // jest WYWOŁANY (no-op udokumentowany), NIE fabrykuje kwot na ścieżce
+      // finansowej. AC1: ISSUED przechodzi przez JEDNOLITY punkt okablowania.
+      for (const issuedRow of result.issued) {
+        if (!issuedRow.created) continue
+        const { event } = await wireEntitlementTransitionPersisted(
+          { appendAudit, clock: () => now },
+          buildGenesisIssuedTransition({
+            entitlement_id: issuedRow.entitlement_id,
+            scope: {
+              instance_id: issuedRow.entitlement_id,
+              market_id: marketId,
+              sales_channel_id: null,
+              vendor_id: input.scope.vendor_id ?? null,
+              location_id: input.scope.location_id ?? null,
+            },
+            actor: "system",
+            actor_hint: "subscriber:path-y:live-issue",
+            occurred_at: input.payload.psp_occurred_at,
+            // Cykl-safe dyskryminator wystąpienia (AI-Review-2): per-entitlement
+            // klucz dedupe (unikatowy, stabilny przy replay).
+            transition_seq: issuedRow.entitlement_dedupe_key,
+          })
+        )
+        events.push(event)
+      }
+      return { result, events }
+    })
 
-    // ── side-effecty PO commit (compensation step) ──────────────────────────
-    // Story 3.3: side-effecty (email/.ics/MinIO) jeszcze nieaktywne (3.4+).
-    // Tu wyłącznie strukturalne, audytowalne logowanie — NIE I/O domenowe.
-    //
-    // KONTRAKT FORWARD dla Story 3.4 (finding L-3): event-level dedupe
-    // (`event_processed`) zwraca `event_processed:false` przy KAŻDYM retry po
-    // pierwszym commicie. Gdy 3.4 doda realne side-effecty (email/.ics/MinIO)
-    // PO commit, a któryś zawiedzie, retry trafi w event-level no-op ⇒
-    // side-effect NIGDY nie zostanie odtworzony (cicha utrata powiadomienia).
-    // 3.4 MUSI zatem prowadzić idempotencję side-effectów ODDZIELNIE od
-    // event-level dedupe (outbox / per-side-effect "delivered" marker), NIE
-    // polegać na ponownym przejściu tej ścieżki. W 3.3 ryzyko jest zerowe
-    // (side-effect = wyłącznie log), ale kontrakt jest tu zadeklarowany jawnie.
-    if (!result.event_processed) {
+    // ── (B) replay/no-op event-level — zero issue, zero okablowania ───────────
+    if (!wired.result.event_processed) {
       logger.info?.(
         `[voucher-live-issue] payment_intent=${input.payload.payment_intent_id} ` +
           `replay/no-op (event-level dedupe) — zero issue`
@@ -211,12 +287,31 @@ export default async function voucherLiveIssueSubscriber({
       return
     }
 
-    const created = result.issued.filter((e) => e.created).length
-    const noop = result.issued.length - created
+    // ── (C) EVENT best-effort POST-COMMIT (AI-Review-3 kontrakt atomowości) ───
+    // Emit DOPIERO po commicie tranzycji: rollback (B) ⇒ brak phantom-eventu.
+    // Fail emitu NIE blokuje (best-effort); kompletność = reconciliation 2.6
+    // (ADR-139 D2). Idempotencja powiadomień (finding L-3 z 3.3): outbox/event
+    // bus prowadzi własny dedupe — emit NIE polega na ponownym przejściu ścieżki.
+    const eventBus = resolveEventBus(scope)
+    const emit = async (event: TransitionEventEnvelope): Promise<void> => {
+      if (!eventBus) {
+        throw new Error("event bus niedostępny (emit best-effort — reconciliation 2.6)")
+      }
+      await eventBus.emit({ name: ENTITLEMENT_STATE_CHANGED_EVENT_TYPE, data: event })
+    }
+    let emitFailures = 0
+    for (const event of wired.events) {
+      const failed = await emitTransitionEventAfterCommit(emit, event)
+      if (failed) emitFailures += 1
+    }
+
+    const created = wired.result.issued.filter((e) => e.created).length
+    const noop = wired.result.issued.length - created
     logger.info?.(
       `[voucher-live-issue] payment_intent=${input.payload.payment_intent_id} ` +
         `order=${input.payload.order_id} ISSUED created=${created} noop=${noop} ` +
-        `total=${result.issued.length}`
+        `total=${wired.result.issued.length} wired=${wired.events.length} ` +
+        `emit_failed=${emitFailures}`
     )
   } catch (err) {
     const error = err as Error

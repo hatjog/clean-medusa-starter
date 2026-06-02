@@ -27,10 +27,16 @@ import {
 } from "../ledger-writer"
 import {
   wireEntitlementTransition,
+  wireEntitlementTransitionPersisted,
+  emitTransitionEventAfterCommit,
   buildTransitionEnvelopes,
+  buildGenesisIssuedTransition,
   runTransitionPostingHook,
   defaultPostingActivationGate,
+  assertWiringTransition,
   ENTITLEMENT_STATE_CHANGED_EVENT_TYPE,
+  ENTITLEMENT_GENESIS,
+  EntitlementGenesisError,
   type TransitionInput,
   type TransitionWiringDeps,
   type TransitionAuditEnvelope,
@@ -399,7 +405,200 @@ describe("Story 3.4 AC3 — inwariant taksonomii (wyłącznie okablowanie, D-5)"
     )
     expect(event.payload.from_state).toBe("SETTLED")
     expect(event.payload.to_state).toBe("CLOSED")
-    expect(audit.idempotency_key).toBe("entitlement:ent_z:transition:SETTLED->CLOSED")
+    // Klucz cykl-safe (AI-Review-2): zawiera dyskryminator wystąpienia
+    // (tu `occurred_at` = FIXED_NOW, bo brak `occurred_at`/`transition_seq`).
+    expect(audit.idempotency_key).toBe(
+      "entitlement:ent_z:transition:SETTLED->CLOSED@2026-06-02T10:00:00.000Z"
+    )
     expect(event.idempotency_key).toBe(audit.idempotency_key)
+  })
+})
+
+// ===========================================================================
+// AI-Review-1 — GENEZA ISSUED (Path Y live-issue) przez JEDNOLITY punkt
+// ===========================================================================
+
+describe("Story 3.4 AI-Review-1 — geneza ISSUED (Path Y) przez okablowanie", () => {
+  it("geneza (ENTITLEMENT_GENESIS → ISSUED) ⇒ event + audit; posting hook WYWOŁANY no-op (runtime_enabled=false)", async () => {
+    const { deps, audits, events, fake } = makeHarness({ wireWriter: true })
+    const input = buildGenesisIssuedTransition({
+      entitlement_id: "ent_live_1",
+      scope: { instance_id: "ent_live_1", market_id: "bonbeauty", sales_channel_id: null },
+      actor: "system",
+      actor_hint: "subscriber:path-y:live-issue",
+      occurred_at: "2026-06-02T09:00:00.000Z",
+      transition_seq: "dedupe_abc",
+    })
+    const result = await wireEntitlementTransition(deps, input)
+
+    // (1) event + (2) audit powstają na genezie ISSUED.
+    expect(events).toHaveLength(1)
+    expect(events[0].payload.from_state).toBe(ENTITLEMENT_GENESIS)
+    expect(events[0].payload.to_state).toBe("ISSUED")
+    expect(audits).toHaveLength(1)
+    expect(audits[0].from_state).toBe(ENTITLEMENT_GENESIS)
+    expect(audits[0].to_state).toBe("ISSUED")
+    // (3) posting hook WYWOŁANY (attempted=false bo brak payloadu finansowego) —
+    // ZERO zapisu ledger przy runtime_enabled=false.
+    expect(result.posting.attempted).toBe(false)
+    expect(result.posting.persisted).toBe(false)
+    expect(fake.txRows).toHaveLength(0)
+    expect(fake.applied.size).toBe(0)
+  })
+
+  it("geneza ISSUED z payloadem ⇒ posting hook policzy transaction_id, no-op (runtime_enabled=false)", async () => {
+    const { deps, fake } = makeHarness({ wireWriter: true })
+    const input = buildGenesisIssuedTransition({
+      entitlement_id: "ent_live_2",
+      scope: { instance_id: "ent_live_2", market_id: "bonbeauty" },
+      transition_seq: "dedupe_xyz",
+      posting: {
+        lifecycle_event: "ISSUED",
+        vat_classification: "MPV",
+        net_minor: 10000,
+        vat_minor: 2300,
+        currency: "PLN",
+      },
+    })
+    const result = await wireEntitlementTransition(deps, input)
+    expect(result.posting.attempted).toBe(true)
+    expect(result.posting.activated).toBe(false)
+    expect(result.posting.persisted).toBe(false)
+    expect(result.posting.reason).toContain("runtime_enabled=false")
+    expect(result.posting.transaction_id).toMatch(/^[0-9a-f]{64}$/)
+    expect(fake.txRows).toHaveLength(0) // zero zapisu ledger
+  })
+
+  it("geneza do stanu innego niż ISSUED ⇒ fail-closed (EntitlementGenesisError), ZERO efektów", async () => {
+    const { deps, audits, events, fake } = makeHarness({ wireWriter: true, gate: GATE_BOTH_ON })
+    const illegalGenesis: TransitionInput = {
+      from: ENTITLEMENT_GENESIS,
+      to: EntitlementInstanceState.ACTIVE, // geneza dozwolona wyłącznie → ISSUED
+      entitlement_id: "ent_bad",
+      scope: { instance_id: "ent_bad", market_id: "pl" },
+      actor: "system",
+    }
+    await expect(wireEntitlementTransition(deps, illegalGenesis)).rejects.toBeInstanceOf(
+      EntitlementGenesisError
+    )
+    expect(audits).toHaveLength(0)
+    expect(events).toHaveLength(0)
+    expect(fake.txRows).toHaveLength(0)
+  })
+
+  it("assertWiringTransition: geneza→ISSUED OK; geneza→inny rzuca; realny graf deleguje do assertTransition", () => {
+    expect(() =>
+      assertWiringTransition(ENTITLEMENT_GENESIS, EntitlementInstanceState.ISSUED)
+    ).not.toThrow()
+    expect(() =>
+      assertWiringTransition(ENTITLEMENT_GENESIS, EntitlementInstanceState.VOIDED)
+    ).toThrow(EntitlementGenesisError)
+    // realny graf nadal egzekwowany (ISSUED→REFUNDED niedozwolone).
+    expect(() =>
+      assertWiringTransition(
+        EntitlementInstanceState.ISSUED,
+        EntitlementInstanceState.REFUNDED
+      )
+    ).toThrow()
+  })
+})
+
+// ===========================================================================
+// AI-Review-2 — idempotency_key cykl-safe (append-only audit nie gubi wpisów)
+// ===========================================================================
+
+describe("Story 3.4 AI-Review-2 — idempotency_key odporny na cykle grafu", () => {
+  it("legalny cykl ACTIVE→DISPUTED→ACTIVE→DISPUTED ⇒ 4 RÓŻNE klucze (audit nie zwija)", async () => {
+    const { deps, audits } = makeHarness()
+    // Sekwencja legalnych tranzycji w cyklu (różne `transition_seq` = różne wystąpienia).
+    const steps: Array<[EntitlementInstanceState, EntitlementInstanceState, number]> = [
+      [EntitlementInstanceState.ACTIVE, EntitlementInstanceState.DISPUTED, 1],
+      [EntitlementInstanceState.DISPUTED, EntitlementInstanceState.ACTIVE, 2],
+      [EntitlementInstanceState.ACTIVE, EntitlementInstanceState.DISPUTED, 3],
+      [EntitlementInstanceState.DISPUTED, EntitlementInstanceState.ACTIVE, 4],
+    ]
+    for (const [from, to, seq] of steps) {
+      await wireEntitlementTransition(deps, {
+        from,
+        to,
+        entitlement_id: "ent_cycle",
+        scope: { instance_id: "ent_cycle", market_id: "pl" },
+        actor: "system",
+        occurred_at: "2026-06-02T09:00:00.000Z", // ten sam timestamp — seq dyskryminuje
+        transition_seq: seq,
+      })
+    }
+    const keys = audits.map((a) => a.idempotency_key)
+    // 4 wpisy, 4 UNIKATOWE klucze — drugie wystąpienie ACTIVE→DISPUTED NIE koliduje.
+    expect(audits).toHaveLength(4)
+    expect(new Set(keys).size).toBe(4)
+    expect(keys[0]).toContain("ACTIVE->DISPUTED@1")
+    expect(keys[2]).toContain("ACTIVE->DISPUTED@3")
+    expect(keys[0]).not.toBe(keys[2])
+  })
+
+  it("brak transition_seq ⇒ occurred_at dyskryminuje (różne-w-czasie wystąpienia tej samej krawędzi)", () => {
+    const a = buildTransitionEnvelopes(
+      {
+        from: EntitlementInstanceState.ACTIVE,
+        to: EntitlementInstanceState.DISPUTED,
+        entitlement_id: "ent_t",
+        scope: { instance_id: "ent_t", market_id: "pl" },
+        actor: "system",
+        occurred_at: "2026-06-02T09:00:00.000Z",
+      },
+      FIXED_NOW
+    )
+    const b = buildTransitionEnvelopes(
+      {
+        from: EntitlementInstanceState.ACTIVE,
+        to: EntitlementInstanceState.DISPUTED,
+        entitlement_id: "ent_t",
+        scope: { instance_id: "ent_t", market_id: "pl" },
+        actor: "system",
+        occurred_at: "2026-06-02T11:30:00.000Z",
+      },
+      FIXED_NOW
+    )
+    expect(a.audit.idempotency_key).not.toBe(b.audit.idempotency_key)
+  })
+})
+
+// ===========================================================================
+// AI-Review-3 — post-COMMIT split (persisted bez emitu; emit osobno po commit)
+// ===========================================================================
+
+describe("Story 3.4 AI-Review-3 — kontrakt atomowości / post-COMMIT", () => {
+  it("wireEntitlementTransitionPersisted NIE emituje eventu (audit + posting w tx)", async () => {
+    const { deps, audits, events } = makeHarness({ wireWriter: true })
+    const { event, audit, posting } = await wireEntitlementTransitionPersisted(
+      deps,
+      issuedToActiveInput()
+    )
+    // Audit zapisany (w tx), ale ZERO emisji eventu (to robi caller PO commit).
+    expect(audits).toHaveLength(1)
+    expect(events).toHaveLength(0)
+    expect(audit.to_state).toBe("ACTIVE")
+    expect(posting.attempted).toBe(true)
+    expect(posting.persisted).toBe(false) // runtime_enabled=false
+    // event zbudowany, zwrócony do emisji post-commit.
+    expect(event.event_type).toBe(ENTITLEMENT_STATE_CHANGED_EVENT_TYPE)
+  })
+
+  it("emitTransitionEventAfterCommit emituje event zwrócony przez persisted (po commit)", async () => {
+    const { deps, events } = makeHarness()
+    const { event } = await wireEntitlementTransitionPersisted(deps, issuedToActiveInput())
+    expect(events).toHaveLength(0)
+    const failed = await emitTransitionEventAfterCommit(deps.emitEvent, event)
+    expect(failed).toBe(false)
+    expect(events).toHaveLength(1)
+    expect(events[0].payload.to_state).toBe("ACTIVE")
+  })
+
+  it("emit best-effort: 2× fail ⇒ emitFailed=true, NIE rzuca (reconciliation 2.6)", async () => {
+    const { deps } = makeHarness({ emitThrows: true })
+    const { event } = await wireEntitlementTransitionPersisted(deps, issuedToActiveInput())
+    const failed = await emitTransitionEventAfterCommit(deps.emitEvent, event)
+    expect(failed).toBe(true)
   })
 })

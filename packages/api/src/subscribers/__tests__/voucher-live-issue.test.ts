@@ -162,3 +162,66 @@ describe("Story 3.3 — subscriber orchestracja (tx + idempotencja end-to-end)",
     await expect(subscriber({ event: bad, container } as any)).rejects.toThrow()
   })
 })
+
+// ===========================================================================
+// Story 3.4 (AI-Review-1) — OKABLOWANIE GENEZY ISSUED w subscriberze Path Y
+// ===========================================================================
+
+/** Container z event-busem (rejestruje emity okablowania) + capture audit logów. */
+function makeWiredContainer() {
+  const base = makeFakeContainer()
+  const emitted: Array<{ name: string; data: unknown }> = []
+  const eventBus = {
+    emit: async (e: { name: string; data: unknown }) => {
+      emitted.push(e)
+    },
+  }
+  const container = {
+    resolve: (key: string) => {
+      if (key === "event_bus") return eventBus
+      return base.container.resolve(key)
+    },
+  }
+  return { container, emitted, log: base.log, entitlements: base.entitlements }
+}
+
+describe("Story 3.4 — subscriber okablowuje genezę ISSUED (event + audit; posting inert)", () => {
+  it("ISSUED ⇒ event okablowania emitowany POST-COMMIT + audit append-only zalogowany", async () => {
+    const { container, emitted, log } = makeWiredContainer()
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await subscriber({ event: envelopeEvent(), container } as any)
+
+    // (1) EVENT okablowania (envelope.v1, AR-EVENTS naming) wyemitowany.
+    expect(emitted).toHaveLength(1)
+    expect(emitted[0].name).toBe("gp.entitlements.entitlement_state_changed.v1")
+    const data = emitted[0].data as {
+      payload: { from_state: string; to_state: string }
+      schema_version: string
+    }
+    expect(data.schema_version).toBe("1")
+    expect(data.payload.from_state).toBe("__genesis__")
+    expect(data.payload.to_state).toBe("ISSUED")
+
+    // (2) AUDIT append-only zalogowany (kto/co/kiedy/scope/wynik).
+    const auditLines = log.filter((l) => l.includes("[entitlement-transition-audit]"))
+    expect(auditLines).toHaveLength(1)
+    expect(auditLines[0]).toContain('"outcome":"transitioned"')
+    expect(auditLines[0]).toContain('"to_state":"ISSUED"')
+  })
+
+  it("replay (event-level dedupe) ⇒ ZERO ponownego okablowania (idempotencja)", async () => {
+    const { container, emitted } = makeWiredContainer()
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await subscriber({ event: envelopeEvent(), container } as any)
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await subscriber({ event: envelopeEvent(), container } as any)
+    // Drugi przebieg = event-level no-op ⇒ wciąż dokładnie 1 emit okablowania.
+    expect(emitted).toHaveLength(1)
+  })
+
+  it("brak event-busa ⇒ subscriber NIE rzuca (emit best-effort, reconciliation 2.6)", async () => {
+    const { container } = makeFakeContainer() // resolve('event_bus') rzuca → bus null
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await expect(subscriber({ event: envelopeEvent(), container } as any)).resolves.toBeUndefined()
+  })
+})

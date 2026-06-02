@@ -144,13 +144,20 @@ export type {
 // dostarcza OKABLOWANIE, NIE aktywuje postingu (runtime_enabled zostaje false, flip = E6/P6).
 export {
   ENTITLEMENT_STATE_CHANGED_EVENT_TYPE,
+  ENTITLEMENT_GENESIS,
+  EntitlementGenesisError,
+  assertWiringTransition,
   defaultPostingActivationGate,
   buildTransitionEnvelopes,
+  buildGenesisIssuedTransition,
   runTransitionPostingHook,
+  wireEntitlementTransitionPersisted,
+  emitTransitionEventAfterCommit,
   wireEntitlementTransition,
 } from "./entitlement-transition-wiring"
 export type {
   TransitionActor,
+  TransitionFromState,
   TransitionScope,
   TransitionEventEnvelope,
   TransitionAuditEnvelope,
@@ -159,6 +166,7 @@ export type {
   TransitionPostingResult,
   TransitionLedgerWriter,
   TransitionInput,
+  GenesisIssuedArgs,
   TransitionWiringDeps,
   TransitionWiringResult,
 } from "./entitlement-transition-wiring"

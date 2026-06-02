@@ -53,6 +53,61 @@ import {
 } from "./ledger-writer"
 
 // ──────────────────────────────────────────────────────────────────────────
+// Geneza (creation) vs tranzycja grafu (AI-Review-1 — okablowanie ISSUED live)
+// ──────────────────────────────────────────────────────────────────────────
+
+/**
+ * Sentinel `from` dla GENEZY (creation) — wiersz tworzony WPROST w stanie
+ * docelowym, bez wcześniejszego stanu persystowanego. Path Y live-issue (3.3)
+ * tworzy `entitlement_instance` od razu w ISSUED — to NIE jest tranzycja grafu
+ * (do ISSUED nie prowadzi żadna krawędź `ALLOWED_ENTITLEMENT_TRANSITIONS`), lecz
+ * geneza. Modelujemy ją jawnym sentinelem zamiast naciągać graf (AC3: taksonomia
+ * 13 stanów + krawędzie pozostają NIEZMIENIONE — sentinel żyje wyłącznie w
+ * warstwie okablowania, NIE w `models/entitlement.ts`).
+ *
+ * Fail-closed: JEDYNYM legalnym celem genezy jest ISSUED (patrz
+ * `assertWiringTransition`); geneza do dowolnego innego stanu rzuca.
+ */
+export const ENTITLEMENT_GENESIS = "__genesis__" as const
+
+/** `from` okablowania: realny stan grafu LUB sentinel genezy (creation → ISSUED). */
+export type TransitionFromState =
+  | EntitlementInstanceState
+  | typeof ENTITLEMENT_GENESIS
+
+/** Rzucane gdy geneza celuje w stan inny niż ISSUED (fail-closed, AC2). */
+export class EntitlementGenesisError extends Error {
+  readonly to: EntitlementInstanceState
+  constructor(to: EntitlementInstanceState) {
+    super(
+      `Illegal entitlement genesis: ${ENTITLEMENT_GENESIS} → ${to}. ` +
+        `Geneza (creation) dozwolona wyłącznie do ISSUED (Path Y live-issue).`
+    )
+    this.name = "EntitlementGenesisError"
+    this.to = to
+  }
+}
+
+/**
+ * Fail-closed guard tranzycji okablowania (AC2). Dla genezy (`from` = sentinel)
+ * jedyny legalny cel to ISSUED; dla realnego stanu deleguje do `assertTransition`
+ * (graf `ALLOWED_ENTITLEMENT_TRANSITIONS` = SSOT). RZUCA zanim powstanie
+ * jakikolwiek efekt uboczny.
+ */
+export function assertWiringTransition(
+  from: TransitionFromState,
+  to: EntitlementInstanceState
+): void {
+  if (from === ENTITLEMENT_GENESIS) {
+    if (to !== EntitlementInstanceState.ISSUED) {
+      throw new EntitlementGenesisError(to)
+    }
+    return
+  }
+  assertTransition(from, to)
+}
+
+// ──────────────────────────────────────────────────────────────────────────
 // Kontrakt eventu (AR-EVENTS naming + envelope.v1)
 // ──────────────────────────────────────────────────────────────────────────
 
@@ -91,7 +146,8 @@ export type TransitionEventEnvelope = {
   idempotency_key: string
   payload: {
     entitlement_id: string
-    from_state: EntitlementInstanceState
+    /** Stan źródłowy LUB sentinel genezy `__genesis__` (creation → ISSUED). */
+    from_state: TransitionFromState
     to_state: EntitlementInstanceState
     transitioned_at: string
     actor_hint?: string
@@ -114,7 +170,7 @@ export type TransitionAuditEnvelope = {
   actor_hint?: string
   // co
   event_type: typeof ENTITLEMENT_STATE_CHANGED_EVENT_TYPE
-  from_state: EntitlementInstanceState
+  from_state: TransitionFromState
   to_state: EntitlementInstanceState
   // kiedy
   occurred_at: string
@@ -206,7 +262,8 @@ export type TransitionLedgerWriter = {
 // ──────────────────────────────────────────────────────────────────────────
 
 export type TransitionInput = {
-  from: EntitlementInstanceState
+  /** Stan źródłowy LUB `ENTITLEMENT_GENESIS` (creation → ISSUED, Path Y 3.3). */
+  from: TransitionFromState
   to: EntitlementInstanceState
   entitlement_id: string
   scope: TransitionScope
@@ -214,6 +271,16 @@ export type TransitionInput = {
   actor_hint?: string
   /** Domyślnie `now`. */
   occurred_at?: string
+  /**
+   * Dyskryminator WYSTĄPIENIA tranzycji (AI-Review-2 — cykl-safe idempotency_key).
+   * Graf zawiera legalne CYKLE (np. `ACTIVE↔DISPUTED`, `REFUND_REQUESTED→ACTIVE→…`),
+   * w których ta sama para `from→to` powtarza się legalnie. Sam `from→to` NIE
+   * dyskryminuje wystąpień ⇒ append-only audit zwijałby drugie wystąpienie.
+   * Podaj monotoniczny per-entitlement dyskryminator (np. ULID / numer sekwencji
+   * tranzycji / redemption_id). Gdy brak — kluczem wystąpienia jest `occurred_at`
+   * (znacznik czasu), co rozróżnia różne-w-czasie wystąpienia tej samej krawędzi.
+   */
+  transition_seq?: string | number
   /**
    * Payload postingu. Obecny ⇒ hook próbuje zaksięgować (bramkowany). Brak ⇒
    * hook podpięty ale bez payloadu (tranzycja niefinansowa / derecognition=E4).
@@ -247,16 +314,26 @@ export type TransitionWiringResult = {
 // ──────────────────────────────────────────────────────────────────────────
 
 /**
- * Deterministyczny idempotency_key tranzycji (stabilny przy replay). Pozwala
- * sinkowi audytu/eventu deduplikować ten sam ślad. Posting idempotentny osobno
- * przez deterministyczny `transaction_id` writera (ADR-139 D3).
+ * Deterministyczny, CYKL-SAFE idempotency_key tranzycji (AI-Review-2). Klucz
+ * koreluje event↔audit dla TEGO SAMEGO wystąpienia tranzycji i jest stabilny
+ * przy replay (te same wejścia ⇒ ten sam klucz). KRYTYCZNE: zawiera dyskryminator
+ * WYSTĄPIENIA (`occurrence`), więc legalne POWTÓRZENIE tej samej krawędzi grafu
+ * w cyklu (np. `ACTIVE→DISPUTED→ACTIVE→DISPUTED`) daje RÓŻNE klucze — append-only
+ * audit NIE zwija drugiego, legalnego wystąpienia. `occurrence` = jawny
+ * `transition_seq` (monotoniczny per entitlement) gdy podany, inaczej `occurred_at`
+ * (znacznik czasu rozróżniający różne-w-czasie wystąpienia).
+ *
+ * Idempotencja POSTINGU jest osobna i finansowo-poprawna — deterministyczny
+ * `transaction_id` writera (sha256 + dyskryminator REDEEMED/EXPIRED, ADR-139 D3);
+ * TEN klucz jest WYŁĄCZNIE dla korelacji/deduplikacji śladu event↔audit.
  */
 function buildTransitionIdempotencyKey(
   entitlementId: string,
-  from: EntitlementInstanceState,
-  to: EntitlementInstanceState
+  from: TransitionFromState,
+  to: EntitlementInstanceState,
+  occurrence: string
 ): string {
-  return `entitlement:${entitlementId}:transition:${from}->${to}`
+  return `entitlement:${entitlementId}:transition:${from}->${to}@${occurrence}`
 }
 
 /**
@@ -269,10 +346,15 @@ export function buildTransitionEnvelopes(
   now: Date
 ): { event: TransitionEventEnvelope; audit: TransitionAuditEnvelope } {
   const occurredAt = input.occurred_at ?? now.toISOString()
+  // Dyskryminator wystąpienia (AI-Review-2): jawny `transition_seq` gdy podany,
+  // inaczej `occurred_at` — w obu wariantach legalny cykl daje różne klucze.
+  const occurrence =
+    input.transition_seq != null ? String(input.transition_seq) : occurredAt
   const idempotencyKey = buildTransitionIdempotencyKey(
     input.entitlement_id,
     input.from,
-    input.to
+    input.to,
+    occurrence
   )
   const scope: TransitionScope = {
     instance_id: input.scope.instance_id,
@@ -450,43 +532,95 @@ export async function runTransitionPostingHook(
 // ──────────────────────────────────────────────────────────────────────────
 
 /**
+ * KONTRAKT ATOMOWOŚCI / POST-COMMIT (AI-Review-3, ADR-139 D2) — egzekwowany
+ * przez ROZDZIELENIE API, nie tylko docstring:
+ *
+ *   `wireEntitlementTransitionPersisted` — praca PERSYSTENTNA (audit + posting)
+ *      w obrębie TEJ SAMEJ atomowej jednostki/tx co zmiana stanu callera.
+ *      NIE emituje eventu. Zwraca `event` do wyemitowania PO commit.
+ *   `emitTransitionEventAfterCommit` — emit best-effort wołany przez callera
+ *      DOPIERO PO COMMIT zmiany stanu. Gdy caller wycofa tx, event NIE jest
+ *      emitowany ⇒ brak phantom-eventu dla tranzycji, która się nie wydarzyła.
+ *
+ * Caller (subscriber 3.3 Path Y / workflowy E4) MUSI:
+ *   (1) otworzyć tx, zmienić stan, wołać `…Persisted` w TEJ tx (audit atomowy),
+ *   (2) COMMIT,
+ *   (3) DOPIERO po commit wołać `emitTransitionEventAfterCommit`.
+ *
+ * UWAGA o postingu (ADR-139 D2): przy `runtime_enabled=false` (stan obecny)
+ * posting jest INERT (writer nie wołany) ⇒ ryzyko rozjazdu state↔ledger = 0.
+ * PO flipie E6/P6 writer 2.6 prowadzi WŁASNĄ DB-tx; kontrakt callera MUSI wtedy
+ * gwarantować, że `…Persisted` jest wołane W tej samej granicy co commit zmiany
+ * stanu i że NIE ma rollbacku PO zwrocie z hooka (reconciliation 2.6 łapie braki,
+ * nie rozjazdy state↔ledger). Patrz ADR-139 D2 (post-COMMIT + reconciliation).
+ */
+export async function wireEntitlementTransitionPersisted(
+  deps: Pick<
+    TransitionWiringDeps,
+    "appendAudit" | "ledgerWriter" | "postingActivation" | "clock"
+  >,
+  input: TransitionInput
+): Promise<{
+  event: TransitionEventEnvelope
+  audit: TransitionAuditEnvelope
+  posting: TransitionPostingResult
+}> {
+  const now = deps.clock?.() ?? new Date()
+
+  // (0) FAIL-CLOSED guard (graf LUB geneza) — NIC poniżej nie wykona się na
+  //     niedozwolonej tranzycji / niedozwolonej genezie (AC2).
+  assertWiringTransition(input.from, input.to)
+
+  // (1) deterministyczne koperty.
+  const { event, audit } = buildTransitionEnvelopes(input, now)
+
+  // (2) AUDIT append-only — w obrębie tx callera (atomowy ze zmianą stanu).
+  await deps.appendAudit(audit)
+
+  // (3) POSTING HOOK — bramkowany dwuwarstwowo; audit-only no-op gdy off.
+  const posting = await runTransitionPostingHook(deps, input, now)
+
+  return { event, audit, posting }
+}
+
+/**
+ * Emit eventu tranzycji — best-effort, wołany przez callera DOPIERO PO COMMIT
+ * (AI-Review-3). Zwraca `true` gdy 2× emit zawiódł (`emitFailed`); kompletność
+ * przy fail = reconciliation-inwariant 2.6 (ADR-139 D2). NIE rzuca.
+ */
+export async function emitTransitionEventAfterCommit(
+  emit: (event: TransitionEventEnvelope) => Promise<void>,
+  event: TransitionEventEnvelope
+): Promise<boolean> {
+  return emitBestEffort(emit, event)
+}
+
+/**
  * Okablowuje JEDNĄ dozwoloną tranzycję L4 → event + audit + posting hook
- * (deterministyczna, jednolita ścieżka — AC1). Kolejność:
+ * (deterministyczna, jednolita ścieżka — AC1). KOMPOZYCJA `…Persisted` + emit.
  *
- *   0. `assertTransition(from, to)` — FAIL-CLOSED. Niedozwolona tranzycja rzuca
- *      `EntitlementTransitionError` ZANIM powstanie KTÓRYKOLWIEK efekt uboczny
- *      (brak audytu / eventu / postingu na odrzuconej ścieżce — AC2).
- *   1. build kopert (event + audit) — czyste, deterministyczne.
- *   2. AUDIT — append-only, w obrębie tx callera (atomowy ze zmianą stanu).
- *   3. POSTING HOOK — bramkowany dwuwarstwowo; inert gdy runtime_enabled=false.
- *   4. EVENT — best-effort post-COMMIT (1 retry). Fail NIE blokuje tranzycji
- *      (`emitFailed=true`; kompletność = reconciliation-inwariant 2.6, ADR-139 D2).
+ * UŻYWAĆ TYLKO gdy caller traktuje całość jako JEDNĄ atomową jednostkę BEZ
+ * osobnej granicy commit (np. testy, in-memory). Dla ścieżek z REALNĄ DB-tx
+ * (subscriber Path Y 3.3 / workflowy E4) UŻYJ `wireEntitlementTransitionPersisted`
+ * w tx + `emitTransitionEventAfterCommit` PO commit — patrz KONTRAKT ATOMOWOŚCI
+ * powyżej (AI-Review-3): wewnętrzny emit TUTAJ jest PRZED commitem callera, więc
+ * rollback po zwrocie zostawiłby phantom-event.
  *
- * UWAGA tx: audit + posting są pracą w obrębie tx/atomowej jednostki callera
- * (writer 2.6 sam zarządza swoją DB-tx). Emit eventu jest POST-COMMIT — wołać
- * po zatwierdzeniu zmiany stanu (best-effort). Caller (subscriber 3.3 / workflowy
- * E4) decyduje o granicy tx; wiring egzekwuje KOLEJNOŚĆ + BRAMKĘ + KSZTAŁT.
+ * Kolejność: (0) fail-closed guard → (1) koperty → (2) audit → (3) posting hook
+ * → (4) emit best-effort. Fail emitu NIE blokuje tranzycji (`emitFailed=true`).
  */
 export async function wireEntitlementTransition(
   deps: TransitionWiringDeps,
   input: TransitionInput
 ): Promise<TransitionWiringResult> {
-  const now = deps.clock?.() ?? new Date()
+  const { event, audit, posting } = await wireEntitlementTransitionPersisted(
+    deps,
+    input
+  )
 
-  // (0) FAIL-CLOSED guard — NIC poniżej nie wykona się na niedozwolonej tranzycji.
-  assertTransition(input.from, input.to)
-
-  // (1) deterministyczne koperty.
-  const { event, audit } = buildTransitionEnvelopes(input, now)
-
-  // (2) AUDIT append-only (niezależny od postingu; działa przy runtime_enabled=false).
-  await deps.appendAudit(audit)
-
-  // (3) POSTING HOOK (bramkowany dwuwarstwowo; audit-only no-op gdy off).
-  const posting = await runTransitionPostingHook(deps, input, now)
-
-  // (4) EVENT best-effort post-COMMIT (1 retry). Fail NIE blokuje tranzycji.
-  const emitFailed = await emitBestEffort(deps.emitEvent, event)
+  // (4) EVENT best-effort — w tej kompozycji PRZED ewentualnym commitem callera
+  //     (patrz KONTRAKT ATOMOWOŚCI: ścieżki z DB-tx mają wołać emit PO commit).
+  const emitFailed = await emitTransitionEventAfterCommit(deps.emitEvent, event)
 
   return { event, audit, posting, emitFailed }
 }
@@ -510,3 +644,71 @@ async function emitBestEffort(
   }
   return true
 }
+
+// ──────────────────────────────────────────────────────────────────────────
+// Geneza ISSUED (Path Y live-issue 3.3) — builder wejścia okablowania
+// ──────────────────────────────────────────────────────────────────────────
+
+/** Argumenty genezy ISSUED dla okablowania (Path Y live-issue, AI-Review-1). */
+export type GenesisIssuedArgs = {
+  entitlement_id: string
+  scope: TransitionScope
+  /** Domyślnie `"system"` (subscriber Path Y). */
+  actor?: TransitionActor
+  actor_hint?: string
+  /** Czas wystąpienia (PSP/issue). Domyślnie `now` w builderze kopert. */
+  occurred_at?: string
+  /**
+   * Dyskryminator wystąpienia (cykl-safe key, AI-Review-2). Dla genezy unikalny
+   * per entitlement (np. `entitlement_dedupe_key`) — geneza jest jednorazowa, ale
+   * dyskryminator gwarantuje stabilny, nie-kolidujący klucz korelacji.
+   */
+  transition_seq?: string | number
+  /**
+   * Payload postingu ISSUED. Gdy obecny ⇒ posting hook policzy `transaction_id`
+   * i (przy `runtime_enabled=false`) zwróci audit-only no-op (WYWOŁANY, inert).
+   * Gdy brak ⇒ hook `attempted:false` (geneza bez kompletu danych finansowych).
+   */
+  posting?: TransitionPostingPayload
+}
+
+/**
+ * Buduje `TransitionInput` dla GENEZY ISSUED (Path Y live-issue → ISSUED, 3.3).
+ * `from = ENTITLEMENT_GENESIS`, `to = ISSUED` (jedyna legalna geneza, fail-closed
+ * w `assertWiringTransition`). To JEDYNY punkt, przez który ścieżka live wystawia
+ * ISSUED do okablowania (event + audit + posting hook) — AC1 zrealizowane w runtime.
+ */
+export function buildGenesisIssuedTransition(
+  args: GenesisIssuedArgs
+): TransitionInput {
+  return {
+    from: ENTITLEMENT_GENESIS,
+    to: EntitlementInstanceState.ISSUED,
+    entitlement_id: args.entitlement_id,
+    scope: args.scope,
+    actor: args.actor ?? "system",
+    ...(args.actor_hint ? { actor_hint: args.actor_hint } : {}),
+    ...(args.occurred_at ? { occurred_at: args.occurred_at } : {}),
+    ...(args.transition_seq != null ? { transition_seq: args.transition_seq } : {}),
+    ...(args.posting ? { posting: args.posting } : {}),
+  }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// KONTRAKT EGZEKWOWANIA `runtime_enabled` (AI-Review-4) — gdzie żyje bramka
+// ──────────────────────────────────────────────────────────────────────────
+//
+// Bramka aktywacji postingu (`runtime_enabled` + per-market) jest egzekwowana w
+// WARSTWIE CALLER (`runTransitionPostingHook`), zgodnie z ADR-139 D5 (governed
+// activation = warstwa caller/E3). Writer 2.6 (`ledger-writer.ts`) NIE czyta
+// `runtime_enabled` — jego kontraktem jest WYŁĄCZNIE idempotentny, balansujący
+// zapis (separacja odpowiedzialności: writer = "jak zapisać", caller = "czy wolno").
+//
+// Aby jednowarstwowe egzekwowanie NIE było kruche (ryzyko: przyszły caller woła
+// `writer.write` z pominięciem hooka), dispersja jest EGZEKWOWANA STATYCZNIE przez
+// checker `entitlement-transition-routing.ts` (test AC1/AI-Review-4): jedynym
+// nie-testowym call-site `…ledgerWriter.write(` / `new VoucherLedgerWriter` w
+// produkcji jest TEN moduł okablowania. Nowy posting call-site ⇒ czerwony checker
+// (świadoma zmiana allow-listy = gate review), NIE ciche obejście bramki. To
+// kontraktowa „druga bariera" bez duplikowania gatingu w writerze (defense bez
+// rozjazdu odpowiedzialności). Patrz `assertLedgerWriterRoutedThroughWiring`.
