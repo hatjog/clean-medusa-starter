@@ -265,6 +265,377 @@ export type {
   RedeemEntitlementEventEmitter,
 } from "./workflows/redeem-entitlement"
 
+// Story 4.1 (Epic 4 / Wave 4 — lifecycle): redeem (partial + full) idempotentny
+// z derecognition. Partial obniża `remaining` na TYM SAMYM entitlement_id (NIE
+// reissue, NIGDY > remaining); tranzycja routuje przez wireEntitlementTransition
+// Persisted (3.4); posting = DERECOGNITION proporcjonalna (generateVoucherPosting
+// 2.3 → ledger-writer 2.6). Idempotencja DWUWARSTWOWA (idempotency_key+
+// entitlement_id domena + transaction_id writera). Withdrawal (art. 38 pkt 1)
+// gaśnie WYŁĄCZNIE przy REDEEMED_FULL. Posting GATED (runtime_enabled=false ⇒
+// audit-only/no-op; flip = E6/P6, NIE tutaj).
+export {
+  VOUCHER_REDEMPTION_TABLE,
+  RedeemPartialEntitlementOperation,
+  RedeemEntitlementNotFoundError as RedeemPartialEntitlementNotFoundError,
+  RedeemAmountError,
+  RedeemNotRedeemableError,
+  PostgresRedeemPartialStore,
+  InMemoryRedeemPartialStore,
+  createRedeemPartialOperationFromScope,
+  isWithdrawalRightExtinguished,
+  buildRedemptionId,
+} from "./workflows/redeem-partial-entitlement"
+export type {
+  RedeemOutcome,
+  RedeemPartialInput,
+  RedeemPartialResult,
+  RedemptionRecord,
+  RedeemableAmountEntitlement,
+  RedeemPartialTx,
+  RedeemPartialStore,
+  RedeemPartialEventEmitter,
+  RedeemPartialDeps,
+} from "./workflows/redeem-partial-entitlement"
+
+// Story 4.2 (Epic 4 / Wave 4 — lifecycle): warstwa SALDA + DEFENSYWNEGO EXPIRY
+// (anti-forfeiture) + powiadomienia. Saldo `remaining` na TYM SAMYM entitlement_id
+// (spójne z 4.1); deterministyczny `expires_at` (12 mies., boundary [1,24], D-9/FR14);
+// pre-expiry powiadomienie oferuje extend ORAZ bezpłatny zwrot salda — copy NIGDY
+// „przepadnie" (anti-forfeiture invariant egzekwowany mechanicznie). AC3: blokada
+// profilu forfeiture REUŻYWA boundary 1.2 (art. 385¹ KC).
+export {
+  DEFAULT_VALIDITY_MONTHS,
+  EXPIRED_CUSTOMER_STATUS,
+  PRE_EXPIRY_REMINDER_EVENT_TYPE,
+  FORBIDDEN_FORFEITURE_TOKENS,
+  ForfeitureCopyError,
+  ExpiryRecoveryOptionsError,
+  ExpiryProfileForfeitureError,
+  entitlementRemainingBalance,
+  resolveValidityMonths,
+  addMonthsUtc,
+  computeExpiresAt,
+  assertNoForfeitureCopy,
+  defaultPreExpiryMessage,
+  buildPreExpiryNotification,
+  buildPreExpiryIdempotencyKey,
+  assertExpiryProfileActivatable,
+} from "./entitlement-expiry"
+export type {
+  EntitlementBalance,
+  ExpiryRecoveryKind,
+  ExpiryRecoveryOption,
+  PreExpiryNotification,
+  BuildPreExpiryNotificationInput,
+} from "./entitlement-expiry"
+
+// Story 4.2: operacja EXPIRED → BREAKAGE (derecognition niewykorzystanego salda)
+// routowana przez wireEntitlementTransitionPersisted (3.4) → posting hook →
+// ledger-writer (2.6); gated (runtime_enabled=false ⇒ audit-only/no-op). Idempotentny
+// sweep (replay ⇒ no-op; domena EXPIRED marker + transaction_id writera). Pre-expiry
+// notifier z dedup (powiadomienie RAZ per okno). Status klienta „Ważność minęła —
+// sprawdź opcje zwrotu" (UX §8). Posting GATED (flip = E6/P6, NIE tutaj).
+export {
+  EXPIRY_SOURCE_STATES,
+  ExpireEntitlementOperation,
+  ExpireEntitlementNotFoundError,
+  EntitlementNotExpirableError,
+  ExpireAmountError,
+  PreExpiryNotifier,
+  PostgresExpireEntitlementStore,
+  InMemoryExpireEntitlementStore,
+  PostgresPreExpiryDedupeStore,
+  InMemoryPreExpiryDedupeStore,
+  createExpireEntitlementOperationFromScope,
+  createPreExpiryNotifierFromScope,
+} from "./workflows/expire-entitlement"
+export type {
+  ExpireEntitlementInput,
+  ExpireEntitlementResult,
+  ExpirableEntitlement,
+  ExpireEntitlementTx,
+  ExpireEntitlementStore,
+  ExpireEntitlementEventEmitter,
+  ExpireEntitlementDeps,
+  PreExpiryNotificationSink,
+  PreExpiryDedupeStore,
+  PreExpiryNotifierDeps,
+  PreExpiryNotifyInput,
+  PreExpiryNotifyResult,
+} from "./workflows/expire-entitlement"
+
+// Story 4.3 (Epic 4 / Wave 4 — lifecycle L4 refund): DWA mechanizmy zwrotu —
+// (a) odstąpienie 14 dni (pełny zwrot niewykorzystanego, art. 38 pkt 1; prawo
+// gaśnie WYŁĄCZNIE przy REDEEMED_FULL — reuse 4.1) + (b) zwrot salda `remaining`
+// (dozwolony także po partial, art. 385¹ KC). Copy rozróżnia (a)/(b) (UX-DR-14,
+// anti-forfeiture). RODO art. 26 carry-forward KONSUMUJE istniejący kontrakt DSAR
+// (ADR-069, NIE buduje nowego). KRYTYCZNE (ADR-139 §Granice): refund posting =
+// NO posting + alarm (REFUNDED nieznane profilowi) ⇒ DEFEROWANY architektonicznie,
+// wymaga OSOBNEGO ADR; tranzycja routuje przez wireEntitlementTransition (3.4) dla
+// event+audit (gated/audit-only). NIE flipuje runtime_enabled (E6/P6).
+export {
+  WITHDRAWAL_WINDOW_DAYS,
+  WITHDRAWAL_BASIS_LABEL,
+  BALANCE_BASIS_LABEL,
+  DSAR_CONTRACT_REF,
+  DSAR_CARRY_FORWARD_ADR,
+  REFUND_POSTING_REQUIRED_ADR,
+  REFUND_POSTING_DEFERRAL_REASON,
+  REFUND_TERMINAL_STATE,
+  RefundChannelError,
+  RefundWithdrawalWindowError,
+  RefundMechanismError,
+  RefundAmountError,
+  RefundCopyAmbiguityError,
+  resolveRefundWindowDays,
+  isWithinWithdrawalWindow,
+  resolveRefundChannel,
+  determineRefundMechanism,
+  buildRefundCopy,
+  assertRefundCopyDistinct,
+  buildDsarCarryForward,
+  buildRefundPostingDeferral,
+  buildPaymentRefundIdempotencyKey,
+} from "./entitlement-refund"
+export type {
+  RefundMechanism,
+  RefundDeterminationInput,
+  RefundDetermination,
+  RefundCopy,
+  DsarCarryForward,
+  RefundPostingDeferral,
+} from "./entitlement-refund"
+
+// Story 4.3: operacja refund (dwa mechanizmy) routowana przez wireEntitlement
+// TransitionPersisted (3.4) → REFUND_REQUESTED → REFUNDED. Posting derecognition
+// FAIL-CLOSED (ADR-139 §Granice): BRAK payloadu postingu (audit-only) + marker
+// deferralu (wymaga osobnego ADR). Idempotentny (REFUNDED terminal marker; refund_id
+// dyskryminator audytu + seam zwrotu płatności — Stripe NIE aktywowany, scope window).
+export {
+  REFUND_SOURCE_STATES,
+  ENTITLEMENT_REFUNDED_EVENT_TYPE,
+  REFUND_POSTING_DEFERRED_EVENT_TYPE,
+  RefundEntitlementOperation,
+  RefundEntitlementNotFoundError,
+  EntitlementNotRefundableError,
+  PostgresRefundEntitlementStore,
+  InMemoryRefundEntitlementStore,
+  createRefundEntitlementOperationFromScope,
+} from "./workflows/refund-entitlement"
+export type {
+  RefundEntitlementInput,
+  RefundEntitlementResult,
+  RefundLifecycleEnvelope,
+  RefundableEntitlement,
+  RefundEntitlementTx,
+  RefundEntitlementStore,
+  RefundEntitlementEventEmitter,
+  RefundPostingDeferralSink,
+  RefundEntitlementDeps,
+} from "./workflows/refund-entitlement"
+
+// Story 4.4 (Epic 4 / Wave 4 — lifecycle L4 extend): POLITYKA + OKABLOWANIE
+// przedłużenia ważności. DWA tryby (FR18): (1) pierwszy extend NIEODPŁATNY 1×
+// (licznik `unpaid_extension_count` 0→1, idempotentny — replay NIE podwaja) + (2)
+// ODPŁATNY 5–15% (boundary L2 fail-closed) ZAWSZE z RÓWNORZĘDNĄ, BEZPŁATNĄ opcją
+// zwrotu salda (parytet, anti-dark-pattern; brak ⇒ ExtendParityError). Copy NIGDY
+// „przepadnie"/„zapłać albo strać" (assertExtendCopySafe). `expires_at` clamp do
+// boundary (≤24 mies. od emisji, NIGDY poza). KRYTYCZNE (ADR-139 D5): extend =
+// entitlement liability BEZ ZMIANY ⇒ audit-only (BRAK payloadu postingu); opłata =
+// money-ledger (deferred, wymaga osobnego ADR + E6/P6). Tranzycja routuje przez
+// JEDNOLITY punkt okablowania (3.4) — from===to (extend NIE zmienia stanu, D-5,
+// taksonomia 13 stanów niezmieniona). NIE flipuje runtime_enabled (E6/P6).
+export {
+  EXTEND_FEE_PCT_MIN,
+  EXTEND_FEE_PCT_MAX,
+  MAX_FREE_EXTENDS,
+  FORBIDDEN_COERCION_TOKENS,
+  EXTEND_FEE_POSTING_REQUIRED_ADR,
+  EXTEND_POSTING_DEFERRAL_REASON,
+  FreeExtendExhaustedError,
+  FreeExtendIdempotencyMissingError,
+  ExtendFeeBoundaryError,
+  ExtendParityError,
+  ExtendCoercionCopyError,
+  ExtendProfileError,
+  ExtendExtensionMonthsBoundaryError,
+  determineExtendMode,
+  computeExtendedExpiresAt,
+  buildExtendIdempotencyKey,
+  assertNoCoercionExtendCopy,
+  assertExtendCopySafe,
+  defaultPaidExtendMessage,
+  buildPaidExtendOffer,
+  assertExtendProfileActivatable,
+  buildExtendPostingDeferral,
+  extendActorHint,
+  buildExtendTransitionInput,
+  buildExtendWiring,
+} from "./entitlement-extend"
+export type {
+  ExtendMode,
+  ExtendDeterminationInput,
+  ExtendDetermination,
+  ComputeExtendedExpiresAtInput,
+  ExtendOptionKind,
+  ExtendOption,
+  ExtendOffer,
+  BuildPaidExtendOfferInput,
+  ExtendPostingDeferral,
+  BuildExtendWiringInput,
+  ExtendWiringResult,
+} from "./entitlement-extend"
+
+// Story 4.5 (Epic 4 / Wave 4 — lifecycle L4 transfer/gifting): RECIPIENT BINDING +
+// walidacja trybu `transferability` (`bearer | personalized | hybrid`, snapshot
+// `policy_snapshot` przy ISSUED, FR15/FR16) + okablowanie tranzycji CLAIM. Obdarowanie
+// (gifting) nadaje recipient binding + claim token (reuse v1.8.0 P4, BEZ nowego UI);
+// claim recipienta aktywuje uprawnienie (`ISSUED → ACTIVE` = „aktywacja przez recipienta")
+// WYŁĄCZNIE przez JEDNOLITY punkt wireEntitlementTransition (3.4) → event + audit (kto
+// obdarował / kto zclaimował) + posting hook. Idempotencja: transfer_id deterministyczny
+// (replay ⇒ jeden transfer); claim token JEDNORAZOWY (replay tej samej tożsamości/okaziciela
+// ⇒ no-op, double-claim ⇒ fail-closed). KRYTYCZNE (ADR-139 D5): transfer/claim = binding-only
+// (NIE derecognition; liability bez zmiany, brak ruchu pieniądza) ⇒ posting hook = no-op
+// derecognition (BRAK payloadu); runtime_enabled zostaje false (flip = E6/P6). RODO: dane
+// recipienta minimalne (wyłącznie recipient_customer_id). Single-vendor / bonbeauty-only
+// (NIE cross-vendor wallet); taksonomia 13 stanów + hard-gate'y nietknięte (D-5).
+export {
+  TRANSFER_POSTING_NOOP_REASON,
+  CLAIM_IDENTITY_AUTH_CONTRACT,
+  TransferabilityEnumError,
+  TransferRecipientRequiredError,
+  TransferRecipientSameAsBuyerError,
+  TransferStateError,
+  TransferClaimTokenSourceError,
+  ClaimTokenInvalidError,
+  ClaimTokenConsumedError,
+  ClaimStateError,
+  readTransferabilityFromSnapshot,
+  buildTransferId,
+  buildTransferGrant,
+  buildAtomicClaimGuard,
+  determineClaimOutcome,
+  buildTransferPostingNoop,
+  claimActorHint,
+  buildClaimTransitionInput,
+  buildClaimWiring,
+} from "./entitlement-transfer"
+export type {
+  RecipientBinding,
+  BuildTransferGrantInput,
+  TransferGrant,
+  ClaimOutcomeKind,
+  DetermineClaimInput,
+  ClaimDetermination,
+  TransferPostingNoop,
+  BuildClaimWiringInput,
+  ClaimWiringResult,
+} from "./entitlement-transfer"
+
+// Story 4.6 (Epic 4 / Wave 4 — lifecycle L4 cancellation / no-show): POLITYKA
+// anulacji/no-show + REBOOK na booking pointerze (v1.6.0). CUTOFF min 12h (jawna
+// anulacja dozwolona do 12h przed terminem, po cutoff fail-closed); anulacja ≥24h ⇒
+// voucher W PEŁNI AKTYWNY (`remaining`/`expires_at` niezmienione, AC1, FR19); anulacja
+// <24h / no-show ⇒ WARTOŚĆ ZACHOWANA + rebook (AC2). INWARIANT UX-DR-14 M-5: rebook NIE
+// skraca `expires_at` (ważność = pierwotna polityka 4.2, NIGDY od daty rebooku;
+// `computeRebookExpiresAt` identity + `assertRebookPreservesExpiry` defense). Copy NIGDY
+// „przepadnie" (reuse `assertNoForfeitureCopy` 4.2). Idempotencja (replay ⇒ no-op):
+// idempotency_key WYMAGANY (fail-closed). KRYTYCZNE (ADR-139 D5): anulacja/no-show/rebook
+// ZWALNIA booking, liability BEZ ZMIANY ⇒ BRAK postingu (audit-only, posting payload
+// CELOWO pominięty); runtime_enabled zostaje false (flip = E6/P6). Tranzycja routuje przez
+// JEDNOLITY punkt okablowania (3.4) — `from === to` (NIE zmienia stanu, D-5, taksonomia 13
+// stanów niezmieniona). NIE rusza hard-gate'ów MPV_MULTI_VENDOR/SUBSCRIPTION_B2C.
+export {
+  CANCELLATION_CUTOFF_HOURS,
+  CANCELLATION_ACTIVE_THRESHOLD_HOURS,
+  CANCELLATION_POSTING_NOOP_REASON,
+  CANCELLATION_DISALLOWED_STATES,
+  CancellationCutoffError,
+  CancellationIdempotencyMissingError,
+  CancellationHoursInvalidError,
+  CancellationPreconditionError,
+  RebookExpiryShorteningError,
+  determineCancellationOutcome,
+  determineNoShowOutcome,
+  computeRebookExpiresAt,
+  assertRebookPreservesExpiry,
+  buildCancellationIdempotencyKey,
+  buildRebookIdempotencyKey,
+  defaultCancellationMessage,
+  defaultRebookMessage,
+  assertCancellationCopySafe,
+  buildCancellationPostingNoop,
+  cancellationActorHint,
+  buildCancellationTransitionInput,
+  buildCancellationWiring,
+} from "./entitlement-cancellation"
+export type {
+  CancellationKind,
+  CancellationTier,
+  CancellationDeterminationInput,
+  CancellationDetermination,
+  NoShowDeterminationInput,
+  CancellationPostingNoop,
+  BuildCancellationWiringInput,
+  CancellationWiringResult,
+} from "./entitlement-cancellation"
+
+// Story 4.7 (Epic 4 / Wave 4 — lifecycle L4 lost-code recovery): ODZYSK UTRACONEGO
+// KODU jako para tranzycji `void(old)` + `issue(new)`. Stary (utracony) kod → VOIDED
+// (terminal, niewykorzystywalny); nowy kod genezą → ISSUED z PEŁNYM niewykorzystanym
+// saldem (`remaining`) i ZACHOWANĄ ważnością (`expires_at`) starego — transfer 1:1
+// (dyscyplina 4.1: NIGDY ponad remaining, NIE inflacja). To KONTYNUACJA tego samego
+// zobowiązania (net-zero), NIE breakage/derecognition (anti-forfeiture, FR20). DWA okna
+// czasowe (AC1): zgłoszenie ≤30 dni od utraty + decyzja ≤7 dni od zgłoszenia (poza oknem
+// ⇒ fail-closed, brak void/issue/transferu). ANTI-DOUBLE-SPEND: void(old) ZANIM nowy
+// aktywny (kolejność egzekwowana w buildLostCodeRecoveryWiring — nigdy 2 ważne kody).
+// Idempotencja: recovery_id deterministyczny + deterministyczny nowy id (replay ⇒ jeden
+// void+issue, no-op). KRYTYCZNE (ADR-139 D5): para void+issue = NET-ZERO ⇒ posting payload
+// CELOWO pominięty (audit-only, attempted:false); runtime_enabled zostaje false (flip =
+// E6/P6). Obie tranzycje routują przez JEDNOLITY punkt wireEntitlementTransition (3.4) —
+// void = istniejąca krawędź {ISSUED,ACTIVE}→VOIDED, issue = istniejąca geneza → ISSUED
+// (D-5, taksonomia 13 stanów niezmieniona). NIE rusza hard-gate'ów MPV_MULTI_VENDOR/
+// SUBSCRIPTION_B2C. Single-vendor / bonbeauty-only.
+export {
+  LOST_CODE_REPORT_WINDOW_DAYS,
+  LOST_CODE_DECISION_WINDOW_DAYS,
+  LOST_CODE_RECOVERABLE_STATES,
+  LOST_CODE_POSTING_NOOP_REASON,
+  LostCodeReportWindowError,
+  LostCodeDecisionWindowError,
+  LostCodeIdempotencyMissingError,
+  LostCodePreconditionError,
+  LostCodeBalanceTransferError,
+  LostCodeFutureDateError,
+  LostCodeLostBeforeIssuedError,
+  LostCodeWiringDirectiveError,
+  isWithinReportWindow,
+  isWithinDecisionWindow,
+  buildLostCodeRecoveryId,
+  deriveRecoveryEntitlementId,
+  computeRecoveryBalanceTransfer,
+  computeRecoveryExpiresAt,
+  determineLostCodeRecoveryOutcome,
+  buildLostCodePostingNoop,
+  buildLostCodeAtomicWriteSeam,
+  lostCodeVoidActorHint,
+  lostCodeReissueActorHint,
+  buildLostCodeVoidTransitionInput,
+  buildLostCodeReissueGenesisInput,
+  buildLostCodeRecoveryWiring,
+  cloneRecoveryPolicySnapshot,
+} from "./entitlement-lost-code"
+export type {
+  RecoveryBalanceTransfer,
+  LostCodeRecoveryDeterminationInput,
+  LostCodeRecoveryDetermination,
+  LostCodePostingNoop,
+  LostCodeAtomicWriteSeam,
+  BuildLostCodeWiringInput,
+  LostCodeLegResult,
+  LostCodeRecoveryWiringResult,
+} from "./entitlement-lost-code"
+
 export default Module(VOUCHER_MODULE, {
   service: VoucherService,
   loaders: [voucherSeedFixturesLoader],

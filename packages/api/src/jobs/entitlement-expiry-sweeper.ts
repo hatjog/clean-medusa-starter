@@ -4,6 +4,10 @@ import {
   EntitlementInstanceState,
   ALLOWED_ENTITLEMENT_TRANSITIONS,
 } from "../modules/voucher/models/entitlement"
+import {
+  createExpireEntitlementOperationFromScope,
+  EXPIRY_SOURCE_STATES,
+} from "../modules/voucher/workflows/expire-entitlement"
 
 /**
  * entitlement-expiry-sweeper — v1.9.0 Wave F6 / Epic-2 HIGH-07.
@@ -37,6 +41,20 @@ import {
  * trailing-week expiry are not required for BonBeauty MVP; this is a
  * defense-in-depth job complementing the read-time expiry check in
  * `VoucherService.claim`.
+ *
+ * ── AI-Review-1: JEDEN punkt wygaszenia przez `ExpireEntitlementOperation` ────
+ * Sweeper NIE używa już bulk-UPDATE. Każdy wiersz jest wygaszany per-row przez
+ * `ExpireEntitlementOperation` (Story 4.2, `expire-entitlement.ts`), co gwarantuje
+ * że tranzycja `<source>→EXPIRED` routuje przez `wireEntitlementTransitionPersisted`
+ * (3.4) → posting hook → `ledger-writer` (2.6). Posting GATED (runtime_enabled=false
+ * ⇒ audit-only/no-op) — flip = E6/P6 (ADR-139 D5).
+ *
+ * Po aktywacji E6/P6 CALLER MUSI przekazać `voucher_net_minor`/`vat_minor` do
+ * ExpireEntitlementOperation (fail-closed gdy brak przy runtime_enabled=true).
+ * Sweep wywołuje expire() bez kwot emisji (runtime_enabled=false ⇒ safe no-op
+ * dla postingu); kwoty wymagane przy integracji E6/P6.
+ *
+ * Brak dwóch ścieżek: bulk-UPDATE usunięty. JEDEN punkt wygaszenia (AI-Review-1).
  */
 
 export const SCHEDULE_NAME = "entitlement-expiry-sweeper" as const
@@ -104,23 +122,10 @@ function resolveOptional<T>(
   }
 }
 
-function expiryTransitionLegal(state: EntitlementInstanceState): boolean {
-  return ALLOWED_ENTITLEMENT_TRANSITIONS[state].includes(
-    EntitlementInstanceState.EXPIRED
-  )
-}
+type ExecResult = { rows: unknown[]; rowCount?: number | null }
+type ExecFn = (sql: string, params?: unknown[]) => Promise<ExecResult>
 
-const SOURCE_STATES: EntitlementInstanceState[] = [
-  EntitlementInstanceState.ISSUED,
-  EntitlementInstanceState.ACTIVE,
-  EntitlementInstanceState.REDEMPTION_REQUESTED,
-].filter(expiryTransitionLegal)
-
-async function runUpdate(
-  exec: (sql: string, params?: unknown[]) => Promise<{ rowCount?: number | null }>,
-  sql: string,
-  params: unknown[]
-): Promise<number> {
+async function runUpdate(exec: ExecFn, sql: string, params: unknown[]): Promise<number> {
   const result = await exec(sql, params)
   return result.rowCount ?? 0
 }
@@ -131,11 +136,7 @@ export default async function entitlementExpirySweeper(
   const logger = resolveLogger(container)
   const posthog = resolveOptional<PosthogClient>(container, "posthog")
 
-  // REDEMPTION_REQUESTED legality check is a defensive assertion: the state
-  // machine MUST keep EXPIRED reachable from each source state we sweep. If
-  // ALLOWED_ENTITLEMENT_TRANSITIONS drifts away the job becomes a no-op for
-  // that source state — flagged by the warning rather than silently writing
-  // an illegal transition.
+  // AI-Review-1: JEDEN punkt wygaszenia — EXPIRY_SOURCE_STATES derywowane z grafu.
   if (
     !ALLOWED_ENTITLEMENT_TRANSITIONS[EntitlementInstanceState.REDEMPTION_REQUESTED].includes(
       EntitlementInstanceState.EXPIRED
@@ -166,23 +167,63 @@ export default async function entitlementExpirySweeper(
 
   const startedAt = new Date()
   let entitlementsExpired = 0
+  let entitlementsSkipped = 0
   let vouchersExpired = 0
 
+  // ── AI-Review-1: per-row expiry przez ExpireEntitlementOperation (JEDEN punkt) ──
+  // NIE bulk-UPDATE. Każdy wiersz routuje przez wireEntitlementTransitionPersisted
+  // (3.4) → posting hook → ledger-writer (2.6). Posting GATED (runtime_enabled=false
+  // ⇒ audit-only/no-op). Kwoty emisji (net/vat) nie są tu znane — przekazywane jako
+  // undefined; operacja używa remaining jako proxy gross (bezpieczne przy no-op).
+  // UWAGA PRE-AKTYWACJI E6/P6: przed flip runtime_enabled=true sweeper MUSI być
+  // zaktualizowany o źródło kwot emisji (net/vat) dla poprawnego postingu breakage.
+
+  // Faza 1: pobierz identyfikatory wierszy gotowych do wygaśnięcia.
+  let expirableIds: string[] = []
   try {
-    entitlementsExpired = await runUpdate(
-      exec,
-      `UPDATE entitlement_instance
-          SET state = $1, updated_at = NOW()
-        WHERE state = ANY($2::text[])
+    const res = await exec(
+      `SELECT id, market_id
+         FROM entitlement_instance
+        WHERE state = ANY($1::text[])
           AND expires_at IS NOT NULL
           AND expires_at < NOW()`,
-      [EntitlementInstanceState.EXPIRED, SOURCE_STATES]
+      [[...EXPIRY_SOURCE_STATES]]
     )
+    expirableIds = (res.rows as { id: string; market_id: string | null }[])
+      .map((r) => r.id)
   } catch (err) {
-    logger.error("entitlement_instance expiry sweep failed", err)
+    logger.error("entitlement_instance expiry candidates query failed", err)
     throw err
   }
 
+  // Faza 2: per-row routing przez ExpireEntitlementOperation.
+  const op = createExpireEntitlementOperationFromScope(
+    container as { resolve: (key: string) => unknown }
+  )
+
+  for (const id of expirableIds) {
+    try {
+      const result = await op.expire({
+        entitlement_id: id,
+        // Kwoty emisji nieznane w sweep — undefined (bezpieczne przy runtime_enabled=false).
+        // Przy runtime_enabled=true operacja rzuca EntitlementNotExpirableError (AI-Review-1).
+        voucher_net_minor: undefined,
+        voucher_vat_minor: undefined,
+      })
+      if (!result.idempotent) {
+        entitlementsExpired++
+      }
+    } catch (err) {
+      // Log per-row błędy; kontynuuj sweep dla pozostałych wierszy (defense-in-depth).
+      logger.error(
+        `entitlement ${id} expiry sweep failed — skipping row`,
+        err
+      )
+      entitlementsSkipped++
+    }
+  }
+
+  // ── Voucher status flip (niezmienione — NIE routing przez operację) ─────────
   try {
     vouchersExpired = await runUpdate(
       exec,
@@ -199,7 +240,8 @@ export default async function entitlementExpirySweeper(
   }
 
   logger.info(
-    `swept entitlements=${entitlementsExpired} vouchers=${vouchersExpired} ` +
+    `swept entitlements=${entitlementsExpired} skipped=${entitlementsSkipped} ` +
+      `vouchers=${vouchersExpired} ` +
       `started=${startedAt.toISOString()} done=${new Date().toISOString()}`
   )
 
@@ -208,6 +250,7 @@ export default async function entitlementExpirySweeper(
     event: "gp.entitlements.expiry_sweeper.heartbeat",
     properties: {
       entitlements_expired: entitlementsExpired,
+      entitlements_skipped: entitlementsSkipped,
       vouchers_expired: vouchersExpired,
       started_at: startedAt.toISOString(),
       completed_at: new Date().toISOString(),
@@ -215,16 +258,14 @@ export default async function entitlementExpirySweeper(
   })
 }
 
-async function pgExecFromUnion(
-  pool: PgPoolLike | KnexLike
-): Promise<((sql: string, params?: unknown[]) => Promise<{ rowCount?: number | null }>) | null> {
+async function pgExecFromUnion(pool: PgPoolLike | KnexLike): Promise<ExecFn | null> {
   const asPool = pool as PgPoolLike
   if (typeof asPool.connect === "function") {
     return async (sql, params) => {
       const client = await asPool.connect()
       try {
-        const res = await client.query(sql, params)
-        return { rowCount: res.rowCount ?? 0 }
+        const res = await client.query(sql, params as ReadonlyArray<unknown>)
+        return { rows: res.rows as unknown[], rowCount: res.rowCount ?? 0 }
       } finally {
         client.release?.()
       }
@@ -240,9 +281,10 @@ async function pgExecFromUnion(
       })
       const res = await asKnex.raw(text, bindings)
       if (Array.isArray(res)) {
-        return { rowCount: res.length }
+        return { rows: res, rowCount: res.length }
       }
-      return { rowCount: (res as { rowCount?: number | null }).rowCount ?? 0 }
+      const obj = res as { rows?: unknown[]; rowCount?: number | null }
+      return { rows: obj.rows ?? [], rowCount: obj.rowCount ?? 0 }
     }
   }
   return null
