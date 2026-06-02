@@ -86,8 +86,9 @@ describe("generateVoucherAppointmentIcs — AC1 neutral payload", () => {
   });
 
   test("does not leak service name, voucher code or health markers", () => {
+    const serviceNameValue = "Zabieg medyczny dermatologia VOUCHER-SECRET-123";
     const ics = render({
-      service_name: "Zabieg medyczny dermatologia VOUCHER-SECRET-123",
+      service_name: serviceNameValue,
       // Extra raw code must be ignored even if a future caller passes it.
       voucher_code: "VOUCHER-SECRET-123",
     } as Partial<VoucherAppointmentIcsInput>);
@@ -97,6 +98,15 @@ describe("generateVoucherAppointmentIcs — AC1 neutral payload", () => {
     expect(ics).not.toContain("Konsultacja dermatologiczna");
     expect(ics).not.toContain("VOUCHER-SECRET-123");
     expect(ics).not.toContain("service_name");
+    // Property-based: literal value of service_name must never appear in output
+    // regardless of content (L-3 fix — structural invariant, not denylist).
+    expect(ics).not.toContain(serviceNameValue);
+  });
+
+  test("service_name with arbitrary value never appears in ics output (property-based L-3)", () => {
+    const uniqueMarker = "UNIQUE-SERVICE-MARKER-XYZ-987654";
+    const ics = render({ service_name: uniqueMarker });
+    expect(ics).not.toContain(uniqueMarker);
   });
 
   test("optional manage link uses scoped HMAC token, never a raw voucher code", () => {
@@ -190,6 +200,25 @@ describe("generateVoucherAppointmentIcs — AC3 reschedule and cancel", () => {
     expect(lineFor(rescheduled, "DESCRIPTION:")).toContain("zmiana terminu");
   });
 
+  test("UID is stable when only time and sequence change (L-1 invariant)", () => {
+    // Simulates the reschedule scenario from Story 5.3 perspective:
+    // same appointment_id + entitlement_instance_id, different time slot.
+    const uid1 = lineFor(
+      render({ sequence: 0, starts_at: "2026-06-18T10:00:00+02:00", ends_at: "2026-06-18T11:00:00+02:00" }),
+      "UID:",
+    );
+    const uid2 = lineFor(
+      render({ sequence: 1, starts_at: "2026-06-25T14:00:00+02:00", ends_at: "2026-06-25T15:00:00+02:00", lifecycle_status: "rescheduled" }),
+      "UID:",
+    );
+    const uid3 = lineFor(
+      render({ sequence: 2, lifecycle_status: "cancelled" }),
+      "UID:",
+    );
+    expect(uid1).toBe(uid2);
+    expect(uid2).toBe(uid3);
+  });
+
   test("cancel emits METHOD:CANCEL, STATUS:CANCELLED, stable UID and neutral status text", () => {
     const original = render({ sequence: 1 });
     const cancelled = render({
@@ -201,8 +230,8 @@ describe("generateVoucherAppointmentIcs — AC3 reschedule and cancel", () => {
     expect(lineFor(cancelled, "STATUS:")).toBe("STATUS:CANCELLED");
     expect(lineFor(cancelled, "UID:")).toBe(lineFor(original, "UID:"));
     expect(lineFor(cancelled, "SEQUENCE:")).toBe("SEQUENCE:2");
-    expect(lineFor(cancelled, "SUMMARY:")).toBe("SUMMARY:Wizyta w Salon Alfa (odwolano)");
-    expect(lineFor(cancelled, "DESCRIPTION:")).toContain("odwolano");
+    expect(lineFor(cancelled, "SUMMARY:")).toBe("SUMMARY:Wizyta w Salon Alfa (odwołano)");
+    expect(lineFor(cancelled, "DESCRIPTION:")).toContain("odwołano");
     expect(cancelled).not.toContain("Konsultacja dermatologiczna");
   });
 
