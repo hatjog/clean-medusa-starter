@@ -228,4 +228,131 @@ describe("Story 2.6 AC2 — idempotentny ledger-writer (ADR-139 D3)", () => {
     // params[2] = posting_profile w INSERT voucher_ledger_transaction
     expect(txRows[0][2]).toBe(VOUCHER_POSTING_PROFILE_ID)
   })
+
+  // ── L2 — taksonomia błędnej daty ROZDZIELONA od waluty ────────────────────────
+  it("L2: błędny occurred_at (ISO) ⇒ rzuca kind='invalid_occurred_at' (NIE currency_inconsistent)", async () => {
+    const { pool, txRows } = makeFakePool()
+    const writer = new VoucherLedgerWriter(pool)
+    const tx = issuedMpvTx()
+    tx.occurred_at = "nie-jest-data" // transaction_id liczony z req, nie z daty → id pozostaje OK
+    await expect(
+      writer.write({ entitlement_id: "ent_1", lifecycle_event: "ISSUED", transaction: tx })
+    ).rejects.toMatchObject({ name: "VoucherLedgerWriteError", kind: "invalid_occurred_at" })
+    expect(txRows).toHaveLength(0) // fail-closed: nic nie zapisane
+  })
+
+  // ── L3 — korelacja req.lifecycle_event ↔ entry_type ↔ metadata.lifecycle_event ─
+  it("L3: entry_type niespójny z lifecycle_event ⇒ rzuca kind='inconsistent_correlation'", async () => {
+    const { pool, txRows } = makeFakePool()
+    const writer = new VoucherLedgerWriter(pool)
+    const tx = issuedMpvTx() // entry_type ENTITLEMENT_ISSUED, metadata.lifecycle_event ISSUED
+    tx.entry_type = "ENTITLEMENT_REDEEMED" // niespójne z req.lifecycle_event ISSUED
+    await expect(
+      writer.write({ entitlement_id: "ent_1", lifecycle_event: "ISSUED", transaction: tx })
+    ).rejects.toMatchObject({ name: "VoucherLedgerWriteError", kind: "inconsistent_correlation" })
+    expect(txRows).toHaveLength(0)
+  })
+
+  it("L3: metadata.lifecycle_event niespójny z req.lifecycle_event ⇒ rzuca kind='inconsistent_correlation'", async () => {
+    const { pool, txRows } = makeFakePool()
+    const writer = new VoucherLedgerWriter(pool)
+    const tx = issuedMpvTx()
+    tx.metadata.lifecycle_event = "REDEEMED" // niespójne z req ISSUED (entry_type wciąż ISSUED)
+    await expect(
+      writer.write({ entitlement_id: "ent_1", lifecycle_event: "ISSUED", transaction: tx })
+    ).rejects.toMatchObject({ name: "VoucherLedgerWriteError", kind: "inconsistent_correlation" })
+    expect(txRows).toHaveLength(0)
+  })
+
+  it("L3: spójna para REDEEMED (entry_type ENTITLEMENT_REDEEMED + metadata REDEEMED) przechodzi korelację", async () => {
+    const { pool, txRows } = makeFakePool()
+    const writer = new VoucherLedgerWriter(pool)
+    const transaction_id = deriveLedgerTransactionId({
+      entitlement_id: "ent_r",
+      lifecycle_event: "REDEEMED",
+      redemption_id: "red_1",
+    })
+    const r = generateVoucherPosting({
+      lifecycle_event: "REDEEMED",
+      vat_classification: "MPV",
+      net_minor: 10000,
+      vat_minor: 2300,
+      redeemed_gross_minor: 12300,
+      redeemed_gross_to_date_minor: 0,
+      transaction_id,
+      occurred_at: "2026-07-01T00:00:00Z",
+      scope: { instance_id: "gp-dev", market_id: "pl" },
+      currency: "PLN",
+    })
+    if (!r.posted) throw new Error("fixture: oczekiwano posted:true")
+    const res = await writer.write({
+      entitlement_id: "ent_r",
+      lifecycle_event: "REDEEMED",
+      redemption_id: "red_1",
+      transaction: r.transaction,
+    })
+    expect(res.applied).toBe(true)
+    expect(txRows).toHaveLength(1)
+  })
+
+  // ── I3 — ROLLBACK cofa dedup (entries INSERT rzuca ⇒ applied zrewertowany) ─────
+  it("I3: entries INSERT rzuca ⇒ ROLLBACK cofa dedup-INSERT (replay potem dosyła, nie utyka)", async () => {
+    // fake-PG modelujący ROLLBACK: dedup-INSERT dodaje do `applied` w obrębie tx,
+    // ROLLBACK przywraca stan sprzed BEGIN. Pierwszy INSERT entries rzuca.
+    const committedApplied = new Set<string>()
+    let pendingApplied: Set<string> | null = null
+    let failEntries = true
+
+    const query = (async (sql: string, params: unknown[] = []) => {
+      const s = sql.trim()
+      if (s === "BEGIN") {
+        pendingApplied = new Set(committedApplied)
+        return { rows: [], rowCount: 0 }
+      }
+      if (s === "COMMIT") {
+        if (pendingApplied) {
+          committedApplied.clear()
+          for (const id of pendingApplied) committedApplied.add(id)
+        }
+        pendingApplied = null
+        return { rows: [], rowCount: 0 }
+      }
+      if (s === "ROLLBACK") {
+        pendingApplied = null // odrzuć pending (cofnięcie dedup)
+        return { rows: [], rowCount: 0 }
+      }
+      if (s.startsWith("INSERT INTO ledger_posting_applied")) {
+        const id = String(params[0])
+        const set = pendingApplied ?? committedApplied
+        if (set.has(id)) return { rows: [], rowCount: 0 }
+        set.add(id)
+        return { rows: [], rowCount: 1 }
+      }
+      if (s.startsWith("INSERT INTO voucher_ledger_transaction")) {
+        return { rows: [], rowCount: 1 }
+      }
+      if (s.startsWith("INSERT INTO voucher_ledger_entry")) {
+        if (failEntries) throw new Error("symulowany błąd INSERT entries")
+        return { rows: [], rowCount: 1 }
+      }
+      return { rows: [], rowCount: 0 }
+    }) as LedgerPgClient["query"]
+    const client: LedgerPgClient = { query, release: jest.fn() }
+    const pool: LedgerPgPool = { connect: async () => client }
+
+    const writer = new VoucherLedgerWriter(pool)
+    const tx = issuedMpvTx()
+
+    // 1. entries INSERT rzuca → write rzuca → ROLLBACK cofa dedup.
+    await expect(
+      writer.write({ entitlement_id: "ent_1", lifecycle_event: "ISSUED", transaction: tx })
+    ).rejects.toThrow("symulowany błąd INSERT entries")
+    expect(committedApplied.has(tx.transaction_id)).toBe(false) // dedup cofnięty
+
+    // 2. replay (już bez błędu) — dedup NIE utknął → wpis dosłany applied=true.
+    failEntries = false
+    const res = await writer.write({ entitlement_id: "ent_1", lifecycle_event: "ISSUED", transaction: tx })
+    expect(res).toEqual({ transaction_id: tx.transaction_id, applied: true, deduped: false })
+    expect(committedApplied.has(tx.transaction_id)).toBe(true)
+  })
 })

@@ -62,18 +62,20 @@ export type LedgerPgPool = {
 // Błędy fail-closed
 // ──────────────────────────────────────────────────────────────────────────
 
+export type VoucherLedgerWriteErrorKind =
+  | "missing_discriminator"
+  | "transaction_id_mismatch"
+  | "currency_inconsistent"
+  // L2: błędny `occurred_at` (ISO 8601) — taksonomia ROZDZIELONA od waluty
+  // (zła data ≠ problem waluty; ułatwia diagnozę/telemetrię fail-closed).
+  | "invalid_occurred_at"
+  // L3: niespójna korelacja dyskryminator (req) ↔ transakcja (tx) — entry_type
+  // i metadata.lifecycle_event MUSZĄ odpowiadać `req.lifecycle_event` (fail-closed).
+  | "inconsistent_correlation"
+
 export class VoucherLedgerWriteError extends Error {
-  readonly kind:
-    | "missing_discriminator"
-    | "transaction_id_mismatch"
-    | "currency_inconsistent"
-  constructor(
-    message: string,
-    kind:
-      | "missing_discriminator"
-      | "transaction_id_mismatch"
-      | "currency_inconsistent"
-  ) {
+  readonly kind: VoucherLedgerWriteErrorKind
+  constructor(message: string, kind: VoucherLedgerWriteErrorKind) {
     super(message)
     this.name = "VoucherLedgerWriteError"
     this.kind = kind
@@ -191,11 +193,56 @@ function toEpochMs(iso: string): number {
   const ms = Date.parse(iso)
   if (Number.isNaN(ms)) {
     throw new VoucherLedgerWriteError(
-      `occurred_at '${iso}' nie jest poprawnym ISO 8601 datetime`,
-      "currency_inconsistent"
+      `occurred_at '${iso}' nie jest poprawnym ISO 8601 datetime (fail-closed)`,
+      "invalid_occurred_at"
     )
   }
   return ms
+}
+
+/**
+ * Oczekiwane `entry_type` + dozwolone `metadata.lifecycle_event` per
+ * `req.lifecycle_event` (dyskryminator). Generator (Story 2.3) emituje gruboziarniste
+ * lifecycle (ISSUED/REDEEMED/EXPIRED); golden-matrix (D4) używa granularnych
+ * REDEEMED_*. Korelacja entry_type↔lifecycle MUSI być spójna (L3, fail-closed) —
+ * sam `transaction_id === expectedId` jej NIE egzekwuje (hostile/buggy caller mógłby
+ * policzyć id z `req`, a dostarczyć niespójny entry_type/metadata).
+ */
+const CORRELATION_BY_LIFECYCLE: Readonly<
+  Record<VoucherLifecycleEvent, { entry_type: string; metadata_lifecycle: ReadonlySet<string> }>
+> = {
+  ISSUED: { entry_type: "ENTITLEMENT_ISSUED", metadata_lifecycle: new Set(["ISSUED"]) },
+  REDEEMED: {
+    entry_type: "ENTITLEMENT_REDEEMED",
+    metadata_lifecycle: new Set(["REDEEMED", "REDEEMED_PARTIAL", "REDEEMED_FULL"]),
+  },
+  // EXPIRED unused → BREAKAGE (ADR-133 §Decyzja pkt 2b): entry_type ENTITLEMENT_BREAKAGE.
+  EXPIRED: { entry_type: "ENTITLEMENT_BREAKAGE", metadata_lifecycle: new Set(["EXPIRED"]) },
+}
+
+/**
+ * Egzekwuje korelację `req.lifecycle_event` ↔ `tx.entry_type` ↔
+ * `tx.metadata.lifecycle_event` (L3, fail-closed, PRZED BEGIN). Niespójność ⇒ rzuca
+ * (NIE zapisuje pary, której każda kolumna z osobna spełnia swój CHECK, ale których
+ * korelacja jest błędna — np. ENTITLEMENT_ISSUED z lifecycle_event REDEEMED).
+ */
+function assertLifecycleCorrelation(req: LedgerLifecycleDiscriminator, tx: LedgerTransactionV1): void {
+  const expected = CORRELATION_BY_LIFECYCLE[req.lifecycle_event]
+  if (tx.entry_type !== expected.entry_type) {
+    throw new VoucherLedgerWriteError(
+      `entry_type '${tx.entry_type}' niespójny z lifecycle_event '${req.lifecycle_event}' ` +
+        `(oczekiwano '${expected.entry_type}', L3 korelacja fail-closed)`,
+      "inconsistent_correlation"
+    )
+  }
+  const metaLifecycle = tx.metadata.lifecycle_event
+  if (!expected.metadata_lifecycle.has(metaLifecycle)) {
+    throw new VoucherLedgerWriteError(
+      `metadata.lifecycle_event '${metaLifecycle}' niespójny z req.lifecycle_event ` +
+        `'${req.lifecycle_event}' (dozwolone: ${[...expected.metadata_lifecycle].join("/")}; L3 korelacja fail-closed)`,
+      "inconsistent_correlation"
+    )
+  }
 }
 
 export class VoucherLedgerWriter {
@@ -228,6 +275,9 @@ export class VoucherLedgerWriter {
         "transaction_id_mismatch"
       )
     }
+    // (L3) Korelacja dyskryminator (req) ↔ entry_type/metadata.lifecycle_event (tx)
+    // — PRZED BEGIN, fail-closed (transaction_id===expectedId jej NIE egzekwuje).
+    assertLifecycleCorrelation(req, tx)
     // Podwójna bariera fail-closed (reuse Story 2.3 — NIE reimplementacja).
     assertPostingAccountsAllowed(tx.lines)
     assertBalanced(tx.lines)
