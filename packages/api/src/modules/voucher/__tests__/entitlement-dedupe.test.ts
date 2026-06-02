@@ -64,8 +64,12 @@ describe("Story 3.3 AC4 — buildEntitlementDedupeKey (DEC-5 pkt 3.ii)", () => {
   it("eksportuje spójne stałe nazw kolumny/indeksu + klauzulę ON CONFLICT", () => {
     expect(ENTITLEMENT_DEDUPE_KEY_COLUMN).toBe("entitlement_dedupe_key")
     expect(ENTITLEMENT_DEDUPE_KEY_UNIQUE_INDEX).toBe("entitlement_instance_dedupe_key_uq")
+    // Predykat `WHERE … IS NOT NULL` JEST WYMAGANY (korekta V1): docelowy index
+    // `entitlement_instance_dedupe_key_uq` jest PARTIAL — PostgreSQL nie zinferuje
+    // partial unique indexu z gołego `ON CONFLICT (col)` (rzuca „no unique or
+    // exclusion constraint matching"). Predykat musi odpowiadać predykatowi indexu.
     expect(ENTITLEMENT_DEDUPE_ON_CONFLICT_CLAUSE).toBe(
-      "ON CONFLICT (entitlement_dedupe_key) DO NOTHING"
+      "ON CONFLICT (entitlement_dedupe_key) WHERE entitlement_dedupe_key IS NOT NULL DO NOTHING"
     )
   })
 })

@@ -42,6 +42,10 @@ import {
  *      `recipient_index`/`dedupe_key` opiera się na PRECONDITION ADR-137: metadata
  *      linii (profil + recipients) jest NIEMUTOWALNA po `payment_intent.succeeded`.
  *      Ścieżka redemption/refund/edycji metadata NIE mutuje tych pól (regulamin § 12).
+ *      C1 (DEFEROWANY, odgrodzony fail-loud): model „N recipientów na TEJ SAMEJ
+ *      linii" jest scope-narrowed. Linia z >1 recipientem ⇒ FAIL-LOUD przed INSERT
+ *      (kolidowałaby z ZACHOWANYM partial UNIQUE `(order_id, line_item_id)` z v1.9.0
+ *      H-6 ⇒ poison-retry). FR10 realizujemy przez RÓŻNE linie (1 recipient/linia).
  *   3. Dla każdej (line_item × recipient_index): liczy `entitlement_dedupe_key`
  *      (PEŁNY sha256, finding L-2), snapshotuje `policy_snapshot` + `vat_classification`
  *      (resolver 2.2), wypełnia `market_id` + `sales_channel_id` (ontologia 3.2),
@@ -245,6 +249,32 @@ export async function liveIssueEntitlementsWithinTx(
     )
 
     const recipients = extractFrozenRecipients(line.metadata)
+
+    // C1 (multi-recipient-per-line) — ODGRODZENIE FAIL-LOUD (model świadomie deferowany).
+    // Pełna obsługa „N recipientów na TEJ SAMEJ linii ⇒ N entitlementów" jest
+    // scope-narrowed przy integracji epiku. Powód twardy: ZACHOWANY (v1.9.0 H-6)
+    // partial UNIQUE `entitlement_instance_order_line_uniq_idx (order_id, line_item_id)`
+    // (migracja `1778925500000`) dopuszcza JEDEN wiersz na (order_id, line_item_id).
+    // N INSERT-ów z identycznym (order_id, line_item_id), różniących się tylko
+    // `recipient_index`/`entitlement_dedupe_key`, naruszyłby ten index na realnym PG
+    // (`ON CONFLICT (entitlement_dedupe_key)` NIE przechwytuje kolizji na INNEJ kolumnie)
+    // ⇒ `unique_violation` ⇒ ROLLBACK całej tx ⇒ `event_processed` cofnięty ⇒
+    // poison-retry na OPŁACONEJ płatności (utrata realizacji opłaconej usługi).
+    // Zamiast CICHO wejść w tę ścieżkę (silent finance-bug), fail-loud PRZED
+    // jakimkolwiek INSERT: czytelny błąd ⇒ tx rollback ⇒ event ponawiany/DLQ/alarm.
+    // FR10 happy-path (N recipientów na RÓŻNYCH liniach = różny `line_item_id`)
+    // działa normalnie — każda linia to osobny (order_id, line_item_id).
+    if (recipients.length > 1) {
+      throw new Error(
+        `liveIssueEntitlementsWithinTx: multi-recipient-per-line NIEOBSŁUGIWANY ` +
+          `(C1 deferowany) — linia ${line.line_item_id} (order ${payload.order_id}, ` +
+          `payment_intent ${payload.payment_intent_id}) niesie ${recipients.length} ` +
+          `recipientów na JEDNEJ linii, co naruszyłoby partial UNIQUE ` +
+          `entitlement_instance_order_line_uniq_idx (order_id, line_item_id) na realnym PG. ` +
+          `Fail-loud przed INSERT (retry/DLQ/alarm), NIE cicha kolizja/poison-retry. ` +
+          `FR10: jeden recipient per line_item (osobna linia per obdarowany).`
+      )
+    }
 
     for (const recipient of recipients) {
       const issuedRow = await issueSingleIssuedRow(
@@ -508,8 +538,13 @@ function isProfileShape(value: unknown): value is Record<string, unknown> {
  * Recipienci zamrożeni w line-item metadata (immutable, precondition ADR-137).
  * `metadata.recipients` (array) ⇒ jeden entitlement per recipient z deterministycznym
  * `recipient_index` (kolejność zamrożona). Brak/pusta lista ⇒ pojedynczy recipient
- * (kupujący/bearer) z `recipient_index = 0`. To realizuje FR10 (jeden zakup ⇒
- * wiele entitlementów per-recipient).
+ * (kupujący/bearer) z `recipient_index = 0`.
+ *
+ * UWAGA (C1 deferowany): zwrócenie listy o długości >1 dla JEDNEJ linii jest
+ * fail-loud-odgrodzone w `liveIssueEntitlementsWithinTx` (kolizja z partial UNIQUE
+ * `(order_id, line_item_id)`). FR10 (jeden zakup ⇒ wiele entitlementów) realizujemy
+ * przez RÓŻNE linie (1 recipient per `line_item_id`), nie przez N recipientów na
+ * tej samej linii.
  */
 function extractFrozenRecipients(
   metadata: Record<string, unknown> | null | undefined

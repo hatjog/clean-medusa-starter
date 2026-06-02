@@ -94,10 +94,21 @@ export function buildEntitlementDedupeKey(
 }
 
 /**
- * Fragment SQL `ON CONFLICT (entitlement_dedupe_key) DO NOTHING` — kanoniczna
- * końcówka INSERT-u entitlementu w writerze 3.3. Re-utworzenie wiersza o tym samym
- * `entitlement_dedupe_key` jest NO-OP-em na poziomie DB (0 affected rows),
- * gwarantowanym przez partial UNIQUE index — bez wyjątku, bez retry-loop.
+ * Fragment SQL `ON CONFLICT (entitlement_dedupe_key) WHERE entitlement_dedupe_key
+ * IS NOT NULL DO NOTHING` — kanoniczna końcówka INSERT-u entitlementu w writerze 3.3.
+ * Re-utworzenie wiersza o tym samym `entitlement_dedupe_key` jest NO-OP-em na poziomie
+ * DB (0 affected rows), gwarantowanym przez partial UNIQUE index — bez wyjątku, bez
+ * retry-loop.
+ *
+ * PREDYKAT `WHERE … IS NOT NULL` JEST WYMAGANY (korekta V1, finansowo-krytyczna):
+ * docelowy index `entitlement_instance_dedupe_key_uq` jest PARTIAL
+ * (`… WHERE entitlement_dedupe_key IS NOT NULL`, migracja `1778928200000`).
+ * PostgreSQL NIE potrafi zinferować partial unique indexu z gołego
+ * `ON CONFLICT (col)` — rzuca „there is no unique or exclusion constraint matching
+ * the ON CONFLICT specification". Bez predykatu KAŻDY live-issue INSERT na REALNYM
+ * PG rzucałby ⇒ ROLLBACK ⇒ `event_processed` cofnięty ⇒ poison-retry na opłaconej
+ * płatności (zero entitlementów). Predykat MUSI odpowiadać dokładnie predykatowi
+ * indexu, by inferencja DO NOTHING trafiła w partial UNIQUE.
  */
 export const ENTITLEMENT_DEDUPE_ON_CONFLICT_CLAUSE =
-  `ON CONFLICT (${ENTITLEMENT_DEDUPE_KEY_COLUMN}) DO NOTHING` as const
+  `ON CONFLICT (${ENTITLEMENT_DEDUPE_KEY_COLUMN}) WHERE ${ENTITLEMENT_DEDUPE_KEY_COLUMN} IS NOT NULL DO NOTHING` as const

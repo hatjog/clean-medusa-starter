@@ -202,7 +202,50 @@ describe("Story 3.3 AC4 — dwupoziomowa idempotencja (DEC-5)", () => {
     expect(entitlements.size).toBe(1)
   })
 
-  it("jeden zakup z N recipientami ⇒ N entitlementów (FR10), klucze deterministyczne", async () => {
+  // FR10 happy-path: N recipientów na RÓŻNYCH liniach (1 recipient per line_item)
+  // ⇒ N entitlementów. Każda linia = osobny (order_id, line_item_id), więc NIE
+  // koliduje z partial UNIQUE `(order_id, line_item_id)` (v1.9.0 H-6).
+  function voucherLine(lineId: string, recipientId: string): LineFixture {
+    return {
+      line_item_id: lineId,
+      metadata: {
+        entitlement_profile_id: "voucher-rezerwacja-otwarta",
+        entitlement_type: "VOUCHER_SERVICE",
+        policy: { validity_months: 12, vat_rate_uniqueness: true },
+        recipients: [{ customer_id: recipientId }],
+      },
+    }
+  }
+
+  it("jeden zakup, N recipientów na RÓŻNYCH liniach ⇒ N entitlementów (FR10 happy), klucze deterministyczne", async () => {
+    const { client, entitlements } = makeFakeClient(
+      { sales_channel_id: "sc_x", metadata: { gp: { market_id: "bonbeauty" } } },
+      [
+        voucherLine("li_a", "cus_a"),
+        voucherLine("li_b", "cus_b"),
+        voucherLine("li_c", "cus_c"),
+      ]
+    )
+    const result = await liveIssueEntitlementsWithinTx(client, baseInput(), NOW)
+    expect(result.issued).toHaveLength(3)
+    expect(entitlements.size).toBe(3)
+    // każda linia ⇒ pojedynczy recipient_index = 0 (1 recipient/linia)
+    expect(result.issued.every((e) => e.recipient_index === 0)).toBe(true)
+    expect(result.issued.map((e) => e.line_item_id).sort()).toEqual(["li_a", "li_b", "li_c"])
+    // klucze odpowiadają sha256(pi ‖ line ‖ 0) — różne, bo różny line_item_id
+    for (const e of result.issued) {
+      expect(e.entitlement_dedupe_key).toBe(
+        buildEntitlementDedupeKey("pi_3Pabc1234567890", e.line_item_id, 0)
+      )
+    }
+    // recipient_customer_id zmapowane per linia
+    const byLine = new Map(result.issued.map((e) => [e.line_item_id, e.recipient_customer_id]))
+    expect(byLine.get("li_a")).toBe("cus_a")
+    expect(byLine.get("li_b")).toBe("cus_b")
+    expect(byLine.get("li_c")).toBe("cus_c")
+  })
+
+  it("(C1 deferowany) multi-recipient na TEJ SAMEJ linii ⇒ FAIL-LOUD przed INSERT (NIE cicha kolizja/poison-retry)", async () => {
     const { client, entitlements } = makeFakeClient(
       { sales_channel_id: "sc_x", metadata: { gp: { market_id: "bonbeauty" } } },
       [
@@ -217,37 +260,18 @@ describe("Story 3.3 AC4 — dwupoziomowa idempotencja (DEC-5)", () => {
         },
       ]
     )
-    const result = await liveIssueEntitlementsWithinTx(client, baseInput(), NOW)
-    expect(result.issued).toHaveLength(3)
-    expect(entitlements.size).toBe(3)
-    // recipient_index deterministyczny 0..2
-    expect(result.issued.map((e) => e.recipient_index).sort()).toEqual([0, 1, 2])
-    // klucze odpowiadają sha256(pi ‖ line ‖ idx)
-    for (let i = 0; i < 3; i++) {
-      expect(result.issued[i].entitlement_dedupe_key).toBe(
-        buildEntitlementDedupeKey("pi_3Pabc1234567890", "li_gift", i)
-      )
-    }
-    // recipient_customer_id zmapowane
-    const byIdx = new Map(result.issued.map((e) => [e.recipient_index, e.recipient_customer_id]))
-    expect(byIdx.get(0)).toBe("cus_a")
-    expect(byIdx.get(1)).toBe("cus_b")
-    expect(byIdx.get(2)).toBe("cus_c")
+    await expect(
+      liveIssueEntitlementsWithinTx(client, baseInput(), NOW)
+    ).rejects.toThrow(/multi-recipient-per-line NIEOBSŁUGIWANY|C1 deferowany/)
+    // fail-closed: rzut PRZED pętlą INSERT ⇒ żaden wiersz nie powstał (tx rollback
+    // u callera cofa też event_processed ⇒ retry/DLQ, NIE silent poison-retry).
+    expect(entitlements.size).toBe(0)
   })
 
-  it("multi-recipient retry ⇒ wciąż N (nie 2N) — każdy klucz no-op na 2. przebiegu", async () => {
-    const fixtureLine: LineFixture = {
-      line_item_id: "li_gift",
-      metadata: {
-        entitlement_profile_id: "p",
-        entitlement_type: "VOUCHER_SERVICE",
-        policy: { vat_rate_uniqueness: true },
-        recipients: [{ customer_id: "cus_a" }, { customer_id: "cus_b" }],
-      },
-    }
+  it("retry N-recipientów-na-różnych-liniach ⇒ wciąż N (nie 2N) — każdy klucz no-op na 2. przebiegu", async () => {
     const { client, entitlements } = makeFakeClient(
       { sales_channel_id: "sc_x", metadata: { gp: { market_id: "bonbeauty" } } },
-      [fixtureLine]
+      [voucherLine("li_x", "cus_a"), voucherLine("li_y", "cus_b")]
     )
     await liveIssueEntitlementsWithinTx(client, baseInput(), NOW)
     // wymuś 2. przebieg przez inny event_type (omija event-level), test per-entitlement
