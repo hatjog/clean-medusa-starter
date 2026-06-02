@@ -94,8 +94,12 @@ describe("voucher appointment confirmed delivery subscriber", () => {
     expect(store).toHaveBeenCalledTimes(1)
     const storeCalls = store.mock.calls as unknown as Array<[Record<string, any>]>
     const stored = storeCalls[0][0]
+    // I-2 fix: when appointment_id is absent the stable UID-based segment is used
+    // (entitlement@bonbeauty → sanitized "entinst_apt_001-bonbeauty") instead of the
+    // literal "appointment" fallback, preventing key collisions across multiple
+    // confirmations for the same entitlement without a stable appointment_id.
     expect(stored.storage_key).toBe(
-      "voucher-appointment-ics/entinst_apt_001/appointment.ics",
+      "voucher-appointment-ics/entinst_apt_001/entinst_apt_001-bonbeauty.ics",
     )
     expect(stored.pdf_buffer.toString("utf8")).toContain("BEGIN:VCALENDAR")
     expect(stored.pdf_buffer.toString("utf8")).not.toContain("RAW-CODE-123")

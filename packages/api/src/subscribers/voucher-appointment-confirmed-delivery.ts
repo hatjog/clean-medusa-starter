@@ -156,10 +156,19 @@ export async function handleVoucherAppointmentConfirmedDelivery(
   const result = await deps.dispatcher.dispatch(notificationPayload)
   const notificationId = extractNotificationId(result)
 
-  deps.logger?.info?.("[voucher-appointment-confirmed] notification sent", {
-    entitlement_instance_id: entitlementId,
-    notification_id: notificationId,
-  })
+  if (notificationId === null) {
+    // L-2: notification_id === null means the notification module returned no ID —
+    // the module may lack createNotifications/send or returned an empty response.
+    // Warn instead of silently reporting "sent" without evidence of delivery.
+    deps.logger?.warn?.("[voucher-appointment-confirmed] notification dispatched but no notification_id returned — possible silent failure (misconfigured notification module?)", {
+      entitlement_instance_id: entitlementId,
+    })
+  } else {
+    deps.logger?.info?.("[voucher-appointment-confirmed] notification sent", {
+      entitlement_instance_id: entitlementId,
+      notification_id: notificationId,
+    })
+  }
 
   return {
     entitlement_instance_id: entitlementId,
@@ -303,10 +312,12 @@ function resolveLogger(container: SubscriberArgs<Record<string, unknown>>["conta
 }
 
 function resolveDownloadBaseUrl(): string {
+  // Download link appoints a backend route (/api/v1/voucher-appointment-ics/:token)
+  // served exclusively by Medusa — never the storefront origin. STOREFRONT_URL is
+  // intentionally excluded from the fallback chain (M-1 finding).
   return (
     process.env.MEDUSA_BACKEND_URL ??
     process.env.BACKEND_URL ??
-    process.env.STOREFRONT_URL ??
     DEFAULT_BACKEND_URL
   )
 }
@@ -342,6 +353,14 @@ export default async function voucherAppointmentConfirmedDeliverySubscriber({
   }
 }
 
+// L-1 finding: the Outlook rescue-path (lifecycle_status: rescheduled|cancelled)
+// is implemented in the email composer (buildLifecycleStatusText) and covered by
+// unit tests, but this subscriber only listens to `appointment_confirmed`. If
+// reschedule/cancel are emitted as separate event types, the Outlook fallback will
+// not trigger from those events. Wiring to reschedule/cancel events is deferred
+// to a future story (Story 5.4 or Epic 6) once those event contracts are defined.
+// The current contract (gp.voucher.appointment_confirmed.v1) does not define
+// reschedule/cancel events — see specs/contracts/events/schemas/payloads/.
 export const config: SubscriberConfig = {
   event: VOUCHER_APPOINTMENT_CONFIRMED_EVENT,
 }

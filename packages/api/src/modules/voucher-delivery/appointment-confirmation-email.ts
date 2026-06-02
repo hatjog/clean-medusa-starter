@@ -1,5 +1,6 @@
 import {
   generateVoucherAppointmentIcs,
+  buildAppointmentCalendarUid,
   type VoucherAppointmentIcsInput,
 } from "./ics-generator";
 import { buildSignedToken } from "./storage/hmac";
@@ -60,15 +61,24 @@ export function buildVoucherAppointmentIcsStorageKey(
   >,
 ): string {
   const entitlement = sanitizeStorageSegment(appointment.entitlement_instance_id);
-  const appointmentId = sanitizeStorageSegment(
-    appointment.appointment_id ?? "",
-  ) || "appointment";
 
   if (!entitlement) {
     throw new Error("entitlement_instance_id is required for .ics storage key");
   }
 
-  return `${VOUCHER_APPOINTMENT_ICS_STORAGE_SCOPE}/${entitlement}/${appointmentId}.ics`;
+  const sanitizedAppointmentId = sanitizeStorageSegment(
+    appointment.appointment_id ?? "",
+  );
+
+  // I-2: When appointment_id is absent, fall back to the stable calendar UID
+  // (derived from entitlement_instance_id by the ICS generator) so that multiple
+  // confirmations for the same entitlement without an appointment_id map to the
+  // same storage key rather than all collapsing to the literal "appointment" segment.
+  const keySegment =
+    sanitizedAppointmentId ||
+    sanitizeStorageSegment(buildAppointmentCalendarUid(appointment));
+
+  return `${VOUCHER_APPOINTMENT_ICS_STORAGE_SCOPE}/${entitlement}/${keySegment}.ics`;
 }
 
 export function isVoucherAppointmentIcsStorageKey(
@@ -302,7 +312,8 @@ function assertNeutralDeliverySurface(
   ]
     .filter((value): value is string => typeof value === "string")
     .map((value) => value.trim())
-    .filter((value) => value.length >= 3);
+    // I-1: threshold lowered to >= 2 to catch 2-char sensitive values (e.g. short last names).
+    .filter((value) => value.length >= 2);
   const combined = [
     surface.text,
     surface.html,
