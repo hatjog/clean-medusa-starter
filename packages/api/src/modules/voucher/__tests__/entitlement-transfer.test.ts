@@ -17,6 +17,7 @@
 import { describe, it, expect } from "@jest/globals"
 import {
   TRANSFER_POSTING_NOOP_REASON,
+  CLAIM_IDENTITY_AUTH_CONTRACT,
   TransferabilityEnumError,
   TransferRecipientRequiredError,
   TransferRecipientSameAsBuyerError,
@@ -29,6 +30,7 @@ import {
   readTransferabilityFromSnapshot,
   buildTransferId,
   buildTransferGrant,
+  buildAtomicClaimGuard,
   determineClaimOutcome,
   buildTransferPostingNoop,
   claimActorHint,
@@ -364,12 +366,14 @@ describe("determineClaimOutcome — idempotencja / double-claim (token jednorazo
     ).toThrow(ClaimTokenConsumedError)
   })
 
-  it("claim ze stanu terminalnego (np. REFUNDED) ⇒ ClaimStateError (fail-closed)", () => {
+  it("claim ze stanu VOIDED (niejednoznaczny — reachable z ISSUED) ⇒ ClaimStateError (fail-closed)", () => {
+    // VOIDED/EXPIRED są reachable zarówno z ISSUED (przed claimem) jak i ACTIVE (po claimie).
+    // Nie można stwierdzić czy claim nastąpił → fail-closed (L4: tylko stany definitywnie post-claim = no-op).
     expect(() =>
       determineClaimOutcome({
         provided_claim_token: "tok-1",
         stored_claim_token: "tok-1",
-        state: EntitlementInstanceState.REFUNDED,
+        state: EntitlementInstanceState.VOIDED,
         bound_recipient_customer_id: null,
         policy_snapshot: BEARER,
       })
@@ -599,5 +603,351 @@ describe("AC3 — transfer/claim = binding-only, posting GATED, taksonomia niezm
     expect(
       ALLOWED_ENTITLEMENT_TRANSITIONS[EntitlementInstanceState.ISSUED]
     ).toContain(EntitlementInstanceState.ACTIVE)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// [M1] Atomowość claim tokenu — buildAtomicClaimGuard (TOCTOU protection)
+// ---------------------------------------------------------------------------
+
+describe("[M1] buildAtomicClaimGuard — jednorazowość atomowa claim tokenu", () => {
+  it("rowsUpdated=1 (proces wygrał atomowy UPDATE) → nie rzuca", () => {
+    expect(() =>
+      buildAtomicClaimGuard(1, "cus_recipient", "cus_recipient")
+    ).not.toThrow()
+  })
+
+  it("rowsUpdated=0 (inny proces wygrał wyścig) → ClaimTokenConsumedError fail-closed", () => {
+    expect(() =>
+      buildAtomicClaimGuard(0, "cus_intruder", "cus_recipient")
+    ).toThrow(ClaimTokenConsumedError)
+  })
+
+  it("concurrent simulation: dwie współbieżne ścieżki widzą state=ISSUED — dokładnie jedna wygrywa", () => {
+    // Symulacja: oba callery czytają state=ISSUED (determineClaimOutcome → 'claimed').
+    // DB atomic UPDATE zwraca rowsUpdated=1 dla pierwszego, 0 dla drugiego.
+    const caller1Rows = 1 // pierwszy wygrał
+    const caller2Rows = 0 // drugi przegrał wyścig
+
+    let caller1Result: string | undefined
+    let caller2Error: unknown
+
+    // Caller 1: wygrywa
+    expect(() => {
+      buildAtomicClaimGuard(caller1Rows, "cus_recipient", "cus_recipient")
+      caller1Result = "success"
+    }).not.toThrow()
+
+    // Caller 2: przegrywa → ClaimTokenConsumedError
+    try {
+      buildAtomicClaimGuard(caller2Rows, "cus_recipient", "cus_recipient")
+    } catch (e) {
+      caller2Error = e
+    }
+
+    expect(caller1Result).toBe("success")
+    expect(caller2Error).toBeInstanceOf(ClaimTokenConsumedError)
+  })
+
+  it("rowsUpdated=0 bearer → ClaimTokenConsumedError (atomic guard niezależny od trybu)", () => {
+    expect(() =>
+      buildAtomicClaimGuard(0, null, null)
+    ).toThrow(ClaimTokenConsumedError)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// [M2] Kontrakt tożsamości claimanta — CLAIM_IDENTITY_AUTH_CONTRACT
+// ---------------------------------------------------------------------------
+
+describe("[M2] CLAIM_IDENTITY_AUTH_CONTRACT — kontrakt uwierzytelnienia tożsamości", () => {
+  it("CLAIM_IDENTITY_AUTH_CONTRACT dokumentuje wymóg sesji uwierzytelnionej", () => {
+    expect(CLAIM_IDENTITY_AUTH_CONTRACT).toContain("authenticated session")
+    expect(CLAIM_IDENTITY_AUTH_CONTRACT).toContain("NEVER from request body")
+    expect(CLAIM_IDENTITY_AUTH_CONTRACT).toContain("personalized")
+  })
+
+  it("personalized: mismatch tożsamości ⇒ odrzucony — egzekucja kontraktu auth", () => {
+    // Cała ochrona personalized opiera się na tym że claimant_customer_id pochodzi z sesji.
+    // Ten test potwierdza, że mismatch jest odrzucony (kontrakt działa gdy auth layer go egzekwuje).
+    expect(() =>
+      determineClaimOutcome({
+        provided_claim_token: "tok-1",
+        stored_claim_token: "tok-1",
+        state: EntitlementInstanceState.ISSUED,
+        bound_recipient_customer_id: "cus_real_recipient",
+        claimant_customer_id: "cus_attacker", // napastnik podał inny id
+        policy_snapshot: PERSONALIZED,
+      })
+    ).toThrow(TransferabilityError)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// [M3] RODO — ClaimTokenConsumedError NIE ujawnia customer_id w message
+// ---------------------------------------------------------------------------
+
+describe("[M3] ClaimTokenConsumedError — brak PII / oracle stanu w message", () => {
+  it("message generyczny — nie zawiera customer_id żadnej ze stron (RODO minimalizacja)", () => {
+    const err = new ClaimTokenConsumedError("cus_victim", "cus_attacker")
+    expect(err.message).not.toContain("cus_victim")
+    expect(err.message).not.toContain("cus_attacker")
+    // message nie tworzy oracle stanu tokenu
+    expect(err.message).not.toContain("aktywowany")
+    expect(err.message).not.toContain("consumed")
+  })
+
+  it("strukturalne pola zachowane (server-side logging) — nie ujawniane w message", () => {
+    const err = new ClaimTokenConsumedError("cus_claimant", "cus_bound")
+    // Pola dostępne do logowania serwerowego
+    expect(err.claimant_customer_id).toBe("cus_claimant")
+    expect(err.bound_recipient_customer_id).toBe("cus_bound")
+    // Ale NIE w message (który mógłby dotrzeć do klienta)
+    expect(err.message).not.toContain("cus_claimant")
+    expect(err.message).not.toContain("cus_bound")
+  })
+
+  it("ClaimTokenConsumedError(null, null) — message nadal generyczny (okaziciel)", () => {
+    const err = new ClaimTokenConsumedError(null, null)
+    expect(err.message).toBeTruthy()
+    expect(err.claimant_customer_id).toBeNull()
+    expect(err.bound_recipient_customer_id).toBeNull()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// [L1] Integracja — kontrakt okablowania (buildTransferGrant / buildClaimWiring)
+// ---------------------------------------------------------------------------
+
+describe("[L1] Integracja — buildTransferGrant + buildClaimWiring jako seamy wywołania", () => {
+  it("buildTransferGrant zwraca kompletny grant (integracja: caller musi persystować binding + token)", async () => {
+    const grant = buildTransferGrant({
+      entitlement_id: "ent_integration_001",
+      state: EntitlementInstanceState.ISSUED,
+      policy_snapshot: BEARER,
+      buyer_customer_id: "cus_buyer",
+      existing_claim_token: "tok-integration",
+      transfer_seq: "int-seq-1",
+    })
+    // Weryfikacja kontraktu: grant zawiera wszystkie elementy potrzebne do persystencji
+    expect(grant.entitlement_id).toBe("ent_integration_001")
+    expect(grant.transfer_id).toBeTruthy()
+    expect(grant.claim_token).toBe("tok-integration")
+    expect(grant.binding).toBeDefined()
+    expect(grant.transferability).toBe("bearer")
+  })
+
+  it("buildClaimWiring zwraca wiring result (integracja: caller musi zaktualizować state + persystować binding)", async () => {
+    const result = await buildClaimWiring(
+      {
+        appendAudit: async () => {},
+        clock: () => new Date("2026-06-02T12:00:00.000Z"),
+      },
+      {
+        entitlement_id: "ent_integration_001",
+        scope: SCOPE,
+        provided_claim_token: "tok-integration",
+        stored_claim_token: "tok-integration",
+        state: EntitlementInstanceState.ISSUED,
+        bound_recipient_customer_id: null,
+        policy_snapshot: BEARER,
+        claim_seq: "int-claim-1",
+      }
+    )
+    // Weryfikacja: wynik zawiera binding + audit + event do persystencji przez callera
+    expect(result.outcome).toBe("claimed")
+    expect(result.binding).toBeDefined()
+    expect(result.audit).toBeDefined()
+    expect(result.event).toBeDefined()
+    // transition=true → caller MUSI zaktualizować stan instancji (+ buildAtomicClaimGuard)
+    // binding → caller MUSI persystować recipient binding
+  })
+})
+
+// ---------------------------------------------------------------------------
+// [L2] Reuse tokenu — sprawdzenie revoked_at przed reuse
+// ---------------------------------------------------------------------------
+
+describe("[L2] buildTransferGrant — odwołany existing_claim_token nie jest reużywany", () => {
+  it("token odwołany (existing_claim_token_revoked_at) → generuje świeży przez seam", () => {
+    const g = buildTransferGrant({
+      entitlement_id: "ent_transfer_001",
+      state: EntitlementInstanceState.ISSUED,
+      policy_snapshot: BEARER,
+      buyer_customer_id: "cus_buyer",
+      existing_claim_token: "tok-revoked",
+      existing_claim_token_revoked_at: new Date("2026-06-01T00:00:00.000Z"),
+      generateClaimToken: () => "tok-fresh-after-revoke",
+      transfer_seq: "seq-revoke",
+    })
+    expect(g.claim_token).toBe("tok-fresh-after-revoke")
+    expect(g.claim_token_reused).toBe(false)
+  })
+
+  it("token odwołany + brak generateClaimToken → TransferClaimTokenSourceError fail-closed", () => {
+    expect(() =>
+      buildTransferGrant({
+        entitlement_id: "ent_transfer_001",
+        state: EntitlementInstanceState.ISSUED,
+        policy_snapshot: BEARER,
+        buyer_customer_id: "cus_buyer",
+        existing_claim_token: "tok-revoked",
+        existing_claim_token_revoked_at: new Date("2026-06-01T00:00:00.000Z"),
+        // brak generateClaimToken
+        transfer_seq: "seq-revoke-fail",
+      })
+    ).toThrow(TransferClaimTokenSourceError)
+  })
+
+  it("token NIE odwołany (revoked_at=null) → reużywany (poprawna ścieżka)", () => {
+    const g = buildTransferGrant({
+      entitlement_id: "ent_transfer_001",
+      state: EntitlementInstanceState.ISSUED,
+      policy_snapshot: BEARER,
+      buyer_customer_id: "cus_buyer",
+      existing_claim_token: "tok-valid",
+      existing_claim_token_revoked_at: null,
+      transfer_seq: "seq-valid",
+    })
+    expect(g.claim_token).toBe("tok-valid")
+    expect(g.claim_token_reused).toBe(true)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// [L3] hybrid soft-flag w koperty audytu (sygnał antyfraudowy)
+// ---------------------------------------------------------------------------
+
+describe("[L3] buildClaimWiring — hybrid mismatch: soft_flag w actor_hint audytu", () => {
+  it("hybrid mismatch (softFlag=true) → actor_hint zawiera :soft_flag=hybrid_mismatch", async () => {
+    const audits: TransitionAuditEnvelope[] = []
+    const res = await buildClaimWiring(
+      {
+        appendAudit: async (a) => {
+          audits.push(a)
+        },
+        clock: () => new Date("2026-06-02T12:00:00.000Z"),
+      },
+      {
+        entitlement_id: "ent_transfer_001",
+        scope: SCOPE,
+        provided_claim_token: "tok-1",
+        stored_claim_token: "tok-1",
+        state: EntitlementInstanceState.ISSUED,
+        bound_recipient_customer_id: "cus_recipient",
+        claimant_customer_id: "cus_other", // mismatch → hybrid soft flag
+        gifted_by_customer_id: "cus_buyer",
+        policy_snapshot: HYBRID,
+        claim_seq: "claim-hybrid-mismatch",
+      }
+    )
+    expect(res.outcome).toBe("claimed")
+    expect(res.softFlag).toBe(true)
+    // Sygnał antyfraudowy musi być w koperty audytu (samowystarczalny ślad forensyczny)
+    expect(res.audit?.actor_hint).toContain(":soft_flag=hybrid_mismatch")
+    expect(audits[0]?.actor_hint).toContain(":soft_flag=hybrid_mismatch")
+  })
+
+  it("hybrid match (softFlag=false) → actor_hint NIE zawiera soft_flag (brak fałszywych sygnałów)", async () => {
+    const res = await buildClaimWiring(
+      {
+        appendAudit: async () => {},
+        clock: () => new Date("2026-06-02T12:00:00.000Z"),
+      },
+      {
+        entitlement_id: "ent_transfer_001",
+        scope: SCOPE,
+        provided_claim_token: "tok-1",
+        stored_claim_token: "tok-1",
+        state: EntitlementInstanceState.ISSUED,
+        bound_recipient_customer_id: "cus_recipient",
+        claimant_customer_id: "cus_recipient", // match → brak soft flag
+        gifted_by_customer_id: "cus_buyer",
+        policy_snapshot: HYBRID,
+        claim_seq: "claim-hybrid-match",
+      }
+    )
+    expect(res.softFlag).toBe(false)
+    expect(res.audit?.actor_hint).not.toContain("soft_flag")
+  })
+})
+
+// ---------------------------------------------------------------------------
+// [L4] Idempotencja replay spójna z terminalami lifecycle post-claim
+// ---------------------------------------------------------------------------
+
+describe("[L4] determineClaimOutcome — replay no-op na terminalach post-claim (AC2)", () => {
+  it("bearer + REFUNDED (post-claim terminal) → idempotent_replay (nie throw)", () => {
+    const d = determineClaimOutcome({
+      provided_claim_token: "tok-1",
+      stored_claim_token: "tok-1",
+      state: EntitlementInstanceState.REFUNDED,
+      bound_recipient_customer_id: null,
+      policy_snapshot: BEARER,
+    })
+    expect(d.outcome).toBe("idempotent_replay")
+    expect(d.transition).toBe(false)
+  })
+
+  it("personalized + REDEEMED_FULL + claimant==bound → idempotent_replay (post-claim terminal)", () => {
+    const d = determineClaimOutcome({
+      provided_claim_token: "tok-1",
+      stored_claim_token: "tok-1",
+      state: EntitlementInstanceState.REDEEMED_FULL,
+      bound_recipient_customer_id: "cus_recipient",
+      claimant_customer_id: "cus_recipient",
+      policy_snapshot: PERSONALIZED,
+    })
+    expect(d.outcome).toBe("idempotent_replay")
+    expect(d.transition).toBe(false)
+  })
+
+  it("personalized + REDEEMED_FULL + inna tożsamość → ClaimTokenConsumedError (double-claim ochrona działa)", () => {
+    expect(() =>
+      determineClaimOutcome({
+        provided_claim_token: "tok-1",
+        stored_claim_token: "tok-1",
+        state: EntitlementInstanceState.REDEEMED_FULL,
+        bound_recipient_customer_id: "cus_recipient",
+        claimant_customer_id: "cus_intruder",
+        policy_snapshot: PERSONALIZED,
+      })
+    ).toThrow(ClaimTokenConsumedError)
+  })
+
+  it("VOIDED (reachable z ISSUED przed claimem) → ClaimStateError fail-closed (niejednoznaczny)", () => {
+    expect(() =>
+      determineClaimOutcome({
+        provided_claim_token: "tok-1",
+        stored_claim_token: "tok-1",
+        state: EntitlementInstanceState.VOIDED,
+        bound_recipient_customer_id: null,
+        policy_snapshot: BEARER,
+      })
+    ).toThrow(ClaimStateError)
+  })
+
+  it("EXPIRED (reachable z ISSUED przed claimem) → ClaimStateError fail-closed (niejednoznaczny)", () => {
+    expect(() =>
+      determineClaimOutcome({
+        provided_claim_token: "tok-1",
+        stored_claim_token: "tok-1",
+        state: EntitlementInstanceState.EXPIRED,
+        bound_recipient_customer_id: null,
+        policy_snapshot: BEARER,
+      })
+    ).toThrow(ClaimStateError)
+  })
+
+  it("bearer + SETTLED (post-claim terminal) → idempotent_replay", () => {
+    const d = determineClaimOutcome({
+      provided_claim_token: "tok-1",
+      stored_claim_token: "tok-1",
+      state: EntitlementInstanceState.SETTLED,
+      bound_recipient_customer_id: null,
+      policy_snapshot: BEARER,
+    })
+    expect(d.outcome).toBe("idempotent_replay")
+    expect(d.transition).toBe(false)
   })
 })

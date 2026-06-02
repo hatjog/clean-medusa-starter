@@ -156,6 +156,10 @@ export class ClaimTokenInvalidError extends Error {
  * INNA / nieznana tożsamość (double-claim ⇒ fail-closed). Token jednorazowy: pierwszy
  * claim aktywuje; replay TEJ SAMEJ tożsamości (lub okaziciela) = no-op idempotentny,
  * ale claim przez INNĄ tożsamość po zużyciu = odrzucony.
+ *
+ * Strukturalne pola (`claimant_customer_id`, `bound_recipient_customer_id`) dostępne do
+ * logowania serwerowego. `message` jest generyczny — NIE zawiera customer_id stron trzecich
+ * (minimalizacja PII / RODO: komunikat nie może dotrzeć do nieuprawnionego claimanta, RODO §5).
  */
 export class ClaimTokenConsumedError extends Error {
   readonly claimant_customer_id: string | null
@@ -164,11 +168,10 @@ export class ClaimTokenConsumedError extends Error {
     claimantCustomerId: string | null,
     boundRecipientCustomerId: string | null
   ) {
+    // RODO: wiadomość generyczna — bez customer_id. Szczegóły w polach strukturalnych
+    // (server-side only). Oracle stanu tokenu dla atakującego musi być zablokowany.
     super(
-      `claim: claim token już zużyty (entitlement aktywowany) — próba ponownego claimu przez ` +
-        `inną/nieznaną tożsamość (claimant='${claimantCustomerId ?? "none"}', ` +
-        `bound recipient='${boundRecipientCustomerId ?? "none"}') ODRZUCONA fail-closed ` +
-        `(claim token jednorazowy; double-claim niedozwolony, AC2).`
+      `claim: token nieważny lub już wykorzystany — dostęp odrzucony (AC2, fail-closed).`
     )
     this.name = "ClaimTokenConsumedError"
     this.claimant_customer_id = claimantCustomerId
@@ -187,6 +190,58 @@ export class ClaimStateError extends Error {
     )
     this.name = "ClaimStateError"
     this.state = state
+  }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Kontrakty bezpieczeństwa (M1 atomowość, M2 tożsamość claimanta)
+// ──────────────────────────────────────────────────────────────────────────
+
+/**
+ * BEZPIECZEŃSTWO (M2): `claimant_customer_id` w {@link determineClaimOutcome} /
+ * {@link buildClaimWiring} MUSI pochodzić z uwierzytelnionego kontekstu sesji (zweryfikowana
+ * tożsamość po stronie callera) — NIGDY z ciała żądania / user-supplied input.
+ *
+ * Cała ochrona trybu `personalized` (wiązanie imienny, anti-secondary-market, RODO §489)
+ * opiera się na tym niezmienniku. Naruszenie: atakujący z ważnym tokenem ustawia
+ * `claimant_customer_id = bound_recipient_customer_id` ⇒ match przechodzi ⇒ kradzież
+ * imiennego vouchera. Ten kontrakt musi być egzekwowany przez warstwę routingu/auth,
+ * NIE przez tę warstwę czystej logiki.
+ */
+export const CLAIM_IDENTITY_AUTH_CONTRACT =
+  "SECURITY: claimant_customer_id MUST be sourced from the authenticated session " +
+  "context (verified identity by the auth layer), NEVER from request body / user-supplied input. " +
+  "The entire 'personalized' binding protection (anti-secondary-market, RODO §489) " +
+  "depends on this invariant. Caller (route/service layer) MUST enforce this before " +
+  "invoking determineClaimOutcome / buildClaimWiring."
+
+/**
+ * Atomowy guard jednorazowości claim tokenu — OBRONA PRZED TOCTOU (M1).
+ *
+ * **KONIECZNE**: caller MUSI wykonać atomową operację DB przed wywołaniem
+ * {@link buildClaimWiring}/{@link determineClaimOutcome}:
+ *
+ * ```sql
+ * UPDATE entitlement_instance
+ *   SET state = 'ACTIVE', claim_token_consumed_at = now()
+ *   WHERE id = :id AND state = 'ISSUED'
+ *   RETURNING id
+ * ```
+ *
+ * Następnie wywołać `buildAtomicClaimGuard(rowsUpdated, ...)`:
+ *   - `rowsUpdated = 1` → ten proces wygrał wyścig → kontynuuj.
+ *   - `rowsUpdated = 0` → inny proces już zclaimował → {@link ClaimTokenConsumedError} fail-closed.
+ *
+ * Bez tego guardu dwa równoległe claimy czytające `state = ISSUED` oba zwrócą `claimed`
+ * i oba wejdą w `wireEntitlementTransitionPersisted` ⇒ podwójna aktywacja (TOCTOU).
+ */
+export function buildAtomicClaimGuard(
+  rowsUpdated: number,
+  claimantCustomerId: string | null,
+  boundRecipientCustomerId: string | null
+): void {
+  if (rowsUpdated === 0) {
+    throw new ClaimTokenConsumedError(claimantCustomerId, boundRecipientCustomerId)
   }
 }
 
@@ -239,8 +294,15 @@ export type BuildTransferGrantInput = {
   buyer_customer_id: string
   /** Recipient (odbiorca). `personalized` wymaga `customer_id`; `bearer`/`hybrid` opcjonalnie. */
   recipient?: { customer_id?: string | null }
-  /** Istniejący claim_token na instancji (reuse v1.8.0 P4 gdy obecny). */
+  /** Istniejący claim_token na instancji (reuse v1.8.0 P4 gdy obecny i NIE odwołany). */
   existing_claim_token?: string | null
+  /**
+   * Znacznik odwołania istniejącego tokenu (buyer-self revoke, Epic-2 MED-09).
+   * Gdy ustawiony: `existing_claim_token` NIE jest reużywany → generowany świeży
+   * (gdy dostępny `generateClaimToken`) lub {@link TransferClaimTokenSourceError} fail-closed.
+   * Asymetria `buildTransferGrant` vs `determineClaimOutcome` domknięta (L2).
+   */
+  existing_claim_token_revoked_at?: Date | string | null
   /** Seam: generacja świeżego claim tokenu, gdy instancja go nie ma (reuse kształtu v1.8.0). */
   generateClaimToken?: () => string
   /** Dyskryminator idempotencji transferu (np. ULID / transfer seq) — replay ⇒ jeden transfer. */
@@ -330,9 +392,13 @@ export function buildTransferGrant(
     }
   }
 
-  // (iv) claim token: reuse v1.8.0 P4 gdy istnieje, inaczej świeży (seam).
-  const reused =
+  // (iv) claim token: reuse v1.8.0 P4 gdy istnieje I NIE jest odwołany; inaczej świeży (seam).
+  // Odwołany token (existing_claim_token_revoked_at != null) NIE jest reużywany — grant
+  // z martwym tokenem byłby nieclaimowalny (L2 fix: asymetria buildTransferGrant vs determineClaimOutcome).
+  const existingPresent =
     input.existing_claim_token != null && input.existing_claim_token !== ""
+  const existingRevoked = input.existing_claim_token_revoked_at != null
+  const reused = existingPresent && !existingRevoked
   const claimToken = reused
     ? (input.existing_claim_token as string)
     : input.generateClaimToken?.()
@@ -457,8 +523,23 @@ export function determineClaimOutcome(
     }
   }
 
-  // 3. ACTIVE — token już zużyty: replay (no-op) vs double-claim (fail-closed).
-  if (input.state === EntitlementInstanceState.ACTIVE) {
+  // 3. Stany niejednoznaczne (VOIDED / EXPIRED): reachable zarówno z ISSUED (przed claimem)
+  //    jak i z ACTIVE (po claimie) — nie można stwierdzić czy claim nastąpił.
+  //    Fail-closed: ClaimStateError (L4: idempotent_replay tylko dla stanów post-claim).
+  if (
+    input.state === EntitlementInstanceState.VOIDED ||
+    input.state === EntitlementInstanceState.EXPIRED
+  ) {
+    throw new ClaimStateError(input.state)
+  }
+
+  // 4. Wszystkie pozostałe stany (ACTIVE + stany post-ACTIVE: REDEMPTION_REQUESTED,
+  //    REDEEMED_PARTIAL, REDEEMED_FULL, SETTLED, CLOSED, REFUND_REQUESTED, REFUNDED,
+  //    DISPUTED, PENDING_VENDOR_DECISION) — token zużyty przez poprzedni claim.
+  //    Replay TEJ SAMEJ tożsamości (lub okaziciela) = idempotent_replay (no-op, AC2).
+  //    Claim przez INNĄ/nieznaną tożsamość po zużyciu = ClaimTokenConsumedError (fail-closed).
+  //    (L4 fix: AC2 „powtórzony claim = no-op" spójny z terminalami lifecycle post-claim.)
+  {
     const binding: RecipientBinding =
       transferability === "bearer"
         ? { recipient_customer_id: null, transferability, bearer: true }
@@ -466,7 +547,7 @@ export function determineClaimOutcome(
 
     if (transferability === "bearer") {
       // Okaziciel: brak tożsamości do rozróżnienia — re-prezentacja TEGO SAMEGO tokenu
-      // na już-aktywnym entitlemencie = idempotentny no-op (jedna aktywacja, brak
+      // na już-zclaimowanym entitlemencie = idempotentny no-op (jedna aktywacja, brak
       // drugiego grantu). To NIE drugi transfer (entitlement zaktywowany dokładnie raz).
       return {
         outcome: "idempotent_replay",
@@ -490,9 +571,6 @@ export function determineClaimOutcome(
     // Double-claim przez inną / nieznaną tożsamość po zużyciu ⇒ fail-closed.
     throw new ClaimTokenConsumedError(claimantId, boundId)
   }
-
-  // 4. Inny stan — token nie jest claimowalny (fail-closed).
-  throw new ClaimStateError(input.state)
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -665,6 +743,16 @@ export async function buildClaimWiring(
 
   // Pierwszy claim: tranzycja ISSUED → ACTIVE przez JEDNOLITY punkt (3.4).
   const transitionInput = buildClaimTransitionInput(input)
+  // L3: hybrid soft-flag mismatch → zakoduj w koperty audytu (sygnał antyfraudowy nie może
+  // być gubiony; ślad append-only musi być samowystarczalny forensicznie, AC2).
+  const transitionInputFinal =
+    determination.softFlag
+      ? {
+          ...transitionInput,
+          actor_hint:
+            transitionInput.actor_hint + ":soft_flag=hybrid_mismatch",
+        }
+      : transitionInput
   const { event, audit, posting } = await wireEntitlementTransitionPersisted(
     {
       appendAudit: deps.appendAudit,
@@ -674,7 +762,7 @@ export async function buildClaimWiring(
         : {}),
       ...(deps.clock ? { clock: deps.clock } : {}),
     },
-    transitionInput
+    transitionInputFinal
   )
 
   // Event best-effort PO COMMIT (caller woła po commit zmiany stanu; tu deleguje seam).

@@ -501,6 +501,7 @@ export type {
 // (NIE cross-vendor wallet); taksonomia 13 stanów + hard-gate'y nietknięte (D-5).
 export {
   TRANSFER_POSTING_NOOP_REASON,
+  CLAIM_IDENTITY_AUTH_CONTRACT,
   TransferabilityEnumError,
   TransferRecipientRequiredError,
   TransferRecipientSameAsBuyerError,
@@ -512,6 +513,7 @@ export {
   readTransferabilityFromSnapshot,
   buildTransferId,
   buildTransferGrant,
+  buildAtomicClaimGuard,
   determineClaimOutcome,
   buildTransferPostingNoop,
   claimActorHint,
