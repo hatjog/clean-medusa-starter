@@ -48,6 +48,19 @@ export {
   persistDeliveryArtifact,
 } from "./multi-vendor-pdf"
 
+// Appointment .ics generator (Story 5.2 / ADR-137 iCal Path A).
+export type {
+  VoucherAppointmentIcsInput,
+  VoucherAppointmentLifecycleStatus,
+  VoucherAppointmentManageLinkOptions,
+} from "./ics-generator"
+export {
+  buildAppointmentCalendarUid,
+  generateVoucherAppointmentIcs,
+  VOUCHER_APPOINTMENT_SUMMARY_FALLBACK,
+  VOUCHER_APPOINTMENT_TIMEZONE,
+} from "./ics-generator"
+
 // Storage layer port + adapters (cleanup-52 / TF-117).
 export type {
   IVoucherPdfStorage,
