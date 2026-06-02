@@ -297,6 +297,73 @@ export type {
   RedeemPartialDeps,
 } from "./workflows/redeem-partial-entitlement"
 
+// Story 4.2 (Epic 4 / Wave 4 — lifecycle): warstwa SALDA + DEFENSYWNEGO EXPIRY
+// (anti-forfeiture) + powiadomienia. Saldo `remaining` na TYM SAMYM entitlement_id
+// (spójne z 4.1); deterministyczny `expires_at` (12 mies., boundary [1,24], D-9/FR14);
+// pre-expiry powiadomienie oferuje extend ORAZ bezpłatny zwrot salda — copy NIGDY
+// „przepadnie" (anti-forfeiture invariant egzekwowany mechanicznie). AC3: blokada
+// profilu forfeiture REUŻYWA boundary 1.2 (art. 385¹ KC).
+export {
+  DEFAULT_VALIDITY_MONTHS,
+  EXPIRED_CUSTOMER_STATUS,
+  PRE_EXPIRY_REMINDER_EVENT_TYPE,
+  FORBIDDEN_FORFEITURE_TOKENS,
+  ForfeitureCopyError,
+  ExpiryRecoveryOptionsError,
+  ExpiryProfileForfeitureError,
+  entitlementRemainingBalance,
+  resolveValidityMonths,
+  addMonthsUtc,
+  computeExpiresAt,
+  assertNoForfeitureCopy,
+  defaultPreExpiryMessage,
+  buildPreExpiryNotification,
+  buildPreExpiryIdempotencyKey,
+  assertExpiryProfileActivatable,
+} from "./entitlement-expiry"
+export type {
+  EntitlementBalance,
+  ExpiryRecoveryKind,
+  ExpiryRecoveryOption,
+  PreExpiryNotification,
+  BuildPreExpiryNotificationInput,
+} from "./entitlement-expiry"
+
+// Story 4.2: operacja EXPIRED → BREAKAGE (derecognition niewykorzystanego salda)
+// routowana przez wireEntitlementTransitionPersisted (3.4) → posting hook →
+// ledger-writer (2.6); gated (runtime_enabled=false ⇒ audit-only/no-op). Idempotentny
+// sweep (replay ⇒ no-op; domena EXPIRED marker + transaction_id writera). Pre-expiry
+// notifier z dedup (powiadomienie RAZ per okno). Status klienta „Ważność minęła —
+// sprawdź opcje zwrotu" (UX §8). Posting GATED (flip = E6/P6, NIE tutaj).
+export {
+  EXPIRY_SOURCE_STATES,
+  ExpireEntitlementOperation,
+  ExpireEntitlementNotFoundError,
+  EntitlementNotExpirableError,
+  ExpireAmountError,
+  PreExpiryNotifier,
+  PostgresExpireEntitlementStore,
+  InMemoryExpireEntitlementStore,
+  PostgresPreExpiryDedupeStore,
+  InMemoryPreExpiryDedupeStore,
+  createExpireEntitlementOperationFromScope,
+  createPreExpiryNotifierFromScope,
+} from "./workflows/expire-entitlement"
+export type {
+  ExpireEntitlementInput,
+  ExpireEntitlementResult,
+  ExpirableEntitlement,
+  ExpireEntitlementTx,
+  ExpireEntitlementStore,
+  ExpireEntitlementEventEmitter,
+  ExpireEntitlementDeps,
+  PreExpiryNotificationSink,
+  PreExpiryDedupeStore,
+  PreExpiryNotifierDeps,
+  PreExpiryNotifyInput,
+  PreExpiryNotifyResult,
+} from "./workflows/expire-entitlement"
+
 export default Module(VOUCHER_MODULE, {
   service: VoucherService,
   loaders: [voucherSeedFixturesLoader],

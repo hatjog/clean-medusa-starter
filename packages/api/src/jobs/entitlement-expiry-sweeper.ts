@@ -37,6 +37,22 @@ import {
  * trailing-week expiry are not required for BonBeauty MVP; this is a
  * defense-in-depth job complementing the read-time expiry check in
  * `VoucherService.claim`.
+ *
+ * ── Relacja do Story 4.2 (v1.11.0 Epic 4) — EXPIRED → BREAKAGE (gated) ───────
+ * Ten job realizuje legacy v1.9.0 FLIP STATUSU (bulk UPDATE → state='EXPIRED'),
+ * BEZ derecognition/breakage. Story 4.2 dostarcza ODDZIELNĄ, routowaną ZDOLNOŚĆ
+ * breakage: `ExpireEntitlementOperation`
+ * (`modules/voucher/workflows/expire-entitlement.ts`), która tranzycję
+ * `<source> → EXPIRED` z `remaining > 0` prowadzi przez JEDEN punkt okablowania
+ * `wireEntitlementTransitionPersisted` (3.4) → posting hook → `ledger-writer`
+ * (2.6), generując `ENTITLEMENT_BREAKAGE` (2.3). Posting jest GATED
+ * (`runtime_enabled=false` ⇒ audit-only/no-op) — flip = E6/P6 (ADR-139 D5).
+ *
+ * Zgodnie z posturą Story 4.1 (capability, NIE aktywacja) operacja breakage NIE
+ * jest jeszcze wpięta w ten cron — jej wpięcie (zastąpienie bulk-flip routowanym
+ * per-row expiry przez operację, by breakage był osiągalny po aktywacji) należy
+ * do integracji E6/P6. Do tego czasu ten job pozostaje niezmieniony (flip statusu
+ * jako defense-in-depth). NIE dodawaj tu drugiej, rozproszonej ścieżki postingu.
  */
 
 export const SCHEDULE_NAME = "entitlement-expiry-sweeper" as const
