@@ -486,6 +486,50 @@ export type {
   ExtendWiringResult,
 } from "./entitlement-extend"
 
+// Story 4.5 (Epic 4 / Wave 4 — lifecycle L4 transfer/gifting): RECIPIENT BINDING +
+// walidacja trybu `transferability` (`bearer | personalized | hybrid`, snapshot
+// `policy_snapshot` przy ISSUED, FR15/FR16) + okablowanie tranzycji CLAIM. Obdarowanie
+// (gifting) nadaje recipient binding + claim token (reuse v1.8.0 P4, BEZ nowego UI);
+// claim recipienta aktywuje uprawnienie (`ISSUED → ACTIVE` = „aktywacja przez recipienta")
+// WYŁĄCZNIE przez JEDNOLITY punkt wireEntitlementTransition (3.4) → event + audit (kto
+// obdarował / kto zclaimował) + posting hook. Idempotencja: transfer_id deterministyczny
+// (replay ⇒ jeden transfer); claim token JEDNORAZOWY (replay tej samej tożsamości/okaziciela
+// ⇒ no-op, double-claim ⇒ fail-closed). KRYTYCZNE (ADR-139 D5): transfer/claim = binding-only
+// (NIE derecognition; liability bez zmiany, brak ruchu pieniądza) ⇒ posting hook = no-op
+// derecognition (BRAK payloadu); runtime_enabled zostaje false (flip = E6/P6). RODO: dane
+// recipienta minimalne (wyłącznie recipient_customer_id). Single-vendor / bonbeauty-only
+// (NIE cross-vendor wallet); taksonomia 13 stanów + hard-gate'y nietknięte (D-5).
+export {
+  TRANSFER_POSTING_NOOP_REASON,
+  TransferabilityEnumError,
+  TransferRecipientRequiredError,
+  TransferRecipientSameAsBuyerError,
+  TransferStateError,
+  TransferClaimTokenSourceError,
+  ClaimTokenInvalidError,
+  ClaimTokenConsumedError,
+  ClaimStateError,
+  readTransferabilityFromSnapshot,
+  buildTransferId,
+  buildTransferGrant,
+  determineClaimOutcome,
+  buildTransferPostingNoop,
+  claimActorHint,
+  buildClaimTransitionInput,
+  buildClaimWiring,
+} from "./entitlement-transfer"
+export type {
+  RecipientBinding,
+  BuildTransferGrantInput,
+  TransferGrant,
+  ClaimOutcomeKind,
+  DetermineClaimInput,
+  ClaimDetermination,
+  TransferPostingNoop,
+  BuildClaimWiringInput,
+  ClaimWiringResult,
+} from "./entitlement-transfer"
+
 export default Module(VOUCHER_MODULE, {
   service: VoucherService,
   loaders: [voucherSeedFixturesLoader],
