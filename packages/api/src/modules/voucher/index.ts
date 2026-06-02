@@ -122,6 +122,21 @@ export type {
   VoucherPostingInput,
   VoucherPostingResult,
 } from "./posting-profile"
+// Story 2.6: fundament persystencji entitlement-ledgera (ADR-139 D3 — idempotentny
+// writer, ujście dla generateVoucherPosting()). Eksport dostarcza ZDOLNOŚĆ ZAPISU,
+// NIE aktywuje postingu (runtime_enabled zostaje false, flip = E6/P6).
+export {
+  VoucherLedgerWriter,
+  VoucherLedgerWriteError,
+  deriveLedgerTransactionId,
+} from "./ledger-writer"
+export type {
+  LedgerPgClient,
+  LedgerPgPool,
+  LedgerLifecycleDiscriminator,
+  VoucherLedgerWriteRequest,
+  VoucherLedgerWriteResult,
+} from "./ledger-writer"
 export {
   ENTITLEMENT_BOUNDARY,
   LOST_CODE_REISSUE_WINDOW_DAYS,
