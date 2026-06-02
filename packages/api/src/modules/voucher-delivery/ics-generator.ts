@@ -7,12 +7,18 @@ import { getVtimezoneComponent } from "@touch4it/ical-timezones";
 import {
   normalizeVoucherAppointmentLocale,
   renderAppointmentCopy,
+  VOUCHER_APPOINTMENT_COPY,
   type VoucherAppointmentLocale,
 } from "./appointment-i18n";
 import { buildSignedToken } from "./storage/hmac";
 
 export const VOUCHER_APPOINTMENT_TIMEZONE = "Europe/Warsaw";
-export const VOUCHER_APPOINTMENT_SUMMARY_FALLBACK = "Wizyta BonBeauty";
+/**
+ * Fallback summary for legacy consumers that have not yet migrated to the
+ * locale-aware i18n path. Derived from the PL i18n bundle to avoid drift.
+ */
+export const VOUCHER_APPOINTMENT_SUMMARY_FALLBACK: string =
+  VOUCHER_APPOINTMENT_COPY.pl.ics_summary_default ?? "Wizyta BonBeauty";
 
 const UID_DOMAIN = "bonbeauty";
 const MAX_SCOPED_TOKEN_TTL_SECONDS = 7 * 24 * 60 * 60;

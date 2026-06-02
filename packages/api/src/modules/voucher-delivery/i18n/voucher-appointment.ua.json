@@ -1,5 +1,5 @@
 {
-  "_review": "machine-translated stub — native UA review deferred to v1.11.0 release review",
+  "_review": "machine-translated stub — native UA review + legal review of email_withdrawal_copy deferred; tracked in ADR-137 §dostarczenie (activation gate: native/legal review MUST complete before runtime_enabled flips for locale=ua)",
   "email_subject_open": "Ваучер BonBeauty - час візиту залишається відкритим",
   "email_subject_confirmed": "Підтвердження візиту BonBeauty",
   "email_subject_rescheduled": "Зміна часу візиту BonBeauty",

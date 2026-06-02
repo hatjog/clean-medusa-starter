@@ -47,12 +47,40 @@ function assertAppointmentBundleParity(): void {
 }
 assertAppointmentBundleParity();
 
+/**
+ * BCP47 alias bridge: the platform propagates locale as BCP47 (`uk`, `en-US`, …).
+ * Internally we use the GP-conventional token `"ua"` for Ukrainian and strip region
+ * suffixes so that incoming `"uk"` or `"en-US"` don't throw at the boundary.
+ * This keeps the internal token set (`pl|en|ua|de`) stable while allowing safe
+ * integration with the Medusa x-medusa-locale middleware.
+ */
+const BCP47_ALIAS: Readonly<Record<string, VoucherAppointmentLocale>> = {
+  uk: "ua",   // BCP47 Ukrainian → internal UA token
+  "uk-UA": "ua",
+  "en-US": "en",
+  "en-GB": "en",
+  "de-DE": "de",
+  "de-AT": "de",
+  "de-CH": "de",
+  "pl-PL": "pl",
+};
+
 export function normalizeVoucherAppointmentLocale(
-  locale: VoucherAppointmentLocale | null | undefined,
+  locale: VoucherAppointmentLocale | string | null | undefined,
 ): VoucherAppointmentLocale {
   const candidate = locale ?? "pl";
+  // Exact match (primary path)
   if ((VOUCHER_APPOINTMENT_LOCALES as readonly string[]).includes(candidate)) {
-    return candidate;
+    return candidate as VoucherAppointmentLocale;
+  }
+  // BCP47 alias (e.g. "uk" → "ua", "en-US" → "en")
+  if (BCP47_ALIAS[candidate]) {
+    return BCP47_ALIAS[candidate];
+  }
+  // Strip region tag and retry (e.g. "uk-UA" already in alias, but handles new variants)
+  const base = candidate.split("-")[0]!;
+  if ((VOUCHER_APPOINTMENT_LOCALES as readonly string[]).includes(base)) {
+    return base as VoucherAppointmentLocale;
   }
 
   throw new Error(`unsupported voucher appointment locale: ${String(locale)}`);

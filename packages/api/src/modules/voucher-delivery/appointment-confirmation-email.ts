@@ -27,7 +27,6 @@ const HTML_ESCAPE: Record<string, string> = {
 export const VOUCHER_APPOINTMENT_EMAIL_A11Y_TOKENS = Object.freeze({
   background: "#ffffff",
   bodyText: "#1f2933",
-  mutedText: "#334155",
   ctaBackground: "#1f2937",
   ctaText: "#ffffff",
   focusOutline: "#0b5fff",

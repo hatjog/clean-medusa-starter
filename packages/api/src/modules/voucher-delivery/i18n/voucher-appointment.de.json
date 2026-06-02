@@ -1,5 +1,5 @@
 {
-  "_review": "machine-translated stub — native DE review deferred to v1.11.0 release review",
+  "_review": "machine-translated stub — native DE review + legal review of email_withdrawal_copy deferred; tracked in ADR-137 §dostarczenie (activation gate: native/legal review MUST complete before runtime_enabled flips for locale=de)",
   "email_subject_open": "BonBeauty-Gutschein - der Termin bleibt offen",
   "email_subject_confirmed": "BonBeauty-Terminbestätigung",
   "email_subject_rescheduled": "BonBeauty-Termin wurde geändert",
@@ -21,7 +21,7 @@
   "ics_summary_default": "BonBeauty-Besuch",
   "ics_summary_rescheduled_suffix": "Termin geändert",
   "ics_summary_cancelled_suffix": "abgesagt",
-  "ics_description_confirmed": "Termin im Salon {salon}. Bitte kommen Sie pünktlich; Straße und Größe bleiben UTF-8-stabil.",
-  "ics_description_rescheduled": "Status: Termin im Salon {salon} wurde geändert. Bitte kommen Sie pünktlich; Straße und Größe bleiben UTF-8-stabil.",
-  "ics_description_cancelled": "Status: Termin im Salon {salon} wurde abgesagt. Straße und Größe bleiben UTF-8-stabil."
+  "ics_description_confirmed": "Termin im Salon {salon}.",
+  "ics_description_rescheduled": "Status: Termin im Salon {salon} wurde geändert.",
+  "ics_description_cancelled": "Status: Termin im Salon {salon} wurde abgesagt."
 }
