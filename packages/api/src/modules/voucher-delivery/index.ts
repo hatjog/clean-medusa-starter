@@ -61,6 +61,21 @@ export {
   VOUCHER_APPOINTMENT_TIMEZONE,
 } from "./ics-generator"
 
+// Appointment confirmation delivery email + scoped .ics download link (Story 5.3).
+export type {
+  VoucherAppointmentDeliveryAttachment,
+  VoucherAppointmentDeliveryCalendar,
+  VoucherAppointmentDeliveryEmail,
+  VoucherAppointmentDeliveryEmailInput,
+} from "./appointment-confirmation-email"
+export {
+  buildVoucherAppointmentDeliveryEmail,
+  buildVoucherAppointmentIcsStorageKey,
+  isVoucherAppointmentIcsStorageKey,
+  VOUCHER_APPOINTMENT_ICS_DOWNLOAD_ROUTE,
+  VOUCHER_APPOINTMENT_ICS_STORAGE_SCOPE,
+} from "./appointment-confirmation-email"
+
 // Storage layer port + adapters (cleanup-52 / TF-117).
 export type {
   IVoucherPdfStorage,

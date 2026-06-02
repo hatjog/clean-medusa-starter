@@ -740,6 +740,95 @@ export class VoucherService {
   }
 
   /**
+   * Story 5.3 — source fetcher for appointment confirmation delivery.
+   *
+   * This is intentionally narrower than findBuyerClaimSource: the appointment
+   * email must not receive a voucher code or service title. It only resolves
+   * the dispatch recipient plus neutral salon/location labels used in the
+   * confirmation body and .ics payload.
+   */
+  async findAppointmentConfirmationDeliverySource(
+    entitlement_instance_id: string,
+  ): Promise<{
+    buyer_email: string | null
+    buyer_locale: string | null
+    salon_name: string | null
+    location_address: string | null
+    seller_handle: string | null
+  } | null> {
+    const pool = this.getPool()
+    const res = await pool.query<Record<string, unknown>>(
+      `SELECT
+         ei.id                                       AS ei_id,
+         ei.policy_snapshot                          AS policy_snapshot,
+         ei.order_id                                 AS order_id,
+         v.seller_name                               AS seller_name,
+         v.seller_handle                             AS seller_handle,
+         o.email                                     AS order_email
+       FROM entitlement_instance ei
+       LEFT JOIN voucher v ON v.code = (ei.policy_snapshot->>'voucher_code')
+       LEFT JOIN public.order o ON o.id = ei.order_id
+       WHERE ei.id = $1
+       ORDER BY ei.created_at DESC
+       LIMIT 1`,
+      [entitlement_instance_id],
+    )
+
+    const row = res.rows[0]
+    if (!row) return null
+
+    const snapshot =
+      typeof row.policy_snapshot === "string"
+        ? (JSON.parse(row.policy_snapshot as string) as Record<string, unknown>)
+        : ((row.policy_snapshot ?? {}) as Record<string, unknown>)
+    const seller =
+      snapshot.seller &&
+      typeof snapshot.seller === "object" &&
+      !Array.isArray(snapshot.seller)
+        ? (snapshot.seller as Record<string, unknown>)
+        : {}
+    const snapshotEmail =
+      typeof snapshot.buyer_email === "string" && (snapshot.buyer_email as string).length > 0
+        ? (snapshot.buyer_email as string)
+        : null
+    const orderEmail =
+      typeof row.order_email === "string" && (row.order_email as string).length > 0
+        ? (row.order_email as string)
+        : null
+    const snapshotLocale =
+      typeof snapshot.buyer_locale === "string" && (snapshot.buyer_locale as string).length > 0
+        ? (snapshot.buyer_locale as string)
+        : null
+    const salonName =
+      typeof seller.name === "string" && (seller.name as string).length > 0
+        ? (seller.name as string)
+        : typeof row.seller_name === "string" && (row.seller_name as string).length > 0
+          ? (row.seller_name as string)
+          : null
+    const locationAddress =
+      typeof seller.address === "string" && (seller.address as string).length > 0
+        ? (seller.address as string)
+        : typeof snapshot.location_address === "string" &&
+            (snapshot.location_address as string).length > 0
+          ? (snapshot.location_address as string)
+          : null
+    const sellerHandle =
+      typeof seller.handle === "string" && (seller.handle as string).length > 0
+        ? (seller.handle as string)
+        : typeof row.seller_handle === "string" && (row.seller_handle as string).length > 0
+          ? (row.seller_handle as string)
+          : null
+
+    return {
+      buyer_email: snapshotEmail ?? orderEmail,
+      buyer_locale: snapshotLocale,
+      salon_name: salonName,
+      location_address: locationAddress,
+      seller_handle: sellerHandle,
+    }
+  }
+
+  /**
    * v1.9.0 Wave F6 / Epic-2 HIGH-01 + CC-2 #1 — System 1 elimination.
    *
    * Admin entitlement search reading from Layer 4 (`entitlement_instance`)
