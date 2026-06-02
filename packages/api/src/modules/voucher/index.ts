@@ -580,6 +580,57 @@ export type {
   CancellationWiringResult,
 } from "./entitlement-cancellation"
 
+// Story 4.7 (Epic 4 / Wave 4 — lifecycle L4 lost-code recovery): ODZYSK UTRACONEGO
+// KODU jako para tranzycji `void(old)` + `issue(new)`. Stary (utracony) kod → VOIDED
+// (terminal, niewykorzystywalny); nowy kod genezą → ISSUED z PEŁNYM niewykorzystanym
+// saldem (`remaining`) i ZACHOWANĄ ważnością (`expires_at`) starego — transfer 1:1
+// (dyscyplina 4.1: NIGDY ponad remaining, NIE inflacja). To KONTYNUACJA tego samego
+// zobowiązania (net-zero), NIE breakage/derecognition (anti-forfeiture, FR20). DWA okna
+// czasowe (AC1): zgłoszenie ≤30 dni od utraty + decyzja ≤7 dni od zgłoszenia (poza oknem
+// ⇒ fail-closed, brak void/issue/transferu). ANTI-DOUBLE-SPEND: void(old) ZANIM nowy
+// aktywny (kolejność egzekwowana w buildLostCodeRecoveryWiring — nigdy 2 ważne kody).
+// Idempotencja: recovery_id deterministyczny + deterministyczny nowy id (replay ⇒ jeden
+// void+issue, no-op). KRYTYCZNE (ADR-139 D5): para void+issue = NET-ZERO ⇒ posting payload
+// CELOWO pominięty (audit-only, attempted:false); runtime_enabled zostaje false (flip =
+// E6/P6). Obie tranzycje routują przez JEDNOLITY punkt wireEntitlementTransition (3.4) —
+// void = istniejąca krawędź {ISSUED,ACTIVE}→VOIDED, issue = istniejąca geneza → ISSUED
+// (D-5, taksonomia 13 stanów niezmieniona). NIE rusza hard-gate'ów MPV_MULTI_VENDOR/
+// SUBSCRIPTION_B2C. Single-vendor / bonbeauty-only.
+export {
+  LOST_CODE_REPORT_WINDOW_DAYS,
+  LOST_CODE_DECISION_WINDOW_DAYS,
+  LOST_CODE_RECOVERABLE_STATES,
+  LOST_CODE_POSTING_NOOP_REASON,
+  LostCodeReportWindowError,
+  LostCodeDecisionWindowError,
+  LostCodeIdempotencyMissingError,
+  LostCodePreconditionError,
+  LostCodeBalanceTransferError,
+  isWithinReportWindow,
+  isWithinDecisionWindow,
+  buildLostCodeRecoveryId,
+  deriveRecoveryEntitlementId,
+  computeRecoveryBalanceTransfer,
+  computeRecoveryExpiresAt,
+  determineLostCodeRecoveryOutcome,
+  buildLostCodePostingNoop,
+  lostCodeVoidActorHint,
+  lostCodeReissueActorHint,
+  buildLostCodeVoidTransitionInput,
+  buildLostCodeReissueGenesisInput,
+  buildLostCodeRecoveryWiring,
+  cloneRecoveryPolicySnapshot,
+} from "./entitlement-lost-code"
+export type {
+  RecoveryBalanceTransfer,
+  LostCodeRecoveryDeterminationInput,
+  LostCodeRecoveryDetermination,
+  LostCodePostingNoop,
+  BuildLostCodeWiringInput,
+  LostCodeLegResult,
+  LostCodeRecoveryWiringResult,
+} from "./entitlement-lost-code"
+
 export default Module(VOUCHER_MODULE, {
   service: VoucherService,
   loaders: [voucherSeedFixturesLoader],
