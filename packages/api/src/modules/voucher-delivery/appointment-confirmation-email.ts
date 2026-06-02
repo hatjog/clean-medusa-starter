@@ -3,6 +3,12 @@ import {
   buildAppointmentCalendarUid,
   type VoucherAppointmentIcsInput,
 } from "./ics-generator";
+import {
+  normalizeVoucherAppointmentLocale,
+  renderAppointmentCopy,
+  voucherAppointmentHtmlLang,
+  type VoucherAppointmentLocale,
+} from "./appointment-i18n";
 import { buildSignedToken } from "./storage/hmac";
 
 export const VOUCHER_APPOINTMENT_ICS_STORAGE_SCOPE =
@@ -18,6 +24,16 @@ const HTML_ESCAPE: Record<string, string> = {
   '"': "&quot;",
   "'": "&#39;",
 };
+export const VOUCHER_APPOINTMENT_EMAIL_A11Y_TOKENS = Object.freeze({
+  background: "#ffffff",
+  bodyText: "#1f2933",
+  mutedText: "#334155",
+  ctaBackground: "#1f2937",
+  ctaText: "#ffffff",
+  focusOutline: "#0b5fff",
+  accentBorder: "#b0892f",
+  minTargetPx: 44,
+});
 
 export type VoucherAppointmentDeliveryAttachment = {
   filename: string;
@@ -50,6 +66,7 @@ export type VoucherAppointmentDeliveryEmailInput = {
   appointment: VoucherAppointmentIcsInput | null;
   download_base_url: string;
   hmac_secret: string;
+  locale?: VoucherAppointmentLocale;
   ttl_seconds?: number;
   now?: Date | string;
 };
@@ -96,20 +113,23 @@ export function buildVoucherAppointmentDeliveryEmail(
   input: VoucherAppointmentDeliveryEmailInput,
 ): VoucherAppointmentDeliveryEmail {
   const now = normalizeDate(input.now ?? new Date(), "now");
-  const withdrawalCopy = buildWithdrawalCopy();
+  const locale = normalizeVoucherAppointmentLocale(input.locale);
+  const withdrawalCopy = buildWithdrawalCopy(locale);
 
   if (!input.appointment) {
-    const subject = "Voucher BonBeauty - termin pozostaje otwarty";
+    const subject = renderAppointmentCopy(locale, "email_subject_open");
+    const statusText = renderAppointmentCopy(locale, "email_status_open");
+    const followupText = renderAppointmentCopy(locale, "email_open_followup");
     const text = [
-      "Voucher został dostarczony.",
-      "Termin pozostaje otwarty. Po potwierdzeniu wizyty wyślemy osobne potwierdzenie kalendarzowe.",
+      statusText,
+      followupText,
       withdrawalCopy,
     ].join("\n\n");
-    const html = [
-      "<p>Voucher został dostarczony.</p>",
-      "<p>Termin pozostaje otwarty. Po potwierdzeniu wizyty wyślemy osobne potwierdzenie kalendarzowe.</p>",
-      `<p>${escapeHtml(withdrawalCopy)}</p>`,
-    ].join("");
+    const html = renderEmailHtml({
+      locale,
+      subject,
+      bodyLines: [statusText, followupText, withdrawalCopy],
+    });
 
     return {
       subject,
@@ -127,6 +147,7 @@ export function buildVoucherAppointmentDeliveryEmail(
     salon_name: input.salon_name ?? appointment.salon_name ?? null,
     location_address:
       input.location_address ?? appointment.location_address ?? null,
+    locale,
     now,
   });
   const storageKey = buildVoucherAppointmentIcsStorageKey(appointment);
@@ -146,31 +167,47 @@ export function buildVoucherAppointmentDeliveryEmail(
     download_url: downloadUrl,
     filename,
   };
-  const statusText = buildLifecycleStatusText(lifecycleStatus);
-  const appointmentWindow = formatAppointmentWindow(appointment);
+  const statusText = buildLifecycleStatusText(lifecycleStatus, locale);
+  const appointmentWindow = formatAppointmentWindow(appointment, locale);
   const salonName = normalizeDisplayName(input.salon_name ?? appointment.salon_name);
   const location = normalizeDisplayName(
     input.location_address ?? appointment.location_address,
   );
-  const subject = buildSubject(lifecycleStatus);
+  const subject = buildSubject(lifecycleStatus, locale);
   const text = [
     statusText,
-    salonName ? `Miejsce: ${salonName}.` : "Miejsce: BonBeauty.",
-    location ? `Adres: ${location}.` : null,
-    appointmentWindow ? `Termin: ${appointmentWindow}.` : null,
-    "W załączniku znajdziesz plik .ics.",
-    `Dodaj do kalendarza: ${downloadUrl}`,
+    salonName
+      ? renderAppointmentCopy(locale, "email_place_known", { salon: salonName })
+      : renderAppointmentCopy(locale, "email_place_default"),
+    location ? renderAppointmentCopy(locale, "email_address", { address: location }) : null,
+    appointmentWindow
+      ? renderAppointmentCopy(locale, "email_term", { window: appointmentWindow })
+      : null,
+    renderAppointmentCopy(locale, "email_attachment_copy"),
+    renderAppointmentCopy(locale, "email_calendar_text", { url: downloadUrl }),
     withdrawalCopy,
   ].filter((line): line is string => Boolean(line)).join("\n\n");
-  const html = [
-    `<p>${escapeHtml(statusText)}</p>`,
-    `<p>${escapeHtml(salonName ? `Miejsce: ${salonName}.` : "Miejsce: BonBeauty.")}</p>`,
-    location ? `<p>${escapeHtml(`Adres: ${location}.`)}</p>` : "",
-    appointmentWindow ? `<p>${escapeHtml(`Termin: ${appointmentWindow}.`)}</p>` : "",
-    "<p>W załączniku znajdziesz plik .ics.</p>",
-    `<p><a href="${escapeHtml(downloadUrl)}">Dodaj do kalendarza</a></p>`,
-    `<p>${escapeHtml(withdrawalCopy)}</p>`,
-  ].join("");
+  const bodyLines = [
+    statusText,
+    salonName
+      ? renderAppointmentCopy(locale, "email_place_known", { salon: salonName })
+      : renderAppointmentCopy(locale, "email_place_default"),
+    location ? renderAppointmentCopy(locale, "email_address", { address: location }) : null,
+    appointmentWindow
+      ? renderAppointmentCopy(locale, "email_term", { window: appointmentWindow })
+      : null,
+    renderAppointmentCopy(locale, "email_attachment_copy"),
+    withdrawalCopy,
+  ].filter((line): line is string => Boolean(line));
+  const html = renderEmailHtml({
+    locale,
+    subject,
+    bodyLines,
+    cta: {
+      url: downloadUrl,
+      label: renderAppointmentCopy(locale, "email_calendar_cta"),
+    },
+  });
   const attachment: VoucherAppointmentDeliveryAttachment = {
     filename,
     content: ics,
@@ -217,58 +254,122 @@ function buildDownloadUrl(input: {
 
 function buildLifecycleStatusText(
   lifecycleStatus: VoucherAppointmentIcsInput["lifecycle_status"],
+  locale: VoucherAppointmentLocale,
 ): string {
   if (lifecycleStatus === "rescheduled") {
-    return "Termin został zmieniony.";
+    return renderAppointmentCopy(locale, "email_status_rescheduled");
   }
 
   if (lifecycleStatus === "cancelled") {
-    return "Termin został odwołany.";
+    return renderAppointmentCopy(locale, "email_status_cancelled");
   }
 
-  return "Termin został potwierdzony.";
+  return renderAppointmentCopy(locale, "email_status_confirmed");
 }
 
 function buildSubject(
   lifecycleStatus: VoucherAppointmentIcsInput["lifecycle_status"],
+  locale: VoucherAppointmentLocale,
 ): string {
   if (lifecycleStatus === "rescheduled") {
-    return "Zmiana terminu wizyty BonBeauty";
+    return renderAppointmentCopy(locale, "email_subject_rescheduled");
   }
 
   if (lifecycleStatus === "cancelled") {
-    return "Odwołanie terminu wizyty BonBeauty";
+    return renderAppointmentCopy(locale, "email_subject_cancelled");
   }
 
-  return "Potwierdzenie terminu wizyty BonBeauty";
+  return renderAppointmentCopy(locale, "email_subject_confirmed");
 }
 
-function buildWithdrawalCopy(): string {
-  return [
-    "prawo do odstąpienia przysługuje do pełnego wykonania usługi",
-    "zgodnie z art. 38 pkt 1 ustawy o prawach konsumenta.",
-    "Przy zakupie zebraliśmy kumulatywną zgodę na rozpoczęcie świadczenia przed upływem terminu odstąpienia oraz oświadczenie dotyczące utraty prawa po pełnym wykonaniu usługi.",
-  ].join(" ");
+function buildWithdrawalCopy(locale: VoucherAppointmentLocale): string {
+  return renderAppointmentCopy(locale, "email_withdrawal_copy");
 }
 
 function formatAppointmentWindow(
   appointment: Pick<VoucherAppointmentIcsInput, "starts_at" | "ends_at">,
+  locale: VoucherAppointmentLocale,
 ): string {
   const startsAt = normalizeDate(appointment.starts_at, "starts_at");
   const endsAt = normalizeDate(appointment.ends_at, "ends_at");
-  const date = new Intl.DateTimeFormat("pl-PL", {
+  const date = new Intl.DateTimeFormat(resolveIntlLocale(locale), {
     timeZone: "Europe/Warsaw",
     year: "numeric",
     month: "2-digit",
     day: "2-digit",
   }).format(startsAt);
-  const time = new Intl.DateTimeFormat("pl-PL", {
+  const time = new Intl.DateTimeFormat(resolveIntlLocale(locale), {
     timeZone: "Europe/Warsaw",
     hour: "2-digit",
     minute: "2-digit",
   });
 
   return `${date}, ${time.format(startsAt)}-${time.format(endsAt)}`;
+}
+
+function resolveIntlLocale(locale: VoucherAppointmentLocale): string {
+  if (locale === "en") {
+    return "en-GB";
+  }
+
+  if (locale === "ua") {
+    return "uk-UA";
+  }
+
+  if (locale === "de") {
+    return "de-DE";
+  }
+
+  return "pl-PL";
+}
+
+function renderEmailHtml(input: {
+  locale: VoucherAppointmentLocale;
+  subject: string;
+  bodyLines: string[];
+  cta?: {
+    url: string;
+    label: string;
+  };
+}): string {
+  const lang = voucherAppointmentHtmlLang(input.locale);
+  const tokens = VOUCHER_APPOINTMENT_EMAIL_A11Y_TOKENS;
+  const paragraphs = input.bodyLines
+    .map(
+      (line) =>
+        `<p style="margin:0 0 16px;color:${tokens.bodyText};overflow-wrap:anywhere;word-break:normal;">${escapeHtml(line)}</p>`,
+    )
+    .join("");
+  const cta = input.cta
+    ? [
+        '<p style="margin:24px 0 16px;">',
+        `<a class="voucher-email__cta" href="${escapeHtml(input.cta.url)}" style="display:inline-block;box-sizing:border-box;min-width:${tokens.minTargetPx}px;min-height:${tokens.minTargetPx}px;padding:12px 18px;line-height:20px;background-color:${tokens.ctaBackground};color:${tokens.ctaText};border:2px solid ${tokens.accentBorder};border-radius:4px;text-decoration:underline;font-weight:700;overflow-wrap:anywhere;word-break:normal;">${escapeHtml(input.cta.label)}</a>`,
+        "</p>",
+      ].join("")
+    : "";
+
+  return [
+    "<!doctype html>",
+    `<html lang="${lang}">`,
+    "<head>",
+    '<meta charset="utf-8">',
+    `<title>${escapeHtml(input.subject)}</title>`,
+    "<style>",
+    `.voucher-email{margin:0;padding:24px;background-color:${tokens.background};color:${tokens.bodyText};font-family:Arial,Helvetica,sans-serif;line-height:1.5;}`,
+    `.voucher-email__content{width:100%;max-width:640px;margin:0 auto;}`,
+    `.voucher-email p{overflow-wrap:anywhere;word-break:normal;}`,
+    `.voucher-email a:focus{outline:3px solid ${tokens.focusOutline};outline-offset:3px;}`,
+    `.voucher-email__cta:focus{outline:3px solid ${tokens.focusOutline};outline-offset:3px;}`,
+    "</style>",
+    "</head>",
+    `<body class="voucher-email" style="margin:0;padding:24px;background-color:${tokens.background};color:${tokens.bodyText};font-family:Arial,Helvetica,sans-serif;line-height:1.5;">`,
+    '<main class="voucher-email__content" role="main" style="width:100%;max-width:640px;margin:0 auto;">',
+    paragraphs,
+    cta,
+    "</main>",
+    "</body>",
+    "</html>",
+  ].join("");
 }
 
 function normalizeDate(value: Date | string, field: string): Date {

@@ -61,6 +61,19 @@ export {
   VOUCHER_APPOINTMENT_TIMEZONE,
 } from "./ics-generator"
 
+// Appointment a11y/i18n copy bundles (Story 5.4).
+export type {
+  VoucherAppointmentLocale,
+} from "./appointment-i18n"
+export {
+  lookupAppointmentCopy,
+  normalizeVoucherAppointmentLocale,
+  renderAppointmentCopy,
+  voucherAppointmentHtmlLang,
+  VOUCHER_APPOINTMENT_COPY,
+  VOUCHER_APPOINTMENT_LOCALES,
+} from "./appointment-i18n"
+
 // Appointment confirmation delivery email + scoped .ics download link (Story 5.3).
 export type {
   VoucherAppointmentDeliveryAttachment,
@@ -72,6 +85,7 @@ export {
   buildVoucherAppointmentDeliveryEmail,
   buildVoucherAppointmentIcsStorageKey,
   isVoucherAppointmentIcsStorageKey,
+  VOUCHER_APPOINTMENT_EMAIL_A11Y_TOKENS,
   VOUCHER_APPOINTMENT_ICS_DOWNLOAD_ROUTE,
   VOUCHER_APPOINTMENT_ICS_STORAGE_SCOPE,
 } from "./appointment-confirmation-email"

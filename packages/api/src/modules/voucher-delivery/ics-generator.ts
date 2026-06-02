@@ -4,6 +4,11 @@ import ical, {
 } from "ical-generator";
 import { getVtimezoneComponent } from "@touch4it/ical-timezones";
 
+import {
+  normalizeVoucherAppointmentLocale,
+  renderAppointmentCopy,
+  type VoucherAppointmentLocale,
+} from "./appointment-i18n";
 import { buildSignedToken } from "./storage/hmac";
 
 export const VOUCHER_APPOINTMENT_TIMEZONE = "Europe/Warsaw";
@@ -47,6 +52,7 @@ export type VoucherAppointmentIcsInput = {
   confirmation_source?: string | null;
   sequence?: number | null;
   lifecycle_status?: VoucherAppointmentLifecycleStatus;
+  locale?: VoucherAppointmentLocale;
   manage_link?: VoucherAppointmentManageLinkOptions | null;
   now?: Date | string;
 };
@@ -90,6 +96,7 @@ export function generateVoucherAppointmentIcs(input: VoucherAppointmentIcsInput)
 
   const now = normalizeDate(input.now ?? new Date(), "now");
   const lifecycleStatus = input.lifecycle_status ?? "confirmed";
+  const locale = normalizeVoucherAppointmentLocale(input.locale);
   const method =
     lifecycleStatus === "cancelled"
       ? ICalCalendarMethod.CANCEL
@@ -98,8 +105,8 @@ export function generateVoucherAppointmentIcs(input: VoucherAppointmentIcsInput)
     lifecycleStatus === "cancelled"
       ? ICalEventStatus.CANCELLED
       : ICalEventStatus.CONFIRMED;
-  const summary = buildSummary(input.salon_name, lifecycleStatus);
-  const description = buildDescription(input.salon_name, lifecycleStatus);
+  const summary = buildSummary(input.salon_name, lifecycleStatus, locale);
+  const description = buildDescription(input.salon_name, lifecycleStatus, locale);
   const url = buildManageUrl(input, now);
 
   const calendar = ical({
@@ -173,17 +180,19 @@ function normalizeSequence(sequence: number | null | undefined): number {
 function buildSummary(
   salonName: string | null | undefined,
   lifecycleStatus: VoucherAppointmentLifecycleStatus,
+  locale: VoucherAppointmentLocale,
 ): string {
-  const base = normalizeSalonName(salonName)
-    ? `Wizyta w ${normalizeSalonName(salonName)}`
-    : VOUCHER_APPOINTMENT_SUMMARY_FALLBACK;
+  const normalizedSalonName = normalizeSalonName(salonName);
+  const base = normalizedSalonName
+    ? renderAppointmentCopy(locale, "ics_summary_salon", { salon: normalizedSalonName })
+    : renderAppointmentCopy(locale, "ics_summary_default");
 
   if (lifecycleStatus === "rescheduled") {
-    return `${base} (zmiana terminu)`;
+    return `${base} (${renderAppointmentCopy(locale, "ics_summary_rescheduled_suffix")})`;
   }
 
   if (lifecycleStatus === "cancelled") {
-    return `${base} (odwołano)`;
+    return `${base} (${renderAppointmentCopy(locale, "ics_summary_cancelled_suffix")})`;
   }
 
   return base;
@@ -192,18 +201,19 @@ function buildSummary(
 function buildDescription(
   salonName: string | null | undefined,
   lifecycleStatus: VoucherAppointmentLifecycleStatus,
+  locale: VoucherAppointmentLocale,
 ): string {
   const name = normalizeSalonName(salonName) ?? "BonBeauty";
 
   if (lifecycleStatus === "rescheduled") {
-    return `Status: zmiana terminu wizyty w ${name}.`;
+    return renderAppointmentCopy(locale, "ics_description_rescheduled", { salon: name });
   }
 
   if (lifecycleStatus === "cancelled") {
-    return `Status: odwołano termin wizyty w ${name}.`;
+    return renderAppointmentCopy(locale, "ics_description_cancelled", { salon: name });
   }
 
-  return `Termin wizyty w ${name}.`;
+  return renderAppointmentCopy(locale, "ics_description_confirmed", { salon: name });
 }
 
 function normalizeSalonName(salonName: string | null | undefined): string | null {
