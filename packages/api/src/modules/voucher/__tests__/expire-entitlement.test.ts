@@ -40,9 +40,12 @@ import {
   PreExpiryNotifier,
   EntitlementNotExpirableError,
   ExpireEntitlementNotFoundError,
+  ExpireAmountError,
   EXPIRY_SOURCE_STATES,
   type ExpirableEntitlement,
   type ExpireEntitlementInput,
+  type ExpireEntitlementTx,
+  type ExpireEntitlementStore,
 } from "../workflows/expire-entitlement"
 
 // ---------------------------------------------------------------------------
@@ -364,12 +367,129 @@ describe("Story 4.2 — fail-closed guards", () => {
 // NOTIFY — pre-expiry powiadomienie nie duplikuje (dedup per okno)
 // ===========================================================================
 
-describe("Story 4.2 — pre-expiry notifier (dedup, NIE duplikuje)", () => {
-  function makeNotifier() {
+// ===========================================================================
+// AI-Review-1 — fail-closed guards: vat_classification, market_id, net/vat gate
+// ===========================================================================
+
+describe("Story 4.2 AI-Review-1/3/4 — fail-closed guards (vat, market_id, net/vat gate)", () => {
+  it("AI-Review-3: brak vat_classification (null) ⇒ EntitlementNotExpirableError (fail-closed)", async () => {
+    const rows = [makeEntitlement({ vat_classification: null })]
+    const { op } = makeOp({ rows })
+    await expect(op.expire(baseInput({ vat_classification: undefined }))).rejects.toBeInstanceOf(
+      EntitlementNotExpirableError
+    )
+    await expect(op.expire(baseInput({ vat_classification: undefined }))).rejects.toThrow(
+      /vat_classification.*null.*fail-closed|fail-closed.*vat_classification/i
+    )
+  })
+
+  it("AI-Review-4: brak market_id (null) ⇒ EntitlementNotExpirableError (fail-loud)", async () => {
+    const rows = [makeEntitlement({ market_id: null })]
+    const { op } = makeOp({ rows })
+    await expect(op.expire(baseInput({ market_id: undefined }))).rejects.toBeInstanceOf(
+      EntitlementNotExpirableError
+    )
+    await expect(op.expire(baseInput({ market_id: undefined }))).rejects.toThrow(
+      /market_id/i
+    )
+  })
+
+  it("AI-Review-4: market_id z input nadpisuje null w wierszu (OK)", async () => {
+    const rows = [makeEntitlement({ market_id: null })]
+    const { op, store } = makeOp({ rows })
+    const res = await op.expire(baseInput({ market_id: "bonbeauty" }))
+    expect(res.new_state).toBe("EXPIRED")
+    expect(store.get("ent_amount_1")!.state).toBe("EXPIRED")
+  })
+
+  it("AI-Review-1: brak net/vat + posting OFF (runtime_enabled=false) ⇒ OK (proxy, no-op)", async () => {
+    const { op, store } = makeOp()
+    const res = await op.expire({ entitlement_id: "ent_amount_1", market_id: "bonbeauty" })
+    expect(res.new_state).toBe("EXPIRED")
+    expect(store.get("ent_amount_1")!.state).toBe("EXPIRED")
+    // Posting audit-only (runtime_enabled=false), brak ledger write.
+    expect(res.posting.activated).toBe(false)
+  })
+
+  it("AI-Review-1: brak net/vat + posting ON (gate=true) ⇒ EntitlementNotExpirableError (fail-closed)", async () => {
+    const { op } = makeOp({ gate: GATE_BOTH_ON, wireWriter: true })
+    await expect(
+      op.expire({ entitlement_id: "ent_amount_1", market_id: "bonbeauty" })
+    ).rejects.toBeInstanceOf(EntitlementNotExpirableError)
+    await expect(
+      op.expire({ entitlement_id: "ent_amount_1", market_id: "bonbeauty" })
+    ).rejects.toThrow(/voucher_net_minor.*vat_minor.*runtime_enabled=true|fail-closed.*AI-Review-1/i)
+  })
+})
+
+// ===========================================================================
+// AI-Review-5 — cross-walidacja net+vat vs issued_gross z redemption
+// ===========================================================================
+
+describe("Story 4.2 AI-Review-5 — cross-walidacja net+vat vs issued_gross", () => {
+  function makeOpWithIssuedGross(issuedGross: number | null, rows?: ExpirableEntitlement[]) {
+    // Subklasa z nadpisanym findIssuedGross — czysty test bez monkey-patch.
+    class PatchedStore extends InMemoryExpireEntitlementStore implements ExpireEntitlementStore {
+      override async withTransaction<T>(fn: (tx: ExpireEntitlementTx) => Promise<T>): Promise<T> {
+        return super.withTransaction(async (tx) => {
+          const patched: ExpireEntitlementTx = {
+            getEntitlementForUpdate: tx.getEntitlementForUpdate.bind(tx),
+            updateEntitlementState: tx.updateEntitlementState.bind(tx),
+            appendAudit: tx.appendAudit.bind(tx),
+            findIssuedGross: async (_id: string) => issuedGross,
+          }
+          return fn(patched)
+        })
+      }
+    }
+    const store = new PatchedStore(rows ?? [makeEntitlement()])
+    const events: TransitionEventEnvelope[] = []
+    const op = new ExpireEntitlementOperation({
+      store,
+      events: { emit: async (e) => void events.push(e) },
+      clock: () => FIXED_NOW,
+    })
+    return { op, store: store as unknown as InMemoryExpireEntitlementStore }
+  }
+
+  it("cross-walidacja: net+vat = issued_gross ⇒ OK (przechodzi)", async () => {
+    const { op, store } = makeOpWithIssuedGross(12300) // totalGross = 10000+2300 = 12300
+    const res = await op.expire(baseInput())
+    expect(res.new_state).toBe("EXPIRED")
+    expect(store.get("ent_amount_1")!.state).toBe("EXPIRED")
+  })
+
+  it("cross-walidacja: net+vat ≠ issued_gross ⇒ ExpireAmountError (fail-closed)", async () => {
+    const { op } = makeOpWithIssuedGross(15000) // totalGross = 12300 ≠ 15000
+    await expect(op.expire(baseInput())).rejects.toThrow(/issued_gross|niespójność.*emisji/i)
+  })
+
+  it("brak issued_gross (null) ⇒ pomiń cross-walidację (nowy voucher bez redempcji)", async () => {
+    const { op, store } = makeOpWithIssuedGross(null)
+    const res = await op.expire(baseInput())
+    expect(res.new_state).toBe("EXPIRED") // bez błędu
+    expect(store.get("ent_amount_1")!.state).toBe("EXPIRED")
+  })
+
+  it("brak jawnych net/vat ⇒ pomiń cross-walidację (sweep bez kwot)", async () => {
+    // Nawet gdy issued_gross różni się od remaining — sweep bez kwot omija check
+    const { op, store } = makeOpWithIssuedGross(99999)
+    const res = await op.expire({ entitlement_id: "ent_amount_1", market_id: "bonbeauty" })
+    expect(res.new_state).toBe("EXPIRED") // bez błędu (net/vat niezadane)
+    expect(store.get("ent_amount_1")!.state).toBe("EXPIRED")
+  })
+})
+
+// ===========================================================================
+// NOTIFY — AI-Review-2: send-then-record, fail-loud na brak sinka
+// ===========================================================================
+
+describe("Story 4.2 AI-Review-2 — notifier send-then-record + fail-loud", () => {
+  function makeNotifier(sinkOverride?: { send: (n: PreExpiryNotification) => Promise<void> }) {
     const sent: PreExpiryNotification[] = []
     const dedupe = new InMemoryPreExpiryDedupeStore()
     const notifier = new PreExpiryNotifier({
-      sink: { send: async (n) => void sent.push(n) },
+      sink: sinkOverride ?? { send: async (n) => void sent.push(n) },
       dedupe,
     })
     return { notifier, sent, dedupe }
@@ -389,12 +509,53 @@ describe("Story 4.2 — pre-expiry notifier (dedup, NIE duplikuje)", () => {
     )
   })
 
-  it("ponowny sweep tego samego okna ⇒ NIE duplikuje (sent=false, sink wołany RAZ)", async () => {
+  it("AI-Review-2: awaria sinka ⇒ NIE zapisuje dedup; ponowny sweep retryuje", async () => {
+    const dedupe = new InMemoryPreExpiryDedupeStore()
+    let sinkCalls = 0
+    const failingSink: import("../workflows/expire-entitlement").PreExpiryNotificationSink = {
+      send: async () => {
+        sinkCalls++
+        throw new Error("sink down")
+      },
+    }
+    const notifier = new PreExpiryNotifier({ sink: failingSink, dedupe })
+
+    // Pierwszy try — sink rzuca
+    await expect(
+      notifier.notify({ entitlement_id: "ent_1", expires_at: FUTURE_EXPIRY, remaining_minor: 12000 })
+    ).rejects.toThrow("sink down")
+    // Dedup NIE zapisany (send-then-record)
+    expect(sinkCalls).toBe(1)
+    expect(dedupe.listSent()).toHaveLength(0)
+
+    // Drugi try z działającym sinkiem (retry) — powinno się udać
+    const sentRetry: PreExpiryNotification[] = []
+    const goodNotifier = new PreExpiryNotifier({
+      sink: { send: async (n) => void sentRetry.push(n) },
+      dedupe,
+    })
+    const retry = await goodNotifier.notify({
+      entitlement_id: "ent_1",
+      expires_at: FUTURE_EXPIRY,
+      remaining_minor: 12000,
+    })
+    expect(retry.sent).toBe(true)
+    expect(sentRetry).toHaveLength(1)
+    expect(dedupe.listSent()).toHaveLength(1)
+  })
+
+  it("AI-Review-2: ponowny sweep po sukcesie — dedup zapisany, drugi run wysyła ponownie (send-then-record semantics)", async () => {
+    // Z send-then-record: każdy sweep wysyła; dedup NIE blokuje sendu.
+    // Consumer event-bus jest idempotentny — duplikat akceptowalny (lepszy niż cisza).
     const { notifier, sent } = makeNotifier()
-    await notifier.notify({ entitlement_id: "ent_1", expires_at: FUTURE_EXPIRY, remaining_minor: 12000 })
-    const replay = await notifier.notify({ entitlement_id: "ent_1", expires_at: FUTURE_EXPIRY, remaining_minor: 12000 })
-    expect(replay.sent).toBe(false)
-    expect(sent).toHaveLength(1) // sink wołany dokładnie raz
+    const first = await notifier.notify({ entitlement_id: "ent_1", expires_at: FUTURE_EXPIRY, remaining_minor: 12000 })
+    expect(first.sent).toBe(true)
+    expect(sent).toHaveLength(1)
+
+    const second = await notifier.notify({ entitlement_id: "ent_1", expires_at: FUTURE_EXPIRY, remaining_minor: 12000 })
+    // Drugi sweep: sink wołany ponownie (send-then-record, consumer idempotentny).
+    expect(second.sent).toBe(true)
+    expect(sent).toHaveLength(2)
   })
 
   it("inny termin (po extend) ⇒ nowe okno przypomnienia (sent=true)", async () => {

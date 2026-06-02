@@ -58,6 +58,7 @@ import type { VatClassification } from "../vat-resolver"
 import {
   wireEntitlementTransitionPersisted,
   emitTransitionEventAfterCommit,
+  defaultPostingActivationGate,
   type TransitionScope,
   type TransitionActor,
   type TransitionAuditEnvelope,
@@ -129,19 +130,31 @@ export class ExpireAmountError extends Error {
 
 export type ExpireEntitlementInput = {
   entitlement_id: string
-  /** Netto (ex-VAT) CAŁEGO vouchera przy emisji, minor units (payload generatora 2.3). */
-  voucher_net_minor: number
-  /** VAT CAŁEGO vouchera przy emisji, minor units (payload generatora 2.3). */
-  voucher_vat_minor: number
+  /**
+   * Netto (ex-VAT) CAŁEGO vouchera przy emisji, minor units (payload generatora 2.3).
+   * Opcjonalne gdy sweep nie dysponuje kwotami emisji (routing audit-only/no-op ok
+   * przy runtime_enabled=false). WYMAGANE gdy posting aktywowany (fail-closed, AI-Review-1).
+   * Cross-walidowane z `voucher_redemption.issued_gross_minor` gdy dostępne (AI-Review-5).
+   */
+  voucher_net_minor?: number
+  /**
+   * VAT CAŁEGO vouchera przy emisji, minor units (payload generatora 2.3). Opcjonalne
+   * — patrz `voucher_net_minor`. WYMAGANE gdy posting aktywowany (AI-Review-1).
+   */
+  voucher_vat_minor?: number
   /**
    * Klasyfikacja VAT (SPV/MPV). KONSUMOWANA ze snapshotu entitlementu / resolvera
    * 2.2, NIE reklasyfikowana tutaj. MPV unused ⇒ bez VAT (art. 73a); SPV ⇒ VAT
    * rozpoznany przy emisji. Jawny override ma priorytet, inaczej z kolumny.
+   * Brak/null ⇒ fail-closed (EntitlementNotExpirableError, AI-Review-3).
    */
   vat_classification?: VatClassification
   /** Waluta payloadu postingu + currency guard writera. Domyślnie PLN. */
   currency?: string
-  /** Ontologia scope (FK 3.2). `market_id` wymagany; reszta opcjonalna. */
+  /**
+   * Ontologia scope (FK 3.2). Brak market_id ⇒ fail-loud (EntitlementNotExpirableError,
+   * NFR3 izolacja per-market, AI-Review-4).
+   */
   market_id?: string | null
   sales_channel_id?: string | null
   vendor_id?: string | null
@@ -206,6 +219,11 @@ export interface ExpireEntitlementTx {
   ): Promise<void>
   /** Append-only audit (w obrębie tej tx — atomowy ze zmianą stanu). */
   appendAudit(audit: TransitionAuditEnvelope): Promise<void>
+  /**
+   * Cross-walidacja: pobiera `issued_gross_minor` z `voucher_redemption` (AI-Review-5).
+   * Zwraca null gdy brak rekordów (nowy voucher bez redempcji → pomiń cross-check).
+   */
+  findIssuedGross(entitlementId: string): Promise<number | null>
 }
 
 export interface ExpireEntitlementStore {
@@ -285,21 +303,77 @@ export class ExpireEntitlementOperation {
         }
       }
 
+      // ── AI-Review-4: fail-loud na brakującym market_id (NFR3 per-market izolacja) ─
+      const resolvedMarketId = input.market_id ?? ent.market_id
+      if (resolvedMarketId == null || resolvedMarketId === "") {
+        throw new EntitlementNotExpirableError(
+          `expire: entitlement ${ent.id} — brak market_id; wymagane jawne market_id ` +
+            `dla izolacji per-market (NFR3, fail-loud, AI-Review-4). ` +
+            `Uzupełnij market_id w wierszu entitlementu lub przekaż przez caller.`
+        )
+      }
+
+      // ── AI-Review-3: fail-closed na braku klasyfikacji VAT (finansowo materialne) ─
+      const vatClassification = input.vat_classification ?? ent.vat_classification
+      if (vatClassification == null) {
+        throw new EntitlementNotExpirableError(
+          `expire: entitlement ${ent.id} — brak klasyfikacji VAT (vat_classification ` +
+            `null/undefined); wymagana jawna SPV/MPV ze snapshotu emisji (resolver 2.2); ` +
+            `domyślne MPV niedozwolone (fail-closed, finansowo materialne, AI-Review-3)`
+        )
+      }
+
       // ── Saldo (4.1) + spójność breakage ───────────────────────────────────
       const remaining = Math.max(0, ent.remaining_amount ?? 0)
-      const totalGross = input.voucher_net_minor + input.voucher_vat_minor
+
+      // AI-Review-1: net/vat opcjonalne gdy sweep nie dysponuje kwotami emisji.
+      // Przy runtime_enabled=false posting jest no-op → proxy gross (remaining) bezpieczny.
+      // Przy runtime_enabled=true: wymagane (fail-closed poniżej).
+      const netMinorProvided =
+        input.voucher_net_minor != null && input.voucher_vat_minor != null
+      const netMinor = input.voucher_net_minor ?? remaining
+      const vatMinor = input.voucher_vat_minor ?? 0
+      const totalGross = netMinor + vatMinor
+
+      // AI-Review-1: fail-closed gdy posting aktywowany a kwoty niejawne.
+      if (!netMinorProvided) {
+        const gate = this.deps.postingActivation ?? defaultPostingActivationGate()
+        if (gate.runtimeEnabled) {
+          throw new EntitlementNotExpirableError(
+            `expire: entitlement ${ent.id} — voucher_net_minor/vat_minor wymagane gdy ` +
+              `runtime_enabled=true; ustaw kwoty emisji przed flip E6/P6 lub przekaż ` +
+              `przez caller (fail-closed, AI-Review-1)`
+          )
+        }
+      }
+
       if (remaining > totalGross) {
         throw new ExpireAmountError(
           `expire: remaining (${remaining}) > brutto vouchera (${totalGross}); ` +
             `payload net/vat niespójny z saldem (fail-closed)`
         )
       }
+
+      // AI-Review-5: cross-walidacja net+vat vs issued_gross z redemption (jak 4.1 L3).
+      // Gdy caller podał jawne kwoty ORAZ istnieje rekord redemption (↔ issued_gross
+      // przechowywany) — sprawdź spójność. Brak rekordu = nowy voucher/sweep → pomiń.
+      if (netMinorProvided) {
+        const issuedGross = await tx.findIssuedGross(ent.id)
+        if (issuedGross != null && totalGross !== issuedGross) {
+          throw new ExpireAmountError(
+            `expire: entitlement ${ent.id} — voucher_net_minor+vat_minor (${totalGross}) ≠ ` +
+              `issued_gross z poprzednich rat (${issuedGross}); niespójność kwot emisji ` +
+              `(fail-closed, AI-Review-5). Przekaż spójne kwoty ze snapshotu emisji.`
+          )
+        }
+      }
+
       // redeemed-to-date PRZED wygaśnięciem (VER-H1, rezydualny VAT) = brutto − remaining.
       const priorRedeemedGross = totalGross - remaining
 
       const scope: TransitionScope = {
         instance_id: ent.id,
-        market_id: (input.market_id ?? ent.market_id) ?? "unknown",
+        market_id: resolvedMarketId,
         sales_channel_id: input.sales_channel_id ?? ent.sales_channel_id ?? null,
         vendor_id: input.vendor_id ?? ent.vendor_id ?? null,
         location_id: input.location_id ?? ent.location_id ?? null,
@@ -307,8 +381,6 @@ export class ExpireEntitlementOperation {
       const actor: TransitionActor = input.actor ?? "system"
       const actorHint = input.actor_hint ?? "system:expiry-sweep"
       const occurredAt = now.toISOString()
-      const vatClassification =
-        input.vat_classification ?? ent.vat_classification ?? "MPV"
 
       const wiringDeps = {
         appendAudit: tx.appendAudit.bind(tx),
@@ -338,6 +410,15 @@ export class ExpireEntitlementOperation {
       // generateVoucherPosting() EXPIRED (2.3) → ledger-writer (2.6). Bramkowany:
       // runtime_enabled=false ⇒ audit-only/no-op (ZERO zapisu ledger). SPV VAT
       // już rozpoznany / MPV unused = bez VAT (art. 73a) — liczy generator 2.3.
+      //
+      // AI-Review-6 — KNOWN-LIMITATION (atomowość state↔ledger, dziedziczone 3.4/2.6):
+      // `PostgresExpireEntitlementStore.withTransaction` prowadzi BEGIN/COMMIT na jednym
+      // kliencie PG; `VoucherLedgerWriter` (post-aktywacji) używa INNEGO połączenia/tx.
+      // Jeśli outer COMMIT zawiedzie PO zapisie ledgera ⇒ stan wiersza ≠ ledger.
+      // Backstop: reconciliation 2.6 + deterministyczny transaction_id (ADR-139 D3).
+      // Przy runtime_enabled=false: brak zapisu ledgera → brak ryzyka.
+      // Cross-ref: 3.4 AI-3 (ta sama właściwość w okablowaniu 3.4); E6/P6 caller MUSI
+      // zagwarantować brak rollbacku po zwrocie z hooka (warunek integracji).
       const wired = await wireEntitlementTransitionPersisted(wiringDeps, {
         from: ent.state,
         to: EntitlementInstanceState.EXPIRED,
@@ -350,8 +431,8 @@ export class ExpireEntitlementOperation {
         posting: {
           lifecycle_event: "EXPIRED",
           vat_classification: vatClassification,
-          net_minor: input.voucher_net_minor,
-          vat_minor: input.voucher_vat_minor,
+          net_minor: netMinor,
+          vat_minor: vatMinor,
           remaining_gross_minor: remaining,
           redeemed_gross_to_date_minor: priorRedeemedGross,
           // EXPIRED dyskryminator deterministycznego transaction_id (ADR-139 D3).
@@ -389,8 +470,14 @@ export class ExpireEntitlementOperation {
           persisted: false,
           deduped: true,
           transaction_id: txId,
+          // AI-Review-1: nie twierdzimy o postingu z nieznanej ścieżki wygaszenia.
+          // Entitlement EXPIRED może być wygaszony przez routowaną operację (z
+          // bookingiem) LUB przez legacy bulk-flip cron (bez postingu). Replay NIE
+          // może zakładać, że breakage już zaksięgowany — to proweniencja nieznana.
           reason:
-            "domain replay — entitlement już EXPIRED; jeden breakage posting (NIE podwaja, sweep idempotentny)",
+            "domain replay — entitlement już EXPIRED (ścieżka wygaszenia nieznana: " +
+            "routowana operacja lub legacy bulk-flip cron); breakage posting mógł NIE " +
+            "zaistnieć; idempotentny, sweep bezpieczny",
         },
         idempotent: true,
         emit_failed: false,
@@ -455,8 +542,11 @@ export type PreExpiryNotifyResult = {
 }
 
 /**
- * Wysyła pre-expiry powiadomienie RAZ per okno (per entitlement + termin). Dedup
- * PRZED wysyłką (`recordSent` ON CONFLICT) ⇒ re-run sweepu NIE duplikuje (AC1).
+ * Wysyła pre-expiry powiadomienie (per entitlement + termin). AI-Review-2:
+ * SEND-THEN-RECORD — sink wołany PRZED zapisem dedup. Dzięki temu awaria sinka
+ * NIE oznacza notyfikacji jako wysłanej ⇒ ponowny sweep retryuje (NIE cicha utrata).
+ * Brak sinka / undefined eventBus ⇒ fail-loud (NIE silent no-op, AI-Review-2).
+ * Konsekwencja: równoczesne sweepy mogą wysłać duplikat (consumer idempotentny).
  * Copy anti-forfeiture egzekwowane mechanicznie w `buildPreExpiryNotification`.
  */
 export class PreExpiryNotifier {
@@ -472,12 +562,11 @@ export class PreExpiryNotifier {
         ? { paid_extend: input.paid_extend }
         : {}),
     })
-    // Dedup-first: zapis faktu wysłania PRZED sink. Konflikt ⇒ już wysłane ⇒ no-op.
-    const ins = await this.deps.dedupe.recordSent(notification)
-    if (!ins.inserted) {
-      return { notification, sent: false }
-    }
+    // AI-Review-2: send-then-record. Awaria sinka ⇒ rzucamy (NIE zapisujemy dedup)
+    // ⇒ ponowny sweep retryuje wysyłkę (NIE cicha utrata powiadomienia anti-forfeiture).
     await this.deps.sink.send(notification)
+    // Record po potwierdzonej wysyłce (ON CONFLICT DO NOTHING — idempotentny).
+    await this.deps.dedupe.recordSent(notification)
     return { notification, sent: true }
   }
 }
@@ -611,6 +700,21 @@ class PostgresExpireEntitlementTx implements ExpireEntitlementTx {
       ]
     )
   }
+
+  async findIssuedGross(entitlementId: string): Promise<number | null> {
+    // AI-Review-5: cross-walidacja net+vat vs issued_gross z voucher_redemption.
+    // Pobiera issued_gross_minor (imm.) z pierwszego rekordu redempcji (wszystkie
+    // raty współdzielą tę samą wartość — walidacja VER-H1 z 4.1 gwarantuje spójność).
+    const res = await this.client.query<{ issued_gross_minor: string }>(
+      `SELECT issued_gross_minor
+         FROM voucher_redemption
+        WHERE entitlement_id = $1
+        LIMIT 1`,
+      [entitlementId]
+    )
+    const row = res.rows[0]
+    return row ? Number(row.issued_gross_minor) : null
+  }
 }
 
 /**
@@ -727,6 +831,12 @@ class InMemoryExpireEntitlementTx implements ExpireEntitlementTx {
   async appendAudit(audit: TransitionAuditEnvelope): Promise<void> {
     this.audits.push(audit)
   }
+
+  async findIssuedGross(_entitlementId: string): Promise<number | null> {
+    // Testy in-memory: brak rekordu redemption → pomiń cross-walidację (null).
+    // Testy cross-walidacji używają osobnych mocków/fake store.
+    return null
+  }
 }
 
 /** In-memory dedup store pre-expiry powiadomień (mirror ON CONFLICT DO NOTHING). */
@@ -790,7 +900,8 @@ export function createExpireEntitlementOperationFromScope(scope: {
 /**
  * Buduje pre-expiry notifier z kontenera. Sink emituje event powiadomienia do
  * istniejącej infry eventów (messaging/email konsumują w warstwie subscriber).
- * Dedup przez append-only `voucher_event` (ON CONFLICT id).
+ * Dedup przez append-only `voucher_event` (ON CONFLICT id). AI-Review-2:
+ * brak eventBus (resolve w catch) ⇒ sink rzuca (fail-loud, NIE silent no-op).
  */
 export function createPreExpiryNotifierFromScope(scope: {
   resolve: (key: string) => unknown
@@ -805,7 +916,16 @@ export function createPreExpiryNotifierFromScope(scope: {
   return new PreExpiryNotifier({
     sink: {
       async send(notification) {
-        await eventBus?.emit?.({
+        // AI-Review-2: fail-loud gdy brak event busu — NIE silent no-op.
+        // Brak dostarczenia powiadomienia anti-forfeiture jest materialny konsumencko.
+        if (eventBus == null || typeof eventBus.emit !== "function") {
+          throw new Error(
+            `pre-expiry notifier: event bus niedostępny — nie można dostarczyć ` +
+              `powiadomienia anti-forfeiture dla entitlement ${notification.entitlement_id} ` +
+              `(fail-loud, AI-Review-2). Sprawdź rejestrację EVENT_BUS w kontenerze.`
+          )
+        }
+        await eventBus.emit({
           name: notification.event_type,
           data: notification,
         })
