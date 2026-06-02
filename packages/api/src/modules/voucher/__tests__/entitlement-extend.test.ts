@@ -18,10 +18,12 @@ import {
   EXTEND_FEE_PCT_MAX,
   MAX_FREE_EXTENDS,
   FreeExtendExhaustedError,
+  FreeExtendIdempotencyMissingError,
   ExtendFeeBoundaryError,
   ExtendParityError,
   ExtendCoercionCopyError,
   ExtendProfileError,
+  ExtendExtensionMonthsBoundaryError,
   ForfeitureCopyError,
   determineExtendMode,
   computeExtendedExpiresAt,
@@ -37,6 +39,8 @@ import {
   ALL_ENTITLEMENT_INSTANCE_STATES,
   EntitlementInstanceState,
   ENTITLEMENT_STATE_CHANGED_EVENT_TYPE,
+  type TransitionAuditEnvelope,
+  type TransitionEventEnvelope,
 } from ".."
 
 const SCOPE = {
@@ -51,16 +55,32 @@ const SCOPE = {
 
 describe("determineExtendMode — (1) free extend 1× (AC1)", () => {
   it("first free extend OK: counter 0→1", () => {
-    const d = determineExtendMode({ requested: "free", unpaid_extension_count: 0 })
+    const key = buildExtendIdempotencyKey("ent_extend_001", "seq-first")
+    const d = determineExtendMode({
+      requested: "free",
+      unpaid_extension_count: 0,
+      idempotency_key: key,
+    })
     expect(d.mode).toBe("free")
     expect(d.fee_pct).toBe(0)
     expect(d.unpaid_extension_count_after).toBe(1)
     expect(d.idempotent_replay).toBe(false)
   })
 
-  it("second free extend REJECTED (FreeExtendExhaustedError) — kieruje do trybu odpłatnego", () => {
+  it("free extend bez idempotency_key ⇒ FreeExtendIdempotencyMissingError (runtime-backstop L1)", () => {
     expect(() =>
-      determineExtendMode({ requested: "free", unpaid_extension_count: MAX_FREE_EXTENDS })
+      determineExtendMode({ requested: "free", unpaid_extension_count: 0 })
+    ).toThrow(FreeExtendIdempotencyMissingError)
+  })
+
+  it("second free extend REJECTED (FreeExtendExhaustedError) — kieruje do trybu odpłatnego", () => {
+    const key = buildExtendIdempotencyKey("ent_extend_001", "seq-second")
+    expect(() =>
+      determineExtendMode({
+        requested: "free",
+        unpaid_extension_count: MAX_FREE_EXTENDS,
+        idempotency_key: key,
+      })
     ).toThrow(FreeExtendExhaustedError)
   })
 
@@ -193,11 +213,12 @@ describe("assertExtendCopySafe — forbidden copy (AC2)", () => {
 // ---------------------------------------------------------------------------
 
 describe("assertExtendProfileActivatable — blokada profilu (AC2)", () => {
-  it("przepuszcza profil z opłatą extendu w boundary", () => {
+  it("przepuszcza profil z opłatą extendu w boundary + jawną on_expiry_convert_to", () => {
     expect(() =>
       assertExtendProfileActivatable({
         validity_months: 12,
         extension: { paid: true, fee_pct: 10 },
+        on_expiry_convert_to: "extend",
       })
     ).not.toThrow()
   })
@@ -207,6 +228,7 @@ describe("assertExtendProfileActivatable — blokada profilu (AC2)", () => {
       assertExtendProfileActivatable({
         validity_months: 12,
         extension: { paid: true, fee_pct: 30 },
+        on_expiry_convert_to: "refund",
       })
     ).toThrow(ExtendProfileError)
   })
@@ -216,6 +238,16 @@ describe("assertExtendProfileActivatable — blokada profilu (AC2)", () => {
       assertExtendProfileActivatable({
         validity_months: 12,
         on_expiry_convert_to: "forfeit",
+      })
+    ).toThrow(ExtendProfileError)
+  })
+
+  it("blokuje profil bez on_expiry_convert_to (omission — L2 forfeiture coverage)", () => {
+    expect(() =>
+      assertExtendProfileActivatable({
+        validity_months: 12,
+        extension: { paid: true, fee_pct: 10 },
+        // on_expiry_convert_to nieobecne — brak jawnej deklaracji zachowania po wygaśnięciu
       })
     ).toThrow(ExtendProfileError)
   })
@@ -361,5 +393,161 @@ describe("extend posting deferral + idempotency", () => {
 describe("inwariant taksonomii (D-5)", () => {
   it("ALL_ENTITLEMENT_INSTANCE_STATES = 13 stanów (extend NIE dodaje stanu)", () => {
     expect(ALL_ENTITLEMENT_INSTANCE_STATES).toHaveLength(13)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// M1 — assertExtendCopySafe: synonimy „zapłać albo strać" / przepadek
+// ---------------------------------------------------------------------------
+
+describe("assertExtendCopySafe — synonimy przymusu/przepadku (M1)", () => {
+  it("rzuca na 'bezpowrotnie' (synonym: nie do odzyskania)", () => {
+    expect(() =>
+      assertExtendCopySafe("Twoje saldo wygaśnie bezpowrotnie, jeśli nie przedłużysz")
+    ).toThrow(ExtendCoercionCopyError)
+  })
+
+  it("rzuca na 'ostatnia szansa' (fałszywa pilność)", () => {
+    expect(() =>
+      assertExtendCopySafe("Ostatnia szansa — przedłuż teraz lub stracisz saldo")
+    ).toThrow()
+  })
+
+  it("rzuca na 'tylko teraz' (pressure urgency)", () => {
+    expect(() =>
+      assertExtendCopySafe("Możesz przedłużyć tylko teraz za 10%")
+    ).toThrow(ExtendCoercionCopyError)
+  })
+
+  it("przepuszcza copy równorzędności (extend ALBO bezpłatny zwrot — bez synonimów)", () => {
+    const msg = defaultPaidExtendMessage(10, 5000, "PLN")
+    expect(() => assertExtendCopySafe(msg)).not.toThrow()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// M2 — parytet WALIDOWANY (refund_available jako wejście, ExtendParityError osiągalny)
+// ---------------------------------------------------------------------------
+
+describe("buildPaidExtendOffer — parytet walidowany, ExtendParityError osiągalny (M2)", () => {
+  it("refund_available:false ⇒ ExtendParityError (brak parytetu — fail-closed AC2)", () => {
+    expect(() =>
+      buildPaidExtendOffer({ fee_pct: 10, remaining_minor: 5000, refund_available: false })
+    ).toThrow(ExtendParityError)
+  })
+
+  it("refund_available:true (domyślne) ⇒ oferta z parytetu (paid + free_refund_balance)", () => {
+    const offer = buildPaidExtendOffer({
+      fee_pct: 10,
+      remaining_minor: 5000,
+      refund_available: true,
+    })
+    expect(offer.options.map((o) => o.kind).sort()).toEqual([
+      "free_refund_balance",
+      "paid_extend",
+    ])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// M3 — buildExtendWiring: appendAudit + emitEvent faktycznie wołane
+// ---------------------------------------------------------------------------
+
+describe("buildExtendWiring — audit persystowany + event emitowany (M3)", () => {
+  it("appendAudit wołany gdy podany (audit faktycznie persystowany)", async () => {
+    const auditSink: TransitionAuditEnvelope[] = []
+    await buildExtendWiring(
+      {
+        appendAudit: async (a) => {
+          auditSink.push(a)
+        },
+        clock: () => new Date("2026-06-02T12:00:00.000Z"),
+      },
+      {
+        entitlement_id: "ent_extend_001",
+        state: EntitlementInstanceState.ACTIVE,
+        scope: SCOPE,
+        mode: "free",
+        extend_seq: "seq-m3-audit",
+      }
+    )
+    expect(auditSink).toHaveLength(1)
+    expect(auditSink[0].actor).toBe("customer")
+    expect(auditSink[0].actor_hint).toBe("extend:free")
+    expect(auditSink[0].scope.market_id).toBe("mkt_bonbeauty")
+  })
+
+  it("emitEvent wołany gdy podany + emitFailed:false (posting nadal audit-only)", async () => {
+    const emittedEvents: TransitionEventEnvelope[] = []
+    const res = await buildExtendWiring(
+      {
+        emitEvent: async (e) => {
+          emittedEvents.push(e)
+        },
+        clock: () => new Date("2026-06-02T12:00:00.000Z"),
+      },
+      {
+        entitlement_id: "ent_extend_001",
+        state: EntitlementInstanceState.ACTIVE,
+        scope: SCOPE,
+        mode: "paid",
+        fee_pct: 10,
+        extend_seq: "seq-m3-event",
+      }
+    )
+    expect(emittedEvents).toHaveLength(1)
+    expect(emittedEvents[0].event_type).toBe(ENTITLEMENT_STATE_CHANGED_EVENT_TYPE)
+    expect(res.emitFailed).toBe(false)
+    expect(res.posting.attempted).toBe(false)
+  })
+
+  it("emitFailed:false gdy emitEvent niepodany", async () => {
+    const res = await buildExtendWiring(
+      { clock: () => new Date("2026-06-02T12:00:00.000Z") },
+      {
+        entitlement_id: "ent_extend_001",
+        state: EntitlementInstanceState.ACTIVE,
+        scope: SCOPE,
+        mode: "free",
+        extend_seq: "seq-m3-noemit",
+      }
+    )
+    expect(res.emitFailed).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// L3 — computeExtendedExpiresAt: dolna granica > 0 miesięcy
+// ---------------------------------------------------------------------------
+
+describe("computeExtendedExpiresAt — dolna granica extension_months (L3)", () => {
+  const issued = new Date("2026-01-15T00:00:00.000Z")
+  const current = new Date("2027-01-15T00:00:00.000Z")
+
+  it("0 miesięcy ⇒ ExtendExtensionMonthsBoundaryError (nie konsumuje free extend)", () => {
+    expect(() =>
+      computeExtendedExpiresAt({ issued_at: issued, current_expires_at: current, extension_months: 0 })
+    ).toThrow(ExtendExtensionMonthsBoundaryError)
+  })
+
+  it("ujemne miesiące ⇒ ExtendExtensionMonthsBoundaryError (fail-closed)", () => {
+    expect(() =>
+      computeExtendedExpiresAt({ issued_at: issued, current_expires_at: current, extension_months: -1 })
+    ).toThrow(ExtendExtensionMonthsBoundaryError)
+  })
+
+  it("NaN ⇒ ExtendExtensionMonthsBoundaryError (fail-closed)", () => {
+    expect(() =>
+      computeExtendedExpiresAt({ issued_at: issued, current_expires_at: current, extension_months: NaN })
+    ).toThrow(ExtendExtensionMonthsBoundaryError)
+  })
+
+  it("1 miesiąc (min) ⇒ OK, przedłuża ważność", () => {
+    const result = computeExtendedExpiresAt({
+      issued_at: issued,
+      current_expires_at: current,
+      extension_months: 1,
+    })
+    expect(result.getTime()).toBeGreaterThan(current.getTime())
   })
 })

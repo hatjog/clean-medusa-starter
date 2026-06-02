@@ -55,6 +55,7 @@ import {
 } from "./models/entitlement"
 import {
   buildTransitionEnvelopes,
+  emitTransitionEventAfterCommit,
   runTransitionPostingHook,
   type TransitionActor,
   type TransitionAuditEnvelope,
@@ -145,6 +146,36 @@ export class ExtendCoercionCopyError extends Error {
   }
 }
 
+/**
+ * Rzucany gdy free extend żądany bez klucza idempotencji (runtime-backstop L1).
+ * Bez `idempotency_key` caller nie może zapewnić replay-safe compare-and-set
+ * na poziomie operacji/persystencji — gate jest wymagany.
+ */
+export class FreeExtendIdempotencyMissingError extends Error {
+  constructor() {
+    super(
+      `extend: idempotency_key jest WYMAGANY dla bezpłatnego extendu — bez niego ` +
+        `nie można zapewnić replay-safe idempotencji na poziomie operacji/persystencji ` +
+        `(AC1, runtime-backstop L1). Podaj klucz z buildExtendIdempotencyKey().`
+    )
+    this.name = "FreeExtendIdempotencyMissingError"
+  }
+}
+
+/** Rzucany gdy extension_months ≤ 0 lub nie jest liczbą skończoną (dolna granica FR14, fail-closed, L3). */
+export class ExtendExtensionMonthsBoundaryError extends Error {
+  readonly extension_months: unknown
+  constructor(extensionMonths: unknown) {
+    super(
+      `extend: extension_months '${String(extensionMonths)}' musi być > 0 ` +
+        `(dolna granica FR14, fail-closed) — 0/ujemne ⇒ brak realnego przedłużenia; ` +
+        `darmowy extend NIE może zostać skonsumowany bez korzyści dla klienta (L3).`
+    )
+    this.name = "ExtendExtensionMonthsBoundaryError"
+    this.extension_months = extensionMonths
+  }
+}
+
 /** Rzucany gdy profil blokuje aktywację extendu (forfeiture / opłata poza boundary). */
 export class ExtendProfileError extends Error {
   readonly violations: string[]
@@ -212,6 +243,12 @@ export function determineExtendMode(
     input.idempotency_key === input.last_applied_idempotency_key
 
   if (input.requested === "free") {
+    // Runtime-backstop (L1): idempotency_key WYMAGANY dla free extend.
+    // Bez niego caller nie może zapewnić replay-safe compare-and-set na poziomie
+    // persystencji — blokujemy wejście zanim licznik zostanie podwyższony.
+    if (!input.idempotency_key) {
+      throw new FreeExtendIdempotencyMissingError()
+    }
     // (1) bezpłatny extend dokładnie 1× — fail-closed po wyczerpaniu (chyba że replay).
     if (!replay && currentCount >= MAX_FREE_EXTENDS) {
       throw new FreeExtendExhaustedError(currentCount)
@@ -273,9 +310,17 @@ export type ComputeExtendedExpiresAtInput = {
 export function computeExtendedExpiresAt(
   input: ComputeExtendedExpiresAtInput
 ): Date {
+  // L3 fix: dolna granica — 0/ujemne/NaN ⇒ fail-closed (NIE konsumuj darmowego extendu
+  // bez realnego przedłużenia; klient traci extend bez korzyści — anti-forfeiture FR14).
+  if (
+    !Number.isFinite(input.extension_months) ||
+    input.extension_months <= 0
+  ) {
+    throw new ExtendExtensionMonthsBoundaryError(input.extension_months)
+  }
   const maxMonths =
     input.validity_months_max ?? ENTITLEMENT_BOUNDARY.validity_months_max
-  const months = Math.max(0, Math.trunc(input.extension_months))
+  const months = Math.trunc(input.extension_months)
   const candidate = addMonthsUtc(input.current_expires_at, months)
   const ceiling = addMonthsUtc(input.issued_at, maxMonths)
   // Clamp do górnej granicy ważności (NIGDY poza boundary).
@@ -312,6 +357,10 @@ export function buildExtendIdempotencyKey(
  * Zakazane sygnały PRZYMUSU w copy odpłatnego extendu („zapłać albo strać"). Token
  * „strac"/„strać" pokrywa „stracisz/stracić/strata"; case-insensitive po normalizacji.
  * Komplementarne do `FORBIDDEN_FORFEITURE_TOKENS` z 4.2 (przepad/utrat/forfeit).
+ *
+ * M1 fix: lista obejmuje synonimy klasy semantycznej „zapłać albo strać" / przepadek,
+ * nie tylko dokładne frazy. Residual risk: klucze i18n z allowlisty (copy strukturalne)
+ * są bezpieczniejsze niż wolny tekst; gate jest backstopem, nie pełną gwarancją.
  */
 export const FORBIDDEN_COERCION_TOKENS: readonly string[] = [
   "strać",
@@ -321,6 +370,10 @@ export const FORBIDDEN_COERCION_TOKENS: readonly string[] = [
   "albo strać",
   "zapłać albo",
   "pay or lose",
+  // M1: synonimy przepadku/przymusu spoza dokładnych fraz
+  "bezpowrotn",   // „bezpowrotnie", „bezpowrotny" — nie do odzyskania
+  "ostatnia szans", // „ostatnia szansa" — fałszywa pilność/presja
+  "tylko teraz",  // „tylko teraz" — presja czasowa, urgency coercion
 ] as const
 
 /**
@@ -390,6 +443,14 @@ export type BuildPaidExtendOfferInput = {
   currency?: string
   /** Override copy (np. i18n). Domyślnie copy równorzędności poniżej. */
   message?: string
+  /**
+   * M2 fix: czy bezpłatny zwrot salda jest faktycznie DOSTĘPNY dla tego entitlementu
+   * (mechanizm (b) z 4.3). Gdy `false` ⇒ {@link ExtendParityError} (brak parytetu;
+   * fail-closed, AC2, art. 385¹ KC). Domyślnie `true`.
+   * Podaj wynik sprawdzenia dostępności refundu z warstwy operacji (4.3),
+   * aby parytet był WALIDOWANY, a nie tylko hardkodowany.
+   */
+  refund_available?: boolean
 }
 
 /**
@@ -440,19 +501,25 @@ export function buildPaidExtendOffer(
   // (iii) anti-forfeiture + anti-coercion — twardy gate copy.
   assertExtendCopySafe(message)
 
+  // (ii) M2 fix: PARYTET walidowany — opcja refundu dodawana TYLKO gdy dostępna
+  // (refund_available z warstwy operacji), nie hardkodowana. ExtendParityError
+  // jest OSIĄGALNY gdy mechanizm (b) z 4.3 niedostępny dla tego entitlementu.
+  const refundAvailable = input.refund_available !== false
   const options: ExtendOption[] = [
     { kind: "paid_extend", paid: true, fee_pct: fee },
-    // Równorzędny, ZAWSZE bezpłatny zwrot salda (mechanizm (b) z 4.3).
-    { kind: "free_refund_balance", paid: false },
+    ...(refundAvailable
+      ? [{ kind: "free_refund_balance" as ExtendOptionKind, paid: false }]
+      : []),
   ]
-  // (ii) PARYTET — odpłatny extend NIGDY bez równoczesnej bezpłatnej opcji.
   const hasFreeRefund = options.some(
     (o) => o.kind === "free_refund_balance" && !o.paid
   )
   if (!hasFreeRefund) {
     throw new ExtendParityError(
-      "extend: odpłatny extend bez równorzędnej, BEZPŁATNEJ opcji zwrotu salda " +
-          "(UX-DR-08 H-2, art. 385¹ KC — klauzula abuzywna 'zapłać albo strać')"
+      "extend: odpłatny extend bez równorzędnej, BEZPŁATNEJ opcji zwrotu salda — " +
+        "mechanizm (b) z 4.3 niedostępny dla tego entitlementu " +
+        "(UX-DR-08 H-2, art. 385¹ KC — klauzula abuzywna 'zapłać albo strać'). " +
+        "Podaj refund_available:true tylko gdy zwrot salda faktycznie dostępny."
     )
   }
 
@@ -482,6 +549,24 @@ export function assertExtendProfileActivatable(
         v.field === "policy.on_expiry_convert_to"
     )
     .map((v) => v.message)
+
+  // L2 fix: rozszerzone pokrycie forfeiture — omission (`on_expiry_convert_to`
+  // undefined/null) wykrywane jawnie. `checkPolicyAgainstBoundary` traktuje brak
+  // pola jako no-op (additive), ale przy aktywacji extendu brak jawnej deklaracji
+  // = niekontrolowane zachowanie po wygaśnięciu (domyślny przepadek, art. 385¹ KC).
+  // Pełny gate governance: walidator 1.2 (`validate_entitlement_profiles.py`).
+  if (
+    policy.on_expiry_convert_to === undefined ||
+    policy.on_expiry_convert_to === null
+  ) {
+    extendViolations.push(
+      "on_expiry_convert_to nieobecne — wymagana jawna deklaracja spośród " +
+        "[extend, refund, store_credit]; brak wartości = niekontrolowane zachowanie " +
+        "po wygaśnięciu (domyślny przepadek — art. 385¹ KC, klauzula abuzywna). " +
+        "Pełna walidacja governance: walidator 1.2 (validate_entitlement_profiles.py)."
+    )
+  }
+
   if (extendViolations.length > 0) {
     throw new ExtendProfileError(extendViolations)
   }
@@ -601,6 +686,11 @@ export type ExtendWiringResult = {
   audit: TransitionAuditEnvelope
   /** Wynik posting hooka — dla extendu ZAWSZE audit-only (`attempted:false`, brak payloadu). */
   posting: TransitionPostingResult
+  /**
+   * M3: true gdy emit eventu zawiódł (best-effort; kompletność = reconciliation 2.6).
+   * false gdy `emitEvent` nie podano w deps LUB emit powiódł się.
+   */
+  emitFailed: boolean
 }
 
 /**
@@ -616,12 +706,41 @@ export async function buildExtendWiring(
   deps: Pick<
     TransitionWiringDeps,
     "ledgerWriter" | "postingActivation" | "clock"
-  >,
+  > & {
+    /**
+     * M3 fix: append-only sink audytu — gdy podany, woła w obrębie tx callera
+     * (atomowy ze zmianą stanu + licznika extendu). Bez tego audyt jest budowany
+     * ale NIE persystowany — caller musi zapewnić persystencję zwróconego `audit`.
+     */
+    appendAudit?: (audit: TransitionAuditEnvelope) => Promise<void>
+    /**
+     * M3 fix: best-effort emit eventu tranzycji (wołany po hooku postingu,
+     * idealnie post-COMMIT). Gdy podany, emit wołany przez `emitTransitionEventAfterCommit`
+     * (retry 2×, NIE rzuca). Fail NIE blokuje — kompletność = reconciliation 2.6.
+     */
+    emitEvent?: (event: TransitionEventEnvelope) => Promise<void>
+  },
   input: BuildExtendWiringInput
 ): Promise<ExtendWiringResult> {
   const now = deps.clock?.() ?? new Date()
   const transitionInput = buildExtendTransitionInput(input)
   const { event, audit } = buildTransitionEnvelopes(transitionInput, now)
+
+  // M3 fix: appendAudit w obrębie tx callera (atomowy ze zmianą stanu + licznika).
+  // Reużywa tej samej semantyki co wireEntitlementTransitionPersisted (3.4),
+  // omijając wyłącznie assertWiringTransition (extend from===to, NIE krawędź grafu).
+  if (deps.appendAudit) {
+    await deps.appendAudit(audit)
+  }
+
   const posting = await runTransitionPostingHook(deps, transitionInput, now)
-  return { event, audit, posting }
+
+  // M3 fix: best-effort emit eventu (post-COMMIT). Reużywa emitTransitionEventAfterCommit
+  // z 3.4 (retry 2×, fail NIE blokuje tranzycji).
+  let emitFailed = false
+  if (deps.emitEvent) {
+    emitFailed = await emitTransitionEventAfterCommit(deps.emitEvent, event)
+  }
+
+  return { event, audit, posting, emitFailed }
 }
