@@ -776,4 +776,77 @@ describe("VoucherService", () => {
       expect(update?.params[2]).toBeNull()
     })
   })
+
+  describe("appointment confirmation delivery source", () => {
+    it("projects neutral email delivery source from entitlement_instance without voucher code", async () => {
+      const pool = makeMockPool({
+        queryResponses: [
+          {
+            rows: [
+              {
+                ei_id: "entinst_apt_001",
+                policy_snapshot: {
+                  buyer_email: "snapshot-buyer@example.test",
+                  buyer_locale: "pl",
+                  voucher_code: "RAW-CODE-DO-NOT-RETURN",
+                  seller: {
+                    name: "Salon Snapshot",
+                    address: "ul. Snapshot 1",
+                  },
+                },
+                order_email: "order-buyer@example.test",
+                seller_name: "Salon Alfa",
+                seller_handle: "salon-alfa",
+              },
+            ],
+          },
+        ],
+      })
+      const svc = makeService(pool)
+
+      const source = await svc.findAppointmentConfirmationDeliverySource(
+        "entinst_apt_001",
+      )
+
+      expect(source).toEqual({
+        buyer_email: "snapshot-buyer@example.test",
+        buyer_locale: "pl",
+        salon_name: "Salon Snapshot",
+        location_address: "ul. Snapshot 1",
+        seller_handle: "salon-alfa",
+      })
+      expect(JSON.stringify(source)).not.toContain("RAW-CODE-DO-NOT-RETURN")
+    })
+
+    it("falls back to order email and voucher seller fields when snapshot fields are absent", async () => {
+      const pool = makeMockPool({
+        queryResponses: [
+          {
+            rows: [
+              {
+                ei_id: "entinst_apt_002",
+                policy_snapshot: {},
+                order_email: "order-buyer@example.test",
+                seller_name: "Salon Alfa",
+                seller_handle: "salon-alfa",
+              },
+            ],
+          },
+        ],
+      })
+      const svc = makeService(pool)
+
+      const source = await svc.findAppointmentConfirmationDeliverySource(
+        "entinst_apt_002",
+      )
+
+      expect(source).toEqual({
+        buyer_email: "order-buyer@example.test",
+        buyer_locale: null,
+        salon_name: "Salon Alfa",
+        location_address: null,
+        seller_handle: "salon-alfa",
+      })
+    })
+  })
 })

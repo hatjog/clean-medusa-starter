@@ -68,12 +68,18 @@ importers:
       '@sentry/node':
         specifier: ^9.0.0
         version: 9.47.1
+      '@touch4it/ical-timezones':
+        specifier: ^1.9.0
+        version: 1.9.0
       awilix:
         specifier: ^8.0.1
         version: 8.0.1
       http-proxy-middleware:
         specifier: ^3.0.5
         version: 3.0.5
+      ical-generator:
+        specifier: 10.2.0
+        version: 10.2.0(@touch4it/ical-timezones@1.9.0)(@types/node@22.19.17)(luxon@3.7.2)
       js-yaml:
         specifier: ^4.1.1
         version: 4.1.1
@@ -3470,6 +3476,10 @@ packages:
   '@tanstack/virtual-core@3.14.0':
     resolution: {integrity: sha512-JLANqGy/D6k4Ujmh8Tr25lGimuOXNiaVyXaCAZS0W+1390sADdGnyUdSWNIfd49gebtIxGMij4IktRVzrdr12Q==}
 
+  '@touch4it/ical-timezones@1.9.0':
+    resolution: {integrity: sha512-UAiZMrFlgMdOIaJDPsKu5S7OecyMLr3GGALJTYkRgHmsHAA/8Ixm1qD09ELP2X7U1lqgrctEgvKj9GzMbczC+g==}
+    engines: {node: '>= 14.0.0'}
+
   '@ts-morph/common@0.28.1':
     resolution: {integrity: sha512-W74iWf7ILp1ZKNYXY5qbddNaml7e9Sedv5lvU1V8lftlitkc9Pq1A+jlH23ltDgWYeZFFEqGCD1Ies9hqu3O+g==}
 
@@ -4978,6 +4988,39 @@ packages:
 
   i18next@23.7.11:
     resolution: {integrity: sha512-A/vOkw8vY99YHU9A1Td3I1dcTiYaPnwBWzrpVzfXUXSYgogK3cmBcmop/0cnXPc6QpUWIyqaugKNxRUEZVk9Nw==}
+
+  ical-generator@10.2.0:
+    resolution: {integrity: sha512-XR5FsiDWCsz5MwBwMA/sQqR3A9H240xkXIeXOabV7uNAiieP+TA9rleVvlwPLRXMz+CXME8cGuDd7cdnE5At6w==}
+    engines: {node: 20 || 22 || >=24}
+    peerDependencies:
+      '@touch4it/ical-timezones': '>=1.6.0'
+      '@types/luxon': '>= 1.26.0'
+      '@types/mocha': '>= 8.2.1'
+      '@types/node': '*'
+      dayjs: '>= 1.10.0'
+      luxon: '>= 1.26.0'
+      moment: '>= 2.29.0'
+      moment-timezone: '>= 0.5.33'
+      rrule: '>= 2.6.8'
+    peerDependenciesMeta:
+      '@touch4it/ical-timezones':
+        optional: true
+      '@types/luxon':
+        optional: true
+      '@types/mocha':
+        optional: true
+      '@types/node':
+        optional: true
+      dayjs:
+        optional: true
+      luxon:
+        optional: true
+      moment:
+        optional: true
+      moment-timezone:
+        optional: true
+      rrule:
+        optional: true
 
   iconv-lite@0.4.24:
     resolution: {integrity: sha512-v3MXnZAcvnywkTUEZomIActle7RXXeedOR31wwl7VlyoXO4Qi9arvSenNQWne1TcRwhCL1HwLI21bEqdpj8/rA==}
@@ -12054,6 +12097,8 @@ snapshots:
 
   '@tanstack/virtual-core@3.14.0': {}
 
+  '@touch4it/ical-timezones@1.9.0': {}
+
   '@ts-morph/common@0.28.1':
     dependencies:
       minimatch: 10.2.5
@@ -13794,6 +13839,12 @@ snapshots:
   i18next@23.7.11:
     dependencies:
       '@babel/runtime': 7.29.2
+
+  ical-generator@10.2.0(@touch4it/ical-timezones@1.9.0)(@types/node@22.19.17)(luxon@3.7.2):
+    optionalDependencies:
+      '@touch4it/ical-timezones': 1.9.0
+      '@types/node': 22.19.17
+      luxon: 3.7.2
 
   iconv-lite@0.4.24:
     dependencies:

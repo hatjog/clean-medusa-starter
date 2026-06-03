@@ -48,6 +48,48 @@ export {
   persistDeliveryArtifact,
 } from "./multi-vendor-pdf"
 
+// Appointment .ics generator (Story 5.2 / ADR-137 iCal Path A).
+export type {
+  VoucherAppointmentIcsInput,
+  VoucherAppointmentLifecycleStatus,
+  VoucherAppointmentManageLinkOptions,
+} from "./ics-generator"
+export {
+  buildAppointmentCalendarUid,
+  generateVoucherAppointmentIcs,
+  VOUCHER_APPOINTMENT_SUMMARY_FALLBACK,
+  VOUCHER_APPOINTMENT_TIMEZONE,
+} from "./ics-generator"
+
+// Appointment a11y/i18n copy bundles (Story 5.4).
+export type {
+  VoucherAppointmentLocale,
+} from "./appointment-i18n"
+export {
+  lookupAppointmentCopy,
+  normalizeVoucherAppointmentLocale,
+  renderAppointmentCopy,
+  voucherAppointmentHtmlLang,
+  VOUCHER_APPOINTMENT_COPY,
+  VOUCHER_APPOINTMENT_LOCALES,
+} from "./appointment-i18n"
+
+// Appointment confirmation delivery email + scoped .ics download link (Story 5.3).
+export type {
+  VoucherAppointmentDeliveryAttachment,
+  VoucherAppointmentDeliveryCalendar,
+  VoucherAppointmentDeliveryEmail,
+  VoucherAppointmentDeliveryEmailInput,
+} from "./appointment-confirmation-email"
+export {
+  buildVoucherAppointmentDeliveryEmail,
+  buildVoucherAppointmentIcsStorageKey,
+  isVoucherAppointmentIcsStorageKey,
+  VOUCHER_APPOINTMENT_EMAIL_A11Y_TOKENS,
+  VOUCHER_APPOINTMENT_ICS_DOWNLOAD_ROUTE,
+  VOUCHER_APPOINTMENT_ICS_STORAGE_SCOPE,
+} from "./appointment-confirmation-email"
+
 // Storage layer port + adapters (cleanup-52 / TF-117).
 export type {
   IVoucherPdfStorage,
