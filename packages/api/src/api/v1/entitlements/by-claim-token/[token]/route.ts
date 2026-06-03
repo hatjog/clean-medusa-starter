@@ -30,6 +30,12 @@ import type { MedusaRequest, MedusaResponse } from "@medusajs/framework/http"
 import { ContainerRegistrationKeys } from "@medusajs/framework/utils"
 
 import { consumeClaimToken } from "../../../../../lib/voucher-claim-rate-limit"
+import {
+  EXPIRED_CLAIM_LINK_GONE_BODY,
+  isClaimTokenExpired,
+  isClaimTokenTtlEnforced,
+  resolveClaimTokenTtlHours,
+} from "../../../../../lib/voucher-claim-magic-link-ttl"
 
 export const AUTHENTICATE = false
 
@@ -189,6 +195,8 @@ export async function GET(req: MedusaRequest, res: MedusaResponse): Promise<void
             ei.policy_snapshot,
             ei.expires_at,
             ei.claim_token_revoked_at,
+            ei.claim_token_issued_at,
+            ei.market_id,
             v.code AS voucher_code,
             v.product_title,
             v.seller_name,
@@ -205,6 +213,25 @@ export async function GET(req: MedusaRequest, res: MedusaResponse): Promise<void
   if (!row || row.claim_token_revoked_at) {
     await padToFloor(startedAt)
     res.status(404).json({ type: "not_found", message: "Claim token not found." })
+    return
+  }
+
+  // Story 7.4 / ADR-138 DEC-1 — TTL magic-linka voucher-claim. Wygasły link
+  // (issued_at + TTL < now) ⇒ HTTP 410 (Gone), NIE 404/500. Grandfather:
+  // issued_at NULL (legacy) ⇒ nie wygasa. Flaga off ⇒ nie wygasa (rollback).
+  const ttlEnforced = isClaimTokenTtlEnforced()
+  const ttlHours = resolveClaimTokenTtlHours(
+    typeof row.market_id === "string" ? row.market_id : null
+  )
+  if (
+    isClaimTokenExpired({
+      issuedAt: row.claim_token_issued_at as Date | string | null,
+      ttlHours,
+      enforced: ttlEnforced,
+    })
+  ) {
+    await padToFloor(startedAt)
+    res.status(410).json(EXPIRED_CLAIM_LINK_GONE_BODY)
     return
   }
 

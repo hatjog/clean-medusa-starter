@@ -37,6 +37,12 @@ import { ContainerRegistrationKeys } from "@medusajs/framework/utils"
 
 import { consumeClaimToken } from "../../../../lib/voucher-claim-rate-limit"
 import {
+  EXPIRED_CLAIM_LINK_GONE_BODY,
+  isClaimTokenExpired,
+  isClaimTokenTtlEnforced,
+  resolveClaimTokenTtlHours,
+} from "../../../../lib/voucher-claim-magic-link-ttl"
+import {
   EntitlementInstanceState,
   assertTransition,
 } from "../../../../modules/voucher/models/entitlement"
@@ -195,7 +201,15 @@ export async function POST(req: MedusaRequest, res: MedusaResponse): Promise<voi
     return
   }
 
-  let result: { id: string; state: EntitlementInstanceState; transitioned: boolean } | null
+  // Story 7.4 / ADR-138 DEC-1 — egzekucja TTL magic-linka voucher-claim.
+  const ttlEnforced = isClaimTokenTtlEnforced()
+
+  let result: {
+    id: string
+    state: EntitlementInstanceState
+    transitioned: boolean
+    expired?: boolean
+  } | null
   try {
     result = await withTransaction(req, async (client) => {
       // F6 HIGH-09: pre-check INSIDE the FOR UPDATE lock to close the TOCTOU
@@ -204,8 +218,11 @@ export async function POST(req: MedusaRequest, res: MedusaResponse): Promise<voi
         id: string
         state: string
         revoked_at: Date | string | null
+        issued_at: Date | string | null
+        market_id: string | null
       }>(
-        `SELECT id, state, claim_token_revoked_at AS revoked_at
+        `SELECT id, state, claim_token_revoked_at AS revoked_at,
+                claim_token_issued_at AS issued_at, market_id
            FROM entitlement_instance
           WHERE claim_token = $1::uuid
           FOR UPDATE`,
@@ -216,6 +233,20 @@ export async function POST(req: MedusaRequest, res: MedusaResponse): Promise<voi
       }
       const row = lockRes.rows[0]
       const currentState = row.state as EntitlementInstanceState
+
+      // TTL magic-linka: wygasły link NIE może zainicjować nowego claimu
+      // (ISSUED → ACTIVE) ⇒ 410 (Gone). Stany terminalne (poniżej) i
+      // idempotentny replay ACTIVE zachowują dotychczasową semantykę.
+      if (
+        currentState === EntitlementInstanceState.ISSUED &&
+        isClaimTokenExpired({
+          issuedAt: row.issued_at,
+          ttlHours: resolveClaimTokenTtlHours(row.market_id),
+          enforced: ttlEnforced,
+        })
+      ) {
+        return { id: row.id, state: currentState, transitioned: false, expired: true }
+      }
 
       if (TERMINAL_TOKEN_STATES.has(currentState)) {
         return { id: row.id, state: currentState, transitioned: false }
@@ -261,6 +292,14 @@ export async function POST(req: MedusaRequest, res: MedusaResponse): Promise<voi
     // for the caller (enumeration safety) — both surface as 404.
     await padToFloor(startedAt)
     res.status(404).json({ type: "not_found", message: "Claim token not found." })
+    return
+  }
+
+  // Wygasły magic-link (TTL) → 410 (Gone) z neutralną kopią. Odróżniony
+  // od stanów terminalnych typem `magic_link_expired` (ADR-138 DEC-1).
+  if (result.expired) {
+    await padToFloor(startedAt)
+    res.status(410).json(EXPIRED_CLAIM_LINK_GONE_BODY)
     return
   }
 
