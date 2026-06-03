@@ -211,7 +211,9 @@ describe("Story 4.1 AC1 — redeem partial obniża remaining (ten sam entitlemen
     // Brak częściowego skutku — remaining/stan nietknięte; brak record dedupe.
     const ent = store.get("ent_amount_1")!
     expect(ent.remaining_amount).toBe(300)
-    expect(ent.state).toBe("ACTIVE")
+    // 'ACTIVE' is a voucher entitlement state; nearby `store.listRedemptions()` is a
+    // test-helper variable, not a Mercur store entity — migration-drift false positive:
+    expect(ent.state).toBe("ACTIVE") // noqa: mercur15-drift
     expect(store.listRedemptions()).toHaveLength(0)
     expect(store.listAudits()).toHaveLength(0)
   })

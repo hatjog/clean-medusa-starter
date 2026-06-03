@@ -386,7 +386,10 @@ describe("Story 3.4 AC3 — inwariant taksonomii (wyłącznie okablowanie, D-5)"
       REFUND_REQUESTED: ["REFUNDED", "DISPUTED", "ACTIVE"],
       REFUNDED: [],
       DISPUTED: ["ACTIVE", "REFUNDED", "CLOSED", "VOIDED"],
-      PENDING_VENDOR_DECISION: ["VOIDED", "ACTIVE", "REDEEMED_PARTIAL", "REDEEMED_FULL"],
+      // 'ACTIVE' below is a voucher entitlement state; the only seller/store/vendor
+      // token in proximity is the voucher state name PENDING_VENDOR_DECISION, not a
+      // Mercur 1.5 seller status — migration-drift false positive, suppressed inline:
+      PENDING_VENDOR_DECISION: ["VOIDED", "ACTIVE", "REDEEMED_PARTIAL", "REDEEMED_FULL"], // noqa: mercur15-drift
     })
   })
 
