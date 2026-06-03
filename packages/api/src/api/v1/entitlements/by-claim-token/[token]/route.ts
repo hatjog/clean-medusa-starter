@@ -30,6 +30,12 @@ import type { MedusaRequest, MedusaResponse } from "@medusajs/framework/http"
 import { ContainerRegistrationKeys } from "@medusajs/framework/utils"
 
 import { consumeClaimToken } from "../../../../../lib/voucher-claim-rate-limit"
+import {
+  EXPIRED_CLAIM_LINK_GONE_BODY,
+  isClaimTokenExpired,
+  isClaimTokenTtlEnforced,
+  resolveClaimTokenTtlHours,
+} from "../../../../../lib/voucher-claim-magic-link-ttl"
 
 export const AUTHENTICATE = false
 
@@ -65,6 +71,15 @@ function rowsFromResult(result: unknown): Record<string, unknown>[] {
 
 const CLAIM_TOKEN_REGEX =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+
+/**
+ * Stany terminalnych entitlementów (spójne z POST /claim TERMINAL_TOKEN_STATES).
+ * W GET: 410 z type=<state>.toLowerCase() + state (NIE magic_link_expired).
+ * Storefront klasyfikuje takie 410 jako `terminal`, NIE `expired` (DEC-2 fix).
+ */
+const TERMINAL_STATES_GET: ReadonlySet<string> = new Set([
+  "REFUNDED", "VOIDED", "EXPIRED", "CLOSED",
+])
 
 type ClaimPagePayload = {
   status: string
@@ -189,6 +204,8 @@ export async function GET(req: MedusaRequest, res: MedusaResponse): Promise<void
             ei.policy_snapshot,
             ei.expires_at,
             ei.claim_token_revoked_at,
+            ei.claim_token_issued_at,
+            ei.market_id,
             v.code AS voucher_code,
             v.product_title,
             v.seller_name,
@@ -205,6 +222,47 @@ export async function GET(req: MedusaRequest, res: MedusaResponse): Promise<void
   if (!row || row.claim_token_revoked_at) {
     await padToFloor(startedAt)
     res.status(404).json({ type: "not_found", message: "Claim token not found." })
+    return
+  }
+
+  // Story 7.4 / ADR-138 DEC-1 — TTL magic-linka voucher-claim. Wygasły link
+  // (issued_at + TTL < now) ⇒ HTTP 410 (Gone), NIE 404/500. Grandfather:
+  // issued_at NULL (legacy) ⇒ nie wygasa. Flaga off ⇒ nie wygasa (rollback).
+  //
+  // KOREKTA ASYMETRII TTL (review fix): sprawdzaj wygaśnięcie tylko dla stanu
+  // ISSUED (spójnie z POST /claim). ACTIVE = voucher już zclaimowany — odbiorca
+  // wracający na swój (postarzały) link widzi stan „już zclaimowane", NIE „link
+  // wygasł – wyślij nowy". Stany terminalne (REFUNDED/VOIDED/EXPIRED/CLOSED)
+  // wracają jako 410 z type≠magic_link_expired (poniżej), co storefront
+  // klasyfikuje jako `terminal`, nie `expired` (DEC-2 / classifyVoucherClaimLinkStatus).
+  const ISSUED_STATE = "ISSUED"
+  const rowState = typeof row.state === "string" ? (row.state as string) : ""
+  const ttlEnforced = isClaimTokenTtlEnforced()
+  const ttlHours = resolveClaimTokenTtlHours(
+    typeof row.market_id === "string" ? row.market_id : null
+  )
+  if (
+    rowState === ISSUED_STATE &&
+    isClaimTokenExpired({
+      issuedAt: row.claim_token_issued_at as Date | string | null,
+      ttlHours,
+      enforced: ttlEnforced,
+    })
+  ) {
+    await padToFloor(startedAt)
+    res.status(410).json(EXPIRED_CLAIM_LINK_GONE_BODY)
+    return
+  }
+
+  // Stany terminalne (REFUNDED/VOIDED/EXPIRED/CLOSED) ⇒ 410 z type≠magic_link_expired
+  // (storefront klasyfikuje jako `terminal`, nie `expired`, nie pokazuje „wyślij nowy link").
+  if (TERMINAL_STATES_GET.has(rowState)) {
+    await padToFloor(startedAt)
+    res.status(410).json({
+      type: rowState.toLowerCase(),
+      message: "This claim is no longer redeemable.",
+      state: rowState,
+    })
     return
   }
 
