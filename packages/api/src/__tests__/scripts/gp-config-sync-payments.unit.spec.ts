@@ -99,7 +99,25 @@ describe("gp-config-sync-payments.resolvePaymentProviderId", () => {
     })
   })
 
-  it("throws when configured provider is not in available list", () => {
+  it("aliases pp_stripe to the canonical card provider (pp_stripe_stripe) on naming drift", () => {
+    const result = resolvePaymentProviderId("pp_stripe", [
+      "pp_stripe-blik_stripe",
+      "pp_stripe-przelewy24_stripe",
+      "pp_stripe_stripe",
+      "pp_system_default",
+    ])
+    expect(result.providerId).toBe("pp_stripe_stripe")
+    expect(result.fallbackApplied).toBe(true)
+    expect(result.warning).toMatch(/aliased to 'pp_stripe_stripe'/)
+  })
+
+  it("aliases to the only pp_stripe* candidate when the canonical card id is absent", () => {
+    const result = resolvePaymentProviderId("pp_stripe", ["pp_stripe-blik_stripe", "pp_system_default"])
+    expect(result.providerId).toBe("pp_stripe-blik_stripe")
+    expect(result.fallbackApplied).toBe(true)
+  })
+
+  it("throws when configured provider has no exact match and no pp_stripe* alias candidate", () => {
     expect(() =>
       resolvePaymentProviderId("pp_stripe", ["pp_system_default"])
     ).toThrow(/Configured payment provider 'pp_stripe' is not enabled in runtime/)

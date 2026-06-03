@@ -189,6 +189,29 @@ export function resolvePaymentProviderId(
     return { providerId: configuredProviderId, fallbackApplied: false }
   }
 
+  // Naming-drift alias (ADR-100 / medusa-config `id: "stripe"` intent): the
+  // market config uses the module-level id `pp_stripe`, but the runtime may
+  // register a plugin-/method-suffixed id (e.g. `pp_stripe_stripe`, and the
+  // multi-market variants `pp_stripe-blik_stripe` / `pp_stripe-przelewy24_stripe`).
+  // When the exact id is absent, alias to an available `pp_stripe<sep>…` provider,
+  // preferring the canonical card provider (`<configured>_stripe`), then the
+  // shortest candidate. Auditable via fallbackApplied + warning; a truly absent
+  // provider still throws (unchanged contract).
+  const candidates = availableProviderIds
+    .filter((id) => id.startsWith(`${configuredProviderId}_`) || id.startsWith(`${configuredProviderId}-`))
+    .sort((a, b) => a.length - b.length || a.localeCompare(b))
+  if (candidates.length > 0) {
+    const canonical = `${configuredProviderId}_stripe`
+    const providerId = candidates.includes(canonical) ? canonical : candidates[0]
+    return {
+      providerId,
+      fallbackApplied: true,
+      warning:
+        `Payment provider '${configuredProviderId}' not enabled verbatim; aliased to '${providerId}' ` +
+        `(available: ${availableProviderIds.join(", ")}). Naming-drift tolerated per ADR-100.`,
+    }
+  }
+
   const available = availableProviderIds.length > 0 ? availableProviderIds.join(", ") : "none"
   throw new Error(
     `Configured payment provider '${configuredProviderId}' is not enabled in runtime. Available providers: ${available}`
