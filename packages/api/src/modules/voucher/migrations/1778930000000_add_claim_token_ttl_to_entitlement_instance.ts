@@ -39,21 +39,33 @@ export class Migration1778930000000 extends Migration {
     `)
 
     // Trigger stamping: ustaw issued_at = NOW() gdy claim_token jest nadawany
-    // (INSERT z niepustym tokenem) lub zmieniany na nowy niepusty token
-    // (re-issue / reissue-lost-code), o ile wywołujący nie podał własnej
-    // wartości issued_at. Czysto na warstwie danych — bez zmian w TS domeny.
+    // (INSERT z niepustym tokenem) lub zmieniany na INNY niepusty token
+    // (re-issue / reissue-lost-code in-place).
+    //
+    // Polityka re-stemplowania (ADR-138 DEC-1 review fix, Story 7.4):
+    //   - INSERT z nowym tokenem ⇒ zawsze stempluj (issued_at := NOW()), nadpisując
+    //     ewentualną wartość przekazaną przez wywołującego tylko gdy jest NULL.
+    //   - UPDATE token DISTINCT FROM OLD ⇒ stempluj BEZWARUNKOWO (reset zegara TTL
+    //     przy każdym re-issue in-place) — nowy link musi mieć WŁASNY stempel,
+    //     nie dziedziczyć daty z poprzedniego tokenu (latentny bug: stary stempel ⇒
+    //     link mógłby urodzić się wygasły).
+    //   - UPDATE token nie zmieniony ⇒ nie dotykaj stempla.
+    // Czysto na warstwie danych — bez zmian w TS domeny (granica Stream A/B).
     this.addSql(`
       CREATE OR REPLACE FUNCTION entitlement_instance_stamp_claim_token_issued_at()
       RETURNS trigger AS $$
       BEGIN
-        IF NEW.claim_token IS NOT NULL
-           AND (
-             TG_OP = 'INSERT'
-             OR NEW.claim_token IS DISTINCT FROM OLD.claim_token
-           )
-           AND NEW.claim_token_issued_at IS NULL
-        THEN
-          NEW.claim_token_issued_at := NOW();
+        IF NEW.claim_token IS NOT NULL THEN
+          IF TG_OP = 'INSERT' THEN
+            -- INSERT: stempluj gdy issued_at nie zostało jawnie podane.
+            IF NEW.claim_token_issued_at IS NULL THEN
+              NEW.claim_token_issued_at := NOW();
+            END IF;
+          ELSIF NEW.claim_token IS DISTINCT FROM OLD.claim_token THEN
+            -- UPDATE z innym tokenem (re-issue in-place): ZAWSZE reset zegara,
+            -- niezależnie od poprzedniej wartości issued_at — nowy token = nowe TTL.
+            NEW.claim_token_issued_at := NOW();
+          END IF;
         END IF;
         RETURN NEW;
       END;
