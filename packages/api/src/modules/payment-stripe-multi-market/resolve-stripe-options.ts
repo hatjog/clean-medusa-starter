@@ -54,8 +54,19 @@ export interface MaybeSecretsCradle {
 }
 
 export function resolveSecretsAdapter(cradle: MaybeSecretsCradle): SecretsAdapter {
-  if (cradle?.secretsAdapter) {
-    return cradle.secretsAdapter
+  // The Medusa container exposes dependencies via an Awilix `cradle` proxy
+  // that THROWS `AwilixResolutionError` on access to an unregistered key — it
+  // does NOT return `undefined`. So a bare `cradle?.secretsAdapter` truthiness
+  // check cannot fall through when `loaders/secrets.ts` hasn't registered the
+  // adapter (current `medusa start` boot path — custom `src/loaders/` are not
+  // auto-discovered). Guard the access so the documented EnvSecretsAdapter
+  // fallback actually runs instead of bubbling a 500 out of initiatePayment.
+  try {
+    if (cradle?.secretsAdapter) {
+      return cradle.secretsAdapter
+    }
+  } catch {
+    // Unregistered in the container → fall through to the env-only default.
   }
   // Fallback: SECRETS_ADAPTER=gcp would be required to opt-in to GCP — for
   // v1.9.x BonBeauty-only env-only path the env adapter is the safe default.

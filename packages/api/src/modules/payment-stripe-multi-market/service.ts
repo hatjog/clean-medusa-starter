@@ -43,6 +43,10 @@ import {
   DEFAULT_MARKET_ID,
   type MaybeSecretsCradle,
 } from "./resolve-stripe-options"
+import {
+  gpMinorToProviderMajor,
+  providerMajorToGpMinor,
+} from "./amount-normalization"
 import type { StripeMultiMarketOptions } from "./types"
 import type { MarketId } from "../../lib/secrets/index"
 
@@ -201,8 +205,25 @@ function withResolverGate<TBase extends new (...args: any[]) => any>(
     // Re-route every async method via the gate. We delegate by calling the
     // base prototype method explicitly so subclass overrides remain
     // honoured.
+    //
+    // AMOUNT-UNIT BOUNDARY (Path B fix): GP stores amounts in MINOR units
+    // (grosze); the upstream provider assumes MAJOR units and applies
+    // getSmallestUnit (×100) on amounts it SENDS to Stripe + getAmountFrom-
+    // SmallestUnit (÷100) on amounts it RETURNS. We therefore convert
+    // grosze→major on the INPUT methods (initiate/refund/update) and
+    // major→grosze on the RETURN methods (retrieve/webhook). Methods that
+    // neither accept nor return a Medusa-normalized amount (status/authorize/
+    // cancel/capture — capture returns the RAW Stripe intent, already in
+    // smallest-unit = grosze) are passed through unchanged.
     async initiatePayment(...args: any[]): Promise<any> {
       await this.__ensureResolved()
+      const input = args[0]
+      if (input && input.amount != null) {
+        args = [
+          { ...input, amount: gpMinorToProviderMajor(input.amount, input.currency_code) },
+          ...args.slice(1),
+        ]
+      }
       return super.initiatePayment(...args)
     }
     async authorizePayment(...args: any[]): Promise<any> {
@@ -223,14 +244,34 @@ function withResolverGate<TBase extends new (...args: any[]) => any>(
     }
     async refundPayment(...args: any[]): Promise<any> {
       await this.__ensureResolved()
+      const input = args[0]
+      if (input && input.amount != null) {
+        // Upstream derives the currency from data.currency for refunds.
+        args = [
+          { ...input, amount: gpMinorToProviderMajor(input.amount, input.data?.currency) },
+          ...args.slice(1),
+        ]
+      }
       return super.refundPayment(...args)
     }
     async retrievePayment(...args: any[]): Promise<any> {
       await this.__ensureResolved()
-      return super.retrievePayment(...args)
+      const result = await super.retrievePayment(...args)
+      const intent = result?.data
+      if (intent && intent.amount != null && intent.currency) {
+        intent.amount = providerMajorToGpMinor(intent.amount, intent.currency)
+      }
+      return result
     }
     async updatePayment(...args: any[]): Promise<any> {
       await this.__ensureResolved()
+      const input = args[0]
+      if (input && input.amount != null) {
+        args = [
+          { ...input, amount: gpMinorToProviderMajor(input.amount, input.currency_code) },
+          ...args.slice(1),
+        ]
+      }
       return super.updatePayment(...args)
     }
     async getPaymentStatus(...args: any[]): Promise<any> {
@@ -259,7 +300,23 @@ function withResolverGate<TBase extends new (...args: any[]) => any>(
     }
     async getWebhookActionAndData(...args: any[]): Promise<any> {
       await this.__ensureResolved()
-      return super.getWebhookActionAndData(...args)
+      const result = await super.getWebhookActionAndData(...args)
+      // Upstream returns `data.amount` in MAJOR units but omits the currency
+      // from its result, so recover it by re-parsing the (already verified)
+      // webhook event. If parsing fails we leave the amount untouched rather
+      // than guess a multiplier.
+      if (result?.data && result.data.amount != null) {
+        try {
+          const event = (this as any).constructWebhookEvent(args[0])
+          const currency = event?.data?.object?.currency
+          if (currency) {
+            result.data.amount = providerMajorToGpMinor(result.data.amount, currency)
+          }
+        } catch {
+          // currency indeterminate → preserve upstream value
+        }
+      }
+      return result
     }
   }
   return StripeMultiMarketMixin
