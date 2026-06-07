@@ -164,6 +164,19 @@ function validateStripeMultiMarketOptions(
  * `AbstractPaymentProvider` from `@medusajs/framework/utils` which mucks
  * with prototype chains.
  */
+/**
+ * Stripe rejects `paymentIntents.cancel` for intents in a terminal state, so
+ * the provider's `deletePayment` (→ `cancelPayment`) cannot remove such a
+ * session. `canceled` is already tolerated by the upstream provider; `succeeded`
+ * is the paid-but-orphaned case that otherwise wedges carts on every refresh.
+ * Centralised + exported for direct unit coverage of the predicate.
+ */
+export function isUncancelablePaymentIntentStatus(
+  status: string | null | undefined
+): boolean {
+  return status === "succeeded" || status === "canceled"
+}
+
 function withResolverGate<TBase extends new (...args: any[]) => any>(
   Base: TBase,
   defaultMarketId: MarketId
@@ -240,7 +253,47 @@ function withResolverGate<TBase extends new (...args: any[]) => any>(
     }
     async deletePayment(...args: any[]): Promise<any> {
       await this.__ensureResolved()
-      return super.deletePayment(...args)
+      try {
+        return await super.deletePayment(...args)
+      } catch (error) {
+        // Upstream `cancelPayment` (which `deletePayment` delegates to) only
+        // tolerates an already-`canceled` PaymentIntent; a `succeeded` (paid)
+        // intent cannot be canceled by Stripe and otherwise hard-fails the
+        // entire cart mutation. Because Medusa abandons payment sessions during
+        // ROUTINE cart refreshes (delete-line-item → refresh-payment-collection
+        // → delete-payment-sessions → validate-deleted-payment-sessions), that
+        // hard failure WEDGES the cart forever: a cart whose intent succeeded
+        // but never completed (orphaned charge) can no longer have items
+        // removed, edited, or re-checked-out — every mutation re-runs the same
+        // doomed cancel and 500s. The intent is already paid (refunds run via
+        // `refundPayment`, never here), so a terminal intent means the session
+        // is effectively already gone → treat the delete as an idempotent
+        // no-op success instead of propagating. `buildError()` flattens the
+        // Stripe error (drops `payment_intent`), so re-derive the authoritative
+        // status via a fresh retrieve rather than parsing the message.
+        if (await this.__paymentIntentIsTerminal(args[0])) {
+          return { data: (args[0] as { data?: unknown } | undefined)?.data ?? {} }
+        }
+        throw error
+      }
+    }
+
+    /**
+     * True when the session's Stripe PaymentIntent is in a terminal state that
+     * Stripe refuses to cancel (`succeeded`/`canceled`). Used by
+     * `deletePayment` to make session-abandonment idempotent. Any retrieve
+     * failure (network / missing id) returns false so the original delete error
+     * still propagates (fail-closed: never silently swallow a real failure).
+     */
+    private async __paymentIntentIsTerminal(input: any): Promise<boolean> {
+      if (!input?.data?.id) return false
+      try {
+        const retrieved = await super.retrievePayment(input)
+        const status = (retrieved?.data as { status?: string } | undefined)?.status
+        return isUncancelablePaymentIntentStatus(status)
+      } catch {
+        return false
+      }
     }
     async refundPayment(...args: any[]): Promise<any> {
       await this.__ensureResolved()
