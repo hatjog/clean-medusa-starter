@@ -28,12 +28,23 @@ type VendorLocation = {
   address?: string
   postal_code?: string
   country_code?: string
+  region?: string
+  lat?: number
+  lng?: number
 }
+
+type VendorOpeningHours = Record<string, { open: string; close: string } | null>
 
 type VendorSeo = {
   meta_title?: string
   meta_description?: string
   [key: string]: unknown
+}
+
+type VendorGalleryImage = {
+  url?: string
+  alt?: string | null
+  is_primary?: boolean
 }
 
 type VendorSocialLinks = {
@@ -54,9 +65,11 @@ type VendorFixture = {
   description?: string
   photo_url?: string
   gallery_urls?: string[]
+  gallery?: VendorGalleryImage[]
   social_links?: VendorSocialLinks
   seo?: VendorSeo
   locations?: VendorLocation[]
+  opening_hours?: VendorOpeningHours
 }
 
 type MarketConfig = {
@@ -182,6 +195,27 @@ function pushUniqueWarning(warnings: string[], seenWarnings: Set<string>, warnin
 
   seenWarnings.add(warning)
   warnings.push(warning)
+}
+
+function normalizeVendorGallery(vendor: VendorFixture): string[] | undefined {
+  const urls = Array.isArray(vendor.gallery_urls)
+    ? vendor.gallery_urls
+    : Array.isArray(vendor.gallery)
+      ? vendor.gallery.map((image) => image?.url)
+      : undefined
+
+  if (!urls) return undefined
+
+  const out: string[] = []
+  const seen = new Set<string>()
+  for (const url of urls) {
+    const trimmed = (url ?? "").trim()
+    if (!trimmed || seen.has(trimmed)) continue
+    seen.add(trimmed)
+    out.push(trimmed)
+  }
+
+  return out
 }
 
 function readSellerMarketId(value: unknown): string | null {
@@ -493,6 +527,7 @@ export async function upsertSeller(
   overwrite = false
 ): Promise<SellerSyncResult> {
   const handle = vendor.slug.trim()
+  const vendorGallery = normalizeVendorGallery(vendor)
 
   // Look up existing seller by handle
   let existingSellers: any[] = []
@@ -527,8 +562,8 @@ export async function upsertSeller(
       gpMetaSeeded.photo_url = vendor.photo_url
       seededFields.push("photo_url")
     }
-    if (vendor.gallery_urls !== undefined && vendor.gallery_urls !== null) {
-      gpMetaSeeded.gallery = vendor.gallery_urls
+    if (vendorGallery !== undefined) {
+      gpMetaSeeded.gallery = vendorGallery
       seededFields.push("gallery")
     }
 
@@ -538,12 +573,14 @@ export async function upsertSeller(
       ...(vendor.social_links ? { social_links: vendor.social_links } : {}),
       ...(vendor.seo ? { seo: vendor.seo } : {}),
       ...(vendor.locations ? { locations: vendor.locations } : {}),
+      ...(vendor.opening_hours ? { opening_hours: vendor.opening_hours } : {}),
       ...gpMetaSeeded,
     }
 
     const createPayload: Record<string, unknown> = {
       handle,
       name: vendor.display_name ?? handle,
+      ...(vendor.photo_url ? { logo: vendor.photo_url } : {}),
       email: vendor.email,
       phone: vendor.phone,
       tax_id: vendor.tax_id,
@@ -625,21 +662,22 @@ export async function upsertSeller(
     const r = resolveSeedIfEmpty(
       "photo_url",
       vendor.photo_url,
-      existingGp.photo_url,
+      existingGp.photo_url ?? existingSeller.logo,
       seededFields,
       overwrite
     )
     if (r.shouldWrite) {
       gpMetaUpdate.photo_url = r.value
+      configWinsPayload.logo = r.value
       if (r.isNewSeed) newlySeededFields.push("photo_url")
     }
   }
 
   // gallery
-  if (vendor.gallery_urls !== undefined) {
+  if (vendorGallery !== undefined) {
     const r = resolveSeedIfEmpty(
       "gallery",
-      vendor.gallery_urls,
+      vendorGallery,
       existingGp.gallery,
       seededFields,
       overwrite
@@ -648,6 +686,14 @@ export async function upsertSeller(
       gpMetaUpdate.gallery = r.value
       if (r.isNewSeed) newlySeededFields.push("gallery")
     }
+  }
+
+  if (vendor.locations !== undefined) {
+    gpMetaUpdate.locations = vendor.locations
+  }
+
+  if (vendor.opening_hours !== undefined) {
+    gpMetaUpdate.opening_hours = vendor.opening_hours
   }
 
   const updatedSeededFields = [...seededFields, ...newlySeededFields]
@@ -677,12 +723,12 @@ export async function upsertSeller(
       incomingSeedValues.description = vendor.description
     }
     if (vendor.photo_url !== undefined) {
-      currentSeedValues.photo_url = existingGp.photo_url
+      currentSeedValues.photo_url = existingGp.photo_url ?? existingSeller.logo
       incomingSeedValues.photo_url = vendor.photo_url
     }
-    if (vendor.gallery_urls !== undefined) {
+    if (vendorGallery !== undefined) {
       currentSeedValues.gallery = existingGp.gallery
-      incomingSeedValues.gallery = vendor.gallery_urls
+      incomingSeedValues.gallery = vendorGallery
     }
 
     const note = formatSeedDiffNote(currentSeedValues, incomingSeedValues)

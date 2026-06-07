@@ -8,6 +8,26 @@ type QueryGraphResult = {
   data: Array<Record<string, unknown>>;
 };
 
+type GalleryItem = {
+  url: string;
+  alt?: string | null;
+  is_primary?: boolean;
+};
+
+type GpMetadata = {
+  photo_url?: string | null;
+  gallery?: Array<string | GalleryItem> | null;
+  locations?: Array<{
+    city?: string | null;
+    address?: string | null;
+    address_line?: string | null;
+    postal_code?: string | null;
+    country_code?: string | null;
+    region?: string | null;
+    district?: string | null;
+  }> | null;
+};
+
 type ProductCountRow = {
   seller_id: string;
   product_count: string;
@@ -15,7 +35,19 @@ type ProductCountRow = {
 
 // Note: `city` removed — Mercur 2 seller entity has no `city` column.
 // TODO(v1.7.0): add address-based city lookup if the UI requires it.
-const SELLER_LIST_FIELDS = ["id", "name", "handle", "photo"] as const;
+const SELLER_LIST_FIELDS = ["id", "name", "handle", "photo", "logo", "metadata"] as const;
+
+function getGpMetadata(seller: Record<string, unknown>): GpMetadata {
+  return (((seller.metadata as Record<string, unknown> | null)?.gp ?? {}) as GpMetadata) ?? {};
+}
+
+function normalizeGallery(gallery: GpMetadata["gallery"] | undefined): GalleryItem[] {
+  if (!Array.isArray(gallery)) return [];
+
+  return gallery
+    .map((item) => (typeof item === "string" ? { url: item } : item))
+    .filter((item): item is GalleryItem => Boolean(item?.url));
+}
 
 export async function GET(req: MedusaRequest, res: MedusaResponse) {
   const salesChannelId = marketContextStorage.getStore()?.sales_channel_id;
@@ -97,8 +129,26 @@ export async function GET(req: MedusaRequest, res: MedusaResponse) {
       .map((sellerId) => {
         const seller = sellersById.get(sellerId);
         if (!seller) return undefined;
+        const gp = getGpMetadata(seller);
+        const primaryLocation = Array.isArray(gp.locations)
+          ? (gp.locations.find(Boolean) ?? null)
+          : null;
         return {
           ...seller,
+          photo:
+            (seller.photo as string | null | undefined) ??
+            (seller.logo as string | null | undefined) ??
+            gp.photo_url ??
+            null,
+          gallery: normalizeGallery(gp.gallery),
+          city: primaryLocation?.city ?? null,
+          address:
+            primaryLocation?.address_line ??
+            primaryLocation?.address ??
+            null,
+          postal_code: primaryLocation?.postal_code ?? null,
+          country_code: primaryLocation?.country_code ?? null,
+          district: primaryLocation?.district ?? primaryLocation?.region ?? null,
           product_count: productCountBySellerId.get(sellerId) ?? 0,
         };
       })

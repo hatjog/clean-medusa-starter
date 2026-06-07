@@ -142,6 +142,14 @@ function fsSyncExists(candidate: string): boolean {
   }
 }
 
+function normalizeCountryCode(value: string | undefined | null): string {
+  return (value ?? "").trim().toLowerCase()
+}
+
+function uniq(values: string[]): string[] {
+  return Array.from(new Set(values.filter(Boolean)))
+}
+
 function resolveSummaryPath(): string {
   return path.resolve(
     process.env.GP_SYNC_CATALOG_SUMMARY ??
@@ -606,7 +614,9 @@ export async function validatePrerequisites(
   container: any,
   marketId: string,
   currency: string,
-  warnings: string[]
+  warnings: string[],
+  dryRun = false,
+  countries: string[] = []
 ): Promise<Prerequisites> {
   // 1. Sales channel — fail-fast
   const salesChannelService = resolveService(container, [
@@ -715,9 +725,71 @@ export async function validatePrerequisites(
     (r: any) => (r?.currency_code ?? "").toUpperCase() === upperCurrency
   )
   if (matchingRegions.length === 0) {
-    throw new Error(
-      `No region found with currency_code '${currency}'. ` +
-        `Ensure a region with currency '${currency}' exists in Medusa Admin or seed.`
+    if (dryRun) {
+      warnings.push(
+        `No region found with currency_code '${currency}'. Dry-run continues; real seed must create or bootstrap this region first.`
+      )
+      return { salesChannelId, shippingProfileId }
+    }
+
+    const createFnName = ["createRegions", "createRegion", "create"].find(
+      (name) => typeof regionService?.[name] === "function"
+    )
+    if (!createFnName) {
+      throw new Error(
+        `No region found with currency_code '${currency}' and region service cannot create regions. ` +
+          `Ensure a region with currency '${currency}' exists in Medusa Admin or seed.`
+      )
+    }
+
+    const assignedCountries = new Set<string>(
+      allRegions.flatMap((region: any) =>
+        Array.isArray(region?.countries)
+          ? region.countries.map((country: any) =>
+              normalizeCountryCode(typeof country === "string" ? country : country?.iso_2)
+            )
+          : []
+      )
+    )
+    try {
+      const db = container.resolve(ContainerRegistrationKeys.PG_CONNECTION) as any
+      const result = await db.raw(
+        `
+          SELECT DISTINCT lower(iso_2) AS iso_2
+          FROM region_country
+          WHERE deleted_at IS NULL
+        `
+      )
+      const rows = Array.isArray(result?.rows) ? result.rows : Array.isArray(result) ? result : []
+      for (const row of rows) {
+        const country = normalizeCountryCode(row?.iso_2)
+        if (country) assignedCountries.add(country)
+      }
+    } catch {
+      // Region service data above is the fallback in non-DB contexts.
+    }
+    const normalizedCountries = uniq(countries.map(normalizeCountryCode))
+      .filter((country) => !assignedCountries.has(country))
+    const regionName = upperCurrency === "EUR"
+      ? "Europe"
+      : normalizedCountries.length === 1
+        ? `${normalizedCountries[0].toUpperCase()} ${upperCurrency}`
+        : `${upperCurrency} Market Region`
+
+    await regionService[createFnName]({
+      name: regionName,
+      currency_code: currency.toLowerCase(),
+      countries: normalizedCountries,
+      automatic_taxes: true,
+      metadata: {
+        gp_seeded_by: "gp-config-sync-catalog",
+        gp_market_id: marketId,
+        gp_seed_region: `${currency.toLowerCase()}/${normalizedCountries.join(",") || "global"}`,
+      },
+    })
+
+    warnings.push(
+      `Created missing region '${regionName}' for currency '${currency}' before catalog sync.`
     )
   }
 
@@ -1522,6 +1594,7 @@ type MarketVendor = {
 
 type MarketConfig = {
   market_id: string
+  countries?: string[]
   vendors?: MarketVendor[]
 }
 
@@ -1933,6 +2006,14 @@ export default async function gpConfigSyncCatalog({ container, args }: ExecArgs)
   const categories = catalog.categories ?? []
   const collections = catalog.collections ?? []
   const products = catalog.products ?? []
+  const marketConfigPath = path.resolve(configRoot, instanceId, "markets", marketId, "market.yaml")
+  let marketCountries: string[] = []
+  try {
+    const marketConfig = await readYamlFile<MarketConfig>(marketConfigPath)
+    marketCountries = Array.isArray(marketConfig.countries) ? marketConfig.countries : []
+  } catch {
+    marketCountries = []
+  }
 
   if (categories.length === 0) console.warn("Warning: 0 categories in fixture — intentional?")
   if (products.length === 0) console.warn("Warning: 0 products in fixture — intentional?")
@@ -1962,13 +2043,27 @@ export default async function gpConfigSyncCatalog({ container, args }: ExecArgs)
 
   // Prerequisites (fail-fast on critical) — validate region for each currency
   console.log(`Validating prerequisites for market '${marketId}'...`)
-  const prereqs = await validatePrerequisites(container, marketId, activeCurrency, warnings)
+  const prereqs = await validatePrerequisites(
+    container,
+    marketId,
+    activeCurrency,
+    warnings,
+    Boolean(collector),
+    marketCountries
+  )
   console.log(`  ✓ Sales channel: ${prereqs.salesChannelId}`)
   console.log(`  ✓ Shipping profile: ${prereqs.shippingProfileId}`)
   console.log(`  ✓ Region with currency '${activeCurrency}' found`)
   for (const currency of allCurrencies.slice(1)) {
     try {
-      await validatePrerequisites(container, marketId, currency, warnings)
+      await validatePrerequisites(
+        container,
+        marketId,
+        currency,
+        warnings,
+        Boolean(collector),
+        marketCountries
+      )
       console.log(`  ✓ Region with currency '${currency}' found`)
     } catch (e: any) {
       warnings.push(`Additional currency '${currency}': ${e?.message ?? String(e)}`)
@@ -2009,7 +2104,6 @@ export default async function gpConfigSyncCatalog({ container, args }: ExecArgs)
   )
 
   // Build vendor pricing map before product sync (now wired to real seller store_status)
-  const marketConfigPath = path.resolve(configRoot, instanceId, "markets", marketId, "market.yaml")
   const resolvedVendorPricingMap = await buildVendorPricingMap(
     marketConfigPath,
     warnings,
