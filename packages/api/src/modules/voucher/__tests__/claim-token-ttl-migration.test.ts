@@ -45,6 +45,11 @@ describe("Story 7.4 AC1-a — migracja claim_token_issued_at (TTL magic-link)", 
     expect(up).toMatch(/NEW\.claim_token_issued_at IS NULL/)
   })
 
+  it("czyści stempel gdy claim_token zostaje wyzerowany (NULL) — brak stale issued_at", () => {
+    // Outer ELSE (NEW.claim_token IS NULL) ⇒ NEW.claim_token_issued_at := NULL.
+    expect(up).toMatch(/ELSE\s+[\s\S]*NEW\.claim_token_issued_at\s*:=\s*NULL/)
+  })
+
   it("podpina trigger BEFORE INSERT OR UPDATE", () => {
     expect(up).toMatch(
       /CREATE TRIGGER trg_entitlement_instance_stamp_claim_token_issued_at/

@@ -11,7 +11,7 @@
  * Rozdział scope tokenów: ten TTL dotyczy voucher-claim, NIE auth-login.
  */
 
-import { describe, it, expect } from "@jest/globals"
+import { afterEach, beforeEach, describe, it, expect, jest } from "@jest/globals"
 import {
   DEFAULT_CLAIM_TOKEN_TTL_HOURS,
   EXPIRED_CLAIM_LINK_GONE_BODY,
@@ -132,6 +132,47 @@ describe("Story 7.4 — TTL magic-link voucher-claim (ADR-138 DEC-1)", () => {
       expect(
         resolveClaimTokenTtlHours(null, { VOUCHER_CLAIM_MAGIC_LINK_TTL_HOURS: "abc" })
       ).toBe(DEFAULT_CLAIM_TOKEN_TTL_HOURS)
+    })
+
+    describe("observability na odrzuconym kandydacie (review fix LOW)", () => {
+      let warnSpy: ReturnType<typeof jest.spyOn>
+      beforeEach(() => {
+        warnSpy = jest.spyOn(console, "warn").mockImplementation(() => {})
+      })
+      afterEach(() => {
+        warnSpy.mockRestore()
+      })
+
+      it("ostrzega gdy wartość > MAX (za duża) i degraduje do default", () => {
+        const tooBig = String(24 * 365 + 1)
+        expect(
+          resolveClaimTokenTtlHours(null, { VOUCHER_CLAIM_MAGIC_LINK_TTL_HOURS: tooBig })
+        ).toBe(DEFAULT_CLAIM_TOKEN_TTL_HOURS)
+        expect(warnSpy).toHaveBeenCalledTimes(1)
+        expect(String(warnSpy.mock.calls[0][0])).toContain(tooBig)
+      })
+
+      it("ostrzega na śmieciowej/ujemnej wartości (raz per kandydat)", () => {
+        resolveClaimTokenTtlHours(null, { VOUCHER_CLAIM_MAGIC_LINK_TTL_HOURS: "abc" })
+        expect(warnSpy).toHaveBeenCalledTimes(1)
+      })
+
+      it("NIE ostrzega gdy env nieobecny (absent ≠ rejected)", () => {
+        resolveClaimTokenTtlHours(null, {})
+        expect(warnSpy).not.toHaveBeenCalled()
+      })
+
+      it("NIE ostrzega na pustym/whitespace stringu (brak konfiguracji)", () => {
+        resolveClaimTokenTtlHours(null, { VOUCHER_CLAIM_MAGIC_LINK_TTL_HOURS: "  " })
+        expect(warnSpy).not.toHaveBeenCalled()
+      })
+
+      it("NIE ostrzega gdy wartość poprawna", () => {
+        expect(
+          resolveClaimTokenTtlHours(null, { VOUCHER_CLAIM_MAGIC_LINK_TTL_HOURS: "48" })
+        ).toBe(48)
+        expect(warnSpy).not.toHaveBeenCalled()
+      })
     })
   })
 
