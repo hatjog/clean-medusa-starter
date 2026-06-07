@@ -34,7 +34,8 @@ type SellerLocation = {
 type GpMetadata = {
   social_links?: SocialLinks | null;
   locations?: SellerLocation[];
-  gallery?: GalleryItem[];
+  photo_url?: string | null;
+  gallery?: Array<string | GalleryItem>;
   opening_hours?: OpeningHours | null;
   seeded_fields?: string[];
 };
@@ -61,8 +62,19 @@ const SELLER_PROFILE_FIELDS = [
   "handle",
   "description",
   "photo",
+  "logo",
   "metadata",
 ] as const;
+
+function normalizeGallery(
+  gallery: GpMetadata["gallery"] | undefined
+): GalleryItem[] {
+  if (!Array.isArray(gallery)) return [];
+
+  return gallery
+    .map((item) => (typeof item === "string" ? { url: item } : item))
+    .filter((item): item is GalleryItem => Boolean(item?.url));
+}
 
 export async function GET(req: MedusaRequest, res: MedusaResponse) {
   const salesChannelId = marketContextStorage.getStore()?.sales_channel_id;
@@ -124,10 +136,14 @@ export async function GET(req: MedusaRequest, res: MedusaResponse) {
     name: (rawSeller.name as string) ?? "",
     handle: (rawSeller.handle as string) ?? "",
     description: (rawSeller.description as string | null) ?? null,
-    photo: (rawSeller.photo as string | null) ?? null,
+    photo:
+      (rawSeller.photo as string | null | undefined) ??
+      (rawSeller.logo as string | null | undefined) ??
+      gp.photo_url ??
+      null,
     social_links: gp.social_links ?? null,
     locations: gp.locations ?? [],
-    gallery: gp.gallery ?? [],
+    gallery: normalizeGallery(gp.gallery),
     opening_hours: gp.opening_hours ?? null,
   };
 

@@ -127,7 +127,7 @@ describe("GET /store/seller/[handle] — enriched profile", () => {
     expect(mockQuery.graph).toHaveBeenCalledWith(
       {
         entity: "seller",
-        fields: ["id", "name", "handle", "description", "photo", "metadata"],
+        fields: ["id", "name", "handle", "description", "photo", "logo", "metadata"],
         filters: {
           id: "seller_123",
         },
@@ -156,6 +156,43 @@ describe("GET /store/seller/[handle] — enriched profile", () => {
       tuesday: "09:00-18:00",
       sunday: null,
     });
+  });
+
+  it("3.2b: falls back to seller logo and metadata photo/gallery shapes", async () => {
+    mockGetStore.mockReturnValue({ sales_channel_id: "sc_bb" });
+    mockGetSellerIdByHandleForSalesChannel.mockResolvedValue("seller_321");
+
+    const sellerWithSeededMedia = {
+      id: "seller_321",
+      name: "Studio Nova",
+      handle: "studio-nova",
+      description: "Seeded vendor",
+      photo: null,
+      logo: "https://cdn.example.com/logo.jpg",
+      metadata: {
+        gp: {
+          photo_url: "https://cdn.example.com/photo.jpg",
+          gallery: ["https://cdn.example.com/g1.jpg"],
+        },
+      },
+    };
+
+    const mockQuery = {
+      graph: jest.fn().mockResolvedValue({ data: [sellerWithSeededMedia] }),
+    };
+
+    const req = createRequest("studio-nova", (key: string) => {
+      if (key === "__pg_connection__") return jest.fn();
+      if (key === "query") return mockQuery;
+      return undefined;
+    });
+    const res = createResponse();
+
+    await GET(req, res as unknown as Parameters<typeof GET>[1]);
+
+    const body = res.body as { seller: Record<string, unknown> };
+    expect(body.seller.photo).toBe("https://cdn.example.com/logo.jpg");
+    expect(body.seller.gallery).toEqual([{ url: "https://cdn.example.com/g1.jpg" }]);
   });
 
   it("3.3: returns safe defaults when metadata is absent", async () => {

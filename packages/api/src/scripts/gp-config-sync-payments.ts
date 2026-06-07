@@ -65,6 +65,30 @@ function uniq(values: string[]): string[] {
   return Array.from(new Set(values.filter(Boolean)))
 }
 
+function firstFunction(obj: any, names: string[]) {
+  for (const name of names) {
+    const candidate = obj?.[name]
+    if (typeof candidate === "function") {
+      return candidate.bind(obj)
+    }
+  }
+
+  return null
+}
+
+async function tryCall(fn: any, candidates: any[][]): Promise<any> {
+  let lastError: unknown
+  for (const args of candidates) {
+    try {
+      return await fn(...args)
+    } catch (error) {
+      lastError = error
+    }
+  }
+
+  throw lastError
+}
+
 async function readYamlFile<T>(filePath: string): Promise<T> {
   const raw = await fs.readFile(filePath, "utf8")
   const doc = yaml.load(raw, { schema: yaml.JSON_SCHEMA })
@@ -161,6 +185,113 @@ export function selectRegionForMarket(
   )
 }
 
+function resolveRegionService(container: any): any {
+  const keysToTry = [
+    "region",
+    "regionModuleService",
+    "IRegionModuleService",
+    "region_module",
+  ]
+
+  const errors: string[] = []
+  for (const key of keysToTry) {
+    try {
+      return container.resolve(key)
+    } catch (error: any) {
+      errors.push(`${key}: ${error?.message ?? String(error)}`)
+    }
+  }
+
+  throw new Error(
+    `Cannot resolve region service. Tried keys: ${keysToTry.join(", ")}. Errors: ${errors.join(" | ")}`
+  )
+}
+
+async function createRegion(service: any, data: Record<string, unknown>): Promise<any> {
+  const createFn = firstFunction(service, ["createRegions", "createRegion", "create"])
+
+  if (!createFn) {
+    throw new Error("Region service does not expose a supported create method (createRegions/create*)")
+  }
+
+  return tryCall(createFn, [
+    [[data]],
+    [[data], {}],
+    [data],
+    [data, {}],
+  ])
+}
+
+function buildRegionName(currency: string, countries: string[]): string {
+  const normalizedCurrency = normalizeCurrencyCode(currency).toUpperCase()
+  const normalizedCountries = uniq(countries.map((country) => normalizeCountryCode(country).toUpperCase()))
+
+  if (normalizedCurrency === "EUR") return "Europe"
+  if (normalizedCountries.length === 1) return `${normalizedCountries[0]} ${normalizedCurrency}`
+  if (normalizedCountries.length > 1) return `${normalizedCurrency} Market Region`
+  return `${normalizedCurrency} Region`
+}
+
+async function ensureRegionForMarket(
+  container: any,
+  db: Knex,
+  currency: string,
+  countries: string[],
+  dryRun: boolean
+): Promise<{ region: RegionRow; created: boolean; dryRunCreated: boolean }> {
+  const initialRegions = await listRegionsWithCountries(db)
+
+  try {
+    return {
+      region: selectRegionForMarket(initialRegions, currency, countries),
+      created: false,
+      dryRunCreated: false,
+    }
+  } catch (error: any) {
+    if (!String(error?.message ?? error).includes("No region found for currency")) {
+      throw error
+    }
+  }
+
+  const normalizedCurrency = normalizeCurrencyCode(currency)
+  const assignedCountries = new Set(
+    initialRegions.flatMap((region) => region.country_codes)
+  )
+  const normalizedCountries = uniq(countries.map(normalizeCountryCode))
+    .filter((country) => !assignedCountries.has(country))
+  const regionName = buildRegionName(currency, countries)
+
+  if (dryRun) {
+    return {
+      region: {
+        id: `dry-run-region-${normalizedCurrency}-${normalizedCountries.join("-") || "global"}`,
+        name: regionName,
+        currency_code: normalizedCurrency,
+        country_codes: normalizedCountries,
+      },
+      created: false,
+      dryRunCreated: true,
+    }
+  }
+
+  await createRegion(resolveRegionService(container), {
+    name: regionName,
+    currency_code: normalizedCurrency,
+    countries: normalizedCountries,
+    automatic_taxes: true,
+    metadata: {
+      gp_seeded_by: "gp-config-sync-payments",
+      gp_seed_region: `${normalizedCurrency}/${normalizedCountries.join(",") || "global"}`,
+    },
+  })
+
+  return {
+    region: selectRegionForMarket(await listRegionsWithCountries(db), currency, countries),
+    created: true,
+    dryRunCreated: false,
+  }
+}
+
 export async function listEnabledPaymentProviderIds(db: Knex): Promise<string[]> {
   const result = await db.raw(
     `
@@ -242,12 +373,12 @@ export default async function gpConfigSyncPayments({ container, args }: ExecArgs
     throw new Error("market.currency is required to resolve region payment providers")
   }
 
-  const [regions, availableProviderIds] = await Promise.all([
-    listRegionsWithCountries(db),
+  const [regionResult, availableProviderIds] = await Promise.all([
+    ensureRegionForMarket(container, db, currency, countries, parsedArgs.dryRun),
     listEnabledPaymentProviderIds(db),
   ])
 
-  const region = selectRegionForMarket(regions, currency, countries)
+  const region = regionResult.region
   const resolution = resolvePaymentProviderId(
     configuredProviderId,
     availableProviderIds
@@ -267,6 +398,8 @@ export default async function gpConfigSyncPayments({ container, args }: ExecArgs
           market_id: parsedArgs.marketId,
           region_id: region.id,
           region_name: region.name,
+          region_created: regionResult.created,
+          region_dry_run_created: regionResult.dryRunCreated,
           configured_provider_id: configuredProviderId,
           effective_provider_id: resolution.providerId,
           fallback_applied: resolution.fallbackApplied,
@@ -289,6 +422,8 @@ export default async function gpConfigSyncPayments({ container, args }: ExecArgs
         market_id: parsedArgs.marketId,
         region_id: region.id,
         region_name: region.name,
+        region_created: regionResult.created,
+        region_dry_run_created: regionResult.dryRunCreated,
         configured_provider_id: configuredProviderId,
         effective_provider_id: resolution.providerId,
         fallback_applied: resolution.fallbackApplied,

@@ -754,7 +754,7 @@ export default async function gpConfigSyncShipping({ container, args }: ExecArgs
     throw new Error("market.currency is required to bootstrap shipping options")
   }
 
-  const prereqs = await validatePrerequisites(container, parsedArgs.marketId, currency, [])
+  const prereqs = await validatePrerequisites(container, parsedArgs.marketId, currency, [], parsedArgs.dryRun)
 
   const marketSellers = await listMarketSellers(db, parsedArgs.marketId)
   const bootstrappedFulfillment = await ensureMarketSellerFulfillmentZones(
@@ -845,7 +845,19 @@ export default async function gpConfigSyncShipping({ container, args }: ExecArgs
     listMarketServiceZones(db, prereqs.salesChannelId),
   ])
 
-  const region = selectRegionForMarket(regions, currency, countries)
+  let region
+  try {
+    region = selectRegionForMarket(regions, currency, countries)
+  } catch (error: any) {
+    if (parsedArgs.dryRun && String(error?.message ?? error).includes("No region found for currency")) {
+      console.warn(
+        `No region found for currency '${currency}'. Dry-run skips shipping option sync; real seed must create or bootstrap this region first.`
+      )
+      return
+    }
+
+    throw error
+  }
 
   if (shippingProfileIds.length === 0) {
     console.warn(`No shipping profiles found for market '${parsedArgs.marketId}'. Skipping shipping sync.`)
