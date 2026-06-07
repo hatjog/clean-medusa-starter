@@ -66,6 +66,11 @@ export class Migration1778930000000 extends Migration {
             -- niezależnie od poprzedniej wartości issued_at — nowy token = nowe TTL.
             NEW.claim_token_issued_at := NOW();
           END IF;
+        ELSE
+          -- claim_token wyzerowany (NULL): wyczyść stempel, by nie zostawiać
+          -- nieaktualnego issued_at po tokenie, który już nie istnieje
+          -- (review fix LOW — stale stamp on token unset).
+          NEW.claim_token_issued_at := NULL;
         END IF;
         RETURN NEW;
       END;

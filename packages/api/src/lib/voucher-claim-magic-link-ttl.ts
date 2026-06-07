@@ -72,10 +72,21 @@ export function resolveClaimTokenTtlHours(marketId?: string | null, env?: EnvLik
 
   for (const raw of candidates) {
     if (raw == null) continue
-    const parsed = Number(raw.trim())
+    const trimmed = raw.trim()
+    if (trimmed === "") continue // pusty string = brak konfiguracji, nie ostrzegamy
+    const parsed = Number(trimmed)
     if (Number.isFinite(parsed) && parsed > 0 && parsed <= MAX_CLAIM_TOKEN_TTL_HOURS) {
       return parsed
     }
+    // Observability (review fix LOW): kandydat OBECNY ale ODRZUCONY (non-finite,
+    // ≤0, lub > MAX). Bez tego operator, który ustawił za dużą/błędną wartość,
+    // jest po cichu zredukowany do 24h. NIE zmieniamy fallbacku (default = fail-safe);
+    // tylko sygnalizujemy. Ostrzegamy raz per odrzucony niepusty kandydat.
+    console.warn(
+      `[voucher-claim-magic-link-ttl] Odrzucono skonfigurowaną wartość TTL "${trimmed}" ` +
+        `(dozwolone: liczba w zakresie 1..${MAX_CLAIM_TOKEN_TTL_HOURS}h). ` +
+        `Fallback do domyślnych ${DEFAULT_CLAIM_TOKEN_TTL_HOURS}h.`
+    )
   }
   return DEFAULT_CLAIM_TOKEN_TTL_HOURS
 }
