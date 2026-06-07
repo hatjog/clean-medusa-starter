@@ -1,5 +1,6 @@
 /**
- * GET /api/v1/admin/entitlements
+ * GET /v1/admin/entitlements
+ * (Medusa file-routing: src/api/v1/... → URL /v1/...; `api/` is the router root, not a URL segment.)
  *
  * Operator entitlement lookup (Story 8.1 — "30-second test").
  * Protected by operatorAuthMiddleware (AC-4, AC-5, AC-6).

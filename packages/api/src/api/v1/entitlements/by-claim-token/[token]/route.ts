@@ -1,5 +1,6 @@
 /**
- * GET /api/v1/entitlements/by-claim-token/:token — v1.9.0 Wave F6 / HIGH-04.
+ * GET /v1/entitlements/by-claim-token/:token — v1.9.0 Wave F6 / HIGH-04.
+ * (Medusa file-routing: src/api/v1/... → URL /v1/...; `api/` is the router root, not a URL segment.)
  *
  * Resolves a public claim_token to entitlement + voucher metadata for the
  * `apps/web/src/app/claim/[claim_token]/page.tsx` SSR fetch. Reads from the

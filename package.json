@@ -13,7 +13,7 @@
     "mercur"
   ],
   "scripts": {
-    "build": "medusa build",
+    "build": "medusa build && node ./scripts/mirror-built-api-routes.mjs",
     "start": "medusa start",
     "dev": "medusa develop",
     "db:migrate:app": "ts-node ./packages/api/src/scripts/run-app-migrations.ts",
