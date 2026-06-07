@@ -7,7 +7,7 @@ import path from "node:path"
 
 import * as yaml from "js-yaml"
 
-import { parseDryRunFlag, parseOverwriteFlag } from "./gp-sync-dry-run"
+import { parseDryRunFlag, parseOverwriteFlag, parsePruneFlag } from "./gp-sync-dry-run"
 import gpConfigSyncAccounts from "./gp-config-sync-accounts"
 import gpConfigSyncBlog from "./gp-config-sync-blog"
 import gpConfigSyncCatalog from "./gp-config-sync-catalog"
@@ -28,6 +28,7 @@ type OrchestratorArgs = {
   configRoot: string
   dryRun: boolean
   overwrite: boolean
+  prune: boolean
 }
 
 type StageRunResult = {
@@ -102,13 +103,14 @@ export function parseOrchestratorArgs(args: string[] | undefined): OrchestratorA
   ).trim()
   const dryRun = parseDryRunFlag(args)
   const overwrite = parseOverwriteFlag(args)
+  const prune = parsePruneFlag(args)
   const allowSkip = args?.includes("--allow-skip") === true
 
   if (!instanceId) throw new Error("instanceId is required (args[0] or GP_INSTANCE_ID)")
   if (!marketId) throw new Error("marketId is required (args[1] or GP_MARKET_ID)")
   if (!configRoot) throw new Error("configRoot is required (GP_CONFIG_ROOT)")
 
-  return { allowSkip, instanceId, marketId, configRoot, dryRun, overwrite }
+  return { allowSkip, instanceId, marketId, configRoot, dryRun, overwrite, prune }
 }
 
 export function assertTranslationStageGate(
@@ -311,6 +313,9 @@ function buildStageArgs(orchestratorArgs: OrchestratorArgs): string[] {
   if (orchestratorArgs.overwrite) {
     args.push("--overwrite")
   }
+  if (orchestratorArgs.prune) {
+    args.push("--prune")
+  }
   return args
 }
 
@@ -324,6 +329,7 @@ async function withStageEnv<T>(
     GP_INSTANCE_ID: process.env.GP_INSTANCE_ID,
     GP_MARKET_ID: process.env.GP_MARKET_ID,
     GP_OVERWRITE: process.env.GP_OVERWRITE,
+    GP_SYNC_PRUNE: process.env.GP_SYNC_PRUNE,
   }
 
   process.env.GP_CONFIG_ROOT = orchestratorArgs.configRoot
@@ -331,6 +337,7 @@ async function withStageEnv<T>(
   process.env.GP_INSTANCE_ID = orchestratorArgs.instanceId
   process.env.GP_MARKET_ID = orchestratorArgs.marketId
   process.env.GP_OVERWRITE = orchestratorArgs.overwrite ? "true" : "false"
+  process.env.GP_SYNC_PRUNE = orchestratorArgs.prune ? "true" : "false"
 
   try {
     return await action()
@@ -349,6 +356,9 @@ async function withStageEnv<T>(
 
     if (previous.GP_OVERWRITE === undefined) delete process.env.GP_OVERWRITE
     else process.env.GP_OVERWRITE = previous.GP_OVERWRITE
+
+    if (previous.GP_SYNC_PRUNE === undefined) delete process.env.GP_SYNC_PRUNE
+    else process.env.GP_SYNC_PRUNE = previous.GP_SYNC_PRUNE
   }
 }
 

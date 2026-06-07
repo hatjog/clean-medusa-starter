@@ -19,6 +19,7 @@ import {
   DryRunCollector,
   parseDryRunFlag,
   parseOverwriteFlag,
+  parsePruneFlag,
 } from "./gp-sync-dry-run"
 
 // ---- Types ----
@@ -87,7 +88,7 @@ export type SellerSyncResult = {
 type SplDetail = {
   vendor_id: string
   fixture_id: string
-  status: "created" | "skipped" | "missing_product"
+  status: "created" | "skipped" | "missing_product" | "pruned"
   product_db_id?: string
   reason?: string
 }
@@ -97,7 +98,7 @@ type SyncSummary = {
   instance_id: string
   market_id: string
   vendors: { created: number; updated: number; skipped: number }
-  spl: { created: number; skipped: number; missing_products: number }
+  spl: { created: number; skipped: number; missing_products: number; pruned: number }
   stale_sellers: { inactivated: number; skipped: number }
   spl_details: SplDetail[]
   warnings: string[]
@@ -151,18 +152,20 @@ function parseArgs(args: string[] | undefined): {
   configRoot: string
   dryRun: boolean
   overwrite: boolean
+  prune: boolean
 } {
   const instanceId = (args?.[0] ?? process.env.GP_INSTANCE_ID ?? "gp-dev").trim()
   const marketId = (args?.[1] ?? process.env.GP_MARKET_ID ?? "bonbeauty").trim()
   const configRoot = (process.env.GP_CONFIG_ROOT ?? path.resolve(process.cwd(), "../config")).trim()
   const dryRun = parseDryRunFlag(args)
   const overwrite = parseOverwriteFlag(args)
+  const prune = parsePruneFlag(args)
 
   if (!instanceId) throw new Error("instanceId is required (args[0] or GP_INSTANCE_ID)")
   if (!marketId) throw new Error("marketId is required (args[1] or GP_MARKET_ID)")
   if (!configRoot) throw new Error("configRoot is required (GP_CONFIG_ROOT)")
 
-  return { instanceId, marketId, configRoot, dryRun, overwrite }
+  return { instanceId, marketId, configRoot, dryRun, overwrite, prune }
 }
 
 async function readYamlFile<T>(filePath: string): Promise<T> {
@@ -322,6 +325,28 @@ export async function findConflictingSellerLink(
     .whereNull("deleted_at")
     .first()
   return row ?? null
+}
+
+/**
+ * --prune helper: return the seller's ACTIVE product↔seller links whose product
+ * is NOT in `keepProductIds` (i.e. dropped from the vendor's config) — the rows
+ * a prune pass would soft-delete. FAIL-SAFE: when `keepProductIds` is empty
+ * (config unreadable / no products resolved) it returns [] so a transient empty
+ * config can never wipe a seller's entire catalog. Scoped to ONE seller; the
+ * caller performs the soft-delete (kept side-effect-free for unit coverage).
+ */
+export async function pruneStaleSellerProductLinks(
+  db: any,
+  sellerId: string,
+  keepProductIds: ReadonlySet<string> | string[]
+): Promise<Array<{ id: string; product_id: string }>> {
+  const keep = Array.isArray(keepProductIds) ? keepProductIds : [...keepProductIds]
+  if (keep.length === 0) return []
+  return db("product_product_seller_seller")
+    .where({ seller_id: sellerId })
+    .whereNull("deleted_at")
+    .whereNotIn("product_id", keep)
+    .select("id", "product_id")
 }
 
 async function createSellerRecord(sellerModuleService: any, payload: Record<string, unknown>): Promise<any> {
@@ -769,7 +794,7 @@ export async function upsertSeller(
 // ---- Default export: Medusa script entrypoint ----
 
 export default async function gpConfigSyncVendors({ container, args }: ExecArgs) {
-  const { instanceId, marketId, configRoot, dryRun, overwrite } = parseArgs(args)
+  const { instanceId, marketId, configRoot, dryRun, overwrite, prune } = parseArgs(args)
   const collector = dryRun ? new DryRunCollector() : undefined
 
   const marketYamlPath = path.resolve(
@@ -843,7 +868,7 @@ export default async function gpConfigSyncVendors({ container, args }: ExecArgs)
   const warnings: string[] = []
   const seenWarnings = new Set<string>()
   const vendorCounts = { created: 0, updated: 0, skipped: 0 }
-  const splCounts = { created: 0, skipped: 0, missing_products: 0 }
+  const splCounts = { created: 0, skipped: 0, missing_products: 0, pruned: 0 }
   const staleSellerCounts = { inactivated: 0, skipped: 0 }
   const splDetails: SplDetail[] = []
 
@@ -923,8 +948,10 @@ export default async function gpConfigSyncVendors({ container, args }: ExecArgs)
         )
 
         let vendorProducts: VendorProductsFile = {}
+        let vendorProductsReadOk = false
         try {
           vendorProducts = await readYamlFile(vendorProductsPath)
+          vendorProductsReadOk = true
         } catch (e: any) {
           pushUniqueWarning(
             warnings,
@@ -933,6 +960,11 @@ export default async function gpConfigSyncVendors({ container, args }: ExecArgs)
           )
           // Keep flow running so other vendors can still sync.
         }
+
+        // --prune keep-set: DB product ids this vendor SHOULD own per config
+        // (collected for every successfully-resolved fixture, even ones the
+        // single-seller guard skips — the vendor still owns them per config).
+        const keepProductIds = new Set<string>()
 
         for (const vp of vendorProducts.products ?? []) {
           const fixtureId = (vp.product_id ?? "").trim()
@@ -971,6 +1003,11 @@ export default async function gpConfigSyncVendors({ container, args }: ExecArgs)
             })
             continue
           }
+
+          // This product is declared by the vendor's config → it must survive a
+          // --prune pass for this seller (recorded before the single-seller
+          // guard, which may skip the *link* but not the ownership intent).
+          keepProductIds.add(product.id)
 
           if (resolved.strategy === "handle") {
             pushUniqueWarning(
@@ -1109,6 +1146,50 @@ export default async function gpConfigSyncVendors({ container, args }: ExecArgs)
                 reason: `${reason}; db-fallback-failed: ${dbReason}`,
               })
             }
+          }
+        }
+
+        // --prune: soft-delete this vendor's seller-product links to products no
+        // longer in its config. Gated on a successful products.yaml read (never
+        // prune on a read error) and on the helper's empty-keep-set fail-safe.
+        if (prune && vendorProductsReadOk) {
+          try {
+            const stale = await pruneStaleSellerProductLinks(
+              db,
+              result.sellerId,
+              keepProductIds
+            )
+            if (stale.length > 0) {
+              if (!dryRun) {
+                await db("product_product_seller_seller")
+                  .whereIn(
+                    "id",
+                    stale.map((r) => r.id)
+                  )
+                  .update({ deleted_at: new Date() })
+              }
+              splCounts.pruned += stale.length
+              pushUniqueWarning(
+                warnings,
+                seenWarnings,
+                `Vendor '${vendor.vendor_id}': ${dryRun ? "[dry-run] would prune" : "pruned"} ${stale.length} stale seller-product link(s) not in config`
+              )
+              for (const r of stale) {
+                splDetails.push({
+                  vendor_id: vendor.vendor_id,
+                  fixture_id: "",
+                  status: "pruned",
+                  product_db_id: r.product_id,
+                  reason: dryRun ? "prune-dry-run" : "pruned-not-in-config",
+                })
+              }
+            }
+          } catch (pruneError: any) {
+            pushUniqueWarning(
+              warnings,
+              seenWarnings,
+              `Vendor '${vendor.vendor_id}': prune failed - ${pruneError?.message ?? String(pruneError)}`
+            )
           }
         }
       }

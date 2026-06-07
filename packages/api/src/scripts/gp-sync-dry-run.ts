@@ -106,6 +106,16 @@ export function parseOverwriteFlag(args?: string[]): boolean {
   return parseCliBooleanFlag(args, "--overwrite", "GP_OVERWRITE")
 }
 
+/**
+ * --prune / GP_SYNC_PRUNE: reconcile DB rows to match config by also REMOVING
+ * (soft-delete) rows the config no longer declares — e.g. a vendor's
+ * seller-product links to products dropped from its products.yaml. Destructive,
+ * so it is OFF by default and gated behind this flag.
+ */
+export function parsePruneFlag(args?: string[]): boolean {
+  return parseCliBooleanFlag(args, "--prune", "GP_SYNC_PRUNE")
+}
+
 export class DryRunCollector {
   private readonly entries: DryRunEntry[] = []
 

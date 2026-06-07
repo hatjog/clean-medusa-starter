@@ -7,7 +7,11 @@
  * Pattern follows gp-config-sync-media.unit.spec.ts (story 7.6).
  */
 
-import { findConflictingSellerLink, upsertSeller } from '../scripts/gp-config-sync-vendors'
+import {
+  findConflictingSellerLink,
+  pruneStaleSellerProductLinks,
+  upsertSeller,
+} from '../scripts/gp-config-sync-vendors'
 
 // Minimal chainable knex-like mock that records the filters and returns a
 // configurable `.first()` row.
@@ -57,6 +61,67 @@ describe('findConflictingSellerLink — single-seller invariant', () => {
     // undefined row coalesces to null
     expect(await findConflictingSellerLink(db, 'prod_2', 'sel_mine')).toBeNull()
     expect(db.calls.whereNull).toBe('deleted_at')
+  })
+})
+
+// Chainable mock for the prune query: where → whereNull → whereNotIn → select.
+function makePruneDbMock(rows: Array<{ id: string; product_id: string }>) {
+  const calls: {
+    table?: string
+    where?: any
+    whereNull?: any
+    whereNotIn?: { col: string; vals: unknown[] }
+    select?: unknown[]
+  } = {}
+  const builder: any = {
+    where: (w: any) => {
+      calls.where = w
+      return builder
+    },
+    whereNull: (c: any) => {
+      calls.whereNull = c
+      return builder
+    },
+    whereNotIn: (col: string, vals: unknown[]) => {
+      calls.whereNotIn = { col, vals }
+      return builder
+    },
+    select: async (...cols: unknown[]) => {
+      calls.select = cols
+      return rows
+    },
+  }
+  const db: any = (table: string) => {
+    calls.table = table
+    return builder
+  }
+  db.calls = calls
+  return db
+}
+
+describe('pruneStaleSellerProductLinks — config↔DB reconcile removals', () => {
+  it('FAIL-SAFE: empty keep-set returns [] and issues NO query', async () => {
+    const db = makePruneDbMock([{ id: 'l1', product_id: 'p1' }])
+    const result = await pruneStaleSellerProductLinks(db, 'sel_1', [])
+    expect(result).toEqual([])
+    expect(db.calls.table).toBeUndefined()
+  })
+
+  it('returns the seller ACTIVE links whose product is NOT in the keep-set', async () => {
+    const stale = [{ id: 'l_stale', product_id: 'p_dropped' }]
+    const db = makePruneDbMock(stale)
+    const result = await pruneStaleSellerProductLinks(db, 'sel_1', new Set(['p_keep']))
+    expect(result).toEqual(stale)
+    expect(db.calls.table).toBe('product_product_seller_seller')
+    expect(db.calls.where).toEqual({ seller_id: 'sel_1' })
+    expect(db.calls.whereNull).toBe('deleted_at')
+    expect(db.calls.whereNotIn).toEqual({ col: 'product_id', vals: ['p_keep'] })
+  })
+
+  it('accepts an array keep-set as well as a Set', async () => {
+    const db = makePruneDbMock([])
+    await pruneStaleSellerProductLinks(db, 'sel_1', ['a', 'b'])
+    expect(db.calls.whereNotIn).toEqual({ col: 'product_id', vals: ['a', 'b'] })
   })
 })
 
