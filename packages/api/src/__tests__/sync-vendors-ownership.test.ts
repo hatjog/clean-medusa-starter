@@ -7,7 +7,58 @@
  * Pattern follows gp-config-sync-media.unit.spec.ts (story 7.6).
  */
 
-import { upsertSeller } from '../scripts/gp-config-sync-vendors'
+import { findConflictingSellerLink, upsertSeller } from '../scripts/gp-config-sync-vendors'
+
+// Minimal chainable knex-like mock that records the filters and returns a
+// configurable `.first()` row.
+function makeDbMock(firstRow: { seller_id: string } | null) {
+  const calls: { table?: string; where?: any; whereNot?: any; whereNull?: any } = {}
+  const builder: any = {
+    where: (w: any) => {
+      calls.where = w
+      return builder
+    },
+    whereNot: (w: any) => {
+      calls.whereNot = w
+      return builder
+    },
+    whereNull: (c: any) => {
+      calls.whereNull = c
+      return builder
+    },
+    first: async () => firstRow,
+  }
+  const db: any = (table: string) => {
+    calls.table = table
+    return builder
+  }
+  db.calls = calls
+  return db
+}
+
+describe('findConflictingSellerLink — single-seller invariant', () => {
+  it('returns the conflicting link when the product is owned by a DIFFERENT seller', async () => {
+    const db = makeDbMock({ seller_id: 'sel_other' })
+    const conflict = await findConflictingSellerLink(db, 'prod_1', 'sel_mine')
+    expect(conflict).toEqual({ seller_id: 'sel_other' })
+    expect(db.calls.table).toBe('product_product_seller_seller')
+    expect(db.calls.where).toEqual({ product_id: 'prod_1' })
+    expect(db.calls.whereNot).toEqual({ seller_id: 'sel_mine' })
+    expect(db.calls.whereNull).toBe('deleted_at')
+  })
+
+  it('returns null when no other-seller link exists (safe to link)', async () => {
+    const db = makeDbMock(null)
+    expect(await findConflictingSellerLink(db, 'prod_1', 'sel_mine')).toBeNull()
+  })
+
+  it('only considers ACTIVE links (whereNull deleted_at) for a different seller', async () => {
+    const db = makeDbMock(undefined as any)
+    // undefined row coalesces to null
+    expect(await findConflictingSellerLink(db, 'prod_2', 'sel_mine')).toBeNull()
+    expect(db.calls.whereNull).toBe('deleted_at')
+  })
+})
 
 // ---- Mock factory ----
 

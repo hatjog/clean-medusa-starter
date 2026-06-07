@@ -303,6 +303,27 @@ async function upsertSellerProductLinkViaDb(
   return "exists"
 }
 
+/**
+ * Single-seller invariant helper: returns an existing ACTIVE product↔seller
+ * link that belongs to a DIFFERENT seller than `sellerId`, or null. A product
+ * must belong to exactly one seller — a second link makes the cart item's
+ * seller ambiguous and breaks checkout (empty shipping-options + `/complete`
+ * "items missing seller" AFTER the card is charged → orphaned charge).
+ * Exported for unit coverage.
+ */
+export async function findConflictingSellerLink(
+  db: any,
+  productId: string,
+  sellerId: string
+): Promise<{ seller_id: string } | null> {
+  const row = await db("product_product_seller_seller")
+    .where({ product_id: productId })
+    .whereNot({ seller_id: sellerId })
+    .whereNull("deleted_at")
+    .first()
+  return row ?? null
+}
+
 async function createSellerRecord(sellerModuleService: any, payload: Record<string, unknown>): Promise<any> {
   if (typeof sellerModuleService.create === "function") {
     return sellerModuleService.create(payload)
@@ -957,6 +978,37 @@ export default async function gpConfigSyncVendors({ container, args }: ExecArgs)
               seenWarnings,
               `Vendor '${vendor.vendor_id}': linked fixture_id='${fixtureId}' using fallback handle='${fallbackHandle}'`
             )
+          }
+
+          // Single-seller invariant (orphaned-checkout guard). Mercur completes
+          // one order per seller and resolves each cart item's seller via the
+          // product↔seller link; a product linked to MORE THAN ONE seller is
+          // ambiguous → `/store/shipping-options` returns nothing for it and
+          // `/store/carts/:id/complete` fails ("items required to be assigned to
+          // a seller but some of them are missing") AFTER the card is charged →
+          // orphaned charge. Config that lists the same product_id under several
+          // vendors must therefore NOT create a second link: keep the first
+          // owner (vendor processing order) and skip + warn for the rest.
+          const conflictingLink = await findConflictingSellerLink(
+            db,
+            product.id,
+            result.sellerId
+          )
+          if (conflictingLink) {
+            pushUniqueWarning(
+              warnings,
+              seenWarnings,
+              `Vendor '${vendor.vendor_id}': product fixture_id='${fixtureId}' (db='${product.id}') is already owned by seller '${conflictingLink.seller_id}'; skipping to preserve the single-seller invariant (fix the config: a product_id must appear under only one vendor)`
+            )
+            splCounts.skipped++
+            splDetails.push({
+              vendor_id: vendor.vendor_id,
+              fixture_id: fixtureId,
+              status: "skipped",
+              product_db_id: product.id,
+              reason: `single-seller-conflict:owned-by=${conflictingLink.seller_id}`,
+            })
+            continue
           }
 
           // Upsert SellerProductLink
