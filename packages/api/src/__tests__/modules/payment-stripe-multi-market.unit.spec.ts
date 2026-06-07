@@ -23,6 +23,8 @@ import {
   SENTINEL_KEY,
   SENTINEL_WEBHOOK_SECRET,
   ensureResolved,
+  withResolverGate,
+  isUncancelablePaymentIntentStatus,
   GpStripeProviderService,
   GpStripeBlikService,
   GpStripePrzelewy24Service,
@@ -301,5 +303,104 @@ describe("F-CC1-001 closure — production path consults the resolver", () => {
         ["bonbeauty", "webhook"],
       ])
     )
+  })
+})
+
+describe("isUncancelablePaymentIntentStatus", () => {
+  it.each([
+    ["succeeded", true],
+    ["canceled", true],
+    ["requires_payment_method", false],
+    ["requires_capture", false],
+    ["processing", false],
+    ["requires_action", false],
+    [undefined, false],
+    [null, false],
+  ])("(%s) -> %s", (status, expected) => {
+    expect(isUncancelablePaymentIntentStatus(status as string | null | undefined)).toBe(
+      expected
+    )
+  })
+})
+
+describe("deletePayment — terminal PaymentIntent tolerance (cart un-wedge)", () => {
+  // A cart whose Stripe intent SUCCEEDED but never completed leaves an orphaned
+  // session. Medusa abandons sessions on every cart refresh via deletePayment;
+  // the upstream provider hard-fails because Stripe refuses to cancel a paid
+  // intent, which wedges the cart forever. The override must treat a terminal
+  // intent as an idempotent no-op delete while still propagating real failures.
+  function makeService(opts: {
+    deleteThrows: boolean
+    retrieveStatus?: string
+    retrieveThrows?: boolean
+  }) {
+    const calls = { delete: 0, retrieve: 0 }
+    class FakeStripeBase {
+      // eslint-disable-next-line @typescript-eslint/no-useless-constructor, @typescript-eslint/no-unused-vars
+      constructor(_cradle: unknown, _options: unknown) {}
+      async deletePayment(_input: unknown): Promise<unknown> {
+        calls.delete++
+        if (opts.deleteThrows) {
+          // Mirrors upstream buildError() output (flattened, no payment_intent).
+          throw new Error(
+            "An error occurred in cancelPayment: You cannot cancel this PaymentIntent because it has a status of succeeded."
+          )
+        }
+        return { data: { id: "pi_x", status: "canceled" } }
+      }
+      async retrievePayment(input: {
+        data?: { id?: string }
+      }): Promise<{ data: { id?: string; status?: string } }> {
+        calls.retrieve++
+        if (opts.retrieveThrows) throw new Error("network")
+        return { data: { id: input?.data?.id, status: opts.retrieveStatus } }
+      }
+    }
+    const Wrapped = withResolverGate(
+      FakeStripeBase as unknown as new (...args: unknown[]) => object,
+      "bonbeauty"
+    )
+    class TestSvc extends Wrapped {
+      static identifier = "stripe"
+    }
+    const svc = new TestSvc(
+      {},
+      {
+        __allowLegacyExplicitKeys: true,
+        apiKey: "sk_test_x",
+        webhookSecret: "whsec_x",
+      }
+    ) as unknown as {
+      deletePayment: (input: unknown) => Promise<{ data: unknown }>
+    }
+    return { svc, calls }
+  }
+
+  it("swallows the delete as a no-op when the intent already succeeded", async () => {
+    const { svc, calls } = makeService({ deleteThrows: true, retrieveStatus: "succeeded" })
+    const res = await svc.deletePayment({ data: { id: "pi_x" } })
+    expect(res).toEqual({ data: { id: "pi_x" } })
+    expect(calls.delete).toBe(1)
+    expect(calls.retrieve).toBe(1)
+  })
+
+  it("re-throws when the intent is still non-terminal (genuine cancel failure)", async () => {
+    const { svc } = makeService({
+      deleteThrows: true,
+      retrieveStatus: "requires_payment_method",
+    })
+    await expect(svc.deletePayment({ data: { id: "pi_x" } })).rejects.toThrow(/cancelPayment/)
+  })
+
+  it("fails closed: re-throws when the status retrieve itself errors", async () => {
+    const { svc } = makeService({ deleteThrows: true, retrieveThrows: true })
+    await expect(svc.deletePayment({ data: { id: "pi_x" } })).rejects.toThrow()
+  })
+
+  it("passes a successful delete straight through (no retrieve)", async () => {
+    const { svc, calls } = makeService({ deleteThrows: false })
+    const res = await svc.deletePayment({ data: { id: "pi_x" } })
+    expect(res).toEqual({ data: { id: "pi_x", status: "canceled" } })
+    expect(calls.retrieve).toBe(0)
   })
 })
