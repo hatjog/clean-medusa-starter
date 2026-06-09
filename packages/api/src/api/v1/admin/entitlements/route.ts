@@ -44,7 +44,7 @@ import {
 type VoucherSearchLike = {
   adminSearchEntitlements: (
     q: string,
-    opts?: { market_id?: string | null }
+    opts?: { market_id?: string | null; allow_cross_market?: boolean }
   ) => Promise<unknown[]>
 }
 
@@ -80,7 +80,12 @@ export async function GET(req: MedusaRequest, res: MedusaResponse): Promise<void
     })
     return
   }
-  if (!marketResult.market_id) {
+  // Story 1.5 / R5 / FR-F5 — market scope is required for non-super-admins
+  // (fail-closed). Super-admins retain the v1.11.0 cross-market global search
+  // (support "find this voucher across all markets") by omitting the header;
+  // the cross-market read is then opt-in via `allow_cross_market: true`, never
+  // an implicit fail-open default at the service layer.
+  if (!marketResult.market_id && !marketResult.is_super_admin) {
     res.status(400).json({
       code: "MARKET_REQUIRED",
       message: "x-gp-market-id is required for entitlement search",
@@ -98,6 +103,7 @@ export async function GET(req: MedusaRequest, res: MedusaResponse): Promise<void
 
   const entitlements = await voucher.adminSearchEntitlements(q, {
     market_id: marketResult.market_id,
+    allow_cross_market: !marketResult.market_id && marketResult.is_super_admin,
   })
   apiSuccess(res, { entitlements })
 }

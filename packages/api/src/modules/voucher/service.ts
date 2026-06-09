@@ -851,11 +851,20 @@ export class VoucherService {
    */
   async adminSearchEntitlements(
     q: string,
-    opts: { market_id?: string | null } = {}
+    opts: { market_id?: string | null; allow_cross_market?: boolean } = {}
   ): Promise<EntitlementAdminView[]> {
     const trimmed = q.trim()
     if (!trimmed) return []
     const marketId = opts.market_id ?? null
+    const allowCrossMarket = opts.allow_cross_market === true
+    // Story 1.5 / R5 / FR-F5 — fail-closed default. A caller that supplies
+    // neither a concrete market_id NOR an explicit cross-market opt-in gets an
+    // empty result set, NOT an unscoped cross-market read. Cross-market global
+    // search is reserved for super-admins and MUST be requested explicitly via
+    // `allow_cross_market: true` (the admin route only sets it after verifying
+    // `is_super_admin`). This removes the prior fail-open default where a future
+    // caller omitting `opts` would silently read every market.
+    if (!marketId && !allowCrossMarket) return []
     const pool = this.getPool()
 
     const isEmailSearch = trimmed.includes("@")

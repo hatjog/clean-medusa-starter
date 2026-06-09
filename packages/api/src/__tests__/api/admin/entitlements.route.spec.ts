@@ -84,6 +84,20 @@ function makeSuperAdminKnex() {
   }) as any
 }
 
+// Non-super-admin with NO admin_market_grants row → fails closed (L2/L1).
+function makeNonSuperAdminKnex() {
+  return ((_table: string) => {
+    const chain = {
+      select: jest.fn(() => chain),
+      where: jest.fn(() => chain),
+      whereIn: jest.fn(() => chain),
+      whereNull: jest.fn(() => chain),
+      limit: jest.fn(() => Promise.resolve([])),
+    }
+    return chain
+  }) as any
+}
+
 describe("GET /v1/admin/entitlements", () => {
   beforeEach(() => {
     __resetCapabilityCache()
@@ -106,6 +120,7 @@ describe("GET /v1/admin/entitlements", () => {
       expect(res.body).toEqual({ data: { entitlements: [mockEntitlement] } })
       expect(req._gpCore.adminSearchEntitlements).toHaveBeenCalledWith("buyer@example.com", {
         market_id: "market-a",
+        allow_cross_market: false,
       })
     })
   })
@@ -120,6 +135,7 @@ describe("GET /v1/admin/entitlements", () => {
       expect(res.body).toEqual({ data: { entitlements: [mockEntitlement] } })
       expect(req._gpCore.adminSearchEntitlements).toHaveBeenCalledWith("VOUCHER123", {
         market_id: "market-a",
+        allow_cross_market: false,
       })
     })
   })
@@ -201,7 +217,8 @@ describe("GET /v1/admin/entitlements", () => {
     })
   })
 
-  it("fails closed when admin market context is missing", async () => {
+  it("fails closed when a non-super-admin omits market context (L1/L2)", async () => {
+    __setKnexForAdminMarketTests(makeNonSuperAdminKnex())
     const req = {
       query: { q: "buyer@example.com" },
       headers: {},
@@ -215,5 +232,29 @@ describe("GET /v1/admin/entitlements", () => {
     expect(res.statusCode).toBe(400)
     expect(res.body).toMatchObject({ code: "MARKET_REQUIRED" })
     expect(req.scope.resolve).not.toHaveBeenCalled()
+  })
+
+  it("super-admin without market context performs cross-market global search (L2)", async () => {
+    // beforeEach already wired makeSuperAdminKnex(); no x-gp-market-id header.
+    const mockGpCore = {
+      adminSearchEntitlements: jest.fn().mockResolvedValue([mockEntitlement]),
+    }
+    const req = {
+      query: { q: "buyer@example.com" },
+      headers: {},
+      auth_context: { actor_id: "admin-1", actor_type: "user" },
+      scope: { resolve: jest.fn().mockReturnValue(mockGpCore) },
+    } as any
+    const res = createRes()
+
+    await GET(req, res as any)
+
+    expect(res.statusCode).toBe(200)
+    expect(res.body).toEqual({ data: { entitlements: [mockEntitlement] } })
+    // Cross-market read is EXPLICIT opt-in (allow_cross_market), market_id null.
+    expect(mockGpCore.adminSearchEntitlements).toHaveBeenCalledWith("buyer@example.com", {
+      market_id: null,
+      allow_cross_market: true,
+    })
   })
 })
