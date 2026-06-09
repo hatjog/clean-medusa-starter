@@ -3,7 +3,10 @@ import { ContainerRegistrationKeys } from "@medusajs/framework/utils";
 import type { Knex } from "knex";
 import { requireMercurServerModule } from "../../../lib/mercur-module-loader";
 import { marketContextStorage } from "../../../lib/market-context";
-import { listReviewIdsForSalesChannel } from "../../../lib/review-market-scope";
+import {
+  getLiveReviewStatsForSalesChannel,
+  listReviewIdsForSalesChannel,
+} from "../../../lib/review-market-scope";
 
 type QueryGraphResult = {
   data: Array<Record<string, unknown>>;
@@ -59,6 +62,14 @@ export async function GET(req: MedusaRequest, res: MedusaResponse) {
   const salesChannelId = marketContextStorage.getStore()?.sales_channel_id;
   const offset = req.queryConfig.pagination?.skip ?? 0;
   const limit = req.queryConfig.pagination?.take ?? 50;
+  const productId =
+    typeof req.query.product_id === "string" ? req.query.product_id : undefined;
+  const sellerId =
+    typeof req.query.seller_id === "string" ? req.query.seller_id : undefined;
+  const filters = {
+    ...(productId ? { productId } : {}),
+    ...(sellerId ? { sellerId } : {}),
+  };
 
   if (!salesChannelId) {
     res.json({
@@ -71,12 +82,10 @@ export async function GET(req: MedusaRequest, res: MedusaResponse) {
   }
 
   const db = req.scope.resolve(ContainerRegistrationKeys.PG_CONNECTION) as Knex;
-  const { reviewIds, count } = await listReviewIdsForSalesChannel(
-    db,
-    salesChannelId,
-    offset,
-    limit
-  );
+  const [{ reviewIds, count }, stats] = await Promise.all([
+    listReviewIdsForSalesChannel(db, salesChannelId, offset, limit, filters),
+    getLiveReviewStatsForSalesChannel(db, salesChannelId, filters),
+  ]);
 
   if (!reviewIds.length) {
     res.json({
@@ -84,6 +93,8 @@ export async function GET(req: MedusaRequest, res: MedusaResponse) {
       count,
       offset,
       limit,
+      average_rating: stats.averageRating,
+      rating_count: stats.count,
     });
     return;
   }
@@ -111,5 +122,7 @@ export async function GET(req: MedusaRequest, res: MedusaResponse) {
     count,
     offset,
     limit,
+    average_rating: stats.averageRating,
+    rating_count: stats.count,
   });
 }

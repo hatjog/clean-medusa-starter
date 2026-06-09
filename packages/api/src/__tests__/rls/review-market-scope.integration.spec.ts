@@ -1,6 +1,9 @@
 import { randomUUID } from "node:crypto";
 import knex, { Knex } from "knex";
-import { listReviewIdsForSalesChannel } from "../../lib/review-market-scope";
+import {
+  getLiveReviewStatsForSalesChannel,
+  listReviewIdsForSalesChannel,
+} from "../../lib/review-market-scope";
 
 const DATABASE_URL =
   process.env.DATABASE_URL ||
@@ -41,6 +44,20 @@ async function getMarketFixture(marketId: string) {
     salesChannelId: salesChannel.id,
     productId: productLink.product_id,
   };
+}
+
+async function getSellerFixture(marketId: string) {
+  const seller = await db("seller")
+    .select("id")
+    .whereRaw("metadata->'gp'->>'market_id' = ?", [marketId])
+    .whereNull("deleted_at")
+    .first<{ id: string }>();
+
+  if (!seller) {
+    throw new Error(`Missing seller fixture for market ${marketId}`);
+  }
+
+  return seller;
 }
 
 beforeAll(() => {
@@ -137,6 +154,53 @@ describe("review market scoping", () => {
       expect(scoped.reviewIds).not.toContain(reviewId);
     } finally {
       await db("product_product_review_review").where({ id: linkId }).delete();
+      await db("review").where({ id: reviewId }).delete();
+    }
+  });
+
+  it("lists seller reviews in sales-channel market scope and computes live AVG from junction", async () => {
+    const bonbeauty = await getMarketFixture("bonbeauty");
+    const seller = await getSellerFixture("bonbeauty");
+    const reviewId = buildReviewId();
+    const linkId = buildLinkId();
+    const now = new Date();
+
+    try {
+      await db("review").insert({
+        id: reviewId,
+        reference: "seller",
+        rating: 4,
+        customer_note: "Seller scoped review",
+        seller_note: null,
+        created_at: now,
+        updated_at: now,
+      });
+      await db("seller_seller_review_review").insert({
+        id: linkId,
+        seller_id: seller.id,
+        review_id: reviewId,
+        created_at: now,
+        updated_at: now,
+      });
+
+      const scoped = await listReviewIdsForSalesChannel(
+        db,
+        bonbeauty.salesChannelId,
+        0,
+        100,
+        { sellerId: seller.id }
+      );
+      const stats = await getLiveReviewStatsForSalesChannel(
+        db,
+        bonbeauty.salesChannelId,
+        { sellerId: seller.id }
+      );
+
+      expect(scoped.reviewIds).toContain(reviewId);
+      expect(stats.count).toBeGreaterThanOrEqual(1);
+      expect(stats.averageRating).toBeGreaterThan(0);
+    } finally {
+      await db("seller_seller_review_review").where({ id: linkId }).delete();
       await db("review").where({ id: reviewId }).delete();
     }
   });
