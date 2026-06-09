@@ -51,8 +51,11 @@ export type DesiredReview = {
   // kontrolowana przez story 2.4 (junction-based filter + `deleted_at`). Jeśli HG-6 wymaga
   // per-review `published` flag w DB, Story 2.4/2.5 powinny dodać kolumnę metadata.
   //
-  // `locale` jest parsowane z kontraktu ale model `review` Mercur nie ma kolumny `locale`.
-  // Lokalizacja review jest domeną storefront/renderu (Story 2.4), nie seed-stage.
+  // M3 fix (ADR-148): `locale` + `provenance` są materializowane przez projekcję
+  // `review.metadata.gp.locale` / `review.metadata.gp.provenance` (jsonb seam Mercur),
+  // NIE jako fizyczne kolumny (ADR-148 odrzuca migrację modelu Mercur). Storefront czyta
+  // te pola (`buildReviewFromRaw` / `pickReviewMeta`), więc runtime przestaje być `null`
+  // po sync. Wartość provenance = domknięty enum D-148/D-149 (== `provenance-tag` z kontraktu).
 }
 
 export type ExistingSeedReview = {
@@ -61,6 +64,10 @@ export type ExistingSeedReview = {
   rating: number | string | null
   customer_note: string | null
   seller_note: string | null
+  // M3 fix (ADR-148): zmaterializowana projekcja metadata.gp.* odczytana z DB,
+  // by re-run wykrył drift i zbackfillował istniejące rekordy (idempotentnie, ADR-144).
+  locale: string | null
+  provenance: string | null
   targetId: string | null
   deleted_at?: unknown
 }
@@ -321,6 +328,7 @@ async function loadExistingSeedReviews(db: Knex, marketId: string): Promise<Exis
       "review.rating",
       "review.customer_note",
       "review.seller_note",
+      "review.metadata",
       "review.deleted_at",
       "ssrr.seller_id",
       "pprr.product_id"
@@ -346,15 +354,22 @@ async function loadExistingSeedReviews(db: Knex, marketId: string): Promise<Exis
         .orWhereRaw("sc.metadata->>'gp_market_id' = ?", [marketId])
     })
 
-  const mapped: ExistingSeedReview[] = rows.map((row: any) => ({
-    id: row.id,
-    reference: row.reference,
-    rating: row.rating,
-    customer_note: row.customer_note,
-    seller_note: row.seller_note,
-    deleted_at: row.deleted_at,
-    targetId: row.seller_id ?? row.product_id ?? null,
-  }))
+  const mapped: ExistingSeedReview[] = rows.map((row: any) => {
+    // M3 fix (ADR-148): metadata jsonb może przyjść jako obiekt (pg jsonb) lub string.
+    const metadata = parseReviewMetadata(row.metadata)
+    const gp = (metadata?.gp ?? {}) as Record<string, unknown>
+    return {
+      id: row.id,
+      reference: row.reference,
+      rating: row.rating,
+      customer_note: row.customer_note,
+      seller_note: row.seller_note,
+      locale: typeof gp.locale === "string" ? gp.locale : null,
+      provenance: typeof gp.provenance === "string" ? gp.provenance : null,
+      deleted_at: row.deleted_at,
+      targetId: row.seller_id ?? row.product_id ?? null,
+    }
+  })
 
   // M2 fix: dedupe po review.id — LEFT JOIN product_sales_channel może zwrócić N duplikatów
   // dla product-review należącej do wielu sales-channeli (ten sam pattern co buildScopedReviewQuery
@@ -369,12 +384,42 @@ async function loadExistingSeedReviews(db: Knex, marketId: string): Promise<Exis
   return Array.from(deduped.values())
 }
 
-function reviewComparable(review: Pick<DesiredReview, "reference" | "rating" | "customer_note" | "seller_note">) {
+// M3 fix (ADR-148): bezpieczny parser metadata.gp.* (pg jsonb może wrócić jako obiekt lub string).
+function parseReviewMetadata(value: unknown): Record<string, unknown> | null {
+  if (!value) return null
+  if (typeof value === "object") return value as Record<string, unknown>
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value)
+      return parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : null
+    } catch {
+      return null
+    }
+  }
+  return null
+}
+
+type ReviewComparableInput = {
+  reference: DesiredReview["reference"] | string | null
+  rating: number | string | null
+  customer_note: string | null
+  seller_note: string | null
+  // Desired niesie `locale` + `provenanceTag`; existing niesie `locale` + `provenance`.
+  locale?: string | null
+  provenance?: string | null
+  provenanceTag?: string | null
+}
+
+function reviewComparable(review: ReviewComparableInput) {
   return {
     reference: review.reference,
     rating: Number(review.rating),
     customer_note: review.customer_note ?? null,
     seller_note: review.seller_note ?? null,
+    // M3 fix (ADR-148): locale + provenance są częścią porównania, by re-run zbackfillował
+    // istniejące rekordy seeda pozbawione metadata.gp.* (idempotentny upsert per ADR-144).
+    locale: review.locale ?? null,
+    provenance: review.provenance ?? review.provenanceTag ?? null,
   }
 }
 
@@ -404,11 +449,13 @@ export function buildReviewSyncPlan(
     // aktywnego linku (current.targetId !== null && !== review.targetId).
     const linkWasSoftDeleted = current.targetId === null
     const targetChanged = current.targetId !== null && current.targetId !== review.targetId
-    const diffs = computeFieldDiffs(reviewComparable(current as any), reviewComparable(review))
+    const diffs = computeFieldDiffs(reviewComparable(current), reviewComparable(review))
     if (targetChanged) {
       diffs.push({
+        // L2 fix: `targetChanged` gwarantuje `current.targetId !== null`, ale TS nie zawęża
+        // pola obiektu — jawny fallback `?? ""` (nieosiągalny) domyka typ `string` FieldDiff.
         field: "target_id",
-        current: current.targetId,
+        current: current.targetId ?? "",
         incoming: review.targetId,
       })
     }
@@ -423,8 +470,15 @@ export function buildReviewSyncPlan(
       continue
     }
 
-    // Konflikt raportujemy tylko dla realnych rozbieżności (diffs zawiera pola), NIE dla reaktywacji linku
-    const conflict = diffs.length > 0 ? `${review.id}: ${diffs.map((d) => d.field).join(", ")}` : undefined
+    // Konflikt raportujemy tylko dla realnych rozbieżności (diffs zawiera pola), NIE dla reaktywacji linku.
+    // M3 (ADR-148): locale/provenance to projekcja display-only z tego samego kontraktu — ich drift
+    // (zwłaszcza backfill null→wartość na pierwszym przebiegu po deployu) NIE jest seed-konfliktem,
+    // ale nadal wymusza akcję `update` (przez `diffs.length > 0` powyżej) by zmaterializować metadata.gp.*.
+    const conflictDiffs = diffs.filter((d) => d.field !== "locale" && d.field !== "provenance")
+    const conflict =
+      conflictDiffs.length > 0
+        ? `${review.id}: ${conflictDiffs.map((d) => d.field).join(", ")}`
+        : undefined
     if (conflict) conflicts.push(conflict)
     entries.push({
       id: review.id,
@@ -451,16 +505,28 @@ export function buildReviewSyncPlan(
 
 async function upsertReviewRow(db: Knex, review: DesiredReview): Promise<void> {
   const now = new Date()
+  // M3 fix (ADR-148): materializacja locale + provenance przez projekcję metadata.gp.*
+  // (jsonb seam Mercur), NIE fizyczna kolumna. `provenance` = domknięty enum D-148/D-149
+  // (== `provenance-tag` z kontraktu reviews 2.2). Storefront czyta metadata.gp.locale|provenance.
+  const gpProjection = { locale: review.locale, provenance: review.provenanceTag }
   const payload = {
     id: review.id,
     reference: review.reference,
     rating: review.rating,
     customer_note: review.customer_note,
     seller_note: review.seller_note,
+    metadata: { gp: gpProjection },
     created_at: now,
     updated_at: now,
     deleted_at: null,
   }
+
+  // Deep-merge metadata.gp.* zachowując pozostałe klucze metadata (i metadata.gp) istniejącego
+  // rekordu — idempotentny upsert (ADR-144). `review.metadata` to wartość PRZED update (PG upsert).
+  const mergedMetadata = db.raw(
+    "coalesce(\"review\".metadata, '{}'::jsonb) || jsonb_build_object('gp', coalesce(\"review\".metadata->'gp', '{}'::jsonb) || ?::jsonb)",
+    [JSON.stringify(gpProjection)]
+  )
 
   await db("review")
     .insert(payload)
@@ -470,6 +536,7 @@ async function upsertReviewRow(db: Knex, review: DesiredReview): Promise<void> {
       rating: payload.rating,
       customer_note: payload.customer_note,
       seller_note: payload.seller_note,
+      metadata: mergedMetadata,
       updated_at: payload.updated_at,
       deleted_at: null,
     })

@@ -31,6 +31,10 @@ function existing(overrides: Partial<ExistingSeedReview> = {}): ExistingSeedRevi
     rating: base.rating,
     customer_note: base.customer_note,
     seller_note: base.seller_note,
+    // M3 fix (ADR-148): w pełni zmaterializowany rekend (metadata.gp.locale|provenance)
+    // — reprezentuje stan po sync, więc identyczny rerun = skip.
+    locale: base.locale,
+    provenance: base.provenanceTag,
     deleted_at: null,
     ...overrides,
   }
@@ -198,6 +202,39 @@ describe("buildReviewSyncPlan", () => {
     ])
     expect(plan.conflicts).toHaveLength(1)
     expect(plan.conflicts[0]).toContain("target_id")
+  })
+
+  it("M3 (ADR-148): backfilluje istniejący rekord bez metadata.gp.* przez update, bez seed-konfliktu", () => {
+    // Rekord zaseedowany PRZED ADR-148 — locale/provenance jeszcze nie zmaterializowane.
+    const preMaterialized = existing({ locale: null, provenance: null })
+    const incoming = desired()
+
+    const plan = buildReviewSyncPlan([incoming], [preMaterialized])
+
+    expect(plan.entries).toEqual([
+      expect.objectContaining({
+        action: "update",
+        diffs: expect.arrayContaining([
+          expect.objectContaining({ field: "locale", incoming: "pl" }),
+          expect.objectContaining({ field: "provenance", incoming: "seeded from gp-ops" }),
+        ]),
+      }),
+    ])
+    // Backfill projekcji display-only NIE jest seed-konfliktem.
+    expect(plan.conflicts).toHaveLength(0)
+    expect(plan.entries[0]).not.toHaveProperty("conflict")
+  })
+
+  it("M3 (ADR-148): zmiana ratingu PLUS backfill locale daje update z konfliktem tylko na rating", () => {
+    const preMaterialized = existing({ locale: null, provenance: null })
+    const incoming = desired({ rating: 3 })
+
+    const plan = buildReviewSyncPlan([incoming], [preMaterialized])
+
+    expect(plan.conflicts).toHaveLength(1)
+    expect(plan.conflicts[0]).toContain("rating")
+    expect(plan.conflicts[0]).not.toContain("locale")
+    expect(plan.conflicts[0]).not.toContain("provenance")
   })
 
   it("M2: duplikaty existing po tym samym id (product-review multi-SC) są deduplikowane", () => {
