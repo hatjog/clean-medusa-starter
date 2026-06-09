@@ -25,6 +25,7 @@ import {
   enforceVendorStatusGate,
   draftOrphanMarketProducts,
   buildVendorPricingMap,
+  buildProductGpMetadata,
   loadEntitlementProfileMap,
   resolveProductEntitlementProfile,
 } from "../../scripts/gp-config-sync-catalog"
@@ -1973,6 +1974,78 @@ describe("resolveProductEntitlementProfile (Story 1.10.1)", () => {
   })
 })
 
+describe("buildProductGpMetadata (Story 2.6 product/catalog field parity)", () => {
+  it("materializes schema-declared catalog fields into metadata.gp, preserving nullable duration", () => {
+    const metadata = buildProductGpMetadata(
+      {
+        product_id: "srv_0702",
+        name: "Wypełnianie kwasem hialuronowym",
+        subtitle: "Naturalny efekt objętości",
+        base_price: { amount: 0, currency: "PLN" },
+        duration_minutes: null,
+        seo: {
+          meta_title: "Kwas hialuronowy | BonBeauty",
+          meta_description: "Wypełnianie kwasem hialuronowym w BonBeauty.",
+        },
+        sort_rank: 7,
+        validity_period: "12 miesięcy",
+        regulatory_class: "standard",
+        entitlement_profile_id: "voucher-rezerwacja-otwarta",
+      },
+      "bonbeauty",
+      true,
+      {
+        profile_id: "voucher-rezerwacja-otwarta",
+        entitlement_type: "VOUCHER_SERVICE",
+        policy: { validity_months: 12 },
+        currency: "PLN",
+      }
+    )
+
+    expect(metadata).toMatchObject({
+      synced_by: "gp-config-sync-catalog",
+      market_id: "bonbeauty",
+      fixture_id: "srv_0702",
+      has_vendor_pricing: true,
+      subtitle: "Naturalny efekt objętości",
+      duration_minutes: null,
+      seo: {
+        meta_title: "Kwas hialuronowy | BonBeauty",
+        meta_description: "Wypełnianie kwasem hialuronowym w BonBeauty.",
+      },
+      sort_rank: 7,
+      validity_period: "12 miesięcy",
+      regulatory_class: "standard",
+      entitlement_profile_id: "voucher-rezerwacja-otwarta",
+      entitlement_profile: {
+        profile_id: "voucher-rezerwacja-otwarta",
+        entitlement_type: "VOUCHER_SERVICE",
+        policy: { validity_months: 12 },
+        currency: "PLN",
+      },
+    })
+  })
+
+  it("omits optional metadata fields when absent instead of inventing storefront fallbacks", () => {
+    const metadata = buildProductGpMetadata(
+      {
+        product_id: "srv_0101",
+        name: "Oczyszczanie twarzy",
+        base_price: { amount: 180, currency: "PLN" },
+      },
+      "bonbeauty",
+      false
+    )
+
+    expect(metadata).toEqual({
+      synced_by: "gp-config-sync-catalog",
+      market_id: "bonbeauty",
+      fixture_id: "srv_0101",
+      has_vendor_pricing: false,
+    })
+  })
+})
+
 describe("syncProducts writes entitlement_profile to product.metadata.gp (Story 1.10.1)", () => {
   const prereqs = { salesChannelId: "sc-bonbeauty", shippingProfileId: "sp-default" }
   const emptyMaps = {
@@ -2017,8 +2090,11 @@ describe("syncProducts writes entitlement_profile to product.metadata.gp (Story 
         {
           product_id: "srv_0101",
           name: "Oczyszczanie twarzy",
+          subtitle: "Autorski zabieg oczyszczający",
           handle: "oczyszczanie-twarzy",
           base_price: { amount: 180, currency: "PLN" },
+          duration_minutes: null,
+          regulatory_class: "standard",
           entitlement_profile_id: "voucher-rezerwacja-otwarta",
         },
       ],
@@ -2046,6 +2122,11 @@ describe("syncProducts writes entitlement_profile to product.metadata.gp (Story 
     expect(payload.metadata.gp.market_id).toBe("bonbeauty")
     expect(payload.metadata.gp.synced_by).toBe("gp-config-sync-catalog")
     expect(payload.metadata.gp.fixture_id).toBe("srv_0101")
+    expect(payload.metadata.gp.entitlement_profile_id).toBe("voucher-rezerwacja-otwarta")
+    expect(payload.metadata.gp.subtitle).toBe("Autorski zabieg oczyszczający")
+    expect(payload.metadata.gp.duration_minutes).toBeNull()
+    expect(payload.metadata.gp.regulatory_class).toBe("standard")
+    expect(payload.subtitle).toBe("Autorski zabieg oczyszczający")
   })
 
   it("does NOT write entitlement_profile when product lacks entitlement_profile_id (legacy/non-voucher flow)", async () => {

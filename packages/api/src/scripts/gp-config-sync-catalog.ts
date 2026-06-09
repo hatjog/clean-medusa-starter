@@ -43,6 +43,7 @@ type FixtureProduct = {
   category_id?: string
   collection_id?: string
   name: string
+  subtitle?: string
   slug?: string
   handle?: string
   status?: string
@@ -51,6 +52,14 @@ type FixtureProduct = {
   duration_minutes?: number | null
   description?: string
   photo_url?: string
+  seo?: {
+    meta_title?: string
+    meta_description?: string
+    og_image_url?: string
+  }
+  sort_rank?: number
+  validity_period?: string
+  regulatory_class?: string
   tags?: string[]
   active?: boolean
   // v1.8.0 Story 1.10.1 — opcjonalny cross-ref do market.yaml
@@ -104,6 +113,37 @@ type OpCounts = { created: number; updated: number; skipped: number }
 type Prerequisites = {
   salesChannelId: string
   shippingProfileId: string
+}
+
+export function buildProductGpMetadata(
+  product: FixtureProduct,
+  marketId: string,
+  hasVendorPricing: boolean,
+  entitlementProfile?: EmbeddedEntitlementProfile
+): Record<string, any> {
+  const metadata: Record<string, any> = {
+    synced_by: "gp-config-sync-catalog",
+    market_id: marketId,
+    fixture_id: product.product_id,
+    has_vendor_pricing: hasVendorPricing,
+  }
+
+  if (product.subtitle !== undefined) metadata.subtitle = product.subtitle
+  if (Object.prototype.hasOwnProperty.call(product, "duration_minutes")) {
+    metadata.duration_minutes = product.duration_minutes ?? null
+  }
+  if (product.seo !== undefined) metadata.seo = product.seo
+  if (product.sort_rank !== undefined) metadata.sort_rank = product.sort_rank
+  if (product.validity_period !== undefined) metadata.validity_period = product.validity_period
+  if (product.regulatory_class !== undefined) metadata.regulatory_class = product.regulatory_class
+  if (product.entitlement_profile_id !== undefined) {
+    metadata.entitlement_profile_id = product.entitlement_profile_id
+  }
+  if (entitlementProfile) {
+    metadata.entitlement_profile = entitlementProfile
+  }
+
+  return metadata
 }
 
 // ---- Utilities (pattern from gp-config-sync-media) ----
@@ -1300,18 +1340,17 @@ export async function syncProducts(
         const existingGpMeta = (existing.metadata as any)?.gp ?? {}
         const nextGpMeta: Record<string, any> = {
           ...existingGpMeta,
-          synced_by: "gp-config-sync-catalog",
-          market_id: marketId,
-          fixture_id: product.product_id,
-          has_vendor_pricing: hasVendorPricing,
+          ...buildProductGpMetadata(product, marketId, hasVendorPricing, entitlementProfile),
         }
-        if (entitlementProfile) {
-          nextGpMeta.entitlement_profile = entitlementProfile
-        } else if ("entitlement_profile" in existingGpMeta) {
+        if (!entitlementProfile && "entitlement_profile" in existingGpMeta) {
           delete nextGpMeta.entitlement_profile
+        }
+        if (product.entitlement_profile_id === undefined && "entitlement_profile_id" in existingGpMeta) {
+          delete nextGpMeta.entitlement_profile_id
         }
         const updatePayload: Record<string, any> = {
           title: product.name,
+          ...(product.subtitle !== undefined ? { subtitle: product.subtitle } : {}),
           description: product.description ?? existing.description,
           status: gateStatus,
           metadata: {
@@ -1423,6 +1462,7 @@ export async function syncProducts(
             products: [
               {
                 title: product.name,
+                ...(product.subtitle !== undefined ? { subtitle: product.subtitle } : {}),
                 handle,
                 status: createGateResult.status as "published" | "draft",
                 description: product.description,
@@ -1449,18 +1489,7 @@ export async function syncProducts(
                 ...(resolvedCategoryIds.length > 0 ? { category_ids: resolvedCategoryIds } : {}),
                 ...(resolvedCollectionId ? { collection_id: resolvedCollectionId } : {}),
                 metadata: {
-                  gp: {
-                    synced_by: "gp-config-sync-catalog",
-                    market_id: marketId,
-                    fixture_id: product.product_id,
-                    has_vendor_pricing: hasVendorPricing,
-                    // Story 1.10.1 — embedded entitlement_profile for the
-                    // payment.captured → entitlement_instance chain. Omitted
-                    // for non-voucher SKUs (entitlementProfile === undefined).
-                    ...(entitlementProfile
-                      ? { entitlement_profile: entitlementProfile }
-                      : {}),
-                  },
+                  gp: buildProductGpMetadata(product, marketId, hasVendorPricing, entitlementProfile),
                 },
               },
             ],
