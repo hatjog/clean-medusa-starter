@@ -2224,3 +2224,75 @@ describe("syncProducts writes entitlement_profile to product.metadata.gp (Story 
     expect(payload.metadata.gp.entitlement_profile).toBeUndefined()
   })
 })
+
+describe("syncProducts stale-clear on update path (Story 2.6 symmetric delete-on-absent)", () => {
+  const prereqs = { salesChannelId: "sc-bonbeauty", shippingProfileId: "sp-default" }
+  const emptyMaps = {
+    categoryMap: new Map<string, string>(),
+    collectionMap: new Map<string, string>(),
+    tagIdMap: new Map<string, string>(),
+  }
+  function makeContainerLite() {
+    return { resolve: jest.fn().mockReturnValue({}) }
+  }
+
+  it("clears stale schema-materialized fields from metadata.gp when removed from source", async () => {
+    const svc = {
+      listProducts: jest.fn().mockResolvedValue([
+        {
+          id: "p-stale",
+          handle: "produkt-stale",
+          categories: [],
+          metadata: {
+            gp: {
+              market_id: "bonbeauty",
+              subtitle: "Stary podtytuł",
+              seo: { meta_title: "Stary tytuł SEO" },
+              sort_rank: 5,
+              validity_period: "6 miesięcy",
+              regulatory_class: "premium",
+              duration_minutes: 60,
+            },
+          },
+          variants: [],
+        },
+      ]),
+      updateProducts: jest.fn().mockResolvedValue({}),
+    } as any
+    const warnings: string[] = []
+
+    await syncProducts(
+      makeContainerLite(),
+      svc,
+      [
+        {
+          // Source no longer declares any of the previously synced catalog fields
+          product_id: "p-stale",
+          name: "Produkt bez pól katalogowych",
+          handle: "produkt-stale",
+          base_price: { amount: 200, currency: "PLN" },
+        },
+      ],
+      prereqs,
+      emptyMaps.categoryMap,
+      emptyMaps.collectionMap,
+      emptyMaps.tagIdMap,
+      "bonbeauty",
+      warnings,
+      undefined,
+      false,
+      undefined,
+      new Map()
+    )
+
+    expect(svc.updateProducts).toHaveBeenCalledTimes(1)
+    const [, payload] = svc.updateProducts.mock.calls[0]
+    const gp = payload.metadata.gp
+    expect(gp.subtitle).toBeUndefined()
+    expect(gp.seo).toBeUndefined()
+    expect(gp.sort_rank).toBeUndefined()
+    expect(gp.validity_period).toBeUndefined()
+    expect(gp.regulatory_class).toBeUndefined()
+    expect(gp.duration_minutes).toBeUndefined()
+  })
+})

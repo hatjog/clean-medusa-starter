@@ -1348,9 +1348,21 @@ export async function syncProducts(
         if (product.entitlement_profile_id === undefined && "entitlement_profile_id" in existingGpMeta) {
           delete nextGpMeta.entitlement_profile_id
         }
+        // Symmetric stale-clear for all schema-materialized catalog fields:
+        // if a field is removed from the source (products.yaml), delete it from
+        // DB metadata.gp to prevent silent parity drift (mirrors entitlement delete above).
+        const STALE_CLEAR_FIELDS = ["subtitle", "seo", "sort_rank", "validity_period", "regulatory_class"] as const
+        for (const field of STALE_CLEAR_FIELDS) {
+          if (product[field] === undefined && field in existingGpMeta) {
+            delete nextGpMeta[field]
+          }
+        }
+        if (!Object.prototype.hasOwnProperty.call(product, "duration_minutes") && "duration_minutes" in existingGpMeta) {
+          delete nextGpMeta.duration_minutes
+        }
         const updatePayload: Record<string, any> = {
           title: product.name,
-          ...(product.subtitle !== undefined ? { subtitle: product.subtitle } : {}),
+          subtitle: product.subtitle ?? null,
           description: product.description ?? existing.description,
           status: gateStatus,
           metadata: {
