@@ -45,6 +45,14 @@ export type DesiredReview = {
   seller_note: string | null
   locale: string
   provenanceTag: string
+  // L1 decision note:
+  // `published` (z reviews-catalog.v1.schema.json) nie jest materializowane jako kolumna DB —
+  // model `review` Mercur nie posiada kolumny `published`. Widoczność review downstream jest
+  // kontrolowana przez story 2.4 (junction-based filter + `deleted_at`). Jeśli HG-6 wymaga
+  // per-review `published` flag w DB, Story 2.4/2.5 powinny dodać kolumnę metadata.
+  //
+  // `locale` jest parsowane z kontraktu ale model `review` Mercur nie ma kolumny `locale`.
+  // Lokalizacja review jest domeną storefront/renderu (Story 2.4), nie seed-stage.
 }
 
 export type ExistingSeedReview = {
@@ -103,10 +111,18 @@ export function parseReviewSyncArgs(args: string[] | undefined): {
   const instanceId = (args?.[0] ?? process.env.GP_INSTANCE_ID ?? "gp-dev").trim()
   const marketId = (args?.[1] ?? process.env.GP_MARKET_ID ?? "bonbeauty").trim()
   const configRoot = (process.env.GP_CONFIG_ROOT ?? path.resolve(process.cwd(), "../config")).trim()
+
+  // M1 fix: GP_DRY_RUN=true jest twardym override'em — jeśli orchestrator jest w trybie dry-run,
+  // stage reviews musi być również dry-run bez względu na --apply/GP_SYNC_APPLY.
+  const orchestratorDryRun = ["true", "1", "yes", "on"].includes(
+    (process.env.GP_DRY_RUN ?? "").trim().toLowerCase()
+  )
   const envApply = ["true", "1", "yes", "on"].includes(
     (process.env.GP_SYNC_APPLY ?? "").trim().toLowerCase()
   )
-  const dryRun = !(args?.includes("--apply") || envApply)
+  const wantsApply = args?.includes("--apply") || envApply
+  // Dry-run jeśli orchestrator wymaga dry-run (twardy override) LUB jeśli --apply nie zostało jawnie podane.
+  const dryRun = orchestratorDryRun || !wantsApply
 
   if (!instanceId) throw new Error("instanceId is required (args[0] or GP_INSTANCE_ID)")
   if (!marketId) throw new Error("marketId is required (args[1] or GP_MARKET_ID)")
@@ -220,6 +236,13 @@ async function resolveSellerTarget(db: Knex, sellerFixtureId: string, marketId: 
 }
 
 async function resolveProductTarget(db: Knex, productFixtureId: string, marketId: string): Promise<ResolvedTarget> {
+  // L2 decision note:
+  // Ten stage scope'uje product-reviews przez product.metadata->'gp'->>'market_id' + sc.metadata->>'gp_market_id'.
+  // Istniejący helper listReviewIdsForSalesChannel (review-market-scope.ts) scope'uje przez
+  // konkretny psc.sales_channel_id. To dwie różne semantyki — Story 2.4 musi ujednolicić tę definicję
+  // przy implementacji render-side scope'u. Jedno źródło prawdy market↔sales-channel powinno
+  // zostać ustalone w Story 2.4/2.5 (rekomendacja: opierać się na konkretnym sales_channel_id
+  // marketu zamiast metadata string match).
   const row = await db("product as product")
     .select("product.id")
     .innerJoin("product_sales_channel as psc", "product.id", "psc.product_id")
@@ -323,7 +346,7 @@ async function loadExistingSeedReviews(db: Knex, marketId: string): Promise<Exis
         .orWhereRaw("sc.metadata->>'gp_market_id' = ?", [marketId])
     })
 
-  return rows.map((row: any) => ({
+  const mapped: ExistingSeedReview[] = rows.map((row: any) => ({
     id: row.id,
     reference: row.reference,
     rating: row.rating,
@@ -332,6 +355,18 @@ async function loadExistingSeedReviews(db: Knex, marketId: string): Promise<Exis
     deleted_at: row.deleted_at,
     targetId: row.seller_id ?? row.product_id ?? null,
   }))
+
+  // M2 fix: dedupe po review.id — LEFT JOIN product_sales_channel może zwrócić N duplikatów
+  // dla product-review należącej do wielu sales-channeli (ten sam pattern co buildScopedReviewQuery
+  // w packages/api/src/lib/review-market-scope.ts który używa .distinct("review.id")).
+  // Używamy pierwszego wystąpienia (first-wins) zamiast last-wins z Map constructor.
+  const deduped = new Map<string, ExistingSeedReview>()
+  for (const row of mapped) {
+    if (!deduped.has(row.id)) {
+      deduped.set(row.id, row)
+    }
+  }
+  return Array.from(deduped.values())
 }
 
 function reviewComparable(review: Pick<DesiredReview, "reference" | "rating" | "customer_note" | "seller_note">) {
@@ -364,17 +399,21 @@ export function buildReviewSyncPlan(
       continue
     }
 
-    const targetChanged = current.targetId !== review.targetId
+    // I1 fix: rozróżnienie reaktywacji linku (current.targetId===null = soft-deleted link)
+    // od zmiany aktywnego targetu. Reaktywacja to nie konflikt — konflikt to zmiana target
+    // aktywnego linku (current.targetId !== null && !== review.targetId).
+    const linkWasSoftDeleted = current.targetId === null
+    const targetChanged = current.targetId !== null && current.targetId !== review.targetId
     const diffs = computeFieldDiffs(reviewComparable(current as any), reviewComparable(review))
     if (targetChanged) {
       diffs.push({
         field: "target_id",
-        current: current.targetId ?? "null",
+        current: current.targetId,
         incoming: review.targetId,
       })
     }
 
-    if (diffs.length === 0 && !current.deleted_at) {
+    if (diffs.length === 0 && !current.deleted_at && !linkWasSoftDeleted) {
       entries.push({
         id: review.id,
         action: "skip",
@@ -384,6 +423,7 @@ export function buildReviewSyncPlan(
       continue
     }
 
+    // Konflikt raportujemy tylko dla realnych rozbieżności (diffs zawiera pola), NIE dla reaktywacji linku
     const conflict = diffs.length > 0 ? `${review.id}: ${diffs.map((d) => d.field).join(", ")}` : undefined
     if (conflict) conflicts.push(conflict)
     entries.push({
@@ -544,6 +584,14 @@ export default async function gpConfigSyncReviews({ container, args }: ExecArgs)
 
   if (parsed.dryRun) {
     console.log(collector?.renderTable() ?? "No planned operations.")
+    // M1 fix: jawna notka operatorowi, gdy plan ma >0 operacji a tryb to dry-run
+    const counts = planCounts(plan)
+    const pendingOps = counts.created + counts.updated + counts.deactivated
+    if (pendingOps > 0) {
+      warnings.push(
+        `reviews dry-run only (${pendingOps} pending operations) — pass --apply to materialize`
+      )
+    }
   } else {
     await applyReviewPlan(db, plan)
   }

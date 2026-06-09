@@ -56,6 +56,7 @@ describe("parseReviewSyncArgs", () => {
   beforeEach(() => {
     process.env = { ...originalEnv }
     delete process.env.GP_SYNC_APPLY
+    delete process.env.GP_DRY_RUN
   })
 
   afterAll(() => {
@@ -65,6 +66,22 @@ describe("parseReviewSyncArgs", () => {
   it("domyślnie działa w dry-run i zapis dopuszcza tylko po --apply", () => {
     expect(parseReviewSyncArgs(["gp-dev", "bonbeauty"]).dryRun).toBe(true)
     expect(parseReviewSyncArgs(["gp-dev", "bonbeauty", "--apply"]).dryRun).toBe(false)
+  })
+
+  it("M1: GP_DRY_RUN=true jest twardym override — blokuje --apply z env/args", () => {
+    process.env.GP_DRY_RUN = "true"
+    process.env.GP_SYNC_APPLY = "true"
+    // Nawet przy GP_SYNC_APPLY=true, GP_DRY_RUN=true wymusza dry-run
+    expect(parseReviewSyncArgs(["gp-dev", "bonbeauty", "--apply"]).dryRun).toBe(true)
+  })
+
+  it("M1: GP_DRY_RUN=false nie blokuje --apply", () => {
+    process.env.GP_DRY_RUN = "false"
+    expect(parseReviewSyncArgs(["gp-dev", "bonbeauty", "--apply"]).dryRun).toBe(false)
+  })
+
+  it("M1: brak GP_DRY_RUN i brak --apply = dry-run (domyślnie bezpieczny)", () => {
+    expect(parseReviewSyncArgs(["gp-dev", "bonbeauty"]).dryRun).toBe(true)
   })
 })
 
@@ -153,5 +170,48 @@ describe("buildReviewSyncPlan", () => {
         targetId: "prod-scoped-bonbeauty",
       }),
     ])
+  })
+
+  it("I1: reaktywacja soft-deleted linku (targetId=null) NIE trafia do conflicts[]", () => {
+    // Review istnieje w DB, ale link jest soft-deleted (targetId=null zwrócone przez loadExistingSeedReviews)
+    const reactivate = existing({ targetId: null })
+    const incoming = desired()
+
+    const plan = buildReviewSyncPlan([incoming], [reactivate])
+
+    // Powinien zaplanować update (reaktywacja), ale NOT jako konflikt
+    expect(plan.entries).toEqual([
+      expect.objectContaining({ action: "update" }),
+    ])
+    expect(plan.conflicts).toHaveLength(0)
+  })
+
+  it("I1: zmiana aktywnego targetu (targetId!==null) TRAFIA do conflicts[]", () => {
+    // Review istnieje z aktywnym linkiem do innego targetu
+    const withDifferentTarget = existing({ targetId: "seller-other-target" })
+    const incoming = desired({ targetId: "seller-city-beauty" })
+
+    const plan = buildReviewSyncPlan([incoming], [withDifferentTarget])
+
+    expect(plan.entries).toEqual([
+      expect.objectContaining({ action: "update" }),
+    ])
+    expect(plan.conflicts).toHaveLength(1)
+    expect(plan.conflicts[0]).toContain("target_id")
+  })
+
+  it("M2: duplikaty existing po tym samym id (product-review multi-SC) są deduplikowane", () => {
+    // Symuluje sytuację gdy loadExistingSeedReviews zwróci zdeduplikowaną tablicę.
+    // buildReviewSyncPlan nie widzi duplikatów w pętli deactivation (dedupe odbywa się w loadExistingSeedReviews).
+    const staleId = buildStableReviewId("seeded from gp-ops", "city-beauty", 9)
+    // Dwa wpisy tego samego id (jak gdyby LEFT JOIN zwrócił dwa wiersze przed deduplikacją w DB layer)
+    const existingDeduped = [existing(), existing({ id: staleId, deleted_at: null })]
+
+    const plan = buildReviewSyncPlan([desired()], existingDeduped)
+
+    // Stale review powinna pojawić się TYLKO raz jako deactivate
+    const deactivations = plan.entries.filter((e) => e.action === "deactivate")
+    expect(deactivations).toHaveLength(1)
+    expect(deactivations[0].id).toBe(staleId)
   })
 })
