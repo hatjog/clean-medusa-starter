@@ -58,6 +58,8 @@ export class MarketContextRequiredError extends Error {
   }
 }
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
 type Queryable = Pick<Pool, "query"> | Pick<PoolClient, "query">
 type EventBusLike = {
   emit: (message: unknown) => Promise<unknown>
@@ -251,6 +253,11 @@ export default class GpCoreService {
     if (typeof marketId !== "string" || marketId.trim().length === 0) {
       throw new MarketContextRequiredError()
     }
+    // Validate UUID format to surface malformed IDs early (before ::uuid cast in PG) —
+    // consistent with SAFE_ID_RE validation in rls-pool-hook.ts (LOW-2, ADR-141 §2).
+    if (!UUID_RE.test(marketId)) {
+      throw new MarketContextRequiredError()
+    }
 
     return marketId
   }
@@ -297,6 +304,11 @@ export default class GpCoreService {
     await Promise.allSettled(tasks)
   }
 
+  // PRE-FLIP PRECONDITION (Story 1.4 / ADR-141 §8): callers that read/write
+  // RLS-protected tables (entitlements, redemptions, entitlement_audit_log) MUST
+  // supply marketId here, or use withMarketContext. Callers that only touch
+  // non-RLS tables (e.g. markets) may omit marketId — but MUST be audited before
+  // the Story-1.4 enforcement flip to avoid silent 0-row returns post-flip.
   async withTransaction<T>(
     work: (client: PoolClient) => Promise<T>,
     marketId?: string | null

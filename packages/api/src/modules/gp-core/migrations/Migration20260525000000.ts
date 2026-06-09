@@ -13,6 +13,19 @@ const RLS_TABLES = [
  *
  * ADR-141: external infra may provision the role first, so this migration is
  * intentionally idempotent and reconciles the runtime role to NOBYPASSRLS.
+ *
+ * MED-1 / Deferred: architectural — ADR-141 §8, enforcement-flip in Story 1.4 (HG-5, rollout za flagą).
+ *
+ * FORCE ROW LEVEL SECURITY affects the table owner too (not just gp_core_runtime).
+ * This is NON-REGRESSIVE pre-flip ONLY because `corePool` connects as a superuser
+ * or BYPASSRLS role (e.g. `postgres`) before Story 1.4 switches the connection to
+ * `gp_core_runtime`.  If `GP_CORE_DATABASE_URL` points to a non-privileged owner
+ * role, admin read paths (enrichEntitlements / adminSearch*) would silently return
+ * 0 rows after this migration.
+ *
+ * PRE-FLIP PRECONDITION (Story 1.4): verify that all `getCorePool()` callers that
+ * read/write entitlements / redemptions / entitlement_audit_log pass marketId to
+ * withTransaction / withMarketContext before enabling GP_CORE_RLS_ENFORCED.
  */
 export class Migration20260525000000 extends Migration {
   async up(): Promise<void> {
