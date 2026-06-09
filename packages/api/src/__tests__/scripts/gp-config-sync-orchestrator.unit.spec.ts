@@ -6,6 +6,8 @@ import {
   runStage,
   sendSlackNotification,
 } from "../../scripts/gp-config-sync-orchestrator"
+import fs from "node:fs"
+import path from "node:path"
 
 describe("parseOrchestratorArgs", () => {
   const originalEnv = process.env
@@ -67,6 +69,31 @@ describe("parseOrchestratorArgs", () => {
     const result = parseOrchestratorArgs(["gp-stage", "mercur", "--allow-skip"])
 
     expect(result.allowSkip).toBe(true)
+  })
+
+  it("parsuje jawny apply gate dla stage sync-reviews", () => {
+    const result = parseOrchestratorArgs(["gp-stage", "mercur", "--apply"])
+
+    expect(result.apply).toBe(true)
+  })
+})
+
+describe("stage registry", () => {
+  it("rejestruje sync-reviews po sync-vendors jako optional stage", () => {
+    const source = fs.readFileSync(
+      path.resolve(__dirname, "../../scripts/gp-config-sync-orchestrator.ts"),
+      "utf8"
+    )
+    const vendorsIndex = source.indexOf('name: "sync-vendors"')
+    const reviewsIndex = source.indexOf('name: "sync-reviews"')
+    const accountsIndex = source.indexOf('name: "sync-accounts"')
+    const reviewsBlock = source.slice(reviewsIndex, accountsIndex)
+
+    expect(vendorsIndex).toBeGreaterThan(-1)
+    expect(reviewsIndex).toBeGreaterThan(vendorsIndex)
+    expect(accountsIndex).toBeGreaterThan(reviewsIndex)
+    expect(reviewsBlock).toContain("required: false")
+    expect(reviewsBlock).toContain("gpConfigSyncReviews")
   })
 })
 

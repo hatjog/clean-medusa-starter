@@ -14,6 +14,7 @@ import gpConfigSyncCatalog from "./gp-config-sync-catalog"
 import gpConfigSyncTranslations from "./gp-config-sync-translations"
 import gpConfigSyncMedia from "./gp-config-sync-media"
 import gpConfigSyncPayments from "./gp-config-sync-payments"
+import gpConfigSyncReviews from "./gp-config-sync-reviews"
 import gpConfigSyncShipping from "./gp-config-sync-shipping"
 import gpConfigSyncVendors from "./gp-config-sync-vendors"
 import { isTranslationFeatureFlagEnabled } from "../lib/translation-ff-config"
@@ -23,6 +24,7 @@ const SLUG_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/
 
 type OrchestratorArgs = {
   allowSkip: boolean
+  apply: boolean
   instanceId: string
   marketId: string
   configRoot: string
@@ -105,12 +107,13 @@ export function parseOrchestratorArgs(args: string[] | undefined): OrchestratorA
   const overwrite = parseOverwriteFlag(args)
   const prune = parsePruneFlag(args)
   const allowSkip = args?.includes("--allow-skip") === true
+  const apply = args?.includes("--apply") === true
 
   if (!instanceId) throw new Error("instanceId is required (args[0] or GP_INSTANCE_ID)")
   if (!marketId) throw new Error("marketId is required (args[1] or GP_MARKET_ID)")
   if (!configRoot) throw new Error("configRoot is required (GP_CONFIG_ROOT)")
 
-  return { allowSkip, instanceId, marketId, configRoot, dryRun, overwrite, prune }
+  return { allowSkip, apply, instanceId, marketId, configRoot, dryRun, overwrite, prune }
 }
 
 export function assertTranslationStageGate(
@@ -315,6 +318,9 @@ function buildStageArgs(orchestratorArgs: OrchestratorArgs): string[] {
   }
   if (orchestratorArgs.prune) {
     args.push("--prune")
+  }
+  if (orchestratorArgs.apply) {
+    args.push("--apply")
   }
   return args
 }
@@ -647,6 +653,18 @@ export default async function gpConfigSyncOrchestrator({ container, args }: Exec
             await invokeStageEntrypoint(gpConfigSyncVendors, container, stageArgs)
           })
           return orchestratorArgs.dryRun ? "vendor dry-run completed" : "vendor sync completed"
+        },
+      },
+      {
+        name: "sync-reviews",
+        required: false,
+        execute: async () => {
+          await withStageEnv(orchestratorArgs, async () => {
+            await invokeStageEntrypoint(gpConfigSyncReviews, container, stageArgs)
+          })
+          return orchestratorArgs.apply
+            ? "reviews sync completed"
+            : "reviews dry-run completed"
         },
       },
       {
