@@ -41,12 +41,32 @@ function buildScopedReviewQuery(
     .whereNull("review.deleted_at")
     .where(function () {
       this.where(function () {
+        // Product-scoped reviews: always included when product is in this sales channel.
         this.where("review.reference", "product").whereNotNull("psc.product_id");
-      }).orWhere(function () {
-        this.where("review.reference", "seller")
-          .whereNotNull("ssrr.seller_id")
-          .whereRaw("seller.metadata->'gp'->>'market_id' = sc.metadata->>'gp_market_id'");
       });
+
+      // Seller-scoped reviews are only included when an explicit sellerId filter is
+      // provided. Without it the query would silently widen the default set (e.g.
+      // the user "written reviews" page at /user/reviews/written) to include seller
+      // reviews it was never designed to handle. Callers that need seller reviews MUST
+      // supply filters.sellerId (or filters.productId) — see route.ts GET handler.
+      //
+      // NOTE (M4 / scope): seller reviews are matched by metadata string
+      // (seller.metadata->'gp'->>'market_id' = sc.metadata->>'gp_market_id').
+      // This depends on the runtime sales_channel having `gp_market_id` set in
+      // metadata (populated by seed-products / gp-config-sync-catalog). If that
+      // metadata is absent the seller branch silently returns an empty set, which is
+      // fail-closed but may be surprising. A future story should unify this to a
+      // direct sales_channel_id lookup (see upstream gp-config-sync-reviews.ts note L2).
+      if (filters.sellerId) {
+        this.orWhere(function () {
+          this.where("review.reference", "seller")
+            .whereNotNull("ssrr.seller_id")
+            .whereRaw(
+              "seller.metadata->'gp'->>'market_id' = sc.metadata->>'gp_market_id'"
+            );
+        });
+      }
     });
 
   if (filters.productId) {
@@ -92,10 +112,15 @@ export async function getLiveReviewStatsForSalesChannel(
   salesChannelId: string,
   filters: ReviewScopeFilters = {}
 ): Promise<{ averageRating: number; count: number }> {
+  // Build a DISTINCT subquery for review IDs to avoid fan-out duplicates from
+  // multiple junction joins (product_product_review_review / seller_seller_review_review).
+  // clearSelect() in Knex strips the distinct flag together with the column list,
+  // so we reconstruct with an explicit raw DISTINCT to guarantee deduplication
+  // before AVG/COUNT — preventing inflated stats when a review links to >1 target.
   const scopedIds = buildScopedReviewQuery(db, salesChannelId, filters)
     .clone()
     .clearSelect()
-    .select("review.id")
+    .select(db.raw("DISTINCT review.id"))
     .as("scoped_reviews");
 
   const row = await db
