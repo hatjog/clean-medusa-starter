@@ -102,9 +102,14 @@ describe("GET /store/seller/[handle] — enriched profile", () => {
             { url: "https://cdn.example.com/g2.jpg" },
           ],
           opening_hours: {
-            monday: "09:00-18:00",
-            tuesday: "09:00-18:00",
+            monday: { open: "09:00", close: "18:00" },
+            tuesday: { open: "09:00", close: "18:00" },
             sunday: null,
+          },
+          seo: {
+            meta_title: "Test Salon Warszawa",
+            meta_description: "Profil Test Salon z realnych danych GP",
+            og_image_url: "https://cdn.example.com/og.jpg",
           },
         },
       },
@@ -152,9 +157,14 @@ describe("GET /store/seller/[handle] — enriched profile", () => {
     expect(body.seller.gallery).toHaveLength(2);
     expect((body.seller.gallery as unknown[])[0]).toMatchObject({ url: "https://cdn.example.com/g1.jpg", is_primary: true });
     expect(body.seller.opening_hours).toEqual({
-      monday: "09:00-18:00",
-      tuesday: "09:00-18:00",
+      monday: { open: "09:00", close: "18:00" },
+      tuesday: { open: "09:00", close: "18:00" },
       sunday: null,
+    });
+    expect(body.seller.seo).toEqual({
+      meta_title: "Test Salon Warszawa",
+      meta_description: "Profil Test Salon z realnych danych GP",
+      og_image_url: "https://cdn.example.com/og.jpg",
     });
   });
 
@@ -229,6 +239,7 @@ describe("GET /store/seller/[handle] — enriched profile", () => {
     expect(body.seller.locations).toEqual([]);
     expect(body.seller.gallery).toEqual([]);
     expect(body.seller.opening_hours).toBeNull();
+    expect(body.seller.seo).toBeNull();
   });
 
   it("3.3b: returns safe defaults when metadata.gp is partially populated", async () => {

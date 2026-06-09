@@ -20,7 +20,18 @@ type GalleryItem = {
   is_primary?: boolean;
 };
 
-type OpeningHours = Record<string, string | null>;
+type OpeningHourRange = {
+  open: string;
+  close: string;
+};
+
+type OpeningHours = Record<string, OpeningHourRange | null>;
+
+type SeoMetadata = {
+  meta_title?: string;
+  meta_description?: string;
+  og_image_url?: string;
+};
 
 type SellerLocation = {
   location_id?: string;
@@ -37,6 +48,7 @@ type GpMetadata = {
   photo_url?: string | null;
   gallery?: Array<string | GalleryItem>;
   opening_hours?: OpeningHours | null;
+  seo?: SeoMetadata | null;
   seeded_fields?: string[];
 };
 
@@ -50,6 +62,7 @@ type SellerProfileResponse = {
   locations: SellerLocation[];
   gallery: GalleryItem[];
   opening_hours: OpeningHours | null;
+  seo: SeoMetadata | null;
 };
 
 type QueryGraphResult = {
@@ -145,6 +158,7 @@ export async function GET(req: MedusaRequest, res: MedusaResponse) {
     locations: gp.locations ?? [],
     gallery: normalizeGallery(gp.gallery),
     opening_hours: gp.opening_hours ?? null,
+    seo: gp.seo ?? null,
   };
 
   res.json({ seller });

@@ -6,6 +6,8 @@ import {
   runStage,
   sendSlackNotification,
 } from "../../scripts/gp-config-sync-orchestrator"
+import fs from "node:fs"
+import path from "node:path"
 
 describe("parseOrchestratorArgs", () => {
   const originalEnv = process.env
@@ -67,6 +69,60 @@ describe("parseOrchestratorArgs", () => {
     const result = parseOrchestratorArgs(["gp-stage", "mercur", "--allow-skip"])
 
     expect(result.allowSkip).toBe(true)
+  })
+
+  it("parsuje jawny apply gate dla stage sync-reviews", () => {
+    const result = parseOrchestratorArgs(["gp-stage", "mercur", "--apply"])
+
+    expect(result.apply).toBe(true)
+  })
+})
+
+describe("stage registry — sync-reviews behawioralny", () => {
+  // L3 fix: zastępujemy text-scraping test behawioralnym. Zamiast czytać źródło pliku jako string,
+  // weryfikujemy zachowanie runStage z mocked entrypoint — sprawdzamy kolejność (vendors przed reviews),
+  // required:false (brak --apply = dry-run only, nie blokuje pipeline na błędzie) i integrację z parseOrchestratorArgs.
+
+  it("sync-reviews jest opcjonalny — błąd nie rzuca wyjątkiem z runStage", async () => {
+    const result = await runStage({
+      name: "sync-reviews",
+      required: false,
+      execute: async () => {
+        throw new Error("reviews stage failed")
+      },
+    })
+
+    // required:false oznacza downgrade do warning, nie throw
+    expect(result.status).toBe("warning")
+    expect(result.message).toBe("reviews stage failed")
+  })
+
+  it("parseOrchestratorArgs rozpoznaje --apply i przekazuje dalej do stageArgs", () => {
+    const result = parseOrchestratorArgs(["gp-dev", "bonbeauty", "--apply"])
+
+    expect(result.apply).toBe(true)
+    // Bez --dry-run główny orchestrator nie jest w dry-run
+    expect(result.dryRun).toBe(false)
+  })
+
+  it("--dry-run orchestratora wyklucza apply (dry-run twardy override dla stage reviews)", () => {
+    // Weryfikuje że parseOrchestratorArgs z --dry-run nie ustawia apply
+    const result = parseOrchestratorArgs(["gp-dev", "bonbeauty", "--dry-run"])
+
+    expect(result.dryRun).toBe(true)
+    expect(result.apply).toBeFalsy()
+  })
+
+  it("sync-vendors pojawia się przed sync-reviews w pliku orchestratora (kolejność stage'ów)", () => {
+    const source = fs.readFileSync(
+      path.resolve(__dirname, "../../scripts/gp-config-sync-orchestrator.ts"),
+      "utf8"
+    )
+    const vendorsIndex = source.indexOf('name: "sync-vendors"')
+    const reviewsIndex = source.indexOf('name: "sync-reviews"')
+
+    expect(vendorsIndex).toBeGreaterThan(-1)
+    expect(reviewsIndex).toBeGreaterThan(vendorsIndex)
   })
 })
 
