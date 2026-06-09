@@ -10,6 +10,8 @@ import { createHash } from "node:crypto"
 
 import { Pool, PoolClient } from "pg"
 
+import { GP_MARKET_SESSION_VAR } from "../../lib/rls-pool-hook"
+
 import {
   MARKET_CREATED_EVENT,
   MARKET_UPDATED_EVENT,
@@ -44,6 +46,15 @@ export class NotImplementedError extends Error {
   constructor(storyId: string) {
     super(`Not implemented — see ${storyId}`)
     this.name = "NotImplementedError"
+  }
+}
+
+export class MarketContextRequiredError extends Error {
+  readonly code = "MARKET_CONTEXT_REQUIRED"
+
+  constructor() {
+    super("MARKET_CONTEXT_REQUIRED")
+    this.name = "MarketContextRequiredError"
   }
 }
 
@@ -236,6 +247,18 @@ export default class GpCoreService {
     await this.eventBus_.emit({ name, data })
   }
 
+  private requireMarketContext(marketId: string | null | undefined): string {
+    if (typeof marketId !== "string" || marketId.trim().length === 0) {
+      throw new MarketContextRequiredError()
+    }
+
+    return marketId
+  }
+
+  private async setTransactionMarketContext(client: PoolClient, marketId: string): Promise<void> {
+    await client.query(`SELECT set_config('${GP_MARKET_SESSION_VAR}', $1, true)`, [marketId])
+  }
+
   private async selectMarketRecord(
     selector: MarketSelector,
     client?: Queryable
@@ -274,11 +297,17 @@ export default class GpCoreService {
     await Promise.allSettled(tasks)
   }
 
-  async withTransaction<T>(work: (client: PoolClient) => Promise<T>): Promise<T> {
+  async withTransaction<T>(
+    work: (client: PoolClient) => Promise<T>,
+    marketId?: string | null
+  ): Promise<T> {
     const client = await this.getCorePool().connect()
 
     try {
       await client.query("BEGIN")
+      if (marketId !== undefined) {
+        await this.setTransactionMarketContext(client, this.requireMarketContext(marketId))
+      }
       const result = await work(client)
       await client.query("COMMIT")
       return result
@@ -288,6 +317,15 @@ export default class GpCoreService {
     } finally {
       client.release()
     }
+  }
+
+  async withMarketContext<T>(
+    marketId: string | null | undefined,
+    work: (client: PoolClient) => Promise<T>
+  ): Promise<T> {
+    const requiredMarketId = this.requireMarketContext(marketId)
+
+    return await this.withTransaction(work, requiredMarketId)
   }
 
   async listMarkets(instanceId?: string): Promise<GpCoreMarket[]> {
