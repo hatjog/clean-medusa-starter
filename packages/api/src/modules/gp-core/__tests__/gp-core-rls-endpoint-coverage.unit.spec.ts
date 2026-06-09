@@ -336,7 +336,7 @@ maybeDescribe("NEEDS-LIVE-RUN Story 1.4 gp_core RLS endpoint coverage-test", () 
         `
           INSERT INTO gp_core.entitlement_audit_log (
             entitlement_id, market_id, action, actor_type, actor_id, old_status, new_status, metadata
-          ) VALUES ($1, $2, 'redeem', 'vendor', 'vendor-a', 'ACTIVE', 'REDEEMED', '{"story":"1.4"}'::jsonb)
+          ) VALUES ($1, $2, 'redeem', 'vendor', 'vendor-a', 'ACTIVE', 'REDEEMED', '{"story":"1.4"}'::jsonb)  -- // noqa: mercur15-drift (gp_core entitlement status, not Mercur store status)
         `,
         [FIXTURE.smokeEntitlement, FIXTURE.marketA]
       )
