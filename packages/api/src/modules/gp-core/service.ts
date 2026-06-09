@@ -59,6 +59,7 @@ export class MarketContextRequiredError extends Error {
 }
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+const GP_CORE_RUNTIME_ROLE = "gp_core_runtime"
 
 type Queryable = Pick<Pool, "query"> | Pick<PoolClient, "query">
 type EventBusLike = {
@@ -166,6 +167,10 @@ export function resolveMercurDatabaseUrl(explicit?: string): string {
   return "postgres://postgres:postgres@localhost:5432/gp_mercur"
 }
 
+export function resolveGpCoreRlsEnforced(raw = process.env.GP_CORE_RLS_ENFORCED): boolean {
+  return raw === "true" || raw === "1"
+}
+
 export default class GpCoreService {
   private readonly container_: Record<string, any>
   private readonly moduleOptions_: GpCoreModuleOptions
@@ -266,6 +271,10 @@ export default class GpCoreService {
     await client.query(`SELECT set_config('${GP_MARKET_SESSION_VAR}', $1, true)`, [marketId])
   }
 
+  private async setTransactionRuntimeRole(client: PoolClient): Promise<void> {
+    await client.query(`SET LOCAL ROLE ${GP_CORE_RUNTIME_ROLE}`)
+  }
+
   private async selectMarketRecord(
     selector: MarketSelector,
     client?: Queryable
@@ -317,6 +326,9 @@ export default class GpCoreService {
 
     try {
       await client.query("BEGIN")
+      if (resolveGpCoreRlsEnforced()) {
+        await this.setTransactionRuntimeRole(client)
+      }
       if (marketId !== undefined) {
         await this.setTransactionMarketContext(client, this.requireMarketContext(marketId))
       }
