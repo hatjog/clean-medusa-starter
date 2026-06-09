@@ -81,13 +81,13 @@ export class Migration20260430090000VoucherRecipientPiiTable extends Migration {
       `ALTER TABLE voucher_recipient_pii FORCE ROW LEVEL SECURITY`
     );
 
-    // 6. Policy: every read/write filtered by `current_setting('app.market_id')`.
-    //    Set per request via Medusa middleware (`SET LOCAL app.market_id = $1`).
+    // 6. Policy: every read/write filtered by canonical gp market session-var.
+    //    Set per request via the RLS pool hook.
     this.addSql(
       `CREATE POLICY rls_voucher_recipient_pii_market_isolation
        ON voucher_recipient_pii
-       USING (market_id = current_setting('app.market_id', true))
-       WITH CHECK (market_id = current_setting('app.market_id', true))`
+       USING (market_id::uuid = current_setting('app.gp_market_id', true)::uuid)
+       WITH CHECK (market_id::uuid = current_setting('app.gp_market_id', true)::uuid)`
     );
 
     // 7. App-role grants (defensive — role may not exist in test envs).

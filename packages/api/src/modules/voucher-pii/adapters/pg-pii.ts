@@ -3,7 +3,7 @@
  *
  * Manages the `voucher_recipient_pii` table. RLS is enforced by the
  * pool hook (lib/rls-pool-hook.ts): each connection receives
- * `SET app.market_id = '...'` before the query runs, so the RLS
+ * `SET app.gp_market_id = '...'` before the query runs, so the RLS
  * policy on `voucher_recipient_pii` gates every SELECT/INSERT by
  * the current market. This adapter never sets GUC itself.
  *
