@@ -14,8 +14,9 @@ describe("v1.12.0 Story 1.1 — gp_core market_id denormalization migration", ()
   const up = collectSql("up");
 
   it("adds market_id nullable first, before backfill and NOT NULL", () => {
-    const addRedemptions = up.indexOf("ALTER TABLE gp_core.redemptions ADD COLUMN IF NOT EXISTS market_id uuid");
-    const addAudit = up.indexOf("ALTER TABLE gp_core.entitlement_audit_log ADD COLUMN IF NOT EXISTS market_id uuid");
+    // L2: ADD COLUMN is now guarded per-column via information_schema (no IF NOT EXISTS suffix)
+    const addRedemptions = up.indexOf("ALTER TABLE gp_core.redemptions ADD COLUMN market_id uuid");
+    const addAudit = up.indexOf("ALTER TABLE gp_core.entitlement_audit_log ADD COLUMN market_id uuid");
     const backfillRedemptions = up.indexOf("UPDATE gp_core.redemptions r");
     const backfillAudit = up.indexOf("UPDATE gp_core.entitlement_audit_log a");
     const notNullRedemptions = up.indexOf("ALTER TABLE gp_core.redemptions ALTER COLUMN market_id SET NOT NULL");
@@ -34,6 +35,15 @@ describe("v1.12.0 Story 1.1 — gp_core market_id denormalization migration", ()
     expect(up).toMatch(/to_regclass\('gp_core\.redemptions'\) IS NOT NULL/);
     expect(up).toMatch(/to_regclass\('gp_core\.entitlement_audit_log'\) IS NOT NULL/);
     expect(up).toMatch(/to_regclass\('gp_core\.entitlements'\) IS NOT NULL/);
+    // L1 fix: FK target gp_core.markets must also be guarded
+    expect(up).toMatch(/to_regclass\('gp_core\.markets'\) IS NOT NULL/);
+  });
+
+  it("uses per-column information_schema guard for idempotency (L2 fix)", () => {
+    // Column-level guard: skip ADD COLUMN only when the specific column exists,
+    // not when any table in the block exists.
+    expect(up).toMatch(/information_schema\.columns[\s\S]*table_schema\s*=\s*'gp_core'[\s\S]*table_name\s*=\s*'redemptions'[\s\S]*column_name\s*=\s*'market_id'/);
+    expect(up).toMatch(/information_schema\.columns[\s\S]*table_schema\s*=\s*'gp_core'[\s\S]*table_name\s*=\s*'entitlement_audit_log'[\s\S]*column_name\s*=\s*'market_id'/);
   });
 
   it("backfills both tables from entitlements.market_id by entitlement_id and is re-runnable", () => {
@@ -43,7 +53,8 @@ describe("v1.12.0 Story 1.1 — gp_core market_id denormalization migration", ()
     expect(up).toMatch(
       /UPDATE gp_core\.entitlement_audit_log a[\s\S]*SET market_id = e\.market_id[\s\S]*FROM gp_core\.entitlements e[\s\S]*WHERE a\.entitlement_id = e\.entitlement_id[\s\S]*AND a\.market_id IS NULL/
     );
-    expect(up).toMatch(/ADD COLUMN IF NOT EXISTS market_id uuid/);
+    // ADD COLUMN is guarded per-column via information_schema (no IF NOT EXISTS suffix on ADD COLUMN)
+    expect(up).toMatch(/ADD COLUMN market_id uuid/);
     expect(up).toMatch(/CREATE INDEX IF NOT EXISTS idx_redemptions_market_id/);
     expect(up).toMatch(/CREATE INDEX IF NOT EXISTS idx_entitlement_audit_log_market_id/);
   });
@@ -70,5 +81,8 @@ describe("v1.12.0 Story 1.1 — gp_core market_id denormalization migration", ()
     expect(down).toMatch(/DROP INDEX IF EXISTS gp_core\.idx_redemptions_market_id/);
     expect(down).toMatch(/ALTER TABLE gp_core\.entitlement_audit_log DROP COLUMN IF EXISTS market_id/);
     expect(down).toMatch(/ALTER TABLE gp_core\.redemptions DROP COLUMN IF EXISTS market_id/);
+    // L3 fix: down() must also guard with to_regclass so it is safe when tables don't exist
+    expect(down).toMatch(/to_regclass\('gp_core\.entitlement_audit_log'\) IS NOT NULL/);
+    expect(down).toMatch(/to_regclass\('gp_core\.redemptions'\) IS NOT NULL/);
   });
 });
