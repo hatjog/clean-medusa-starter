@@ -37,6 +37,7 @@ import {
   isClaimTokenTtlEnforced,
   resolveClaimTokenTtlHours,
 } from "../../../../../lib/voucher-claim-magic-link-ttl"
+import { marketContextStorage } from "../../../../../lib/market-context"
 
 export const AUTHENTICATE = false
 
@@ -58,6 +59,13 @@ function resolveIp(req: MedusaRequest): string {
   const forwarded = req.headers["x-forwarded-for"]
   if (typeof forwarded === "string") return forwarded.split(",")[0].trim()
   return req.socket?.remoteAddress ?? "unknown"
+}
+
+function resolveCustomerScope(req: MedusaRequest): string | null {
+  const raw = req.headers["x-gp-customer-id"]
+  if (typeof raw === "string" && raw.trim()) return raw.trim()
+  if (Array.isArray(raw) && raw[0]?.trim()) return raw[0].trim()
+  return null
 }
 
 type Db = {
@@ -151,6 +159,8 @@ export async function GET(req: MedusaRequest, res: MedusaResponse): Promise<void
   const startedAt = Date.now()
   const token = (req.params as { token?: string })?.token ?? ""
   const ip = resolveIp(req)
+  const marketId = marketContextStorage.getStore()?.market_id ?? null
+  const customerId = resolveCustomerScope(req)
 
   // --- Rate limit ---
   const rl = consumeClaimToken(ip)
@@ -207,6 +217,7 @@ export async function GET(req: MedusaRequest, res: MedusaResponse): Promise<void
             ei.claim_token_revoked_at,
             ei.claim_token_issued_at,
             ei.market_id,
+            ei.recipient_customer_id,
             v.code AS voucher_code,
             v.product_title,
             v.seller_name,
@@ -221,6 +232,17 @@ export async function GET(req: MedusaRequest, res: MedusaResponse): Promise<void
 
   const row = rowsFromResult(result)[0]
   if (!row || row.claim_token_revoked_at) {
+    await padToFloor(startedAt)
+    res.status(404).json({ type: "not_found", message: "Claim token not found." })
+    return
+  }
+  const rowMarketId =
+    typeof row.market_id === "string" && row.market_id ? row.market_id : null
+  const rowRecipientCustomerId =
+    typeof row.recipient_customer_id === "string" && row.recipient_customer_id
+      ? row.recipient_customer_id
+      : null
+  if ((marketId && rowMarketId !== marketId) || (rowRecipientCustomerId && rowRecipientCustomerId !== customerId)) {
     await padToFloor(startedAt)
     res.status(404).json({ type: "not_found", message: "Claim token not found." })
     return

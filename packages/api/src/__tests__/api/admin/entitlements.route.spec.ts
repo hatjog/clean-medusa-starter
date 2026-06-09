@@ -14,6 +14,8 @@
  */
 
 import { GET } from "../../../api/v1/admin/entitlements/route"
+import { __setKnexForAdminMarketTests } from "../../../lib/admin-market-context"
+import { __resetCapabilityCache } from "../../../lib/capability-grants-repo"
 
 const mockEntitlement = {
   id: "ent_01",
@@ -41,6 +43,8 @@ function createReq(query: Record<string, string> = {}) {
 
   return {
     query,
+    headers: { "x-gp-market-id": "market-a" },
+    auth_context: { actor_id: "admin-1", actor_type: "user" },
     scope: {
       resolve: jest.fn().mockReturnValue(mockGpCore),
     },
@@ -63,7 +67,34 @@ function createRes() {
   }
 }
 
+function makeSuperAdminKnex() {
+  return ((table: string) => {
+    const rows =
+      table === "admin_capability_grants"
+        ? [{ capability: "__super_admin__" }]
+        : []
+    const chain = {
+      select: jest.fn(() => chain),
+      where: jest.fn(() => chain),
+      whereIn: jest.fn(() => chain),
+      whereNull: jest.fn(() => chain),
+      limit: jest.fn(() => Promise.resolve(rows)),
+    }
+    return chain
+  }) as any
+}
+
 describe("GET /v1/admin/entitlements", () => {
+  beforeEach(() => {
+    __resetCapabilityCache()
+    __setKnexForAdminMarketTests(makeSuperAdminKnex())
+  })
+
+  afterEach(() => {
+    __setKnexForAdminMarketTests(undefined)
+    __resetCapabilityCache()
+  })
+
   describe("happy path — email search", () => {
     it("returns entitlements array for email query", async () => {
       const req = createReq({ q: "buyer@example.com" })
@@ -73,7 +104,9 @@ describe("GET /v1/admin/entitlements", () => {
 
       expect(res.statusCode).toBe(200)
       expect(res.body).toEqual({ data: { entitlements: [mockEntitlement] } })
-      expect(req._gpCore.adminSearchEntitlements).toHaveBeenCalledWith("buyer@example.com")
+      expect(req._gpCore.adminSearchEntitlements).toHaveBeenCalledWith("buyer@example.com", {
+        market_id: "market-a",
+      })
     })
   })
 
@@ -85,7 +118,9 @@ describe("GET /v1/admin/entitlements", () => {
       await GET(req, res as any)
 
       expect(res.body).toEqual({ data: { entitlements: [mockEntitlement] } })
-      expect(req._gpCore.adminSearchEntitlements).toHaveBeenCalledWith("VOUCHER123")
+      expect(req._gpCore.adminSearchEntitlements).toHaveBeenCalledWith("VOUCHER123", {
+        market_id: "market-a",
+      })
     })
   })
 
@@ -107,6 +142,8 @@ describe("GET /v1/admin/entitlements", () => {
       }
       const req = {
         query: { q: "nonexistent" },
+        headers: { "x-gp-market-id": "market-a" },
+        auth_context: { actor_id: "admin-1", actor_type: "user" },
         scope: { resolve: jest.fn().mockReturnValue(gpCore) },
       } as any
       const res = createRes()
@@ -152,6 +189,8 @@ describe("GET /v1/admin/entitlements", () => {
     it("returns 503 when GpCoreService cannot be resolved", async () => {
       const req = {
         query: { q: "testquery" },
+        headers: { "x-gp-market-id": "market-a" },
+        auth_context: { actor_id: "admin-1", actor_type: "user" },
         scope: { resolve: jest.fn().mockImplementation(() => { throw new Error("not found") }) },
       } as any
       const res = createRes()
@@ -160,5 +199,21 @@ describe("GET /v1/admin/entitlements", () => {
 
       expect(res.statusCode).toBe(503)
     })
+  })
+
+  it("fails closed when admin market context is missing", async () => {
+    const req = {
+      query: { q: "buyer@example.com" },
+      headers: {},
+      auth_context: { actor_id: "admin-1", actor_type: "user" },
+      scope: { resolve: jest.fn() },
+    } as any
+    const res = createRes()
+
+    await GET(req, res as any)
+
+    expect(res.statusCode).toBe(400)
+    expect(res.body).toMatchObject({ code: "MARKET_REQUIRED" })
+    expect(req.scope.resolve).not.toHaveBeenCalled()
   })
 })

@@ -35,13 +35,17 @@ import type { MedusaRequest, MedusaResponse } from "@medusajs/framework/http"
 import { AdminEntitlementsQuerySchema } from "../../../../lib/contracts/admin"
 import { apiError, apiSuccess } from "../../../../lib/api/response"
 import { ErrorCode } from "../../../../lib/contracts/errors"
+import { resolveAdminMarketContext } from "../../../../lib/admin-market-context"
 import {
   VOUCHER_MODULE,
   type VoucherService,
 } from "../../../../modules/voucher"
 
 type VoucherSearchLike = {
-  adminSearchEntitlements: (q: string) => Promise<unknown[]>
+  adminSearchEntitlements: (
+    q: string,
+    opts?: { market_id?: string | null }
+  ) => Promise<unknown[]>
 }
 
 function resolveVoucherService(req: MedusaRequest): VoucherSearchLike | null {
@@ -68,6 +72,22 @@ export async function GET(req: MedusaRequest, res: MedusaResponse): Promise<void
 
   const { q } = parseResult.data
 
+  const marketResult = await resolveAdminMarketContext(req)
+  if (!marketResult.ok) {
+    res.status(marketResult.status).json({
+      code: marketResult.code,
+      message: marketResult.message,
+    })
+    return
+  }
+  if (!marketResult.market_id) {
+    res.status(400).json({
+      code: "MARKET_REQUIRED",
+      message: "x-gp-market-id is required for entitlement search",
+    })
+    return
+  }
+
   const voucher = resolveVoucherService(req)
   if (!voucher) {
     apiError(res, ErrorCode.SERVICE_UNAVAILABLE, 503, {
@@ -76,6 +96,8 @@ export async function GET(req: MedusaRequest, res: MedusaResponse): Promise<void
     return
   }
 
-  const entitlements = await voucher.adminSearchEntitlements(q)
+  const entitlements = await voucher.adminSearchEntitlements(q, {
+    market_id: marketResult.market_id,
+  })
   apiSuccess(res, { entitlements })
 }

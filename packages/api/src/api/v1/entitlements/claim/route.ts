@@ -46,6 +46,7 @@ import {
   EntitlementInstanceState,
   assertTransition,
 } from "../../../../modules/voucher/models/entitlement"
+import { marketContextStorage } from "../../../../lib/market-context"
 
 export const AUTHENTICATE = false
 
@@ -76,6 +77,13 @@ function resolveIp(req: MedusaRequest): string {
   const forwarded = req.headers["x-forwarded-for"]
   if (typeof forwarded === "string") return forwarded.split(",")[0].trim()
   return req.socket?.remoteAddress ?? "unknown"
+}
+
+function resolveCustomerScope(req: MedusaRequest): string | null {
+  const raw = req.headers["x-gp-customer-id"]
+  if (typeof raw === "string" && raw.trim()) return raw.trim()
+  if (Array.isArray(raw) && raw[0]?.trim()) return raw[0].trim()
+  return null
 }
 
 function extractClaimToken(req: MedusaRequest): string {
@@ -177,6 +185,8 @@ async function withTransaction<T>(
 export async function POST(req: MedusaRequest, res: MedusaResponse): Promise<void> {
   const startedAt = Date.now()
   const ip = resolveIp(req)
+  const marketId = marketContextStorage.getStore()?.market_id ?? null
+  const customerId = resolveCustomerScope(req)
 
   // --- Rate limit ---
   const rl = consumeClaimToken(ip)
@@ -220,9 +230,10 @@ export async function POST(req: MedusaRequest, res: MedusaResponse): Promise<voi
         revoked_at: Date | string | null
         issued_at: Date | string | null
         market_id: string | null
+        recipient_customer_id: string | null
       }>(
         `SELECT id, state, claim_token_revoked_at AS revoked_at,
-                claim_token_issued_at AS issued_at, market_id
+                claim_token_issued_at AS issued_at, market_id, recipient_customer_id
            FROM entitlement_instance
           WHERE claim_token = $1::uuid
           FOR UPDATE`,
@@ -232,6 +243,9 @@ export async function POST(req: MedusaRequest, res: MedusaResponse): Promise<voi
         return null
       }
       const row = lockRes.rows[0]
+      if ((marketId && row.market_id !== marketId) || (row.recipient_customer_id && row.recipient_customer_id !== customerId)) {
+        return null
+      }
       const currentState = row.state as EntitlementInstanceState
 
       // TTL magic-linka: wygasły link NIE może zainicjować nowego claimu
