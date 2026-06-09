@@ -31,6 +31,12 @@ export class Migration20260525001000 extends Migration {
   }
 
   async down(): Promise<void> {
+    // Reconciliation note (INFO-2): up() reconciles the role even when externally provisioned
+    // (CREATE only if absent, then ALTER NOBYPASSRLS). down() drops it unconditionally if present —
+    // same asymmetry as the ratified Migration20260525000000 (story 1.3) pattern. Operational
+    // awareness: rolling back this migration will remove the role even if it was externally managed
+    // before this migration ran. The dependent_objects_still_exist guard prevents hard errors when
+    // the role has active dependencies (e.g. public-schema grants added at multi-market flip time).
     this.addSql(`
       DO $$ BEGIN
         IF EXISTS (
