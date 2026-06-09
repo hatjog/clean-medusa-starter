@@ -849,9 +849,22 @@ export class VoucherService {
    * an obsolete table; the Layer 4 equivalents live on `policy_snapshot` and
    * `remaining_amount`).
    */
-  async adminSearchEntitlements(q: string): Promise<EntitlementAdminView[]> {
+  async adminSearchEntitlements(
+    q: string,
+    opts: { market_id?: string | null; allow_cross_market?: boolean } = {}
+  ): Promise<EntitlementAdminView[]> {
     const trimmed = q.trim()
     if (!trimmed) return []
+    const marketId = opts.market_id ?? null
+    const allowCrossMarket = opts.allow_cross_market === true
+    // Story 1.5 / R5 / FR-F5 — fail-closed default. A caller that supplies
+    // neither a concrete market_id NOR an explicit cross-market opt-in gets an
+    // empty result set, NOT an unscoped cross-market read. Cross-market global
+    // search is reserved for super-admins and MUST be requested explicitly via
+    // `allow_cross_market: true` (the admin route only sets it after verifying
+    // `is_super_admin`). This removes the prior fail-open default where a future
+    // caller omitting `opts` would silently read every market.
+    if (!marketId && !allowCrossMarket) return []
     const pool = this.getPool()
 
     const isEmailSearch = trimmed.includes("@")
@@ -872,9 +885,10 @@ export class VoucherService {
            FROM entitlement_instance ei
            LEFT JOIN voucher v ON v.code = (ei.policy_snapshot->>'voucher_code')
           WHERE ei.order_id = ANY($1::text[])
+            AND ($2::text IS NULL OR ei.market_id = $2)
           ORDER BY ei.created_at DESC
           LIMIT 200`,
-        [orderIds]
+        [orderIds, marketId]
       )
       return rows.rows.map((r) => this.projectAdminView(r))
     }
@@ -883,11 +897,14 @@ export class VoucherService {
       `SELECT ei.*, v.code AS voucher_code, v.value_minor, v.currency_code
          FROM entitlement_instance ei
          LEFT JOIN voucher v ON v.code = (ei.policy_snapshot->>'voucher_code')
-        WHERE (v.code ILIKE $1)
-           ${isUuid ? "OR ei.claim_token = $2::uuid OR ei.order_id = $2 OR ei.id = $2" : "OR ei.order_id = $2 OR ei.id = $2"}
+        WHERE (
+             v.code ILIKE $1
+          ${isUuid ? "OR ei.claim_token = $2::uuid OR ei.order_id = $2 OR ei.id = $2" : "OR ei.order_id = $2 OR ei.id = $2"}
+        )
+          AND ($3::text IS NULL OR ei.market_id = $3)
         ORDER BY ei.created_at DESC
         LIMIT 100`,
-      [`%${trimmed}%`, trimmed]
+      [`%${trimmed}%`, trimmed, marketId]
     )
     return directRes.rows.map((r) => this.projectAdminView(r))
   }

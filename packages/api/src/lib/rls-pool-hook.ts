@@ -19,6 +19,7 @@ import { marketContextStorage } from "./market-context";
 
 const SAFE_ID_RE = /^[a-zA-Z0-9_-]+$/;
 const RLS_MARKER = Symbol("__gp_rls_active");
+export const GP_MARKET_SESSION_VAR = "app.gp_market_id";
 
 export type HookLogger = {
   warn?: (...args: unknown[]) => void;
@@ -93,7 +94,7 @@ export function installRlsPoolHook(
     try {
       await connection.query("SET ROLE medusa_store");
       await connection.query(
-        "SELECT set_config('app.gp_market_id', $1, false)",
+        `SELECT set_config('${GP_MARKET_SESSION_VAR}', $1, false)`,
         [ctx.market_id]
       );
       connection[RLS_MARKER] = true;
@@ -104,7 +105,7 @@ export function installRlsPoolHook(
       });
 
       try {
-        await connection.query("RESET app.gp_market_id");
+        await connection.query(`RESET ${GP_MARKET_SESSION_VAR}`);
       } catch {
         // ignore best-effort cleanup and destroy the connection below
       }
@@ -132,7 +133,7 @@ export function installRlsPoolHook(
   ): Promise<void> {
     if (connection[RLS_MARKER]) {
       try {
-        await connection.query("RESET app.gp_market_id");
+        await connection.query(`RESET ${GP_MARKET_SESSION_VAR}`);
         await connection.query("RESET ROLE");
       } catch (error) {
         logger?.error?.("RLS pool hook release cleanup failed", {

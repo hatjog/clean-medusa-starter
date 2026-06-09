@@ -10,6 +10,8 @@ import { createHash } from "node:crypto"
 
 import { Pool, PoolClient } from "pg"
 
+import { GP_MARKET_SESSION_VAR } from "../../lib/rls-pool-hook"
+
 import {
   MARKET_CREATED_EVENT,
   MARKET_UPDATED_EVENT,
@@ -46,6 +48,18 @@ export class NotImplementedError extends Error {
     this.name = "NotImplementedError"
   }
 }
+
+export class MarketContextRequiredError extends Error {
+  readonly code = "MARKET_CONTEXT_REQUIRED"
+
+  constructor() {
+    super("MARKET_CONTEXT_REQUIRED")
+    this.name = "MarketContextRequiredError"
+  }
+}
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+const GP_CORE_RUNTIME_ROLE = "gp_core_runtime"
 
 type Queryable = Pick<Pool, "query"> | Pick<PoolClient, "query">
 type EventBusLike = {
@@ -153,6 +167,10 @@ export function resolveMercurDatabaseUrl(explicit?: string): string {
   return "postgres://postgres:postgres@localhost:5432/gp_mercur"
 }
 
+export function resolveGpCoreRlsEnforced(raw = process.env.GP_CORE_RLS_ENFORCED): boolean {
+  return raw === "true" || raw === "1"
+}
+
 export default class GpCoreService {
   private readonly container_: Record<string, any>
   private readonly moduleOptions_: GpCoreModuleOptions
@@ -236,6 +254,27 @@ export default class GpCoreService {
     await this.eventBus_.emit({ name, data })
   }
 
+  private requireMarketContext(marketId: string | null | undefined): string {
+    if (typeof marketId !== "string" || marketId.trim().length === 0) {
+      throw new MarketContextRequiredError()
+    }
+    // Validate UUID format to surface malformed IDs early (before ::uuid cast in PG) —
+    // consistent with SAFE_ID_RE validation in rls-pool-hook.ts (LOW-2, ADR-141 §2).
+    if (!UUID_RE.test(marketId)) {
+      throw new MarketContextRequiredError()
+    }
+
+    return marketId
+  }
+
+  private async setTransactionMarketContext(client: PoolClient, marketId: string): Promise<void> {
+    await client.query(`SELECT set_config('${GP_MARKET_SESSION_VAR}', $1, true)`, [marketId])
+  }
+
+  private async setTransactionRuntimeRole(client: PoolClient): Promise<void> {
+    await client.query(`SET LOCAL ROLE ${GP_CORE_RUNTIME_ROLE}`)
+  }
+
   private async selectMarketRecord(
     selector: MarketSelector,
     client?: Queryable
@@ -274,11 +313,25 @@ export default class GpCoreService {
     await Promise.allSettled(tasks)
   }
 
-  async withTransaction<T>(work: (client: PoolClient) => Promise<T>): Promise<T> {
+  // PRE-FLIP PRECONDITION (Story 1.4 / ADR-141 §8): callers that read/write
+  // RLS-protected tables (entitlements, redemptions, entitlement_audit_log) MUST
+  // supply marketId here, or use withMarketContext. Callers that only touch
+  // non-RLS tables (e.g. markets) may omit marketId — but MUST be audited before
+  // the Story-1.4 enforcement flip to avoid silent 0-row returns post-flip.
+  async withTransaction<T>(
+    work: (client: PoolClient) => Promise<T>,
+    marketId?: string | null
+  ): Promise<T> {
     const client = await this.getCorePool().connect()
 
     try {
       await client.query("BEGIN")
+      if (resolveGpCoreRlsEnforced()) {
+        await this.setTransactionRuntimeRole(client)
+      }
+      if (marketId !== undefined) {
+        await this.setTransactionMarketContext(client, this.requireMarketContext(marketId))
+      }
       const result = await work(client)
       await client.query("COMMIT")
       return result
@@ -288,6 +341,15 @@ export default class GpCoreService {
     } finally {
       client.release()
     }
+  }
+
+  async withMarketContext<T>(
+    marketId: string | null | undefined,
+    work: (client: PoolClient) => Promise<T>
+  ): Promise<T> {
+    const requiredMarketId = this.requireMarketContext(marketId)
+
+    return await this.withTransaction(work, requiredMarketId)
   }
 
   async listMarkets(instanceId?: string): Promise<GpCoreMarket[]> {

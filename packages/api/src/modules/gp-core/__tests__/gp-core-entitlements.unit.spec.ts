@@ -180,10 +180,19 @@ describe("GpCoreService — Entitlement Stubs", () => {
   })
 
   it("healthCheck returns status for both pools", async () => {
+    const healthyPool = {
+      query: jest.fn(() => Promise.resolve({ rows: [{ "?column?": 1 }] })),
+    }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    ;(service as any).corePool_ = healthyPool
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    ;(service as any).mercurPool_ = healthyPool
+
     const result = await service.healthCheck()
     expect(result).toHaveProperty("core")
     expect(result).toHaveProperty("mercur")
     expect(typeof result.core).toBe("boolean")
     expect(typeof result.mercur).toBe("boolean")
   })
+
 })
