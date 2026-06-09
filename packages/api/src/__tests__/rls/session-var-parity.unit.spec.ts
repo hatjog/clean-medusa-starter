@@ -57,10 +57,20 @@ function createMockContainer() {
   return { resolve: mockResolve, logger } as any;
 }
 
+// Extracts session-var key names from NULLIF(current_setting('key', true), '')::uuid pattern.
+// Design note (I1): test treats GP_MARKET_SESSION_VAR (exported const from hook) as
+// ground-truth for the producer key. The migration holds its own local copy of the literal
+// to avoid circular imports; this parity test is the mechanical link that catches drift
+// between the hook's exported constant and the migration DDL literal.
 function extractCurrentSettingKeys(sql: string): string[] {
-  return [...sql.matchAll(/current_setting\('([^']+)',\s*true\)::uuid/g)].map(
-    (match) => match[1]
-  );
+  return [
+    ...[...sql.matchAll(/NULLIF\(current_setting\('([^']+)',\s*true\),\s*''\)::uuid/g)].map(
+      (m) => m[1]
+    ),
+    ...[...sql.matchAll(/(?<!NULLIF\()current_setting\('([^']+)',\s*true\)::uuid/g)].map(
+      (m) => m[1]
+    ),
+  ];
 }
 
 function listProductionSourceFiles(dir: string): string[] {
@@ -98,9 +108,26 @@ describe("gp market session-var parity", () => {
     expect(policyKeys).toEqual([GP_MARKET_SESSION_VAR, GP_MARKET_SESSION_VAR]);
     expect(sql).toContain("DROP POLICY IF EXISTS rls_voucher_recipient_pii_market_isolation");
     expect(sql).toContain("CREATE POLICY rls_voucher_recipient_pii_market_isolation");
-    expect(sql).toContain("USING (market_id::uuid = current_setting('app.gp_market_id', true)::uuid)");
-    expect(sql).toContain("WITH CHECK (market_id::uuid = current_setting('app.gp_market_id', true)::uuid)");
+    expect(sql).toContain(
+      "USING (market_id::uuid = NULLIF(current_setting('app.gp_market_id', true), '')::uuid)"
+    );
+    expect(sql).toContain(
+      "WITH CHECK (market_id::uuid = NULLIF(current_setting('app.gp_market_id', true), '')::uuid)"
+    );
     expect(sql).not.toContain(RETIRED_SESSION_VAR);
+  });
+
+  it("policy DDL uses NULLIF guard so empty GUC hides rows instead of throwing cast error", async () => {
+    const migration = new (RecordingMigration as any)();
+
+    await migration.up();
+
+    const sql = migration.recorded.map((entry) => entry.sql).join("\n");
+    // NULLIF('', '')→NULL → NULL::uuid comparison → row hidden (fail-closed), not
+    // "invalid input syntax for type uuid: """ which a bare current_setting(...)::uuid would raise.
+    expect(sql).toContain("NULLIF(current_setting('app.gp_market_id', true), '')::uuid");
+    // Bare cast without NULLIF guard must not appear
+    expect(sql).not.toMatch(/current_setting\('app\.gp_market_id',\s*true\)::uuid(?!\s*\))/);
   });
 
   it("keeps down() as a forward-fix and does not reintroduce the retired key", async () => {
@@ -119,9 +146,12 @@ describe("gp market session-var parity", () => {
   it("keeps production gp_core/voucher-pii sources free of the retired session-var key", () => {
     const srcRoot = path.resolve(__dirname, "../..");
     const retiredKeyPattern = new RegExp(["app", "\\.market_id"].join(""));
-    const offenders = listProductionSourceFiles(srcRoot).filter((file) =>
-      retiredKeyPattern.test(fs.readFileSync(file, "utf8"))
-    );
+    const offenders = listProductionSourceFiles(srcRoot)
+      // Exclude historical (already-applied) migrations: their legacy DDL is
+      // immutable history; the forward-fix migration Migration20260609090000 is the
+      // canonical record of the rename for existing environments.
+      .filter((file) => !path.basename(file).startsWith("Migration20260430090000"))
+      .filter((file) => retiredKeyPattern.test(fs.readFileSync(file, "utf8")));
 
     expect(offenders).toEqual([]);
   });

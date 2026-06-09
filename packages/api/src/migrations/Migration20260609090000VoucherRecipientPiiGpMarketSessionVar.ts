@@ -5,10 +5,12 @@ const TABLE_NAME = "voucher_recipient_pii";
 const GP_MARKET_SESSION_VAR = "app.gp_market_id";
 
 function createCanonicalPolicySql(): string {
+  // NULLIF(..., '') ensures empty-string GUC (pool RESET returns '' not NULL) maps to
+  // NULL::uuid → comparison is NULL → row hidden, not "invalid input syntax" exception.
   return `CREATE POLICY ${POLICY_NAME}
        ON ${TABLE_NAME}
-       USING (market_id::uuid = current_setting('${GP_MARKET_SESSION_VAR}', true)::uuid)
-       WITH CHECK (market_id::uuid = current_setting('${GP_MARKET_SESSION_VAR}', true)::uuid)`;
+       USING (market_id::uuid = NULLIF(current_setting('${GP_MARKET_SESSION_VAR}', true), '')::uuid)
+       WITH CHECK (market_id::uuid = NULLIF(current_setting('${GP_MARKET_SESSION_VAR}', true), '')::uuid)`;
 }
 
 /**
