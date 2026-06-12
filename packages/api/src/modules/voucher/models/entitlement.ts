@@ -46,7 +46,7 @@ export enum EntitlementType {
   // --- inactive in v1.12.0 (subscription hard-gate) ---
   SUBSCRIPTION_B2C = "SUBSCRIPTION_B2C",
   SUBSCRIPTION_B2B = "SUBSCRIPTION_B2B",
-  BUNDLE = "BUNDLE",
+  BUNDLE = "BUNDLE", // active (v1.12.0) — schema-order requires last position
 }
 
 /** All 6 canonical types in schema-declared order. */
