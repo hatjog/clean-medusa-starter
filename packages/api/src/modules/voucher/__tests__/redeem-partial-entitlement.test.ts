@@ -16,7 +16,11 @@ import {
   EntitlementInstanceState,
   EntitlementType,
 } from "../models/entitlement"
-import { VOUCHER_LIABILITY_ONLY_V1 } from "../posting-profile"
+import {
+  VOUCHER_BUNDLE_POSTING_PROFILE_ID,
+  VOUCHER_CREDIT_PACK_POSTING_PROFILE_ID,
+  VOUCHER_LIABILITY_ONLY_V1,
+} from "../posting-profile"
 import {
   VoucherLedgerWriter,
   deriveLedgerTransactionId,
@@ -33,10 +37,12 @@ import {
   InMemoryRedeemPartialStore,
   RedeemAmountError,
   RedeemNotRedeemableError,
+  RedeemChoiceSetItemError,
   RedeemEntitlementNotFoundError,
   isWithdrawalRightExtinguished,
   buildRedemptionId,
   type RedeemableAmountEntitlement,
+  type RedeemableChoiceSetItem,
   type RedeemPartialInput,
 } from "../workflows/redeem-partial-entitlement"
 
@@ -100,8 +106,24 @@ function makeEntitlement(
   }
 }
 
+function makeChoiceSetItem(
+  overrides: Partial<RedeemableChoiceSetItem> = {}
+): RedeemableChoiceSetItem {
+  return {
+    id: "choice_1",
+    instance_id: "ent_bundle_1",
+    market_id: "bonbeauty",
+    reference_amount_minor: 100,
+    remaining_minor: 100,
+    status: "ACTIVE",
+    redemption_id: null,
+    ...overrides,
+  }
+}
+
 function makeOp(opts?: {
   rows?: RedeemableAmountEntitlement[]
+  choiceSetItems?: RedeemableChoiceSetItem[]
   gate?: PostingActivationGate
   wireWriter?: boolean
 }): {
@@ -110,7 +132,10 @@ function makeOp(opts?: {
   events: TransitionEventEnvelope[]
   fake: ReturnType<typeof makeFakePool>
 } {
-  const store = new InMemoryRedeemPartialStore(opts?.rows ?? [makeEntitlement()])
+  const store = new InMemoryRedeemPartialStore(
+    opts?.rows ?? [makeEntitlement()],
+    opts?.choiceSetItems ?? []
+  )
   const events: TransitionEventEnvelope[] = []
   const fake = makeFakePool()
   const op = new RedeemPartialEntitlementOperation({
@@ -245,11 +270,184 @@ describe("Story 4.1 AC1 — redeem partial obniża remaining (ten sam entitlemen
     )
   })
 
+  it("CREDIT_PACK używa tej samej semantyki salda: partial, multi-installment i FULL", async () => {
+    const rows = [
+      makeEntitlement({
+        entitlement_type: EntitlementType.CREDIT_PACK,
+        remaining_amount: 300,
+      }),
+    ]
+    const { op, store } = makeOp({ rows })
+
+    const partial = await op.redeem(
+      baseInput({ amount_minor: 120, idempotency_key: "credit-1" })
+    )
+    expect(partial.outcome).toBe("REDEEMED_PARTIAL")
+    expect(partial.remaining_after_minor).toBe(180)
+    expect(partial.withdrawal_right_extinguished).toBe(false)
+    expect(store.get("ent_amount_1")!.remaining_amount).toBe(180)
+
+    const full = await op.redeem(
+      baseInput({ amount_minor: 180, idempotency_key: "credit-2" })
+    )
+    expect(full.outcome).toBe("REDEEMED_FULL")
+    expect(full.remaining_after_minor).toBe(0)
+    expect(full.withdrawal_right_extinguished).toBe(true)
+    expect(store.get("ent_amount_1")!.remaining_amount).toBe(0)
+  })
+
   it("entitlement nieistniejący ⇒ RedeemEntitlementNotFoundError", async () => {
     const { op } = makeOp({ rows: [] })
     await expect(op.redeem(baseInput())).rejects.toBeInstanceOf(
       RedeemEntitlementNotFoundError
     )
+  })
+})
+
+// ===========================================================================
+// v1.12.0 Story 3.7 AC2 — BUNDLE consume choice_set pozycja po pozycji
+// ===========================================================================
+
+describe("Story 3.7 AC2 — BUNDLE consume pojedynczej pozycji choice_set", () => {
+  function makeBundleRows() {
+    return {
+      rows: [
+        makeEntitlement({
+          id: "ent_bundle_1",
+          entitlement_type: EntitlementType.BUNDLE,
+          remaining_amount: 300,
+        }),
+      ],
+      choiceSetItems: [
+        makeChoiceSetItem({ id: "choice_1", remaining_minor: 100, reference_amount_minor: 100 }),
+        makeChoiceSetItem({ id: "choice_2", remaining_minor: 200, reference_amount_minor: 200 }),
+      ],
+    }
+  }
+
+  function bundleInput(
+    overrides: Partial<RedeemPartialInput> = {}
+  ): RedeemPartialInput {
+    return {
+      ...baseInput({
+        entitlement_id: "ent_bundle_1",
+        amount_minor: undefined,
+        idempotency_key: "bundle-1",
+        voucher_net_minor: 244,
+        voucher_vat_minor: 56,
+      }),
+      choice_set_item_id: "choice_1",
+      ...overrides,
+    }
+  }
+
+  it("konsumuje jedną pozycję, pokazuje pozostałe dostępne i zostawia PARTIAL", async () => {
+    const { rows, choiceSetItems } = makeBundleRows()
+    const { op, store } = makeOp({ rows, choiceSetItems })
+
+    const res = await op.redeem(bundleInput())
+
+    expect(res.outcome).toBe("REDEEMED_PARTIAL")
+    expect(res.amount_minor).toBe(100)
+    expect(res.remaining_before_minor).toBe(300)
+    expect(res.remaining_after_minor).toBe(200)
+    expect(res.choice_set_item_id).toBe("choice_1")
+    expect(res.available_choice_set_item_ids).toEqual(["choice_2"])
+    expect(store.get("ent_bundle_1")!.remaining_amount).toBe(200)
+    expect(store.get("ent_bundle_1")!.state).toBe("REDEEMED_PARTIAL")
+    expect(store.listChoiceSetItems()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: "choice_1",
+          status: "REDEEMED",
+          remaining_minor: 0,
+          redemption_id: res.redemption_id,
+        }),
+        expect.objectContaining({
+          id: "choice_2",
+          status: "ACTIVE",
+          remaining_minor: 200,
+        }),
+      ])
+    )
+  })
+
+  it("ostatnia pozycja BUNDLE przełącza entitlement na REDEEMED_FULL", async () => {
+    const { rows, choiceSetItems } = makeBundleRows()
+    const { op, store } = makeOp({ rows, choiceSetItems })
+
+    await op.redeem(bundleInput({ idempotency_key: "bundle-1", choice_set_item_id: "choice_1" }))
+    const full = await op.redeem(
+      bundleInput({ idempotency_key: "bundle-2", choice_set_item_id: "choice_2" })
+    )
+
+    expect(full.outcome).toBe("REDEEMED_FULL")
+    expect(full.remaining_after_minor).toBe(0)
+    expect(full.available_choice_set_item_ids).toEqual([])
+    expect(full.withdrawal_right_extinguished).toBe(true)
+    expect(store.get("ent_bundle_1")!.state).toBe("REDEEMED_FULL")
+    expect(store.listChoiceSetItems().every((i) => i.status === "REDEEMED")).toBe(true)
+  })
+
+  it("replay tego samego klucza nie konsumuje pozycji drugi raz i nie dubluje audytu/postingu", async () => {
+    const { rows, choiceSetItems } = makeBundleRows()
+    const { op, store } = makeOp({ rows, choiceSetItems })
+
+    const first = await op.redeem(bundleInput())
+    const replay = await op.redeem(bundleInput())
+
+    expect(replay.idempotent).toBe(true)
+    expect(replay.redemption_id).toBe(first.redemption_id)
+    expect(store.get("ent_bundle_1")!.remaining_amount).toBe(200)
+    expect(store.listRedemptions()).toHaveLength(1)
+    expect(store.listAudits()).toHaveLength(2)
+  })
+
+  it("re-konsumpcja albo pozycja spoza setu rzuca fail-closed i robi rollback", async () => {
+    const { rows, choiceSetItems } = makeBundleRows()
+    const { op, store } = makeOp({ rows, choiceSetItems })
+
+    await op.redeem(bundleInput())
+    await expect(
+      op.redeem(bundleInput({ idempotency_key: "bundle-reconsume" }))
+    ).rejects.toBeInstanceOf(RedeemChoiceSetItemError)
+    await expect(
+      op.redeem(
+        bundleInput({
+          idempotency_key: "bundle-outside",
+          choice_set_item_id: "choice_outside",
+        })
+      )
+    ).rejects.toBeInstanceOf(RedeemChoiceSetItemError)
+
+    expect(store.get("ent_bundle_1")!.remaining_amount).toBe(200)
+    expect(store.listRedemptions()).toHaveLength(1)
+    expect(store.listAudits()).toHaveLength(2)
+  })
+
+  it("amount_minor podany dla BUNDLE musi zgadzać się z konsumowaną pozycją", async () => {
+    const { rows, choiceSetItems } = makeBundleRows()
+    const { op } = makeOp({ rows, choiceSetItems })
+
+    await expect(
+      op.redeem(bundleInput({ amount_minor: 99 }))
+    ).rejects.toBeInstanceOf(RedeemAmountError)
+  })
+
+  it("BUNDLE wybiera posting-profile przez registry keyed-by-entitlement_type", async () => {
+    const { rows, choiceSetItems } = makeBundleRows()
+    const { op, fake } = makeOp({
+      rows,
+      choiceSetItems,
+      gate: GATE_BOTH_ON,
+      wireWriter: true,
+    })
+
+    const res = await op.redeem(bundleInput())
+
+    expect(res.posting.persisted).toBe(true)
+    expect(fake.txRows).toHaveLength(1)
+    expect(fake.txRows[0][2]).toBe(VOUCHER_BUNDLE_POSTING_PROFILE_ID)
   })
 })
 
@@ -287,6 +485,28 @@ describe("Story 4.1 AC1 — derecognition posting przez writer (sym. aktywacja)"
         redemption_id: rid,
       })
     )
+  })
+
+  it("CREDIT_PACK wybiera posting-profile przez registry keyed-by-entitlement_type", async () => {
+    const rows = [
+      makeEntitlement({
+        entitlement_type: EntitlementType.CREDIT_PACK,
+        remaining_amount: 12300,
+      }),
+    ]
+    const { op, fake } = makeOp({ rows, gate: GATE_BOTH_ON, wireWriter: true })
+    const res = await op.redeem(
+      baseInput({
+        amount_minor: 6000,
+        idempotency_key: "credit-profile",
+        voucher_net_minor: 10000,
+        voucher_vat_minor: 2300,
+      })
+    )
+
+    expect(res.posting.persisted).toBe(true)
+    expect(fake.txRows).toHaveLength(1)
+    expect(fake.txRows[0][2]).toBe(VOUCHER_CREDIT_PACK_POSTING_PROFILE_ID)
   })
 
   it("SPV redeem (gate ON) ⇒ generator no-op (VAT przy emisji); ZERO legu ledger; remaining obniżony", async () => {
