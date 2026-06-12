@@ -20,6 +20,7 @@ import {
   resolveVatClassification,
   type VatClassification,
 } from "../../modules/voucher/vat-resolver"
+import { VoucherPostingInvariantError } from "../../modules/voucher/posting-profile"
 
 /**
  * live-issue-from-payment-intent.ts — Story 3.3 (v1.11.0 Epic 3) — RDZEŃ live-issue
@@ -128,6 +129,13 @@ type OrderLineRow = {
 type FrozenRecipient = {
   recipient_index: number
   recipient_customer_id: string | null
+}
+
+type ChoiceSetSnapshotItem = {
+  item_key: string
+  label: string | null
+  reference_amount_minor: number
+  vat_classification: VatClassification
 }
 
 /**
@@ -405,6 +413,20 @@ async function issueSingleIssuedRow(
     vat_rate_uniqueness: profile.policy.vat_rate_uniqueness,
     ...(vatRates ? { vat_rates: vatRates } : {}),
   })
+  const choiceSetItems = extractChoiceSetSnapshotItems(profile, vatClassification)
+  const referencePriceMinor = computeReferencePriceMinor(
+    profile,
+    payload,
+    choiceSetItems,
+    lineItemId
+  )
+  assertReferencePriceInvariant(
+    profile,
+    referencePriceMinor,
+    choiceSetItems,
+    lineItemId,
+    payload
+  )
 
   // ── snapshot policy (regulamin § 12 — immutable post-ISSUED) ───────────────
   const snapshot: EntitlementPolicySnapshot = snapshotPolicy({
@@ -425,9 +447,9 @@ async function issueSingleIssuedRow(
     `INSERT INTO entitlement_instance
        (id, entitlement_profile_id, entitlement_type, order_id, line_item_id,
         state, policy_snapshot, market_id, sales_channel_id, vat_classification,
-        entitlement_dedupe_key, recipient_index, recipient_customer_id,
+        reference_price_minor, entitlement_dedupe_key, recipient_index, recipient_customer_id,
         created_at, updated_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11, $12, $13, $14, $14)
+     VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11, $12, $13, $14, $15, $15)
      ${ENTITLEMENT_DEDUPE_ON_CONFLICT_CLAUSE}
      RETURNING id`,
     [
@@ -441,6 +463,7 @@ async function issueSingleIssuedRow(
       ctx.marketId,
       ctx.salesChannelId,
       vatClassification,
+      referencePriceMinor,
       dedupeKey,
       recipient.recipient_index,
       recipient.recipient_customer_id,
@@ -449,6 +472,10 @@ async function issueSingleIssuedRow(
   )
 
   const created = (insert.rowCount ?? insert.rows.length) > 0
+  if (created && choiceSetItems.length > 0) {
+    await insertChoiceSetItems(client, entitlementId, ctx.marketId, choiceSetItems, now)
+  }
+
   return {
     entitlement_id: insert.rows[0]?.id ?? entitlementId,
     entitlement_dedupe_key: dedupeKey,
@@ -458,6 +485,115 @@ async function issueSingleIssuedRow(
     vat_classification: vatClassification,
     created,
   }
+}
+
+function computeReferencePriceMinor(
+  profile: ResolvedProfile,
+  payload: PaymentIntentSucceededPayload,
+  choiceSetItems: ChoiceSetSnapshotItem[],
+  lineItemId: string
+): number | null {
+  if (profile.entitlement_type === EntitlementType.CREDIT_PACK) {
+    return assertPositiveIntegerMinor(
+      profile.amount_minor ??
+        readNumber(profile.policy.face_value_minor) ??
+        readNumber(profile.policy.amount_minor) ??
+        payload.amount_minor,
+      `CREDIT_PACK face_value_minor/amount_minor (linia ${lineItemId})`
+    )
+  }
+
+  if (profile.entitlement_type === EntitlementType.BUNDLE) {
+    if (choiceSetItems.length === 0) {
+      throw new VoucherPostingInvariantError(
+        `liveIssueEntitlementsWithinTx: BUNDLE ${lineItemId} nie niesie choice_set — ` +
+          `nie można zamrozić reference_price_minor zgodnie z ADR-140 §2`
+      )
+    }
+    return choiceSetItems.reduce((sum, item) => sum + item.reference_amount_minor, 0)
+  }
+
+  return null
+}
+
+function assertReferencePriceInvariant(
+  profile: ResolvedProfile,
+  referencePriceMinor: number | null,
+  choiceSetItems: ChoiceSetSnapshotItem[],
+  lineItemId: string,
+  payload: PaymentIntentSucceededPayload
+): void {
+  if (profile.entitlement_type === EntitlementType.CREDIT_PACK) {
+    const faceValueMinor = assertPositiveIntegerMinor(
+      profile.amount_minor ??
+        readNumber(profile.policy.face_value_minor) ??
+        readNumber(profile.policy.amount_minor) ??
+        payload.amount_minor,
+      `CREDIT_PACK face_value_minor/amount_minor (linia ${lineItemId})`
+    )
+    if (referencePriceMinor !== faceValueMinor) {
+      throw new VoucherPostingInvariantError(
+        `liveIssueEntitlementsWithinTx: invariant CREDIT_PACK naruszony dla linii ${lineItemId}: ` +
+          `reference_price_minor=${referencePriceMinor}, face_value_minor=${faceValueMinor}`
+      )
+    }
+  }
+
+  if (profile.entitlement_type === EntitlementType.BUNDLE) {
+    const sum = choiceSetItems.reduce((acc, item) => acc + item.reference_amount_minor, 0)
+    if (referencePriceMinor !== sum) {
+      throw new VoucherPostingInvariantError(
+        `liveIssueEntitlementsWithinTx: invariant BUNDLE naruszony dla linii ${lineItemId}: ` +
+          `reference_price_minor=${referencePriceMinor}, SUM(choice_set)=${sum}`
+      )
+    }
+  }
+}
+
+async function insertChoiceSetItems(
+  client: LiveIssuePgClient,
+  entitlementId: string,
+  marketId: string,
+  items: ChoiceSetSnapshotItem[],
+  now: Date
+): Promise<void> {
+  for (let index = 0; index < items.length; index += 1) {
+    const item = items[index]
+    await client.query(
+      `INSERT INTO entitlement_choice_set_item
+         (id, instance_id, market_id, label, reference_amount_minor,
+          remaining_minor, vat_classification, status, redemption_id,
+          created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $5, $6, 'ACTIVE', NULL, $7, $7)
+       ON CONFLICT (id) DO NOTHING`,
+      [
+        buildChoiceSetItemId(entitlementId, item, index),
+        entitlementId,
+        marketId,
+        item.label,
+        item.reference_amount_minor,
+        item.vat_classification,
+        now,
+      ]
+    )
+  }
+}
+
+function buildChoiceSetItemId(
+  entitlementId: string,
+  item: ChoiceSetSnapshotItem,
+  index: number
+): string {
+  const digest = createHash("sha256")
+    .update(entitlementId)
+    .update("\0")
+    .update(String(index))
+    .update("\0")
+    .update(item.item_key)
+    .update("\0")
+    .update(String(item.reference_amount_minor))
+    .digest("hex")
+  return `ecsi_${digest}`
 }
 
 /**
@@ -582,6 +718,66 @@ function extractVatRates(
 ): readonly unknown[] | null {
   const rates = policy.vat_rates
   return Array.isArray(rates) ? rates : null
+}
+
+function extractChoiceSetSnapshotItems(
+  profile: ResolvedProfile,
+  fallbackVatClassification: VatClassification
+): ChoiceSetSnapshotItem[] {
+  if (profile.entitlement_type !== EntitlementType.BUNDLE) return []
+
+  const raw =
+    profile.policy.choice_set ??
+    profile.policy.choice_set_items ??
+    profile.policy.selected_choice_set ??
+    profile.policy.items
+  if (!Array.isArray(raw)) return []
+
+  return raw.map((entry, index) => {
+    const record = readObject(entry)
+    if (!record) {
+      throw new VoucherPostingInvariantError(
+        `liveIssueEntitlementsWithinTx: BUNDLE choice_set[${index}] ma nieprawidłowy kształt`
+      )
+    }
+    const referenceAmountMinor = assertPositiveIntegerMinor(
+      readNumber(record.reference_amount_minor) ??
+        readNumber(record.amount_minor) ??
+        readNumber(record.face_value_minor),
+      `BUNDLE choice_set[${index}].reference_amount_minor`
+    )
+    const vatClassification =
+      readVatClassification(record.vat_classification) ??
+      resolveVatClassification({
+        vat_rate_uniqueness: record.vat_rate_uniqueness,
+        ...(Array.isArray(record.vat_rates) ? { vat_rates: record.vat_rates } : {}),
+      }) ??
+      fallbackVatClassification
+
+    return {
+      item_key:
+        readString(record.item_key) ??
+        readString(record.id) ??
+        readString(record.sku) ??
+        String(index),
+      label: readString(record.label) ?? readString(record.name) ?? null,
+      reference_amount_minor: referenceAmountMinor,
+      vat_classification: vatClassification,
+    }
+  })
+}
+
+function readVatClassification(value: unknown): VatClassification | undefined {
+  return value === "SPV" || value === "MPV" ? value : undefined
+}
+
+function assertPositiveIntegerMinor(value: unknown, field: string): number {
+  if (typeof value !== "number" || !Number.isInteger(value) || value <= 0) {
+    throw new VoucherPostingInvariantError(
+      `liveIssueEntitlementsWithinTx: ${field} musi być dodatnią liczbą całkowitą minor units`
+    )
+  }
+  return value
 }
 
 function readString(value: unknown): string | undefined {

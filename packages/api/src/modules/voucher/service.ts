@@ -385,9 +385,9 @@ export class VoucherService {
       entitlement_profile_id: row.entitlement_profile_id as string,
       entitlement_type: row.entitlement_type as EntitlementType,
       order_id: (row.order_id ?? null) as string | null,
-      // Ontologia scope + snapshoty dodane migracjami. Wypełnienie
-      // reference_price_minor należy do v1.12.0 Story 3.4; tu tylko mapujemy
-      // nullable kolumnę dla wierszy legacy i pre-snapshot.
+      // Ontologia scope + snapshoty dodane migracjami. reference_price_minor
+      // jest wypełniane przy ISSUED dla CREDIT_PACK/BUNDLE; null zostaje dla
+      // legacy i typów bez ceny referencyjnej.
       market_id: (row.market_id ?? null) as string | null,
       sales_channel_id: (row.sales_channel_id ?? null) as string | null,
       vat_classification: (row.vat_classification ?? null) as VatClassification | null,
