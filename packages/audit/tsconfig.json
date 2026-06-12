@@ -5,6 +5,7 @@
     "declaration": true,
     "noEmit": true,
     "outDir": "dist",
+    "rootDir": "src",
     "module": "Node16",
     "moduleResolution": "Node16"
   },

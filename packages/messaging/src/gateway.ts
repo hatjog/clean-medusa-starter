@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { toAuditProvider } from "@gp/audit";
 
 import {
   MessagingProviderError,
@@ -14,8 +15,8 @@ import type {
 } from "./flow-kpi-telemetry";
 import type { IMessagingProvider } from "./provider";
 import type {
-  AuditEnvelope,
   Channel,
+  NotificationAuditEnvelope,
   NotificationDeliveryEvent,
   NotificationDeliveryEventType,
   NotificationDispatch,
@@ -455,13 +456,13 @@ export class DefaultMessagingGateway implements MessagingGateway {
     error_code?: string;
     error_message?: string;
     gate_source?: "feature_flag";
-  }): AuditEnvelope {
+  }): NotificationAuditEnvelope {
     return {
       audit_id: this.uuid(),
       event_type: "notification.dispatch",
       status: input.status,
       dispatch_id: input.dispatch_id,
-      provider: input.provider,
+      provider: toAuditProvider(input.provider),
       flow_id: input.intent.flow_id,
       template_key: input.intent.template_key,
       channel: input.intent.channel,

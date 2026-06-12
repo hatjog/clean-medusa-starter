@@ -158,7 +158,7 @@ async function createPaymentIntentForMarket(
 // audit envelope keeps `market_id` for internal visibility; the customer
 // payload MUST NOT carry it (no information disclosure).
 // ---------------------------------------------------------------------------
-interface AuditEnvelope {
+type PaymentRejectionAudit = {
   code: string
   market_id: MarketId
 }
@@ -166,7 +166,7 @@ interface AuditEnvelope {
 function buildRejectionAudit(
   market_id: MarketId,
   err: PaymentProviderNotConfiguredError
-): AuditEnvelope {
+): PaymentRejectionAudit {
   return { code: err.code, market_id }
 }
 

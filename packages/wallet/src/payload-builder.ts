@@ -163,7 +163,9 @@ export class DefaultWalletPayloadBuilder implements WalletPayloadBuilder {
 
 function resolveMarket(entitlement_instance: EntitlementInstance): string {
   return pickString(
-    entitlement_instance.metadata?.gp?.market_id ?? entitlement_instance.market_id,
+    entitlement_instance.metadata?.gp?.market_id ??
+      entitlement_instance.market_id ??
+      undefined,
     "unknown"
   )
 }

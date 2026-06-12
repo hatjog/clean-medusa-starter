@@ -175,7 +175,7 @@ describe("voucher-wallet-invalidation subscriber", () => {
     const providerEnvelope = {
       event_type: "wallet.pass_invalidation_failed" as const,
       entitlement_instance_id: "ei_123",
-      provider: "google",
+      provider: "google" as const,
       outcome: "failure" as const,
       timestamp: fixedNow.toISOString(),
       error_code: "GOOGLE_WALLET_API_403",

@@ -3,7 +3,7 @@ import type { SubscriberArgs, SubscriberConfig } from "@medusajs/framework"
 import {
   WalletPassInvalidationError,
   isWalletProviderKind,
-  type AuditEnvelope as ProviderAuditEnvelope,
+  type WalletAuditEnvelope as ProviderAuditEnvelope,
   type WalletInvalidationReason,
   type WalletPassFacade,
   type WalletProviderKind,

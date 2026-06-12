@@ -17,8 +17,12 @@
     "baseUrl": "./",
     "ignoreDeprecations": "5.0",
     "paths": {
+      "@gp/audit": ["packages/audit/src/index.ts"],
+      "@gp/audit/*": ["packages/audit/src/*"],
       "@gp/messaging": ["packages/messaging/src/index.ts"],
       "@gp/messaging/*": ["packages/messaging/src/*"],
+      "@gp/voucher": ["packages/voucher/src/index.ts"],
+      "@gp/voucher/*": ["packages/voucher/src/*"],
       "@/*": ["packages/api/src/*"]
     },
     "jsx": "react-jsx",
