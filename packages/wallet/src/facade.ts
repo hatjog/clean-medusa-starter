@@ -6,7 +6,7 @@ import {
   type WalletLocale,
   type WalletProviderKind,
 } from "./payload"
-import { toAuditProvider } from "@gp/audit"
+import { toAuditProviderSafe } from "@gp/audit"
 import type { WalletPayloadBuilder } from "./payload-builder"
 import type { WalletPassProvider } from "./provider"
 import { emitWalletCounter, sanitizeWalletErrorMessage } from "./telemetry"
@@ -400,7 +400,13 @@ export class DefaultWalletPassFacade implements WalletPassFacade {
     return {
       event_type: input.event_type,
       entitlement_instance_id: input.entitlement_instance_id,
-      provider: toAuditProvider(input.provider),
+      // Use safe variant so that error-path envelopes (unsupported provider)
+      // preserve the raw runtime value instead of throwing a secondary Error
+      // before UnsupportedWalletProviderError can be constructed (M-1 fix).
+      // Cast: WalletAuditEnvelope constrains provider to WalletProviderKind
+      // ("google"|"apple") at type level; runtime value is preserved verbatim
+      // by toAuditProviderSafe even when it falls outside the enum (L-2 + M-1).
+      provider: toAuditProviderSafe(input.provider) as WalletProviderKind,
       save_url: input.save_url,
       reason: input.reason,
       timestamp: this.now().toISOString(),

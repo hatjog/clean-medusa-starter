@@ -99,8 +99,14 @@ export type NotificationAuditEnvelopeFields = {
   gate_source?: "feature_flag";
 }
 
+/**
+ * Notification-domain audit envelope.
+ *
+ * The second type parameter narrows `provider` to notification-specific providers
+ * (brevo | resend), restoring per-domain precision (L-2 fix).
+ */
 export type NotificationAuditEnvelope =
-  AuditEnvelope<NotificationAuditEnvelopeFields>
+  AuditEnvelope<NotificationAuditEnvelopeFields, NotificationProvider>
 
 export interface NotificationDispatch {
   dispatch_id: string;

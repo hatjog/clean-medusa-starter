@@ -93,23 +93,35 @@ export type WalletAuditOutcome =
   | "failure"
   | `rejected_${WalletDenyReason}`
 
-export type WalletAuditEnvelope = AuditEnvelope<{
-  event_type: WalletAuditEventType
-  entitlement_instance_id: string
-  market?: string
-  release?: string
-  actor_id?: string
-  lifecycle?: string
-  save_url?: string
-  reason?: WalletInvalidationReason
-  gate_reason?: string
-  timestamp: string
-  outcome: WalletAuditOutcome
-  error_code?: string
-  error_message?: string
-  requested_locale?: string
-  effective_locale?: WalletLocale
-}>
+/**
+ * Wallet-domain audit envelope.
+ *
+ * The second type parameter narrows `provider` to wallet-specific providers
+ * (google | apple) restoring per-domain precision lost in the base AuditEnvelope
+ * union (L-2 fix). Unknown/error-path providers carry "google" | "apple" as the
+ * type constraint; the safe cast in facade.ts (toAuditProviderSafe) ensures the
+ * runtime value is preserved verbatim even when it falls outside this set.
+ */
+export type WalletAuditEnvelope = AuditEnvelope<
+  {
+    event_type: WalletAuditEventType
+    entitlement_instance_id: string
+    market?: string
+    release?: string
+    actor_id?: string
+    lifecycle?: string
+    save_url?: string
+    reason?: WalletInvalidationReason
+    gate_reason?: string
+    timestamp: string
+    outcome: WalletAuditOutcome
+    error_code?: string
+    error_message?: string
+    requested_locale?: string
+    effective_locale?: WalletLocale
+  },
+  WalletProviderKind
+>
 
 export type AuditEvent = WalletAuditEnvelope
 export type {

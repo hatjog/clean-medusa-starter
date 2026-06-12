@@ -1,5 +1,4 @@
 import { createHash, randomUUID } from "node:crypto";
-import { toAuditProvider } from "@gp/audit";
 
 import {
   MessagingProviderError,
@@ -462,7 +461,10 @@ export class DefaultMessagingGateway implements MessagingGateway {
       event_type: "notification.dispatch",
       status: input.status,
       dispatch_id: input.dispatch_id,
-      provider: toAuditProvider(input.provider),
+      // input.provider is already NotificationProvider ("brevo"|"resend") which
+      // satisfies the narrowed AuditEnvelope<..., NotificationProvider> constraint
+      // directly — no runtime conversion needed (L-2 fix).
+      provider: input.provider,
       flow_id: input.intent.flow_id,
       template_key: input.intent.template_key,
       channel: input.intent.channel,

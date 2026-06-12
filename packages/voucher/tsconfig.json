@@ -8,6 +8,6 @@
     "module": "Node16",
     "moduleResolution": "Node16"
   },
-  "include": ["src/**/*.ts", "../api/src/modules/voucher/models/entitlement.ts"],
+  "include": ["src/**/*.ts"],
   "exclude": ["dist", "node_modules"]
 }

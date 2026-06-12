@@ -10,7 +10,7 @@
     "noEmit": false,
     "baseUrl": "../../",
     "paths": {
-      "@gp/audit": ["packages/audit/dist/index.d.ts"]
+      "@gp/audit": ["packages/audit/src/index.ts"]
     }
   },
   "include": ["src/**/*.ts"],
