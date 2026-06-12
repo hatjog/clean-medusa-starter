@@ -4,23 +4,14 @@ import type { Knex } from "knex";
 import { requireMercurServerModule } from "../../../lib/mercur-module-loader";
 import { marketContextStorage } from "../../../lib/market-context";
 import {
+  type AuthenticatedStoreRequest,
+  getCustomerId,
+  resolveQueryGraph,
+} from "../../../lib/request-surface";
+import {
   getLiveReviewStatsForSalesChannel,
   listReviewIdsForSalesChannel,
 } from "../../../lib/review-market-scope";
-
-type QueryGraphResult = {
-  data: Array<Record<string, unknown>>;
-};
-
-type AuthenticatedStoreRequest = MedusaRequest & {
-  auth_context?: {
-    actor_id?: string;
-  };
-};
-
-type QueryGraph = {
-  graph: (input: Record<string, unknown>) => Promise<QueryGraphResult>;
-};
 
 type CreateReviewWorkflowModule = {
   createReviewWorkflow: {
@@ -39,15 +30,6 @@ function getCreateReviewWorkflow() {
     "workflows",
     "create-review.js"
   ).createReviewWorkflow;
-}
-
-function getCustomerId(req: AuthenticatedStoreRequest): string | undefined {
-  const actorId = req.auth_context?.actor_id;
-  return typeof actorId === "string" && actorId.length > 0 ? actorId : undefined;
-}
-
-function resolveQueryGraph(req: MedusaRequest): QueryGraph {
-  return req.scope.resolve(ContainerRegistrationKeys.QUERY) as QueryGraph;
 }
 
 export async function POST(req: AuthenticatedStoreRequest, res: MedusaResponse) {

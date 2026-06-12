@@ -8,29 +8,19 @@ import type { Knex } from "knex";
 import { requireMercurServerModule } from "../../../lib/mercur-module-loader";
 import { marketContextStorage } from "../../../lib/market-context";
 import { filterProductIdsForSalesChannel } from "../../../lib/product-market-scope";
-
-type QueryGraphResult = {
-  data: Array<Record<string, unknown>>;
-};
+import {
+  type AuthenticatedStoreRequest,
+  getCustomerId,
+  resolveQueryGraph,
+} from "../../../lib/request-surface";
 
 const fallbackWishlistsByCustomer = new Map<string, Set<string>>();
-
-type AuthenticatedStoreRequest = MedusaRequest & {
-  auth_context?: {
-    actor_id?: string;
-  };
-};
 
 type WishlistLinkRecord = {
   wishlist?: {
     products?: Array<{ id?: unknown }>;
   };
 };
-
-function getCustomerId(req: AuthenticatedStoreRequest): string | undefined {
-  const actorId = req.auth_context?.actor_id;
-  return typeof actorId === "string" && actorId.length > 0 ? actorId : undefined;
-}
 
 function isWishlistLinkRecord(value: unknown): value is WishlistLinkRecord {
   return typeof value === "object" && value !== null;
@@ -120,9 +110,7 @@ export async function POST(req: AuthenticatedStoreRequest, res: MedusaResponse) 
     },
   });
 
-  const query = req.scope.resolve(ContainerRegistrationKeys.QUERY) as {
-    graph: (input: Record<string, unknown>) => Promise<QueryGraphResult>;
-  };
+  const query = resolveQueryGraph(req);
   const {
     data: [wishlist],
   } = await query.graph({
@@ -137,9 +125,7 @@ export async function POST(req: AuthenticatedStoreRequest, res: MedusaResponse) 
 }
 
 export async function GET(req: AuthenticatedStoreRequest, res: MedusaResponse) {
-  const query = req.scope.resolve(ContainerRegistrationKeys.QUERY) as {
-    graph: (input: Record<string, unknown>) => Promise<QueryGraphResult>;
-  };
+  const query = resolveQueryGraph(req);
   const customerId = getCustomerId(req);
   const salesChannelId = marketContextStorage.getStore()?.sales_channel_id;
   const offset = req.queryConfig?.pagination?.skip ?? 0;

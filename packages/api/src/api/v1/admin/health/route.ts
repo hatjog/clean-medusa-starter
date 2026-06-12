@@ -8,7 +8,6 @@
  */
 import type { MedusaRequest, MedusaResponse } from "@medusajs/framework/http"
 import net from "node:net"
-import type { Pool } from "pg"
 import { withOperatorAuth } from "../../../../middlewares/with-operator-auth"
 import GpCoreService from "../../../../modules/gp-core/service"
 
@@ -81,12 +80,10 @@ async function checkHttp(
   }
 }
 
-type GpCoreServiceWithPool = GpCoreService & {
-  getCorePool: () => Pool
-}
-
-function getGpCoreService(req: MedusaRequest): GpCoreServiceWithPool {
-  return req.scope.resolve("gpCoreService") as GpCoreServiceWithPool
+function getGpCoreService(req: MedusaRequest): GpCoreService {
+  // `getCorePool()` is a public read accessor on GpCoreService (Story 6.4),
+  // so the resolved service already exposes it — no intersection cast needed.
+  return req.scope.resolve("gpCoreService") as GpCoreService
 }
 
 export const GET = withOperatorAuth(async (req, res) => {
