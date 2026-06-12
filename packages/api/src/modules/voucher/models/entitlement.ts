@@ -403,6 +403,12 @@ export interface EntitlementInstanceRow {
    * Null do czasu snapshotu.
    */
   vat_classification: VatClassification | null
+  /**
+   * Snapshot ceny referencyjnej w minor units. Kolumnę dodaje v1.12.0 Story 3.2;
+   * WYPEŁNIENIE przy ISSUED + invariant ADR-140 §2 egzekwuje Story 3.4.
+   * Null dla legacy i do czasu snapshotu.
+   */
+  reference_price_minor: number | null
   state: EntitlementInstanceState
   // BE-2 (Story 2.3): active service-booking pointer; reset on cancel_booking.
   booking_pointer: string | null

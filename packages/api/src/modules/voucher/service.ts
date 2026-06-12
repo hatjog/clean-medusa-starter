@@ -385,12 +385,16 @@ export class VoucherService {
       entitlement_profile_id: row.entitlement_profile_id as string,
       entitlement_type: row.entitlement_type as EntitlementType,
       order_id: (row.order_id ?? null) as string | null,
-      // Ontologia scope + VAT snapshot (Story 3.2). Kolumny dodane przez migrację
-      // 1778928100000; wypełnienie market_id/sales_channel_id przy live-issue (3.3),
-      // vat_classification snapshotowany przy ISSUED (3.3). Null dla wierszy legacy.
+      // Ontologia scope + snapshoty dodane migracjami. Wypełnienie
+      // reference_price_minor należy do v1.12.0 Story 3.4; tu tylko mapujemy
+      // nullable kolumnę dla wierszy legacy i pre-snapshot.
       market_id: (row.market_id ?? null) as string | null,
       sales_channel_id: (row.sales_channel_id ?? null) as string | null,
       vat_classification: (row.vat_classification ?? null) as VatClassification | null,
+      reference_price_minor:
+        row.reference_price_minor != null
+          ? Number(row.reference_price_minor)
+          : null,
       state: row.state as EntitlementInstanceState,
       booking_pointer: (row.booking_pointer ?? null) as string | null,
       policy_snapshot: this.toPolicySnapshot(row.policy_snapshot),
