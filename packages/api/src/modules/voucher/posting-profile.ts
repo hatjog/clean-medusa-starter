@@ -100,6 +100,15 @@ export const VOUCHER_LIABILITY_ONLY_V1 = Object.freeze({
   forbidden_money_classes: Object.freeze([...FORBIDDEN_MONEY_CLASSES]),
 } as const)
 
+/**
+ * Profil CREDIT_PACK (saldo kwotowe) — ADR-140 §3, runtime_enabled:false (HG-4 DEFERRED v2.0.0+).
+ *
+ * `allowed_accounts`/`forbidden_money_classes` są metadanymi deklaratywnymi (spójnymi z
+ * `VOUCHER_LIABILITY_ONLY_V1`). Guard (`assertPostingAccountsAllowed`) waliduje względem
+ * modułowych stałych `ALLOWED_ACCOUNTS`/`FORBIDDEN_MONEY_CLASSES`, nie pól profilu —
+ * namespace jest świadomie współdzielony dla wszystkich 3 profili v1.12.0. Rozszerzenie
+ * per-profile account-scoping wymaga zmiany architektury guard'a (planowane v1.13.0+).
+ */
 export const VOUCHER_CREDIT_PACK_V1 = Object.freeze({
   id: VOUCHER_CREDIT_PACK_POSTING_PROFILE_ID,
   runtime_enabled: false as const,
@@ -107,6 +116,15 @@ export const VOUCHER_CREDIT_PACK_V1 = Object.freeze({
   forbidden_money_classes: Object.freeze([...FORBIDDEN_MONEY_CLASSES]),
 } as const)
 
+/**
+ * Profil BUNDLE (`choice_set` wymiennych pozycji) — ADR-140 §3, runtime_enabled:false (HG-4 DEFERRED v2.0.0+).
+ *
+ * `allowed_accounts`/`forbidden_money_classes` są metadanymi deklaratywnymi (spójnymi z
+ * `VOUCHER_LIABILITY_ONLY_V1`). Guard (`assertPostingAccountsAllowed`) waliduje względem
+ * modułowych stałych `ALLOWED_ACCOUNTS`/`FORBIDDEN_MONEY_CLASSES`, nie pól profilu —
+ * namespace jest świadomie współdzielony dla wszystkich 3 profili v1.12.0. Rozszerzenie
+ * per-profile account-scoping wymaga zmiany architektury guard'a (planowane v1.13.0+).
+ */
 export const VOUCHER_BUNDLE_V1 = Object.freeze({
   id: VOUCHER_BUNDLE_POSTING_PROFILE_ID,
   runtime_enabled: false as const,
@@ -185,6 +203,11 @@ export type VoucherPostingInput = {
   /**
    * Wymiar resolvera ADR-140 §3. Brak pola oznacza legacy/voucher path i mapuje
    * się na `voucher_liability_only_v1`; podany nieznany typ rzuca fail-closed.
+   *
+   * `| string` jest świadome: umożliwia testy z literałami poza enumem
+   * (np. `"UNKNOWN_TYPE"`) oraz tolerancję dla wartości spoza `EntitlementType`
+   * w callerach przed statycznym typowaniem. Bezpieczeństwo egzekwowane w runtime
+   * przez fail-closed resolver (`VoucherPostingInvariantError` dla unknown).
    */
   entitlement_type?: EntitlementType | string
   lifecycle_event: VoucherLifecycleEvent
@@ -268,23 +291,28 @@ export function isMoneyAccount(account: string): boolean {
  * Bariera działa NIEZALEŻNIE od walidatora CI (ADR-133 §Decyzja pkt 3 —
  * podwójna bariera entitlement↔money). Wywoływana przez generator przed
  * zwróceniem wpisu; może też być użyta samodzielnie na dowolnym zbiorze linii.
+ *
+ * `profileId` (opcjonalne) — przekazywane przez `buildEnvelope` w celu
+ * parametryzacji diagnostycznych komunikatów błędów (L1); bez wpływu na
+ * logikę fail-closed egzekucji.
  */
 export function assertPostingAccountsAllowed(
-  lines: ReadonlyArray<Pick<LedgerLine, "account">>
+  lines: ReadonlyArray<Pick<LedgerLine, "account">>,
+  profileId: string = VOUCHER_POSTING_PROFILE_ID
 ): void {
   for (const line of lines) {
     // Money-account check NAJPIERW — precyzyjny komunikat dla zakazu kont
     // pieniężnych (FR33/D-2), zanim wpadnie w ogólny allow-list.
     if (isMoneyAccount(line.account)) {
       throw new VoucherPostingGuardError(
-        `voucher_liability_only_v1 odrzuca posting na konto pieniężne "${line.account}" (fail-closed, FR33/D-2/ADR-007)`,
+        `${profileId} odrzuca posting na konto pieniężne "${line.account}" (fail-closed, FR33/D-2/ADR-007)`,
         line.account,
         "money_account"
       )
     }
     if (!ALLOWED_ACCOUNTS.has(line.account)) {
       throw new VoucherPostingGuardError(
-        `voucher_liability_only_v1 odrzuca konto "${line.account}" spoza dozwolonego namespace entitlement/VAT (fail-closed, ADR-133 §Decyzja pkt 2)`,
+        `${profileId} odrzuca konto "${line.account}" spoza dozwolonego namespace entitlement/VAT (fail-closed, ADR-133 §Decyzja pkt 2)`,
         line.account,
         "account_outside_namespace"
       )
@@ -387,7 +415,7 @@ function buildEnvelope(
   lines: LedgerLine[]
 ): LedgerTransactionV1 {
   // Podwójna bariera: runtime posting guard (konta) + inwariant double-entry.
-  assertPostingAccountsAllowed(lines)
+  assertPostingAccountsAllowed(lines, profile.id)
   assertBalanced(lines)
   return {
     transaction_id: input.transaction_id,
