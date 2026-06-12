@@ -33,44 +33,23 @@ import {
   verifyBinding,
 } from "../../../../../lib/claim-idempotency-binding"
 import { VOUCHER_MODULE, type VoucherService } from "../../../../../modules/voucher"
+import {
+  appendClaimAudit,
+  appendClaimAuditWithFallback,
+  auditLog,
+  bindingStore,
+  completeClaimBinding,
+  reserveClaimBinding,
+  withClaimTransaction,
+  type ClaimAuditRow,
+  type ClaimRouteResponse,
+} from "./helpers"
 
 // Disable Medusa's default admin auth — public store endpoint.
 export const AUTHENTICATE = false
 
 /** Minimum response latency floor in ms (anti-enumeration constant-time). */
 const RESPONSE_FLOOR_MS = 200
-
-/** In-memory idempotency binding store: idempotency_key → hex binding. */
-const _bindingStore = new Map<string, string>()
-
-/** In-memory audit log (appended in-process). */
-export interface ClaimAuditRow {
-  idempotency_key: string
-  code: string
-  ip: string
-  outcome:
-    | "ok"
-    | "idempotent_replay"
-    | "replay_tampered"
-    | "rate_limited"
-    | "invalid_code"
-    | "expired"
-    | "already_claimed"
-  occurred_at: string
-}
-
-const _auditLog: ClaimAuditRow[] = []
-
-/** Exposed for tests only. */
-export function _getAuditLog(): ReadonlyArray<ClaimAuditRow> {
-  return _auditLog
-}
-export function _clearAuditLog(): void {
-  _auditLog.splice(0, _auditLog.length)
-}
-export function _clearBindingStore(): void {
-  _bindingStore.clear()
-}
 
 /** Returns a Promise that resolves after `ms` milliseconds. */
 function delay(ms: number): Promise<void> {
@@ -105,6 +84,10 @@ type EventBusLike = {
   emit?: (message: { name: string; data: Record<string, unknown> }) => Promise<unknown>
 }
 
+type DurableClaimResult = ClaimRouteResponse & {
+  eventPayload?: { voucher_id: string; voucher_code: string; claimed_at: string }
+}
+
 async function emitVoucherClaimedEvent(
   req: MedusaRequest,
   payload: { voucher_id: string; voucher_code: string; claimed_at: string },
@@ -116,6 +99,13 @@ async function emitVoucherClaimedEvent(
     }
   } catch {
     // Claim success is not rolled back by notification fan-out issues.
+  }
+}
+
+function auditRow(input: Omit<ClaimAuditRow, "occurred_at"> & { occurred_at?: string }): ClaimAuditRow {
+  return {
+    ...input,
+    occurred_at: input.occurred_at ?? new Date().toISOString(),
   }
 }
 
@@ -135,13 +125,12 @@ export async function POST(
   const rl = consumeClaimToken(ip)
   if (!rl.allowed) {
     await padToFloor(startedAt)
-    _auditLog.push({
+    await appendClaimAuditWithFallback(req, auditRow({
       idempotency_key: "",
       code,
       ip,
       outcome: "rate_limited",
-      occurred_at: new Date().toISOString(),
-    })
+    }))
     res.setHeader("Retry-After", String(rl.retryAfterSec))
     res.status(429).json({
       type: "rate_limited",
@@ -211,13 +200,12 @@ export async function POST(
 
   if (!verifyBinding(idempotencyKey, expectedBinding)) {
     await padToFloor(startedAt)
-    _auditLog.push({
+    await appendClaimAuditWithFallback(req, auditRow({
       idempotency_key: idempotencyKey,
       code,
       ip,
       outcome: "replay_tampered",
-      occurred_at: new Date().toISOString(),
-    })
+    }))
     res.status(409).json({
       type: "replay_mismatch",
       message: "Idempotency binding mismatch — replay rejected.",
@@ -225,15 +213,161 @@ export async function POST(
     return
   }
 
-  // --- Idempotency binding check ---
-  const existingBinding = _bindingStore.get(idempotencyKey)
+  const durableResult = await withClaimTransaction<DurableClaimResult>(req, async (client) => {
+    const reserved = await reserveClaimBinding(client, {
+      idempotencyKey,
+      bindingHash: expectedBinding,
+      code,
+      claimedAt,
+    })
+
+    if (!reserved.inserted) {
+      // INFO-1 (defensive-only branch): the top-level verifyBinding check at
+      // line ~201 already rejects every request whose idempotency_key ≠
+      // expectedBinding before we enter the transaction. Inside the transaction
+      // `reserved.bindingHash` always equals `expectedBinding`, so this branch
+      // is unreachable on the normal prod path. It is kept as a defence-in-depth
+      // guard in case the pre-tx check is bypassed (e.g. future code change).
+      const bindingMatch = verifyBinding(reserved.bindingHash, expectedBinding)
+      if (!bindingMatch) {
+        await appendClaimAudit(client, auditRow({
+          idempotency_key: idempotencyKey,
+          code,
+          ip,
+          outcome: "replay_tampered",
+        }))
+        return {
+          status: 409,
+          body: {
+            type: "replay_mismatch",
+            message: "Idempotency binding mismatch — replay rejected.",
+          },
+        }
+      }
+
+      await appendClaimAudit(client, auditRow({
+        idempotency_key: idempotencyKey,
+        code,
+        ip,
+        outcome: "idempotent_replay",
+      }))
+
+      // LOW-3 fix: unify replay contract — durable path also signals idempotent:true
+      // so callers get the same body shape regardless of whether PG is available.
+      if (reserved.response) {
+        return {
+          ...reserved.response,
+          body: { ...reserved.response.body, idempotent: true },
+        }
+      }
+      return {
+        status: 409,
+        body: {
+          type: "claim_replay_pending",
+          message: "Claim replay is still pending. Please retry.",
+        },
+      }
+    }
+
+    let response: DurableClaimResult
+
+    if (!voucherForCheck) {
+      response = {
+        status: 404,
+        body: {
+          type: "not_found",
+          message: "Voucher not found.",
+        },
+      }
+      await appendClaimAudit(client, auditRow({
+        idempotency_key: idempotencyKey,
+        code,
+        ip,
+        outcome: "invalid_code",
+      }))
+      await completeClaimBinding(client, idempotencyKey, response)
+      return response
+    }
+
+    const claimedAtIso = new Date().toISOString()
+    const claimResult = await voucherService.claim(code, {
+      now: new Date(claimedAtIso),
+      client,
+    })
+
+    if (claimResult.status !== "claimed") {
+      const outcome =
+        claimResult.status === "already_claimed"
+          ? "already_claimed"
+          : claimResult.status === "expired"
+            ? "expired"
+            : "invalid_code"
+      response = claimResult.status === "already_claimed"
+        ? {
+            status: 409,
+            body: {
+              type: "already_claimed",
+              message: "Voucher has already been claimed.",
+              state: "claimed",
+            },
+          }
+        : claimResult.status === "expired"
+          ? { status: 410, body: { type: "expired", message: "Voucher has expired." } }
+          : { status: 404, body: { type: "not_found", message: "Voucher not found." } }
+      await appendClaimAudit(client, auditRow({
+        idempotency_key: idempotencyKey,
+        code,
+        ip,
+        outcome,
+        occurred_at: claimedAtIso,
+      }))
+      await completeClaimBinding(client, idempotencyKey, response)
+      return response
+    }
+
+    const updatedVoucher = claimResult.voucher
+    response = {
+      status: 200,
+      body: {
+        state: "claimed",
+        claimed_at: claimedAtIso,
+        seller_handle: updatedVoucher.seller_handle,
+      },
+      eventPayload: {
+        voucher_id: updatedVoucher.code,
+        voucher_code: updatedVoucher.code,
+        claimed_at: claimedAtIso,
+      },
+    }
+    await appendClaimAudit(client, auditRow({
+      idempotency_key: idempotencyKey,
+      code,
+      ip,
+      outcome: "ok",
+      occurred_at: claimedAtIso,
+    }))
+    await completeClaimBinding(client, idempotencyKey, response)
+    return response
+  })
+
+  if (durableResult !== null) {
+    if (durableResult.eventPayload) {
+      await emitVoucherClaimedEvent(req, durableResult.eventPayload)
+    }
+    await padToFloor(startedAt)
+    res.status(durableResult.status).json(durableResult.body)
+    return
+  }
+
+  // --- Idempotency binding check (single-instance fallback only) ---
+  const existingBinding = bindingStore.get(idempotencyKey)
 
   if (existingBinding !== undefined) {
     // Idempotency key was seen before — verify binding matches.
     const bindingMatch = verifyBinding(existingBinding, expectedBinding)
     if (!bindingMatch) {
       await padToFloor(startedAt)
-      _auditLog.push({
+      auditLog.push({
         idempotency_key: idempotencyKey,
         code,
         ip,
@@ -248,7 +382,7 @@ export async function POST(
     }
     // Idempotent replay — same binding, return success without mutation.
     await padToFloor(startedAt)
-    _auditLog.push({
+    auditLog.push({
       idempotency_key: idempotencyKey,
       code,
       ip,
@@ -264,12 +398,12 @@ export async function POST(
   }
 
   // New idempotency key — register binding before any state change.
-  _bindingStore.set(idempotencyKey, expectedBinding)
+  bindingStore.set(idempotencyKey, expectedBinding)
 
   // --- Voucher existence check (constant-time: always runs this code path) ---
   if (!voucherForCheck) {
     await padToFloor(startedAt)
-    _auditLog.push({
+    auditLog.push({
       idempotency_key: idempotencyKey,
       code,
       ip,
@@ -297,7 +431,7 @@ export async function POST(
   if (claimResult.status !== "claimed") {
     // Unexpected result after pre-checks passed — guard defensively.
     await padToFloor(startedAt)
-    _auditLog.push({
+    auditLog.push({
       idempotency_key: idempotencyKey,
       code,
       ip,
@@ -320,7 +454,7 @@ export async function POST(
 
   const updatedVoucher = claimResult.voucher
 
-  _auditLog.push({
+  auditLog.push({
     idempotency_key: idempotencyKey,
     code,
     ip,

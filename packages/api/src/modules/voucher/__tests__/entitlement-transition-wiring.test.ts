@@ -18,6 +18,7 @@ import {
   ALLOWED_ENTITLEMENT_TRANSITIONS,
   EntitlementTransitionError,
 } from "../models/entitlement"
+import { assertEventEnvelopeMatchesContract } from "../../gp-core/market-lifecycle-events"
 import { VOUCHER_LIABILITY_ONLY_V1 } from "../posting-profile"
 import {
   VoucherLedgerWriter,
@@ -603,5 +604,70 @@ describe("Story 3.4 AI-Review-3 — kontrakt atomowości / post-COMMIT", () => {
     const { event } = await wireEntitlementTransitionPersisted(deps, issuedToActiveInput())
     const failed = await emitTransitionEventAfterCommit(deps.emitEvent, event)
     expect(failed).toBe(true)
+  })
+
+  it("event okablowania spełnia contract-as-code envelope.v1 + payload schema (ADR-137)", async () => {
+    const { deps } = makeHarness()
+    const { event, audit } = await wireEntitlementTransitionPersisted(
+      deps,
+      issuedToActiveInput()
+    )
+
+    expect(event.scope).toEqual({
+      instance_id: "ent_1",
+      market_id: "pl",
+      vendor_id: null,
+      location_id: null,
+    })
+    expect(audit.scope.sales_channel_id).toBe("sc_pl")
+    expect(() =>
+      assertEventEnvelopeMatchesContract(
+        event,
+        "gp.entitlements.entitlement_state_changed.v1"
+      )
+    ).not.toThrow()
+  })
+
+  it("mapuje domenowych aktorów tranzycji na kanonicznych actorów envelope.v1", () => {
+    const admin = buildTransitionEnvelopes(
+      {
+        from: EntitlementInstanceState.ACTIVE,
+        to: EntitlementInstanceState.DISPUTED,
+        entitlement_id: "ent_admin",
+        scope: { instance_id: "ent_admin", market_id: "pl" },
+        actor: "admin",
+        transition_seq: "admin-1",
+      },
+      FIXED_NOW
+    )
+    const customer = buildTransitionEnvelopes(
+      {
+        from: EntitlementInstanceState.ISSUED,
+        to: EntitlementInstanceState.ACTIVE,
+        entitlement_id: "ent_customer",
+        scope: { instance_id: "ent_customer", market_id: "pl" },
+        actor: "customer",
+        transition_seq: "customer-1",
+      },
+      FIXED_NOW
+    )
+    const vendor = buildTransitionEnvelopes(
+      {
+        from: EntitlementInstanceState.ACTIVE,
+        to: EntitlementInstanceState.REDEMPTION_REQUESTED,
+        entitlement_id: "ent_vendor",
+        scope: { instance_id: "ent_vendor", market_id: "pl" },
+        actor: "vendor",
+        transition_seq: "vendor-1",
+      },
+      FIXED_NOW
+    )
+
+    expect(admin.event.actor).toBe("market_operator")
+    expect(customer.event.actor).toBe("end_customer")
+    expect(vendor.event.actor).toBe("vendor_user")
+    expect(admin.audit.actor).toBe("admin")
+    expect(customer.audit.actor).toBe("customer")
+    expect(vendor.audit.actor).toBe("vendor")
   })
 })

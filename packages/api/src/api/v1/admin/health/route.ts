@@ -81,6 +81,8 @@ async function checkHttp(
 }
 
 function getGpCoreService(req: MedusaRequest): GpCoreService {
+  // `getCorePool()` is a public read accessor on GpCoreService (Story 6.4),
+  // so the resolved service already exposes it — no intersection cast needed.
   return req.scope.resolve("gpCoreService") as GpCoreService
 }
 
@@ -103,7 +105,7 @@ export const GET = withOperatorAuth(async (req, res) => {
     const dbHealth = await gpCore.healthCheck()
     if (dbHealth.core) {
       // These use the internal pool — safe to call
-      const pool = (gpCore as any).getCorePool()
+      const pool = gpCore.getCorePool()
 
       const statsResult = await pool.query(
         `SELECT status, COUNT(*)::int AS count FROM entitlements GROUP BY status`

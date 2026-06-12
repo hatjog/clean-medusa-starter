@@ -1,3 +1,5 @@
+import type { AuditEnvelope, AuditProviderValue } from "@gp/audit";
+
 export type ConsentBasis =
   | "transactional_critical"
   | "transactional_supportive"
@@ -8,7 +10,7 @@ export type Channel = "email" | "sms" | "push";
 
 export type Locale = "pl-PL" | "en-US" | "uk-UA" | "de-DE";
 
-export type NotificationProvider = "brevo" | "resend" | string;
+export type NotificationProvider = Extract<AuditProviderValue, "brevo" | "resend">;
 
 export type NotificationDispatchStatus =
   | "queued"
@@ -58,8 +60,6 @@ export interface NotificationIntent {
   idempotency_key: string;
 }
 
-// TODO(F-11/Epic J): migrate this local envelope to shared @gp/audit when it exists.
-//
 // Sentinel convention (Story 5.5 Path Y subscriber + Story 5.10 pre-parse reject):
 // - Dla event_type: "notification.delivery" z correlation_state: "orphan" lub
 //   "rejected_pre_dispatch" pola `flow_id`, `template_key`, `market_id` MOGĄ
@@ -71,12 +71,11 @@ export interface NotificationIntent {
 //   `__no_recipient__` (non-collidable z hex sha256 output).
 // - Dla `dispatch_id` reject pre-dispatch → sentinel `__pre_dispatch__`.
 // - Dla `locale` reject pre-parse → sentinel `__unknown__`.
-export interface AuditEnvelope {
+export type NotificationAuditEnvelopeFields = {
   audit_id: string;
   event_type: "notification.dispatch" | "notification.delivery";
   status: NotificationDispatchStatus;
   dispatch_id: string;
-  provider: NotificationProvider;
   provider_event_id?: string;
   correlation_id?: string;
   correlation_state?: NotificationDeliveryCorrelationState;
@@ -100,13 +99,22 @@ export interface AuditEnvelope {
   gate_source?: "feature_flag";
 }
 
+/**
+ * Notification-domain audit envelope.
+ *
+ * The second type parameter narrows `provider` to notification-specific providers
+ * (brevo | resend), restoring per-domain precision (L-2 fix).
+ */
+export type NotificationAuditEnvelope =
+  AuditEnvelope<NotificationAuditEnvelopeFields, NotificationProvider>
+
 export interface NotificationDispatch {
   dispatch_id: string;
   provider: NotificationProvider;
   status: NotificationDispatchStatus;
   provider_message_id?: string;
   sent_at?: string;
-  audit_event: AuditEnvelope;
+  audit_event: NotificationAuditEnvelope;
 }
 
 export type NotificationDeliveryEventType =

@@ -780,6 +780,11 @@ export default defineMiddlewares({
       middlewares: [authenticate("customer", ["session", "bearer"])],
     },
     {
+      method: ["GET"],
+      matcher: "/vendor/auth/sessions",
+      middlewares: [authenticate("seller", ["bearer"])],
+    },
+    {
       method: ["POST"],
       matcher: "/vendor/magic-links/:jti/revoke",
       middlewares: [authenticate("seller", ["bearer"])],

@@ -96,7 +96,7 @@ jest.mock("../../../../src/lib/vendor-notification-log", () => ({
 // Imported AFTER jest.mock so the mock is in place when the module under
 // test resolves its own imports.
 // eslint-disable-next-line @typescript-eslint/no-var-requires
-const { uploadHandler } = require("../../../../src/api/vendor/training-cert/upload/route") as {
+const { uploadHandler } = require("../../../../src/api/vendor/training-cert/upload/helpers") as {
   uploadHandler: (
     req: any,
     res: any,

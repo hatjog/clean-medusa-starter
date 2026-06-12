@@ -37,7 +37,7 @@ type RequestWithVendorAuth = MedusaRequest & {
   vendorAuth?: VendorAuthContext
 }
 
-export interface VendorVoucherView {
+interface VendorVoucherView {
   code: string
   seller_id: string
   seller_name: string

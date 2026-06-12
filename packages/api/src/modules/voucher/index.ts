@@ -102,15 +102,25 @@ export type {
 } from "./telemetry"
 // Story 2.3: posting profile voucher_liability_only_v1 (AUTHORED, runtime_enabled:FALSE
 // per ADR-133 §P6 — eksport dostarcza ZDOLNOŚĆ, NIE aktywuje profilu w runtime).
+// Story 3.3 (v1.12.0): rejestr posting-profile keyed by `entitlement_type` + profile
+// CREDIT_PACK/BUNDLE (ADR-140 §3, capability audit-only, runtime_enabled:false HG-4 DEFERRED v2.0.0+).
 export {
   VOUCHER_POSTING_PROFILE_ID,
+  VOUCHER_CREDIT_PACK_POSTING_PROFILE_ID,
+  VOUCHER_BUNDLE_POSTING_PROFILE_ID,
+  VOUCHER_POSTING_PROFILE_IDS,
   VOUCHER_LEDGER_ACCOUNTS,
   VOUCHER_LIABILITY_ONLY_V1,
+  VOUCHER_CREDIT_PACK_V1,
+  VOUCHER_BUNDLE_V1,
+  VOUCHER_POSTING_PROFILE_REGISTRY,
+  VOUCHER_POSTING_PROFILES_BY_ID,
   VoucherPostingGuardError,
   VoucherPostingInvariantError,
   isMoneyAccount,
   assertPostingAccountsAllowed,
   assertBalanced,
+  resolveVoucherPostingProfile,
   generateVoucherPosting,
 } from "./posting-profile"
 export type {
@@ -121,6 +131,8 @@ export type {
   VoucherLifecycleEvent,
   VoucherPostingInput,
   VoucherPostingResult,
+  VoucherPostingProfile,
+  VoucherPostingProfileId,
 } from "./posting-profile"
 // Story 2.6: fundament persystencji entitlement-ledgera (ADR-139 D3 — idempotentny
 // writer, ujście dla generateVoucherPosting()). Eksport dostarcza ZDOLNOŚĆ ZAPISU,

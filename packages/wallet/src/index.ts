@@ -32,6 +32,7 @@ export type {
   WalletPayloadSchemaBarcodeSpec,
   WalletPayloadSchemaBranding,
 } from "./payload-schema"
+export type { AuditEnvelope } from "@gp/audit"
 export { createWalletProviderRegistry } from "./registry"
 export type { CreateWalletProviderRegistryOptions } from "./registry"
 export {
@@ -77,13 +78,13 @@ export type {
   WalletGateReason,
 } from "./telemetry"
 export type {
-  AuditEnvelope,
   AuditEvent,
   EntitlementInstance,
   EntitlementInstanceReadModel,
   EntitlementInstanceWalletMetadata,
   LocalizedWalletText,
   WalletAuditEventType,
+  WalletAuditEnvelope,
   WalletAuditOutcome,
   WalletBarcodeFormat,
   WalletBarcodeSpec,

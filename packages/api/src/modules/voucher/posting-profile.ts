@@ -39,9 +39,20 @@
  */
 
 import type { VatClassification } from "./vat-resolver"
+import { EntitlementType } from "./models/entitlement"
 
-/** Identyfikator profilu — wartość `metadata.posting_profile` w `ledger-transaction.v1`. */
+/** Identyfikator profilu legacy — wartość `metadata.posting_profile` w `ledger-transaction.v1`. */
 export const VOUCHER_POSTING_PROFILE_ID = "voucher_liability_only_v1" as const
+export const VOUCHER_CREDIT_PACK_POSTING_PROFILE_ID = "voucher_credit_pack_v1" as const
+export const VOUCHER_BUNDLE_POSTING_PROFILE_ID = "voucher_bundle_v1" as const
+
+export const VOUCHER_POSTING_PROFILE_IDS = Object.freeze([
+  VOUCHER_POSTING_PROFILE_ID,
+  VOUCHER_CREDIT_PACK_POSTING_PROFILE_ID,
+  VOUCHER_BUNDLE_POSTING_PROFILE_ID,
+] as const)
+
+export type VoucherPostingProfileId = (typeof VOUCHER_POSTING_PROFILE_IDS)[number]
 
 /**
  * Konta dozwolone dla posting profile `voucher_liability_only_v1`
@@ -89,6 +100,59 @@ export const VOUCHER_LIABILITY_ONLY_V1 = Object.freeze({
   forbidden_money_classes: Object.freeze([...FORBIDDEN_MONEY_CLASSES]),
 } as const)
 
+/**
+ * Profil CREDIT_PACK (saldo kwotowe) — ADR-140 §3, runtime_enabled:false (HG-4 DEFERRED v2.0.0+).
+ *
+ * `allowed_accounts`/`forbidden_money_classes` są metadanymi deklaratywnymi (spójnymi z
+ * `VOUCHER_LIABILITY_ONLY_V1`). Guard (`assertPostingAccountsAllowed`) waliduje względem
+ * modułowych stałych `ALLOWED_ACCOUNTS`/`FORBIDDEN_MONEY_CLASSES`, nie pól profilu —
+ * namespace jest świadomie współdzielony dla wszystkich 3 profili v1.12.0. Rozszerzenie
+ * per-profile account-scoping wymaga zmiany architektury guard'a (planowane v1.13.0+).
+ */
+export const VOUCHER_CREDIT_PACK_V1 = Object.freeze({
+  id: VOUCHER_CREDIT_PACK_POSTING_PROFILE_ID,
+  runtime_enabled: false as const,
+  allowed_accounts: Object.freeze([...ALLOWED_ACCOUNTS]),
+  forbidden_money_classes: Object.freeze([...FORBIDDEN_MONEY_CLASSES]),
+} as const)
+
+/**
+ * Profil BUNDLE (`choice_set` wymiennych pozycji) — ADR-140 §3, runtime_enabled:false (HG-4 DEFERRED v2.0.0+).
+ *
+ * `allowed_accounts`/`forbidden_money_classes` są metadanymi deklaratywnymi (spójnymi z
+ * `VOUCHER_LIABILITY_ONLY_V1`). Guard (`assertPostingAccountsAllowed`) waliduje względem
+ * modułowych stałych `ALLOWED_ACCOUNTS`/`FORBIDDEN_MONEY_CLASSES`, nie pól profilu —
+ * namespace jest świadomie współdzielony dla wszystkich 3 profili v1.12.0. Rozszerzenie
+ * per-profile account-scoping wymaga zmiany architektury guard'a (planowane v1.13.0+).
+ */
+export const VOUCHER_BUNDLE_V1 = Object.freeze({
+  id: VOUCHER_BUNDLE_POSTING_PROFILE_ID,
+  runtime_enabled: false as const,
+  allowed_accounts: Object.freeze([...ALLOWED_ACCOUNTS]),
+  forbidden_money_classes: Object.freeze([...FORBIDDEN_MONEY_CLASSES]),
+} as const)
+
+export type VoucherPostingProfile =
+  | typeof VOUCHER_LIABILITY_ONLY_V1
+  | typeof VOUCHER_CREDIT_PACK_V1
+  | typeof VOUCHER_BUNDLE_V1
+
+export const VOUCHER_POSTING_PROFILES_BY_ID: Readonly<Record<VoucherPostingProfileId, VoucherPostingProfile>> =
+  Object.freeze({
+    [VOUCHER_POSTING_PROFILE_ID]: VOUCHER_LIABILITY_ONLY_V1,
+    [VOUCHER_CREDIT_PACK_POSTING_PROFILE_ID]: VOUCHER_CREDIT_PACK_V1,
+    [VOUCHER_BUNDLE_POSTING_PROFILE_ID]: VOUCHER_BUNDLE_V1,
+  })
+
+export const VOUCHER_POSTING_PROFILE_REGISTRY: Readonly<
+  Partial<Record<EntitlementType, VoucherPostingProfile>>
+> = Object.freeze({
+  [EntitlementType.VOUCHER_AMOUNT]: VOUCHER_LIABILITY_ONLY_V1,
+  [EntitlementType.VOUCHER_SERVICE]: VOUCHER_LIABILITY_ONLY_V1,
+  [EntitlementType.CREDIT_PACK]: VOUCHER_CREDIT_PACK_V1,
+  [EntitlementType.BUNDLE]: VOUCHER_BUNDLE_V1,
+})
+
 // ──────────────────────────────────────────────────────────────────────────
 // Typy zgodne z kontraktem `ledger-transaction.v1` (Story 2.1)
 // ──────────────────────────────────────────────────────────────────────────
@@ -124,7 +188,7 @@ export type LedgerTransactionV1 = {
   entry_type: VoucherEntryType
   lines: LedgerLine[]
   metadata: {
-    posting_profile: typeof VOUCHER_POSTING_PROFILE_ID
+    posting_profile: VoucherPostingProfileId
     vat_classification: VatClassification
     lifecycle_event: string
     [key: string]: unknown
@@ -136,6 +200,16 @@ export type LedgerTransactionV1 = {
  * `net_minor` + `vat_minor` = brutto całego vouchera przy emisji.
  */
 export type VoucherPostingInput = {
+  /**
+   * Wymiar resolvera ADR-140 §3. Brak pola oznacza legacy/voucher path i mapuje
+   * się na `voucher_liability_only_v1`; podany nieznany typ rzuca fail-closed.
+   *
+   * `| string` jest świadome: umożliwia testy z literałami poza enumem
+   * (np. `"UNKNOWN_TYPE"`) oraz tolerancję dla wartości spoza `EntitlementType`
+   * w callerach przed statycznym typowaniem. Bezpieczeństwo egzekwowane w runtime
+   * przez fail-closed resolver (`VoucherPostingInvariantError` dla unknown).
+   */
+  entitlement_type?: EntitlementType | string
   lifecycle_event: VoucherLifecycleEvent
   /** Konsumowane z resolvera Story 2.2; profil NIE reklasyfikuje (single source). */
   vat_classification: VatClassification
@@ -217,23 +291,28 @@ export function isMoneyAccount(account: string): boolean {
  * Bariera działa NIEZALEŻNIE od walidatora CI (ADR-133 §Decyzja pkt 3 —
  * podwójna bariera entitlement↔money). Wywoływana przez generator przed
  * zwróceniem wpisu; może też być użyta samodzielnie na dowolnym zbiorze linii.
+ *
+ * `profileId` (opcjonalne) — przekazywane przez `buildEnvelope` w celu
+ * parametryzacji diagnostycznych komunikatów błędów (L1); bez wpływu na
+ * logikę fail-closed egzekucji.
  */
 export function assertPostingAccountsAllowed(
-  lines: ReadonlyArray<Pick<LedgerLine, "account">>
+  lines: ReadonlyArray<Pick<LedgerLine, "account">>,
+  profileId: string = VOUCHER_POSTING_PROFILE_ID
 ): void {
   for (const line of lines) {
     // Money-account check NAJPIERW — precyzyjny komunikat dla zakazu kont
     // pieniężnych (FR33/D-2), zanim wpadnie w ogólny allow-list.
     if (isMoneyAccount(line.account)) {
       throw new VoucherPostingGuardError(
-        `voucher_liability_only_v1 odrzuca posting na konto pieniężne "${line.account}" (fail-closed, FR33/D-2/ADR-007)`,
+        `${profileId} odrzuca posting na konto pieniężne "${line.account}" (fail-closed, FR33/D-2/ADR-007)`,
         line.account,
         "money_account"
       )
     }
     if (!ALLOWED_ACCOUNTS.has(line.account)) {
       throw new VoucherPostingGuardError(
-        `voucher_liability_only_v1 odrzuca konto "${line.account}" spoza dozwolonego namespace entitlement/VAT (fail-closed, ADR-133 §Decyzja pkt 2)`,
+        `${profileId} odrzuca konto "${line.account}" spoza dozwolonego namespace entitlement/VAT (fail-closed, ADR-133 §Decyzja pkt 2)`,
         line.account,
         "account_outside_namespace"
       )
@@ -250,6 +329,24 @@ export class VoucherPostingInvariantError extends Error {
     super(message)
     this.name = "VoucherPostingInvariantError"
   }
+}
+
+export function resolveVoucherPostingProfile(
+  entitlementType: VoucherPostingInput["entitlement_type"]
+): VoucherPostingProfile {
+  if (entitlementType == null) {
+    return VOUCHER_LIABILITY_ONLY_V1
+  }
+  const profile =
+    VOUCHER_POSTING_PROFILE_REGISTRY[
+      entitlementType as keyof typeof VOUCHER_POSTING_PROFILE_REGISTRY
+    ]
+  if (!profile) {
+    throw new VoucherPostingInvariantError(
+      `nieznany entitlement_type dla posting_profile registry: ${String(entitlementType)}`
+    )
+  }
+  return profile
 }
 
 function assertNonNegativeInteger(value: number, label: string): void {
@@ -312,12 +409,13 @@ function proportionalVat(
 
 function buildEnvelope(
   input: VoucherPostingInput,
+  profile: VoucherPostingProfile,
   entryType: VoucherEntryType,
   lifecycleEvent: string,
   lines: LedgerLine[]
 ): LedgerTransactionV1 {
   // Podwójna bariera: runtime posting guard (konta) + inwariant double-entry.
-  assertPostingAccountsAllowed(lines)
+  assertPostingAccountsAllowed(lines, profile.id)
   assertBalanced(lines)
   return {
     transaction_id: input.transaction_id,
@@ -327,7 +425,7 @@ function buildEnvelope(
     entry_type: entryType,
     lines,
     metadata: {
-      posting_profile: VOUCHER_POSTING_PROFILE_ID,
+      posting_profile: profile.id,
       vat_classification: input.vat_classification,
       lifecycle_event: lifecycleEvent,
     },
@@ -363,7 +461,7 @@ function line(
  * (poza zakresem profilu, FR33). Carve-out VAT samobilansuje się bez konta
  * pieniężnego.
  */
-function generateIssued(input: VoucherPostingInput): VoucherPostingResult {
+function generateIssued(input: VoucherPostingInput, profile: VoucherPostingProfile): VoucherPostingResult {
   assertNonNegativeInteger(input.vat_minor, "vat_minor")
   assertNonNegativeInteger(input.net_minor, "net_minor")
 
@@ -398,7 +496,7 @@ function generateIssued(input: VoucherPostingInput): VoucherPostingResult {
     line(input, "issued-vat", vatAccount, "credit", input.vat_minor, note),
   ]
 
-  return { posted: true, transaction: buildEnvelope(input, "ENTITLEMENT_ISSUED", "ISSUED", lines) }
+  return { posted: true, transaction: buildEnvelope(input, profile, "ENTITLEMENT_ISSUED", "ISSUED", lines) }
 }
 
 /**
@@ -411,7 +509,7 @@ function generateIssued(input: VoucherPostingInput): VoucherPostingResult {
  *          jest legiem money-ledger (poza zakresem). W entitlement-ledgerze brak
  *          legu → udokumentowany no-op (VAT już rozpoznany, brak nowego VAT).
  */
-function generateRedeemed(input: VoucherPostingInput): VoucherPostingResult {
+function generateRedeemed(input: VoucherPostingInput, profile: VoucherPostingProfile): VoucherPostingResult {
   assertNonNegativeInteger(input.vat_minor, "vat_minor")
   assertNonNegativeInteger(input.net_minor, "net_minor")
   const redeemedGross = input.redeemed_gross_minor ?? 0
@@ -473,7 +571,7 @@ function generateRedeemed(input: VoucherPostingInput): VoucherPostingResult {
     ),
   ]
 
-  return { posted: true, transaction: buildEnvelope(input, "ENTITLEMENT_REDEEMED", "REDEEMED", lines) }
+  return { posted: true, transaction: buildEnvelope(input, profile, "ENTITLEMENT_REDEEMED", "REDEEMED", lines) }
 }
 
 /**
@@ -488,7 +586,7 @@ function generateRedeemed(input: VoucherPostingInput): VoucherPostingResult {
  * Forfeiture/partial NIE reklasyfikują (C-68/23) — breakage liczony WYŁĄCZNIE
  * od niewykorzystanego salda.
  */
-function generateBreakage(input: VoucherPostingInput): VoucherPostingResult {
+function generateBreakage(input: VoucherPostingInput, profile: VoucherPostingProfile): VoucherPostingResult {
   assertNonNegativeInteger(input.vat_minor, "vat_minor")
   assertNonNegativeInteger(input.net_minor, "net_minor")
   const remainingGross = input.remaining_gross_minor ?? 0
@@ -551,7 +649,7 @@ function generateBreakage(input: VoucherPostingInput): VoucherPostingResult {
         "SPV breakage: rozpoznanie breakage z niewykorzystanego salda netto"
       ),
     ]
-    return { posted: true, transaction: buildEnvelope(input, "ENTITLEMENT_BREAKAGE", "EXPIRED", lines) }
+    return { posted: true, transaction: buildEnvelope(input, profile, "ENTITLEMENT_BREAKAGE", "EXPIRED", lines) }
   }
 
   // MPV unused = bez VAT (art. 73a): zawieszony VAT niewykorzystanego salda
@@ -607,7 +705,7 @@ function generateBreakage(input: VoucherPostingInput): VoucherPostingResult {
     )
   )
 
-  return { posted: true, transaction: buildEnvelope(input, "ENTITLEMENT_BREAKAGE", "EXPIRED", lines) }
+  return { posted: true, transaction: buildEnvelope(input, profile, "ENTITLEMENT_BREAKAGE", "EXPIRED", lines) }
 }
 
 /**
@@ -623,13 +721,14 @@ function generateBreakage(input: VoucherPostingInput): VoucherPostingResult {
 export function generateVoucherPosting(
   input: VoucherPostingInput
 ): VoucherPostingResult {
+  const profile = resolveVoucherPostingProfile(input.entitlement_type)
   switch (input.lifecycle_event) {
     case "ISSUED":
-      return generateIssued(input)
+      return generateIssued(input, profile)
     case "REDEEMED":
-      return generateRedeemed(input)
+      return generateRedeemed(input, profile)
     case "EXPIRED":
-      return generateBreakage(input)
+      return generateBreakage(input, profile)
     default: {
       const exhaustive: never = input.lifecycle_event
       throw new VoucherPostingInvariantError(

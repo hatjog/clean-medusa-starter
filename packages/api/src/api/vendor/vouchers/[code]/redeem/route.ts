@@ -45,7 +45,7 @@ type RequestWithVendorAuth = MedusaRequest & {
   vendorAuth?: VendorAuthContext
 }
 
-export type VendorRedeemAuditEnvelope = {
+type VendorRedeemAuditEnvelope = {
   audit_log_id: string
   vendor_id: string
   seller_id: string

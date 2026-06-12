@@ -1,3 +1,11 @@
+import type { AuditEnvelope } from "@gp/audit"
+import type {
+  EntitlementInstance,
+  EntitlementInstanceReadModel,
+  EntitlementInstanceWalletMetadata,
+  LocalizedWalletText,
+} from "@gp/voucher"
+
 export const WALLET_PROVIDER_KINDS = ["google", "apple"] as const
 export type WalletProviderKind = (typeof WALLET_PROVIDER_KINDS)[number]
 
@@ -85,81 +93,42 @@ export type WalletAuditOutcome =
   | "failure"
   | `rejected_${WalletDenyReason}`
 
-// TODO(F-11, deferred architectural): migrate to shared @gp/audit when the
-// audit package consolidation lands (Epic J observability follow-up story).
-// TODO(F-09, deferred): pole `provider` jest dziś typu `string` aby zachować
-// backward-compat z istniejącymi callerami spoza gate path; docelowo zacieśnić
-// do `WalletProviderKind` w ramach F-11 migracji do `@gp/audit`.
-export interface AuditEnvelope {
-  event_type: WalletAuditEventType
-  entitlement_instance_id: string
-  provider: string
-  market?: string
-  release?: string
-  actor_id?: string
-  lifecycle?: string
-  save_url?: string
-  reason?: WalletInvalidationReason
-  gate_reason?: string
-  timestamp: string
-  outcome: WalletAuditOutcome
-  error_code?: string
-  error_message?: string
-  requested_locale?: string
-  effective_locale?: WalletLocale
-}
+/**
+ * Wallet-domain audit envelope.
+ *
+ * The second type parameter narrows `provider` to wallet-specific providers
+ * (google | apple) restoring per-domain precision lost in the base AuditEnvelope
+ * union (L-2 fix). Unknown/error-path providers carry "google" | "apple" as the
+ * type constraint; the safe cast in facade.ts (toAuditProviderSafe) ensures the
+ * runtime value is preserved verbatim even when it falls outside this set.
+ */
+export type WalletAuditEnvelope = AuditEnvelope<
+  {
+    event_type: WalletAuditEventType
+    entitlement_instance_id: string
+    market?: string
+    release?: string
+    actor_id?: string
+    lifecycle?: string
+    save_url?: string
+    reason?: WalletInvalidationReason
+    gate_reason?: string
+    timestamp: string
+    outcome: WalletAuditOutcome
+    error_code?: string
+    error_message?: string
+    requested_locale?: string
+    effective_locale?: WalletLocale
+  },
+  WalletProviderKind
+>
 
-export type AuditEvent = AuditEnvelope
-
-export type LocalizedWalletText =
-  | string
-  | Partial<Record<WalletLocale, string>>
-  | Record<string, string>
-
-export interface EntitlementInstanceWalletMetadata {
-  code?: string
-  title?: LocalizedWalletText
-  entitlement_type?: string
-  status?: WalletPassStatus
-  expires_at?: string | Date | null
-  salon_name?: string
-  salon_address?: string
-  deep_link?: string
-  barcode_spec?: WalletBarcodeSpec
-  branding?: Partial<WalletBranding>
-  latitude?: number
-  longitude?: number
-}
-
-// TODO: zastąpić read modelem L4 z @gp/voucher, gdy projekcja wallet wyląduje.
-export interface EntitlementInstance {
-  id: string
-  code?: string
-  title?: LocalizedWalletText
-  market_id?: string
-  entitlement_type?: string
-  status?: WalletPassStatus
-  state?: string
-  expires_at?: string | Date | null
-  salon_name?: string
-  salon_address?: string
-  deep_link?: string
-  barcode_spec?: WalletBarcodeSpec
-  branding?: Partial<WalletBranding>
-  latitude?: number
-  longitude?: number
-  metadata?: {
-    wallet?: EntitlementInstanceWalletMetadata
-    gp?: {
-      market_id?: string
-      entitlement_type?: string
-      wallet?: EntitlementInstanceWalletMetadata
-    }
-  } & Record<string, unknown>
-}
-
-export interface EntitlementInstanceReadModel {
-  getById(entitlement_instance_id: string): Promise<EntitlementInstance | null>
+export type AuditEvent = WalletAuditEnvelope
+export type {
+  EntitlementInstance,
+  EntitlementInstanceReadModel,
+  EntitlementInstanceWalletMetadata,
+  LocalizedWalletText,
 }
 
 export function isWalletProviderKind(value: unknown): value is WalletProviderKind {

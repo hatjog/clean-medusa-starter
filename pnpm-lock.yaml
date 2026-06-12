@@ -26,9 +26,15 @@ importers:
 
   .:
     dependencies:
+      '@gp/audit':
+        specifier: workspace:*
+        version: link:packages/audit
       '@gp/messaging':
         specifier: workspace:*
         version: link:packages/messaging
+      '@gp/voucher':
+        specifier: workspace:*
+        version: link:packages/voucher
       '@gp/wallet':
         specifier: workspace:*
         version: link:packages/wallet
@@ -151,8 +157,17 @@ importers:
         specifier: ^1.0.0-pre.53
         version: 1.0.0-pre.53
 
+  packages/audit:
+    devDependencies:
+      typescript:
+        specifier: ^5.6.2
+        version: 5.9.3
+
   packages/messaging:
     dependencies:
+      '@gp/audit':
+        specifier: workspace:*
+        version: link:../audit
       js-yaml:
         specifier: ^4.1.1
         version: 4.1.1
@@ -161,8 +176,20 @@ importers:
         specifier: ^4.0.9
         version: 4.0.9
 
+  packages/voucher:
+    devDependencies:
+      typescript:
+        specifier: ^5.6.2
+        version: 5.9.3
+
   packages/wallet:
     dependencies:
+      '@gp/audit':
+        specifier: workspace:*
+        version: link:../audit
+      '@gp/voucher':
+        specifier: workspace:*
+        version: link:../voucher
       googleapis:
         specifier: ^144.0.0
         version: 144.0.0

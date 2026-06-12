@@ -2,10 +2,11 @@ import { createHash } from "node:crypto"
 
 import type { SubscriberArgs, SubscriberConfig } from "@medusajs/framework"
 import { ContainerRegistrationKeys } from "@medusajs/framework/utils"
+import { AuditProvider } from "@gp/audit"
 import type {
-  AuditEnvelope,
   ConsentBasis,
   Locale,
+  NotificationAuditEnvelope,
   NotificationDeliveryAuditOutcome,
   NotificationDeliveryCorrelationState,
   NotificationDeliveryEventType,
@@ -113,9 +114,9 @@ type KnexLike = {
 }
 
 type AuditSink = {
-  record?: (auditEvent: AuditEnvelope) => Promise<void> | void
-  write?: (auditEvent: AuditEnvelope) => Promise<void> | void
-  append?: (auditEvent: AuditEnvelope) => Promise<void> | void
+  record?: (auditEvent: NotificationAuditEnvelope) => Promise<void> | void
+  write?: (auditEvent: NotificationAuditEnvelope) => Promise<void> | void
+  append?: (auditEvent: NotificationAuditEnvelope) => Promise<void> | void
 }
 
 type NormalizedBrevoDeliveryEvent = {
@@ -351,7 +352,7 @@ async function lookupDispatch(
 function buildAuditEnvelope(
   normalized: NormalizedBrevoDeliveryEvent,
   correlated: CorrelatedDispatch,
-): AuditEnvelope {
+): NotificationAuditEnvelope {
   const outcome = resolveOutcome(normalized.event_type)
   const dispatch = correlated.dispatch
 
@@ -362,7 +363,7 @@ function buildAuditEnvelope(
     event_type: "notification.delivery",
     status: resolveDeliveryStatus(normalized.event_type),
     dispatch_id: correlated.dispatch_id,
-    provider: "brevo",
+    provider: AuditProvider.BREVO,
     provider_event_id: normalized.provider_event_id,
     correlation_id: correlated.correlation_id,
     correlation_state: correlated.correlation_state,
@@ -393,10 +394,10 @@ function deriveAuditId(providerEventId: string, eventType: NotificationDeliveryE
 
 async function emitAuditEvent(
   container: ResolveContainer,
-  auditEvent: AuditEnvelope,
+  auditEvent: NotificationAuditEnvelope,
   logger: LoggerLike,
 ): Promise<void> {
-  const sink = resolveOptional<AuditSink | ((auditEvent: AuditEnvelope) => Promise<void> | void)>(
+  const sink = resolveOptional<AuditSink | ((auditEvent: NotificationAuditEnvelope) => Promise<void> | void)>(
     container,
     [
       "notification_delivery_audit_sink",
@@ -458,7 +459,7 @@ function resolveOutcome(
 
 function resolveDeliveryStatus(
   eventType: NotificationDeliveryEventType,
-): AuditEnvelope["status"] {
+): NotificationAuditEnvelope["status"] {
   switch (eventType) {
     case "delivered":
       return "delivered"
@@ -639,4 +640,3 @@ function markProviderEventSeen(providerEventId: string): void {
 function readString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined
 }
-

@@ -20,6 +20,7 @@ import {
   resolveVatClassification,
   type VatClassification,
 } from "../../modules/voucher/vat-resolver"
+import { VoucherPostingInvariantError } from "../../modules/voucher/posting-profile"
 
 /**
  * live-issue-from-payment-intent.ts — Story 3.3 (v1.11.0 Epic 3) — RDZEŃ live-issue
@@ -128,6 +129,13 @@ type OrderLineRow = {
 type FrozenRecipient = {
   recipient_index: number
   recipient_customer_id: string | null
+}
+
+type ChoiceSetSnapshotItem = {
+  item_key: string
+  label: string | null
+  reference_amount_minor: number
+  vat_classification: VatClassification
 }
 
 /**
@@ -405,6 +413,25 @@ async function issueSingleIssuedRow(
     vat_rate_uniqueness: profile.policy.vat_rate_uniqueness,
     ...(vatRates ? { vat_rates: vatRates } : {}),
   })
+  const choiceSetItems = extractChoiceSetSnapshotItems(profile, vatClassification)
+  const referencePriceMinor = computeReferencePriceMinor(profile, choiceSetItems, lineItemId)
+  // Asercja invariantu z niezależnymi wyroczniami (ADR-140 §2, M1-fix):
+  //   - CREDIT_PACK oracle = face_value z policy/profilu (resolveCreditPackFaceValueMinor,
+  //     inna ścieżka niż compute — resolvuje wyłącznie z policy, bez payload fallbacku).
+  //   - BUNDLE oracle = lista `reference_amount_minor` z przygotowanych wierszy choice_set
+  //     (tablica itemAmounts zbudowana niezależnie, nie ta sama zmienna co choiceSetItems.reduce).
+  const creditPackOracle =
+    profile.entitlement_type === EntitlementType.CREDIT_PACK
+      ? resolveCreditPackFaceValueMinor(profile, lineItemId)
+      : undefined
+  const bundleAmountsOracle =
+    profile.entitlement_type === EntitlementType.BUNDLE
+      ? choiceSetItems.map((item) => item.reference_amount_minor)
+      : undefined
+  assertReferencePriceInvariant(profile.entitlement_type as EntitlementType, referencePriceMinor, lineItemId, {
+    faceValueMinor: creditPackOracle,
+    itemAmounts: bundleAmountsOracle,
+  })
 
   // ── snapshot policy (regulamin § 12 — immutable post-ISSUED) ───────────────
   const snapshot: EntitlementPolicySnapshot = snapshotPolicy({
@@ -425,9 +452,9 @@ async function issueSingleIssuedRow(
     `INSERT INTO entitlement_instance
        (id, entitlement_profile_id, entitlement_type, order_id, line_item_id,
         state, policy_snapshot, market_id, sales_channel_id, vat_classification,
-        entitlement_dedupe_key, recipient_index, recipient_customer_id,
+        reference_price_minor, entitlement_dedupe_key, recipient_index, recipient_customer_id,
         created_at, updated_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11, $12, $13, $14, $14)
+     VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11, $12, $13, $14, $15, $15)
      ${ENTITLEMENT_DEDUPE_ON_CONFLICT_CLAUSE}
      RETURNING id`,
     [
@@ -441,6 +468,7 @@ async function issueSingleIssuedRow(
       ctx.marketId,
       ctx.salesChannelId,
       vatClassification,
+      referencePriceMinor,
       dedupeKey,
       recipient.recipient_index,
       recipient.recipient_customer_id,
@@ -449,6 +477,10 @@ async function issueSingleIssuedRow(
   )
 
   const created = (insert.rowCount ?? insert.rows.length) > 0
+  if (created && choiceSetItems.length > 0) {
+    await insertChoiceSetItems(client, entitlementId, ctx.marketId, choiceSetItems, now)
+  }
+
   return {
     entitlement_id: insert.rows[0]?.id ?? entitlementId,
     entitlement_dedupe_key: dedupeKey,
@@ -458,6 +490,152 @@ async function issueSingleIssuedRow(
     vat_classification: vatClassification,
     created,
   }
+}
+
+/**
+ * Rozwiązuje face_value_minor dla CREDIT_PACK wyłącznie z profilu/policy (bez
+ * fallbacku do kwoty zapłaconej przez Stripe). ADR-140 §2: `reference_price_minor`
+ * = face_value_minor — NIE kwota transakcji. Przy braku jawnej wartości rzuca
+ * fail-closed (nieokreślony face_value to błąd konfiguracji, nie edge-case).
+ */
+function resolveCreditPackFaceValueMinor(
+  profile: ResolvedProfile,
+  lineItemId: string
+): number {
+  const resolved =
+    profile.amount_minor ??
+    readNumber(profile.policy.face_value_minor) ??
+    readNumber(profile.policy.amount_minor)
+  if (resolved === undefined || resolved === null) {
+    throw new VoucherPostingInvariantError(
+      `liveIssueEntitlementsWithinTx: CREDIT_PACK ${lineItemId} nie ma jawnego ` +
+        `face_value_minor ani amount_minor w profilu/policy — nie można zamrozić ` +
+        `reference_price_minor (fallback do kwoty Stripe payload narusza ADR-140 §2)`
+    )
+  }
+  return assertPositiveIntegerMinor(
+    resolved,
+    `CREDIT_PACK face_value_minor/amount_minor (linia ${lineItemId})`
+  )
+}
+
+function computeReferencePriceMinor(
+  profile: ResolvedProfile,
+  choiceSetItems: ChoiceSetSnapshotItem[],
+  lineItemId: string
+): number | null {
+  if (profile.entitlement_type === EntitlementType.CREDIT_PACK) {
+    return resolveCreditPackFaceValueMinor(profile, lineItemId)
+  }
+
+  if (profile.entitlement_type === EntitlementType.BUNDLE) {
+    if (choiceSetItems.length === 0) {
+      throw new VoucherPostingInvariantError(
+        `liveIssueEntitlementsWithinTx: BUNDLE ${lineItemId} nie niesie choice_set — ` +
+          `nie można zamrozić reference_price_minor zgodnie z ADR-140 §2`
+      )
+    }
+    return choiceSetItems.reduce((sum, item) => sum + item.reference_amount_minor, 0)
+  }
+
+  return null
+}
+
+/**
+ * Asercja invariantu ADR-140 §2 — egzekwuje spójność zamrożonego snapshotu
+ * względem niezależnie dostarczonych wartości oracle (fail-closed):
+ *   - CREDIT_PACK: `referencePriceMinor` musi równać się `faceValueMinorOracle`
+ *     (face_value z policy/profilu, rozwiązany niezależnie od `computeReferencePriceMinor`).
+ *   - BUNDLE: `referencePriceMinor` musi równać się sumie `itemAmountsOracle`
+ *     (lista `reference_amount_minor` z przygotowanych wierszy choice_set,
+ *     dostarczona niezależnie od tablicy `choiceSetItems` użytej w compute).
+ *
+ * Eksportowana na potrzeby golden-testów niespójności (wywołanie z rozbieżnymi
+ * wartościami oracle weryfikuje fail-closed bez round-tripu przez publiczne API).
+ */
+export function assertReferencePriceInvariant(
+  entitlementType: EntitlementType,
+  referencePriceMinor: number | null,
+  lineItemId: string,
+  oracle: { faceValueMinor?: number; itemAmounts?: readonly number[] }
+): void {
+  if (entitlementType === EntitlementType.CREDIT_PACK) {
+    const faceValueMinor = oracle.faceValueMinor
+    if (faceValueMinor === undefined) return // nie dostarczono oracle — brak weryfikacji
+    if (referencePriceMinor !== faceValueMinor) {
+      throw new VoucherPostingInvariantError(
+        `liveIssueEntitlementsWithinTx: invariant CREDIT_PACK naruszony dla linii ${lineItemId}: ` +
+          `reference_price_minor=${referencePriceMinor}, face_value_minor=${faceValueMinor}`
+      )
+    }
+  }
+
+  if (entitlementType === EntitlementType.BUNDLE) {
+    const itemAmounts = oracle.itemAmounts
+    if (!itemAmounts) return // nie dostarczono oracle — brak weryfikacji
+    const sum = itemAmounts.reduce((acc, amt) => acc + amt, 0)
+    if (referencePriceMinor !== sum) {
+      throw new VoucherPostingInvariantError(
+        `liveIssueEntitlementsWithinTx: invariant BUNDLE naruszony dla linii ${lineItemId}: ` +
+          `reference_price_minor=${referencePriceMinor}, SUM(choice_set)=${sum}`
+      )
+    }
+  }
+}
+
+async function insertChoiceSetItems(
+  client: LiveIssuePgClient,
+  entitlementId: string,
+  marketId: string,
+  items: ChoiceSetSnapshotItem[],
+  now: Date
+): Promise<void> {
+  for (let index = 0; index < items.length; index += 1) {
+    const item = items[index]
+    await client.query(
+      `INSERT INTO entitlement_choice_set_item
+         (id, instance_id, market_id, label, reference_amount_minor,
+          remaining_minor, vat_classification, status, redemption_id,
+          created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $5, $6, 'ACTIVE', NULL, $7, $7)
+       ON CONFLICT (id) DO NOTHING`,
+      [
+        buildChoiceSetItemId(entitlementId, item, index),
+        entitlementId,
+        marketId,
+        item.label,
+        item.reference_amount_minor,
+        item.vat_classification,
+        now,
+      ]
+    )
+  }
+}
+
+/**
+ * Deterministyczny id wiersza choice_set (stabilny przy replay).
+ *
+ * I2: digest miesza `index` (pozycja w tablicy) i `item_key`. `index` jako
+ * tie-breaker chroni przed kolizją gdy dwa items mają ten sam `item_key` (np.
+ * zduplikowane linie w policy); przy jednorazowym issue kolejność tablicy
+ * jest stała. Replay jest chroniony na poziomie entitlement-instance (`created=false`
+ * ⇒ `insertChoiceSetItems` nie jest wywoływane — guard w `issueSingleIssuedRow`).
+ */
+function buildChoiceSetItemId(
+  entitlementId: string,
+  item: ChoiceSetSnapshotItem,
+  index: number
+): string {
+  const digest = createHash("sha256")
+    .update(entitlementId)
+    .update("\0")
+    .update(String(index))
+    .update("\0")
+    .update(item.item_key)
+    .update("\0")
+    .update(String(item.reference_amount_minor))
+    .digest("hex")
+  return `ecsi_${digest}`
 }
 
 /**
@@ -582,6 +760,67 @@ function extractVatRates(
 ): readonly unknown[] | null {
   const rates = policy.vat_rates
   return Array.isArray(rates) ? rates : null
+}
+
+function extractChoiceSetSnapshotItems(
+  profile: ResolvedProfile,
+  fallbackVatClassification: VatClassification
+): ChoiceSetSnapshotItem[] {
+  if (profile.entitlement_type !== EntitlementType.BUNDLE) return []
+
+  // L2-fix: czytamy wyłącznie jawne klucze choice_set — generyczny `items` usunięty,
+  // bo koliduje z konwencją metadanych i mógłby omyłkowo serializować pozycje koszyka.
+  const raw =
+    profile.policy.choice_set ??
+    profile.policy.choice_set_items ??
+    profile.policy.selected_choice_set
+  if (!Array.isArray(raw)) return []
+
+  return raw.map((entry, index) => {
+    const record = readObject(entry)
+    if (!record) {
+      throw new VoucherPostingInvariantError(
+        `liveIssueEntitlementsWithinTx: BUNDLE choice_set[${index}] ma nieprawidłowy kształt`
+      )
+    }
+    const referenceAmountMinor = assertPositiveIntegerMinor(
+      readNumber(record.reference_amount_minor) ??
+        readNumber(record.amount_minor) ??
+        readNumber(record.face_value_minor),
+      `BUNDLE choice_set[${index}].reference_amount_minor`
+    )
+    const vatClassification =
+      readVatClassification(record.vat_classification) ??
+      resolveVatClassification({
+        vat_rate_uniqueness: record.vat_rate_uniqueness,
+        ...(Array.isArray(record.vat_rates) ? { vat_rates: record.vat_rates } : {}),
+      }) ??
+      fallbackVatClassification
+
+    return {
+      item_key:
+        readString(record.item_key) ??
+        readString(record.id) ??
+        readString(record.sku) ??
+        String(index),
+      label: readString(record.label) ?? readString(record.name) ?? null,
+      reference_amount_minor: referenceAmountMinor,
+      vat_classification: vatClassification,
+    }
+  })
+}
+
+function readVatClassification(value: unknown): VatClassification | undefined {
+  return value === "SPV" || value === "MPV" ? value : undefined
+}
+
+function assertPositiveIntegerMinor(value: unknown, field: string): number {
+  if (typeof value !== "number" || !Number.isInteger(value) || value <= 0) {
+    throw new VoucherPostingInvariantError(
+      `liveIssueEntitlementsWithinTx: ${field} musi być dodatnią liczbą całkowitą minor units`
+    )
+  }
+  return value
 }
 
 function readString(value: unknown): string | undefined {

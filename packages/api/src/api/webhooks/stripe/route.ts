@@ -7,11 +7,9 @@
  */
 
 import type { MedusaRequest, MedusaResponse } from "@medusajs/framework/http"
+import { STRIPE_WEBHOOK_RETIRED_MESSAGE } from "./helpers"
 
 export const AUTHENTICATE = false
-
-export const STRIPE_WEBHOOK_RETIRED_MESSAGE =
-  "Webhook moved to Medusa native /hooks/payment/stripe"
 
 export async function POST(
   _req: MedusaRequest,

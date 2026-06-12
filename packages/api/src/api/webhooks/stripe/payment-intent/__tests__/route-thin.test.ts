@@ -9,7 +9,8 @@
 import { describe, it, expect } from "@jest/globals"
 import { createHmac } from "node:crypto"
 
-import { POST, STRIPE_SIGNATURE_HEADER } from "../route"
+import { POST } from "../route"
+import { STRIPE_SIGNATURE_HEADER } from "../helpers"
 import {
   buildPaymentIntentSucceededEnvelope,
   verifyStripeSignature,

@@ -75,6 +75,13 @@ const REDEEMABLE_SOURCE_STATES: ReadonlySet<EntitlementInstanceState> = new Set(
   EntitlementInstanceState.REDEEMED_PARTIAL,
 ])
 
+const AMOUNT_REDEEMABLE_TYPES: ReadonlySet<EntitlementType> = new Set([
+  EntitlementType.VOUCHER_AMOUNT,
+  EntitlementType.CREDIT_PACK,
+])
+
+const BUNDLE_REDEEMABLE_TYPE = EntitlementType.BUNDLE
+
 /** Wynik dyskryminacji redeemu: pełny (`remaining`→0) vs partial (saldo > 0). */
 export type RedeemOutcome =
   | EntitlementInstanceState.REDEEMED_PARTIAL
@@ -155,14 +162,27 @@ export class RedeemNotRedeemableError extends Error {
   }
 }
 
+export class RedeemChoiceSetItemError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = "RedeemChoiceSetItemError"
+  }
+}
+
 // ──────────────────────────────────────────────────────────────────────────
 // Kontrakty wejścia / wyjścia
 // ──────────────────────────────────────────────────────────────────────────
 
 export type RedeemPartialInput = {
   entitlement_id: string
-  /** Zrealizowane brutto w tym evencie (minor units). 1 ≤ amount ≤ remaining. */
-  amount_minor: number
+  /**
+   * Zrealizowane brutto w tym evencie (minor units). Dla VOUCHER_AMOUNT/CREDIT_PACK:
+   * 1 ≤ amount ≤ remaining. Dla BUNDLE może być pominięte — wtedy kwota pochodzi z
+   * konsumowanej pozycji choice_set; jeśli podane, musi równać się jej remaining.
+   */
+  amount_minor?: number
+  /** BUNDLE: identyfikator wiersza `entitlement_choice_set_item` do konsumpcji. */
+  choice_set_item_id?: string
   /** Klucz idempotencji operacji domeny (z `entitlement_id` = klucz dedupe AC2). */
   idempotency_key: string
   /** Waluta payloadu postingu + currency consistency guard writera. Domyślnie PLN. */
@@ -203,6 +223,10 @@ export type RedeemPartialResult = {
   amount_minor: number
   remaining_before_minor: number
   remaining_after_minor: number
+  /** BUNDLE: pozycja choice_set skonsumowana w tym redeemie. */
+  choice_set_item_id?: string
+  /** BUNDLE: niezrealizowane pozycje po redeemie, do pokazania jako dostępne. */
+  available_choice_set_item_ids?: string[]
   /** AC3: prawo odstąpienia (art. 38 pkt 1) — gaśnie WYŁĄCZNIE przy REDEEMED_FULL. */
   withdrawal_right_extinguished: boolean
   /** Wynik posting hooka (derecognition). Bramkowany: audit-only/no-op gdy off. */
@@ -219,6 +243,7 @@ export type RedemptionRecord = {
   idempotency_key: string
   redemption_id: string
   amount_minor: number
+  choice_set_item_id?: string | null
   resulting_state: RedeemOutcome
   remaining_after_minor: number
   /**
@@ -251,6 +276,16 @@ export type RedeemableAmountEntitlement = {
   recipient_customer_id?: string | null
 }
 
+export type RedeemableChoiceSetItem = {
+  id: string
+  instance_id: string
+  market_id: string
+  reference_amount_minor: number
+  remaining_minor: number
+  status: "ACTIVE" | "REDEEMED"
+  redemption_id: string | null
+}
+
 // ──────────────────────────────────────────────────────────────────────────
 // Store / tx — granica persystencji (wzorzec InMemory*/Postgres* z workflows/)
 // ──────────────────────────────────────────────────────────────────────────
@@ -272,6 +307,9 @@ export interface RedeemPartialTx {
   findAnyRedemptionByEntitlementId(
     entitlementId: string
   ): Promise<RedemptionRecord | null>
+  getChoiceSetItemsForUpdate(
+    entitlementId: string
+  ): Promise<RedeemableChoiceSetItem[]>
   /**
    * Idempotentny zapis record dedupe (ON CONFLICT (entitlement_id,
    * idempotency_key) DO NOTHING). `inserted:false` ⇒ równoległy replay przegrał
@@ -291,6 +329,11 @@ export interface RedeemPartialTx {
     fromState: EntitlementInstanceState,
     toState: RedeemOutcome,
     remainingAfter: number,
+    now: Date
+  ): Promise<void>
+  consumeChoiceSetItem(
+    id: string,
+    redemptionId: string,
     now: Date
   ): Promise<void>
   /** Append-only audit (w obrębie tej tx — atomowy ze zmianą stanu). */
@@ -319,6 +362,173 @@ export type RedeemPartialDeps = {
   clock?: () => Date
 }
 
+type ResolvedRedeemSpend = {
+  amount: number
+  remainingBefore: number
+  remainingAfter: number
+  outcome: RedeemOutcome
+  priorRedeemedGross: number
+  choiceSetItemId?: string
+  availableChoiceSetItemIds?: string[]
+}
+
+function assertPositiveIntegerAmount(
+  amount: number | undefined,
+  remaining: number
+): number {
+  if (!Number.isInteger(amount) || amount == null || amount < 1) {
+    throw new RedeemAmountError(
+      `redeem: amount_minor musi być dodatnią liczbą całkowitą (otrzymano ${amount})`,
+      amount ?? 0,
+      remaining
+    )
+  }
+  return amount
+}
+
+async function resolveRedeemSpend(
+  tx: RedeemPartialTx,
+  ent: RedeemableAmountEntitlement,
+  input: RedeemPartialInput,
+  totalGross: number
+): Promise<ResolvedRedeemSpend> {
+  if (AMOUNT_REDEEMABLE_TYPES.has(ent.entitlement_type)) {
+    const remainingBefore = ent.remaining_amount
+    if (remainingBefore == null || remainingBefore <= 0) {
+      throw new RedeemNotRedeemableError(
+        `redeem: entitlement ${ent.id} ma remaining=${remainingBefore} ` +
+          `(brak salda do realizacji)`
+      )
+    }
+
+    const amount = assertPositiveIntegerAmount(
+      input.amount_minor,
+      remainingBefore
+    )
+    if (amount > remainingBefore) {
+      throw new RedeemAmountError(
+        `redeem: amount_minor (${amount}) > remaining (${remainingBefore}) — ` +
+          `over-redeem odrzucony fail-closed (brak częściowego skutku, NIE reissue)`,
+        amount,
+        remainingBefore
+      )
+    }
+
+    const remainingAfter = remainingBefore - amount
+    const priorRedeemedGross = totalGross - remainingBefore
+    if (priorRedeemedGross < 0) {
+      throw new RedeemAmountError(
+        `redeem: niespójne wejście — remaining (${remainingBefore}) > brutto ` +
+          `vouchera (${totalGross}); payload net/vat nie zgadza się z saldem`,
+        amount,
+        remainingBefore
+      )
+    }
+
+    return {
+      amount,
+      remainingBefore,
+      remainingAfter,
+      priorRedeemedGross,
+      outcome:
+        remainingAfter === 0
+          ? EntitlementInstanceState.REDEEMED_FULL
+          : EntitlementInstanceState.REDEEMED_PARTIAL,
+    }
+  }
+
+  if (ent.entitlement_type === BUNDLE_REDEEMABLE_TYPE) {
+    const choiceSetItemId = input.choice_set_item_id
+    if (!choiceSetItemId) {
+      throw new RedeemChoiceSetItemError(
+        "redeem: BUNDLE wymaga choice_set_item_id (identyfikator pozycji choice_set)"
+      )
+    }
+
+    const items = await tx.getChoiceSetItemsForUpdate(ent.id)
+    const item = items.find((i) => i.id === choiceSetItemId)
+    if (!item) {
+      throw new RedeemChoiceSetItemError(
+        `redeem: choice_set_item_id=${choiceSetItemId} nie należy do entitlement ${ent.id}`
+      )
+    }
+    if (item.status !== "ACTIVE" || item.remaining_minor <= 0) {
+      throw new RedeemChoiceSetItemError(
+        `redeem: choice_set_item_id=${choiceSetItemId} jest już skonsumowany ` +
+          `(status=${item.status}, remaining=${item.remaining_minor})`
+      )
+    }
+    // INFO-3 (defensive assertion): walidacja zgodności market_id pozycji z
+    // entitlementem. Ochrona przed cross-market access do czasu aktywacji
+    // pełnej polityki RLS na entitlement_choice_set_item (Epic 1, ADR-141).
+    // FK instance_id zapewnia powiązanie, ale market_id jest dodatkową warstwą.
+    if (ent.market_id && item.market_id && item.market_id !== ent.market_id) {
+      throw new RedeemChoiceSetItemError(
+        `redeem: choice_set_item_id=${choiceSetItemId} należy do market=${item.market_id}, ` +
+          `ale entitlement ${ent.id} jest w market=${ent.market_id} (cross-market odrzucony)`
+      )
+    }
+
+    const remainingBefore = items.reduce(
+      (sum, i) => sum + Math.max(0, i.remaining_minor),
+      0
+    )
+    const amount = item.remaining_minor
+    if (input.amount_minor != null && input.amount_minor !== amount) {
+      throw new RedeemAmountError(
+        `redeem: BUNDLE amount_minor (${input.amount_minor}) musi równać się ` +
+          `remaining_minor pozycji choice_set (${amount})`,
+        input.amount_minor,
+        remainingBefore
+      )
+    }
+
+    const remainingAfter = remainingBefore - amount
+    const priorRedeemedGross = totalGross - remainingBefore
+    if (priorRedeemedGross < 0) {
+      throw new RedeemAmountError(
+        `redeem: niespójne wejście — remaining choice_set (${remainingBefore}) > ` +
+          `brutto vouchera (${totalGross}); payload net/vat nie zgadza się z setem`,
+        amount,
+        remainingBefore
+      )
+    }
+    // LOW-1 (latent pre-flip invariant): payload postingu przekazuje net/vat CAŁEGO
+    // vouchera przy emisji (pochodna totalGross), a redeemed_gross_minor = wartość
+    // jednej pozycji choice_set. Proporcjonalna derecognition VAT dla BUNDLE liczy się
+    // per pozycja (redeemed_gross_minor / totalGross * vat). Wymagany niezmiennik:
+    // Σ remaining_minor wszystkich pozycji choice_set == voucher_net_minor + voucher_vat_minor.
+    // Posting jest INERT (runtime_enabled:false, HG-4 DEFERRED v2.0.0+), więc brak
+    // skutku finansowego. Zwalidować/zakontraktować w posting-profile BUNDLE (3.3)
+    // PRZED aktywacją finance-flip (hard-gate Story 3.9/E6/P6).
+
+    const availableChoiceSetItemIds = items
+      .filter(
+        (i) =>
+          i.id !== item.id && i.status === "ACTIVE" && i.remaining_minor > 0
+      )
+      .map((i) => i.id)
+
+    return {
+      amount,
+      remainingBefore,
+      remainingAfter,
+      priorRedeemedGross,
+      choiceSetItemId,
+      availableChoiceSetItemIds,
+      outcome:
+        remainingAfter === 0
+          ? EntitlementInstanceState.REDEEMED_FULL
+          : EntitlementInstanceState.REDEEMED_PARTIAL,
+    }
+  }
+
+  throw new RedeemNotRedeemableError(
+    `redeem: entitlement ${ent.id} ma typ ${ent.entitlement_type}; redeem ` +
+      `dozwolony tylko dla VOUCHER_AMOUNT, CREDIT_PACK i BUNDLE`
+  )
+}
+
 // ──────────────────────────────────────────────────────────────────────────
 // Operacja redeem (partial + full) idempotentna
 // ──────────────────────────────────────────────────────────────────────────
@@ -333,7 +543,7 @@ export class RedeemPartialEntitlementOperation {
     if (!idempotencyKey) {
       throw new RedeemAmountError(
         "redeem: idempotency_key wymagany (klucz idempotencji domeny, AC2)",
-        input.amount_minor,
+        input.amount_minor ?? 0,
         0
       )
     }
@@ -350,7 +560,10 @@ export class RedeemPartialEntitlementOperation {
       if (prior) {
         // L6: wykryj dryf parametrów — reużyty idempotency_key z innym amount_minor
         // to sygnał błędu po stronie callera (fail-loud, NIE cichy pierwszy-skutek).
-        if (prior.amount_minor !== input.amount_minor) {
+        if (
+          input.amount_minor != null &&
+          prior.amount_minor !== input.amount_minor
+        ) {
           throw new RedeemAmountError(
             `redeem: param drift — idempotency_key=${idempotencyKey} już użyty z ` +
               `amount_minor=${prior.amount_minor}, teraz podano ${input.amount_minor} ` +
@@ -359,46 +572,44 @@ export class RedeemPartialEntitlementOperation {
             prior.remaining_after_minor + prior.amount_minor
           )
         }
-        return { kind: "replay" as const, record: prior }
+
+        // L7: BUNDLE replay — wykryj dryf choice_set_item_id przez odczyt pozycji
+        // choice_set (bez zmiany schematu voucher_redemption). Pozycja skonsumowana
+        // przez prior.redemption_id jest trwałym śladem w entitlement_choice_set_item.
+        // Jeśli caller podaje inny choice_set_item_id ⇒ fail-loud (asymetria kontraktu
+        // eliminowana; test/prod behaviour ujednolicone przez odczyt z DB, nie z rekordu).
+        let replayAvailableChoiceSetItemIds: string[] | undefined
+        if (ent.entitlement_type === BUNDLE_REDEEMABLE_TYPE) {
+          const replayItems = await tx.getChoiceSetItemsForUpdate(ent.id)
+          const redeemedItem = replayItems.find(
+            (i) => i.redemption_id === prior.redemption_id
+          )
+          if (input.choice_set_item_id && redeemedItem && redeemedItem.id !== input.choice_set_item_id) {
+            throw new RedeemChoiceSetItemError(
+              `redeem: param drift (BUNDLE) — idempotency_key=${idempotencyKey} już użyty dla ` +
+                `choice_set_item_id=${redeemedItem.id}, teraz podano ${input.choice_set_item_id} ` +
+                `(dryf pozycji choice_set; fail-closed, AC2)`
+            )
+          }
+          // Zwróć aktualną listę dostępnych pozycji (nie skonsumowanych) dla replay BUNDLE
+          // aby zachować spójny kształt wyniku z ścieżką "applied" (AC2 „pozostałe pokazane").
+          replayAvailableChoiceSetItemIds = replayItems
+            .filter((i) => i.status === "ACTIVE" && i.remaining_minor > 0)
+            .map((i) => i.id)
+        }
+
+        return {
+          kind: "replay" as const,
+          record: prior,
+          replayAvailableChoiceSetItemIds,
+        }
       }
 
       // ── Inwarianty redeemowalności (fail-closed) ──────────────────────────
-      // Scope: voucher KWOTOWY (VOUCHER_AMOUNT) z saldem `remaining`.
-      if (ent.entitlement_type !== EntitlementType.VOUCHER_AMOUNT) {
-        throw new RedeemNotRedeemableError(
-          `redeem: entitlement ${ent.id} nie jest VOUCHER_AMOUNT ` +
-            `(typ=${ent.entitlement_type}); redeem kwotowy poza zakresem`
-        )
-      }
       if (!REDEEMABLE_SOURCE_STATES.has(ent.state)) {
         throw new RedeemNotRedeemableError(
           `redeem: entitlement ${ent.id} w stanie ${ent.state} nie jest ` +
             `redeemowalny (dozwolone: ACTIVE / REDEEMED_PARTIAL)`
-        )
-      }
-      const remainingBefore = ent.remaining_amount
-      if (remainingBefore == null || remainingBefore <= 0) {
-        throw new RedeemNotRedeemableError(
-          `redeem: entitlement ${ent.id} ma remaining=${remainingBefore} ` +
-            `(brak salda do realizacji)`
-        )
-      }
-
-      // ── Inwariant zakresu kwoty (AC1) — NIGDY > remaining, NIE ujemne ──────
-      const amount = input.amount_minor
-      if (!Number.isInteger(amount) || amount < 1) {
-        throw new RedeemAmountError(
-          `redeem: amount_minor musi być dodatnią liczbą całkowitą (otrzymano ${amount})`,
-          amount,
-          remainingBefore
-        )
-      }
-      if (amount > remainingBefore) {
-        throw new RedeemAmountError(
-          `redeem: amount_minor (${amount}) > remaining (${remainingBefore}) — ` +
-            `over-redeem odrzucony fail-closed (brak częściowego skutku, NIE reissue)`,
-          amount,
-          remainingBefore
         )
       }
 
@@ -409,16 +620,23 @@ export class RedeemPartialEntitlementOperation {
       }
       assertTransferabilityAllowed(ent.policy_snapshot, redeemCtx)
 
-      // ── Dyskryminacja wyniku: full (remaining→0) vs partial (saldo > 0) ────
-      const remainingAfter = remainingBefore - amount
-      const outcome: RedeemOutcome =
-        remainingAfter === 0
-          ? EntitlementInstanceState.REDEEMED_FULL
-          : EntitlementInstanceState.REDEEMED_PARTIAL
-
       // Redeemed-to-date PRZED tym eventem (VER-H1, kumulatywny VAT). Saldo brutto
       // śledzi zrealizowane brutto: prior = totalGross − remainingBefore.
       const totalGross = input.voucher_net_minor + input.voucher_vat_minor
+
+      const spend = await resolveRedeemSpend(
+        tx,
+        ent,
+        input,
+        totalGross
+      )
+      const {
+        amount,
+        remainingBefore,
+        remainingAfter,
+        priorRedeemedGross,
+        outcome,
+      } = spend
 
       // L3: walidacja spójności net/vat między ratami multi-installment (VER-H1).
       // Sprawdź czy issued_gross_minor z poprzedniej raty zgadza się z totalGross.
@@ -435,16 +653,6 @@ export class RedeemPartialEntitlementOperation {
             `wartości emisji z poprzedniej raty (${anyPriorRedemption.issued_gross_minor}); ` +
             `voucher_net_minor/voucher_vat_minor muszą być spójne we wszystkich ` +
             `ratach (VER-H1 fail-closed)`,
-          amount,
-          remainingBefore
-        )
-      }
-
-      const priorRedeemedGross = totalGross - remainingBefore
-      if (priorRedeemedGross < 0) {
-        throw new RedeemAmountError(
-          `redeem: niespójne wejście — remaining (${remainingBefore}) > brutto ` +
-            `vouchera (${totalGross}); payload net/vat nie zgadza się z saldem`,
           amount,
           remainingBefore
         )
@@ -505,6 +713,7 @@ export class RedeemPartialEntitlementOperation {
         idempotency_key: idempotencyKey,
         redemption_id: redemptionId,
         amount_minor: amount,
+        choice_set_item_id: spend.choiceSetItemId ?? null,
         resulting_state: outcome,
         remaining_after_minor: remainingAfter,
         issued_gross_minor: totalGross,
@@ -520,6 +729,9 @@ export class RedeemPartialEntitlementOperation {
           amount,
           remainingBefore
         )
+      }
+      if (spend.choiceSetItemId) {
+        await tx.consumeChoiceSetItem(spend.choiceSetItemId, redemptionId, now)
       }
       await tx.updateEntitlementRemainingAndState(
         ent.id,
@@ -548,6 +760,7 @@ export class RedeemPartialEntitlementOperation {
         occurred_at: occurredAt,
         transition_seq: `${redemptionId}:redeem`,
         posting: {
+          entitlement_type: ent.entitlement_type,
           lifecycle_event: "REDEEMED",
           vat_classification: vatClassification,
           net_minor: input.voucher_net_minor,
@@ -564,6 +777,7 @@ export class RedeemPartialEntitlementOperation {
         kind: "applied" as const,
         record,
         remainingBefore,
+        availableChoiceSetItemIds: spend.availableChoiceSetItemIds,
         posting: step2.posting,
         events: [step1.event, step2.event],
       }
@@ -586,6 +800,14 @@ export class RedeemPartialEntitlementOperation {
         amount_minor: rec.amount_minor,
         remaining_before_minor: rec.remaining_after_minor + rec.amount_minor,
         remaining_after_minor: rec.remaining_after_minor,
+        ...(rec.choice_set_item_id
+          ? { choice_set_item_id: rec.choice_set_item_id }
+          : {}),
+        // L7: BUNDLE replay zwraca aktualną listę dostępnych pozycji (pobrana w tx),
+        // ujednolicając kształt wyniku ze ścieżką "applied" (AC2 „pozostałe pokazane").
+        ...(txOut.replayAvailableChoiceSetItemIds !== undefined
+          ? { available_choice_set_item_ids: txOut.replayAvailableChoiceSetItemIds }
+          : {}),
         withdrawal_right_extinguished: isWithdrawalRightExtinguished(
           rec.resulting_state
         ),
@@ -622,6 +844,12 @@ export class RedeemPartialEntitlementOperation {
       amount_minor: rec.amount_minor,
       remaining_before_minor: txOut.remainingBefore,
       remaining_after_minor: rec.remaining_after_minor,
+      ...(rec.choice_set_item_id
+        ? { choice_set_item_id: rec.choice_set_item_id }
+        : {}),
+      ...(txOut.availableChoiceSetItemIds
+        ? { available_choice_set_item_ids: txOut.availableChoiceSetItemIds }
+        : {}),
       withdrawal_right_extinguished: isWithdrawalRightExtinguished(
         rec.resulting_state
       ),
@@ -766,6 +994,29 @@ class PostgresRedeemPartialTx implements RedeemPartialTx {
     return mapRedemptionRow(row)
   }
 
+  async getChoiceSetItemsForUpdate(
+    entitlementId: string
+  ): Promise<RedeemableChoiceSetItem[]> {
+    const res = await this.client.query<Record<string, unknown>>(
+      `SELECT id, instance_id, market_id, reference_amount_minor,
+              remaining_minor, status, redemption_id
+         FROM entitlement_choice_set_item
+        WHERE instance_id = $1
+        ORDER BY id
+        FOR UPDATE`,
+      [entitlementId]
+    )
+    return res.rows.map((row) => ({
+      id: row.id as string,
+      instance_id: row.instance_id as string,
+      market_id: row.market_id as string,
+      reference_amount_minor: Number(row.reference_amount_minor),
+      remaining_minor: Number(row.remaining_minor),
+      status: row.status as "ACTIVE" | "REDEEMED",
+      redemption_id: (row.redemption_id ?? null) as string | null,
+    }))
+  }
+
   async insertRedemption(
     record: RedemptionRecord
   ): Promise<{ inserted: boolean }> {
@@ -830,6 +1081,29 @@ class PostgresRedeemPartialTx implements RedeemPartialTx {
     }
   }
 
+  async consumeChoiceSetItem(
+    id: string,
+    redemptionId: string,
+    now: Date
+  ): Promise<void> {
+    const res = await this.client.query(
+      `UPDATE entitlement_choice_set_item
+          SET remaining_minor = 0,
+              status = 'REDEEMED',
+              redemption_id = $2,
+              updated_at = $3
+        WHERE id = $1
+          AND status = 'ACTIVE'
+          AND remaining_minor > 0`,
+      [id, redemptionId, now]
+    )
+    if ((res.rowCount ?? 0) !== 1) {
+      throw new RedeemChoiceSetItemError(
+        `consumeChoiceSetItem ${id}: affected ${res.rowCount ?? 0} rows (expected 1)`
+      )
+    }
+  }
+
   async appendAudit(audit: TransitionAuditEnvelope): Promise<void> {
     // Append-only audit envelope (niemutowalny ślad) do voucher_event, spójnie z
     // istniejącymi emiterami service.ts (id, voucher_code NULL, entitlement_id,
@@ -864,11 +1138,16 @@ function inMemoryRedemptionKey(
 export class InMemoryRedeemPartialStore implements RedeemPartialStore {
   private rows: Map<string, RedeemableAmountEntitlement>
   private redemptions: Map<string, RedemptionRecord>
+  private choiceSetItems: Map<string, RedeemableChoiceSetItem>
   private audits: TransitionAuditEnvelope[]
 
-  constructor(rows: RedeemableAmountEntitlement[] = []) {
+  constructor(
+    rows: RedeemableAmountEntitlement[] = [],
+    choiceSetItems: RedeemableChoiceSetItem[] = []
+  ) {
     this.rows = new Map(rows.map((r) => [r.id, { ...r }]))
     this.redemptions = new Map()
+    this.choiceSetItems = new Map(choiceSetItems.map((i) => [i.id, { ...i }]))
     this.audits = []
   }
 
@@ -878,6 +1157,10 @@ export class InMemoryRedeemPartialStore implements RedeemPartialStore {
 
   listRedemptions(): RedemptionRecord[] {
     return [...this.redemptions.values()]
+  }
+
+  listChoiceSetItems(): RedeemableChoiceSetItem[] {
+    return [...this.choiceSetItems.values()]
   }
 
   /** Append-only audyty utrwalone (po COMMIT) — do asercji AC1/AC2 w testach. */
@@ -894,16 +1177,25 @@ export class InMemoryRedeemPartialStore implements RedeemPartialStore {
     const redemptionsSnapshot = new Map(
       [...this.redemptions.entries()].map(([k, r]) => [k, { ...r }])
     )
+    const choiceSetSnapshot = new Map(
+      [...this.choiceSetItems.entries()].map(([k, r]) => [k, { ...r }])
+    )
     const auditsLen = this.audits.length
     try {
       return await fn(
-        new InMemoryRedeemPartialTx(this.rows, this.redemptions, this.audits)
+        new InMemoryRedeemPartialTx(
+          this.rows,
+          this.redemptions,
+          this.choiceSetItems,
+          this.audits
+        )
       )
     } catch (err) {
       // Rollback: przywróć migawki + odetnij audyty tej tx (fail-closed — ZERO
       // efektów ubocznych na odrzuconej ścieżce, AC2).
       this.rows = rowsSnapshot
       this.redemptions = redemptionsSnapshot
+      this.choiceSetItems = choiceSetSnapshot
       this.audits.length = auditsLen
       throw err
     }
@@ -914,6 +1206,7 @@ class InMemoryRedeemPartialTx implements RedeemPartialTx {
   constructor(
     private readonly rows: Map<string, RedeemableAmountEntitlement>,
     private readonly redemptions: Map<string, RedemptionRecord>,
+    private readonly choiceSetItems: Map<string, RedeemableChoiceSetItem>,
     private readonly audits: TransitionAuditEnvelope[]
   ) {}
 
@@ -953,6 +1246,15 @@ class InMemoryRedeemPartialTx implements RedeemPartialTx {
       if (record.entitlement_id === entitlementId) return { ...record }
     }
     return null
+  }
+
+  async getChoiceSetItemsForUpdate(
+    entitlementId: string
+  ): Promise<RedeemableChoiceSetItem[]> {
+    return [...this.choiceSetItems.values()]
+      .filter((item) => item.instance_id === entitlementId)
+      .map((item) => ({ ...item }))
+      .sort((a, b) => a.id.localeCompare(b.id))
   }
 
   async insertRedemption(
@@ -1000,6 +1302,26 @@ class InMemoryRedeemPartialTx implements RedeemPartialTx {
       ...row,
       state: toState,
       remaining_amount: remainingAfter,
+    })
+    void _now
+  }
+
+  async consumeChoiceSetItem(
+    id: string,
+    redemptionId: string,
+    _now: Date
+  ): Promise<void> {
+    const item = this.choiceSetItems.get(id)
+    if (!item || item.status !== "ACTIVE" || item.remaining_minor <= 0) {
+      throw new RedeemChoiceSetItemError(
+        `consumeChoiceSetItem ${id}: expected ACTIVE item with remaining > 0`
+      )
+    }
+    this.choiceSetItems.set(id, {
+      ...item,
+      status: "REDEEMED",
+      remaining_minor: 0,
+      redemption_id: redemptionId,
     })
     void _now
   }

@@ -2,9 +2,9 @@ import { EventEmitter } from "node:events"
 
 import {
   AUTHENTICATE,
-  BREVO_PROVIDER_PLUGIN_PENDING_MESSAGE,
   POST,
 } from "../../../../api/hooks/notifications/brevo/route"
+import { BREVO_PROVIDER_PLUGIN_PENDING_MESSAGE } from "../../../../api/hooks/notifications/brevo/helpers"
 
 class FakeResponse extends EventEmitter {
   statusCode = 200

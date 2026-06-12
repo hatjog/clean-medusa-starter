@@ -1,6 +1,7 @@
+import { toAuditProvider } from "@gp/audit"
 import type {
-  AuditEnvelope,
   EntitlementLifecycleStatus,
+  WalletAuditEnvelope,
   WalletDenyReason,
   WalletInvalidationReason,
   WalletProviderKind,
@@ -51,7 +52,7 @@ export interface WalletFeaturePolicyInput {
 
 export type WalletFeaturePolicyResult =
   | { allowed: true }
-  | { allowed: false; reason: WalletDenyReason; audit_event: AuditEnvelope }
+  | { allowed: false; reason: WalletDenyReason; audit_event: WalletAuditEnvelope }
 
 export interface WalletFeaturePolicy {
   check(input: WalletFeaturePolicyInput): Promise<WalletFeaturePolicyResult>
@@ -126,7 +127,7 @@ export class DefaultWalletFeaturePolicy implements WalletFeaturePolicy {
       audit_event: {
         event_type: "wallet.pass_gated",
         entitlement_instance_id: input.entitlement_instance_id,
-        provider: input.provider,
+        provider: toAuditProvider(input.provider) as WalletProviderKind,
         market: input.market,
         release: input.release,
         actor_id: input.actor.actor_id,

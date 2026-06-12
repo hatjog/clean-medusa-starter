@@ -6,6 +6,7 @@ import {
 import type { Knex } from "knex";
 import { marketContextStorage } from "../../../../lib/market-context";
 import { searchProductIdsForSalesChannel } from "../../../../lib/product-market-scope";
+import { augmentProductsWithVendorMeta } from "../../../../lib/multi-vendor-resolver";
 
 type SearchBody = {
   query: string;
@@ -130,6 +131,8 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
   const orderedProducts = productIds
     .map((productId) => productsById.get(productId))
     .filter(Boolean);
+
+  await augmentProductsWithVendorMeta(orderedProducts as Array<Record<string, unknown>>, db);
 
   res.json({
     products: orderedProducts,

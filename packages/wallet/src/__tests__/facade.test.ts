@@ -230,6 +230,8 @@ describe("DefaultWalletPassFacade", () => {
       facade.generatePass("ei_123", "samsung" as never, "pl-PL")
     ).rejects.toMatchObject({
       name: "UnsupportedWalletProviderError",
+      // Note: no `satisfies` here — "samsung" is not WalletProviderKind but is
+      // preserved verbatim at runtime by toAuditProviderSafe (M-1 + L-2 fix).
       audit_event: {
         event_type: "wallet.pass_failed",
         entitlement_instance_id: "ei_123",
@@ -238,7 +240,7 @@ describe("DefaultWalletPassFacade", () => {
         outcome: "failure",
         error_code: "UNSUPPORTED_PROVIDER",
       },
-    } satisfies Partial<UnsupportedWalletProviderError>)
+    })
   })
 
   it("throws UnsupportedWalletProviderError for invalidate enum mismatch", async () => {
@@ -251,6 +253,8 @@ describe("DefaultWalletPassFacade", () => {
       facade.invalidatePass("ei_123", "samsung" as never, "revoked")
     ).rejects.toMatchObject({
       name: "UnsupportedWalletProviderError",
+      // Note: no `satisfies` here — "samsung" is not WalletProviderKind but is
+      // preserved verbatim at runtime by toAuditProviderSafe (M-1 + L-2 fix).
       audit_event: {
         event_type: "wallet.pass_invalidation_failed",
         entitlement_instance_id: "ei_123",
@@ -259,7 +263,56 @@ describe("DefaultWalletPassFacade", () => {
         outcome: "failure",
         error_code: "UNSUPPORTED_PROVIDER",
       },
-    } satisfies Partial<UnsupportedWalletProviderError>)
+    })
+  })
+
+  // M-1 regression test: provider completely outside AuditProvider enum (e.g. "foobar")
+  // must still produce UnsupportedWalletProviderError — not a secondary generic Error from
+  // toAuditProvider throwing before the envelope is built.
+  it("throws UnsupportedWalletProviderError with preserved provider value for provider completely outside AuditProvider enum (M-1)", async () => {
+    const facade = createFacade({
+      google: createProvider("https://pay.google.com/gp/v/save/token"),
+      apple: createProvider("https://wallet.apple.example/pass/token"),
+    })
+
+    await expect(
+      facade.generatePass("ei_123", "foobar" as never, "pl-PL")
+    ).rejects.toMatchObject({
+      name: "UnsupportedWalletProviderError",
+      // Note: no `satisfies` here — "foobar" is not WalletProviderKind but must
+      // be preserved verbatim by toAuditProviderSafe for telemetry diagnostics.
+      audit_event: {
+        event_type: "wallet.pass_failed",
+        entitlement_instance_id: "ei_123",
+        provider: "foobar",
+        timestamp,
+        outcome: "failure",
+        error_code: "UNSUPPORTED_PROVIDER",
+      },
+    })
+  })
+
+  it("throws UnsupportedWalletProviderError for invalidatePass with provider completely outside enum (M-1)", async () => {
+    const facade = createFacade({
+      google: createProvider("https://pay.google.com/gp/v/save/token"),
+      apple: createProvider("https://wallet.apple.example/pass/token"),
+    })
+
+    await expect(
+      facade.invalidatePass("ei_123", "foobar" as never, "revoked")
+    ).rejects.toMatchObject({
+      name: "UnsupportedWalletProviderError",
+      // Note: no `satisfies` here — "foobar" is not WalletProviderKind but must
+      // be preserved verbatim by toAuditProviderSafe for telemetry diagnostics.
+      audit_event: {
+        event_type: "wallet.pass_invalidation_failed",
+        entitlement_instance_id: "ei_123",
+        provider: "foobar",
+        timestamp,
+        outcome: "failure",
+        error_code: "UNSUPPORTED_PROVIDER",
+      },
+    })
   })
 
   it("wraps provider failure and preserves failure audit event", async () => {

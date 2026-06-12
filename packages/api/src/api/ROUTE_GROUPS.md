@@ -13,8 +13,8 @@ Related files:
 |-------|--------|------|-----------|------------|--------|
 | **public** | `/v1/health`, `/status`, `/api/v1/entitlements/claim` | None | (future: rate-limit) | Yes (future) | Existing endpoints, no auth required |
 | **storefront** | `/store/*` | Publishable API key | `marketContextMiddleware` → `marketGuardMiddleware` → `customerMarketGuardMiddleware` + route-specific overlays | Yes (future) | Fully implemented — see [MIDDLEWARE_STACK.md](MIDDLEWARE_STACK.md) |
-| **vendor (GP browser JWT)** | `/vendor/magic-links/:jti/revoke` | `authenticate("seller", ["bearer"])` + handler `actor_type="seller"` guard | Wired in `middlewares.ts` | No | Browser-initiated magic-link revoke; JTI-scoped seller validation, constant-time lookup, 3/min/JTI rate limit |
-| **vendor (GP-S2S-HMAC)** | `/vendor/competitive-insights`, `/vendor/training-cert/upload`, `/vendor/vouchers/:code/lookup`, `/vendor/vouchers/:code/redeem` | `withVendorAuth` (HMAC `x-vendor-signature` only; cc-4 F-10 removed the legacy `x-vendor-token` path) | Inline HOF in route handler | No | GP-owned S2S surface — vendor session derived from HMAC; cross-vendor lookups return 404 |
+| **vendor (GP browser JWT)** | `/vendor/auth/sessions`, `/vendor/magic-links/:jti/revoke`, `/vendor/competitive-insights` | `authenticate("seller", ["bearer"])` + handler seller-context guard | Wired in `middlewares.ts` / Mercur seller context | No | Browser-initiated vendor routes; session list, JTI-scoped revoke, and seller-context competitive insights |
+| **vendor (GP-S2S-HMAC)** | `/vendor/training-cert/upload`, `/vendor/vouchers/:code/lookup`, `/vendor/vouchers/:code/redeem` | `withVendorAuth` (HMAC `x-vendor-signature` only; cc-4 F-10 removed the legacy `x-vendor-token` path) | Inline HOF in route handler | No | GP-owned S2S surface — machine-to-machine only; cross-vendor lookups return 404 |
 | **vendor (Mercur-native)** | other `/vendor/*` routes shipped by upstream Mercur | Mercur seller cookie/session | Native Mercur middleware | No | Untouched — upstream contract preserved |
 | **admin (Medusa-native)** | `/admin/*` non-GP routes | Medusa admin auth | Native Medusa middleware | No | Native Medusa — no explicit GP middleware needed |
 | **admin (GP-custom UI)** | `/admin/operator/*`, `/admin/vendors/*` (POST/PATCH/PUT/DELETE), `/admin/entitlements/*` (POST), `/admin/magic-links/*` (POST), `/admin/sellers/:id/pause` | `authenticate("user", ["session","bearer"])` + `operatorAuthMiddleware` | Wired in `middlewares.ts` | No | GP custom operator surface — `actor_type="user"` enforced; cc-4 F-01 wired `operator/*` matcher |
@@ -34,16 +34,25 @@ Related files:
 - Fail-closed: missing market context → 403
 - Full middleware chain documented in [MIDDLEWARE_STACK.md](MIDDLEWARE_STACK.md)
 
+### Vendor Group (GP browser JWT)
+- `authenticate("seller", ["bearer"])` wired in `middlewares.ts` (same pattern as `/vendor/magic-links/:jti/revoke`).
+- Seller identity read from `req.auth_context.actor_id` (actor_type must be "seller").
+- GP routes:
+  - `GET  /vendor/auth/sessions` (ra-15 — active seller magic-link sessions; browser-initiated, uses bearer JWT)
+  - `POST /vendor/magic-links/:jti/revoke`
+  - `GET  /vendor/competitive-insights` (seller-context JWT, cc-4)
+
 ### Vendor Group (GP S2S HMAC)
 - `withVendorAuth` HOF (HMAC `x-vendor-signature` only — cc-4 F-10 removed `x-vendor-token` legacy path).
+- Machine-to-machine only; no browser-originated callers.
 - GP routes under `/vendor/*`:
-  - `POST /vendor/magic-links/:jti/revoke`
-  - `GET  /vendor/competitive-insights`
   - `POST /vendor/training-cert/upload`
   - `GET  /vendor/vouchers/:code/lookup` (cc-4 F-05 — Story 8.4 cross-actor handoff)
   - `POST /vendor/vouchers/:code/redeem` (cc-4 F-05 — Story 8.4 cross-actor handoff)
 - Cross-vendor lookups return 404 (do NOT leak existence) — vendor scope enforced by `voucher.seller_id === req.vendorAuth.seller_id` check.
 - No explicit middleware in GP `middlewares.ts`; the HOF wraps the handler.
+- Audit verdict (ra-15 review fix): S2S HMAC inventory corrected — sessions moved to browser-JWT group;
+  `assertAuthTransport` enforces the remaining 3 S2S HMAC routes in CI.
 
 ### Vendor Group (Mercur-native)
 - Untouched upstream Mercur seller cookie flow.

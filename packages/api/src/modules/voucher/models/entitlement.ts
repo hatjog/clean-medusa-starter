@@ -34,20 +34,19 @@ import type { VatClassification } from "../vat-resolver"
  * specs/contracts/config/schemas/market-config.v1.schema.json
  * (properties.entitlement_profiles.items.properties.entitlement_type.enum).
  *
- * v1.8.0 activates VOUCHER_AMOUNT + VOUCHER_SERVICE only (BonBeauty MVP). The
- * other 4 are defined-but-inactive: present in the taxonomy for forward schema
- * stability but MUST NOT surface in UI/runtime (guard via
- * ACTIVE_ENTITLEMENT_TYPES below). Named retry slots v1.9.0/v1.10.0+ per
- * D-V180-ARCH-DEF-8.
+ * v1.12.0 activates VOUCHER_AMOUNT, VOUCHER_SERVICE, CREDIT_PACK and BUNDLE.
+ * SUBSCRIPTION_B2C / SUBSCRIPTION_B2B remain defined-but-inactive hard-gated
+ * subscription slots and MUST NOT surface in UI/runtime (guard via
+ * ACTIVE_ENTITLEMENT_TYPES below).
  */
 export enum EntitlementType {
   VOUCHER_AMOUNT = "VOUCHER_AMOUNT",
   VOUCHER_SERVICE = "VOUCHER_SERVICE",
-  // --- inactive in v1.8.0 (defined-but-not-activated) ---
   CREDIT_PACK = "CREDIT_PACK",
+  // --- inactive in v1.12.0 (subscription hard-gate) ---
   SUBSCRIPTION_B2C = "SUBSCRIPTION_B2C",
   SUBSCRIPTION_B2B = "SUBSCRIPTION_B2B",
-  BUNDLE = "BUNDLE",
+  BUNDLE = "BUNDLE", // active (v1.12.0) — schema-order requires last position
 }
 
 /** All 6 canonical types in schema-declared order. */
@@ -61,20 +60,22 @@ export const ALL_ENTITLEMENT_TYPES: readonly EntitlementType[] = [
 ]
 
 /**
- * Types activated in v1.8.0. Anything outside this whitelist is
+ * Types activated in v1.12.0. Anything outside this whitelist is
  * defined-but-inactive and MUST NOT appear in UI/runtime flows.
  */
 export const ACTIVE_ENTITLEMENT_TYPES: ReadonlySet<EntitlementType> = new Set([
   EntitlementType.VOUCHER_AMOUNT,
   EntitlementType.VOUCHER_SERVICE,
+  EntitlementType.CREDIT_PACK,
+  EntitlementType.BUNDLE,
 ])
 
-/** Defined-but-inactive types (CREDIT_PACK / SUBSCRIPTION_* / BUNDLE). */
+/** Defined-but-inactive types (subscription hard-gate). */
 export const INACTIVE_ENTITLEMENT_TYPES: ReadonlySet<EntitlementType> = new Set(
   ALL_ENTITLEMENT_TYPES.filter((t) => !ACTIVE_ENTITLEMENT_TYPES.has(t))
 )
 
-/** True iff `t` is activated in v1.8.0 (BonBeauty MVP). */
+/** True iff `t` is activated in v1.12.0. */
 export function isActiveEntitlementType(t: EntitlementType): boolean {
   return ACTIVE_ENTITLEMENT_TYPES.has(t)
 }
@@ -402,6 +403,12 @@ export interface EntitlementInstanceRow {
    * Null do czasu snapshotu.
    */
   vat_classification: VatClassification | null
+  /**
+   * Snapshot ceny referencyjnej w minor units. Kolumnę dodaje v1.12.0 Story 3.2;
+   * WYPEŁNIENIE przy ISSUED + invariant ADR-140 §2 egzekwuje Story 3.4.
+   * Null dla legacy i do czasu snapshotu.
+   */
+  reference_price_minor: number | null
   state: EntitlementInstanceState
   // BE-2 (Story 2.3): active service-booking pointer; reset on cancel_booking.
   booking_pointer: string | null

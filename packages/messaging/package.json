@@ -16,6 +16,7 @@
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "dependencies": {
+    "@gp/audit": "workspace:*",
     "js-yaml": "^4.1.1"
   },
   "devDependencies": {

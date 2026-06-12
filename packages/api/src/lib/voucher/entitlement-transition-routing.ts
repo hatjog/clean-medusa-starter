@@ -71,32 +71,32 @@ export const TRANSITION_GUARD_CALLSITES: ReadonlyArray<{
   {
     suffix: "workflows/entitlements/issue-entitlement.ts",
     status: "E4_DEFERRED",
-    note: "captured-path ISSUED→ACTIVE/refund — E4 przerouuje przez okablowanie",
+    note: "carry-out v1.12.0: captured-path ISSUED→ACTIVE/refund legacy issue workflow nie jest wymaganym lifecycle CREDIT_PACK/BUNDLE; domknięcie przez dedicated issue/refund workflow w następnym zakresie E4",
   },
   {
     suffix: "modules/voucher/workflows/redeem-entitlement.ts",
-    status: "E4_DEFERRED",
-    note: "REDEMPTION/REDEEMED — E4 derecognition przez okablowanie",
+    status: "WIRED",
+    note: "3.5/E4: auto-redeem ACTIVE→REDEMPTION_REQUESTED→REDEEMED_FULL okablowane przez wireEntitlementTransitionPersisted + emit post-COMMIT",
   },
   {
     suffix: "modules/voucher/workflows/reissue-lost-code.ts",
     status: "E4_DEFERRED",
-    note: "→VOIDED reissue — E4 przerouuje przez okablowanie",
+    note: "carry-out v1.12.0: reissue-lost-code jest legacy VOUCHER_* recovery, nie wymagany redeem/expiry/refund CREDIT_PACK/BUNDLE; osobne domknięcie w follow-up E4",
   },
   {
     suffix: "modules/voucher/workflows/issue-retention.ts",
     status: "E4_DEFERRED",
-    note: "→VOIDED retention — E4 przerouuje przez okablowanie",
+    note: "carry-out v1.12.0: retention void dotyczy legacy recovery/retention, poza wymaganym lifecycle CREDIT_PACK/BUNDLE; osobne domknięcie w follow-up E4",
   },
   {
     suffix: "modules/voucher/service.ts",
-    status: "E4_DEFERRED",
-    note: "ACTIVE/VOIDED/PENDING_VENDOR_DECISION/refund — E4 przez okablowanie",
+    status: "WIRED",
+    note: "3.5/E4: stanowe cancel/no-show call-site'y ACTIVE/VOIDED/PENDING_VENDOR_DECISION okablowane przez wireEntitlementTransitionPersisted + emit post-COMMIT; refund/expiry capability realizują dedicated workflows",
   },
   {
     suffix: "api/v1/entitlements/claim/route.ts",
     status: "E4_DEFERRED",
-    note: "claim →ACTIVE — E4 przerouuje przez okablowanie",
+    note: "carry-out v1.12.0: claim →ACTIVE jest aktywacją recipienta/legacy claim, nie redeem/expiry/refund CREDIT_PACK/BUNDLE; domknięcie w osobnym zakresie claim-routing",
   },
 ] as const
 

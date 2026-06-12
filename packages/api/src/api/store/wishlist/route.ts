@@ -8,12 +8,23 @@ import type { Knex } from "knex";
 import { requireMercurServerModule } from "../../../lib/mercur-module-loader";
 import { marketContextStorage } from "../../../lib/market-context";
 import { filterProductIdsForSalesChannel } from "../../../lib/product-market-scope";
-
-type QueryGraphResult = {
-  data: Array<Record<string, any>>;
-};
+import {
+  type AuthenticatedStoreRequest,
+  getCustomerId,
+  resolveQueryGraph,
+} from "../../../lib/request-surface";
 
 const fallbackWishlistsByCustomer = new Map<string, Set<string>>();
+
+type WishlistLinkRecord = {
+  wishlist?: {
+    products?: Array<{ id?: unknown }>;
+  };
+};
+
+function isWishlistLinkRecord(value: unknown): value is WishlistLinkRecord {
+  return typeof value === "object" && value !== null;
+}
 
 type CreateWishlistWorkflowModule = {
   createWishlistEntryWorkflow: {
@@ -55,9 +66,8 @@ function isOptionalWishlistModuleUnavailable(error: unknown) {
   );
 }
 
-export async function POST(req: MedusaRequest, res: MedusaResponse) {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const customerId = (req as any).auth_context?.actor_id as string | undefined;
+export async function POST(req: AuthenticatedStoreRequest, res: MedusaResponse) {
+  const customerId = getCustomerId(req);
   const body = ((req.validatedBody ?? req.body ?? {}) as Record<
     string,
     unknown
@@ -100,9 +110,7 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
     },
   });
 
-  const query = req.scope.resolve(ContainerRegistrationKeys.QUERY) as {
-    graph: (input: Record<string, unknown>) => Promise<QueryGraphResult>;
-  };
+  const query = resolveQueryGraph(req);
   const {
     data: [wishlist],
   } = await query.graph({
@@ -116,12 +124,9 @@ export async function POST(req: MedusaRequest, res: MedusaResponse) {
   res.status(201).json({ wishlist });
 }
 
-export async function GET(req: MedusaRequest, res: MedusaResponse) {
-  const query = req.scope.resolve(ContainerRegistrationKeys.QUERY) as {
-    graph: (input: Record<string, unknown>) => Promise<QueryGraphResult>;
-  };
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const customerId = (req as any).auth_context?.actor_id;
+export async function GET(req: AuthenticatedStoreRequest, res: MedusaResponse) {
+  const query = resolveQueryGraph(req);
+  const customerId = getCustomerId(req);
   const salesChannelId = marketContextStorage.getStore()?.sales_channel_id;
   const offset = req.queryConfig?.pagination?.skip ?? 0;
   const requestedLimit =
@@ -152,11 +157,9 @@ export async function GET(req: MedusaRequest, res: MedusaResponse) {
       },
     });
 
-    rawProductIds = Array.isArray(wishlistLink?.wishlist?.products)
+    rawProductIds = isWishlistLinkRecord(wishlistLink) && Array.isArray(wishlistLink.wishlist?.products)
       ? wishlistLink.wishlist.products
-          .map((product: Record<string, unknown>) =>
-            typeof product?.id === "string" ? product.id : null
-          )
+          .map((product) => (typeof product.id === "string" ? product.id : null))
           .filter((productId: string | null): productId is string => !!productId)
       : [];
   } catch (error) {

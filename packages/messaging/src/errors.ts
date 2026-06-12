@@ -1,16 +1,16 @@
 /// <reference lib="es2022.error" />
-import type { AuditEnvelope } from "./types";
+import type { NotificationAuditEnvelope } from "./types";
 
 interface MessagingErrorOptions {
   error_code: string;
-  audit_event?: AuditEnvelope;
+  audit_event?: NotificationAuditEnvelope;
   cause?: unknown;
   status_code?: number;
 }
 
 export class MessagingError extends Error {
   readonly error_code: string;
-  readonly audit_event?: AuditEnvelope;
+  readonly audit_event?: NotificationAuditEnvelope;
   readonly status_code?: number;
 
   constructor(message: string, options: MessagingErrorOptions) {

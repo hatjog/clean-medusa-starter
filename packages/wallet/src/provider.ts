@@ -1,5 +1,5 @@
 import type {
-  AuditEnvelope,
+  WalletAuditEnvelope,
   WalletInvalidationReason,
   WalletLocale,
   WalletPayload,
@@ -7,11 +7,11 @@ import type {
 
 export interface WalletPassIssueResult {
   save_url: string
-  audit_event?: AuditEnvelope | unknown
+  audit_event?: WalletAuditEnvelope | unknown
 }
 
 export interface WalletPassInvalidateResult {
-  audit_event?: AuditEnvelope | unknown
+  audit_event?: WalletAuditEnvelope | unknown
 }
 
 /**

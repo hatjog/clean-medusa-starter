@@ -4,13 +4,14 @@ import type { Knex } from "knex";
 import { requireMercurServerModule } from "../../../lib/mercur-module-loader";
 import { marketContextStorage } from "../../../lib/market-context";
 import {
+  type AuthenticatedStoreRequest,
+  getCustomerId,
+  resolveQueryGraph,
+} from "../../../lib/request-surface";
+import {
   getLiveReviewStatsForSalesChannel,
   listReviewIdsForSalesChannel,
 } from "../../../lib/review-market-scope";
-
-type QueryGraphResult = {
-  data: Array<Record<string, unknown>>;
-};
 
 type CreateReviewWorkflowModule = {
   createReviewWorkflow: {
@@ -31,23 +32,20 @@ function getCreateReviewWorkflow() {
   ).createReviewWorkflow;
 }
 
-export async function POST(req: MedusaRequest, res: MedusaResponse) {
+export async function POST(req: AuthenticatedStoreRequest, res: MedusaResponse) {
   const createReviewWorkflow = getCreateReviewWorkflow();
   const { result } = await createReviewWorkflow.run({
     container: req.scope,
     input: {
       ...(req.validatedBody as Record<string, unknown>),
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      customer_id: (req as any).auth_context?.actor_id,
+      customer_id: getCustomerId(req),
     },
   });
 
-  const query = req.scope.resolve(ContainerRegistrationKeys.QUERY) as {
-    graph: (input: Record<string, unknown>) => Promise<QueryGraphResult>;
-  };
+  const query = resolveQueryGraph(req);
   const {
     data: [review],
-  } = await (query as any).graph({
+  } = await query.graph({
     entity: "review",
     fields: req.queryConfig.fields,
     filters: {
@@ -102,9 +100,7 @@ export async function GET(req: MedusaRequest, res: MedusaResponse) {
   const fields = req.queryConfig.fields.includes("id")
     ? req.queryConfig.fields
     : [...req.queryConfig.fields, "id"];
-  const query = req.scope.resolve(ContainerRegistrationKeys.QUERY) as {
-    graph: (input: Record<string, unknown>) => Promise<QueryGraphResult>;
-  };
+  const query = resolveQueryGraph(req);
   const { data: reviews } = await query.graph({
     entity: "review",
     fields,

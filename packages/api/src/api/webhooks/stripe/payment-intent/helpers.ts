@@ -1,0 +1,2 @@
+export const STRIPE_WEBHOOK_SECRET_ENV = "STRIPE_WEBHOOK_SECRET"
+export const STRIPE_SIGNATURE_HEADER = "stripe-signature"

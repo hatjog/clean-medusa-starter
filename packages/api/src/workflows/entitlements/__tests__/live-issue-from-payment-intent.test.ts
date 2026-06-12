@@ -16,11 +16,16 @@ import { describe, it, expect } from "@jest/globals"
 
 import {
   liveIssueEntitlementsWithinTx,
+  assertReferencePriceInvariant,
   type LiveIssueInput,
   type LiveIssuePgClient,
 } from "../live-issue-from-payment-intent"
-import { EntitlementInstanceState } from "../../../modules/voucher/models/entitlement"
+import {
+  EntitlementInstanceState,
+  EntitlementType,
+} from "../../../modules/voucher/models/entitlement"
 import { buildEntitlementDedupeKey } from "../../../modules/voucher/models/entitlement-dedupe"
+import { VoucherPostingInvariantError } from "../../../modules/voucher/posting-profile"
 
 type EntitlementRow = {
   id: string
@@ -33,9 +38,22 @@ type EntitlementRow = {
   market_id: string | null
   sales_channel_id: string | null
   vat_classification: string
+  reference_price_minor: number | null
   entitlement_dedupe_key: string
   recipient_index: number
   recipient_customer_id: string | null
+}
+
+type ChoiceSetRow = {
+  id: string
+  instance_id: string
+  market_id: string
+  label: string | null
+  reference_amount_minor: number
+  remaining_minor: number
+  vat_classification: string
+  status: string
+  redemption_id: string | null
 }
 
 type OrderFixture = {
@@ -52,6 +70,7 @@ type LineFixture = { line_item_id: string; metadata: Record<string, unknown> | n
 function makeFakeClient(order: OrderFixture, lines: LineFixture[]) {
   const eventProcessed = new Set<string>()
   const entitlements = new Map<string, EntitlementRow>()
+  const choiceSetItems = new Map<string, ChoiceSetRow>()
 
   const client: LiveIssuePgClient = {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -69,7 +88,7 @@ function makeFakeClient(order: OrderFixture, lines: LineFixture[]) {
         return { rows: lines as unknown as T[], rowCount: lines.length }
       }
       if (/INSERT INTO entitlement_instance/i.test(sql)) {
-        const dedupeKey = values[10] as string
+        const dedupeKey = values[11] as string
         if (entitlements.has(dedupeKey)) {
           // ON CONFLICT (entitlement_dedupe_key) DO NOTHING ⇒ brak RETURNING.
           return { rows: [], rowCount: 0 }
@@ -85,18 +104,35 @@ function makeFakeClient(order: OrderFixture, lines: LineFixture[]) {
           market_id: (values[7] as string | null) ?? null,
           sales_channel_id: (values[8] as string | null) ?? null,
           vat_classification: values[9] as string,
+          reference_price_minor: (values[10] as number | null) ?? null,
           entitlement_dedupe_key: dedupeKey,
-          recipient_index: values[11] as number,
-          recipient_customer_id: (values[12] as string | null) ?? null,
+          recipient_index: values[12] as number,
+          recipient_customer_id: (values[13] as string | null) ?? null,
         }
         entitlements.set(dedupeKey, row)
         return { rows: [{ id: row.id }] as unknown as T[], rowCount: 1 }
+      }
+      if (/INSERT INTO entitlement_choice_set_item/i.test(sql)) {
+        const id = values[0] as string
+        if (choiceSetItems.has(id)) return { rows: [], rowCount: 0 }
+        choiceSetItems.set(id, {
+          id,
+          instance_id: values[1] as string,
+          market_id: values[2] as string,
+          label: (values[3] as string | null) ?? null,
+          reference_amount_minor: values[4] as number,
+          remaining_minor: values[4] as number,
+          vat_classification: values[5] as string,
+          status: "ACTIVE",
+          redemption_id: null,
+        })
+        return { rows: [], rowCount: 1 }
       }
       return { rows: [], rowCount: 0 }
     },
   }
 
-  return { client, entitlements, eventProcessed }
+  return { client, entitlements, choiceSetItems, eventProcessed }
 }
 
 const NOW = new Date("2026-06-02T10:15:30.000Z")
@@ -143,6 +179,7 @@ describe("Story 3.3 AC2 — live-issue → L4 ISSUED ze snapshotem (policy + VAT
     expect(row.market_id).toBe("bonbeauty")
     expect(row.sales_channel_id).toBe("sc_bonbeauty")
     expect(row.vat_classification).toBe("SPV") // vat_rate_uniqueness:true ⇒ SPV
+    expect(row.reference_price_minor).toBeNull()
     // policy snapshot zawiera zamrożone pola źródłowe
     const snap = JSON.parse(row.policy_snapshot)
     expect(snap.source_payment_intent_id).toBe("pi_3Pabc1234567890")
@@ -280,6 +317,168 @@ describe("Story 3.3 AC4 — dwupoziomowa idempotencja (DEC-5)", () => {
     const r2 = await liveIssueEntitlementsWithinTx(client, replay, NOW)
     expect(entitlements.size).toBe(2)
     expect(r2.issued.every((e) => !e.created)).toBe(true)
+  })
+})
+
+describe("Story 3.4 — reference_price snapshot + BUNDLE choice_set w issue-tx", () => {
+  function creditPackLine(): LineFixture {
+    return {
+      line_item_id: "li_credit_pack",
+      metadata: {
+        entitlement_profile_id: "voucher-credit-pack",
+        entitlement_type: EntitlementType.CREDIT_PACK,
+        amount_minor: 15000,
+        policy: { vat_rate_uniqueness: true, face_value_minor: 15000 },
+      },
+    }
+  }
+
+  function bundleLine(choiceSet: unknown[] = [
+    { item_key: "massage", label: "Masaż", reference_amount_minor: 12000, vat_rates: [8] },
+    { item_key: "spa", label: "SPA", reference_amount_minor: 8000, vat_rates: [23] },
+  ]): LineFixture {
+    return {
+      line_item_id: "li_bundle",
+      metadata: {
+        entitlement_profile_id: "voucher-bundle",
+        entitlement_type: EntitlementType.BUNDLE,
+        policy: {
+          vat_rates: [8, 23],
+          choice_set: choiceSet,
+        },
+      },
+    }
+  }
+
+  it("CREDIT_PACK zamraża reference_price_minor = face_value_minor i nie tworzy choice_set", async () => {
+    const { client, entitlements, choiceSetItems } = makeFakeClient(
+      { sales_channel_id: "sc_x", metadata: { gp: { market_id: "bonbeauty" } } },
+      [creditPackLine()]
+    )
+
+    const result = await liveIssueEntitlementsWithinTx(client, baseInput(), NOW)
+
+    expect(result.issued).toHaveLength(1)
+    const row = [...entitlements.values()][0]
+    expect(row.entitlement_type).toBe(EntitlementType.CREDIT_PACK)
+    expect(row.reference_price_minor).toBe(15000)
+    expect(choiceSetItems.size).toBe(0)
+  })
+
+  it("BUNDLE zamraża reference_price_minor = SUM(choice_set) i persystuje komplet aktywnych pozycji", async () => {
+    const { client, entitlements, choiceSetItems } = makeFakeClient(
+      { sales_channel_id: "sc_x", metadata: { gp: { market_id: "bonbeauty" } } },
+      [bundleLine()]
+    )
+
+    const result = await liveIssueEntitlementsWithinTx(client, baseInput(), NOW)
+
+    expect(result.issued).toHaveLength(1)
+    const row = [...entitlements.values()][0]
+    expect(row.entitlement_type).toBe(EntitlementType.BUNDLE)
+    expect(row.reference_price_minor).toBe(20000)
+    expect(choiceSetItems.size).toBe(2)
+    for (const item of choiceSetItems.values()) {
+      expect(item.instance_id).toBe(row.id)
+      expect(item.market_id).toBe("bonbeauty")
+      expect(item.remaining_minor).toBe(item.reference_amount_minor)
+      expect(item.status).toBe("ACTIVE")
+      expect(item.redemption_id).toBeNull()
+      expect(["SPV", "MPV"]).toContain(item.vat_classification)
+    }
+  })
+
+  it("per-entitlement replay nie duplikuje choice_set", async () => {
+    const { client, choiceSetItems } = makeFakeClient(
+      { sales_channel_id: "sc_x", metadata: { gp: { market_id: "bonbeauty" } } },
+      [bundleLine()]
+    )
+    await liveIssueEntitlementsWithinTx(client, baseInput(), NOW)
+    const replay = baseInput()
+    replay.event_type = "gp.stripe.payment_intent_succeeded.v1.replay"
+
+    const result = await liveIssueEntitlementsWithinTx(client, replay, NOW)
+
+    expect(result.issued[0].created).toBe(false)
+    expect(choiceSetItems.size).toBe(2)
+  })
+
+  it("BUNDLE bez choice_set rzuca fail-closed przed zapisem niespójnego snapshotu", async () => {
+    const { client, entitlements, choiceSetItems } = makeFakeClient(
+      { sales_channel_id: "sc_x", metadata: { gp: { market_id: "bonbeauty" } } },
+      [bundleLine([])]
+    )
+
+    await expect(liveIssueEntitlementsWithinTx(client, baseInput(), NOW)).rejects.toBeInstanceOf(
+      VoucherPostingInvariantError
+    )
+    expect(entitlements.size).toBe(0)
+    expect(choiceSetItems.size).toBe(0)
+  })
+
+  it("CREDIT_PACK bez jawnego face_value_minor w policy rzuca fail-closed (nie fallbackuje do kwoty Stripe)", async () => {
+    // L1-fix: gdy policy nie niesie face_value_minor ani amount_minor, NIE wolno
+    // fallbackować do payload.amount_minor (zapłacono ≠ face_value per ADR-140 §2).
+    const { client } = makeFakeClient(
+      { sales_channel_id: "sc_x", metadata: { gp: { market_id: "bonbeauty" } } },
+      [
+        {
+          line_item_id: "li_credit_pack_no_fv",
+          metadata: {
+            entitlement_profile_id: "voucher-credit-pack",
+            entitlement_type: EntitlementType.CREDIT_PACK,
+            // brak amount_minor na poziomie profilu
+            policy: { vat_rate_uniqueness: true /* brak face_value_minor/amount_minor */ },
+          },
+        },
+      ]
+    )
+    await expect(liveIssueEntitlementsWithinTx(client, baseInput(), NOW)).rejects.toBeInstanceOf(
+      VoucherPostingInvariantError
+    )
+  })
+
+  describe("AC3 golden-test — assertReferencePriceInvariant z rozbieżnymi oracle (M1-fix)", () => {
+    it("CREDIT_PACK: rozbieżność snapshot vs face_value oracle ⇒ rzuca VoucherPostingInvariantError", () => {
+      // Zmanipulowany snapshot (np. 10000) vs oracle (15000) — asercja musi złapać.
+      expect(() =>
+        assertReferencePriceInvariant(EntitlementType.CREDIT_PACK, 10000, "li_test", {
+          faceValueMinor: 15000,
+        })
+      ).toThrow(VoucherPostingInvariantError)
+    })
+
+    it("CREDIT_PACK: snapshot zgodny z oracle ⇒ nie rzuca", () => {
+      expect(() =>
+        assertReferencePriceInvariant(EntitlementType.CREDIT_PACK, 15000, "li_test", {
+          faceValueMinor: 15000,
+        })
+      ).not.toThrow()
+    })
+
+    it("BUNDLE: rozbieżność snapshot vs SUM(itemAmounts oracle) ⇒ rzuca VoucherPostingInvariantError", () => {
+      // Snapshot zamrożony jako 20000, ale oracle wskazuje 19000 (rozbieżność).
+      // Ten test byłby niemożliwy do napisania gdyby asercja była tautologiczna.
+      expect(() =>
+        assertReferencePriceInvariant(EntitlementType.BUNDLE, 20000, "li_test", {
+          itemAmounts: [12000, 7000], // SUM = 19000 ≠ 20000
+        })
+      ).toThrow(VoucherPostingInvariantError)
+    })
+
+    it("BUNDLE: snapshot zgodny z SUM(itemAmounts oracle) ⇒ nie rzuca", () => {
+      expect(() =>
+        assertReferencePriceInvariant(EntitlementType.BUNDLE, 20000, "li_test", {
+          itemAmounts: [12000, 8000], // SUM = 20000 = snapshot
+        })
+      ).not.toThrow()
+    })
+
+    it("VOUCHER_* (null snapshot): asercja nie rzuca (brak oracle)", () => {
+      expect(() =>
+        assertReferencePriceInvariant(EntitlementType.VOUCHER_AMOUNT, null, "li_test", {})
+      ).not.toThrow()
+    })
   })
 })
 

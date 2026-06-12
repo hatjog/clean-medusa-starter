@@ -18,7 +18,7 @@ export interface BrevoAdapterOptions {
 }
 
 export class BrevoAdapter implements IMessagingProvider {
-  readonly key = "brevo";
+  readonly key = "brevo" as const;
 
   private readonly clock: () => Date;
   private readonly uuid: () => string;

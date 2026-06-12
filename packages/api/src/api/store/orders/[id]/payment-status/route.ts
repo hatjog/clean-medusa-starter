@@ -50,10 +50,14 @@
 
 import { randomBytes } from "crypto"
 
-import { ContainerRegistrationKeys, Modules } from "@medusajs/framework/utils"
+import { ContainerRegistrationKeys } from "@medusajs/framework/utils"
 import type { MedusaRequest, MedusaResponse } from "@medusajs/framework/http"
 import { marketContextStorage } from "../../../../../lib/market-context"
 import { classifyPaymentAttempt } from "../../../../../lib/payment/failure-classification"
+import {
+  retrieveOrderByStatusIdentifier,
+  resolveOrderModule,
+} from "./helpers"
 
 // Customer auth is installed for this route in api/middlewares.ts. Keep the
 // route-level flag off so Medusa does not apply default admin auth semantics.
@@ -138,19 +142,6 @@ function resolveLogger(req: MedusaRequest): LoggerLike {
   }
 }
 
-type OrderModuleLike = {
-  retrieveOrder: (id: string, options?: Record<string, unknown>) => Promise<{
-    id?: string
-    customer_id?: string | null
-    payment_status?: string | null
-    status?: string | null
-    created_at?: string | Date | null
-    sales_channel_id?: string | null
-  } | null>
-}
-
-type RetrievedOrder = Awaited<ReturnType<OrderModuleLike["retrieveOrder"]>>
-
 type AuthenticatedMedusaRequest = MedusaRequest & {
   auth_context?: {
     actor_id?: string
@@ -218,51 +209,6 @@ async function resolveLatestPaymentAttempt(
         ? row.retry_count
         : null,
   }
-}
-
-export async function resolveOrderByCartId(
-  req: MedusaRequest,
-  cartId: string
-): Promise<string | null> {
-  const db = req.scope.resolve(ContainerRegistrationKeys.PG_CONNECTION) as KnexLike
-  try {
-    const result = await db.raw(
-      `
-        SELECT id
-        FROM "order"
-        WHERE cart_id = ?
-          AND deleted_at IS NULL
-        ORDER BY created_at DESC
-        LIMIT 1
-      `,
-      [cartId]
-    )
-    const row = result.rows?.[0] as Record<string, unknown> | undefined
-    return typeof row?.id === "string" ? row.id : null
-  } catch {
-    return null
-  }
-}
-
-export async function retrieveOrderByStatusIdentifier(
-  req: MedusaRequest,
-  orderModule: OrderModuleLike,
-  statusIdentifier: string
-): Promise<RetrievedOrder> {
-  const options = {
-    select: ["id", "customer_id", "payment_status", "status", "created_at", "sales_channel_id"],
-  }
-  const directOrder = await orderModule.retrieveOrder(statusIdentifier, options)
-  if (directOrder) {
-    return directOrder
-  }
-
-  const resolvedOrderId = await resolveOrderByCartId(req, statusIdentifier)
-  if (!resolvedOrderId || resolvedOrderId === statusIdentifier) {
-    return null
-  }
-
-  return orderModule.retrieveOrder(resolvedOrderId, options)
 }
 
 function refineFailureStatus(
@@ -347,7 +293,7 @@ export async function GET(
   }
 
   try {
-    const orderModule = req.scope.resolve(Modules.ORDER) as OrderModuleLike
+    const orderModule = resolveOrderModule(req)
     const order = await retrieveOrderByStatusIdentifier(req, orderModule, orderId)
 
     if (!order || order.customer_id !== customerId) {

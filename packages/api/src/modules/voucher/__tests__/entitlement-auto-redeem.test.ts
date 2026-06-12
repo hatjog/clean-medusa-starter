@@ -144,8 +144,17 @@ describe("RedeemEntitlementWorkflow — case (a) happy path", () => {
     // State persisted
     expect(store.get("ent-001")?.state).toBe(EntitlementInstanceState.REDEEMED_FULL)
 
-    // Event emitted exactly once
-    expect(emitFn).toHaveBeenCalledTimes(1)
+    // Transition events are emitted post-COMMIT before the legacy redeemed event.
+    expect(emitFn).toHaveBeenCalledTimes(3)
+    const emitted = (emitFn as jest.MockedFunction<typeof emitFn>).mock.calls.map(
+      ([event]) => event.event_type
+    )
+    expect(emitted).toEqual([
+      "gp.entitlements.entitlement_state_changed.v1",
+      "gp.entitlements.entitlement_state_changed.v1",
+      "gp.entitlements.entitlement_redeemed.v1",
+    ])
+    expect(store.listAudits()).toHaveLength(2)
   })
 })
 
@@ -159,7 +168,7 @@ describe("RedeemEntitlementWorkflow — case (e) idempotency", () => {
 
     const first = await workflow.redeem(BASE_INPUT)
     expect(first.idempotent).toBe(false)
-    expect(emitFn).toHaveBeenCalledTimes(1)
+    expect(emitFn).toHaveBeenCalledTimes(3)
 
     // Second call — entitlement is now REDEEMED_FULL
     const second = await workflow.redeem(BASE_INPUT)
@@ -167,7 +176,7 @@ describe("RedeemEntitlementWorkflow — case (e) idempotency", () => {
     expect(second.new_state).toBe(EntitlementInstanceState.REDEEMED_FULL)
 
     // No second event emitted
-    expect(emitFn).toHaveBeenCalledTimes(1)
+    expect(emitFn).toHaveBeenCalledTimes(3)
 
     // State unchanged
     expect(store.get("ent-001")?.state).toBe(EntitlementInstanceState.REDEEMED_FULL)
@@ -305,15 +314,17 @@ describe("Integration/lifecycle simulation — full redemption cycle", () => {
     const r1 = await workflow.redeem(bookingEvent)
     expect(r1.idempotent).toBe(false)
     expect(store.get("ent-001")?.state).toBe(EntitlementInstanceState.REDEEMED_FULL)
-    expect(emitFn).toHaveBeenCalledTimes(1)
-    const emittedEvent = emitFn.mock.calls[0]?.[0]
+    expect(emitFn).toHaveBeenCalledTimes(3)
+    const emittedEvent = emitFn.mock.calls
+      .map(([event]) => event)
+      .find((event) => event.event_type === "gp.entitlements.entitlement_redeemed.v1")
     expect(emittedEvent?.payload.new_status).toBe("REDEEMED")
     expect(emittedEvent?.payload.remaining_minor_after).toBe(0)
 
     // Second delivery (replay) → idempotent no-op
     const r2 = await workflow.redeem(bookingEvent)
     expect(r2.idempotent).toBe(true)
-    expect(emitFn).toHaveBeenCalledTimes(1) // still 1, no second emit
+    expect(emitFn).toHaveBeenCalledTimes(3) // still 3, no second emit
 
     // State unchanged
     expect(store.get("ent-001")?.state).toBe(EntitlementInstanceState.REDEEMED_FULL)
@@ -331,7 +342,7 @@ describe("Integration/lifecycle simulation — full redemption cycle", () => {
     const result = await workflow.redeem(BASE_INPUT)
     expect(result.idempotent).toBe(false)
     expect(store.get("ent-001")?.state).toBe(EntitlementInstanceState.REDEEMED_FULL)
-    expect(emitFn).toHaveBeenCalledTimes(1)
+    expect(emitFn).toHaveBeenCalledTimes(2)
   })
 })
 
@@ -346,7 +357,9 @@ describe("RedeemEntitlementWorkflow — event envelope shape", () => {
 
     await workflow.redeem(BASE_INPUT)
 
-    const envelope = emitFn.mock.calls[0]?.[0]
+    const envelope = emitFn.mock.calls
+      .map(([event]) => event)
+      .find((event) => event.event_type === "gp.entitlements.entitlement_redeemed.v1")
     expect(envelope).toMatchObject({
       schema_version: "1",
       event_type: "gp.entitlements.entitlement_redeemed.v1",

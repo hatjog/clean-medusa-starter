@@ -1,11 +1,12 @@
 import {
   isWalletProviderKind,
   normalizeWalletLocale,
-  type AuditEnvelope,
+  type WalletAuditEnvelope,
   type WalletInvalidationReason,
   type WalletLocale,
   type WalletProviderKind,
 } from "./payload"
+import { toAuditProviderSafe } from "@gp/audit"
 import type { WalletPayloadBuilder } from "./payload-builder"
 import type { WalletPassProvider } from "./provider"
 import { emitWalletCounter, sanitizeWalletErrorMessage } from "./telemetry"
@@ -25,13 +26,13 @@ export interface WalletPassFacade {
     entitlement_instance_id: string,
     provider: WalletProviderKind,
     locale: WalletLocale
-  ): Promise<{ save_url: string; audit_event: AuditEnvelope }>
+  ): Promise<{ save_url: string; audit_event: WalletAuditEnvelope }>
 
   invalidatePass(
     entitlement_instance_id: string,
     provider: WalletProviderKind,
     reason: WalletInvalidationReason
-  ): Promise<{ audit_event: AuditEnvelope }>
+  ): Promise<{ audit_event: WalletAuditEnvelope }>
 }
 
 export type WalletProviderRegistry = Partial<
@@ -43,7 +44,7 @@ export interface WalletPassFacadeOptions {
 }
 
 export class UnsupportedWalletProviderError extends Error {
-  constructor(readonly audit_event: AuditEnvelope) {
+  constructor(readonly audit_event: WalletAuditEnvelope) {
     super(`Unsupported wallet provider: ${audit_event.provider}`)
     this.name = "UnsupportedWalletProviderError"
   }
@@ -52,7 +53,7 @@ export class UnsupportedWalletProviderError extends Error {
 export class WalletPassGenerationError extends Error {
   constructor(
     message: string,
-    readonly audit_event: AuditEnvelope,
+    readonly audit_event: WalletAuditEnvelope,
     readonly cause?: unknown
   ) {
     super(message)
@@ -63,7 +64,7 @@ export class WalletPassGenerationError extends Error {
 export class WalletPassInvalidationError extends Error {
   constructor(
     message: string,
-    readonly audit_event: AuditEnvelope,
+    readonly audit_event: WalletAuditEnvelope,
     readonly cause?: unknown
   ) {
     super(message)
@@ -86,7 +87,7 @@ export class DefaultWalletPassFacade implements WalletPassFacade {
     entitlement_instance_id: string,
     provider: WalletProviderKind,
     locale: WalletLocale
-  ): Promise<{ save_url: string; audit_event: AuditEnvelope }> {
+  ): Promise<{ save_url: string; audit_event: WalletAuditEnvelope }> {
     const requested_locale = String(locale)
     // R-H2 (phase-4): extract a safe stringified id once and reuse in every
     // pre-payload guard catch path. The previous code passed the raw
@@ -234,7 +235,7 @@ export class DefaultWalletPassFacade implements WalletPassFacade {
     entitlement_instance_id: string,
     provider: WalletProviderKind,
     reason: WalletInvalidationReason
-  ): Promise<{ audit_event: AuditEnvelope }> {
+  ): Promise<{ audit_event: WalletAuditEnvelope }> {
     // R-H3 (phase-4): mirror P2 pre-payload guard wrapping for
     // `invalidatePass`. Previously these guards threw outside any try/catch
     // and bypassed telemetry entirely on missing id / unsupported provider /
@@ -385,21 +386,27 @@ export class DefaultWalletPassFacade implements WalletPassFacade {
   }
 
   private createAuditEvent(input: {
-    event_type: AuditEnvelope["event_type"]
+    event_type: WalletAuditEnvelope["event_type"]
     entitlement_instance_id: string
     provider: string
-    outcome: AuditEnvelope["outcome"]
+    outcome: WalletAuditEnvelope["outcome"]
     save_url?: string
     reason?: WalletInvalidationReason
     error_code?: string
     error_message?: string
     requested_locale?: string
     effective_locale?: WalletLocale
-  }): AuditEnvelope {
+  }): WalletAuditEnvelope {
     return {
       event_type: input.event_type,
       entitlement_instance_id: input.entitlement_instance_id,
-      provider: input.provider,
+      // Use safe variant so that error-path envelopes (unsupported provider)
+      // preserve the raw runtime value instead of throwing a secondary Error
+      // before UnsupportedWalletProviderError can be constructed (M-1 fix).
+      // Cast: WalletAuditEnvelope constrains provider to WalletProviderKind
+      // ("google"|"apple") at type level; runtime value is preserved verbatim
+      // by toAuditProviderSafe even when it falls outside the enum (L-2 + M-1).
+      provider: toAuditProviderSafe(input.provider) as WalletProviderKind,
       save_url: input.save_url,
       reason: input.reason,
       timestamp: this.now().toISOString(),

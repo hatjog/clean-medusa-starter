@@ -6,7 +6,8 @@ import type {
   MedusaResponse,
 } from "@medusajs/framework/http"
 import { ContainerRegistrationKeys } from "@medusajs/framework/utils"
-import type { AuditEnvelope } from "@gp/messaging"
+import { AuditProvider } from "@gp/audit"
+import type { NotificationAuditEnvelope } from "@gp/messaging"
 
 export const BREVO_PROVIDER_ROUTE_PREFIX = "/hooks/notifications/brevo"
 export const BREVO_PROVIDER_ROUTE_MATCHER = `${BREVO_PROVIDER_ROUTE_PREFIX}*`
@@ -47,9 +48,9 @@ type LoggerLike = {
 }
 
 type AuditSink = {
-  record?: (auditEvent: AuditEnvelope) => Promise<void> | void
-  write?: (auditEvent: AuditEnvelope) => Promise<void> | void
-  append?: (auditEvent: AuditEnvelope) => Promise<void> | void
+  record?: (auditEvent: NotificationAuditEnvelope) => Promise<void> | void
+  write?: (auditEvent: NotificationAuditEnvelope) => Promise<void> | void
+  append?: (auditEvent: NotificationAuditEnvelope) => Promise<void> | void
 }
 
 type BrevoWebhookRequest = MedusaRequest & {
@@ -290,7 +291,7 @@ function buildRejectAuditEnvelope(
     requestId: string
     errorCode: BrevoWebhookRejectCode
   },
-): AuditEnvelope {
+): NotificationAuditEnvelope {
   const rawBody = resolveRawBody(req)
   const bodyByteLength = rawBody?.byteLength ?? 0
   const sourceIp = resolveSourceIp(req)
@@ -310,7 +311,7 @@ function buildRejectAuditEnvelope(
     status: "failed",
     // Pre-dispatch reject has no upstream dispatch by definition (F-06).
     dispatch_id: PRE_DISPATCH_SENTINEL,
-    provider: "brevo",
+    provider: AuditProvider.BREVO,
     // correlation_id is intentionally omitted: at reject time we have nothing
     // legitimate to correlate against (body is unparsed/untrusted).
     correlation_state: "rejected_pre_dispatch",
@@ -340,10 +341,10 @@ function buildRejectAuditEnvelope(
 
 async function emitAuditEvent(
   req: MedusaRequest,
-  auditEvent: AuditEnvelope,
+  auditEvent: NotificationAuditEnvelope,
 ): Promise<void> {
   const request = req as BrevoWebhookRequest
-  const sink = resolveOptional<AuditSink | ((auditEvent: AuditEnvelope) => Promise<void> | void)>(
+  const sink = resolveOptional<AuditSink | ((auditEvent: NotificationAuditEnvelope) => Promise<void> | void)>(
     request,
     [
       "notification_delivery_audit_sink",

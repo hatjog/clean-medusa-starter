@@ -35,6 +35,14 @@ import {
   type RefundChannel,
   validityMonthsMax,
 } from "./entitlement-boundary"
+import {
+  ENTITLEMENT_STATE_CHANGED_EVENT_TYPE,
+  emitTransitionEventAfterCommit,
+  wireEntitlementTransitionPersisted,
+  type TransitionAuditEnvelope,
+  type TransitionEventEnvelope,
+  type TransitionScope,
+} from "./entitlement-transition-wiring"
 
 // Local minimal shape for admin search projection (Layer 4-aware).
 // Mirrors fields from `lib/contracts/admin#EntitlementAdminView` that are
@@ -385,12 +393,16 @@ export class VoucherService {
       entitlement_profile_id: row.entitlement_profile_id as string,
       entitlement_type: row.entitlement_type as EntitlementType,
       order_id: (row.order_id ?? null) as string | null,
-      // Ontologia scope + VAT snapshot (Story 3.2). Kolumny dodane przez migrację
-      // 1778928100000; wypełnienie market_id/sales_channel_id przy live-issue (3.3),
-      // vat_classification snapshotowany przy ISSUED (3.3). Null dla wierszy legacy.
+      // Ontologia scope + snapshoty dodane migracjami. reference_price_minor
+      // jest wypełniane przy ISSUED dla CREDIT_PACK/BUNDLE; null zostaje dla
+      // legacy i typów bez ceny referencyjnej.
       market_id: (row.market_id ?? null) as string | null,
       sales_channel_id: (row.sales_channel_id ?? null) as string | null,
       vat_classification: (row.vat_classification ?? null) as VatClassification | null,
+      reference_price_minor:
+        row.reference_price_minor != null
+          ? Number(row.reference_price_minor)
+          : null,
       state: row.state as EntitlementInstanceState,
       booking_pointer: (row.booking_pointer ?? null) as string | null,
       policy_snapshot: this.toPolicySnapshot(row.policy_snapshot),
@@ -581,24 +593,81 @@ export class VoucherService {
     )
   }
 
-  // ---------------------------------------------------------------------------
-  // Public API
-  // ---------------------------------------------------------------------------
+  private resolveTransitionScope(row: EntitlementInstanceResult): TransitionScope {
+    // Fail-closed: market_id is required for per-market isolation (NFR3, ADR-139 D5).
+    // A missing market_id is a data-integrity anomaly — silently substituting
+    // "unknown" would produce a misleading audit trail and break per-market posting
+    // gate checks when the gate is eventually activated (v2.0.0+ HG-4).
+    if (!row.market_id) {
+      throw new Error(
+        `VoucherService: entitlement ${row.id} has no market_id — cannot build TransitionScope (NFR3 fail-closed)`
+      )
+    }
+    return {
+      instance_id: row.id,
+      market_id: row.market_id,
+      sales_channel_id: row.sales_channel_id ?? null,
+      vendor_id: null,
+      location_id: null,
+    }
+  }
 
-  async getByCode(code: string): Promise<VoucherWithEvents | null> {
-    const pool = this.getPool()
-    const vResult = await pool.query<Record<string, unknown>>(
+  private async appendTransitionAudit(
+    client: Queryable,
+    audit: TransitionAuditEnvelope
+  ): Promise<void> {
+    await client.query(
+      `INSERT INTO voucher_event (id, voucher_code, entitlement_id, event_type, payload, occurred_at, created_at)
+       VALUES ($1, NULL, $2, $3, $4::jsonb, $5, NOW())
+       ON CONFLICT (id) DO NOTHING`,
+      [
+        audit.idempotency_key,
+        audit.entitlement_id,
+        audit.event_type,
+        JSON.stringify(audit),
+        audit.occurred_at,
+      ]
+    )
+  }
+
+  private async emitTransitionAfterCommit(
+    event: TransitionEventEnvelope
+  ): Promise<boolean> {
+    return emitTransitionEventAfterCommit(async (envelope) => {
+      if (!this.eventBus_) {
+        throw new Error("event bus niedostępny (transition emit best-effort)")
+      }
+      await this.eventBus_.emit({
+        name: ENTITLEMENT_STATE_CHANGED_EVENT_TYPE,
+        data: envelope,
+      })
+    }, event)
+  }
+
+  private async getByCodeWithClient(
+    client: Queryable,
+    code: string
+  ): Promise<VoucherWithEvents | null> {
+    const vResult = await client.query<Record<string, unknown>>(
       `SELECT * FROM voucher WHERE code = $1`,
       [code]
     )
     if (vResult.rows.length === 0) return null
     const voucher = this.rowToVoucher(vResult.rows[0])
 
-    const eResult = await pool.query<Record<string, unknown>>(
+    const eResult = await client.query<Record<string, unknown>>(
       `SELECT * FROM voucher_event WHERE voucher_code = $1 ORDER BY occurred_at ASC`,
       [code]
     )
     return { ...voucher, events: eResult.rows.map((r) => this.rowToEvent(r)) }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Public API
+  // ---------------------------------------------------------------------------
+
+  async getByCode(code: string): Promise<VoucherWithEvents | null> {
+    return this.getByCodeWithClient(this.getPool(), code)
   }
 
   async listCodes(): Promise<string[]> {
@@ -1033,6 +1102,8 @@ export class VoucherService {
     const opts: CancelBookingInput =
       input instanceof Date ? { current_time: input } : input
     const client = await this.getPool().connect()
+    let transitionEvent: TransitionEventEnvelope | undefined
+    let committed = false
 
     try {
       await client.query("BEGIN")
@@ -1135,6 +1206,25 @@ export class VoucherService {
           `VoucherService.cancel_booking: failed to update ${entitlement_id}`
         )
       }
+      const { event } = await wireEntitlementTransitionPersisted(
+        {
+          appendAudit: (audit) => this.appendTransitionAudit(client, audit),
+          clock: () => cancelledAt,
+        },
+        {
+          from: previousState,
+          to: EntitlementInstanceState.ACTIVE,
+          entitlement_id,
+          scope: this.resolveTransitionScope(current),
+          actor: "system",
+          actor_hint: "voucher:cancel_booking",
+          occurred_at: cancelledAt.toISOString(),
+          // Stable key: entitlement_id + operation suffix — no timestamp so retry
+          // produces the same id (ON CONFLICT DO NOTHING deduplicates the audit row).
+          transition_seq: `${entitlement_id}:cancel_booking`,
+        }
+      )
+      transitionEvent = event
 
       const updated = this.rowToEntitlementInstance(updateRes.rows[0])
       await this.emitEntitlementBookingCancelled(client, {
@@ -1149,9 +1239,18 @@ export class VoucherService {
       }
 
       await client.query("COMMIT")
+      committed = true
+      // Post-COMMIT emit: outside the ROLLBACK scope so a failing emit never
+      // triggers an erroneous ROLLBACK on an already-committed transaction
+      // (symmetric with mark_no_show — LOW finding AI-Review cancel_booking).
+      if (transitionEvent) {
+        await this.emitTransitionAfterCommit(transitionEvent)
+      }
       return updated
     } catch (err) {
-      await client.query("ROLLBACK")
+      if (!committed) {
+        await client.query("ROLLBACK")
+      }
       throw err
     } finally {
       client.release()
@@ -1189,6 +1288,7 @@ export class VoucherService {
   ): Promise<MarkNoShowResult> {
     const client = await this.getPool().connect()
     let committed = false
+    let transitionEvent: TransitionEventEnvelope | undefined
 
     try {
       await client.query("BEGIN")
@@ -1262,6 +1362,25 @@ export class VoucherService {
       switch (policyValue) {
         case "forfeit_voucher": {
           assertTransition(current.state, EntitlementInstanceState.VOIDED)
+          const wired = await wireEntitlementTransitionPersisted(
+            {
+              appendAudit: (audit) => this.appendTransitionAudit(client, audit),
+              clock: () => new Date(markedAt),
+            },
+            {
+              from: current.state,
+              to: EntitlementInstanceState.VOIDED,
+              entitlement_id,
+              scope: this.resolveTransitionScope(current),
+              actor: "system",
+              actor_hint: input.actor ?? "voucher:mark_no_show:forfeit_voucher",
+              occurred_at: markedAt,
+              // Stable key without timestamp — retry produces same id so ON CONFLICT
+              // DO NOTHING deduplicates the audit row (LOW finding AI-Review seq-key).
+              transition_seq: `${entitlement_id}:no_show:forfeit_voucher`,
+            }
+          )
+          transitionEvent = wired.event
           newState = EntitlementInstanceState.VOIDED
           outcome = "forfeiture"
           await client.query(
@@ -1290,6 +1409,23 @@ export class VoucherService {
           newRemainingAmount = 0
           newState = EntitlementInstanceState.VOIDED
           assertTransition(current.state, EntitlementInstanceState.VOIDED)
+          const wired = await wireEntitlementTransitionPersisted(
+            {
+              appendAudit: (audit) => this.appendTransitionAudit(client, audit),
+              clock: () => new Date(markedAt),
+            },
+            {
+              from: current.state,
+              to: EntitlementInstanceState.VOIDED,
+              entitlement_id,
+              scope: this.resolveTransitionScope(current),
+              actor: "system",
+              actor_hint: input.actor ?? "voucher:mark_no_show:charge_full",
+              occurred_at: markedAt,
+              transition_seq: `${entitlement_id}:no_show:charge_full`,
+            }
+          )
+          transitionEvent = wired.event
           outcome = "charge_full"
           await client.query(
             `UPDATE entitlement_instance
@@ -1308,6 +1444,23 @@ export class VoucherService {
         }
         case "vendor_decision": {
           assertTransition(current.state, EntitlementInstanceState.PENDING_VENDOR_DECISION)
+          const wired = await wireEntitlementTransitionPersisted(
+            {
+              appendAudit: (audit) => this.appendTransitionAudit(client, audit),
+              clock: () => new Date(markedAt),
+            },
+            {
+              from: current.state,
+              to: EntitlementInstanceState.PENDING_VENDOR_DECISION,
+              entitlement_id,
+              scope: this.resolveTransitionScope(current),
+              actor: "system",
+              actor_hint: input.actor ?? "voucher:mark_no_show:vendor_decision",
+              occurred_at: markedAt,
+              transition_seq: `${entitlement_id}:no_show:vendor_decision`,
+            }
+          )
+          transitionEvent = wired.event
           newState = EntitlementInstanceState.PENDING_VENDOR_DECISION
           outcome = "vendor_decision"
           await client.query(
@@ -1346,6 +1499,9 @@ export class VoucherService {
 
       await client.query("COMMIT")
       committed = true
+      if (transitionEvent) {
+        await this.emitTransitionAfterCommit(transitionEvent)
+      }
 
       return {
         entitlement_id,
@@ -1372,10 +1528,10 @@ export class VoucherService {
 
   async claim(
     code: string,
-    opts: { now?: Date } = {}
+    opts: { now?: Date; client?: Queryable } = {}
   ): Promise<ClaimResult> {
-    const pool = this.getPool()
     const now = opts.now ?? new Date()
+    const txClient = opts.client ?? null
 
     // v1.9.0 Wave F6 HIGH-09 — the previous unlocked existence/expiry/already-
     // claimed pre-check formed a TOCTOU window with the FOR UPDATE block
@@ -1384,23 +1540,25 @@ export class VoucherService {
     // equivalent, but the early-out spares the connection acquisition) and
     // move expiry / already-claimed branching INSIDE the lock so all state
     // observations come from the same locked snapshot.
-    const voucher = await this.getByCode(code)
+    const voucher = txClient
+      ? await this.getByCodeWithClient(txClient, code)
+      : await this.getByCode(code)
     if (!voucher) return { status: "not_found", voucher: null }
 
     // F2 fix: Atomic status transition + event append in a transaction.
     // Use SELECT ... FOR UPDATE to lock the row, then conditional UPDATE
     // gated on status<>'claimed' so concurrent callers cannot double-fire
     // the `claimed` event.
-    const client = await pool.connect()
+    const client = txClient ?? await this.getPool().connect()
     let didTransition = false
     try {
-      await client.query("BEGIN")
+      if (!txClient) await client.query("BEGIN")
       const lockRes = await client.query<{ status: string; expires_at: Date | null }>(
         `SELECT status, expires_at FROM voucher WHERE code = $1 FOR UPDATE`,
         [code]
       )
       if (lockRes.rows.length === 0) {
-        await client.query("ROLLBACK")
+        if (!txClient) await client.query("ROLLBACK")
         return { status: "not_found", voucher: null }
       }
       const lockedStatus = lockRes.rows[0].status
@@ -1408,13 +1566,17 @@ export class VoucherService {
         ? new Date(lockRes.rows[0].expires_at)
         : null
       if (lockedStatus === "claimed") {
-        await client.query("ROLLBACK")
-        const current = await this.getByCode(code)
+        if (!txClient) await client.query("ROLLBACK")
+        const current = txClient
+          ? await this.getByCodeWithClient(txClient, code)
+          : await this.getByCode(code)
         return { status: "already_claimed", voucher: current ?? voucher }
       }
       if (lockedExpires && lockedExpires < now) {
-        await client.query("ROLLBACK")
-        const current = await this.getByCode(code)
+        if (!txClient) await client.query("ROLLBACK")
+        const current = txClient
+          ? await this.getByCodeWithClient(txClient, code)
+          : await this.getByCode(code)
         return { status: "expired", voucher: current ?? voucher }
       }
       const updRes = await client.query(
@@ -1431,15 +1593,17 @@ export class VoucherService {
         )
         didTransition = true
       }
-      await client.query("COMMIT")
+      if (!txClient) await client.query("COMMIT")
     } catch (err) {
-      await client.query("ROLLBACK")
+      if (!txClient) await client.query("ROLLBACK")
       throw err
     } finally {
-      client.release()
+      if (!txClient) (client as PoolClient).release()
     }
 
-    const updated = await this.getByCode(code)
+    const updated = txClient
+      ? await this.getByCodeWithClient(txClient, code)
+      : await this.getByCode(code)
     if (!updated) throw new Error(`VoucherService.claim: failed to read back ${code}`)
     if (!didTransition) {
       // Race lost — a concurrent caller already transitioned to claimed.

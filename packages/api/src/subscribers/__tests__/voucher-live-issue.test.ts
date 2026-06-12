@@ -65,10 +65,14 @@ function makeFakeContainer() {
   const eventProcessed = new Set<string>()
   const entitlements = new Map<string, unknown>()
   const log: string[] = []
+  const txLog: string[] = []
 
   const client = {
     query: async (sql: string, values: ReadonlyArray<unknown> = []) => {
-      if (/^(BEGIN|COMMIT|ROLLBACK)/i.test(sql.trim())) return { rows: [], rowCount: 0 }
+      if (/^(BEGIN|COMMIT|ROLLBACK)/i.test(sql.trim())) {
+        txLog.push(sql.trim().toUpperCase())
+        return { rows: [], rowCount: 0 }
+      }
       if (/INSERT INTO event_processed/i.test(sql)) {
         const key = `${values[0]}|${values[1]}`
         if (eventProcessed.has(key)) return { rows: [], rowCount: 0 }
@@ -118,7 +122,7 @@ function makeFakeContainer() {
       throw new Error(`unresolved ${key}`)
     },
   }
-  return { container, entitlements, log }
+  return { container, entitlements, log, txLog }
 }
 
 function envelopeEvent() {
@@ -173,6 +177,7 @@ function makeWiredContainer() {
   const emitted: Array<{ name: string; data: unknown }> = []
   const eventBus = {
     emit: async (e: { name: string; data: unknown }) => {
+      base.txLog.push("EMIT")
       emitted.push(e)
     },
   }
@@ -182,12 +187,18 @@ function makeWiredContainer() {
       return base.container.resolve(key)
     },
   }
-  return { container, emitted, log: base.log, entitlements: base.entitlements }
+  return {
+    container,
+    emitted,
+    log: base.log,
+    entitlements: base.entitlements,
+    txLog: base.txLog,
+  }
 }
 
 describe("Story 3.4 — subscriber okablowuje genezę ISSUED (event + audit; posting inert)", () => {
   it("ISSUED ⇒ event okablowania emitowany POST-COMMIT + audit append-only zalogowany", async () => {
-    const { container, emitted, log } = makeWiredContainer()
+    const { container, emitted, log, txLog } = makeWiredContainer()
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await subscriber({ event: envelopeEvent(), container } as any)
 
@@ -207,6 +218,9 @@ describe("Story 3.4 — subscriber okablowuje genezę ISSUED (event + audit; pos
     expect(auditLines).toHaveLength(1)
     expect(auditLines[0]).toContain('"outcome":"transitioned"')
     expect(auditLines[0]).toContain('"to_state":"ISSUED"')
+
+    // AI-Review-3 / ADR-137: event okablowania dopiero po COMMIT.
+    expect(txLog).toEqual(["BEGIN", "COMMIT", "EMIT"])
   })
 
   it("replay (event-level dedupe) ⇒ ZERO ponownego okablowania (idempotencja)", async () => {

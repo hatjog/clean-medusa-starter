@@ -120,8 +120,15 @@ export function assertWiringTransition(
 export const ENTITLEMENT_STATE_CHANGED_EVENT_TYPE =
   "gp.entitlements.entitlement_state_changed.v1" as const
 
-/** Aktor envelope.v1 (`actor` enum — zgodnie z envelope.v1.schema.json). */
+/** Aktor domenowy audytu tranzycji. */
 export type TransitionActor = "system" | "customer" | "vendor" | "admin"
+
+/** Aktor publicznego eventu envelope.v1 (`actor` enum z envelope.v1.schema.json). */
+export type TransitionEventActor =
+  | "system"
+  | "end_customer"
+  | "vendor_user"
+  | "market_operator"
 
 /**
  * Scope tranzycji (ontologia FK 3.2). `instance_id` + `market_id` wymagane
@@ -141,8 +148,8 @@ export type TransitionEventEnvelope = {
   schema_version: "1"
   event_type: typeof ENTITLEMENT_STATE_CHANGED_EVENT_TYPE
   occurred_at: string
-  actor: TransitionActor
-  scope: TransitionScope
+  actor: TransitionEventActor
+  scope: Pick<TransitionScope, "instance_id" | "market_id" | "vendor_id" | "location_id">
   idempotency_key: string
   payload: {
     entitlement_id: string
@@ -336,6 +343,19 @@ function buildTransitionIdempotencyKey(
   return `entitlement:${entitlementId}:transition:${from}->${to}@${occurrence}`
 }
 
+function toEnvelopeActor(actor: TransitionActor): TransitionEventActor {
+  switch (actor) {
+    case "customer":
+      return "end_customer"
+    case "vendor":
+      return "vendor_user"
+    case "admin":
+      return "market_operator"
+    default:
+      return "system"
+  }
+}
+
 /**
  * Buduje parę kopert (event + audit) dla tranzycji. CZYSTA funkcja — bez I/O,
  * bez bramki, bez side-effectów. AC1 (kształt) + AC3 (brak zmiany taksonomii)
@@ -356,20 +376,26 @@ export function buildTransitionEnvelopes(
     input.to,
     occurrence
   )
-  const scope: TransitionScope = {
+  const auditScope: TransitionScope = {
     instance_id: input.scope.instance_id,
     market_id: input.scope.market_id,
     sales_channel_id: input.scope.sales_channel_id ?? null,
     vendor_id: input.scope.vendor_id ?? null,
     location_id: input.scope.location_id ?? null,
   }
+  const eventScope: TransitionEventEnvelope["scope"] = {
+    instance_id: auditScope.instance_id,
+    market_id: auditScope.market_id,
+    vendor_id: auditScope.vendor_id ?? null,
+    location_id: auditScope.location_id ?? null,
+  }
 
   const event: TransitionEventEnvelope = {
     schema_version: "1",
     event_type: ENTITLEMENT_STATE_CHANGED_EVENT_TYPE,
     occurred_at: occurredAt,
-    actor: input.actor,
-    scope,
+    actor: toEnvelopeActor(input.actor),
+    scope: eventScope,
     idempotency_key: idempotencyKey,
     payload: {
       entitlement_id: input.entitlement_id,
@@ -388,7 +414,7 @@ export function buildTransitionEnvelopes(
     from_state: input.from,
     to_state: input.to,
     occurred_at: occurredAt,
-    scope,
+    scope: auditScope,
     outcome: "transitioned",
     entitlement_id: input.entitlement_id,
     idempotency_key: idempotencyKey,
