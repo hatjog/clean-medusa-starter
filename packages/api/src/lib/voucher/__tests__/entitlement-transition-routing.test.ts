@@ -12,6 +12,7 @@
  * exclusivity zachowana) — to twardy gate dyspersji.
  */
 import { describe, it, expect } from "@jest/globals"
+import fs from "node:fs"
 import path from "node:path"
 
 import {
@@ -87,6 +88,49 @@ describe("Story 3.4 — checker dyspersji okablowania (czysta funkcja)", () => {
     expect(ALLOWED_LEDGER_WRITER_CALLSITES).toContain(
       "modules/voucher/entitlement-transition-wiring.ts"
     )
+  })
+
+  it("3.5: manifest klasyfikuje okablowane call-site'y E4 jako WIRED", () => {
+    for (const suffix of [
+      "modules/voucher/workflows/redeem-entitlement.ts",
+      "modules/voucher/service.ts",
+    ]) {
+      const callsite = TRANSITION_GUARD_CALLSITES.find((c) =>
+        c.suffix.endsWith(suffix)
+      )
+      expect(callsite?.status).toBe("WIRED")
+      expect(callsite?.note).toContain("3.5/E4")
+    }
+  })
+
+  it("3.5: WIRED call-site'y realnie wołają jednolity punkt okablowania", () => {
+    const srcRoot = path.resolve(__dirname, "../../..")
+    for (const suffix of [
+      "modules/voucher/workflows/redeem-entitlement.ts",
+      "modules/voucher/service.ts",
+    ]) {
+      const callsite = TRANSITION_GUARD_CALLSITES.find((c) =>
+        c.suffix.endsWith(suffix)
+      )
+      expect(callsite?.status).toBe("WIRED")
+      const content = fs.readFileSync(path.join(srcRoot, suffix), "utf8")
+      expect(content).toContain("wireEntitlementTransitionPersisted")
+    }
+  })
+
+  it("3.5: carry-out call-site'y pozostają jawnie E4_DEFERRED z uzasadnieniem", () => {
+    for (const suffix of [
+      "workflows/entitlements/issue-entitlement.ts",
+      "modules/voucher/workflows/reissue-lost-code.ts",
+      "modules/voucher/workflows/issue-retention.ts",
+      "api/v1/entitlements/claim/route.ts",
+    ]) {
+      const callsite = TRANSITION_GUARD_CALLSITES.find((c) =>
+        c.suffix.endsWith(suffix)
+      )
+      expect(callsite?.status).toBe("E4_DEFERRED")
+      expect(callsite?.note).toContain("carry-out v1.12.0")
+    }
   })
 })
 

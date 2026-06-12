@@ -35,6 +35,14 @@ import {
   type RefundChannel,
   validityMonthsMax,
 } from "./entitlement-boundary"
+import {
+  ENTITLEMENT_STATE_CHANGED_EVENT_TYPE,
+  emitTransitionEventAfterCommit,
+  wireEntitlementTransitionPersisted,
+  type TransitionAuditEnvelope,
+  type TransitionEventEnvelope,
+  type TransitionScope,
+} from "./entitlement-transition-wiring"
 
 // Local minimal shape for admin search projection (Layer 4-aware).
 // Mirrors fields from `lib/contracts/admin#EntitlementAdminView` that are
@@ -585,6 +593,48 @@ export class VoucherService {
     )
   }
 
+  private resolveTransitionScope(row: EntitlementInstanceResult): TransitionScope {
+    return {
+      instance_id: row.id,
+      market_id: row.market_id ?? "unknown",
+      sales_channel_id: row.sales_channel_id ?? null,
+      vendor_id: null,
+      location_id: null,
+    }
+  }
+
+  private async appendTransitionAudit(
+    client: Queryable,
+    audit: TransitionAuditEnvelope
+  ): Promise<void> {
+    await client.query(
+      `INSERT INTO voucher_event (id, voucher_code, entitlement_id, event_type, payload, occurred_at, created_at)
+       VALUES ($1, NULL, $2, $3, $4::jsonb, $5, NOW())
+       ON CONFLICT (id) DO NOTHING`,
+      [
+        audit.idempotency_key,
+        audit.entitlement_id,
+        audit.event_type,
+        JSON.stringify(audit),
+        audit.occurred_at,
+      ]
+    )
+  }
+
+  private async emitTransitionAfterCommit(
+    event: TransitionEventEnvelope
+  ): Promise<boolean> {
+    return emitTransitionEventAfterCommit(async (envelope) => {
+      if (!this.eventBus_) {
+        throw new Error("event bus niedostępny (transition emit best-effort)")
+      }
+      await this.eventBus_.emit({
+        name: ENTITLEMENT_STATE_CHANGED_EVENT_TYPE,
+        data: envelope,
+      })
+    }, event)
+  }
+
   private async getByCodeWithClient(
     client: Queryable,
     code: string
@@ -1043,6 +1093,7 @@ export class VoucherService {
     const opts: CancelBookingInput =
       input instanceof Date ? { current_time: input } : input
     const client = await this.getPool().connect()
+    let transitionEvent: TransitionEventEnvelope | undefined
 
     try {
       await client.query("BEGIN")
@@ -1145,6 +1196,23 @@ export class VoucherService {
           `VoucherService.cancel_booking: failed to update ${entitlement_id}`
         )
       }
+      const { event } = await wireEntitlementTransitionPersisted(
+        {
+          appendAudit: (audit) => this.appendTransitionAudit(client, audit),
+          clock: () => cancelledAt,
+        },
+        {
+          from: previousState,
+          to: EntitlementInstanceState.ACTIVE,
+          entitlement_id,
+          scope: this.resolveTransitionScope(current),
+          actor: "system",
+          actor_hint: "voucher:cancel_booking",
+          occurred_at: cancelledAt.toISOString(),
+          transition_seq: `${entitlement_id}:cancel_booking:${cancelledAt.toISOString()}`,
+        }
+      )
+      transitionEvent = event
 
       const updated = this.rowToEntitlementInstance(updateRes.rows[0])
       await this.emitEntitlementBookingCancelled(client, {
@@ -1159,6 +1227,9 @@ export class VoucherService {
       }
 
       await client.query("COMMIT")
+      if (transitionEvent) {
+        await this.emitTransitionAfterCommit(transitionEvent)
+      }
       return updated
     } catch (err) {
       await client.query("ROLLBACK")
@@ -1199,6 +1270,7 @@ export class VoucherService {
   ): Promise<MarkNoShowResult> {
     const client = await this.getPool().connect()
     let committed = false
+    let transitionEvent: TransitionEventEnvelope | undefined
 
     try {
       await client.query("BEGIN")
@@ -1272,6 +1344,23 @@ export class VoucherService {
       switch (policyValue) {
         case "forfeit_voucher": {
           assertTransition(current.state, EntitlementInstanceState.VOIDED)
+          const wired = await wireEntitlementTransitionPersisted(
+            {
+              appendAudit: (audit) => this.appendTransitionAudit(client, audit),
+              clock: () => new Date(markedAt),
+            },
+            {
+              from: current.state,
+              to: EntitlementInstanceState.VOIDED,
+              entitlement_id,
+              scope: this.resolveTransitionScope(current),
+              actor: "system",
+              actor_hint: input.actor ?? "voucher:mark_no_show:forfeit_voucher",
+              occurred_at: markedAt,
+              transition_seq: `${entitlement_id}:no_show:forfeit_voucher:${markedAt}`,
+            }
+          )
+          transitionEvent = wired.event
           newState = EntitlementInstanceState.VOIDED
           outcome = "forfeiture"
           await client.query(
@@ -1300,6 +1389,23 @@ export class VoucherService {
           newRemainingAmount = 0
           newState = EntitlementInstanceState.VOIDED
           assertTransition(current.state, EntitlementInstanceState.VOIDED)
+          const wired = await wireEntitlementTransitionPersisted(
+            {
+              appendAudit: (audit) => this.appendTransitionAudit(client, audit),
+              clock: () => new Date(markedAt),
+            },
+            {
+              from: current.state,
+              to: EntitlementInstanceState.VOIDED,
+              entitlement_id,
+              scope: this.resolveTransitionScope(current),
+              actor: "system",
+              actor_hint: input.actor ?? "voucher:mark_no_show:charge_full",
+              occurred_at: markedAt,
+              transition_seq: `${entitlement_id}:no_show:charge_full:${markedAt}`,
+            }
+          )
+          transitionEvent = wired.event
           outcome = "charge_full"
           await client.query(
             `UPDATE entitlement_instance
@@ -1318,6 +1424,23 @@ export class VoucherService {
         }
         case "vendor_decision": {
           assertTransition(current.state, EntitlementInstanceState.PENDING_VENDOR_DECISION)
+          const wired = await wireEntitlementTransitionPersisted(
+            {
+              appendAudit: (audit) => this.appendTransitionAudit(client, audit),
+              clock: () => new Date(markedAt),
+            },
+            {
+              from: current.state,
+              to: EntitlementInstanceState.PENDING_VENDOR_DECISION,
+              entitlement_id,
+              scope: this.resolveTransitionScope(current),
+              actor: "system",
+              actor_hint: input.actor ?? "voucher:mark_no_show:vendor_decision",
+              occurred_at: markedAt,
+              transition_seq: `${entitlement_id}:no_show:vendor_decision:${markedAt}`,
+            }
+          )
+          transitionEvent = wired.event
           newState = EntitlementInstanceState.PENDING_VENDOR_DECISION
           outcome = "vendor_decision"
           await client.query(
@@ -1356,6 +1479,9 @@ export class VoucherService {
 
       await client.query("COMMIT")
       committed = true
+      if (transitionEvent) {
+        await this.emitTransitionAfterCommit(transitionEvent)
+      }
 
       return {
         entitlement_id,

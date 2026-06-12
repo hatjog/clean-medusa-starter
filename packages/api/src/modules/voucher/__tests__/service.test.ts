@@ -464,8 +464,10 @@ describe("VoucherService", () => {
       expect(update?.sql).toContain("state = $2")
       expect(update?.sql).not.toContain("expires_at")
 
-      const eventInsert = capturedClientQueries.find((q) =>
-        q.sql.includes("INSERT INTO voucher_event")
+      const eventInsert = capturedClientQueries.find(
+        (q) =>
+          q.sql.includes("INSERT INTO voucher_event") &&
+          q.params[2] === "ENTITLEMENT_BOOKING_CANCELLED"
       )
       expect(eventInsert?.sql).toContain("payload")
       expect(eventInsert?.params[2]).toBe("ENTITLEMENT_BOOKING_CANCELLED")

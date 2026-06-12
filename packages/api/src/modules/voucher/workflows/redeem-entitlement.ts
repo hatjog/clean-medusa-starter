@@ -27,6 +27,14 @@ import {
   assertTransferabilityAllowed,
   type RedeemContext,
 } from "../entitlement-boundary"
+import {
+  ENTITLEMENT_STATE_CHANGED_EVENT_TYPE,
+  emitTransitionEventAfterCommit,
+  wireEntitlementTransitionPersisted,
+  type TransitionAuditEnvelope,
+  type TransitionEventEnvelope,
+  type TransitionScope,
+} from "../entitlement-transition-wiring"
 
 export const ENTITLEMENT_REDEEMED_EVENT_TYPE =
   "gp.entitlements.entitlement_redeemed.v1" as const
@@ -120,6 +128,7 @@ export interface RedeemEntitlementStore {
 
 export interface RedeemEntitlementTx {
   getEntitlementForUpdate(id: string): Promise<RedeemableEntitlement | null>
+  appendAudit(audit: TransitionAuditEnvelope): Promise<void>
   updateEntitlementState(
     id: string,
     fromState: EntitlementInstanceState,
@@ -129,7 +138,7 @@ export interface RedeemEntitlementTx {
 }
 
 export type RedeemEntitlementEventEmitter = {
-  emit: (envelope: RedeemEventEnvelope) => Promise<void>
+  emit: (envelope: RedeemEventEnvelope | TransitionEventEnvelope) => Promise<void>
 }
 
 export class RedeemEntitlementWorkflow {
@@ -171,11 +180,33 @@ export class RedeemEntitlementWorkflow {
         }
       }
 
+      const scope: TransitionScope = {
+        instance_id: ent.id,
+        market_id: ent.market_id ?? input.market_id ?? "unknown",
+        sales_channel_id: null,
+        vendor_id: null,
+        location_id: null,
+      }
+      const transitionEvents: TransitionEventEnvelope[] = []
+
       // Step 1: ACTIVE → REDEMPTION_REQUESTED (skip if already there).
       if (ent.state === EntitlementInstanceState.ACTIVE) {
         assertTransition(
           EntitlementInstanceState.ACTIVE,
           EntitlementInstanceState.REDEMPTION_REQUESTED
+        )
+        const { event } = await wireEntitlementTransitionPersisted(
+          { appendAudit: tx.appendAudit.bind(tx), clock: () => now },
+          {
+            from: EntitlementInstanceState.ACTIVE,
+            to: EntitlementInstanceState.REDEMPTION_REQUESTED,
+            entitlement_id: ent.id,
+            scope,
+            actor: "system",
+            actor_hint: "system:auto-redeem:booking-confirm",
+            occurred_at: now.toISOString(),
+            transition_seq: `${idempotencyKey}:request`,
+          }
         )
         await tx.updateEntitlementState(
           ent.id,
@@ -183,6 +214,7 @@ export class RedeemEntitlementWorkflow {
           EntitlementInstanceState.REDEMPTION_REQUESTED,
           now
         )
+        transitionEvents.push(event)
       } else if (ent.state !== EntitlementInstanceState.REDEMPTION_REQUESTED) {
         // State does not allow transition to REDEEMED_FULL — throws EntitlementTransitionError.
         assertTransition(ent.state, EntitlementInstanceState.REDEEMED_FULL)
@@ -193,21 +225,44 @@ export class RedeemEntitlementWorkflow {
         EntitlementInstanceState.REDEMPTION_REQUESTED,
         EntitlementInstanceState.REDEEMED_FULL
       )
+      const { event } = await wireEntitlementTransitionPersisted(
+        { appendAudit: tx.appendAudit.bind(tx), clock: () => now },
+        {
+          from: EntitlementInstanceState.REDEMPTION_REQUESTED,
+          to: EntitlementInstanceState.REDEEMED_FULL,
+          entitlement_id: ent.id,
+          scope,
+          actor: "system",
+          actor_hint: "system:auto-redeem:booking-confirm",
+          occurred_at: now.toISOString(),
+          transition_seq: `${idempotencyKey}:redeem`,
+        }
+      )
       await tx.updateEntitlementState(
         ent.id,
         EntitlementInstanceState.REDEMPTION_REQUESTED,
         EntitlementInstanceState.REDEEMED_FULL,
         now
       )
+      transitionEvents.push(event)
 
       return {
         result: buildResult(ent, input, now, idempotencyKey, false),
         shouldEmit: true,
+        transitionEvents,
       }
     })
 
     if (result.shouldEmit) {
-      // Post-COMMIT emit (cross-cut #3). Best-effort retry; propagates on
+      // Post-COMMIT emit (cross-cut #3). Transition events use the shared
+      // best-effort helper, so a double emit failure never creates a phantom
+      // pre-commit event and does not roll back the committed state.
+      for (const event of result.transitionEvents ?? []) {
+        await emitTransitionEventAfterCommit(this.events.emit, event)
+      }
+
+      // Legacy redeemed event remains observable for existing subscribers.
+      // Best-effort retry; propagates on
       // second failure so the caller observes the error (observable > silent drop).
       let emitError: unknown
       for (let attempt = 0; attempt < 2; attempt++) {
@@ -399,6 +454,21 @@ class PostgresRedeemEntitlementTx implements RedeemEntitlementTx {
       )
     }
   }
+
+  async appendAudit(audit: TransitionAuditEnvelope): Promise<void> {
+    await this.client.query(
+      `INSERT INTO voucher_event (id, voucher_code, entitlement_id, event_type, payload, occurred_at, created_at)
+       VALUES ($1, NULL, $2, $3, $4::jsonb, $5, NOW())
+       ON CONFLICT (id) DO NOTHING`,
+      [
+        audit.idempotency_key,
+        audit.entitlement_id,
+        audit.event_type,
+        JSON.stringify(audit),
+        audit.occurred_at,
+      ]
+    )
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -407,13 +477,19 @@ class PostgresRedeemEntitlementTx implements RedeemEntitlementTx {
 
 export class InMemoryRedeemEntitlementStore implements RedeemEntitlementStore {
   private rows: Map<string, RedeemableEntitlement>
+  private audits: TransitionAuditEnvelope[]
 
   constructor(rows: RedeemableEntitlement[] = []) {
     this.rows = new Map(rows.map((r) => [r.id, { ...r }]))
+    this.audits = []
   }
 
   get(id: string): RedeemableEntitlement | undefined {
     return this.rows.get(id)
+  }
+
+  listAudits(): TransitionAuditEnvelope[] {
+    return [...this.audits]
   }
 
   async withTransaction<T>(
@@ -422,10 +498,12 @@ export class InMemoryRedeemEntitlementStore implements RedeemEntitlementStore {
     const snapshot = new Map(
       [...this.rows.entries()].map(([id, r]) => [id, { ...r }])
     )
+    const auditsLen = this.audits.length
     try {
-      return await fn(new InMemoryRedeemEntitlementTx(this.rows))
+      return await fn(new InMemoryRedeemEntitlementTx(this.rows, this.audits))
     } catch (err) {
       this.rows = snapshot
+      this.audits.length = auditsLen
       throw err
     }
   }
@@ -433,7 +511,8 @@ export class InMemoryRedeemEntitlementStore implements RedeemEntitlementStore {
 
 class InMemoryRedeemEntitlementTx implements RedeemEntitlementTx {
   constructor(
-    private readonly rows: Map<string, RedeemableEntitlement>
+    private readonly rows: Map<string, RedeemableEntitlement>,
+    private readonly audits: TransitionAuditEnvelope[]
   ) {}
 
   async getEntitlementForUpdate(
@@ -458,6 +537,10 @@ class InMemoryRedeemEntitlementTx implements RedeemEntitlementTx {
     this.rows.set(id, { ...row, state: toState })
     void now
   }
+
+  async appendAudit(audit: TransitionAuditEnvelope): Promise<void> {
+    this.audits.push(audit)
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -467,7 +550,7 @@ class InMemoryRedeemEntitlementTx implements RedeemEntitlementTx {
 type EventBusLike = {
   emit?: (message: {
     name: string
-    data: RedeemEventEnvelope
+    data: RedeemEventEnvelope | TransitionEventEnvelope
   }) => Promise<unknown>
 }
 
@@ -486,7 +569,10 @@ export function createRedeemEntitlementWorkflowFromScope(scope: {
     {
       async emit(envelope) {
         await eventBus?.emit?.({
-          name: ENTITLEMENT_REDEEMED_EVENT_TYPE,
+          name:
+            envelope.event_type === ENTITLEMENT_STATE_CHANGED_EVENT_TYPE
+              ? ENTITLEMENT_STATE_CHANGED_EVENT_TYPE
+              : ENTITLEMENT_REDEEMED_EVENT_TYPE,
           data: envelope,
         })
       },
