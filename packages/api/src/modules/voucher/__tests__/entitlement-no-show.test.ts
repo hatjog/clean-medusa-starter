@@ -81,6 +81,7 @@ const BASE_INSTANCE: QueryRow = {
   entitlement_profile_id: "voucher-rezerwacja-otwarta",
   entitlement_type: EntitlementType.VOUCHER_SERVICE,
   order_id: "ord_001",
+  market_id: "mkt_bonbeauty_pl",
   state: EntitlementInstanceState.ACTIVE,
   booking_pointer: null,
   policy_snapshot: JSON.stringify({

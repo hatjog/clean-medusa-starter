@@ -103,7 +103,14 @@ describe("Story 3.4 — checker dyspersji okablowania (czysta funkcja)", () => {
     }
   })
 
-  it("3.5: WIRED call-site'y realnie wołają jednolity punkt okablowania", () => {
+  it("3.5: WIRED call-site'y realnie wołają jednolity punkt okablowania (parytet call-site)", () => {
+    // AC3a (MEDIUM finding AI-Review): for each WIRED file verify that every
+    // `assertTransition(` that precedes a persistent state change is accompanied by a
+    // nearby `wireEntitlementTransitionPersisted` call. The heuristic: scan each
+    // `assertTransition(` occurrence and check that within the next 20 lines there is
+    // a wiring call OR the assertTransition is on an error-only path (no state UPDATE
+    // follows). This prevents future silent dispersion inside already-WIRED files
+    // (the file-level "contains" check is insufficient — AI-Review finding).
     const srcRoot = path.resolve(__dirname, "../../..")
     for (const suffix of [
       "modules/voucher/workflows/redeem-entitlement.ts",
@@ -115,6 +122,33 @@ describe("Story 3.4 — checker dyspersji okablowania (czysta funkcja)", () => {
       expect(callsite?.status).toBe("WIRED")
       const content = fs.readFileSync(path.join(srcRoot, suffix), "utf8")
       expect(content).toContain("wireEntitlementTransitionPersisted")
+
+      // Call-site parity: every assertTransition( in a WIRED file must either:
+      //   (a) be followed by wireEntitlementTransitionPersisted within 20 lines, OR
+      //   (b) be on a throw-only guard path (next non-empty line throws / is else branch)
+      // This catches new dispersed assertTransition( added to WIRED files in future.
+      const lines = content.split("\n")
+      const WIRING_CALL = "wireEntitlementTransitionPersisted"
+      const dispersed: number[] = []
+      for (let i = 0; i < lines.length; i++) {
+        if (!lines[i].includes("assertTransition(")) continue
+        // Skip assertWiringTransition( (internal guard in wiring module itself)
+        if (lines[i].includes("assertWiringTransition")) continue
+        // Check if any of the next 20 lines contain wiring OR throw
+        const window = lines.slice(i + 1, i + 21)
+        const hasWiring = window.some((l) => l.includes(WIRING_CALL))
+        const isGuardThrow = window.some(
+          (l) =>
+            l.trim().startsWith("throw ") ||
+            l.trim().startsWith("} else if") ||
+            l.trim().startsWith("} else {") ||
+            l.trim() === "}"
+        )
+        if (!hasWiring && !isGuardThrow) {
+          dispersed.push(i + 1) // 1-based line number
+        }
+      }
+      expect(dispersed).toHaveLength(0) // all assertTransition( are wired or guard-only
     }
   })
 

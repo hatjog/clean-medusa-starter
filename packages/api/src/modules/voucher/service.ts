@@ -594,9 +594,18 @@ export class VoucherService {
   }
 
   private resolveTransitionScope(row: EntitlementInstanceResult): TransitionScope {
+    // Fail-closed: market_id is required for per-market isolation (NFR3, ADR-139 D5).
+    // A missing market_id is a data-integrity anomaly — silently substituting
+    // "unknown" would produce a misleading audit trail and break per-market posting
+    // gate checks when the gate is eventually activated (v2.0.0+ HG-4).
+    if (!row.market_id) {
+      throw new Error(
+        `VoucherService: entitlement ${row.id} has no market_id — cannot build TransitionScope (NFR3 fail-closed)`
+      )
+    }
     return {
       instance_id: row.id,
-      market_id: row.market_id ?? "unknown",
+      market_id: row.market_id,
       sales_channel_id: row.sales_channel_id ?? null,
       vendor_id: null,
       location_id: null,
@@ -1094,6 +1103,7 @@ export class VoucherService {
       input instanceof Date ? { current_time: input } : input
     const client = await this.getPool().connect()
     let transitionEvent: TransitionEventEnvelope | undefined
+    let committed = false
 
     try {
       await client.query("BEGIN")
@@ -1209,7 +1219,9 @@ export class VoucherService {
           actor: "system",
           actor_hint: "voucher:cancel_booking",
           occurred_at: cancelledAt.toISOString(),
-          transition_seq: `${entitlement_id}:cancel_booking:${cancelledAt.toISOString()}`,
+          // Stable key: entitlement_id + operation suffix — no timestamp so retry
+          // produces the same id (ON CONFLICT DO NOTHING deduplicates the audit row).
+          transition_seq: `${entitlement_id}:cancel_booking`,
         }
       )
       transitionEvent = event
@@ -1227,12 +1239,18 @@ export class VoucherService {
       }
 
       await client.query("COMMIT")
+      committed = true
+      // Post-COMMIT emit: outside the ROLLBACK scope so a failing emit never
+      // triggers an erroneous ROLLBACK on an already-committed transaction
+      // (symmetric with mark_no_show — LOW finding AI-Review cancel_booking).
       if (transitionEvent) {
         await this.emitTransitionAfterCommit(transitionEvent)
       }
       return updated
     } catch (err) {
-      await client.query("ROLLBACK")
+      if (!committed) {
+        await client.query("ROLLBACK")
+      }
       throw err
     } finally {
       client.release()
@@ -1357,7 +1375,9 @@ export class VoucherService {
               actor: "system",
               actor_hint: input.actor ?? "voucher:mark_no_show:forfeit_voucher",
               occurred_at: markedAt,
-              transition_seq: `${entitlement_id}:no_show:forfeit_voucher:${markedAt}`,
+              // Stable key without timestamp — retry produces same id so ON CONFLICT
+              // DO NOTHING deduplicates the audit row (LOW finding AI-Review seq-key).
+              transition_seq: `${entitlement_id}:no_show:forfeit_voucher`,
             }
           )
           transitionEvent = wired.event
@@ -1402,7 +1422,7 @@ export class VoucherService {
               actor: "system",
               actor_hint: input.actor ?? "voucher:mark_no_show:charge_full",
               occurred_at: markedAt,
-              transition_seq: `${entitlement_id}:no_show:charge_full:${markedAt}`,
+              transition_seq: `${entitlement_id}:no_show:charge_full`,
             }
           )
           transitionEvent = wired.event
@@ -1437,7 +1457,7 @@ export class VoucherService {
               actor: "system",
               actor_hint: input.actor ?? "voucher:mark_no_show:vendor_decision",
               occurred_at: markedAt,
-              transition_seq: `${entitlement_id}:no_show:vendor_decision:${markedAt}`,
+              transition_seq: `${entitlement_id}:no_show:vendor_decision`,
             }
           )
           transitionEvent = wired.event

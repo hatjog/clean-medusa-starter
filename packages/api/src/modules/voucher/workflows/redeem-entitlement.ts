@@ -180,9 +180,16 @@ export class RedeemEntitlementWorkflow {
         }
       }
 
+      // Fail-closed: market_id is required for per-market isolation (NFR3, ADR-139 D5).
+      const resolvedScopeMarketId = ent.market_id ?? input.market_id
+      if (!resolvedScopeMarketId) {
+        throw new Error(
+          `autoRedeemEntitlement: entitlement ${ent.id} has no market_id — cannot build TransitionScope (NFR3 fail-closed)`
+        )
+      }
       const scope: TransitionScope = {
         instance_id: ent.id,
-        market_id: ent.market_id ?? input.market_id ?? "unknown",
+        market_id: resolvedScopeMarketId,
         sales_channel_id: null,
         vendor_id: null,
         location_id: null,
@@ -317,11 +324,14 @@ function buildResult(
   // created_at, updated_at). So ent.market_id will always be null/undefined until the
   // column is added. At wiring time (v1.9.0+), pass market_id via RedeemEntitlementInput
   // from the booking-confirmation event context.
+  // Fail-closed: market_id is required for per-market scope of the event envelope
+  // (NFR3, ADR-139 D5). No sentinel — missing market_id is a data anomaly that must
+  // be surfaced, not silently substituted (LOW finding AI-Review sentinel).
   const resolvedMarketId = ent.market_id ?? input.market_id
   if (!resolvedMarketId) {
-    // "unknown" satisfies schema minLength:1 but is semantically incorrect.
-    // This fallback must be resolved when the subscriber is wired to a real event.
-    // Apply-path: derive market_id from the booking-confirmation event payload.
+    throw new Error(
+      `buildResult: entitlement ${ent.id} has no market_id — cannot build RedeemEventEnvelope (NFR3 fail-closed)`
+    )
   }
   const event: RedeemEventEnvelope = {
     schema_version: "1",
@@ -332,7 +342,7 @@ function buildResult(
     actor: "system",
     scope: {
       instance_id: ent.id,
-      market_id: resolvedMarketId ?? "unknown",
+      market_id: resolvedMarketId,
     },
     idempotency_key: idempotencyKey,
     payload: {

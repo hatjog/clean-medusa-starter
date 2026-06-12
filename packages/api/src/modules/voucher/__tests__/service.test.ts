@@ -154,6 +154,7 @@ const ENTITLEMENT_REBOOK_ROW: EntitlementTestRow = {
   entitlement_profile_id: "voucher-rezerwacja-otwarta",
   entitlement_type: EntitlementType.VOUCHER_SERVICE,
   order_id: "ord_rebook_001",
+  market_id: "mkt_bonbeauty_pl",
   state: EntitlementInstanceState.REDEMPTION_REQUESTED,
   policy_snapshot: SERVICE_POLICY,
   booking_pointer: "booking_abc_123",
