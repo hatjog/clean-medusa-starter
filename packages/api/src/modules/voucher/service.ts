@@ -581,24 +581,30 @@ export class VoucherService {
     )
   }
 
-  // ---------------------------------------------------------------------------
-  // Public API
-  // ---------------------------------------------------------------------------
-
-  async getByCode(code: string): Promise<VoucherWithEvents | null> {
-    const pool = this.getPool()
-    const vResult = await pool.query<Record<string, unknown>>(
+  private async getByCodeWithClient(
+    client: Queryable,
+    code: string
+  ): Promise<VoucherWithEvents | null> {
+    const vResult = await client.query<Record<string, unknown>>(
       `SELECT * FROM voucher WHERE code = $1`,
       [code]
     )
     if (vResult.rows.length === 0) return null
     const voucher = this.rowToVoucher(vResult.rows[0])
 
-    const eResult = await pool.query<Record<string, unknown>>(
+    const eResult = await client.query<Record<string, unknown>>(
       `SELECT * FROM voucher_event WHERE voucher_code = $1 ORDER BY occurred_at ASC`,
       [code]
     )
     return { ...voucher, events: eResult.rows.map((r) => this.rowToEvent(r)) }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Public API
+  // ---------------------------------------------------------------------------
+
+  async getByCode(code: string): Promise<VoucherWithEvents | null> {
+    return this.getByCodeWithClient(this.getPool(), code)
   }
 
   async listCodes(): Promise<string[]> {
@@ -1372,10 +1378,10 @@ export class VoucherService {
 
   async claim(
     code: string,
-    opts: { now?: Date } = {}
+    opts: { now?: Date; client?: Queryable } = {}
   ): Promise<ClaimResult> {
-    const pool = this.getPool()
     const now = opts.now ?? new Date()
+    const txClient = opts.client ?? null
 
     // v1.9.0 Wave F6 HIGH-09 — the previous unlocked existence/expiry/already-
     // claimed pre-check formed a TOCTOU window with the FOR UPDATE block
@@ -1384,23 +1390,25 @@ export class VoucherService {
     // equivalent, but the early-out spares the connection acquisition) and
     // move expiry / already-claimed branching INSIDE the lock so all state
     // observations come from the same locked snapshot.
-    const voucher = await this.getByCode(code)
+    const voucher = txClient
+      ? await this.getByCodeWithClient(txClient, code)
+      : await this.getByCode(code)
     if (!voucher) return { status: "not_found", voucher: null }
 
     // F2 fix: Atomic status transition + event append in a transaction.
     // Use SELECT ... FOR UPDATE to lock the row, then conditional UPDATE
     // gated on status<>'claimed' so concurrent callers cannot double-fire
     // the `claimed` event.
-    const client = await pool.connect()
+    const client = txClient ?? await this.getPool().connect()
     let didTransition = false
     try {
-      await client.query("BEGIN")
+      if (!txClient) await client.query("BEGIN")
       const lockRes = await client.query<{ status: string; expires_at: Date | null }>(
         `SELECT status, expires_at FROM voucher WHERE code = $1 FOR UPDATE`,
         [code]
       )
       if (lockRes.rows.length === 0) {
-        await client.query("ROLLBACK")
+        if (!txClient) await client.query("ROLLBACK")
         return { status: "not_found", voucher: null }
       }
       const lockedStatus = lockRes.rows[0].status
@@ -1408,13 +1416,17 @@ export class VoucherService {
         ? new Date(lockRes.rows[0].expires_at)
         : null
       if (lockedStatus === "claimed") {
-        await client.query("ROLLBACK")
-        const current = await this.getByCode(code)
+        if (!txClient) await client.query("ROLLBACK")
+        const current = txClient
+          ? await this.getByCodeWithClient(txClient, code)
+          : await this.getByCode(code)
         return { status: "already_claimed", voucher: current ?? voucher }
       }
       if (lockedExpires && lockedExpires < now) {
-        await client.query("ROLLBACK")
-        const current = await this.getByCode(code)
+        if (!txClient) await client.query("ROLLBACK")
+        const current = txClient
+          ? await this.getByCodeWithClient(txClient, code)
+          : await this.getByCode(code)
         return { status: "expired", voucher: current ?? voucher }
       }
       const updRes = await client.query(
@@ -1431,15 +1443,17 @@ export class VoucherService {
         )
         didTransition = true
       }
-      await client.query("COMMIT")
+      if (!txClient) await client.query("COMMIT")
     } catch (err) {
-      await client.query("ROLLBACK")
+      if (!txClient) await client.query("ROLLBACK")
       throw err
     } finally {
-      client.release()
+      if (!txClient) (client as PoolClient).release()
     }
 
-    const updated = await this.getByCode(code)
+    const updated = txClient
+      ? await this.getByCodeWithClient(txClient, code)
+      : await this.getByCode(code)
     if (!updated) throw new Error(`VoucherService.claim: failed to read back ${code}`)
     if (!didTransition) {
       // Race lost — a concurrent caller already transitioned to claimed.

@@ -30,15 +30,15 @@ import {
   _getAuditLog,
 } from "../../../api/store/vouchers/[code]/claim/helpers"
 import { Modules } from "@medusajs/framework/utils"
-import type { VoucherWithEvents } from "../../../modules/voucher"
+import { VoucherService, type VoucherWithEvents } from "../../../modules/voucher"
 
 // ---------------------------------------------------------------------------
 // VoucherService mock factory
 // ---------------------------------------------------------------------------
 
 type MockVoucherService = {
-  getByCode: jest.Mock
-  claim: jest.Mock
+  getByCode: jest.Mock | ((code: string) => Promise<VoucherWithEvents | null>)
+  claim: jest.Mock | ((code: string, opts?: Record<string, unknown>) => Promise<unknown>)
 }
 
 function makeMockVoucherService(defaults?: {
@@ -65,6 +65,140 @@ function makeMockVoucherService(defaults?: {
   }
 }
 
+type FakeBindingRow = {
+  binding_hash: string
+  code: string
+  claimed_at: string
+  response_status: number | null
+  response_body: Record<string, unknown> | null
+  expires_at: Date
+}
+
+class FakeClaimPg {
+  bindings = new Map<string, FakeBindingRow>()
+  audits: Array<Record<string, unknown>> = []
+  vouchers = new Map<string, VoucherWithEvents>()
+  claimUpdates = 0
+
+  constructor(vouchers: VoucherWithEvents[]) {
+    for (const voucher of vouchers) {
+      this.vouchers.set(voucher.code, {
+        ...voucher,
+        events: [...voucher.events],
+      })
+    }
+  }
+
+  async connect(): Promise<FakeClaimPg> {
+    return this
+  }
+
+  release(): void {
+    // no-op fake client
+  }
+
+  async query<T = Record<string, unknown>>(
+    sql: string,
+    values: ReadonlyArray<unknown> = []
+  ): Promise<{ rows: T[]; rowCount: number }> {
+    const compact = sql.replace(/\s+/g, " ").trim()
+
+    if (["BEGIN", "COMMIT", "ROLLBACK"].includes(compact)) {
+      return { rows: [], rowCount: 0 }
+    }
+
+    if (compact.startsWith("INSERT INTO voucher_claim_binding")) {
+      const [idempotencyKey, bindingHash, code, claimedAt] = values as string[]
+      if (this.bindings.has(idempotencyKey)) return { rows: [], rowCount: 0 }
+      this.bindings.set(idempotencyKey, {
+        binding_hash: bindingHash,
+        code,
+        claimed_at: claimedAt,
+        response_status: null,
+        response_body: null,
+        expires_at: new Date(Date.now() + 24 * 60 * 60 * 1000),
+      })
+      return { rows: [], rowCount: 1 }
+    }
+
+    if (compact.startsWith("SELECT binding_hash, response_status, response_body")) {
+      const row = this.bindings.get(values[0] as string)
+      return { rows: (row ? [row] : []) as T[], rowCount: row ? 1 : 0 }
+    }
+
+    if (compact.startsWith("UPDATE voucher_claim_binding")) {
+      const [idempotencyKey, status, body] = values
+      const row = this.bindings.get(idempotencyKey as string)
+      if (!row) return { rows: [], rowCount: 0 }
+      row.response_status = Number(status)
+      row.response_body =
+        typeof body === "string"
+          ? JSON.parse(body) as Record<string, unknown>
+          : body as Record<string, unknown>
+      return { rows: [], rowCount: 1 }
+    }
+
+    if (compact.startsWith("INSERT INTO voucher_claim_audit")) {
+      const [idempotencyKey, code, ip, outcome, occurredAt] = values
+      this.audits.push({ idempotencyKey, code, ip, outcome, occurredAt })
+      return { rows: [], rowCount: 1 }
+    }
+
+    if (compact === "SELECT * FROM voucher WHERE code = $1") {
+      const voucher = this.vouchers.get(values[0] as string)
+      return { rows: (voucher ? [this.voucherRow(voucher)] : []) as T[], rowCount: voucher ? 1 : 0 }
+    }
+
+    if (compact.startsWith("SELECT * FROM voucher_event WHERE voucher_code = $1")) {
+      const voucher = this.vouchers.get(values[0] as string)
+      return { rows: (voucher?.events ?? []) as T[], rowCount: voucher?.events.length ?? 0 }
+    }
+
+    if (compact.startsWith("SELECT status, expires_at FROM voucher WHERE code = $1 FOR UPDATE")) {
+      const voucher = this.vouchers.get(values[0] as string)
+      return {
+        rows: (voucher ? [{ status: voucher.status, expires_at: voucher.expires_at }] : []) as T[],
+        rowCount: voucher ? 1 : 0,
+      }
+    }
+
+    if (compact.startsWith("UPDATE voucher SET status = 'claimed'")) {
+      const voucher = this.vouchers.get(values[0] as string)
+      if (!voucher || voucher.status === "claimed") return { rows: [], rowCount: 0 }
+      voucher.status = "claimed"
+      voucher.updated_at = new Date()
+      this.claimUpdates += 1
+      return { rows: [], rowCount: 1 }
+    }
+
+    if (compact.startsWith("INSERT INTO voucher_event")) {
+      const [id, code, occurredAt] = values
+      const voucher = this.vouchers.get(code as string)
+      voucher?.events.push({
+        id: id as string,
+        voucher_code: code as string,
+        event_type: "claimed",
+        occurred_at: occurredAt as Date,
+        created_at: new Date(),
+      })
+      return { rows: [], rowCount: 1 }
+    }
+
+    throw new Error(`unexpected fake query: ${compact}`)
+  }
+
+  private voucherRow(voucher: VoucherWithEvents): Record<string, unknown> {
+    const { events: _events, ...row } = voucher
+    return row
+  }
+}
+
+function makePgVoucherService(pg: FakeClaimPg): VoucherService {
+  const service = new VoucherService()
+  service._testPool = pg as never
+  return service
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -73,7 +207,7 @@ function makeReq(
   code: string,
   body: Record<string, unknown> = {},
   ip = "127.0.0.1",
-  voucherService?: MockVoucherService,
+  voucherService?: MockVoucherService | VoucherService,
   extraScope?: { resolve: (key: string) => unknown },
 ): {
   params: { code: string }
@@ -396,6 +530,76 @@ describe("POST /store/vouchers/:code/claim", () => {
     await POST(req2 as never, res2 as never)
     expect(res2._status).toBe(200)
     expect((res2._body as Record<string, unknown>).idempotent).toBe(true)
+  })
+
+  it("Story 6.1 AC1 — PG binding survives in-memory reset and replays original response", async () => {
+    const body = validBody()
+    const pg = new FakeClaimPg([IDLE_VOUCHER])
+    const service = makePgVoucherService(pg)
+    const scope = {
+      resolve: (key: string) => {
+        if (key === "__pg_pool__") return pg
+        throw new Error(`unexpected resolve: ${key}`)
+      },
+    }
+
+    const res1 = makeRes()
+    await POST(
+      makeReq(IDLE_VOUCHER.code, body, "127.0.0.1", service, scope) as never,
+      res1 as never
+    )
+    expect(res1._status).toBe(200)
+    expect(pg.claimUpdates).toBe(1)
+
+    _clearBindingStore()
+    _clearAuditLog()
+
+    const res2 = makeRes()
+    await POST(
+      makeReq(IDLE_VOUCHER.code, body, "127.0.0.2", service, scope) as never,
+      res2 as never
+    )
+
+    expect(res2._status).toBe(200)
+    expect(res2._body).toEqual(res1._body)
+    expect(pg.claimUpdates).toBe(1)
+    expect(_getAuditLog()).toHaveLength(0)
+    expect(pg.audits.map((row) => row.outcome)).toEqual(["ok", "idempotent_replay"])
+  })
+
+  it("Story 6.1 AC1 — PG replay mismatch writes durable audit and does not mutate twice", async () => {
+    const body = validBody()
+    const pg = new FakeClaimPg([IDLE_VOUCHER])
+    const service = makePgVoucherService(pg)
+    const scope = {
+      resolve: (key: string) => {
+        if (key === "__pg_pool__") return pg
+        throw new Error(`unexpected resolve: ${key}`)
+      },
+    }
+
+    await POST(
+      makeReq(IDLE_VOUCHER.code, body, "127.0.0.1", service, scope) as never,
+      makeRes() as never
+    )
+
+    const res = makeRes()
+    await POST(
+      makeReq(
+        IDLE_VOUCHER.code,
+        { ...body, recipient_session: "tampered-session" },
+        "127.0.0.1",
+        service,
+        scope
+      ) as never,
+      res as never
+    )
+
+    expect(res._status).toBe(409)
+    expect((res._body as Record<string, unknown>).type).toBe("replay_mismatch")
+    expect(pg.claimUpdates).toBe(1)
+    expect(pg.audits.map((row) => row.outcome)).toEqual(["ok", "replay_tampered"])
+    expect(_getAuditLog()).toHaveLength(0)
   })
 
   it("AC3 — replay with tampered session → 409 replay_mismatch", async () => {
