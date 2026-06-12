@@ -7,7 +7,6 @@ import type { Knex } from "knex";
 import { marketContextStorage } from "../../../../lib/market-context";
 import { filterProductIdsByFilters } from "../../../../lib/product-market-scope";
 import { augmentProductsWithVendorMeta } from "../../../../lib/multi-vendor-resolver";
-import { getFlagState } from "../../../../lib/feature-flag-tri-state";
 
 const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -271,9 +270,7 @@ export async function GET(req: MedusaRequest, res: MedusaResponse) {
     });
   }
 
-  if (await getFlagState("multi_vendor_pdp", db) === "on") {
-    await augmentProductsWithVendorMeta(orderedProducts as Array<Record<string, unknown>>, db);
-  }
+  await augmentProductsWithVendorMeta(orderedProducts as Array<Record<string, unknown>>, db);
 
   // Return pipeline total count for pagination UI.
   // orderedProducts.length is the current page size (≤ limit).
