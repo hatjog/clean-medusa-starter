@@ -12,6 +12,16 @@ type QueryGraphResult = {
   data: Array<Record<string, unknown>>;
 };
 
+type AuthenticatedStoreRequest = MedusaRequest & {
+  auth_context?: {
+    actor_id?: string;
+  };
+};
+
+type QueryGraph = {
+  graph: (input: Record<string, unknown>) => Promise<QueryGraphResult>;
+};
+
 type CreateReviewWorkflowModule = {
   createReviewWorkflow: {
     run: (input: {
@@ -31,23 +41,29 @@ function getCreateReviewWorkflow() {
   ).createReviewWorkflow;
 }
 
-export async function POST(req: MedusaRequest, res: MedusaResponse) {
+function getCustomerId(req: AuthenticatedStoreRequest): string | undefined {
+  const actorId = req.auth_context?.actor_id;
+  return typeof actorId === "string" && actorId.length > 0 ? actorId : undefined;
+}
+
+function resolveQueryGraph(req: MedusaRequest): QueryGraph {
+  return req.scope.resolve(ContainerRegistrationKeys.QUERY) as QueryGraph;
+}
+
+export async function POST(req: AuthenticatedStoreRequest, res: MedusaResponse) {
   const createReviewWorkflow = getCreateReviewWorkflow();
   const { result } = await createReviewWorkflow.run({
     container: req.scope,
     input: {
       ...(req.validatedBody as Record<string, unknown>),
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      customer_id: (req as any).auth_context?.actor_id,
+      customer_id: getCustomerId(req),
     },
   });
 
-  const query = req.scope.resolve(ContainerRegistrationKeys.QUERY) as {
-    graph: (input: Record<string, unknown>) => Promise<QueryGraphResult>;
-  };
+  const query = resolveQueryGraph(req);
   const {
     data: [review],
-  } = await (query as any).graph({
+  } = await query.graph({
     entity: "review",
     fields: req.queryConfig.fields,
     filters: {
@@ -102,9 +118,7 @@ export async function GET(req: MedusaRequest, res: MedusaResponse) {
   const fields = req.queryConfig.fields.includes("id")
     ? req.queryConfig.fields
     : [...req.queryConfig.fields, "id"];
-  const query = req.scope.resolve(ContainerRegistrationKeys.QUERY) as {
-    graph: (input: Record<string, unknown>) => Promise<QueryGraphResult>;
-  };
+  const query = resolveQueryGraph(req);
   const { data: reviews } = await query.graph({
     entity: "review",
     fields,

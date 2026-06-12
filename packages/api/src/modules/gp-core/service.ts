@@ -216,7 +216,7 @@ export default class GpCoreService {
     return null
   }
 
-  private getCorePool(): Pool {
+  getCorePool(): Pool {
     if (!this.corePool_) {
       this.corePool_ = new Pool({
         connectionString: resolveGpCoreDatabaseUrl(this.moduleOptions_.databaseUrl),

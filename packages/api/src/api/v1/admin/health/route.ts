@@ -8,6 +8,7 @@
  */
 import type { MedusaRequest, MedusaResponse } from "@medusajs/framework/http"
 import net from "node:net"
+import type { Pool } from "pg"
 import { withOperatorAuth } from "../../../../middlewares/with-operator-auth"
 import GpCoreService from "../../../../modules/gp-core/service"
 
@@ -80,8 +81,12 @@ async function checkHttp(
   }
 }
 
-function getGpCoreService(req: MedusaRequest): GpCoreService {
-  return req.scope.resolve("gpCoreService") as GpCoreService
+type GpCoreServiceWithPool = GpCoreService & {
+  getCorePool: () => Pool
+}
+
+function getGpCoreService(req: MedusaRequest): GpCoreServiceWithPool {
+  return req.scope.resolve("gpCoreService") as GpCoreServiceWithPool
 }
 
 export const GET = withOperatorAuth(async (req, res) => {
@@ -103,7 +108,7 @@ export const GET = withOperatorAuth(async (req, res) => {
     const dbHealth = await gpCore.healthCheck()
     if (dbHealth.core) {
       // These use the internal pool — safe to call
-      const pool = (gpCore as any).getCorePool()
+      const pool = gpCore.getCorePool()
 
       const statsResult = await pool.query(
         `SELECT status, COUNT(*)::int AS count FROM entitlements GROUP BY status`
