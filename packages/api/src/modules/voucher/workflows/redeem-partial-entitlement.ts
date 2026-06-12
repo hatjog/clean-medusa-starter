@@ -390,7 +390,6 @@ async function resolveRedeemSpend(
   tx: RedeemPartialTx,
   ent: RedeemableAmountEntitlement,
   input: RedeemPartialInput,
-  redemptionId: string,
   totalGross: number
 ): Promise<ResolvedRedeemSpend> {
   if (AMOUNT_REDEEMABLE_TYPES.has(ent.entitlement_type)) {
@@ -459,6 +458,16 @@ async function resolveRedeemSpend(
           `(status=${item.status}, remaining=${item.remaining_minor})`
       )
     }
+    // INFO-3 (defensive assertion): walidacja zgodności market_id pozycji z
+    // entitlementem. Ochrona przed cross-market access do czasu aktywacji
+    // pełnej polityki RLS na entitlement_choice_set_item (Epic 1, ADR-141).
+    // FK instance_id zapewnia powiązanie, ale market_id jest dodatkową warstwą.
+    if (ent.market_id && item.market_id && item.market_id !== ent.market_id) {
+      throw new RedeemChoiceSetItemError(
+        `redeem: choice_set_item_id=${choiceSetItemId} należy do market=${item.market_id}, ` +
+          `ale entitlement ${ent.id} jest w market=${ent.market_id} (cross-market odrzucony)`
+      )
+    }
 
     const remainingBefore = items.reduce(
       (sum, i) => sum + Math.max(0, i.remaining_minor),
@@ -484,6 +493,14 @@ async function resolveRedeemSpend(
         remainingBefore
       )
     }
+    // LOW-1 (latent pre-flip invariant): payload postingu przekazuje net/vat CAŁEGO
+    // vouchera przy emisji (pochodna totalGross), a redeemed_gross_minor = wartość
+    // jednej pozycji choice_set. Proporcjonalna derecognition VAT dla BUNDLE liczy się
+    // per pozycja (redeemed_gross_minor / totalGross * vat). Wymagany niezmiennik:
+    // Σ remaining_minor wszystkich pozycji choice_set == voucher_net_minor + voucher_vat_minor.
+    // Posting jest INERT (runtime_enabled:false, HG-4 DEFERRED v2.0.0+), więc brak
+    // skutku finansowego. Zwalidować/zakontraktować w posting-profile BUNDLE (3.3)
+    // PRZED aktywacją finance-flip (hard-gate Story 3.9/E6/P6).
 
     const availableChoiceSetItemIds = items
       .filter(
@@ -492,7 +509,6 @@ async function resolveRedeemSpend(
       )
       .map((i) => i.id)
 
-    void redemptionId
     return {
       amount,
       remainingBefore,
@@ -556,7 +572,37 @@ export class RedeemPartialEntitlementOperation {
             prior.remaining_after_minor + prior.amount_minor
           )
         }
-        return { kind: "replay" as const, record: prior }
+
+        // L7: BUNDLE replay — wykryj dryf choice_set_item_id przez odczyt pozycji
+        // choice_set (bez zmiany schematu voucher_redemption). Pozycja skonsumowana
+        // przez prior.redemption_id jest trwałym śladem w entitlement_choice_set_item.
+        // Jeśli caller podaje inny choice_set_item_id ⇒ fail-loud (asymetria kontraktu
+        // eliminowana; test/prod behaviour ujednolicone przez odczyt z DB, nie z rekordu).
+        let replayAvailableChoiceSetItemIds: string[] | undefined
+        if (ent.entitlement_type === BUNDLE_REDEEMABLE_TYPE) {
+          const replayItems = await tx.getChoiceSetItemsForUpdate(ent.id)
+          const redeemedItem = replayItems.find(
+            (i) => i.redemption_id === prior.redemption_id
+          )
+          if (input.choice_set_item_id && redeemedItem && redeemedItem.id !== input.choice_set_item_id) {
+            throw new RedeemChoiceSetItemError(
+              `redeem: param drift (BUNDLE) — idempotency_key=${idempotencyKey} już użyty dla ` +
+                `choice_set_item_id=${redeemedItem.id}, teraz podano ${input.choice_set_item_id} ` +
+                `(dryf pozycji choice_set; fail-closed, AC2)`
+            )
+          }
+          // Zwróć aktualną listę dostępnych pozycji (nie skonsumowanych) dla replay BUNDLE
+          // aby zachować spójny kształt wyniku z ścieżką "applied" (AC2 „pozostałe pokazane").
+          replayAvailableChoiceSetItemIds = replayItems
+            .filter((i) => i.status === "ACTIVE" && i.remaining_minor > 0)
+            .map((i) => i.id)
+        }
+
+        return {
+          kind: "replay" as const,
+          record: prior,
+          replayAvailableChoiceSetItemIds,
+        }
       }
 
       // ── Inwarianty redeemowalności (fail-closed) ──────────────────────────
@@ -582,7 +628,6 @@ export class RedeemPartialEntitlementOperation {
         tx,
         ent,
         input,
-        redemptionId,
         totalGross
       )
       const {
@@ -757,6 +802,11 @@ export class RedeemPartialEntitlementOperation {
         remaining_after_minor: rec.remaining_after_minor,
         ...(rec.choice_set_item_id
           ? { choice_set_item_id: rec.choice_set_item_id }
+          : {}),
+        // L7: BUNDLE replay zwraca aktualną listę dostępnych pozycji (pobrana w tx),
+        // ujednolicając kształt wyniku ze ścieżką "applied" (AC2 „pozostałe pokazane").
+        ...(txOut.replayAvailableChoiceSetItemIds !== undefined
+          ? { available_choice_set_item_ids: txOut.replayAvailableChoiceSetItemIds }
           : {}),
         withdrawal_right_extinguished: isWithdrawalRightExtinguished(
           rec.resulting_state

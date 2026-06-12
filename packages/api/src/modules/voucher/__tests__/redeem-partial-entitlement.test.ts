@@ -449,6 +449,55 @@ describe("Story 3.7 AC2 — BUNDLE consume pojedynczej pozycji choice_set", () =
     expect(fake.txRows).toHaveLength(1)
     expect(fake.txRows[0][2]).toBe(VOUCHER_BUNDLE_POSTING_PROFILE_ID)
   })
+
+  // L7 — BUNDLE replay zwraca available_choice_set_item_ids (AC2 „pozostałe pokazane")
+  it("BUNDLE replay zwraca available_choice_set_item_ids — kształt wyniku spójny z applied", async () => {
+    const { rows, choiceSetItems } = makeBundleRows()
+    const { op } = makeOp({ rows, choiceSetItems })
+
+    const first = await op.redeem(bundleInput())
+    const replay = await op.redeem(bundleInput())
+
+    expect(replay.idempotent).toBe(true)
+    expect(replay.redemption_id).toBe(first.redemption_id)
+    // Replay BUNDLE musi zwracać dostępne pozycje (AC2 — „pozostałe pokazane").
+    expect(replay.available_choice_set_item_ids).toBeDefined()
+    // choice_1 skonsumowany ⇒ tylko choice_2 w dostępnych.
+    expect(replay.available_choice_set_item_ids).toEqual(["choice_2"])
+  })
+
+  // L7 — BUNDLE param-drift: ten sam idempotency_key, inny choice_set_item_id ⇒ fail-loud
+  it("BUNDLE replay z innym choice_set_item_id ⇒ RedeemChoiceSetItemError (fail-loud, NIE cichy)", async () => {
+    const { rows, choiceSetItems } = makeBundleRows()
+    const { op } = makeOp({ rows, choiceSetItems })
+
+    // Pierwsza realizacja choice_1 pod kluczem bundle-drift.
+    await op.redeem(bundleInput({ idempotency_key: "bundle-drift" }))
+    // Replay z TYM SAMYM kluczem ale INNYM choice_set_item_id ⇒ fail-loud.
+    await expect(
+      op.redeem(bundleInput({ idempotency_key: "bundle-drift", choice_set_item_id: "choice_2" }))
+    ).rejects.toBeInstanceOf(RedeemChoiceSetItemError)
+  })
+
+  // INFO-3 — cross-market odrzucony dla pozycji choice_set z innego market_id
+  it("BUNDLE pozycja z innym market_id niż entitlement ⇒ RedeemChoiceSetItemError (cross-market)", async () => {
+    const rows = [
+      makeEntitlement({
+        id: "ent_bundle_1",
+        entitlement_type: EntitlementType.BUNDLE,
+        remaining_amount: 300,
+        market_id: "bonbeauty",
+      }),
+    ]
+    const choiceSetItems = [
+      makeChoiceSetItem({ id: "choice_cross", instance_id: "ent_bundle_1", remaining_minor: 100, market_id: "other_market" }),
+    ]
+    const { op } = makeOp({ rows, choiceSetItems })
+
+    await expect(
+      op.redeem(bundleInput({ choice_set_item_id: "choice_cross" }))
+    ).rejects.toBeInstanceOf(RedeemChoiceSetItemError)
+  })
 })
 
 // ===========================================================================
