@@ -39,9 +39,20 @@
  */
 
 import type { VatClassification } from "./vat-resolver"
+import { EntitlementType } from "./models/entitlement"
 
-/** Identyfikator profilu — wartość `metadata.posting_profile` w `ledger-transaction.v1`. */
+/** Identyfikator profilu legacy — wartość `metadata.posting_profile` w `ledger-transaction.v1`. */
 export const VOUCHER_POSTING_PROFILE_ID = "voucher_liability_only_v1" as const
+export const VOUCHER_CREDIT_PACK_POSTING_PROFILE_ID = "voucher_credit_pack_v1" as const
+export const VOUCHER_BUNDLE_POSTING_PROFILE_ID = "voucher_bundle_v1" as const
+
+export const VOUCHER_POSTING_PROFILE_IDS = Object.freeze([
+  VOUCHER_POSTING_PROFILE_ID,
+  VOUCHER_CREDIT_PACK_POSTING_PROFILE_ID,
+  VOUCHER_BUNDLE_POSTING_PROFILE_ID,
+] as const)
+
+export type VoucherPostingProfileId = (typeof VOUCHER_POSTING_PROFILE_IDS)[number]
 
 /**
  * Konta dozwolone dla posting profile `voucher_liability_only_v1`
@@ -89,6 +100,41 @@ export const VOUCHER_LIABILITY_ONLY_V1 = Object.freeze({
   forbidden_money_classes: Object.freeze([...FORBIDDEN_MONEY_CLASSES]),
 } as const)
 
+export const VOUCHER_CREDIT_PACK_V1 = Object.freeze({
+  id: VOUCHER_CREDIT_PACK_POSTING_PROFILE_ID,
+  runtime_enabled: false as const,
+  allowed_accounts: Object.freeze([...ALLOWED_ACCOUNTS]),
+  forbidden_money_classes: Object.freeze([...FORBIDDEN_MONEY_CLASSES]),
+} as const)
+
+export const VOUCHER_BUNDLE_V1 = Object.freeze({
+  id: VOUCHER_BUNDLE_POSTING_PROFILE_ID,
+  runtime_enabled: false as const,
+  allowed_accounts: Object.freeze([...ALLOWED_ACCOUNTS]),
+  forbidden_money_classes: Object.freeze([...FORBIDDEN_MONEY_CLASSES]),
+} as const)
+
+export type VoucherPostingProfile =
+  | typeof VOUCHER_LIABILITY_ONLY_V1
+  | typeof VOUCHER_CREDIT_PACK_V1
+  | typeof VOUCHER_BUNDLE_V1
+
+export const VOUCHER_POSTING_PROFILES_BY_ID: Readonly<Record<VoucherPostingProfileId, VoucherPostingProfile>> =
+  Object.freeze({
+    [VOUCHER_POSTING_PROFILE_ID]: VOUCHER_LIABILITY_ONLY_V1,
+    [VOUCHER_CREDIT_PACK_POSTING_PROFILE_ID]: VOUCHER_CREDIT_PACK_V1,
+    [VOUCHER_BUNDLE_POSTING_PROFILE_ID]: VOUCHER_BUNDLE_V1,
+  })
+
+export const VOUCHER_POSTING_PROFILE_REGISTRY: Readonly<
+  Partial<Record<EntitlementType, VoucherPostingProfile>>
+> = Object.freeze({
+  [EntitlementType.VOUCHER_AMOUNT]: VOUCHER_LIABILITY_ONLY_V1,
+  [EntitlementType.VOUCHER_SERVICE]: VOUCHER_LIABILITY_ONLY_V1,
+  [EntitlementType.CREDIT_PACK]: VOUCHER_CREDIT_PACK_V1,
+  [EntitlementType.BUNDLE]: VOUCHER_BUNDLE_V1,
+})
+
 // ──────────────────────────────────────────────────────────────────────────
 // Typy zgodne z kontraktem `ledger-transaction.v1` (Story 2.1)
 // ──────────────────────────────────────────────────────────────────────────
@@ -124,7 +170,7 @@ export type LedgerTransactionV1 = {
   entry_type: VoucherEntryType
   lines: LedgerLine[]
   metadata: {
-    posting_profile: typeof VOUCHER_POSTING_PROFILE_ID
+    posting_profile: VoucherPostingProfileId
     vat_classification: VatClassification
     lifecycle_event: string
     [key: string]: unknown
@@ -136,6 +182,11 @@ export type LedgerTransactionV1 = {
  * `net_minor` + `vat_minor` = brutto całego vouchera przy emisji.
  */
 export type VoucherPostingInput = {
+  /**
+   * Wymiar resolvera ADR-140 §3. Brak pola oznacza legacy/voucher path i mapuje
+   * się na `voucher_liability_only_v1`; podany nieznany typ rzuca fail-closed.
+   */
+  entitlement_type?: EntitlementType | string
   lifecycle_event: VoucherLifecycleEvent
   /** Konsumowane z resolvera Story 2.2; profil NIE reklasyfikuje (single source). */
   vat_classification: VatClassification
@@ -252,6 +303,24 @@ export class VoucherPostingInvariantError extends Error {
   }
 }
 
+export function resolveVoucherPostingProfile(
+  entitlementType: VoucherPostingInput["entitlement_type"]
+): VoucherPostingProfile {
+  if (entitlementType == null) {
+    return VOUCHER_LIABILITY_ONLY_V1
+  }
+  const profile =
+    VOUCHER_POSTING_PROFILE_REGISTRY[
+      entitlementType as keyof typeof VOUCHER_POSTING_PROFILE_REGISTRY
+    ]
+  if (!profile) {
+    throw new VoucherPostingInvariantError(
+      `nieznany entitlement_type dla posting_profile registry: ${String(entitlementType)}`
+    )
+  }
+  return profile
+}
+
 function assertNonNegativeInteger(value: number, label: string): void {
   if (!Number.isInteger(value) || value < 0) {
     throw new VoucherPostingInvariantError(
@@ -312,6 +381,7 @@ function proportionalVat(
 
 function buildEnvelope(
   input: VoucherPostingInput,
+  profile: VoucherPostingProfile,
   entryType: VoucherEntryType,
   lifecycleEvent: string,
   lines: LedgerLine[]
@@ -327,7 +397,7 @@ function buildEnvelope(
     entry_type: entryType,
     lines,
     metadata: {
-      posting_profile: VOUCHER_POSTING_PROFILE_ID,
+      posting_profile: profile.id,
       vat_classification: input.vat_classification,
       lifecycle_event: lifecycleEvent,
     },
@@ -363,7 +433,7 @@ function line(
  * (poza zakresem profilu, FR33). Carve-out VAT samobilansuje się bez konta
  * pieniężnego.
  */
-function generateIssued(input: VoucherPostingInput): VoucherPostingResult {
+function generateIssued(input: VoucherPostingInput, profile: VoucherPostingProfile): VoucherPostingResult {
   assertNonNegativeInteger(input.vat_minor, "vat_minor")
   assertNonNegativeInteger(input.net_minor, "net_minor")
 
@@ -398,7 +468,7 @@ function generateIssued(input: VoucherPostingInput): VoucherPostingResult {
     line(input, "issued-vat", vatAccount, "credit", input.vat_minor, note),
   ]
 
-  return { posted: true, transaction: buildEnvelope(input, "ENTITLEMENT_ISSUED", "ISSUED", lines) }
+  return { posted: true, transaction: buildEnvelope(input, profile, "ENTITLEMENT_ISSUED", "ISSUED", lines) }
 }
 
 /**
@@ -411,7 +481,7 @@ function generateIssued(input: VoucherPostingInput): VoucherPostingResult {
  *          jest legiem money-ledger (poza zakresem). W entitlement-ledgerze brak
  *          legu → udokumentowany no-op (VAT już rozpoznany, brak nowego VAT).
  */
-function generateRedeemed(input: VoucherPostingInput): VoucherPostingResult {
+function generateRedeemed(input: VoucherPostingInput, profile: VoucherPostingProfile): VoucherPostingResult {
   assertNonNegativeInteger(input.vat_minor, "vat_minor")
   assertNonNegativeInteger(input.net_minor, "net_minor")
   const redeemedGross = input.redeemed_gross_minor ?? 0
@@ -473,7 +543,7 @@ function generateRedeemed(input: VoucherPostingInput): VoucherPostingResult {
     ),
   ]
 
-  return { posted: true, transaction: buildEnvelope(input, "ENTITLEMENT_REDEEMED", "REDEEMED", lines) }
+  return { posted: true, transaction: buildEnvelope(input, profile, "ENTITLEMENT_REDEEMED", "REDEEMED", lines) }
 }
 
 /**
@@ -488,7 +558,7 @@ function generateRedeemed(input: VoucherPostingInput): VoucherPostingResult {
  * Forfeiture/partial NIE reklasyfikują (C-68/23) — breakage liczony WYŁĄCZNIE
  * od niewykorzystanego salda.
  */
-function generateBreakage(input: VoucherPostingInput): VoucherPostingResult {
+function generateBreakage(input: VoucherPostingInput, profile: VoucherPostingProfile): VoucherPostingResult {
   assertNonNegativeInteger(input.vat_minor, "vat_minor")
   assertNonNegativeInteger(input.net_minor, "net_minor")
   const remainingGross = input.remaining_gross_minor ?? 0
@@ -551,7 +621,7 @@ function generateBreakage(input: VoucherPostingInput): VoucherPostingResult {
         "SPV breakage: rozpoznanie breakage z niewykorzystanego salda netto"
       ),
     ]
-    return { posted: true, transaction: buildEnvelope(input, "ENTITLEMENT_BREAKAGE", "EXPIRED", lines) }
+    return { posted: true, transaction: buildEnvelope(input, profile, "ENTITLEMENT_BREAKAGE", "EXPIRED", lines) }
   }
 
   // MPV unused = bez VAT (art. 73a): zawieszony VAT niewykorzystanego salda
@@ -607,7 +677,7 @@ function generateBreakage(input: VoucherPostingInput): VoucherPostingResult {
     )
   )
 
-  return { posted: true, transaction: buildEnvelope(input, "ENTITLEMENT_BREAKAGE", "EXPIRED", lines) }
+  return { posted: true, transaction: buildEnvelope(input, profile, "ENTITLEMENT_BREAKAGE", "EXPIRED", lines) }
 }
 
 /**
@@ -623,13 +693,14 @@ function generateBreakage(input: VoucherPostingInput): VoucherPostingResult {
 export function generateVoucherPosting(
   input: VoucherPostingInput
 ): VoucherPostingResult {
+  const profile = resolveVoucherPostingProfile(input.entitlement_type)
   switch (input.lifecycle_event) {
     case "ISSUED":
-      return generateIssued(input)
+      return generateIssued(input, profile)
     case "REDEEMED":
-      return generateRedeemed(input)
+      return generateRedeemed(input, profile)
     case "EXPIRED":
-      return generateBreakage(input)
+      return generateBreakage(input, profile)
     default: {
       const exhaustive: never = input.lifecycle_event
       throw new VoucherPostingInvariantError(

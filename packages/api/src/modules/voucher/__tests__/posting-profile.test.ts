@@ -1,19 +1,27 @@
 import { describe, expect, it } from "@jest/globals"
-import type { VatClassification } from "../vat-resolver"
+import { resolveVatClassification, type VatClassification } from "../vat-resolver"
+import { EntitlementType } from "../models/entitlement"
 import {
+  VOUCHER_BUNDLE_POSTING_PROFILE_ID,
+  VOUCHER_BUNDLE_V1,
+  VOUCHER_CREDIT_PACK_POSTING_PROFILE_ID,
+  VOUCHER_CREDIT_PACK_V1,
   VOUCHER_LEDGER_ACCOUNTS,
   VOUCHER_LIABILITY_ONLY_V1,
   VOUCHER_POSTING_PROFILE_ID,
+  VOUCHER_POSTING_PROFILE_REGISTRY,
   VoucherPostingGuardError,
   VoucherPostingInvariantError,
   assertBalanced,
   assertPostingAccountsAllowed,
   generateVoucherPosting,
   isMoneyAccount,
+  resolveVoucherPostingProfile,
 } from "../posting-profile"
 import type {
   LedgerLine,
   LedgerTransactionV1,
+  VoucherPostingProfileId,
   VoucherLifecycleEvent,
   VoucherPostingInput,
   VoucherPostingResult,
@@ -57,13 +65,16 @@ function accountsTouched(tx: LedgerTransactionV1): string[] {
 const CASH_ACCOUNTS = ["cash", "cash_clearing", "cash_settlement"] as const
 
 /** Inwarianty wspólne dla KAŻDEGO wygenerowanego wpisu (kontrakt + ledger README). */
-function assertContractConformance(tx: LedgerTransactionV1): void {
+function assertContractConformance(
+  tx: LedgerTransactionV1,
+  expectedProfile: VoucherPostingProfileId = VOUCHER_POSTING_PROFILE_ID
+): void {
   // entry_type ∈ enum lifecycle (additive, ADR-133 §Decyzja pkt 2b).
   expect(["ENTITLEMENT_ISSUED", "ENTITLEMENT_REDEEMED", "ENTITLEMENT_BREAKAGE"]).toContain(
     tx.entry_type
   )
   // conditional metadata-keys (Story 2.1 if/then).
-  expect(tx.metadata.posting_profile).toBe(VOUCHER_POSTING_PROFILE_ID)
+  expect(tx.metadata.posting_profile).toBe(expectedProfile)
   expect(["SPV", "MPV"]).toContain(tx.metadata.vat_classification)
   expect(typeof tx.metadata.lifecycle_event).toBe("string")
   // lines: minItems 2; każda linia ma dokładnie jedną stronę dodatnią; balans.
@@ -87,6 +98,56 @@ function assertContractConformance(tx: LedgerTransactionV1): void {
 }
 
 describe("posting profile voucher_liability_only_v1", () => {
+  describe("Story 3.3 — rejestr profili keyed by entitlement_type", () => {
+    it("rozwiązuje profile deklaratywnie z rejestru, a legacy/brak typu zostaje voucher_liability_only_v1", () => {
+      expect(resolveVoucherPostingProfile(undefined).id).toBe(VOUCHER_POSTING_PROFILE_ID)
+      expect(resolveVoucherPostingProfile(EntitlementType.VOUCHER_AMOUNT).id).toBe(
+        VOUCHER_POSTING_PROFILE_ID
+      )
+      expect(resolveVoucherPostingProfile(EntitlementType.VOUCHER_SERVICE).id).toBe(
+        VOUCHER_POSTING_PROFILE_ID
+      )
+      expect(resolveVoucherPostingProfile(EntitlementType.CREDIT_PACK).id).toBe(
+        VOUCHER_CREDIT_PACK_POSTING_PROFILE_ID
+      )
+      expect(resolveVoucherPostingProfile(EntitlementType.BUNDLE).id).toBe(
+        VOUCHER_BUNDLE_POSTING_PROFILE_ID
+      )
+
+      expect(VOUCHER_POSTING_PROFILE_REGISTRY).toMatchObject({
+        [EntitlementType.CREDIT_PACK]: VOUCHER_CREDIT_PACK_V1,
+        [EntitlementType.BUNDLE]: VOUCHER_BUNDLE_V1,
+      })
+    })
+
+    it("nieznany entitlement_type rzuca fail-closed, bez cichego fallbacku na legacy", () => {
+      expect(() => resolveVoucherPostingProfile("UNKNOWN_TYPE")).toThrow(
+        VoucherPostingInvariantError
+      )
+      expect(() =>
+        generateVoucherPosting(
+          baseInput({
+            entitlement_type: "UNKNOWN_TYPE",
+            lifecycle_event: "ISSUED",
+            vat_classification: "SPV",
+          })
+        )
+      ).toThrow(VoucherPostingInvariantError)
+    })
+
+    it("nowe profile są runtime_disabled i reuse'ują namespace kont entitlement/VAT bez kont pieniężnych", () => {
+      for (const profile of [VOUCHER_CREDIT_PACK_V1, VOUCHER_BUNDLE_V1]) {
+        expect(profile.runtime_enabled).toBe(false)
+        expect(profile.allowed_accounts).toEqual(
+          expect.arrayContaining(Object.values(VOUCHER_LEDGER_ACCOUNTS))
+        )
+        expect(profile.forbidden_money_classes).toEqual(
+          expect.arrayContaining([...CASH_ACCOUNTS])
+        )
+      }
+    })
+  })
+
   describe("T3 — runtime-disabled (ADR-133 §P6)", () => {
     it("profil jest AUTHORED ale runtime_enabled:FALSE", () => {
       expect(VOUCHER_LIABILITY_ONLY_V1.id).toBe("voucher_liability_only_v1")
@@ -146,6 +207,71 @@ describe("posting profile voucher_liability_only_v1", () => {
       for (const a of accountsTouched(tx)) {
         expect(a).not.toMatch(/revenue/)
       }
+    })
+  })
+
+  describe("Story 3.3 AC2/AC3 — CREDIT_PACK/BUNDLE golden matrix", () => {
+    it("CREDIT_PACK SPV ISSUED zapisuje metadata.posting_profile=voucher_credit_pack_v1", () => {
+      const tx = expectPosted(
+        generateVoucherPosting(
+          baseInput({
+            entitlement_type: EntitlementType.CREDIT_PACK,
+            lifecycle_event: "ISSUED",
+            vat_classification: resolveVatClassification({ vat_rates: [23, "23%"] }),
+          })
+        )
+      )
+      assertContractConformance(tx, VOUCHER_CREDIT_PACK_POSTING_PROFILE_ID)
+      expect(tx.metadata.vat_classification).toBe("SPV")
+      expect(accountsTouched(tx)).toContain(VOUCHER_LEDGER_ACCOUNTS.VAT_OUTPUT_EMISSION)
+    })
+
+    it("BUNDLE jednolite stawki ⇒ SPV przy ISSUED i posting_profile=voucher_bundle_v1", () => {
+      const tx = expectPosted(
+        generateVoucherPosting(
+          baseInput({
+            entitlement_type: EntitlementType.BUNDLE,
+            lifecycle_event: "ISSUED",
+            vat_classification: resolveVatClassification({ vat_rates: [8, "8.00%"] }),
+          })
+        )
+      )
+      assertContractConformance(tx, VOUCHER_BUNDLE_POSTING_PROFILE_ID)
+      expect(tx.metadata.vat_classification).toBe("SPV")
+      expect(accountsTouched(tx)).toContain(VOUCHER_LEDGER_ACCOUNTS.VAT_OUTPUT_EMISSION)
+    })
+
+    it("BUNDLE mieszane stawki choice_set ⇒ resolver fail-closed MPV; VAT dopiero przy redeem", () => {
+      const mixedChoiceSetClassification = resolveVatClassification({ vat_rates: [8, 23] })
+      expect(mixedChoiceSetClassification).toBe("MPV")
+
+      const issued = expectPosted(
+        generateVoucherPosting(
+          baseInput({
+            entitlement_type: EntitlementType.BUNDLE,
+            lifecycle_event: "ISSUED",
+            vat_classification: mixedChoiceSetClassification,
+          })
+        )
+      )
+      assertContractConformance(issued, VOUCHER_BUNDLE_POSTING_PROFILE_ID)
+      expect(accountsTouched(issued)).toContain(VOUCHER_LEDGER_ACCOUNTS.VAT_OUTPUT_SUSPENSE)
+      expect(accountsTouched(issued)).not.toContain(VOUCHER_LEDGER_ACCOUNTS.VAT_OUTPUT)
+
+      const redeemed = expectPosted(
+        generateVoucherPosting(
+          baseInput({
+            entitlement_type: EntitlementType.BUNDLE,
+            lifecycle_event: "REDEEMED",
+            vat_classification: mixedChoiceSetClassification,
+            redeemed_gross_minor: GROSS / 2,
+          })
+        )
+      )
+      assertContractConformance(redeemed, VOUCHER_BUNDLE_POSTING_PROFILE_ID)
+      expect(accountsTouched(redeemed)).toContain(VOUCHER_LEDGER_ACCOUNTS.VAT_OUTPUT)
+      const outLine = redeemed.lines.find((l) => l.account === VOUCHER_LEDGER_ACCOUNTS.VAT_OUTPUT)!
+      expect(outLine.credit_minor).toBe(1150)
     })
   })
 
