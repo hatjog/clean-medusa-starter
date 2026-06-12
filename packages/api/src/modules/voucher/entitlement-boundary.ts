@@ -100,6 +100,14 @@ export const ON_EXPIRY_CONVERT_TARGETS = [
 ] as const
 export type OnExpiryConvertTarget = (typeof ON_EXPIRY_CONVERT_TARGETS)[number]
 
+/** v1.12.0 Story 3.8: types that require compliance-by-design policy fields. */
+export const COMPLIANCE_REQUIRED_ENTITLEMENT_TYPES = [
+  EntitlementType.CREDIT_PACK,
+  EntitlementType.BUNDLE,
+] as const
+export type ComplianceRequiredEntitlementType =
+  (typeof COMPLIANCE_REQUIRED_ENTITLEMENT_TYPES)[number]
+
 /** Allowed `policy.kybc.verification_method` values (DSA art. 30 — a+c). */
 export const KYBC_VERIFICATION_METHODS = ["a_plus_c", "a", "c"] as const
 export type KybcVerificationMethod =
@@ -272,6 +280,36 @@ export interface BoundaryViolation {
   /** Dotted path within the profile policy, e.g. `policy.extension.fee_pct`. */
   field: string
   message: string
+}
+
+/** RODO/HG-7 assertion for gift recipient persistence in the voucher module. */
+export const GIFT_RECIPIENT_PII_MINIMIZATION_CONTRACT = {
+  phases: ["issue", "claim", "redeem", "expiry"] as const,
+  persistedRecipientFields: ["recipient_customer_id"] as const,
+  forbiddenPersistedFields: [
+    "recipient_email",
+    "recipient_phone",
+    "recipient_name",
+    "buyer_message",
+  ] as const,
+  legalBasis: "voucher-issue recipient binding; data minimization per phase",
+} as const
+
+/** VAT/art. 73a assertion consumed by Story 3.8; posting remains audit-only. */
+export const MPV_BREAKAGE_NO_OUTPUT_VAT_CONTRACT = {
+  vatClassification: "MPV",
+  lifecycleEvent: "EXPIRED",
+  outputVatAccount: "vat:output",
+  runtimeEnabled: false,
+  assertion: "unused MPV breakage does not generate output VAT on expiry",
+} as const
+
+function requiresCompliancePolicy(
+  entitlementType: EntitlementType
+): entitlementType is ComplianceRequiredEntitlementType {
+  return (COMPLIANCE_REQUIRED_ENTITLEMENT_TYPES as readonly EntitlementType[]).includes(
+    entitlementType
+  )
 }
 
 /**
@@ -533,6 +571,71 @@ export function checkPolicyAgainstBoundary(
   // Boolean policy toggles (consent_snapshot, auto_renew, payment_gating, …)
   // are type-checked at the schema layer (copy 1); the runtime boundary cares
   // only about enum membership + numeric bounds.
+
+  return v
+}
+
+/**
+ * Story 3.8 compliance layer: CREDIT_PACK/BUNDLE must carry the consumer
+ * invariants already defined by the boundary enums. Existing voucher types keep
+ * the previous optional posture.
+ */
+export function checkPolicyComplianceForEntitlementType(
+  entitlementType: EntitlementType,
+  policy: Record<string, unknown>
+): BoundaryViolation[] {
+  const v = checkPolicyAgainstBoundary(policy)
+  if (!requiresCompliancePolicy(entitlementType)) return v
+
+  const withdrawal = policy.withdrawal as Record<string, unknown> | undefined
+  if (!withdrawal) {
+    v.push({
+      field: "policy.withdrawal",
+      message:
+        `${entitlementType} requires withdrawal.basis=${WITHDRAWAL_BASIS_VALUES[0]} ` +
+        `and withdrawal.terminating_event=${WITHDRAWAL_TERMINATING_EVENTS[0]}`,
+    })
+  } else {
+    if (withdrawal.basis !== WITHDRAWAL_BASIS_VALUES[0]) {
+      v.push({
+        field: "policy.withdrawal.basis",
+        message:
+          `${entitlementType} requires withdrawal.basis=${WITHDRAWAL_BASIS_VALUES[0]} ` +
+          "(art. 38 pkt 1 full performance)",
+      })
+    }
+    if (withdrawal.terminating_event !== WITHDRAWAL_TERMINATING_EVENTS[0]) {
+      v.push({
+        field: "policy.withdrawal.terminating_event",
+        message:
+          `${entitlementType} requires withdrawal.terminating_event=${WITHDRAWAL_TERMINATING_EVENTS[0]} ` +
+          "(right extinguishes only on full redemption)",
+      })
+    }
+  }
+
+  if (policy.refund_channel !== "original_payment") {
+    v.push({
+      field: "policy.refund_channel",
+      message:
+        `${entitlementType} requires refund_channel=original_payment ` +
+        "(14-day unused entitlement refund)",
+    })
+  }
+
+  if (
+    policy.on_expiry_convert_to === undefined ||
+    !(ON_EXPIRY_CONVERT_TARGETS as readonly string[]).includes(
+      policy.on_expiry_convert_to as string
+    )
+  ) {
+    v.push({
+      field: "policy.on_expiry_convert_to",
+      message:
+        `${entitlementType} requires on_expiry_convert_to in [` +
+        `${ON_EXPIRY_CONVERT_TARGETS.join(", ")}] (defensive expiry; no forfeiture)`,
+    })
+  }
 
   return v
 }
