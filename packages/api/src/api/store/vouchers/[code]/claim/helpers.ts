@@ -147,16 +147,59 @@ export async function appendClaimAudit(
   )
 }
 
+/**
+ * Appends an audit row for paths that fire BEFORE a PG transaction is opened
+ * (rate_limited, top-level replay_tampered).
+ *
+ * MEDIUM fix — original implementation wrapped every call in a full
+ * BEGIN/COMMIT via `withClaimTransaction`, amplifying connection-pool pressure
+ * under flood (each 429 → 1 acquired connection + transaction).
+ *
+ * New strategy: attempt a lightweight non-transactional auto-commit INSERT by
+ * acquiring a single pooled connection (no BEGIN/COMMIT).  PG auto-commits a
+ * bare INSERT, so pool pressure is lower: connection is acquired, INSERT sent,
+ * connection released — no round-trips for BEGIN/COMMIT.  On failure (pool
+ * exhaustion, network), fall back to in-memory `auditLog` (same as before).
+ *
+ * Knex path falls through to the original `withClaimTransaction` path since
+ * Knex does not expose a clean non-transactional API.
+ */
 export async function appendClaimAuditWithFallback(
   req: MedusaRequest,
   row: ClaimAuditRow
 ): Promise<void> {
-  const persisted = await withClaimTransaction(req, (client) =>
-    appendClaimAudit(client, row)
-  )
-  if (persisted === null) {
+  const db = resolveDb(req)
+
+  if (db && isPgPool(db)) {
+    // Non-transactional auto-commit path (no BEGIN/COMMIT overhead).
+    let client: PgClientLike | undefined
+    try {
+      client = await db.connect()
+      await appendClaimAudit(client, row)
+      return
+    } catch {
+      // Best-effort — fall through to in-memory on any failure.
+    } finally {
+      client?.release?.()
+    }
+    // PG write failed — record in-memory as fallback.
     auditLog.push(row)
+    return
   }
+
+  if (db) {
+    // Knex path — use the original transactional path (no cheap alternative).
+    const persisted = await withClaimTransaction(req, (client) =>
+      appendClaimAudit(client, row)
+    )
+    if (persisted === null) {
+      auditLog.push(row)
+    }
+    return
+  }
+
+  // No DB configured — single-instance fallback.
+  auditLog.push(row)
 }
 
 export async function reserveClaimBinding(
@@ -187,6 +230,7 @@ export async function reserveClaimBinding(
 
   if ((inserted.rowCount ?? 0) > 0) return { inserted: true }
 
+  // INSERT had a conflict — check for a live (non-expired) binding first.
   const existing = await client.query<BindingReplayRow>(
     `SELECT binding_hash, response_status, response_body
        FROM voucher_claim_binding
@@ -197,17 +241,44 @@ export async function reserveClaimBinding(
   )
 
   const row = existing.rows[0]
-  if (!row) return { inserted: true }
 
-  const body = normalizeResponseBody(row.response_body)
-  return {
-    inserted: false,
-    bindingHash: row.binding_hash,
-    response:
-      row.response_status && body
-        ? { status: Number(row.response_status), body }
-        : null,
+  if (row) {
+    // Live binding found — standard replay path.
+    const body = normalizeResponseBody(row.response_body)
+    return {
+      inserted: false,
+      bindingHash: row.binding_hash,
+      response:
+        row.response_status && body
+          ? { status: Number(row.response_status), body }
+          : null,
+    }
   }
+
+  // Conflict was with an EXPIRED row.  Refresh it in-place so this request
+  // becomes the new canonical binding (TTL drift — LOW finding fix).
+  // The expired row has no live claimant, so overwriting it is safe: any
+  // parallel request for the same key also hits the conflict branch and will
+  // block on the SELECT FOR UPDATE above until we COMMIT.
+  await client.query(
+    `UPDATE voucher_claim_binding
+        SET binding_hash  = $2,
+            code          = $3,
+            claimed_at    = $4,
+            expires_at    = NOW() + ($5::text || ' hours')::interval,
+            response_status = NULL,
+            response_body   = NULL,
+            updated_at    = NOW()
+      WHERE idempotency_key = $1`,
+    [
+      input.idempotencyKey,
+      input.bindingHash,
+      input.code,
+      input.claimedAt,
+      String(ttlHours()),
+    ]
+  )
+  return { inserted: true }
 }
 
 export async function completeClaimBinding(

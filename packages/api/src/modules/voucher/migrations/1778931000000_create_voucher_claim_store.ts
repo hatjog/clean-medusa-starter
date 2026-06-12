@@ -11,6 +11,20 @@ import { Migration } from "@medusajs/framework/mikro-orm/migrations"
  *
  * `down()` jest non-destrukcyjny: historia claim/audit nie jest kasowana przez
  * rollback, forward-fix pozostaje jedyną bezpieczną korektą danych.
+ *
+ * Retencja (LOW-1):
+ * `voucher_claim_binding` ma kolumnę `expires_at` (TTL 24h domyślnie) oraz
+ * indeks — wygasłe wiersze są rozpoznawane przez `reserveClaimBinding` i
+ * nadpisywane in-place.  Docelowe czyszczenie stale-expired wierszy powinno
+ * być realizowane przez periodicą (pg_cron / Medusa job) poza ścieżką
+ * krytyczną: `DELETE FROM voucher_claim_binding WHERE expires_at < NOW() - interval '7 days'`.
+ *
+ * `voucher_claim_audit` rośnie append-only i nie ma wbudowanego TTL.
+ * Polityka retencji: indeks `(code, created_at)` + `(idempotency_key, created_at)`
+ * umożliwia wydajne range-scany.  Partycjonowanie po `created_at` lub cykliczny
+ * DELETE starszych wierszy (np. > 90 dni) należy wdrożyć przez dedicated job
+ * przed osiągnięciem skali > 10M wierszy.  Decyzja o partycjonowaniu wykracza
+ * poza zakres story 6.1 — patrz ADR-142.
  */
 export class Migration1778931000000 extends Migration {
   async up(): Promise<void> {

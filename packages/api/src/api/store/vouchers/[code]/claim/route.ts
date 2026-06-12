@@ -222,6 +222,12 @@ export async function POST(
     })
 
     if (!reserved.inserted) {
+      // INFO-1 (defensive-only branch): the top-level verifyBinding check at
+      // line ~201 already rejects every request whose idempotency_key ≠
+      // expectedBinding before we enter the transaction. Inside the transaction
+      // `reserved.bindingHash` always equals `expectedBinding`, so this branch
+      // is unreachable on the normal prod path. It is kept as a defence-in-depth
+      // guard in case the pre-tx check is bypassed (e.g. future code change).
       const bindingMatch = verifyBinding(reserved.bindingHash, expectedBinding)
       if (!bindingMatch) {
         await appendClaimAudit(client, auditRow({
@@ -245,7 +251,16 @@ export async function POST(
         ip,
         outcome: "idempotent_replay",
       }))
-      return reserved.response ?? {
+
+      // LOW-3 fix: unify replay contract — durable path also signals idempotent:true
+      // so callers get the same body shape regardless of whether PG is available.
+      if (reserved.response) {
+        return {
+          ...reserved.response,
+          body: { ...reserved.response.body, idempotent: true },
+        }
+      }
+      return {
         status: 409,
         body: {
           type: "claim_replay_pending",

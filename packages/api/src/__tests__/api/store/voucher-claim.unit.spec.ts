@@ -122,11 +122,29 @@ class FakeClaimPg {
     }
 
     if (compact.startsWith("SELECT binding_hash, response_status, response_body")) {
+      // Simulate WHERE expires_at > NOW() — return empty for expired bindings.
       const row = this.bindings.get(values[0] as string)
-      return { rows: (row ? [row] : []) as T[], rowCount: row ? 1 : 0 }
+      const live = row && row.expires_at > new Date() ? row : undefined
+      return { rows: (live ? [live] : []) as T[], rowCount: live ? 1 : 0 }
     }
 
     if (compact.startsWith("UPDATE voucher_claim_binding")) {
+      // Two different UPDATE shapes:
+      // 1. completeClaimBinding: SET response_status=$2, response_body=$3 WHERE idempotency_key=$1
+      // 2. expired-refresh (reserveClaimBinding): SET binding_hash=$2, code=$3, ... WHERE idempotency_key=$1
+      if (compact.includes("SET binding_hash")) {
+        // Expired-binding refresh — reset the row with fresh binding data.
+        const [idempotencyKey, bindingHash, code, claimedAt] = values as string[]
+        const row = this.bindings.get(idempotencyKey)
+        if (!row) return { rows: [], rowCount: 0 }
+        row.binding_hash = bindingHash
+        row.code = code
+        row.claimed_at = claimedAt
+        row.response_status = null
+        row.response_body = null
+        row.expires_at = new Date(Date.now() + 24 * 60 * 60 * 1000)
+        return { rows: [], rowCount: 1 }
+      }
       const [idempotencyKey, status, body] = values
       const row = this.bindings.get(idempotencyKey as string)
       if (!row) return { rows: [], rowCount: 0 }
@@ -561,7 +579,8 @@ describe("POST /store/vouchers/:code/claim", () => {
     )
 
     expect(res2._status).toBe(200)
-    expect(res2._body).toEqual(res1._body)
+    // LOW-3 fix: durable replay now adds idempotent:true to match in-memory contract.
+    expect(res2._body).toEqual({ ...(res1._body as Record<string, unknown>), idempotent: true })
     expect(pg.claimUpdates).toBe(1)
     expect(_getAuditLog()).toHaveLength(0)
     expect(pg.audits.map((row) => row.outcome)).toEqual(["ok", "idempotent_replay"])
@@ -682,5 +701,81 @@ describe("POST /store/vouchers/:code/claim", () => {
     const res = makeRes()
     await POST(req as never, res as never)
     expect(res._status).toBe(400)
+  })
+
+  it("Story 6.1 LOW-2 fix — expired binding is refreshed and re-claims successfully", async () => {
+    const body = validBody()
+    const pg = new FakeClaimPg([IDLE_VOUCHER])
+    const service = makePgVoucherService(pg)
+    const scope = {
+      resolve: (key: string) => {
+        if (key === "__pg_pool__") return pg
+        throw new Error(`unexpected resolve: ${key}`)
+      },
+    }
+
+    // First claim — succeeds, binding stored.
+    const res1 = makeRes()
+    await POST(
+      makeReq(IDLE_VOUCHER.code, body, "127.0.0.1", service, scope) as never,
+      res1 as never
+    )
+    expect(res1._status).toBe(200)
+    expect(pg.claimUpdates).toBe(1)
+
+    // Manually expire the binding so TTL check fails.
+    const bindingRow = pg.bindings.get(body.idempotency_key)
+    if (bindingRow) bindingRow.expires_at = new Date(0) // epoch = definitely expired
+
+    // Reset voucher status so it can be claimed again (simulates new voucher or
+    // different operational context where the binding expired after the claim).
+    const voucherInPg = pg.vouchers.get(IDLE_VOUCHER.code)
+    if (voucherInPg) voucherInPg.status = "idle"
+    pg.claimUpdates = 0
+
+    // Second request — same idempotency_key, binding expired.
+    // LOW-2 fix: reserveClaimBinding detects expired conflict, refreshes in-place,
+    // and treats this as a new (inserted) binding — re-runs mutation.
+    const res2 = makeRes()
+    await POST(
+      makeReq(IDLE_VOUCHER.code, body, "127.0.0.2", service, scope) as never,
+      res2 as never
+    )
+    expect(res2._status).toBe(200)
+    // Must NOT return idempotent:true (this is a fresh claim after TTL drift, not a replay).
+    expect((res2._body as Record<string, unknown>).idempotent).toBeUndefined()
+    expect(pg.claimUpdates).toBe(1)
+  })
+
+  it("Story 6.1 LOW-3 fix — durable replay includes idempotent:true flag", async () => {
+    const body = validBody()
+    const pg = new FakeClaimPg([IDLE_VOUCHER])
+    const service = makePgVoucherService(pg)
+    const scope = {
+      resolve: (key: string) => {
+        if (key === "__pg_pool__") return pg
+        throw new Error(`unexpected resolve: ${key}`)
+      },
+    }
+
+    // First claim.
+    const res1 = makeRes()
+    await POST(
+      makeReq(IDLE_VOUCHER.code, body, "127.0.0.1", service, scope) as never,
+      res1 as never
+    )
+    expect(res1._status).toBe(200)
+
+    // Durable replay (clear in-memory binding to force PG path).
+    _clearBindingStore()
+
+    const res2 = makeRes()
+    await POST(
+      makeReq(IDLE_VOUCHER.code, body, "127.0.0.2", service, scope) as never,
+      res2 as never
+    )
+    expect(res2._status).toBe(200)
+    // LOW-3 fix: durable replay must include idempotent:true (contract parity with fallback).
+    expect((res2._body as Record<string, unknown>).idempotent).toBe(true)
   })
 })
