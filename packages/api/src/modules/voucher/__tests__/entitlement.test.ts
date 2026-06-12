@@ -2,7 +2,7 @@
  * voucher/entitlement.test.ts — Story v180-2-1 (ADR-099 4-layer model).
  *
  * Covers:
- *   T1 — Layer 1 EntitlementType enum (6 canonical, 2 active / 4 inactive)
+ *   T1 — Layer 1 EntitlementType enum (6 canonical, 4 active / 2 inactive)
  *   T2 — Layer 2 boundary checks (within-boundary pass, violation reported)
  *   T4 — Layer 4 entitlement_instance state machine (allowed pass / illegal
  *        reject / terminal states) + policy_snapshot immutability post-ISSUED
@@ -52,19 +52,21 @@ describe("Layer 1 — EntitlementType", () => {
     ])
   })
 
-  it("activates exactly VOUCHER_AMOUNT + VOUCHER_SERVICE in v1.8.0", () => {
+  it("activates exactly the v1.12.0 safe-core voucher taxonomy", () => {
     expect([...ACTIVE_ENTITLEMENT_TYPES].sort()).toEqual([
+      "BUNDLE",
+      "CREDIT_PACK",
       "VOUCHER_AMOUNT",
       "VOUCHER_SERVICE",
     ])
     expect(isActiveEntitlementType(EntitlementType.VOUCHER_AMOUNT)).toBe(true)
-    expect(isActiveEntitlementType(EntitlementType.CREDIT_PACK)).toBe(false)
+    expect(isActiveEntitlementType(EntitlementType.CREDIT_PACK)).toBe(true)
+    expect(isActiveEntitlementType(EntitlementType.BUNDLE)).toBe(true)
+    expect(isActiveEntitlementType(EntitlementType.SUBSCRIPTION_B2C)).toBe(false)
   })
 
-  it("marks the other 4 defined-but-inactive", () => {
+  it("marks subscription types as defined-but-inactive", () => {
     expect([...INACTIVE_ENTITLEMENT_TYPES].sort()).toEqual([
-      "BUNDLE",
-      "CREDIT_PACK",
       "SUBSCRIPTION_B2B",
       "SUBSCRIPTION_B2C",
     ])
