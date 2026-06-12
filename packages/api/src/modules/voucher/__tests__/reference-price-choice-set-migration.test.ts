@@ -2,7 +2,8 @@
  * reference-price-choice-set-migration.test.ts — v1.12.0 Story 3.2.
  *
  * Quick-gate na emitowanym DDL: `reference_price_minor`, dedykowana tabela
- * `entitlement_choice_set_item`, CHECK-i finansowe, store-RLS na `app.gp_market_id`,
+ * `entitlement_choice_set_item`, CHECK-i finansowe, store-RLS na `app.gp_market_id`
+ * (ENABLE + FORCE — fail-closed dla wlasciciela tabeli), trigger updated_at,
  * rozszerzony `posting_profile` CHECK oraz non-destrukcyjny `down()`.
  */
 
@@ -27,7 +28,7 @@ describe("v1.12.0 Story 3.2 — reference_price + choice_set schema", () => {
     )
   })
 
-  it("tworzy dedykowaną tabelę entitlement_choice_set_item, nie JSONB", () => {
+  it("tworzy dedykowana tabele entitlement_choice_set_item, nie JSONB", () => {
     expect(up).toMatch(/CREATE TABLE IF NOT EXISTS entitlement_choice_set_item/)
     expect(up).toMatch(/instance_id\s+text NOT NULL\s+REFERENCES entitlement_instance\(id\)/)
     expect(up).toMatch(/market_id\s+text NOT NULL/)
@@ -44,7 +45,7 @@ describe("v1.12.0 Story 3.2 — reference_price + choice_set schema", () => {
     expect(up).toMatch(/entitlement_choice_set_item_market_id_idx[\s\S]*ON entitlement_choice_set_item \(market_id\)/)
   })
 
-  it("CHECK-i per item są NOT VALID i guardowane przez pg_catalog.pg_constraint", () => {
+  it("CHECK-i per item sa NOT VALID i guardowane przez pg_catalog.pg_constraint", () => {
     for (const constraint of [
       "entitlement_choice_set_item_market_id_chk",
       "entitlement_choice_set_item_reference_amount_chk",
@@ -65,12 +66,22 @@ describe("v1.12.0 Story 3.2 — reference_price + choice_set schema", () => {
     expect((up.match(/NOT VALID/g) ?? []).length).toBeGreaterThanOrEqual(6)
   })
 
-  it("włącza store-RLS policy na market_id przez app.gp_market_id", () => {
+  it("wlacza store-RLS policy na market_id przez app.gp_market_id — ENABLE + FORCE (fail-closed)", () => {
+    // ENABLE: polityka dostepna
     expect(up).toMatch(/ALTER TABLE entitlement_choice_set_item ENABLE ROW LEVEL SECURITY/)
+    // FORCE: polityka obowiazuje takze wlasciciela tabeli i role bez SET ROLE —
+    // bez FORCE sciezka bez market-context bylaby fail-open (dostep do sald wszystkich rynkow)
+    expect(up).toMatch(/ALTER TABLE entitlement_choice_set_item FORCE ROW LEVEL SECURITY/)
     expect(up).toMatch(/GRANT SELECT, INSERT, UPDATE, DELETE ON entitlement_choice_set_item TO medusa_store/)
     expect(up).toMatch(/CREATE POLICY entitlement_choice_set_item_market_isolation/)
     expect(up).toMatch(/USING \(market_id = NULLIF\(current_setting\('app\.gp_market_id', true\), ''\)\)/)
     expect(up).toMatch(/WITH CHECK \(market_id = NULLIF\(current_setting\('app\.gp_market_id', true\), ''\)\)/)
+  })
+
+  it("instaluje trigger auto-touch updated_at (wymagany dla redeem 3.7 UPDATE remaining_minor)", () => {
+    expect(up).toMatch(/CREATE OR REPLACE FUNCTION fn_entitlement_choice_set_item_touch_updated_at/)
+    expect(up).toMatch(/CREATE TRIGGER trg_entitlement_choice_set_item_touch_updated_at/)
+    expect(up).toMatch(/BEFORE UPDATE ON entitlement_choice_set_item/)
   })
 
   it("rozszerza posting_profile CHECK o profile capability CREDIT_PACK/BUNDLE bez ruszania entry_type", () => {
@@ -79,6 +90,13 @@ describe("v1.12.0 Story 3.2 — reference_price + choice_set schema", () => {
     expect(up).toContain("'voucher_credit_pack_v1'")
     expect(up).toContain("'voucher_bundle_v1'")
     expect(up).not.toMatch(/entry_type\s+IN/i)
+  })
+
+  it("DROP oryginalnego inline-constraintu uzywa precyzyjnego match po nazwie (nie LIKE substring)", () => {
+    // Precyzyjny drop po nazwie voucher_ledger_transaction_posting_profile_check
+    // zapobiega przypadkowemu usunieciu kompozytowych constraintow
+    expect(up).toMatch(/conname = 'voucher_ledger_transaction_posting_profile_check'/)
+    expect(up).not.toMatch(/pg_get_constraintdef.*LIKE.*posting_profile/)
   })
 
   it("down() jest non-destrukcyjny", () => {
