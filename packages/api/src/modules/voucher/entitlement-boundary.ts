@@ -83,10 +83,28 @@ export const WITHDRAWAL_BASIS_VALUES = [
 ] as const
 export type WithdrawalBasis = (typeof WITHDRAWAL_BASIS_VALUES)[number]
 
+/**
+ * Named constant for the required `withdrawal.basis` value for CREDIT_PACK/BUNDLE
+ * (art. 38 pkt 1 — full service performance extinguishes withdrawal right).
+ * Used in `checkPolicyComplianceForEntitlementType` instead of positional [0]
+ * to make intent explicit and protect against future enum reorder (I1 fix).
+ */
+export const WITHDRAWAL_REQUIRED_BASIS: WithdrawalBasis =
+  "art_38_pkt_1_full_performance"
+
 /** Allowed `policy.withdrawal.terminating_event` values. */
 export const WITHDRAWAL_TERMINATING_EVENTS = ["REDEEMED_FULL"] as const
 export type WithdrawalTerminatingEvent =
   (typeof WITHDRAWAL_TERMINATING_EVENTS)[number]
+
+/**
+ * Named constant for the required `withdrawal.terminating_event` value for
+ * CREDIT_PACK/BUNDLE — withdrawal right extinguishes only on full redemption.
+ * Mirrors `isWithdrawalRightExtinguished` semantics from Story 3.7.
+ * Used instead of positional [0] (I1 fix).
+ */
+export const WITHDRAWAL_REQUIRED_TERMINATING_EVENT: WithdrawalTerminatingEvent =
+  "REDEEMED_FULL"
 
 /**
  * Allowed `policy.on_expiry_convert_to` values. Forfeiture/przepadek is
@@ -100,10 +118,19 @@ export const ON_EXPIRY_CONVERT_TARGETS = [
 ] as const
 export type OnExpiryConvertTarget = (typeof ON_EXPIRY_CONVERT_TARGETS)[number]
 
-/** v1.12.0 Story 3.8: types that require compliance-by-design policy fields. */
+/**
+ * v1.12.0 Story 3.8: types that require compliance-by-design policy fields
+ * (withdrawal/refund-14d/expiry-defensywny per FR-A6/NFR7/art. 38 pkt 1).
+ *
+ * String literals are used (not enum references) so that the parity validator
+ * `validate_entitlement_boundary_parity.py` can extract this constant via
+ * its standard regex — same set-equal enforcement as other boundary pairs.
+ * Values must be identical to the corresponding `EntitlementType` enum values
+ * (both = "CREDIT_PACK" / "BUNDLE").
+ */
 export const COMPLIANCE_REQUIRED_ENTITLEMENT_TYPES = [
-  EntitlementType.CREDIT_PACK,
-  EntitlementType.BUNDLE,
+  "CREDIT_PACK",
+  "BUNDLE",
 ] as const
 export type ComplianceRequiredEntitlementType =
   (typeof COMPLIANCE_REQUIRED_ENTITLEMENT_TYPES)[number]
@@ -282,7 +309,24 @@ export interface BoundaryViolation {
   message: string
 }
 
-/** RODO/HG-7 assertion for gift recipient persistence in the voucher module. */
+/**
+ * RODO/HG-7 assertion for gift recipient persistence in the voucher module.
+ *
+ * `persistedRecipientFields` lists the ONLY fields that MUST be persisted for
+ * recipient binding (as `recipient_customer_id` on the entitlement instance).
+ *
+ * `forbiddenPersistedFields` lists fields that MUST NOT be persisted in the
+ * entitlement boundary / profile layer. NOTE (L2 fix): `buyer_message` is
+ * forbidden in the entitlement-boundary / profile persistence layer but MAY
+ * be stored transiently in the gift-delivery flow (Epic 6, UX-DR9) with per-
+ * phase retention — the prohibition here covers "do not attach to the
+ * entitlement snapshot/profile record itself", not "never process in transit".
+ *
+ * `knownSnapshotFields` provides a cross-check set of all entitlement snapshot
+ * field names. Any field that appears in `persistedRecipientFields` MUST also
+ * appear here to enforce that the contract is anchored to a real schema field
+ * rather than a phantom name (M1 fix — contract is not purely self-referential).
+ */
 export const GIFT_RECIPIENT_PII_MINIMIZATION_CONTRACT = {
   phases: ["issue", "claim", "redeem", "expiry"] as const,
   persistedRecipientFields: ["recipient_customer_id"] as const,
@@ -290,15 +334,49 @@ export const GIFT_RECIPIENT_PII_MINIMIZATION_CONTRACT = {
     "recipient_email",
     "recipient_phone",
     "recipient_name",
+    /** Forbidden in entitlement snapshot/profile; MAY be stored transiently in
+     *  gift-delivery flow (Epic 6) with per-phase retention per UX-DR9. */
     "buyer_message",
   ] as const,
   legalBasis: "voucher-issue recipient binding; data minimization per phase",
+  /**
+   * Known entitlement snapshot schema fields (M1 fix). Each name in
+   * `persistedRecipientFields` must appear here — tested in
+   * `entitlement-boundary-compliance.test.ts` to prevent phantom-field drift.
+   * Populated from `models/entitlement.ts` L4 snapshot surface (Story 3.4).
+   * Add new snapshot fields here when the schema evolves.
+   */
+  knownSnapshotFields: [
+    "recipient_customer_id",
+    "entitlement_type",
+    "profile_id",
+    "metadata",
+    "policy_snapshot",
+    "issued_at",
+    "expires_at",
+    "status",
+  ] as const,
 } as const
 
-/** VAT/art. 73a assertion consumed by Story 3.8; posting remains audit-only. */
+/**
+ * VAT/art. 73a assertion consumed by Story 3.8; posting remains audit-only.
+ *
+ * `resolverNoReclassificationToken` cross-checks that the VAT resolver's
+ * `VAT_CLASSIFICATION_SNAPSHOT_RULE.noReclassificationEvents` contains "expiry"
+ * — ensuring that MPV breakage on expiry does NOT reclassify/re-trigger VAT
+ * output (M1 fix: contract is no longer purely self-referential; see test in
+ * `entitlement-boundary-compliance.test.ts` that imports `vat-resolver.ts`
+ * and verifies the snapshot rule's no-reclassification list contains this token).
+ */
 export const MPV_BREAKAGE_NO_OUTPUT_VAT_CONTRACT = {
   vatClassification: "MPV",
   lifecycleEvent: "EXPIRED",
+  /**
+   * The lifecycle event token as it appears in `vat-resolver.ts`
+   * `NO_RECLASSIFICATION_EVENTS`. The compliance test must verify that this
+   * token is present in the resolver's constant (cross-file assertion).
+   */
+  resolverNoReclassificationToken: "expiry",
   outputVatAccount: "vat:output",
   runtimeEnabled: false,
   assertion: "unused MPV breakage does not generate output VAT on expiry",
@@ -579,6 +657,17 @@ export function checkPolicyAgainstBoundary(
  * Story 3.8 compliance layer: CREDIT_PACK/BUNDLE must carry the consumer
  * invariants already defined by the boundary enums. Existing voucher types keep
  * the previous optional posture.
+ *
+ * ARCHITECTURE NOTE (L3 fix): This function is a **governance mirror** function
+ * — it is deliberately NOT wired into any runtime issuance/redemption path in
+ * v1.12.0. The authoritative enforcement gate is the Python governance validator
+ * `_grow/tools/validate_entitlement_profiles.py` (`_check_credit_bundle_compliance`),
+ * which runs against the fixture/config corpus on every commit. This TS function
+ * exists as a runtime-callable mirror so that future stories wiring CREDIT_PACK/
+ * BUNDLE issuance (e.g. Epic 5) can call it at profile-load time without
+ * rebuilding the logic. Any future story that needs runtime enforcement MUST
+ * explicitly wire this function at the appropriate call site — do not assume it
+ * is enforced at runtime without verifying the call graph.
  */
 export function checkPolicyComplianceForEntitlementType(
   entitlementType: EntitlementType,
@@ -592,23 +681,23 @@ export function checkPolicyComplianceForEntitlementType(
     v.push({
       field: "policy.withdrawal",
       message:
-        `${entitlementType} requires withdrawal.basis=${WITHDRAWAL_BASIS_VALUES[0]} ` +
-        `and withdrawal.terminating_event=${WITHDRAWAL_TERMINATING_EVENTS[0]}`,
+        `${entitlementType} requires withdrawal.basis=${WITHDRAWAL_REQUIRED_BASIS} ` +
+        `and withdrawal.terminating_event=${WITHDRAWAL_REQUIRED_TERMINATING_EVENT}`,
     })
   } else {
-    if (withdrawal.basis !== WITHDRAWAL_BASIS_VALUES[0]) {
+    if (withdrawal.basis !== WITHDRAWAL_REQUIRED_BASIS) {
       v.push({
         field: "policy.withdrawal.basis",
         message:
-          `${entitlementType} requires withdrawal.basis=${WITHDRAWAL_BASIS_VALUES[0]} ` +
+          `${entitlementType} requires withdrawal.basis=${WITHDRAWAL_REQUIRED_BASIS} ` +
           "(art. 38 pkt 1 full performance)",
       })
     }
-    if (withdrawal.terminating_event !== WITHDRAWAL_TERMINATING_EVENTS[0]) {
+    if (withdrawal.terminating_event !== WITHDRAWAL_REQUIRED_TERMINATING_EVENT) {
       v.push({
         field: "policy.withdrawal.terminating_event",
         message:
-          `${entitlementType} requires withdrawal.terminating_event=${WITHDRAWAL_TERMINATING_EVENTS[0]} ` +
+          `${entitlementType} requires withdrawal.terminating_event=${WITHDRAWAL_REQUIRED_TERMINATING_EVENT} ` +
           "(right extinguishes only on full redemption)",
       })
     }
