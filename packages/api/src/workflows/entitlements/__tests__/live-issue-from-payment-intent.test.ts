@@ -16,6 +16,7 @@ import { describe, it, expect } from "@jest/globals"
 
 import {
   liveIssueEntitlementsWithinTx,
+  assertReferencePriceInvariant,
   type LiveIssueInput,
   type LiveIssuePgClient,
 } from "../live-issue-from-payment-intent"
@@ -413,6 +414,71 @@ describe("Story 3.4 — reference_price snapshot + BUNDLE choice_set w issue-tx"
     )
     expect(entitlements.size).toBe(0)
     expect(choiceSetItems.size).toBe(0)
+  })
+
+  it("CREDIT_PACK bez jawnego face_value_minor w policy rzuca fail-closed (nie fallbackuje do kwoty Stripe)", async () => {
+    // L1-fix: gdy policy nie niesie face_value_minor ani amount_minor, NIE wolno
+    // fallbackować do payload.amount_minor (zapłacono ≠ face_value per ADR-140 §2).
+    const { client } = makeFakeClient(
+      { sales_channel_id: "sc_x", metadata: { gp: { market_id: "bonbeauty" } } },
+      [
+        {
+          line_item_id: "li_credit_pack_no_fv",
+          metadata: {
+            entitlement_profile_id: "voucher-credit-pack",
+            entitlement_type: EntitlementType.CREDIT_PACK,
+            // brak amount_minor na poziomie profilu
+            policy: { vat_rate_uniqueness: true /* brak face_value_minor/amount_minor */ },
+          },
+        },
+      ]
+    )
+    await expect(liveIssueEntitlementsWithinTx(client, baseInput(), NOW)).rejects.toBeInstanceOf(
+      VoucherPostingInvariantError
+    )
+  })
+
+  describe("AC3 golden-test — assertReferencePriceInvariant z rozbieżnymi oracle (M1-fix)", () => {
+    it("CREDIT_PACK: rozbieżność snapshot vs face_value oracle ⇒ rzuca VoucherPostingInvariantError", () => {
+      // Zmanipulowany snapshot (np. 10000) vs oracle (15000) — asercja musi złapać.
+      expect(() =>
+        assertReferencePriceInvariant(EntitlementType.CREDIT_PACK, 10000, "li_test", {
+          faceValueMinor: 15000,
+        })
+      ).toThrow(VoucherPostingInvariantError)
+    })
+
+    it("CREDIT_PACK: snapshot zgodny z oracle ⇒ nie rzuca", () => {
+      expect(() =>
+        assertReferencePriceInvariant(EntitlementType.CREDIT_PACK, 15000, "li_test", {
+          faceValueMinor: 15000,
+        })
+      ).not.toThrow()
+    })
+
+    it("BUNDLE: rozbieżność snapshot vs SUM(itemAmounts oracle) ⇒ rzuca VoucherPostingInvariantError", () => {
+      // Snapshot zamrożony jako 20000, ale oracle wskazuje 19000 (rozbieżność).
+      // Ten test byłby niemożliwy do napisania gdyby asercja była tautologiczna.
+      expect(() =>
+        assertReferencePriceInvariant(EntitlementType.BUNDLE, 20000, "li_test", {
+          itemAmounts: [12000, 7000], // SUM = 19000 ≠ 20000
+        })
+      ).toThrow(VoucherPostingInvariantError)
+    })
+
+    it("BUNDLE: snapshot zgodny z SUM(itemAmounts oracle) ⇒ nie rzuca", () => {
+      expect(() =>
+        assertReferencePriceInvariant(EntitlementType.BUNDLE, 20000, "li_test", {
+          itemAmounts: [12000, 8000], // SUM = 20000 = snapshot
+        })
+      ).not.toThrow()
+    })
+
+    it("VOUCHER_* (null snapshot): asercja nie rzuca (brak oracle)", () => {
+      expect(() =>
+        assertReferencePriceInvariant(EntitlementType.VOUCHER_AMOUNT, null, "li_test", {})
+      ).not.toThrow()
+    })
   })
 })
 
