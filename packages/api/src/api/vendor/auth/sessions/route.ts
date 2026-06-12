@@ -58,6 +58,11 @@ function toIsoString(value: Date | string): string {
   return value instanceof Date ? value.toISOString() : new Date(value).toISOString()
 }
 
+// Active sessions are capped per page; we probe one extra row to signal `has_more`
+// so a security screen with >PAGE_SIZE live magic-link sessions is not silently
+// truncated without the client knowing there are older sessions to revoke.
+const PAGE_SIZE = 20
+
 export async function GET(req: MedusaRequest, res: MedusaResponse): Promise<void> {
   const sellerId = resolveSellerId(req)
   if (!sellerId) {
@@ -92,13 +97,16 @@ export async function GET(req: MedusaRequest, res: MedusaResponse): Promise<void
     .where("issued.expires_at", ">", new Date())
     .whereNull("revoked.token_jti")
     .orderBy("issued.issued_at", "desc")
-    .limit(20)
+    .limit(PAGE_SIZE + 1)
 
-  const sessions: VendorAuthSessionView[] = rows.map((row) => ({
+  const hasMore = rows.length > PAGE_SIZE
+  const page = hasMore ? rows.slice(0, PAGE_SIZE) : rows
+
+  const sessions: VendorAuthSessionView[] = page.map((row) => ({
     jti: row.token_jti,
     last_active: toIsoString(row.issued_at),
     current_session: Boolean(currentJti && currentJti === row.token_jti),
   }))
 
-  res.status(200).json({ sessions })
+  res.status(200).json({ sessions, has_more: hasMore })
 }

@@ -96,7 +96,25 @@ describe("GET /vendor/auth/sessions", () => {
           current_session: true,
         },
       ],
+      has_more: false,
     })
+  })
+
+  it("signals has_more when the active session page is full", async () => {
+    const issuedAt = new Date("2026-06-12T10:00:00.000Z")
+    const rows = Array.from({ length: 21 }, (_unused, index) => ({
+      token_jti: `00000000-0000-4000-8000-0000000000${String(index).padStart(2, "0")}`,
+      issued_at: issuedAt,
+    }))
+    const req = makeRequest({ rows })
+    const res = makeResponse()
+
+    await GET(req as never, res as unknown as MedusaResponse)
+
+    expect(res.statusCode).toBe(200)
+    const body = res.body as { sessions: unknown[]; has_more: boolean }
+    expect(body.sessions).toHaveLength(20)
+    expect(body.has_more).toBe(true)
   })
 
   it("fails closed when seller auth context is missing", async () => {
