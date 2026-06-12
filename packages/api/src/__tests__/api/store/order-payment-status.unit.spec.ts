@@ -3,7 +3,7 @@ import { ContainerRegistrationKeys } from "@medusajs/framework/utils"
 import {
   resolveOrderByCartId,
   retrieveOrderByStatusIdentifier,
-} from "../../../api/store/orders/[id]/payment-status/route"
+} from "../../../api/store/orders/[id]/payment-status/helpers"
 
 describe("order payment-status identifier resolution", () => {
   it("resolves cart.id to the backend order id for payment-status lookups", async () => {

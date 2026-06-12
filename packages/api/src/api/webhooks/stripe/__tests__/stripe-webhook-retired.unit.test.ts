@@ -1,4 +1,5 @@
-import { POST, STRIPE_WEBHOOK_RETIRED_MESSAGE } from "../route"
+import { POST } from "../route"
+import { STRIPE_WEBHOOK_RETIRED_MESSAGE } from "../helpers"
 
 describe("retired Stripe webhook route", () => {
   it("returns 410 without signature verification or mutation", async () => {

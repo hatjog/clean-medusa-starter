@@ -127,7 +127,7 @@ export class DefaultWalletFeaturePolicy implements WalletFeaturePolicy {
       audit_event: {
         event_type: "wallet.pass_gated",
         entitlement_instance_id: input.entitlement_instance_id,
-        provider: toAuditProvider(input.provider),
+        provider: toAuditProvider(input.provider) as WalletProviderKind,
         market: input.market,
         release: input.release,
         actor_id: input.actor.actor_id,

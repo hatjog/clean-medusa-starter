@@ -22,11 +22,13 @@ import {
   _setClock,
 } from "../../../lib/voucher-claim-rate-limit"
 import {
+  POST,
+} from "../../../api/store/vouchers/[code]/claim/route"
+import {
   _clearAuditLog,
   _clearBindingStore,
   _getAuditLog,
-  POST,
-} from "../../../api/store/vouchers/[code]/claim/route"
+} from "../../../api/store/vouchers/[code]/claim/helpers"
 import { Modules } from "@medusajs/framework/utils"
 import type { VoucherWithEvents } from "../../../modules/voucher"
 

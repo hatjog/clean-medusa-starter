@@ -13,11 +13,9 @@
  */
 
 import type { MedusaRequest, MedusaResponse } from "@medusajs/framework/http"
+import { BREVO_PROVIDER_PLUGIN_PENDING_MESSAGE } from "./helpers"
 
 export const AUTHENTICATE = false
-
-export const BREVO_PROVIDER_PLUGIN_PENDING_MESSAGE =
-  "Brevo notification provider plugin not yet registered; request validated and discarded."
 
 export async function POST(
   _req: MedusaRequest,

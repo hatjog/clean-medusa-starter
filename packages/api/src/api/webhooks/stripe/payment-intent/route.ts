@@ -26,11 +26,12 @@ import {
   verifyStripeSignature,
   type StripePaymentIntentEvent,
 } from "../../../../lib/payment/stripe-payment-intent-event"
+import {
+  STRIPE_SIGNATURE_HEADER,
+  STRIPE_WEBHOOK_SECRET_ENV,
+} from "./helpers"
 
 export const AUTHENTICATE = false
-
-export const STRIPE_WEBHOOK_SECRET_ENV = "STRIPE_WEBHOOK_SECRET"
-export const STRIPE_SIGNATURE_HEADER = "stripe-signature"
 
 type LoggerLike = {
   info?: (message: string) => void

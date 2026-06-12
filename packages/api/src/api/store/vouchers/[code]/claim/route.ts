@@ -33,44 +33,13 @@ import {
   verifyBinding,
 } from "../../../../../lib/claim-idempotency-binding"
 import { VOUCHER_MODULE, type VoucherService } from "../../../../../modules/voucher"
+import { auditLog, bindingStore } from "./helpers"
 
 // Disable Medusa's default admin auth — public store endpoint.
 export const AUTHENTICATE = false
 
 /** Minimum response latency floor in ms (anti-enumeration constant-time). */
 const RESPONSE_FLOOR_MS = 200
-
-/** In-memory idempotency binding store: idempotency_key → hex binding. */
-const _bindingStore = new Map<string, string>()
-
-/** In-memory audit log (appended in-process). */
-export interface ClaimAuditRow {
-  idempotency_key: string
-  code: string
-  ip: string
-  outcome:
-    | "ok"
-    | "idempotent_replay"
-    | "replay_tampered"
-    | "rate_limited"
-    | "invalid_code"
-    | "expired"
-    | "already_claimed"
-  occurred_at: string
-}
-
-const _auditLog: ClaimAuditRow[] = []
-
-/** Exposed for tests only. */
-export function _getAuditLog(): ReadonlyArray<ClaimAuditRow> {
-  return _auditLog
-}
-export function _clearAuditLog(): void {
-  _auditLog.splice(0, _auditLog.length)
-}
-export function _clearBindingStore(): void {
-  _bindingStore.clear()
-}
 
 /** Returns a Promise that resolves after `ms` milliseconds. */
 function delay(ms: number): Promise<void> {
@@ -135,7 +104,7 @@ export async function POST(
   const rl = consumeClaimToken(ip)
   if (!rl.allowed) {
     await padToFloor(startedAt)
-    _auditLog.push({
+    auditLog.push({
       idempotency_key: "",
       code,
       ip,
@@ -211,7 +180,7 @@ export async function POST(
 
   if (!verifyBinding(idempotencyKey, expectedBinding)) {
     await padToFloor(startedAt)
-    _auditLog.push({
+    auditLog.push({
       idempotency_key: idempotencyKey,
       code,
       ip,
@@ -226,14 +195,14 @@ export async function POST(
   }
 
   // --- Idempotency binding check ---
-  const existingBinding = _bindingStore.get(idempotencyKey)
+  const existingBinding = bindingStore.get(idempotencyKey)
 
   if (existingBinding !== undefined) {
     // Idempotency key was seen before — verify binding matches.
     const bindingMatch = verifyBinding(existingBinding, expectedBinding)
     if (!bindingMatch) {
       await padToFloor(startedAt)
-      _auditLog.push({
+      auditLog.push({
         idempotency_key: idempotencyKey,
         code,
         ip,
@@ -248,7 +217,7 @@ export async function POST(
     }
     // Idempotent replay — same binding, return success without mutation.
     await padToFloor(startedAt)
-    _auditLog.push({
+    auditLog.push({
       idempotency_key: idempotencyKey,
       code,
       ip,
@@ -264,12 +233,12 @@ export async function POST(
   }
 
   // New idempotency key — register binding before any state change.
-  _bindingStore.set(idempotencyKey, expectedBinding)
+  bindingStore.set(idempotencyKey, expectedBinding)
 
   // --- Voucher existence check (constant-time: always runs this code path) ---
   if (!voucherForCheck) {
     await padToFloor(startedAt)
-    _auditLog.push({
+    auditLog.push({
       idempotency_key: idempotencyKey,
       code,
       ip,
@@ -297,7 +266,7 @@ export async function POST(
   if (claimResult.status !== "claimed") {
     // Unexpected result after pre-checks passed — guard defensively.
     await padToFloor(startedAt)
-    _auditLog.push({
+    auditLog.push({
       idempotency_key: idempotencyKey,
       code,
       ip,
@@ -320,7 +289,7 @@ export async function POST(
 
   const updatedVoucher = claimResult.voucher
 
-  _auditLog.push({
+  auditLog.push({
     idempotency_key: idempotencyKey,
     code,
     ip,

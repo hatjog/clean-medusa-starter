@@ -48,7 +48,7 @@ type SellerRow = {
   handle: string
 }
 
-export type VendorSplit = {
+type VendorSplit = {
   seller_id: string
   seller_name: string | null
   seller_handle: string | null

@@ -24,7 +24,7 @@ type MagicLinkSessionRow = {
   issued_at: Date | string
 }
 
-export type VendorAuthSessionView = {
+type VendorAuthSessionView = {
   jti: string
   last_active: string
   current_session: boolean
