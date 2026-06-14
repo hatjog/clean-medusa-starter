@@ -29,6 +29,7 @@
  */
 
 import PDFDocument from "pdfkit"
+import QRCode from "qrcode"
 
 import {
   buildAppleMapsDeeplink,
@@ -335,6 +336,43 @@ function formatVoucherValue(
   }
 }
 
+/**
+ * Draw a vector QR encoding `text` into the box (x, y, box×box).
+ *
+ * Pure vector output — one filled rect per dark module (no PNG/raster, no
+ * native deps). A white rounded panel + hairline frame + symmetric quiet
+ * zone keep the symbol scannable on the cream background. The +0.4pt module
+ * overlap closes sub-pixel seams some PDF rasterizers leave between cells.
+ */
+function drawVoucherQr(
+  doc: PDFKit.PDFDocument,
+  text: string,
+  x: number,
+  y: number,
+  box: number,
+): void {
+  const qr = QRCode.create(text, { errorCorrectionLevel: "M" })
+  const size = qr.modules.size
+  const data = qr.modules.data
+  const quiet = box * 0.09
+  const cell = (box - quiet * 2) / size
+
+  // White panel + hairline frame (scannable contrast on cream).
+  doc
+    .roundedRect(x, y, box, box, 8)
+    .lineWidth(1)
+    .fillAndStroke(PDF_BRAND.card, PDF_BRAND.hairline)
+
+  doc.fillColor(PDF_BRAND.ink)
+  for (let r = 0; r < size; r++) {
+    for (let c = 0; c < size; c++) {
+      if (data[r * size + c]) {
+        doc.rect(x + quiet + c * cell, y + quiet + r * cell, cell + 0.4, cell + 0.4).fill()
+      }
+    }
+  }
+}
+
 export function renderVoucherPdf(payload: VoucherPdfPayload): Promise<Buffer> {
   return new Promise<Buffer>((resolve, reject) => {
     const locale = payload.locale
@@ -392,6 +430,22 @@ export function renderVoucherPdf(payload: VoucherPdfPayload): Promise<Buffer> {
     const pw = cw - 56
     let y = cardY + 28
 
+    // Scannable QR (encodes the voucher code) — top-right of the card. The
+    // salon/service text block below is narrowed to `topW` to clear it.
+    const qrSize = 100
+    const qrX = M + cw - 28 - qrSize
+    const qrY = cardY + 28
+    drawVoucherQr(doc, payload.voucher_code, qrX, qrY, qrSize)
+    doc
+      .fillColor(PDF_BRAND.muted)
+      .font("Helvetica")
+      .fontSize(8)
+      .text(lookupCopy(locale, "scan_to_redeem"), qrX, qrY + qrSize + 5, {
+        width: qrSize,
+        align: "center",
+      })
+    const topW = pw - qrSize - 22
+
     // Salon (FM-43: exactly ONE salon section per PDF).
     doc
       .fillColor(PDF_BRAND.bronze)
@@ -399,14 +453,16 @@ export function renderVoucherPdf(payload: VoucherPdfPayload): Promise<Buffer> {
       .fontSize(9)
       .text(lookupCopy(locale, "salon_section_title").toUpperCase(), px, y, { characterSpacing: 1.5 })
     y += 16
-    doc.fillColor(PDF_BRAND.ink).font("Helvetica-Bold").fontSize(18).text(payload.vendor.name, px, y, { width: pw })
+    doc.fillColor(PDF_BRAND.ink).font("Helvetica-Bold").fontSize(18).text(payload.vendor.name, px, y, { width: topW })
     y = doc.y + 2
-    doc.fillColor(PDF_BRAND.muted).font("Helvetica").fontSize(11).text(`@${payload.vendor.handle}`, px, y)
+    doc.fillColor(PDF_BRAND.muted).font("Helvetica").fontSize(11).text(`@${payload.vendor.handle}`, px, y, { width: topW })
     y = doc.y + 12
 
     // Service (may wrap → advance by the actual rendered height).
-    doc.fillColor(PDF_BRAND.ink).font("Helvetica").fontSize(13).text(payload.service_description, px, y, { width: pw })
+    doc.fillColor(PDF_BRAND.ink).font("Helvetica").fontSize(13).text(payload.service_description, px, y, { width: topW })
     y = doc.y + 14
+    // Never let the value/code box ride up under the QR block.
+    y = Math.max(y, qrY + qrSize + 22)
 
     // Value — large gold figure.
     doc
