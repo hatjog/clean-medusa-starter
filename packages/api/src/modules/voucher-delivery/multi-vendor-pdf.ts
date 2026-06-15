@@ -29,6 +29,7 @@
  */
 
 import PDFDocument from "pdfkit"
+import QRCode from "qrcode"
 
 import {
   buildAppleMapsDeeplink,
@@ -288,85 +289,263 @@ export function buildVoucherPdfPayload(args: {
  * Engine: pdfkit (pure JS, MIT, no native deps, Node.js streaming Buffer).
  * Uses lookupCopy() for all i18n strings — throws fail-fast on missing key.
  */
+/**
+ * BonBeauty brand-skin tokens for the PDF (contract A — cream/gold). Hex literals
+ * mirror the storefront tokens (--gold #C5A059, --cta #907032, page-bg #F9F4EC).
+ */
+const PDF_BRAND = {
+  cream: "#F9F4EC",
+  card: "#FFFFFF",
+  gold: "#C5A059",
+  bronze: "#907032",
+  ink: "#1A1A1A",
+  muted: "#7A7263",
+  hairline: "#E6D8BC",
+  tint: "#F6EEDD",
+  noteBg: "#FBF6EC",
+} as const
+
+const PDF_BCP47: Record<VoucherPdfLocale, string> = {
+  pl: "pl-PL",
+  en: "en-GB",
+  ua: "uk-UA",
+  de: "de-DE",
+}
+
+/** Format the voucher value buyer-facing: PLN → "260 zł" (whole amounts drop decimals). */
+function formatVoucherValue(
+  valueMinor: number,
+  currencyCode: string,
+  locale: VoucherPdfLocale,
+): string {
+  const value = valueMinor / 100
+  const code = (currencyCode || "PLN").toUpperCase()
+  const bcp47 = PDF_BCP47[locale] ?? "pl-PL"
+  if (code === "PLN") {
+    const whole = Math.round(value * 100) % 100 === 0
+    const num = new Intl.NumberFormat(bcp47, {
+      minimumFractionDigits: whole ? 0 : 2,
+      maximumFractionDigits: 2,
+    }).format(value)
+    return `${num} zł`
+  }
+  try {
+    return new Intl.NumberFormat(bcp47, { style: "currency", currency: code }).format(value)
+  } catch {
+    return `${value.toFixed(2)} ${code}`
+  }
+}
+
+/**
+ * Draw a vector QR encoding `text` into the box (x, y, box×box).
+ *
+ * Pure vector output — one filled rect per dark module (no PNG/raster, no
+ * native deps). A white rounded panel + hairline frame + symmetric quiet
+ * zone keep the symbol scannable on the cream background. The +0.4pt module
+ * overlap closes sub-pixel seams some PDF rasterizers leave between cells.
+ */
+function drawVoucherQr(
+  doc: PDFKit.PDFDocument,
+  text: string,
+  x: number,
+  y: number,
+  box: number,
+): void {
+  const qr = QRCode.create(text, { errorCorrectionLevel: "M" })
+  const size = qr.modules.size
+  const data = qr.modules.data
+  const quiet = box * 0.09
+  const cell = (box - quiet * 2) / size
+
+  // White panel + hairline frame (scannable contrast on cream).
+  doc
+    .roundedRect(x, y, box, box, 8)
+    .lineWidth(1)
+    .fillAndStroke(PDF_BRAND.card, PDF_BRAND.hairline)
+
+  doc.fillColor(PDF_BRAND.ink)
+  for (let r = 0; r < size; r++) {
+    for (let c = 0; c < size; c++) {
+      if (data[r * size + c]) {
+        doc.rect(x + quiet + c * cell, y + quiet + r * cell, cell + 0.4, cell + 0.4).fill()
+      }
+    }
+  }
+}
+
 export function renderVoucherPdf(payload: VoucherPdfPayload): Promise<Buffer> {
   return new Promise<Buffer>((resolve, reject) => {
     const locale = payload.locale
     const chunks: Buffer[] = []
 
-    const doc = new PDFDocument({ margin: 50, size: "A4" })
+    // margin:0 — we paint a full-bleed cream background and lay out by hand.
+    const doc = new PDFDocument({ margin: 0, size: "A4" })
 
     doc.on("data", (chunk: Buffer) => chunks.push(chunk))
     doc.on("end", () => resolve(Buffer.concat(chunks)))
     doc.on("error", reject)
 
-    // Title
-    doc
-      .fontSize(18)
-      .font("Helvetica-Bold")
-      .text(lookupCopy(locale, "title"), { align: "center" })
-    doc.moveDown(0.5)
+    const W = doc.page.width
+    const H = doc.page.height
+    const M = 48
+    const cw = W - 2 * M
 
-    // Voucher code
+    // Cream background (contract A page-bg).
+    doc.rect(0, 0, W, H).fill(PDF_BRAND.cream)
+
+    // Brand lockup — gold "BB" monogram + wordmark.
+    doc.roundedRect(M, 50, 34, 34, 9).fill(PDF_BRAND.gold)
     doc
-      .fontSize(12)
+      .fillColor(PDF_BRAND.cream)
+      .font("Helvetica-Bold")
+      .fontSize(15)
+      .text("BB", M, 60, { width: 34, align: "center" })
+    doc
+      .fillColor(PDF_BRAND.ink)
+      .font("Helvetica-Bold")
+      .fontSize(16)
+      .text("BonBeauty", M + 44, 60)
+    doc
+      .moveTo(M, 102)
+      .lineTo(W - M, 102)
+      .lineWidth(1)
+      .stroke(PDF_BRAND.hairline)
+
+    // Title (i18n).
+    doc
+      .fillColor(PDF_BRAND.ink)
+      .font("Helvetica-Bold")
+      .fontSize(26)
+      .text(lookupCopy(locale, "title"), M, 132, { width: cw })
+
+    // ── Main voucher card ──────────────────────────────────────────────
+    const cardY = 184
+    const cardH = 322
+    doc
+      .roundedRect(M, cardY, cw, cardH, 18)
+      .lineWidth(1)
+      .fillAndStroke(PDF_BRAND.card, PDF_BRAND.hairline)
+
+    const px = M + 28
+    const pw = cw - 56
+    let y = cardY + 28
+
+    // Scannable QR (encodes the voucher code) — top-right of the card. The
+    // salon/service text block below is narrowed to `topW` to clear it.
+    const qrSize = 100
+    const qrX = M + cw - 28 - qrSize
+    const qrY = cardY + 28
+    drawVoucherQr(doc, payload.voucher_code, qrX, qrY, qrSize)
+    doc
+      .fillColor(PDF_BRAND.muted)
       .font("Helvetica")
-      .text(`${lookupCopy(locale, "redemption_code_label")}: `, { continued: true })
-      .font("Helvetica-Bold")
-      .text(payload.voucher_code)
-    doc.moveDown(0.8)
+      .fontSize(8)
+      .text(lookupCopy(locale, "scan_to_redeem"), qrX, qrY + qrSize + 5, {
+        width: qrSize,
+        align: "center",
+      })
+    const topW = pw - qrSize - 22
 
-    // Salon section header (FM-43: exactly ONE salon section per PDF)
+    // Salon (FM-43: exactly ONE salon section per PDF).
     doc
-      .fontSize(13)
+      .fillColor(PDF_BRAND.bronze)
       .font("Helvetica-Bold")
-      .text(`— ${lookupCopy(locale, "salon_section_title")} —`)
-    doc.font("Helvetica").fontSize(11)
-    doc.text(payload.vendor.name)
-    doc.text(`@${payload.vendor.handle}`)
-    if (payload.vendor.address) {
-      doc.text(payload.vendor.address)
-    }
-    doc.moveDown(0.5)
+      .fontSize(9)
+      .text(lookupCopy(locale, "salon_section_title").toUpperCase(), px, y, { characterSpacing: 1.5 })
+    y += 16
+    doc.fillColor(PDF_BRAND.ink).font("Helvetica-Bold").fontSize(18).text(payload.vendor.name, px, y, { width: topW })
+    y = doc.y + 2
+    doc.fillColor(PDF_BRAND.muted).font("Helvetica").fontSize(11).text(`@${payload.vendor.handle}`, px, y, { width: topW })
+    y = doc.y + 12
 
-    // Service + value
-    doc.text(
-      `${lookupCopy(locale, "service_description_label")}: ${payload.service_description}`,
-    )
-    doc.text(
-      `${lookupCopy(locale, "voucher_value_label")}: ${(payload.value_minor / 100).toFixed(2)} ${payload.currency_code}`,
-    )
+    // Service (may wrap → advance by the actual rendered height).
+    doc.fillColor(PDF_BRAND.ink).font("Helvetica").fontSize(13).text(payload.service_description, px, y, { width: topW })
+    y = doc.y + 14
+    // Never let the value/code box ride up under the QR block.
+    y = Math.max(y, qrY + qrSize + 22)
 
-    // Validity
+    // Value — large gold figure.
+    doc
+      .fillColor(PDF_BRAND.gold)
+      .font("Helvetica-Bold")
+      .fontSize(38)
+      .text(formatVoucherValue(payload.value_minor, payload.currency_code, locale), px, y)
+    y = doc.y + 12
+
+    // Redemption code box (gold tint).
+    const codeBoxH = 58
+    doc
+      .roundedRect(px, y, pw, codeBoxH, 10)
+      .lineWidth(1)
+      .fillAndStroke(PDF_BRAND.tint, PDF_BRAND.hairline)
+    doc
+      .fillColor(PDF_BRAND.bronze)
+      .font("Helvetica-Bold")
+      .fontSize(8)
+      .text(lookupCopy(locale, "redemption_code_label").toUpperCase(), px + 16, y + 12, { characterSpacing: 1.5 })
+    doc
+      .fillColor(PDF_BRAND.ink)
+      .font("Helvetica-Bold")
+      .fontSize(19)
+      .text(payload.voucher_code, px + 16, y + 26, { characterSpacing: 2 })
+    y += codeBoxH + 16
+
+    // Validity.
     if (payload.valid_until) {
-      doc.text(`${lookupCopy(locale, "validity_period_label")}: ${payload.valid_until}`)
+      doc
+        .fillColor(PDF_BRAND.muted)
+        .font("Helvetica")
+        .fontSize(11)
+        .text(`${lookupCopy(locale, "validity_period_label")}: ${payload.valid_until}`, px, y)
     }
 
-    // Buyer note
+    // ── Below the card ─────────────────────────────────────────────────
+    let by = cardY + cardH + 22
+
+    // Buyer note — italic, gold-accented tinted strip.
     if (payload.buyer_note) {
-      doc.moveDown(0.3)
-      doc.font("Helvetica-Oblique").text(`> ${payload.buyer_note}`)
-      doc.font("Helvetica")
+      const noteH = 58
+      doc.roundedRect(M, by, cw, noteH, 12).lineWidth(1).fillAndStroke(PDF_BRAND.noteBg, PDF_BRAND.hairline)
+      doc.rect(M, by, 4, noteH).fill(PDF_BRAND.gold)
+      doc
+        .fillColor(PDF_BRAND.muted)
+        .font("Helvetica-Oblique")
+        .fontSize(12)
+        .text(payload.buyer_note, M + 22, by + 19, { width: cw - 44 })
+      by += noteH + 20
     }
 
-    // Directions section (Story v160-6-5; AR45-safe — vendor-side only)
+    // Directions (Story v160-6-5; AR45-safe — vendor-side only).
     const directions = renderDirectionsSection(payload)
     if (directions.length > 0) {
-      doc.moveDown(0.8)
       doc
-        .fontSize(12)
+        .fillColor(PDF_BRAND.bronze)
         .font("Helvetica-Bold")
-        .text(`— ${lookupCopy(locale, "directions_title")} —`)
-      doc.fontSize(10).font("Helvetica")
-      // Skip the header line already rendered above; output remaining lines.
-      const bodyLines = directions.slice(1)
-      for (const line of bodyLines) {
+        .fontSize(10)
+        .text(lookupCopy(locale, "directions_title"), M, by, { characterSpacing: 1 })
+      by += 18
+      doc.fillColor(PDF_BRAND.muted).font("Helvetica").fontSize(9.5)
+      for (const line of directions.slice(1)) {
         if (line === "") {
-          doc.moveDown(0.3)
+          by += 5
         } else {
-          doc.text(line)
+          doc.text(line, M, by, { width: cw })
+          by += 13
         }
       }
     }
+
+    // Footer — hairline + brand mark.
+    doc
+      .moveTo(M, H - 64)
+      .lineTo(W - M, H - 64)
+      .lineWidth(1)
+      .stroke(PDF_BRAND.hairline)
+    doc
+      .fillColor(PDF_BRAND.bronze)
+      .font("Helvetica-Bold")
+      .fontSize(9)
+      .text("BonBeauty", M, H - 52, { width: cw, align: "right" })
 
     doc.end()
   })
