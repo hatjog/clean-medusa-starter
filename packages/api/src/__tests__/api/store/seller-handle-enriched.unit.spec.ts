@@ -275,6 +275,54 @@ describe("GET /store/seller/[handle] — enriched profile", () => {
     expect(body.seller.opening_hours).toBeNull();
   });
 
+  it("3.6: overlays name/description from the translation module for a non-source locale", async () => {
+    mockGetStore.mockReturnValue({ sales_channel_id: "sc_bb" });
+    mockGetSellerIdByHandleForSalesChannel.mockResolvedValue("seller_123");
+
+    const baseSeller = {
+      id: "seller_123",
+      name: "Studio Nova",
+      handle: "studio-nova",
+      // Column empty in practice; GP enrichment + translation provide content.
+      description: null,
+      metadata: { gp: { description: "Salon premium w centrum Warszawy." } },
+    };
+
+    const mockQuery = {
+      graph: jest.fn().mockResolvedValue({ data: [baseSeller] }),
+    };
+    const mockTranslation = {
+      listTranslations: jest.fn().mockResolvedValue([
+        {
+          reference_id: "seller_123",
+          translations: {
+            name: "Studio Nova",
+            description: "Преміальний салон у центрі Варшави.",
+          },
+        },
+      ]),
+    };
+
+    const req = createRequest("studio-nova", (key: string) => {
+      if (key === "__pg_connection__") return jest.fn();
+      if (key === "query") return mockQuery;
+      if (key === "translation") return mockTranslation;
+      return undefined;
+    });
+    (req as unknown as { locale?: string }).locale = "uk-UA";
+    const res = createResponse();
+
+    await GET(req, res as unknown as Parameters<typeof GET>[1]);
+
+    expect(mockTranslation.listTranslations).toHaveBeenCalledWith({
+      reference: "seller",
+      reference_id: ["seller_123"],
+      locale_code: "uk-UA",
+    });
+    const body = res.body as { seller: Record<string, unknown> };
+    expect(body.seller.description).toBe("Преміальний салон у центрі Варшави.");
+  });
+
   it("3.4: throws NOT_FOUND when salesChannelId is missing", async () => {
     mockGetStore.mockReturnValue(null);
 
