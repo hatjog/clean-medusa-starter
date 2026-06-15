@@ -124,6 +124,21 @@ describe("stage registry — sync-reviews behawioralny", () => {
     expect(vendorsIndex).toBeGreaterThan(-1)
     expect(reviewsIndex).toBeGreaterThan(vendorsIndex)
   })
+
+  it("sync-i18n-content jest po sync-catalog i sync-vendors (treść tłumaczeń wymaga istniejących encji kategorii/produktów ORAZ sprzedawców)", () => {
+    const source = fs.readFileSync(
+      path.resolve(__dirname, "../../scripts/gp-config-sync-orchestrator.ts"),
+      "utf8"
+    )
+    const catalogIndex = source.indexOf('name: "sync-catalog"')
+    const vendorsIndex = source.indexOf('name: "sync-vendors"')
+    const i18nContentIndex = source.indexOf('name: "sync-i18n-content"')
+    const reviewsIndex = source.indexOf('name: "sync-reviews"')
+
+    expect(i18nContentIndex).toBeGreaterThan(catalogIndex)
+    expect(i18nContentIndex).toBeGreaterThan(vendorsIndex)
+    expect(reviewsIndex).toBeGreaterThan(i18nContentIndex)
+  })
 })
 
 describe("assertTranslationStageGate", () => {

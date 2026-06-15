@@ -73,6 +73,8 @@ npx medusa exec ./src/scripts/my-script.ts arg1 arg2
 pnpm run db:migrate:all
 pnpm run db:migrate:app:status
 yarn gp-config-sync-catalog gp-dev bonbeauty
+yarn gp-config-sync-translations gp-dev bonbeauty
+yarn gp-config-sync-i18n-content gp-dev bonbeauty --dry-run
 yarn gp-config-sync-vendors gp-dev bonbeauty
 yarn gp-config-sync-payments gp-dev bonbeauty
 yarn gp-config-sync-orchestrator gp-dev bonbeauty
