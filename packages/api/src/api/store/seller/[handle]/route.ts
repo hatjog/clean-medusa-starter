@@ -6,6 +6,10 @@ import {
 import type { Knex } from "knex";
 import { marketContextStorage } from "../../../../lib/market-context";
 import { getSellerIdByHandleForSalesChannel } from "../../../../lib/seller-market-scope";
+import {
+  fetchTranslationOverlay,
+  overlayField,
+} from "../../../../lib/translation-overlay";
 
 type SocialLinks = {
   instagram?: string | null;
@@ -144,11 +148,24 @@ export async function GET(req: MedusaRequest, res: MedusaResponse) {
     (rawSeller.metadata as Record<string, unknown>)?.gp ?? {}
   ) as GpMetadata;
 
+  // v1.12.0 UA-loc: the framework's query.graph({ locale }) overlay does not
+  // decorate the custom `seller` module entity, so name/description ship in the
+  // source locale despite materialized UA/DE/EN translations. Overlay them
+  // explicitly from the translation module (no-op for the source locale pl-PL).
+  const translation = (
+    await fetchTranslationOverlay(req.scope, "seller", [sellerId], locale)
+  ).get(sellerId);
+
   const seller: SellerProfileResponse = {
     id: rawSeller.id as string,
-    name: (rawSeller.name as string) ?? "",
+    name:
+      overlayField((rawSeller.name as string) ?? "", translation, "name") ?? "",
     handle: (rawSeller.handle as string) ?? "",
-    description: (rawSeller.description as string | null) ?? null,
+    description: overlayField(
+      (rawSeller.description as string | null) ?? null,
+      translation,
+      "description"
+    ),
     photo:
       (rawSeller.photo as string | null | undefined) ??
       (rawSeller.logo as string | null | undefined) ??
