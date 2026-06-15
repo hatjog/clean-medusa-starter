@@ -31,6 +31,7 @@
     "gp-config-sync-catalog": "medusa exec ./packages/api/src/scripts/gp-config-sync-catalog.ts",
     "gp-config-sync-orchestrator": "medusa exec ./packages/api/src/scripts/gp-config-sync-orchestrator.ts",
     "gp-config-sync-translations": "medusa exec ./packages/api/src/scripts/gp-config-sync-translations.ts",
+    "gp-config-sync-i18n-content": "medusa exec ./packages/api/src/scripts/gp-config-sync-i18n-content.ts",
     "gp-config-sync-shipping": "medusa exec ./packages/api/src/scripts/gp-config-sync-shipping.ts",
     "gp-config-sync-payments": "medusa exec ./packages/api/src/scripts/gp-config-sync-payments.ts",
     "gp-config-sync-media": "medusa exec ./packages/api/src/scripts/gp-config-sync-media.ts",

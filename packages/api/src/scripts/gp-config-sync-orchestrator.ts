@@ -11,6 +11,7 @@ import { parseDryRunFlag, parseOverwriteFlag, parsePruneFlag } from "./gp-sync-d
 import gpConfigSyncAccounts from "./gp-config-sync-accounts"
 import gpConfigSyncBlog from "./gp-config-sync-blog"
 import gpConfigSyncCatalog from "./gp-config-sync-catalog"
+import gpConfigSyncI18nContent from "./gp-config-sync-i18n-content"
 import gpConfigSyncTranslations from "./gp-config-sync-translations"
 import gpConfigSyncMedia from "./gp-config-sync-media"
 import gpConfigSyncPayments from "./gp-config-sync-payments"
@@ -653,6 +654,46 @@ export default async function gpConfigSyncOrchestrator({ container, args }: Exec
             await invokeStageEntrypoint(gpConfigSyncVendors, container, stageArgs)
           })
           return orchestratorArgs.dryRun ? "vendor dry-run completed" : "vendor sync completed"
+        },
+      },
+      {
+        name: "sync-i18n-content",
+        required: true,
+        execute: async () => {
+          const result = await withStageEnv(orchestratorArgs, async () => {
+            return await invokeStageEntrypoint(gpConfigSyncI18nContent, container, stageArgs)
+          })
+
+          if ("skipped" in result && result.skipped) {
+            return {
+              status: "skipped" as const,
+              message: `i18n content sync: SKIPPED (${result.reason})`,
+            }
+          }
+
+          const completedResult = result as {
+            locales: string[]
+            entities: Record<
+              string,
+              {
+                created: number
+                translation_records: number
+                updated: number
+              }
+            >
+          }
+          const recordCount = Object.values(completedResult.entities).reduce(
+            (sum, entity) => sum + entity.translation_records,
+            0
+          )
+          const changedCount = Object.values(completedResult.entities).reduce(
+            (sum, entity) => sum + entity.created + entity.updated,
+            0
+          )
+
+          return orchestratorArgs.dryRun
+            ? `i18n content sync: COMPLETED (dry-run, locales=${completedResult.locales.length}, records=${recordCount}, planned_changes=${changedCount})`
+            : `i18n content sync: COMPLETED (locales=${completedResult.locales.length}, records=${recordCount}, changes=${changedCount})`
         },
       },
       {
