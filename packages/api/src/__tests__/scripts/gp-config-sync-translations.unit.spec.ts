@@ -47,6 +47,7 @@ describe("gp-config-sync-translations", () => {
   beforeEach(() => {
     process.env = { ...originalEnv }
     delete process.env.GP_CONFIG_ROOT
+    delete process.env.GP_ENV
     delete process.env.GP_INSTANCE_ID
     delete process.env.GP_MARKET_ID
     delete process.env.MEDUSA_FF_TRANSLATION
@@ -348,7 +349,8 @@ describe("gp-config-sync-translations", () => {
     expect(summary.updated).toEqual(["trset_product"])
   })
 
-  it("pomija sync bez rozwiazywania serwisow gdy Translation FF jest wylaczony", async () => {
+  it("pomija sync bez rozwiazywania serwisow tylko w dev z jawnym FF=off", async () => {
+    process.env.GP_ENV = "dev"
     process.env.MEDUSA_FF_TRANSLATION = "false"
     const container = {
       resolve: jest.fn(() => {
@@ -363,6 +365,21 @@ describe("gp-config-sync-translations", () => {
       skipped: true,
       reason: "MEDUSA_FF_TRANSLATION is not true",
     })
+    expect(container.resolve).not.toHaveBeenCalled()
+  })
+
+  it("blokuje FF=off w test, bo E5 VR wymaga deterministycznego FF=on", async () => {
+    process.env.NODE_ENV = "test"
+    process.env.MEDUSA_FF_TRANSLATION = "false"
+    const container = {
+      resolve: jest.fn(() => {
+        throw new Error("nie powinno byc wywolane")
+      }),
+    }
+
+    await expect(
+      gpConfigSyncTranslations({ container: container as never, args: [] })
+    ).rejects.toThrow(/cannot be disabled by MEDUSA_FF_TRANSLATION=false in test/)
     expect(container.resolve).not.toHaveBeenCalled()
   })
 })

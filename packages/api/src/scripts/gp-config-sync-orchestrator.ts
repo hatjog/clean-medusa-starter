@@ -123,12 +123,13 @@ export function assertTranslationStageGate(
 ): void {
   const stage = env.MEDUSA_STAGE?.trim().toLowerCase()
   const gatedStages = new Set(["staging", "canary", "production"])
+  const rawTranslationFlag = env.MEDUSA_FF_TRANSLATION?.trim().toLowerCase()
 
   if (
     stage &&
     gatedStages.has(stage) &&
-    !isTranslationFeatureFlagEnabled(env) &&
-    !orchestratorArgs.allowSkip
+    !orchestratorArgs.allowSkip &&
+    (rawTranslationFlag === "false" || !isTranslationFeatureFlagEnabled(env))
   ) {
     throw new Error(
       `FF translation gate required in stage ${stage}; pass --allow-skip to override`
