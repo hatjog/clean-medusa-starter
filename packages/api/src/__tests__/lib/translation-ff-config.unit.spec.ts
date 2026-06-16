@@ -30,6 +30,14 @@ describe("translation FF config", () => {
   })
 
   it("rozstrzyga dev jako configurable z jawnym defaultem OFF", () => {
+    expect(resolveTranslationFeatureFlagPolicy({})).toEqual(
+      expect.objectContaining({
+        environment: "dev",
+        enabled: false,
+        source: "policy-default",
+      })
+    )
+
     expect(resolveTranslationFeatureFlagPolicy({ GP_ENV: "dev" })).toEqual(
       expect.objectContaining({
         environment: "dev",
@@ -78,12 +86,26 @@ describe("translation FF config", () => {
         NODE_ENV: "development",
       }).environment
     ).toBe("production")
+
+    expect(
+      resolveTranslationFeatureFlagPolicy({
+        MEDUSA_STAGE: "canary",
+        NODE_ENV: "development",
+      }).environment
+    ).toBe("staging")
   })
 
-  it("fail-loud dla nieznanego env i proby wylaczenia FF poza dev", () => {
+  it("fail-loud dla nieznanego env, niepoprawnej wartosci i proby wylaczenia FF poza dev", () => {
     expect(() => resolveTranslationFeatureFlagPolicy({ GP_ENV: "preview" })).toThrow(
       /Unsupported MEDUSA_FF_TRANSLATION environment/
     )
+
+    expect(() =>
+      resolveTranslationFeatureFlagPolicy({
+        GP_ENV: "dev",
+        MEDUSA_FF_TRANSLATION: "on",
+      })
+    ).toThrow(/Invalid MEDUSA_FF_TRANSLATION value/)
 
     expect(() =>
       resolveTranslationFeatureFlagPolicy({

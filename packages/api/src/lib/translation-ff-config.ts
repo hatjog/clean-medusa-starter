@@ -83,6 +83,10 @@ function readEnv(env: EnvLike, key: string): string | undefined {
 function normalizePolicyEnvironment(
   value: string | undefined
 ): TranslationFeatureFlagEnvironment | null {
+  if (value === undefined) {
+    return "dev"
+  }
+
   switch (value?.trim().toLowerCase()) {
     case "production":
     case "prod":
@@ -124,14 +128,8 @@ function parseBooleanOverride(value: string | undefined): boolean | null {
 
   switch (value.trim().toLowerCase()) {
     case "true":
-    case "1":
-    case "on":
-    case "yes":
       return true
     case "false":
-    case "0":
-    case "off":
-    case "no":
       return false
     default:
       throw new Error(
