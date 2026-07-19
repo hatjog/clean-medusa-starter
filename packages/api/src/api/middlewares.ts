@@ -754,6 +754,14 @@ export default defineMiddlewares({
       method: ["POST"],
       matcher: "/webhooks/stripe",
     },
+    // Story 5.1 (FR-10) FINDING-1 fix: bez preserveRawBody route.ts (readRawBody)
+    // fail-closed 400 raw_body_unavailable na KAŻDYM realnym webhooku Stripe —
+    // sygnatura musi być weryfikowana bajt-w-bajt (wzorzec Brevo poniżej).
+    {
+      method: ["POST"],
+      matcher: "/webhooks/stripe/payment-intent",
+      bodyParser: { preserveRawBody: true },
+    },
     {
       method: ["POST"],
       matcher: BREVO_PROVIDER_ROUTE_MATCHER,
