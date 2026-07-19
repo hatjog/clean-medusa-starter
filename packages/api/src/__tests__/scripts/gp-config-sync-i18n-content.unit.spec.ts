@@ -191,4 +191,92 @@ describe("gp-config-sync-i18n-content", () => {
     expect(translationService.createTranslations).not.toHaveBeenCalled()
     expect(translationService.updateTranslations).not.toHaveBeenCalled()
   })
+
+  it("skips entities whose i18n source file is missing instead of crashing", async () => {
+    const i18nDir = await fs.mkdtemp(path.join(os.tmpdir(), "gp-i18n-content-"))
+    await fs.writeFile(
+      path.join(i18nDir, "sellers.yaml"),
+      [
+        "entries:",
+        "  - handle: city-beauty",
+        "    fields:",
+        "      name:",
+        "        uk-UA: City Beauty",
+        "",
+      ].join("\n"),
+      "utf8"
+    )
+    const { productModuleService, sellerModuleService, translationService } = makeServices()
+
+    const summary = await syncI18nTranslationContent(
+      translationService,
+      productModuleService,
+      sellerModuleService,
+      {
+        dryRun: true,
+        i18nDir,
+        locales: ["uk-UA"],
+        marketId: "bonbeauty",
+      }
+    )
+
+    expect(summary.entities.product_category).toMatchObject({
+      source_entries: 0,
+      translation_records: 0,
+      created: 0,
+    })
+    expect(summary.entities.product).toMatchObject({
+      source_entries: 0,
+      translation_records: 0,
+      created: 0,
+    })
+    expect(summary.entities.seller.translation_records).toBe(1)
+    expect(summary.warnings).toEqual(
+      expect.arrayContaining([
+        expect.stringContaining("product_category: i18n source file missing"),
+        expect.stringContaining("product: i18n source file missing"),
+      ])
+    )
+    expect(translationService.createTranslations).not.toHaveBeenCalled()
+  })
+
+  it("passes dry-run for a market without an i18n directory at all", async () => {
+    const missingDir = path.join(os.tmpdir(), "gp-i18n-content-missing", "i18n")
+    const { productModuleService, sellerModuleService, translationService } = makeServices()
+
+    const summary = await syncI18nTranslationContent(
+      translationService,
+      productModuleService,
+      sellerModuleService,
+      {
+        dryRun: true,
+        i18nDir: missingDir,
+        locales: ["uk-UA"],
+        marketId: "testmarketb",
+      }
+    )
+
+    for (const entity of Object.values(summary.entities)) {
+      expect(entity.source_entries).toBe(0)
+      expect(entity.translation_records).toBe(0)
+    }
+    expect(summary.warnings.filter((w) => w.includes("i18n source file missing"))).toHaveLength(3)
+    expect(translationService.createTranslations).not.toHaveBeenCalled()
+    expect(translationService.updateTranslations).not.toHaveBeenCalled()
+  })
+
+  it("still throws on invalid i18n YAML", async () => {
+    const i18nDir = await fs.mkdtemp(path.join(os.tmpdir(), "gp-i18n-content-"))
+    await fs.writeFile(path.join(i18nDir, "categories.yaml"), "not-an-entries-doc\n", "utf8")
+    const { productModuleService, sellerModuleService, translationService } = makeServices()
+
+    await expect(
+      syncI18nTranslationContent(translationService, productModuleService, sellerModuleService, {
+        dryRun: true,
+        i18nDir,
+        locales: ["uk-UA"],
+        marketId: "bonbeauty",
+      })
+    ).rejects.toThrow(/Invalid i18n YAML document/)
+  })
 })

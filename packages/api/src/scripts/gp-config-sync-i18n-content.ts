@@ -520,8 +520,23 @@ async function collectTranslationPayloads(
 
   for (const config of configs) {
     const filePath = path.join(options.i18nDir, config.fileName)
-    const entries = await readI18nFile(filePath)
     const summary = options.summaries[config.entityType]
+
+    // Markety bez contentu i18n (brak pliku encji albo całego katalogu i18n)
+    // są poprawnym stanem — pomijamy encję z warningiem. Niepoprawny YAML
+    // nadal rzuca.
+    let entries: I18nEntry[]
+    try {
+      entries = await readI18nFile(filePath)
+    } catch (error: any) {
+      if (error?.code === "ENOENT") {
+        options.warnings.push(
+          `${config.entityType}: i18n source file missing (${filePath}) — entity skipped`
+        )
+        continue
+      }
+      throw error
+    }
     summary.source_entries = entries.length
 
     for (const entry of entries) {
