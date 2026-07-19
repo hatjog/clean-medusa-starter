@@ -19,6 +19,14 @@ type I18nFields = Record<string, Record<string, unknown>>
 type I18nEntry = {
   handle?: unknown
   fields?: I18nFields
+  /**
+   * Marker kolejki review (gp-cli Story 4.2 / AD-13) — legacy scalar albo
+   * mapa per-locale. Code review 4.2 F3: ten sync dziś TYLKO CZYTA to pole
+   * do celów raportowania (`countUnshippedLocales` niżej) — NIE gate'uje na
+   * nim materializacji. Patrz deferral note w ContentPipelineService.ts
+   * (gp-cli) i ADR-160 (status Proposed).
+   */
+  review_status?: unknown
 }
 
 type I18nFile = {
@@ -78,6 +86,14 @@ type EntitySummary = {
   content_bar_updated: number
   /** AD-4: ile encji miało już identyczny `content_bar` (idempotencja). */
   content_bar_unchanged: number
+  /**
+   * Code review 4.2 F3: ile zmaterializowanych rekordów tłumaczeń NIE miało
+   * `review_status: shipped` dla swojego locale (brak markera liczy się jako
+   * "nie shipped"). Materializacja i tak je synchronizuje — patrz deferral
+   * note w gp-cli `ContentPipelineService.ts` i ADR-160. To pole jest
+   * WYŁĄCZNIE widocznością, nie bramką.
+   */
+  unshipped_records: number
 }
 
 /**
@@ -380,7 +396,22 @@ function emptyEntitySummary(): EntitySummary {
     missing_handles: [],
     content_bar_updated: 0,
     content_bar_unchanged: 0,
+    unshipped_records: 0,
   }
+}
+
+/**
+ * Code review 4.2 F3: czy `review_status` wpisu oznacza dane `locale` jako
+ * `shipped`. Akceptuje oba kształty (legacy scalar = ten sam stan dla
+ * wszystkich locale ≠ PL; mapa per-locale). Brak markera = `false` (nie
+ * "nieznany", nie "zakładamy shipped") — nowe wpisy bez markera nie powinny
+ * cicho liczyć się jako gotowe.
+ */
+function isLocaleShipped(entry: I18nEntry, locale: string): boolean {
+  const raw = entry.review_status
+  if (typeof raw === 'string') return raw === 'shipped'
+  if (isRecord(raw)) return raw[locale] === 'shipped'
+  return false
 }
 
 function createEntitySummaries(): Record<EntityType, EntitySummary> {
@@ -547,7 +578,20 @@ async function collectTranslationPayloads(
           translations,
         })
         summary.translation_records += 1
+        // Code review 4.2 F3: visibility-only counter — materialization does
+        // NOT gate on review_status (deferred, see ADR-160 / F3 note above).
+        if (!isLocaleShipped(entry, locale)) {
+          summary.unshipped_records += 1
+        }
       }
+    }
+
+    if (summary.unshipped_records > 0) {
+      options.warnings.push(
+        `${config.entityType}: materialized ${summary.unshipped_records} translation record(s) ` +
+          `whose review_status is not 'shipped' — Story 4.2 does NOT gate ship on review_status ` +
+          `(deferred, see ADR-160 / gp-cli ContentPipelineService.ts F3 note).`
+      )
     }
   }
 

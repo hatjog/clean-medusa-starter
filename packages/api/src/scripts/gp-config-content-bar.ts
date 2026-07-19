@@ -1,5 +1,5 @@
 /**
- * `gp-config-content-bar` — pomiar baru treści (AD-4) bez DB i bez LLM.
+ * `gp-config-content-bar` — pomiar baru treści (AD-4), logika bez DB i bez LLM.
  *
  * Skrypt czyta source YAML gp-ops (`gp-ops/markets/<market>/i18n/*.yaml`
  * + PL kategorii z `gp-ops/config/<instance>/markets/<market>/products.yaml`
@@ -7,18 +7,30 @@
  * × locale.
  *
  * Dlaczego osobny skrypt, a nie część `gp-config-sync-i18n-content`:
- * pipeline FR-22 (gp-cli, Story 4.2) musi umieć zmierzyć bar **bez
- * uruchomionej Medusy** — etap pomiaru baru jest jawnie non-LLM i non-DB
- * (AC4: „etapy nie wymagające modelu działają bez klucza"). Sync nadal
- * używa TEJ SAMEJ stałej i TEJ SAMEJ funkcji wordcount z
- * `./lib/content-bar.ts` — AD-4 wymaga jednego źródła, nie jednego
- * wywołania.
+ * pipeline FR-22 (gp-cli, Story 4.2) musi umieć zmierzyć bar bez pisania do
+ * Medusy i bez klucza LLM (AC4: „etapy nie wymagające modelu działają bez
+ * klucza") — `measureMarketContentBar` NIE dotyka `container` (patrz
+ * komentarz przy `gpConfigContentBar` niżej) i da się wywołać z testu
+ * jednostkowego bez bootowania Medusy w ogóle. Sync nadal używa TEJ SAMEJ
+ * stałej i TEJ SAMEJ funkcji wordcount z `./lib/content-bar.ts` — AD-4
+ * wymaga jednego źródła, nie jednego wywołania.
  *
- * Uruchomienie (bez Medusa containera, bez dodatkowych zależności):
+ * Code review 4.2 F7 — **nuance na "bez DB" powyżej**: to jest prawda dla
+ * `measureMarketContentBar` (logika czysta, testowalna izolowanie), ale
+ * NIEPRAWDA dla faktycznego wywołania `pnpm gp-config-content-bar` z gp-cli
+ * — ten entrypoint jest odpalany przez `medusa exec`, więc CLI wciąż bootuje
+ * cały kontener Medusy (w tym połączenie z DB) zanim ten kod w ogóle
+ * dostanie sterowanie; sam kontener jest po prostu świadomie nieużywany.
+ * Operator oczekujący realnego "bez DB" (np. offline / bez uruchomionego
+ * Postgresa) powinien wywołać `measureMarketContentBar` bezpośrednio z testu
+ * albo skryptu node, nie przez `pnpm gp-config-content-bar`.
+ *
+ * Uruchomienie (bez dodatkowych zależności poza działającą Medusą):
  *   pnpm gp-config-content-bar --market bonbeauty --instance gp-dev
  *
- * Kontrakt wyjścia jest STABILNY — konsumuje go gp-cli (`gp content bar`)
- * oraz raport FR-23 (Story 4.3). Zmiana kształtu = zmiana kontraktu.
+ * Kontrakt wyjścia jest STABILNY — konsumuje go gp-cli
+ * (`gp content pipeline --stage bar`) oraz raport FR-23 (Story 4.3). Zmiana
+ * kształtu = zmiana kontraktu.
  */
 
 import fs from "node:fs"
@@ -247,20 +259,16 @@ export async function gpConfigContentBar({
 }: {
   args?: string[]
 }): Promise<ContentBarReport> {
+  // Code review 4.2 F12: a `process.env.GP_INSTANCE_ID`/`GP_MARKET_ID`
+  // fallback used to sit here, directly under the AD-11 "no hidden
+  // defaults" comment — a genuine contradiction (an operator's ambient env
+  // var could silently pick the target instance/market instead of the
+  // explicit flag/positional arg). Removed: only `--instance`/`--market`
+  // (or the positional args mirroring `gp-config-sync-i18n-content`) count.
   const argv = args ?? []
   const positional = argv.filter((arg) => !arg.startsWith("--"))
-  const instanceId = (
-    readFlag(argv, "instance") ??
-    positional[0] ??
-    process.env.GP_INSTANCE_ID ??
-    ""
-  ).trim()
-  const marketId = (
-    readFlag(argv, "market") ??
-    positional[1] ??
-    process.env.GP_MARKET_ID ??
-    ""
-  ).trim()
+  const instanceId = (readFlag(argv, "instance") ?? positional[0] ?? "").trim()
+  const marketId = (readFlag(argv, "market") ?? positional[1] ?? "").trim()
 
   // AD-11: instance + market OBOWIĄZKOWE, bez ukrytych defaultów.
   if (!instanceId || !marketId) {
