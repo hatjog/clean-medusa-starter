@@ -9,6 +9,8 @@ import * as yaml from "js-yaml"
 import { parseDryRunFlag } from "./gp-sync-dry-run"
 import { loadMarketSupportedLocaleCodes } from "./gp-config-sync-translations"
 import { isTranslationFeatureFlagEnabled } from "../lib/translation-ff-config"
+import { buildContentBarMap, type ContentBarMap } from "./lib/content-bar"
+import { readCategoryPlSource } from "./gp-config-content-bar"
 
 type EntityType = "product_category" | "product" | "seller"
 
@@ -72,6 +74,22 @@ type EntitySummary = {
   unchanged: number
   skipped: number
   missing_handles: string[]
+  /** AD-4: ile encji dostało nowy/zmieniony `metadata.gp.content_bar`. */
+  content_bar_updated: number
+  /** AD-4: ile encji miało już identyczny `content_bar` (idempotencja). */
+  content_bar_unchanged: number
+}
+
+/**
+ * Encja rozwiązana w DB wraz z jej opisami z source YAML — wejście do
+ * materializacji `metadata.gp.content_bar` (AD-4).
+ */
+type ContentBarTarget = {
+  entityType: EntityType
+  entityId: string
+  handle: string
+  metadata: unknown
+  bodiesByLocale: Record<string, unknown>
 }
 
 type I18nContentSummary = {
@@ -360,6 +378,8 @@ function emptyEntitySummary(): EntitySummary {
     unchanged: 0,
     skipped: 0,
     missing_handles: [],
+    content_bar_updated: 0,
+    content_bar_unchanged: 0,
   }
 }
 
@@ -455,6 +475,14 @@ async function collectTranslationPayloads(
     marketId: string
     summaries: Record<EntityType, EntitySummary>
     warnings: string[]
+    /**
+     * AD-4: zbierane po drodze cele materializacji `content_bar`. Celowo
+     * wypełniane w tej samej pętli co payloady tłumaczeń — druga pętla po
+     * YAML rozjechałaby się z pierwszą przy pierwszej zmianie filtra.
+     */
+    barTargets: ContentBarTarget[]
+    /** AD-12: PL kategorii pochodzi z gp-config products.yaml, nie z i18n. */
+    categoryPlByHandle: Map<string, string>
   }
 ): Promise<TranslationPayload[]> {
   const payloads: TranslationPayload[] = []
@@ -485,6 +513,22 @@ async function collectTranslationPayloads(
       }
 
       summary.resolved_entries += 1
+
+      // AD-4: bar mierzymy z SOURCE YAML (nie z tego, co akurat wylądowało
+      // w DB) i dla WSZYSTKICH locale, także PL — gate FAZY 1 czyta
+      // `content_bar.pl`, więc pominięcie PL wyzerowałoby katalog.
+      const bodyValues = entry.fields?.["description"]
+      const bodies: Record<string, unknown> = isRecord(bodyValues) ? { ...bodyValues } : {}
+      if (config.entityType === "product_category") {
+        bodies["pl-PL"] = options.categoryPlByHandle.get(handle) ?? ""
+      }
+      options.barTargets.push({
+        entityType: config.entityType,
+        entityId: match.id,
+        handle,
+        metadata: match.metadata,
+        bodiesByLocale: bodies,
+      })
 
       for (const locale of options.locales) {
         const translations = buildEntryTranslations(entry, config.fields, locale)
@@ -612,6 +656,96 @@ async function applyTranslationPayloads(
   }
 }
 
+/**
+ * AD-4 — materializuje `metadata.gp.content_bar` na encji.
+ *
+ * Kontrakt: `{ [localeSlug]: { words: int, bar: bool } }`. Storefront
+ * (`checkQualityGate` w `normalize-listed-products.ts`) czyta WYŁĄCZNIE
+ * pole `bar` i nigdy nie przelicza słów — dlatego liczba musi powstać tutaj,
+ * w sync-time, z tej samej stałej i tej samej funkcji wordcount co pipeline
+ * gp-cli (FR-22) i raport (FR-23).
+ *
+ * Zapis jest idempotentny: identyczna mapa nie generuje update'u.
+ */
+async function applyContentBarMetadata(
+  services: { productModuleService: any; sellerModuleService: any },
+  targets: ContentBarTarget[],
+  options: {
+    dryRun: boolean
+    summaries: Record<EntityType, EntitySummary>
+    warnings: string[]
+  }
+): Promise<void> {
+  const updatesByEntity = new Map<
+    EntityType,
+    Array<{ id: string; metadata: Record<string, unknown> }>
+  >()
+
+  for (const target of targets) {
+    const summary = options.summaries[target.entityType]
+    let nextBar: ContentBarMap
+    try {
+      nextBar = buildContentBarMap(target.entityType, target.bodiesByLocale)
+    } catch (error: any) {
+      // Fail-loud na poziomie encji, ale bez zabijania całego syncu —
+      // nieznany typ treści to błąd konfiguracji, nie błąd danych operatora.
+      options.warnings.push(
+        `${target.entityType} '${target.handle}': content_bar not computed — ` +
+          `${error?.message ?? String(error)}`
+      )
+      continue
+    }
+
+    const metadata = isRecord(target.metadata) ? target.metadata : {}
+    const gp = isRecord(metadata.gp) ? metadata.gp : {}
+
+    if (sameJson(gp.content_bar ?? null, nextBar)) {
+      summary.content_bar_unchanged += 1
+      continue
+    }
+
+    summary.content_bar_updated += 1
+    updatesByEntity.set(target.entityType, [
+      ...(updatesByEntity.get(target.entityType) ?? []),
+      {
+        id: target.entityId,
+        // Merge, nie podmiana: `metadata.gp` niesie też `market_id`,
+        // `images[]` (AD-10) i inne pola, których ten sync nie jest właścicielem.
+        metadata: { ...metadata, gp: { ...gp, content_bar: nextBar } },
+      },
+    ])
+  }
+
+  if (options.dryRun) {
+    return
+  }
+
+  for (const [entityType, updates] of updatesByEntity.entries()) {
+    if (updates.length === 0) continue
+
+    const service =
+      entityType === "seller" ? services.sellerModuleService : services.productModuleService
+    const methodNames =
+      entityType === "product"
+        ? ["updateProducts", "update"]
+        : entityType === "product_category"
+          ? ["updateProductCategories", "update"]
+          : ["updateSellers", "update"]
+
+    const updateFn = firstFunction(service, methodNames)
+    if (!updateFn) {
+      throw new Error(
+        `Cannot materialize content_bar for '${entityType}': service exposes none of ` +
+          `${methodNames.join(", ")}.`
+      )
+    }
+
+    for (const update of updates) {
+      await updateFn(update.id, { metadata: update.metadata })
+    }
+  }
+}
+
 export async function syncI18nTranslationContent(
   translationService: any,
   productModuleService: any,
@@ -621,11 +755,22 @@ export async function syncI18nTranslationContent(
     i18nDir: string
     locales: string[]
     marketId: string
+    /** AD-12: skąd wziąć PL kategorii. Bez tego PL kategorii = 0 słów. */
+    categoryPlByHandle?: Map<string, string>
   }
 ): Promise<Omit<I18nContentSummary, "ok" | "dry_run" | "i18n_root" | "locales">> {
   const dryRun = options.dryRun === true
   const summaries = createEntitySummaries()
   const warnings: string[] = []
+  const barTargets: ContentBarTarget[] = []
+
+  // Klucze mapy PL normalizujemy tak samo jak handle z i18n YAML, żeby
+  // `Twarz` / `twarz` / `tward-` nie rozjechały się cicho na 0 słów.
+  const categoryPlByHandle = new Map<string, string>()
+  for (const [handle, description] of options.categoryPlByHandle ?? []) {
+    categoryPlByHandle.set(normalizeHandle(handle), description)
+  }
+
   const payloads = await collectTranslationPayloads(
     CONTENT_ENTITY_CONFIGS,
     { productModuleService, sellerModuleService },
@@ -635,6 +780,8 @@ export async function syncI18nTranslationContent(
       marketId: options.marketId,
       summaries,
       warnings,
+      barTargets,
+      categoryPlByHandle,
     }
   )
 
@@ -642,6 +789,12 @@ export async function syncI18nTranslationContent(
     dryRun,
     summaries,
   })
+
+  await applyContentBarMetadata(
+    { productModuleService, sellerModuleService },
+    barTargets,
+    { dryRun, summaries, warnings }
+  )
 
   return {
     entities: summaries,
@@ -714,6 +867,22 @@ export async function gpConfigSyncI18nContent({
     })
   )
   const i18nDir = path.resolve(parsedArgs.i18nRoot, parsedArgs.marketId, "i18n")
+
+  // AD-12: PL kategorii czytamy z gp-config `products.yaml`. Brak pliku nie
+  // wywraca syncu (tłumaczenia ≠ PL), ale MUSI być widoczny — bez tego
+  // `content_bar.pl` kategorii wyszedłby cicho zerem i gate FAZY 1
+  // wyczyściłby kafelki kategorii.
+  const categoryPlWarnings: string[] = []
+  const categoryPlByHandle = readCategoryPlSource(
+    parsedArgs.configRoot,
+    parsedArgs.instanceId,
+    parsedArgs.marketId,
+    categoryPlWarnings
+  )
+  for (const warning of categoryPlWarnings) {
+    console.warn(`[gp-config-sync-i18n-content] ${warning}`)
+  }
+
   const summary = await syncI18nTranslationContent(
     translation.service,
     productModuleService,
@@ -723,8 +892,10 @@ export async function gpConfigSyncI18nContent({
       i18nDir,
       locales,
       marketId: parsedArgs.marketId,
+      categoryPlByHandle,
     }
   )
+  summary.warnings.push(...categoryPlWarnings)
   const result: I18nContentSummary = {
     ok: true,
     dry_run: parsedArgs.dryRun,
@@ -738,7 +909,9 @@ export async function gpConfigSyncI18nContent({
       `[gp-config-sync-i18n-content] ${entityType}: ` +
         `records=${entitySummary.translation_records}, ` +
         `created=${entitySummary.created}, updated=${entitySummary.updated}, ` +
-        `unchanged=${entitySummary.unchanged}, skipped=${entitySummary.skipped}`
+        `unchanged=${entitySummary.unchanged}, skipped=${entitySummary.skipped}, ` +
+        `content_bar_updated=${entitySummary.content_bar_updated}, ` +
+        `content_bar_unchanged=${entitySummary.content_bar_unchanged}`
     )
   }
   console.log(JSON.stringify(result, null, 2))
