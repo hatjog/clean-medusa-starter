@@ -7,11 +7,24 @@ import * as yaml from "js-yaml"
 
 import { DryRunCollector, parseDryRunFlag } from "./gp-sync-dry-run"
 
+type ProductsCatalogCategoryImage = {
+  url?: string
+  alt?: string
+  is_primary?: boolean
+}
+
 type ProductsCatalogCategory = {
   category_id: string
   slug: string
   handle?: string
   photo_url?: string
+  images?: ProductsCatalogCategoryImage[]
+}
+
+export type GpCategoryImage = {
+  url: string
+  alt?: string
+  is_primary?: boolean
 }
 
 type ProductsCatalogCollection = {
@@ -206,6 +219,130 @@ export async function syncCollectionMedia(
   return { updated, skipped }
 }
 
+/**
+ * Normalizes source `images[]` into the `metadata.gp.images` carrier (AD-10).
+ * Source element ORDER is preserved — the storefront reader falls back to
+ * `gp.images[0]`, so order is significant. `alt` travels with its url
+ * verbatim (empty string is a deliberate value, not data loss); `is_primary`
+ * is kept only when literally `true`.
+ */
+export function normalizeCategoryImages(
+  images: unknown,
+  categoryId: string,
+  warnings: string[]
+): GpCategoryImage[] {
+  if (images === undefined || images === null) {
+    return []
+  }
+
+  if (!Array.isArray(images)) {
+    warnings.push(`Category '${categoryId}': images is not an array; ignoring`)
+    return []
+  }
+
+  const out: GpCategoryImage[] = []
+  images.forEach((img, idx) => {
+    const url = typeof (img as ProductsCatalogCategoryImage)?.url === "string"
+      ? ((img as ProductsCatalogCategoryImage).url as string).trim()
+      : ""
+    if (!url) {
+      warnings.push(`Category '${categoryId}': images[${idx}] missing url; dropped`)
+      return
+    }
+
+    const alt = (img as ProductsCatalogCategoryImage).alt
+    out.push({
+      url,
+      ...(typeof alt === "string" ? { alt } : {}),
+      ...((img as ProductsCatalogCategoryImage).is_primary === true ? { is_primary: true } : {}),
+    })
+  })
+
+  return out
+}
+
+export async function syncCategoryMedia(
+  productModuleService: any,
+  categories: ProductsCatalogCategory[],
+  marketId: string,
+  warnings: string[],
+  collector?: DryRunCollector
+): Promise<{ updated: number; skipped: number }> {
+  let updated = 0
+  let skipped = 0
+
+  for (const category of categories ?? []) {
+    const coverUrl = category.photo_url?.trim()
+    const gpImages = normalizeCategoryImages(category.images, category.category_id, warnings)
+
+    if (!coverUrl && gpImages.length === 0) {
+      collector?.add({
+        entityType: "category-media",
+        handle: (category.handle ?? category.slug ?? category.category_id).trim(),
+        action: "skip",
+        note: "missing photo_url/images",
+      })
+      skipped++
+      continue
+    }
+
+    const handle = (category.handle ?? category.slug)?.trim()
+    if (!handle) {
+      warnings.push(`Category '${category.category_id}': missing slug/handle; cannot resolve category`)
+      collector?.add({
+        entityType: "category-media",
+        handle: category.category_id,
+        action: "skip",
+        note: "missing slug/handle",
+      })
+      skipped++
+      continue
+    }
+
+    const matches = await productModuleService.listProductCategories({ handle })
+    const { match: dbCategory, reason } = selectCollectionMatch(matches ?? [], marketId)
+    if (!dbCategory?.id) {
+      warnings.push(
+        `Category '${category.category_id}' handle='${handle}': ${reason ?? 'no Mercur category found'}`
+      )
+      collector?.add({
+        entityType: "category-media",
+        handle,
+        action: "skip",
+        note: reason ?? "no Mercur category found",
+      })
+      skipped++
+      continue
+    }
+
+    // Replacement (not append) keeps the sync idempotent: a second run on the
+    // same source yields a byte-identical metadata.gp.images array.
+    const mergedMetadata = {
+      ...(dbCategory.metadata ?? {}),
+      ...(coverUrl ? { photo_url: coverUrl } : {}),
+      gp: {
+        ...((dbCategory.metadata as any)?.gp ?? {}),
+        market_id: marketId,
+        ...(gpImages.length ? { images: gpImages } : {}),
+      },
+    }
+
+    if (collector) {
+      collector.add({
+        entityType: "category-media",
+        handle,
+        action: "update",
+        note: `photo_url=${coverUrl ? "yes" : "no"}; images=${gpImages.length}`,
+      })
+    } else {
+      await productModuleService.updateProductCategories(dbCategory.id, { metadata: mergedMetadata })
+    }
+    updated++
+  }
+
+  return { updated, skipped }
+}
+
 export function parseArgs(args: string[] | undefined): {
   instanceId: string
   marketId: string
@@ -302,70 +439,17 @@ export default async function gpConfigSyncMedia({ container, args }: ExecArgs) {
   collectionsUpdated = collectionMediaCounts.updated
   collectionsSkipped = collectionMediaCounts.skipped
 
-  // 2) Categories: categories[].photo_url -> Mercur ProductCategory.metadata.photo_url
-  for (const category of catalog.categories ?? []) {
-    const coverUrl = category.photo_url?.trim()
-    if (!coverUrl) {
-      collector?.add({
-        entityType: "category-media",
-        handle: (category.handle ?? category.slug ?? category.category_id).trim(),
-        action: "skip",
-        note: "missing photo_url",
-      })
-      categoriesSkipped++
-      continue
-    }
-
-    const handle = (category.handle ?? category.slug)?.trim()
-    if (!handle) {
-      warnings.push(`Category '${category.category_id}': missing slug/handle; cannot resolve category`)
-      collector?.add({
-        entityType: "category-media",
-        handle: category.category_id,
-        action: "skip",
-        note: "missing slug/handle",
-      })
-      categoriesSkipped++
-      continue
-    }
-
-    const matches = await productModuleService.listProductCategories({ handle })
-    const { match: dbCategory, reason } = selectCollectionMatch(matches ?? [], marketId)
-    if (!dbCategory?.id) {
-      warnings.push(
-        `Category '${category.category_id}' handle='${handle}': ${reason ?? 'no Mercur category found'}`
-      )
-      collector?.add({
-        entityType: "category-media",
-        handle,
-        action: "skip",
-        note: reason ?? "no Mercur category found",
-      })
-      categoriesSkipped++
-      continue
-    }
-
-    const mergedMetadata = {
-      ...(dbCategory.metadata ?? {}),
-      photo_url: coverUrl,
-      gp: {
-        ...((dbCategory.metadata as any)?.gp ?? {}),
-        market_id: marketId,
-      },
-    }
-
-    if (collector) {
-      collector.add({
-        entityType: "category-media",
-        handle,
-        action: "update",
-        note: "photo_url",
-      })
-    } else {
-      await productModuleService.updateProductCategories(dbCategory.id, { metadata: mergedMetadata })
-    }
-    categoriesUpdated++
-  }
+  // 2) Categories: categories[].photo_url + images[] -> Mercur
+  //    ProductCategory.metadata.photo_url + metadata.gp.images (AD-10)
+  const categoryMediaCounts = await syncCategoryMedia(
+    productModuleService,
+    catalog.categories ?? [],
+    marketId,
+    warnings,
+    collector
+  )
+  categoriesUpdated = categoryMediaCounts.updated
+  categoriesSkipped = categoryMediaCounts.skipped
 
   // 3) Products: products[].photo_url/gallery_urls -> Mercur Product.thumbnail + Product.images[]
   for (const product of catalog.products ?? []) {

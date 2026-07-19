@@ -1,4 +1,8 @@
-import { syncCollectionMedia } from '../../scripts/gp-config-sync-media'
+import {
+  normalizeCategoryImages,
+  syncCategoryMedia,
+  syncCollectionMedia,
+} from '../../scripts/gp-config-sync-media'
 import { DryRunCollector } from '../../scripts/gp-sync-dry-run'
 
 function makeProductModuleService(overrides: Record<string, any> = {}) {
@@ -223,6 +227,229 @@ describe('syncCollectionMedia', () => {
     expect(collector.getEntries()).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ entityType: 'collection-media', handle: 'premium-core', action: 'update' }),
+      ])
+    )
+  })
+})
+
+describe('normalizeCategoryImages', () => {
+  it('preserves source order, carries alt with url, keeps is_primary only when true', () => {
+    const warnings: string[] = []
+
+    const images = normalizeCategoryImages(
+      [
+        { url: ' assets/envato_images/a.jpg ', alt: 'Primary alt', is_primary: true },
+        { url: 'assets/envato_images/b.jpg', alt: '' },
+        { url: 'assets/envato_images/c.jpg', is_primary: false },
+      ],
+      'grp_twarz',
+      warnings
+    )
+
+    expect(images).toEqual([
+      { url: 'assets/envato_images/a.jpg', alt: 'Primary alt', is_primary: true },
+      { url: 'assets/envato_images/b.jpg', alt: '' },
+      { url: 'assets/envato_images/c.jpg' },
+    ])
+    expect(warnings).toHaveLength(0)
+  })
+
+  it('returns empty array for missing images without warning', () => {
+    const warnings: string[] = []
+
+    expect(normalizeCategoryImages(undefined, 'grp_twarz', warnings)).toEqual([])
+    expect(normalizeCategoryImages(null, 'grp_twarz', warnings)).toEqual([])
+    expect(warnings).toHaveLength(0)
+  })
+
+  it('warns and ignores non-array images', () => {
+    const warnings: string[] = []
+
+    expect(normalizeCategoryImages('assets/a.jpg', 'grp_twarz', warnings)).toEqual([])
+    expect(warnings.some((w) => w.includes('images is not an array'))).toBe(true)
+  })
+
+  it('drops elements without a usable url and warns per element', () => {
+    const warnings: string[] = []
+
+    const images = normalizeCategoryImages(
+      [{ alt: 'no url' }, { url: '   ' }, { url: 'assets/ok.jpg' }, null],
+      'grp_twarz',
+      warnings
+    )
+
+    expect(images).toEqual([{ url: 'assets/ok.jpg' }])
+    expect(warnings).toHaveLength(3)
+    expect(warnings.every((w) => w.includes('missing url'))).toBe(true)
+  })
+})
+
+describe('syncCategoryMedia', () => {
+  function makeCategoryModuleService(overrides: Record<string, any> = {}) {
+    return {
+      listProductCategories: jest.fn().mockResolvedValue([
+        {
+          id: 'pcat-twarz',
+          handle: 'twarz',
+          metadata: {
+            photo_url: 'assets/envato_images/old.jpg',
+            gp: {
+              market_id: 'bonbeauty',
+              fixture_id: 'grp_twarz',
+            },
+          },
+        },
+      ]),
+      updateProductCategories: jest.fn().mockResolvedValue({}),
+      ...overrides,
+    }
+  }
+
+  const sourceCategory = {
+    category_id: 'grp_twarz',
+    slug: 'twarz',
+    photo_url: 'assets/envato_images/primary.jpg',
+    images: [
+      { url: 'assets/envato_images/primary.jpg', alt: 'Zabieg na twarz', is_primary: true },
+      { url: 'assets/envato_images/second.jpg', alt: 'Oczyszczanie twarzy' },
+    ],
+  }
+
+  it('materializes metadata.gp.images preserving order and alt, keeps photo_url', async () => {
+    const productModuleService = makeCategoryModuleService()
+    const warnings: string[] = []
+
+    const counts = await syncCategoryMedia(
+      productModuleService,
+      [sourceCategory],
+      'bonbeauty',
+      warnings
+    )
+
+    expect(counts).toEqual({ updated: 1, skipped: 0 })
+    expect(warnings).toHaveLength(0)
+    expect(productModuleService.updateProductCategories).toHaveBeenCalledWith('pcat-twarz', {
+      metadata: {
+        photo_url: 'assets/envato_images/primary.jpg',
+        gp: {
+          market_id: 'bonbeauty',
+          fixture_id: 'grp_twarz',
+          images: [
+            { url: 'assets/envato_images/primary.jpg', alt: 'Zabieg na twarz', is_primary: true },
+            { url: 'assets/envato_images/second.jpg', alt: 'Oczyszczanie twarzy' },
+          ],
+        },
+      },
+    })
+  })
+
+  it('is idempotent: a second run on the same source produces the same metadata payload', async () => {
+    const productModuleService = makeCategoryModuleService()
+    const warnings: string[] = []
+
+    await syncCategoryMedia(productModuleService, [sourceCategory], 'bonbeauty', warnings)
+    const firstPayload = productModuleService.updateProductCategories.mock.calls[0][1]
+
+    // Simulate the DB state after the first run and sync again.
+    productModuleService.listProductCategories.mockResolvedValue([
+      { id: 'pcat-twarz', handle: 'twarz', metadata: firstPayload.metadata },
+    ])
+    await syncCategoryMedia(productModuleService, [sourceCategory], 'bonbeauty', warnings)
+    const secondPayload = productModuleService.updateProductCategories.mock.calls[1][1]
+
+    expect(secondPayload).toEqual(firstPayload)
+    expect(secondPayload.metadata.gp.images).toHaveLength(2)
+    expect(warnings).toHaveLength(0)
+  })
+
+  it('updates gp.images without touching existing photo_url when source has images only', async () => {
+    const productModuleService = makeCategoryModuleService()
+    const warnings: string[] = []
+
+    const counts = await syncCategoryMedia(
+      productModuleService,
+      [
+        {
+          category_id: 'grp_twarz',
+          slug: 'twarz',
+          images: [{ url: 'assets/envato_images/only.jpg', alt: 'Alt' }],
+        },
+      ],
+      'bonbeauty',
+      warnings
+    )
+
+    expect(counts).toEqual({ updated: 1, skipped: 0 })
+    const payload = productModuleService.updateProductCategories.mock.calls[0][1]
+    expect(payload.metadata.photo_url).toBe('assets/envato_images/old.jpg')
+    expect(payload.metadata.gp.images).toEqual([
+      { url: 'assets/envato_images/only.jpg', alt: 'Alt' },
+    ])
+  })
+
+  it('skips categories with neither photo_url nor images', async () => {
+    const productModuleService = makeCategoryModuleService()
+    const warnings: string[] = []
+
+    const counts = await syncCategoryMedia(
+      productModuleService,
+      [{ category_id: 'grp_pusta', slug: 'pusta' }],
+      'bonbeauty',
+      warnings
+    )
+
+    expect(counts).toEqual({ updated: 0, skipped: 1 })
+    expect(productModuleService.listProductCategories).not.toHaveBeenCalled()
+    expect(productModuleService.updateProductCategories).not.toHaveBeenCalled()
+  })
+
+  it('skips and warns when category belongs to another market', async () => {
+    const productModuleService = makeCategoryModuleService({
+      listProductCategories: jest.fn().mockResolvedValue([
+        {
+          id: 'pcat-foreign',
+          handle: 'twarz',
+          metadata: { gp: { market_id: 'mercur' } },
+        },
+      ]),
+    })
+    const warnings: string[] = []
+
+    const counts = await syncCategoryMedia(
+      productModuleService,
+      [sourceCategory],
+      'bonbeauty',
+      warnings
+    )
+
+    expect(counts).toEqual({ updated: 0, skipped: 1 })
+    expect(productModuleService.updateProductCategories).not.toHaveBeenCalled()
+    expect(warnings.some((w) => w.includes('cross-market guard'))).toBe(true)
+  })
+
+  it('records planned category media update in dry-run without touching DB', async () => {
+    const productModuleService = makeCategoryModuleService()
+    const warnings: string[] = []
+    const collector = new DryRunCollector()
+
+    const counts = await syncCategoryMedia(
+      productModuleService,
+      [sourceCategory],
+      'bonbeauty',
+      warnings,
+      collector
+    )
+
+    expect(counts).toEqual({ updated: 1, skipped: 0 })
+    expect(productModuleService.updateProductCategories).not.toHaveBeenCalled()
+    expect(collector.getEntries()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          entityType: 'category-media',
+          handle: 'twarz',
+          action: 'update',
+          note: 'photo_url=yes; images=2',
+        }),
       ])
     )
   })

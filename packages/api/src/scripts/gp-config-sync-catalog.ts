@@ -26,6 +26,12 @@ type FixtureCollection = {
   active?: boolean
 }
 
+type FixtureCategoryImage = {
+  url?: string
+  alt?: string
+  is_primary?: boolean
+}
+
 type FixtureCategory = {
   category_id: string
   name: string
@@ -36,6 +42,9 @@ type FixtureCategory = {
   rank?: number
   parent_category_id?: string | null
   description?: string
+  // Materialized into metadata.gp.images by gp-config-sync-media (AD-10),
+  // not here; declared so the source field is a recognized part of the contract.
+  images?: FixtureCategoryImage[]
 }
 
 type FixtureProduct = {
