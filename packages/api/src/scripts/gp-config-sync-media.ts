@@ -273,9 +273,15 @@ export async function syncCategoryMedia(
 
   for (const category of categories ?? []) {
     const coverUrl = category.photo_url?.trim()
+    // Declared = source explicitly carries an `images` array (even if it
+    // normalizes to zero valid entries after filtering). Declared-but-empty
+    // is a real signal ("images were removed from the source") and must
+    // replace/clear any stale metadata.gp.images — vs. undeclared (`images`
+    // key absent entirely), which leaves prior gp.images untouched.
+    const imagesDeclared = Array.isArray(category.images)
     const gpImages = normalizeCategoryImages(category.images, category.category_id, warnings)
 
-    if (!coverUrl && gpImages.length === 0) {
+    if (!coverUrl && gpImages.length === 0 && !imagesDeclared) {
       collector?.add({
         entityType: "category-media",
         handle: (category.handle ?? category.slug ?? category.category_id).trim(),
@@ -315,15 +321,24 @@ export async function syncCategoryMedia(
       continue
     }
 
+    if (imagesDeclared && gpImages.length === 0) {
+      warnings.push(
+        `Category '${category.category_id}': images[] declared but empty/all-invalid in source; clearing metadata.gp.images`
+      )
+    }
+
     // Replacement (not append) keeps the sync idempotent: a second run on the
-    // same source yields a byte-identical metadata.gp.images array.
+    // same source yields a byte-identical metadata.gp.images array. When the
+    // source explicitly declares `images` (even empty/all-dropped), we must
+    // replace the carrier with [] rather than leaving stale entries behind —
+    // otherwise a deleted source image keeps rendering forever (3-1-F1).
     const mergedMetadata = {
       ...(dbCategory.metadata ?? {}),
       ...(coverUrl ? { photo_url: coverUrl } : {}),
       gp: {
         ...((dbCategory.metadata as any)?.gp ?? {}),
         market_id: marketId,
-        ...(gpImages.length ? { images: gpImages } : {}),
+        ...(imagesDeclared ? { images: gpImages } : (gpImages.length ? { images: gpImages } : {})),
       },
     }
 

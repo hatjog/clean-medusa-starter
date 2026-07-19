@@ -387,6 +387,107 @@ describe('syncCategoryMedia', () => {
     ])
   })
 
+  it('clears stale metadata.gp.images when source declares an empty images[] (3-1-F1)', async () => {
+    const productModuleService = makeCategoryModuleService({
+      listProductCategories: jest.fn().mockResolvedValue([
+        {
+          id: 'pcat-twarz',
+          handle: 'twarz',
+          metadata: {
+            photo_url: 'assets/envato_images/old.jpg',
+            gp: {
+              market_id: 'bonbeauty',
+              fixture_id: 'grp_twarz',
+              images: [
+                { url: 'assets/envato_images/stale.jpg', alt: 'Stale', is_primary: true },
+              ],
+            },
+          },
+        },
+      ]),
+    })
+    const warnings: string[] = []
+
+    const counts = await syncCategoryMedia(
+      productModuleService,
+      [{ category_id: 'grp_twarz', slug: 'twarz', photo_url: 'assets/envato_images/old.jpg', images: [] }],
+      'bonbeauty',
+      warnings
+    )
+
+    expect(counts).toEqual({ updated: 1, skipped: 0 })
+    const payload = productModuleService.updateProductCategories.mock.calls[0][1]
+    expect(payload.metadata.gp.images).toEqual([])
+    expect(warnings.some((w) => w.includes('clearing metadata.gp.images'))).toBe(true)
+  })
+
+  it('clears stale metadata.gp.images when all source images[] entries are dropped as invalid', async () => {
+    const productModuleService = makeCategoryModuleService({
+      listProductCategories: jest.fn().mockResolvedValue([
+        {
+          id: 'pcat-twarz',
+          handle: 'twarz',
+          metadata: {
+            gp: {
+              market_id: 'bonbeauty',
+              images: [{ url: 'assets/envato_images/stale.jpg' }],
+            },
+          },
+        },
+      ]),
+    })
+    const warnings: string[] = []
+
+    const counts = await syncCategoryMedia(
+      productModuleService,
+      [
+        {
+          category_id: 'grp_twarz',
+          slug: 'twarz',
+          photo_url: 'assets/envato_images/old.jpg',
+          images: [{ alt: 'no url here' } as any],
+        },
+      ],
+      'bonbeauty',
+      warnings
+    )
+
+    expect(counts).toEqual({ updated: 1, skipped: 0 })
+    const payload = productModuleService.updateProductCategories.mock.calls[0][1]
+    expect(payload.metadata.gp.images).toEqual([])
+  })
+
+  it('leaves existing metadata.gp.images untouched when source omits images entirely (undeclared, not empty)', async () => {
+    const productModuleService = makeCategoryModuleService({
+      listProductCategories: jest.fn().mockResolvedValue([
+        {
+          id: 'pcat-twarz',
+          handle: 'twarz',
+          metadata: {
+            gp: {
+              market_id: 'bonbeauty',
+              images: [{ url: 'assets/envato_images/kept.jpg', is_primary: true }],
+            },
+          },
+        },
+      ]),
+    })
+    const warnings: string[] = []
+
+    const counts = await syncCategoryMedia(
+      productModuleService,
+      [{ category_id: 'grp_twarz', slug: 'twarz', photo_url: 'assets/envato_images/new.jpg' }],
+      'bonbeauty',
+      warnings
+    )
+
+    expect(counts).toEqual({ updated: 1, skipped: 0 })
+    const payload = productModuleService.updateProductCategories.mock.calls[0][1]
+    expect(payload.metadata.gp.images).toEqual([
+      { url: 'assets/envato_images/kept.jpg', is_primary: true },
+    ])
+  })
+
   it('skips categories with neither photo_url nor images', async () => {
     const productModuleService = makeCategoryModuleService()
     const warnings: string[] = []
