@@ -721,6 +721,45 @@ export function buildGenesisIssuedTransition(
 }
 
 // ──────────────────────────────────────────────────────────────────────────
+// Geneza ACTIVE (captured-path instant-issue) — builder wejścia okablowania
+// (Story 2.1 v1.14.0, AD-7)
+// ──────────────────────────────────────────────────────────────────────────
+
+/** Argumenty genezy ACTIVE dla okablowania (`payment.captured → issue-entitlement`). */
+export type GenesisActiveArgs = GenesisIssuedArgs
+
+/**
+ * Buduje `TransitionInput` dla GENEZY ACTIVE (instant-issue: `payment.captured`
+ * → `issue-entitlement.ts` tworzy wiersz OD RAZU w ACTIVE). AD-7 wymaga emitu
+ * `entitlement_state_changed` także dla tej genezy (subscriber 2.3 konsumuje
+ * obie genezy; ACTIVE = idempotentne dogonienie tych samych template_keys).
+ *
+ * KRYTYCZNE — fail-closed genezy NIENARUSZONY: sentinel `ENTITLEMENT_GENESIS`
+ * pozostaje legalny WYŁĄCZNIE dla ISSUED (`assertWiringTransition`). Geneza
+ * ACTIVE jest modelowana jako KONCEPTUALNA krawędź grafu `ISSUED → ACTIVE` —
+ * dokładnie ta, którą `issue-entitlement.ts` deklaruje strukturalnym guardem
+ * `assertTransition(ISSUED, ACTIVE)` przed INSERT-em already-ACTIVE (ADR-099a:
+ * ISSUED jest konceptualny, wiersz persystowany od razu ACTIVE). Ten sam
+ * builder/envelope co ISSUED (`buildTransitionEnvelopes`) — ŻADNEGO drugiego
+ * kształtu eventu.
+ */
+export function buildGenesisActiveTransition(
+  args: GenesisActiveArgs
+): TransitionInput {
+  return {
+    from: EntitlementInstanceState.ISSUED,
+    to: EntitlementInstanceState.ACTIVE,
+    entitlement_id: args.entitlement_id,
+    scope: args.scope,
+    actor: args.actor ?? "system",
+    ...(args.actor_hint ? { actor_hint: args.actor_hint } : {}),
+    ...(args.occurred_at ? { occurred_at: args.occurred_at } : {}),
+    ...(args.transition_seq != null ? { transition_seq: args.transition_seq } : {}),
+    ...(args.posting ? { posting: args.posting } : {}),
+  }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
 // KONTRAKT EGZEKWOWANIA `runtime_enabled` (AI-Review-4) — gdzie żyje bramka
 // ──────────────────────────────────────────────────────────────────────────
 //

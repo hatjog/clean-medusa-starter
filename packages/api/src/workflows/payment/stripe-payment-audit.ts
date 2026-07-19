@@ -28,6 +28,14 @@ import {
   type RefundEntitlementRevocationResult,
 } from "../entitlements/issue-entitlement"
 import type { EntitlementType } from "../../modules/voucher/models/entitlement"
+import {
+  buildGenesisActiveTransition,
+  emitTransitionEventAfterCommit,
+  wireEntitlementTransitionPersisted,
+  ENTITLEMENT_STATE_CHANGED_EVENT_TYPE,
+  type TransitionAuditEnvelope,
+  type TransitionEventEnvelope,
+} from "../../modules/voucher/entitlement-transition-wiring"
 import { redactFailureCode } from "../../lib/payment/failure-classification"
 
 export const STRIPE_PAYMENT_EVENTS = [
@@ -135,6 +143,12 @@ export type StripePaymentAuditResult = {
   refundReconcile?: StripeRefundReconcileResult
   /** v1.9.0 wf5 (H-3 / F-CC1-002): entitlement revocation outcome for payment.refunded. */
   refundRevocation?: RefundEntitlementRevocationResult
+  /**
+   * Story 2.1 (v1.14.0, AD-7): eventy `entitlement_state_changed` genezy ACTIVE
+   * zbudowane W tx (audit atomowy) — emitowane best-effort DOPIERO w `emit()`
+   * (post-commit). Tylko nowo utworzone wiersze (`idempotent=false`).
+   */
+  transition_events?: TransitionEventEnvelope[]
 }
 
 type QueryResult<T> = Promise<{ rows: T[]; rowCount?: number | null }>
@@ -203,6 +217,7 @@ export class StripePaymentAuditWorkflow {
       let entitlement: IssueEntitlementResult | undefined
       let entitlementsAll: IssueEntitlementResult[] | undefined
       let refundRevocation: RefundEntitlementRevocationResult | undefined
+      const transitionEvents: TransitionEventEnvelope[] = []
       const inserted = await insertDedupRow(client, payload, envelope)
       if (!inserted) {
         return { event_id: eventId, envelope, deduplicated: true }
@@ -254,6 +269,40 @@ export class StripePaymentAuditWorkflow {
           }
           entitlementsAll = multi.results
           entitlement = multi.results[0]
+
+          // Story 2.1 (v1.14.0, AD-7): geneza ACTIVE przechodzi przez JEDNOLITY
+          // punkt okablowania — dokładnie wg wzorca ISSUED (voucher-live-issue):
+          // audit append-only W TEJ tx, event zebrany i emitowany DOPIERO
+          // post-commit w `emit()`. Wiring wołany WYŁĄCZNIE dla nowo utworzonych
+          // wierszy (`idempotent=false`) — replay nie re-audytuje / nie re-emituje.
+          // Posting hook bez payloadu finansowego (attempted=false, no-op).
+          const appendAudit = this.makeTransitionAuditSink()
+          for (const issued of multi.results) {
+            if (issued.idempotent) continue
+            const { event } = await wireEntitlementTransitionPersisted(
+              { appendAudit, clock: () => now },
+              buildGenesisActiveTransition({
+                entitlement_id: issued.entitlement_id,
+                scope: {
+                  instance_id: issued.entitlement_id,
+                  // Precedens defensywny tego pliku (emit entitlement_issued.v1):
+                  // brak market_id NIE może failować transakcji biznesowej.
+                  market_id: payload.market_id ?? "unknown",
+                  sales_channel_id: null,
+                  vendor_id: null,
+                  location_id: null,
+                },
+                actor: "system",
+                actor_hint: "workflow:stripe-payment-audit:captured-instant-issue",
+                occurred_at: now.toISOString(),
+                // Dyskryminator wystąpienia: deterministyczny entitlement_id
+                // (sha256 z order_id+event_id+line_item_id) — geneza jednorazowa,
+                // klucz stabilny i nie-kolidujący.
+                transition_seq: issued.entitlement_id,
+              })
+            )
+            transitionEvents.push(event)
+          }
         } catch (err) {
           if (!(err instanceof MissingEntitlementProfileError)) {
             throw err
@@ -311,8 +360,26 @@ export class StripePaymentAuditWorkflow {
         entitlement,
         entitlements_all: entitlementsAll,
         refundRevocation,
+        ...(transitionEvents.length > 0
+          ? { transition_events: transitionEvents }
+          : {}),
       }
     })
+  }
+
+  /**
+   * Story 2.1 (v1.14.0): append-only sink audytu tranzycji — strukturalny log
+   * (ten sam kontrakt forward co w voucher-live-issue: durable audit-table /
+   * outbox podmienia sink BEZ zmiany kontraktu okablowania).
+   */
+  private makeTransitionAuditSink(): (
+    audit: TransitionAuditEnvelope
+  ) => Promise<void> {
+    return async (audit) => {
+      this.logger?.info?.(
+        `[entitlement-transition-audit] ${JSON.stringify(audit)}`
+      )
+    }
   }
 
   async emit(
@@ -350,6 +417,40 @@ export class StripePaymentAuditWorkflow {
         name: "gp.payments.payment_refunded.v1",
         data: buildPaymentRefundedContractEvent(result, payload, now),
       })
+    }
+    // Story 2.1 (v1.14.0, AD-7): emit `entitlement_state_changed` genezy ACTIVE
+    // — post-commit (emit() biegnie PO processMutation/COMMIT), best-effort z
+    // 1 retry (`emitTransitionEventAfterCommit` NIE rzuca). Awaria emitu NIGDY
+    // nie failuje transakcji biznesowej; kompletność = reconciliation sweep (2.5).
+    if (result.transition_events?.length) {
+      const emitStateChanged = async (
+        event: TransitionEventEnvelope
+      ): Promise<void> => {
+        if (!this.eventBus?.emit) {
+          throw new Error(
+            "event bus niedostępny (emit best-effort — reconciliation 2.5)"
+          )
+        }
+        await this.eventBus.emit({
+          name: ENTITLEMENT_STATE_CHANGED_EVENT_TYPE,
+          data: event,
+        })
+      }
+      let emitFailures = 0
+      for (const event of result.transition_events) {
+        const failed = await emitTransitionEventAfterCommit(
+          emitStateChanged,
+          event
+        )
+        if (failed) emitFailures += 1
+      }
+      if (emitFailures > 0) {
+        this.logger?.warn?.(
+          `[stripe-payment-audit] entitlement_state_changed genesis-ACTIVE ` +
+            `emit_failed=${emitFailures}/${result.transition_events.length} ` +
+            `(best-effort; dogonienie = reconciliation sweep 2.5)`
+        )
+      }
     }
     if (result.entitlement) {
       await this.eventBus?.emit?.({
