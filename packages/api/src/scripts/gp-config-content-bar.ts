@@ -15,15 +15,17 @@
  * stałej i TEJ SAMEJ funkcji wordcount z `./lib/content-bar.ts` — AD-4
  * wymaga jednego źródła, nie jednego wywołania.
  *
- * Code review 4.2 F7 — **nuance na "bez DB" powyżej**: to jest prawda dla
- * `measureMarketContentBar` (logika czysta, testowalna izolowanie), ale
- * NIEPRAWDA dla faktycznego wywołania `pnpm gp-config-content-bar` z gp-cli
- * — ten entrypoint jest odpalany przez `medusa exec`, więc CLI wciąż bootuje
- * cały kontener Medusy (w tym połączenie z DB) zanim ten kod w ogóle
- * dostanie sterowanie; sam kontener jest po prostu świadomie nieużywany.
- * Operator oczekujący realnego "bez DB" (np. offline / bez uruchomionego
- * Postgresa) powinien wywołać `measureMarketContentBar` bezpośrednio z testu
- * albo skryptu node, nie przez `pnpm gp-config-content-bar`.
+ * Code review 4.2 F7 / 4.3 F2 — **nuance na "bez DB" powyżej**: to jest
+ * prawda dla `measureMarketContentBar` (logika czysta, testowalna
+ * izolowanie), ale NIEPRAWDA dla wywołania przez `pnpm gp-config-content-bar`
+ * — ten entrypoint jest odpalany przez `medusa exec`, więc bootuje cały
+ * kontener Medusy (w tym realne połączenie z DB) zanim ten kod dostanie
+ * sterowanie; sam kontener jest po prostu świadomie nieużywany. Konsument
+ * oczekujący realnego "bez DB" (offline / bez uruchomionego Postgresa —
+ * raport FR-23, etapy no-LLM pipeline'u FR-22) MUSI wołać
+ * `pnpm gp-config-content-bar:standalone`
+ * (`gp-config-content-bar-standalone.ts`) — ten sam kontrakt stdout, zero
+ * bootu Medusy.
  *
  * Uruchomienie (bez dodatkowych zależności poza działającą Medusą):
  *   pnpm gp-config-content-bar --market bonbeauty --instance gp-dev

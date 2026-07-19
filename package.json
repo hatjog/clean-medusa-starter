@@ -33,6 +33,7 @@
     "gp-config-sync-translations": "medusa exec ./packages/api/src/scripts/gp-config-sync-translations.ts",
     "gp-config-sync-i18n-content": "medusa exec ./packages/api/src/scripts/gp-config-sync-i18n-content.ts",
     "gp-config-content-bar": "medusa exec ./packages/api/src/scripts/gp-config-content-bar.ts",
+    "gp-config-content-bar:standalone": "ts-node --transpile-only ./packages/api/src/scripts/gp-config-content-bar-standalone.ts",
     "gp-config-sync-shipping": "medusa exec ./packages/api/src/scripts/gp-config-sync-shipping.ts",
     "gp-config-sync-payments": "medusa exec ./packages/api/src/scripts/gp-config-sync-payments.ts",
     "gp-config-sync-media": "medusa exec ./packages/api/src/scripts/gp-config-sync-media.ts",
