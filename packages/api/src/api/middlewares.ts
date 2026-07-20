@@ -27,7 +27,6 @@ import {
   scopeCustomerEmail,
 } from "../lib/customer-scoped-email";
 import { marketContextStorage } from "../lib/market-context";
-import { filterProductIdsByFilters } from "../lib/product-market-scope";
 import { recordRequest } from "../lib/request-log-aggregator";
 import { installRlsPoolHook, type HookLogger } from "../lib/rls-pool-hook";
 import { marketContextCache } from "../loaders/market-context-cache";
@@ -637,32 +636,6 @@ function productMarketId(product: Record<string, unknown>): string | null {
   return typeof value === "string" && value.trim() ? value : null;
 }
 
-function integerQueryValue(value: unknown, fallback: number): number {
-  const raw = Array.isArray(value) ? value[0] : value;
-  const parsed =
-    typeof raw === "number"
-      ? raw
-      : typeof raw === "string"
-        ? Number.parseInt(raw, 10)
-        : Number.NaN;
-
-  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
-}
-
-function productFields(req: MedusaRequest): string[] {
-  const fields = getRequestExtensions(req).query?.fields;
-  if (typeof fields !== "string") {
-    return ["*"];
-  }
-
-  const parsed = fields
-    .split(",")
-    .map((field) => field.trim())
-    .filter(Boolean);
-
-  return parsed.length > 0 ? Array.from(new Set([...parsed, "metadata"])) : ["*"];
-}
-
 export async function productListMarketScopeMiddleware(
   req: MedusaRequest,
   res: MedusaResponse,
@@ -704,40 +677,36 @@ export async function productListMarketScopeMiddleware(
         return originalJson(body);
       }
 
-      const db = req.scope.resolve(ContainerRegistrationKeys.PG_CONNECTION) as Knex;
-      const query = req.scope.resolve(ContainerRegistrationKeys.QUERY) as {
-        graph: (input: Record<string, unknown>) => Promise<{ data: Array<Record<string, unknown>> }>;
-      };
-      const request = getRequestExtensions(req);
-      const limit = integerQueryValue(request.query?.limit, Number(typedBody.limit ?? 20));
-      const offset = integerQueryValue(request.query?.offset, Number(typedBody.offset ?? 0));
-      const { productIds, count } = await filterProductIdsByFilters(
-        db,
-        context.sales_channel_id,
-        {},
-        { offset, limit }
-      );
-
-      if (productIds.length === 0) {
-        return originalJson({ ...typedBody, products: [], count, offset, limit });
-      }
-
-      const { data: products } = await query.graph({
-        entity: "product",
-        fields: productFields(req),
-        filters: { id: productIds },
+      // Market-scope guard: the resolved market context (publishable key → sales
+      // channel) must never expose another market's products. The core Medusa
+      // handler has already sales-channel-scoped, query-matched (handle / category
+      // / …) AND priced (`calculated_price`) every product in `typedBody.products`;
+      // we only drop the ones whose `gp.market_id` doesn't match the resolved market.
+      //
+      // Previously this path re-derived the list via
+      // `filterProductIdsByFilters(..., {}, ...)` + `query.graph(...)`, which
+      //   (a) discarded the request's own filters — a `handle=…` PDP lookup returned
+      //       the newest in-channel product instead of the requested one, and
+      //   (b) dropped the pricing context, so every re-fetched product came back
+      //       with `calculated_price: null` and a permanently disabled add-to-cart.
+      // Filtering the already-correct response in place fixes both while keeping the
+      // isolation guarantee. Products whose market can't be determined (metadata not
+      // requested) are kept — the publishable-key sales-channel scope still applies.
+      const inMarketProducts = typedBody.products.filter((product) => {
+        const productMarket = productMarketId(product);
+        return productMarket === null || productMarket === context.market_id;
       });
-      const productsById = new Map(products.map((product) => [product.id, product]));
-      const orderedProducts = productIds
-        .map((id) => productsById.get(id))
-        .filter((product): product is Record<string, unknown> => Boolean(product));
+
+      const removedCount = typedBody.products.length - inMarketProducts.length;
+      const scopedCount =
+        typeof typedBody.count === "number"
+          ? Math.max(typedBody.count - removedCount, inMarketProducts.length)
+          : inMarketProducts.length;
 
       return originalJson({
         ...typedBody,
-        products: orderedProducts,
-        count,
-        offset,
-        limit,
+        products: inMarketProducts,
+        count: scopedCount,
       });
     };
 
