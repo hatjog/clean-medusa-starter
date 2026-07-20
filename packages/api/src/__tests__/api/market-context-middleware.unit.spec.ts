@@ -154,40 +154,21 @@ describe("Market Context Middleware", () => {
 });
 
 describe("Product List Market Scope Middleware", () => {
-  it("rehydrates native product lists when the response leaks another market", async () => {
-    mockFilterProductIdsByFilters.mockResolvedValue({
-      productIds: ["prod_evt"],
-      count: 1,
-    });
-    const db = { name: "db" };
-    const query = {
-      graph: jest.fn().mockResolvedValue({
-        data: [
-          {
-            id: "prod_evt",
-            title: "Event product",
-            status: "published",
-            metadata: { gp: { market_id: "bonevent" } },
-          },
-        ],
-      }),
-    };
+  it("drops leaked cross-market products in place, preserving in-market items and their resolved prices", async () => {
     const req = {
-      query: { limit: "3", offset: "0", fields: "id,title,status,metadata" },
-      scope: {
-        resolve: jest.fn((key: string) => {
-          if (key === "__pg_connection__") return db;
-          if (key === "__query__") return query;
-          return undefined;
-        }),
+      query: {
+        limit: "3",
+        offset: "0",
+        fields: "id,title,status,variants.calculated_price,metadata",
       },
+      scope: { resolve: jest.fn() },
     } as any;
     const originalJson = jest.fn();
     const res = { json: originalJson, status: jest.fn().mockReturnThis() } as any;
     const next = jest.fn();
 
     await marketContextStorage.run(
-      { market_id: "bonevent", sales_channel_id: "sc_evt" },
+      { market_id: "bonbeauty", sales_channel_id: "sc_bb" },
       async () => {
         await productListMarketScopeMiddleware(req, res, next);
         await res.json({
@@ -196,6 +177,20 @@ describe("Product List Market Scope Middleware", () => {
               id: "prod_bb",
               title: "Beauty product",
               metadata: { gp: { market_id: "bonbeauty" } },
+              variants: [
+                {
+                  calculated_price: {
+                    calculated_amount: 18000,
+                    currency_code: "pln",
+                  },
+                },
+              ],
+            },
+            {
+              id: "prod_evt",
+              title: "Event product",
+              metadata: { gp: { market_id: "bonevent" } },
+              variants: [{ calculated_price: null }],
             },
           ],
           count: 115,
@@ -206,28 +201,45 @@ describe("Product List Market Scope Middleware", () => {
     );
 
     expect(next).toHaveBeenCalled();
-    expect(mockFilterProductIdsByFilters).toHaveBeenCalledWith(
-      db,
-      "sc_evt",
-      {},
-      { offset: 0, limit: 3 }
-    );
-    expect(query.graph).toHaveBeenCalledWith({
-      entity: "product",
-      fields: ["id", "title", "status", "metadata"],
-      filters: { id: ["prod_evt"] },
+    // No re-fetch: the already-priced core response is filtered in place, so the
+    // SQL scope helper is never invoked and the request scope is never resolved
+    // for a DB / query graph.
+    expect(mockFilterProductIdsByFilters).not.toHaveBeenCalled();
+    expect(req.scope.resolve).not.toHaveBeenCalled();
+
+    const payload = originalJson.mock.calls[0][0];
+    expect(payload.products.map((product: { id: string }) => product.id)).toEqual([
+      "prod_bb",
+    ]);
+    // The in-market product keeps the calculated_price resolved by the core handler.
+    expect(payload.products[0].variants[0].calculated_price).toEqual({
+      calculated_amount: 18000,
+      currency_code: "pln",
     });
-    expect(originalJson).toHaveBeenCalledWith(
-      expect.objectContaining({
-        products: [
-          expect.objectContaining({
-            id: "prod_evt",
-            metadata: { gp: { market_id: "bonevent" } },
-          }),
-        ],
-        count: 1,
-      })
+    // count is decremented by the single dropped cross-market product.
+    expect(payload.count).toBe(114);
+  });
+
+  it("passes the response through untouched when every product matches the market", async () => {
+    const req = { query: {}, scope: { resolve: jest.fn() } } as any;
+    const originalJson = jest.fn();
+    const res = { json: originalJson, status: jest.fn().mockReturnThis() } as any;
+    const next = jest.fn();
+    const body = {
+      products: [{ id: "prod_bb", metadata: { gp: { market_id: "bonbeauty" } } }],
+      count: 1,
+    };
+
+    await marketContextStorage.run(
+      { market_id: "bonbeauty", sales_channel_id: "sc_bb" },
+      async () => {
+        await productListMarketScopeMiddleware(req, res, next);
+        await res.json(body);
+      }
     );
+
+    expect(mockFilterProductIdsByFilters).not.toHaveBeenCalled();
+    expect(originalJson).toHaveBeenCalledWith(body);
   });
 });
 
