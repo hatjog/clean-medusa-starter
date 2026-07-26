@@ -181,10 +181,27 @@ describe("granice zakresu 2.4 — handoff rozszerza mechanikę 2.3, nie duplikuj
   it("handoff NIE dostał własnej tabeli ani własnej migracji delivery", () => {
     // Ledger 2.3 jest jedynym nośnikiem idempotencji wysyłki; drugi klucz
     // szablonu mieści się w istniejącym UNIQUE bez zmiany schematu.
-    const migrations = readdirSync(resolve(SRC, "migrations")).filter((name) =>
-      /handoff|gift/i.test(name),
+    // Medusa migracje domenowe leżą w `src/modules/<module>/migrations/`
+    // (precedens: ledger 2.3 w `modules/voucher/migrations/`), NIE w
+    // top-level `src/migrations/` — skan musi objąć oba katalogi, inaczej
+    // druga tabela delivery przechodzi niezauważona.
+    const topLevelMigrations = readdirSync(resolve(SRC, "migrations")).filter(
+      (name) => /handoff|gift/i.test(name),
     )
-    expect(migrations).toEqual([])
+    const moduleDirs = readdirSync(resolve(SRC, "modules"), {
+      withFileTypes: true,
+    }).filter((entry) => entry.isDirectory())
+    const moduleMigrations = moduleDirs.flatMap((entry) => {
+      const migrationsDir = resolve(SRC, "modules", entry.name, "migrations")
+      try {
+        return readdirSync(migrationsDir).filter((name) =>
+          /handoff|gift/i.test(name),
+        )
+      } catch {
+        return []
+      }
+    })
+    expect([...topLevelMigrations, ...moduleMigrations]).toEqual([])
 
     const handoffIntent = stripComments(
       read("modules/voucher-delivery/handoff-link-intent.ts"),

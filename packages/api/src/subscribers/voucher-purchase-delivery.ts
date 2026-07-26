@@ -343,6 +343,33 @@ export async function handleVoucherPurchaseDelivery(
     return result("skipped_missing_voucher_code", trigger, null, marketId, null)
   }
 
+  // LOW#6 (code-review 2.4): decyzja handoffu jest PURE (nie zależy od locale
+  // rynku ani base URL), więc liczymy ją PRZED bramkami fail-loud poniżej.
+  // Gdy NIC nie ma być wysłane — brak buyer-maila I handoff nieeligible — nie
+  // wolno wchodzić w bramki locale/claim URL: przed 2.4 taki przypadek (np.
+  // zamówienie importowe bez buyer-maila, na rynku bez skonfigurowanego
+  // GP_STOREFRONT_URL) kończył się cichym `skipped_missing_recipient`; wejście
+  // w bramki fail-loud zamieniłoby to na fałszywy sygnał awarii konfiguracji
+  // w KPI/logu dla przypadku, w którym nie było komu nic wysłać.
+  const handoffDecision = evaluateGiftHandoff(source)
+  if (!recipientEmail && !handoffDecision.eligible) {
+    return {
+      outcome: "skipped_missing_recipient",
+      entitlement_id: entitlementId,
+      dispatch_id: null,
+      market_id: marketId,
+      locale: null,
+      error_code: null,
+      handoff: {
+        outcome: "skipped_not_eligible",
+        dispatch_id: null,
+        locale: null,
+        error_code: null,
+        skip_reason: handoffDecision.reason,
+      },
+    }
+  }
+
   // AC3: locale ZAKUPU z `order.metadata.purchase_locale`; `buyer_locale`
   // (snapshot polityki) jest wtórnym nośnikiem tej samej intencji.
   const requestedLocale = source.purchase_locale ?? source.buyer_locale ?? null
@@ -435,7 +462,7 @@ export async function handleVoucherPurchaseDelivery(
   // TA SAMA sekwencja, TEN SAM ledger, TEN SAM subscriber — różni się wyłącznie
   // `template_key` i `recipient_hash`. Awaria buyer-maila nie może zabrać
   // handoffu ani odwrotnie, więc kolejność jest bez znaczenia dla wyniku.
-  const handoff = await runGiftHandoff(source, context, deps)
+  const handoff = await runGiftHandoff(handoffDecision, context, deps)
 
   return { ...buyerResult, handoff }
 }
@@ -447,14 +474,16 @@ export async function handleVoucherPurchaseDelivery(
  * `GiftHandoffSkipReason`. Rezerwacja w ledgerze powstaje DOPIERO po przejściu
  * predykatu — dzięki temu wariant „przekażę osobiście" i zastane `scheduled`
  * nie zostawiają sierocego wiersza `queued`.
+ *
+ * Decyzja jest przekazana z `handleVoucherPurchaseDelivery` (LOW#6, code-review
+ * 2.4) — liczona TAM raz, przed bramkami fail-loud locale/claim URL, żeby ta
+ * funkcja i wczesny fast-path „nic do wysłania" nigdy się nie rozjechały.
  */
 async function runGiftHandoff(
-  source: PurchaseDeliverySource,
+  decision: ReturnType<typeof evaluateGiftHandoff>,
   context: DispatchAttemptContext,
   deps: PurchaseDeliveryDeps,
 ): Promise<GiftHandoffResult> {
-  const decision = evaluateGiftHandoff(source)
-
   if (!decision.eligible) {
     if (decision.reason !== "not_gift") {
       // `not_gift` to zdecydowana większość ruchu (zakup dla siebie) — logowanie
@@ -491,7 +520,16 @@ async function runGiftHandoff(
     dispatch_id: attempt.dispatch_id,
     locale: attempt.locale,
     error_code: attempt.error_code,
-    skip_reason: null,
+    // INFO#11 (code-review 2.4): predykat już uznał adres za eligible, więc
+    // `attempt.outcome === "skipped_missing_recipient"` tutaj może wyjść
+    // WYŁĄCZNIE z `hashRecipientEmail` (adres, który przeszedł walidację
+    // kształtu w `evaluateGiftHandoff`, ale nie da się zahashować). Bez tego
+    // rozróżnienia dwa różne „handoff nie poszedł" były nierozróżnialne w
+    // wyniku (ADR-163 §5 obiecuje enum powodu dla KAŻDEGO pominięcia).
+    skip_reason:
+      attempt.outcome === "skipped_missing_recipient"
+        ? "invalid_recipient_email"
+        : null,
   }
 }
 
@@ -647,18 +685,24 @@ async function runDispatchAttempt(
   }
 
   const provider = deps.provider ?? "brevo"
-  const notification = buildNotification({
-    recipient_email: recipientEmail,
-    recipient_hash: recipientHash,
-    entitlement_id: entitlementId,
-    voucher_code: voucherCode,
-    market_id: marketId,
-    locale,
-    claim_url: claimUrl,
-    dispatch_id: dispatchId,
-  })
 
   try {
+    // INFO#10 (code-review 2.4): `buildNotification` żyje W `try`, mimo że
+    // dziś nie rzuca. Docstringi `runGiftHandoff`/handlera deklarują „NIGDY
+    // nie rzuca: każdy błąd staje się wynikiem + logiem" — builder POZA `try`
+    // złamałby ten kontrakt w chwili, gdy ktoś doda w nim walidację (np.
+    // asercję na `claim_url`): wiersz `queued` zostałby bez domknięcia, a
+    // wyjątek wyszedłby z subscribera. Koszt przesunięcia: zero.
+    const notification = buildNotification({
+      recipient_email: recipientEmail,
+      recipient_hash: recipientHash,
+      entitlement_id: entitlementId,
+      voucher_code: voucherCode,
+      market_id: marketId,
+      locale,
+      claim_url: claimUrl,
+      dispatch_id: dispatchId,
+    })
     const dispatchResult = await deps.dispatcher.dispatch(notification)
     const providerMessageId = extractNotificationId(dispatchResult)
 
