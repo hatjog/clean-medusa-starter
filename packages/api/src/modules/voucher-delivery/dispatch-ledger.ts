@@ -8,6 +8,12 @@
  * (Story 2.5) możliwym: sweep skanuje entitlementy ISSUED/ACTIVE bez wiersza
  * dispatch. **Ta story buduje TYLKO ledger — joba sweepa NIE.**
  *
+ * Story 2.5 dokłada tutaj `DeliveryGapScanPort`: READ-ONLY skan luk, licznik
+ * granicy H1 oraz JEDNO warunkowe przejęcie porzuconej rezerwacji `queued`
+ * (`queued → failed` z guardem `status='queued' AND queued_at < próg`). Sweep
+ * nie zyskuje przez to drugiej ścieżki wysyłki — dosyłką dalej zajmuje się
+ * `reserveDispatch` wołany z handlera subscribera.
+ *
  * ── Inwarianty ──────────────────────────────────────────────────────────────
  *  1. **Zero surowego PII.** Ledger poznaje odbiorcę wyłącznie jako
  *     `RecipientHash` (`sha256:<hex>`); typ jest brandowany, więc podanie
@@ -49,6 +55,13 @@ import { isRecipientHash, type RecipientHash } from "./recipient-hash"
 export const VOUCHER_DELIVERY_DISPATCH_TABLE = "voucher_delivery_dispatch"
 export const VOUCHER_DELIVERY_DISPATCH_AUDIT_TABLE =
   "voucher_delivery_dispatch_audit"
+
+/**
+ * Tabela źródłowa skanu luk (Story 2.5). Ledger czyta z niej WYŁĄCZNIE
+ * `id`/`market_id`/`state`/`created_at` i nigdy do niej nie pisze — właścicielem
+ * `entitlement_instance` jest moduł voucher, nie voucher-delivery.
+ */
+export const ENTITLEMENT_INSTANCE_TABLE = "entitlement_instance"
 
 /**
  * Minimalny port SQL. Ledger nie zależy od Knexa jako typu, żeby testy
@@ -134,6 +147,91 @@ export interface DispatchLedgerPort {
   findByIdentity(identity: DispatchIdentity): Promise<DispatchRow | null>
 }
 
+// ──────────────────────────────────────────────────────────────────────────
+// Story 2.5 — skan luk (READ-ONLY) + przejęcie porzuconej rezerwacji `queued`.
+// ──────────────────────────────────────────────────────────────────────────
+
+/**
+ * Kandydat sweepa: para (entitlement, oczekiwany `template_key`), dla której
+ * ledger NIE potwierdza domkniętej wysyłki. `dispatch_*` są `null`, gdy wiersza
+ * nie ma w ogóle (zgubiony event — dokładnie przypadek z AD-7).
+ */
+export interface DeliveryGapCandidate {
+  entitlement_id: string
+  market_id: string | null
+  /** Stan `entitlement_instance` w momencie skanu (ISSUED albo ACTIVE). */
+  entitlement_state: string
+  template_key: string
+  dispatch_id: string | null
+  dispatch_status: DeliveryDispatchState | null
+  queued_at: string | null
+  attempt_count: number
+}
+
+export interface ScanDeliveryGapsInput {
+  /**
+   * Zbiór OCZEKIWANYCH szablonów — parametr, nie literał, żeby dołożenie
+   * kolejnego klucza (`voucher_handoff_link`, Story 2.4) nie wymagało zmiany
+   * zapytania. Pusty zbiór jest błędem wołającego, nie „skanuj wszystko".
+   */
+  template_keys: readonly string[]
+  /** Stany `entitlement_instance`, w których wysyłka jest jeszcze oczekiwana. */
+  source_states: readonly string[]
+  /** ISO 8601 — entitlementy MŁODSZE są pomijane (grace-window sweepa). */
+  created_before: string
+  /** ISO 8601 — `queued` starsze = rezerwacja PORZUCONA, nie wysyłka w locie. */
+  stale_queued_before: string
+  /** Bounded batch: maksymalna liczba wierszy na przebieg. */
+  limit: number
+}
+
+export interface DeliveryGapScanResult {
+  candidates: DeliveryGapCandidate[]
+  /**
+   * `true`, gdy skan zwrócił dokładnie `limit` wierszy — reszta zaległości
+   * istnieje i zostanie dogoniona w kolejnym przebiegu. Wołający MUSI to
+   * zalogować (zero cichego truncate).
+   */
+  truncated: boolean
+}
+
+export interface CountGapsBeyondSourceStatesInput {
+  template_keys: readonly string[]
+  source_states: readonly string[]
+  created_before: string
+  /** ISO 8601 — dolna granica okna (skan bez niej byłby pełnym seq-scanem). */
+  created_after: string
+}
+
+/**
+ * Port skanu luk (Story 2.5). Rozdzielony od `DispatchLedgerPort`, bo sweep
+ * potrzebuje obu, a subscriber WYŁĄCZNIE tego drugiego — dzięki temu ścieżka
+ * subscribera nie zyskuje przypadkiem dostępu do zapytań skanujących.
+ */
+export interface DeliveryGapScanPort {
+  scanDeliveryGaps(input: ScanDeliveryGapsInput): Promise<DeliveryGapScanResult>
+  /**
+   * Licznik OBSERWOWALNOŚCI granicy H1 (patrz `voucher-ledger-reconciliation`):
+   * entitlementy, które wyszły już poza `source_states`, a nie mają ŻADNEGO
+   * wiersza dispatch. Sweep ich NIE dosyła (stan poza matrycą AD-7) — ale
+   * milczenie o nich byłoby fail-open, więc są liczone.
+   */
+  countGapsBeyondSourceStates(
+    input: CountGapsBeyondSourceStatesInput,
+  ): Promise<number>
+  /**
+   * Przejmuje PORZUCONĄ rezerwację `queued` (D3): jedno warunkowe UPDATE
+   * `queued → failed` z guardem `status='queued' AND queued_at < …`. NIE drugi
+   * INSERT i NIE nowy wiersz — po tym przejściu legalną ścieżką dosyłki jest
+   * zastany retry z 2.3 (`failed → queued` przez `reserveDispatch`).
+   */
+  abandonStaleQueued(input: {
+    dispatch_id: string
+    stale_queued_before: string
+    error_code: string
+  }): Promise<boolean>
+}
+
 export class DispatchLedgerError extends Error {
   readonly error_code: string
 
@@ -155,7 +253,9 @@ export interface PgDispatchLedgerOptions {
   uuid?: () => string
 }
 
-export class PgDispatchLedger implements DispatchLedgerPort {
+export class PgDispatchLedger
+  implements DispatchLedgerPort, DeliveryGapScanPort
+{
   private readonly now: () => Date
   private readonly uuid: () => string
 
@@ -404,6 +504,203 @@ export class PgDispatchLedger implements DispatchLedgerPort {
     return rows.length > 0 ? normalizeRow(rows[0]) : null
   }
 
+  // ────────────────────────────────────────────────────────────────────────
+  // Story 2.5 — skan luk (READ-ONLY) + przejęcie porzuconego `queued`.
+  // ────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Skan luk: pary (entitlement w `source_states`, oczekiwany `template_key`),
+   * dla których ledger NIE potwierdza domkniętej wysyłki.
+   *
+   * Zapytanie jest READ-ONLY. `CROSS JOIN (VALUES …)` rozwija zbiór oczekiwanych
+   * szablonów po stronie SQL-a, więc dołożenie kolejnego klucza nie zmienia
+   * kształtu zapytania. Lista wartości jest rozwijana na JAWNE placeholdery —
+   * binding tablicowy jest w tym dialekcie błędem (`toKnexPositionalSql`).
+   *
+   * Trzy rozłączne kształty luki w `WHERE`:
+   *   1. `d.dispatch_id IS NULL` — wiersza nie ma (zgubiony event, AD-7);
+   *   2. `queued` starsze niż próg — rezerwacja porzucona po crashu (D3);
+   *   3. `failed`/`retrying` — legalny retry wg semantyki 2.3.
+   * `sent`/`delivered`/`degraded` i `dead_lettered` NIE pasują do żadnego z nich,
+   * więc nie wracają ze skanu (blokada jest w SQL-u i powtórnie w ledgerze).
+   *
+   * Sortowanie jest deterministyczne (`created_at, id, template_key`), żeby
+   * bounded batch dogonił zaległości od najstarszych, a nie losowo.
+   */
+  async scanDeliveryGaps(
+    input: ScanDeliveryGapsInput,
+  ): Promise<DeliveryGapScanResult> {
+    if (input.template_keys.length === 0) {
+      throw new DispatchLedgerError(
+        "scanDeliveryGaps wymaga niepustego zbioru template_keys — pusty zbiór " +
+          "nie znaczy „skanuj wszystko”",
+        "VOUCHER_DELIVERY_GAP_SCAN_TEMPLATE_KEYS_EMPTY",
+      )
+    }
+    if (input.source_states.length === 0) {
+      throw new DispatchLedgerError(
+        "scanDeliveryGaps wymaga niepustego zbioru source_states",
+        "VOUCHER_DELIVERY_GAP_SCAN_SOURCE_STATES_EMPTY",
+      )
+    }
+    if (!Number.isInteger(input.limit) || input.limit < 1) {
+      throw new DispatchLedgerError(
+        "scanDeliveryGaps wymaga limitu >= 1 — skan bez limitu może wystrzelić " +
+          "nieograniczoną liczbę wysyłek",
+        "VOUCHER_DELIVERY_GAP_SCAN_LIMIT_INVALID",
+      )
+    }
+
+    const templateKeys = [...input.template_keys]
+    const sourceStates = [...input.source_states]
+    const retryStates = [...DISPATCH_STATES_ALLOWING_RETRY]
+
+    // Numeracja `$N` jest rosnąca wzdłuż tekstu zapytania — kolejność bindingów
+    // to: szablony, stany źródłowe, created_before, stale_queued_before,
+    // stany retry, limit.
+    let position = 0
+    const templatePlaceholders = templateKeys
+      .map(() => `($${++position})`)
+      .join(", ")
+    const statePlaceholders = sourceStates.map(() => `$${++position}`).join(", ")
+    const createdBeforePlaceholder = `$${++position}`
+    const staleQueuedPlaceholder = `$${++position}`
+    const retryPlaceholders = retryStates.map(() => `$${++position}`).join(", ")
+    const limitPlaceholder = `$${++position}`
+
+    const rows = await this.queryRows<Record<string, unknown>>(
+      `SELECT e.id            AS entitlement_id,
+              e.market_id     AS market_id,
+              e.state         AS entitlement_state,
+              t.template_key  AS template_key,
+              d.dispatch_id   AS dispatch_id,
+              d.status        AS dispatch_status,
+              d.queued_at     AS queued_at,
+              d.attempt_count AS attempt_count
+         FROM ${ENTITLEMENT_INSTANCE_TABLE} e
+         CROSS JOIN (VALUES ${templatePlaceholders}) AS t(template_key)
+         LEFT JOIN ${VOUCHER_DELIVERY_DISPATCH_TABLE} d
+                ON d.entitlement_id = e.id
+               AND d.template_key = t.template_key
+        WHERE e.state IN (${statePlaceholders})
+          AND e.created_at < ${createdBeforePlaceholder}
+          AND (
+                d.dispatch_id IS NULL
+             OR (d.status = 'queued' AND d.queued_at < ${staleQueuedPlaceholder})
+             OR d.status IN (${retryPlaceholders})
+          )
+        ORDER BY e.created_at ASC, e.id ASC, t.template_key ASC
+        LIMIT ${limitPlaceholder}`,
+      [
+        ...templateKeys,
+        ...sourceStates,
+        input.created_before,
+        input.stale_queued_before,
+        ...retryStates,
+        input.limit,
+      ],
+    )
+
+    const candidates = rows.map((row) => normalizeGapCandidate(row))
+
+    return { candidates, truncated: candidates.length >= input.limit }
+  }
+
+  /**
+   * Licznik granicy H1: entitlementy POZA `source_states` bez ŻADNEGO wiersza
+   * dispatch dla oczekiwanych szablonów. Sweep ich nie dosyła (stan poza matrycą
+   * AD-7), ale liczy — inaczej „skan po bieżącym stanie" byłby cicho fail-open.
+   * Okno `created_after` jest obowiązkowe: COUNT bez niego rósłby z całą historią.
+   */
+  async countGapsBeyondSourceStates(
+    input: CountGapsBeyondSourceStatesInput,
+  ): Promise<number> {
+    if (input.template_keys.length === 0 || input.source_states.length === 0) {
+      throw new DispatchLedgerError(
+        "countGapsBeyondSourceStates wymaga niepustych zbiorów template_keys " +
+          "i source_states",
+        "VOUCHER_DELIVERY_GAP_COUNT_INPUT_EMPTY",
+      )
+    }
+
+    const sourceStates = [...input.source_states]
+    const templateKeys = [...input.template_keys]
+
+    let position = 0
+    const statePlaceholders = sourceStates.map(() => `$${++position}`).join(", ")
+    const createdBeforePlaceholder = `$${++position}`
+    const createdAfterPlaceholder = `$${++position}`
+    const templatePlaceholders = templateKeys
+      .map(() => `$${++position}`)
+      .join(", ")
+
+    const rows = await this.queryRows<{ gap_count: number | string }>(
+      `SELECT COUNT(*)::int AS gap_count
+         FROM ${ENTITLEMENT_INSTANCE_TABLE} e
+        WHERE e.state NOT IN (${statePlaceholders})
+          AND e.created_at < ${createdBeforePlaceholder}
+          AND e.created_at >= ${createdAfterPlaceholder}
+          AND NOT EXISTS (
+                SELECT 1
+                  FROM ${VOUCHER_DELIVERY_DISPATCH_TABLE} d
+                 WHERE d.entitlement_id = e.id
+                   AND d.template_key IN (${templatePlaceholders})
+              )`,
+      [
+        ...sourceStates,
+        input.created_before,
+        input.created_after,
+        ...templateKeys,
+      ],
+    )
+
+    return rows.length > 0 ? Number(rows[0].gap_count ?? 0) : 0
+  }
+
+  /**
+   * D3 — przejęcie PORZUCONEJ rezerwacji `queued`.
+   *
+   * Jedno warunkowe UPDATE `queued → failed` z podwójnym guardem
+   * (`status='queued'` ORAZ `queued_at < próg`), więc:
+   *   - dwa równoległe sweepy dają dokładnie jedno przejęcie (UPDATE=1);
+   *   - rezerwacja młodsza niż próg (wysyłka REALNIE w locie) nie jest ruszana,
+   *     nawet jeśli wołający pomylił się w wyborze wiersza;
+   *   - nie powstaje drugi wiersz ani drugi INSERT — dosyłką zajmuje się zastany
+   *     retry z 2.3 (`failed → queued` przez `reserveDispatch`).
+   * `error_code` jest wymagany przez CHECK migracji (`status='failed'` ⇒ kod).
+   */
+  async abandonStaleQueued(input: {
+    dispatch_id: string
+    stale_queued_before: string
+    error_code: string
+  }): Promise<boolean> {
+    const nowIso = this.now().toISOString()
+    const rows = await this.queryRows<DispatchRow>(
+      `UPDATE ${VOUCHER_DELIVERY_DISPATCH_TABLE}
+          SET status = 'failed',
+              error_code = $1,
+              failed_at = $2,
+              updated_at = $3
+        WHERE dispatch_id = $4
+          AND status = 'queued'
+          AND queued_at < $5
+      RETURNING ${SELECT_COLUMNS}`,
+      [
+        input.error_code,
+        nowIso,
+        nowIso,
+        input.dispatch_id,
+        input.stale_queued_before,
+      ],
+    )
+
+    if (rows.length === 0) return false
+
+    const row = normalizeRow(rows[0])
+    await this.appendAudit(row, "queued", "failed", input.error_code, nowIso)
+    return true
+  }
+
   /**
    * Append-only wpis audytowy. Zapisujemy WYŁĄCZNIE hash odbiorcy i kod błędu —
    * nigdy adresu ani treści odpowiedzi providera (D-70 / AC2).
@@ -488,6 +785,37 @@ function normalizeRow(raw: unknown): DispatchRow {
     error_code: record.error_code == null ? null : String(record.error_code),
     attempt_count: Number(record.attempt_count ?? 0),
     queued_at: normalizeTimestamp(record.queued_at),
+  }
+}
+
+/**
+ * Story 2.5 — normalizacja wiersza skanu. `dispatch_*` są NULL-owalne (LEFT
+ * JOIN), ale gdy status jest obecny, MUSI należeć do kontraktu: nieznany status
+ * jest fail-loud, a nie cichym „to chyba luka" (dosyłka na podstawie stanu,
+ * którego nie rozumiemy, to potencjalny duplikat maila).
+ */
+function normalizeGapCandidate(raw: unknown): DeliveryGapCandidate {
+  const record = (raw ?? {}) as Record<string, unknown>
+  const status = record.dispatch_status
+
+  if (status != null && !isDeliveryDispatchState(status)) {
+    throw new DispatchLedgerError(
+      `Skan luk zwrócił wiersz ze statusem spoza kontraktu: ${String(status)} ` +
+        `(dozwolone: ${DELIVERY_DISPATCH_STATES.join(", ")})`,
+      "VOUCHER_DELIVERY_DISPATCH_STATUS_UNKNOWN",
+    )
+  }
+
+  return {
+    entitlement_id: String(record.entitlement_id ?? ""),
+    market_id: record.market_id == null ? null : String(record.market_id),
+    entitlement_state: String(record.entitlement_state ?? ""),
+    template_key: String(record.template_key ?? ""),
+    dispatch_id:
+      record.dispatch_id == null ? null : String(record.dispatch_id),
+    dispatch_status: status == null ? null : status,
+    queued_at: normalizeTimestamp(record.queued_at),
+    attempt_count: Number(record.attempt_count ?? 0),
   }
 }
 

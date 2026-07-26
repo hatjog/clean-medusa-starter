@@ -169,6 +169,92 @@ describe("R-2.3-H1 — SQL ledgera jest wykonywalny przez REALNY formatter Knexa
   })
 })
 
+/**
+ * Story 2.5 — skan luk, licznik granicy H1 i przejęcie porzuconego `queued`
+ * dołączają do tego samego gate'u dialektu. Skan jest tu najwrażliwszy: buduje
+ * placeholdery DYNAMICZNIE (`CROSS JOIN (VALUES …)` + `IN (…)` × 2), więc
+ * literówka w numeracji `$N` nie zapaliłaby się w atrapie SQL — tylko tutaj.
+ */
+async function recordSweepScanCalls(): Promise<Call[]> {
+  const calls: Call[] = []
+
+  const scan = new RecordingSql(() => [])
+  await new PgDispatchLedger(scan).scanDeliveryGaps({
+    // Dwa szablony ŚWIADOMIE: wariant jednoelementowy nie wykryłby przesunięcia
+    // numeracji przy rozwiniętej liście wartości (przyszłe 2.4).
+    template_keys: ["voucher_purchase_confirmation", "voucher_handoff_link"],
+    source_states: ["ISSUED", "ACTIVE"],
+    created_before: "2026-07-26T11:30:00.000Z",
+    stale_queued_before: "2026-07-26T11:45:00.000Z",
+    limit: 200,
+  })
+  calls.push(...scan.calls)
+
+  const count = new RecordingSql(() => [{ gap_count: 0 }])
+  await new PgDispatchLedger(count).countGapsBeyondSourceStates({
+    template_keys: ["voucher_purchase_confirmation"],
+    source_states: ["ISSUED", "ACTIVE"],
+    created_before: "2026-07-26T11:30:00.000Z",
+    created_after: "2026-07-19T12:00:00.000Z",
+  })
+  calls.push(...count.calls)
+
+  const abandon = new RecordingSql((sql) =>
+    sql.includes("SET status = 'failed'") ? [baseRow("failed")] : [],
+  )
+  await new PgDispatchLedger(abandon).abandonStaleQueued({
+    dispatch_id: "dispatch-1",
+    stale_queued_before: "2026-07-26T11:45:00.000Z",
+    error_code: "VOUCHER_DELIVERY_QUEUED_ABANDONED",
+  })
+  calls.push(...abandon.calls)
+
+  return calls
+}
+
+describe("Story 2.5 — SQL sweepa jest wykonywalny przez REALNY formatter Knexa", () => {
+  let calls: Call[]
+
+  beforeAll(async () => {
+    calls = await recordSweepScanCalls()
+  })
+
+  it("pokrywa skan luk, licznik granicy H1 i przejęcie `queued` (+ audit)", () => {
+    expect(calls.length).toBeGreaterThanOrEqual(4)
+  })
+
+  it("żadne zapytanie nie trafia do sterownika z placeholderem `$N`", () => {
+    for (const call of calls) {
+      expect(call.sql).not.toMatch(/\$\d+/)
+    }
+  })
+
+  it("każde zapytanie przechodzi przez formatter Knexa bez błędu bindingów", () => {
+    for (const call of calls) {
+      expect(() => formatWithKnex(call)).not.toThrow()
+      expect(formatWithKnex(call).bindings).toHaveLength(call.bindings.length)
+    }
+  })
+
+  it("skan luk jest READ-ONLY (żadnego INSERT/UPDATE/DELETE)", () => {
+    const scan = calls.find((call) => call.sql.includes("CROSS JOIN (VALUES"))
+    expect(scan).toBeDefined()
+    expect(scan?.sql).not.toMatch(/\b(INSERT|UPDATE|DELETE)\b/i)
+    expect(scan?.sql).toMatch(/\bLIMIT\b/)
+  })
+
+  it("przejęcie `queued` niesie OBA guardy (status + staleness) i jedno UPDATE", () => {
+    const abandon = calls.find(
+      (call) =>
+        call.sql.includes(`UPDATE ${VOUCHER_DELIVERY_DISPATCH_TABLE}`) &&
+        call.sql.includes("SET status = 'failed'"),
+    )
+    expect(abandon).toBeDefined()
+    expect(abandon?.sql).toContain("AND status = 'queued'")
+    expect(abandon?.sql).toMatch(/queued_at < \?/)
+  })
+})
+
 describe("R-2.3-H1 — reader locale rynku używa tego samego dialektu", () => {
   it("SELECT z `market_runtime_config` przechodzi przez formatter Knexa", async () => {
     const recorder = new RecordingSql(() => [{ locales: { default: "pl", supported: ["pl"] } }])
