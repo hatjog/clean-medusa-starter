@@ -700,6 +700,32 @@ describe("AC2 — defensywność: graceful skip + log bez PII, nigdy rzucony wyj
     expect(sql.dispatch).toHaveLength(0)
   })
 
+  it("LOW#6 (code-review 2.4): brak buyer-maila + brak konfiguracji base URL + NIE-prezent → skip cichy, NIE fałszywy `failed` konfiguracji", async () => {
+    // Zamówienie importowe/admin: bez buyer_email, bez kontraktu prezentu, na
+    // rynku bez skonfigurowanego GP_STOREFRONT_URL. Przed poprawką: subscriber
+    // wchodził w bramkę base URL mimo braku odbiorcy i zwracał `failed` +
+    // `VOUCHER_DELIVERY_STOREFRONT_URL_NOT_CONFIGURED` — fałszywy sygnał awarii
+    // konfiguracji dla przypadku, w którym nie było w ogóle komu nic wysłać.
+    const { deps, sql, dispatchCalls } = makeDeps({
+      source: { buyer_email: null, voucher_code: VOUCHER_CODE, market_id: MARKET_ID },
+      env: {},
+    })
+
+    const result = await handleVoucherPurchaseDelivery(envelope("ISSUED"), deps)
+
+    expect(result.outcome).toBe("skipped_missing_recipient")
+    expect(result.error_code).toBeNull()
+    expect(result.handoff).toEqual({
+      outcome: "skipped_not_eligible",
+      dispatch_id: null,
+      locale: null,
+      error_code: null,
+      skip_reason: "not_gift",
+    })
+    expect(dispatchCalls).toHaveLength(0)
+    expect(sql.dispatch).toHaveLength(0)
+  })
+
   it("event bez entitlement_id → graceful skip", async () => {
     const { deps } = makeDeps({})
     const result = await handleVoucherPurchaseDelivery(
