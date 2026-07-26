@@ -1,6 +1,9 @@
 import { Modules } from "@medusajs/framework/utils"
 
+import type { NotificationTemplateKey } from "@gp/messaging"
+
 import { assertNotificationProviderReady } from "./vendor-notification-provider-readiness"
+import { resolveNotificationMarketId } from "./notification-market-context"
 
 type ScopeResolver = {
   resolve: (key: string) => unknown
@@ -29,8 +32,21 @@ export type DispatchVendorEmailInput = {
   subject: string
   text: string
   html: string
-  template: string
+  /**
+   * Story 2.2 (dług nazewniczy z 2.1, poz. 3): pole nazywa się `templateKey` i
+   * przyjmuje WYŁĄCZNIE klucz z rejestru (`NOTIFICATION_TEMPLATE_KEYS`).
+   * Literał w call-site = drugie źródło prawdy → łamie AD-6.
+   */
+  templateKey: NotificationTemplateKey
   triggerBy: string
+  /** Rynek odbiorcy; domyślnie `resolveNotificationMarketId()` (patrz dług tam). */
+  marketId?: string
+  /** Locale wiadomości (pl/en/ua/de albo BCP-47); wymagane przez providera. */
+  locale?: string
+  /** Flow dla KPI/feature-flag; domyślnie `templateKey`. */
+  flowId?: string
+  /** Klucz idempotencji gatewaya; brak = wysyłka bez dedupe. */
+  idempotencyKey?: string
   metadata?: Record<string, unknown>
 }
 
@@ -97,8 +113,17 @@ export async function dispatchVendorEmail(
   const payload = {
     to: input.to,
     channel: "email",
-    template: input.template,
+    // `template` to pole KONTRAKTU Medusy (ProviderSendNotificationDTO) — nie da
+    // się go przemianować bez łamania modułu. Kanoniczne GP `template_key`
+    // (ADR-158) jedzie w `data` i ma pierwszeństwo po stronie wrappera brevo;
+    // obie wartości pochodzą z tej samej stałej rejestru.
+    template: input.templateKey,
     data: {
+      template_key: input.templateKey,
+      market_id: input.marketId ?? resolveNotificationMarketId(),
+      locale: input.locale ?? "pl",
+      flow_id: input.flowId ?? input.templateKey,
+      ...(input.idempotencyKey ? { idempotency_key: input.idempotencyKey } : {}),
       subject: input.subject,
       text: input.text,
       html: input.html,

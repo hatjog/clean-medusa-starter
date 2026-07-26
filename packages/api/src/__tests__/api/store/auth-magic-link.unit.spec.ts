@@ -9,6 +9,7 @@ import {
   resetMagicLinkRuntime,
 } from "../../../lib/auth/magic-link"
 import { marketContextStorage } from "../../../lib/market-context"
+import { NOTIFICATION_TEMPLATE_KEYS } from "@gp/messaging"
 
 const JWT_SECRET = "test-jwt-secret-for-recover-magic-link-123456789"
 const NOW = new Date("2026-05-20T08:00:00.000Z")
@@ -50,6 +51,11 @@ function notificationService() {
   return {
     createNotifications: jest.fn().mockResolvedValue({ id: "notif_1" }),
   }
+}
+
+/** Story 2.2 (AC5 poz.2): logger jako świadek śladu w catch. */
+function loggerSpy() {
+  return { warn: jest.fn(), error: jest.fn() }
 }
 
 function configModule() {
@@ -180,6 +186,98 @@ describe("POST /store/auth/magic-link", () => {
     expect(res.statusCode).toBe(202)
     expect(res.body).toEqual({ success: true })
     expect(notifications.createNotifications).not.toHaveBeenCalled()
+  })
+
+  // Story 2.2 (AC5 poz.2): payload recover niesie kanoniczny template_key +
+  // market_id (rejestr AD-6), a nie literał — inaczej provider brevo nie ma jak
+  // rozwiązać nadawcy ani allowlisty.
+  it("wysyła recover z kluczem rejestru i kontekstem rynku", async () => {
+    const customer = customerService([{ id: "cus_1", email: "bonbeauty::anna@example.test" }])
+    const notifications = notificationService()
+    const res = response()
+
+    await withMarket(async () => {
+      await requestMagicLink(
+        request(
+          { purpose: "recover", email: "anna@example.test", locale: "pl" },
+          {
+            [Modules.CUSTOMER]: customer,
+            [Modules.NOTIFICATION]: notifications,
+          }
+        ),
+        res as unknown as MedusaResponse
+      )
+    })
+
+    const payload = notifications.createNotifications.mock.calls[0][0] as Record<string, any>
+    expect(payload.template).toBe(NOTIFICATION_TEMPLATE_KEYS.CUSTOMER_RECOVER_MAGIC_LINK)
+    expect(payload.data.template_key).toBe(
+      NOTIFICATION_TEMPLATE_KEYS.CUSTOMER_RECOVER_MAGIC_LINK
+    )
+    expect(payload.data.market_id).toBe("bonbeauty")
+  })
+
+  // Story 2.2 (AC5 poz.2): catch przestaje być cichy, ale odpowiedź NIE zmienia
+  // się ani o bajt — obie własności bronione naraz w jednym teście.
+  it("loguje awarię dispatchu i ZACHOWUJE enumeration-safe odpowiedź", async () => {
+    const customer = customerService([{ id: "cus_1", email: "bonbeauty::anna@example.test" }])
+    const notifications = {
+      createNotifications: jest.fn().mockRejectedValue(
+        Object.assign(new Error("brevo says no"), {
+          error_code: "BREVO_TEMPLATE_NOT_CONFIGURED",
+        })
+      ),
+    }
+    const logger = loggerSpy()
+    const res = response()
+
+    await withMarket(async () => {
+      await requestMagicLink(
+        request(
+          { purpose: "recover", email: "anna@example.test", locale: "pl" },
+          {
+            [Modules.CUSTOMER]: customer,
+            [Modules.NOTIFICATION]: notifications,
+            [ContainerRegistrationKeys.LOGGER]: logger,
+          }
+        ),
+        res as unknown as MedusaResponse
+      )
+    })
+
+    // (1) Ślad istnieje i niesie kod błędu.
+    expect(logger.error).toHaveBeenCalledTimes(1)
+    const logged = String(logger.error.mock.calls[0][0])
+    expect(logged).toContain("BREVO_TEMPLATE_NOT_CONFIGURED")
+    // (2) Log NIE ujawnia adresu, tokenu ani istnienia konta.
+    expect(logged).not.toContain("anna@example.test")
+    expect(logged).not.toContain("/user/recover/")
+    // (3) Odpowiedź nieodróżnialna od ścieżki „konto nie istnieje".
+    expect(res.statusCode).toBe(202)
+    expect(res.body).toEqual({ success: true })
+  })
+
+  it("loguje no-op dispatchu gdy moduł Notification jest nieobecny (bez zmiany odpowiedzi)", async () => {
+    const customer = customerService([{ id: "cus_1", email: "bonbeauty::anna@example.test" }])
+    const logger = loggerSpy()
+    const res = response()
+
+    await withMarket(async () => {
+      await requestMagicLink(
+        request(
+          { purpose: "recover", email: "anna@example.test", locale: "pl" },
+          {
+            [Modules.CUSTOMER]: customer,
+            [ContainerRegistrationKeys.LOGGER]: logger,
+          }
+        ),
+        res as unknown as MedusaResponse
+      )
+    })
+
+    expect(logger.warn).toHaveBeenCalledTimes(1)
+    expect(res.statusCode).toBe(202)
+    expect(res.body).toEqual({ success: true })
   })
 
   it("rejects malformed request payloads before token generation", async () => {

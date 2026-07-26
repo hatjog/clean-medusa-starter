@@ -3,8 +3,8 @@
   "version": "0.0.1",
   "private": true,
   "description": "Provider-neutral GP messaging gateway package.",
-  "main": "dist/index.js",
-  "types": "dist/index.d.ts",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
   "files": [
     "dist",
     "src"
@@ -13,7 +13,8 @@
     "build": "tsc -p tsconfig.build.json",
     "clean": "rm -rf dist",
     "test": "jest --config ./jest.config.js",
-    "typecheck": "tsc --noEmit -p tsconfig.json"
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "gen:notification-templates": "ts-node --transpile-only ./scripts/generate-notification-template-registry.ts"
   },
   "dependencies": {
     "@gp/audit": "workspace:*",

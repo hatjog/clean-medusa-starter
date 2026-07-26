@@ -27,6 +27,7 @@ import type {
   DeliveryDecisionPort,
   EventEmitterPort,
   IdempotencyPort,
+  NotificationDispatchPort,
   RateLimitPort,
   VoucherPiiPort,
 } from "./ports";
@@ -50,6 +51,12 @@ export interface VoucherPiiServiceDeps {
   events: EventEmitterPort;
   idempotency: IdempotencyPort;
   rateLimit: RateLimitPort;
+  /**
+   * Story 2.2 (AC4): Step 3 woła moduł Notification przez ten port. Port jest
+   * WYMAGANY — opcjonalność oznaczałaby cichy powrót do stubu, czyli dokładnie
+   * ten no-op, który ta story likwiduje.
+   */
+  notifications: NotificationDispatchPort;
   /** Per-recipient bucket (default 10/min). Configurable via env in adapter. */
   recipientBucketSize?: number;
   recipientRefillPerMin?: number;
@@ -57,8 +64,15 @@ export interface VoucherPiiServiceDeps {
   providerBucketSize?: number;
   providerRefillPerMin?: number;
   /**
-   * Stub provider id for v1.5.0 — vendor selection logic is owned by future
-   * ADR (OOS for this story). Default = 'stub-email-v1'.
+   * Kanoniczny `provider_ref` zapisywany do `voucher_delivery_decision`.
+   * v1.5.0–v1.13.0: `stub-email-v1` (brak realnej wysyłki). Od v1.14.0 (Story 2.2,
+   * AC4) domyślnie bierzemy `notifications.providerRef` — czyli realny provider
+   * (`brevo`). Override zostaje jako seam konfiguracyjny.
+   *
+   * UWAGA (zmiana odnotowana, AC4): klucz bucketu rate-limitu per-provider
+   * (`rl:voucher:dispatch:<market>:<provider_ref>`) przestaje wskazywać
+   * `stub-email-v1` i wskazuje realnego providera. Semantyka bucketu bez zmian
+   * (per-market × per-provider), zmienia się wyłącznie jego nazwa.
    */
   defaultProviderRef?: string;
   /** Clock seam for tests (deterministic latency_ms). */
@@ -90,11 +104,12 @@ export class VoucherPiiService {
       events: deps.events,
       idempotency: deps.idempotency,
       rateLimit: deps.rateLimit,
+      notifications: deps.notifications,
       recipientBucketSize: deps.recipientBucketSize ?? 10,
       recipientRefillPerMin: deps.recipientRefillPerMin ?? 10,
       providerBucketSize: deps.providerBucketSize ?? 100,
       providerRefillPerMin: deps.providerRefillPerMin ?? 100,
-      defaultProviderRef: deps.defaultProviderRef ?? "stub-email-v1",
+      defaultProviderRef: deps.defaultProviderRef ?? deps.notifications.providerRef,
       now: deps.now ?? (() => Date.now()),
     };
   }
@@ -274,10 +289,58 @@ export class VoucherPiiService {
           };
         }
 
-        // Step 3 — dispatch (STUB v1.5.0; vendor integration v1.6.0+).
-        // Real provider call would happen here. The stub provider always
-        // succeeds — failure injection lives in chaos test.
+        // Step 3 — dispatch przez moduł Notification (Story 2.2, AC4; AD-5).
+        // Do v1.13.0 był tu STUB (`stub-email-v1`), który zawsze „się udawał".
+        // Teraz wysyłka jest realna, więc musi mieć realną semantykę awarii:
+        // fail → `dlq_provider_failed` + zapis decyzji + audyt + event.
+        // NIGDY rollback konsentu (D-66) i NIGDY utrata rekordu audytu (D-67) —
+        // wyjątek z providera jest tu ŁAPANY i zamieniany na stan degradacyjny.
         const provider_ref = this.deps.defaultProviderRef;
+
+        try {
+          await this.deps.notifications.dispatch({
+            consent_audit_id: args.consent_audit_id,
+            market_id: args.market_id,
+            recipient_id: args.recipient_id,
+            delivery_decision_id: args.delivery_decision_id,
+            request_id: args.request_id,
+          });
+        } catch (error) {
+          const failedLatency = this.deps.now() - start;
+          await this.deps.delivery.recordOutcome({
+            delivery_decision_id: args.delivery_decision_id,
+            outcome: "dlq_provider_failed",
+            latency_ms: failedLatency,
+            provider_ref,
+            delivery_attempt_n: args.delivery_attempt_n,
+          });
+          await this.deps.audit.appendAuditRow({
+            market_id: args.market_id,
+            payload: {
+              action: "DELIVERY_DECISION_RECORDED",
+              consent_audit_id: args.consent_audit_id,
+              delivery_decision_id: args.delivery_decision_id,
+              outcome: "dlq_provider_failed",
+              provider_ref,
+              // Zapisujemy WYŁĄCZNIE kod/klasę błędu — zero PII, zero treści maila.
+              error_code: readErrorCode(error),
+              request_id: args.request_id,
+            },
+          });
+          await this.emitDeliveryDecision({
+            ...args,
+            outcome: "dlq_provider_failed",
+            latency_ms: failedLatency,
+            provider_ref,
+            audit_chain_verified: true,
+          });
+          return {
+            outcome: "dlq_provider_failed",
+            latency_ms: failedLatency,
+            provider_ref,
+            audit_chain_verified: true,
+          };
+        }
 
         // Step 4 — record decision (chained audit entry happens via the
         // audit port internally).
@@ -450,4 +513,20 @@ export class VoucherPiiService {
       },
     });
   }
+}
+
+/**
+ * Wyciąga kod błędu providera do wpisu audytowego. Świadomie NIE zapisujemy
+ * `message` — mógłby nieść adres odbiorcy albo treść maila (D-70: zero PII
+ * w audycie).
+ */
+function readErrorCode(error: unknown): string {
+  const record = error as { error_code?: unknown; code?: unknown; name?: unknown };
+  if (typeof record?.error_code === "string" && record.error_code) {
+    return record.error_code;
+  }
+  if (typeof record?.code === "string" && record.code) {
+    return record.code;
+  }
+  return typeof record?.name === "string" && record.name ? record.name : "UNKNOWN_ERROR";
 }

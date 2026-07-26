@@ -29,6 +29,7 @@ import {
   type DeliveryDecisionPort,
   type DeliveryOutcome,
   type EventEmitterPort,
+  type NotificationDispatchPort,
   type VoucherPiiPort,
 } from "../modules/voucher-pii";
 import { VoucherPiiService } from "../modules/voucher-pii/voucher-pii.service";
@@ -164,6 +165,31 @@ class FakeDeliveryPort implements DeliveryDecisionPort {
   }
 }
 
+/**
+ * Story 2.2 (AC4): Step 3 woła port notyfikacji zamiast stubu `stub-email-v1`.
+ * Fake pozostaje in-memory — testy jednostkowe D-72 NIE wymagają kontenera
+ * Medusy ani sieci; ZERO realnej wysyłki.
+ */
+class FakeNotificationDispatch implements NotificationDispatchPort {
+  readonly providerRef = "brevo";
+  public calls: Array<Record<string, string>> = [];
+  public failWith: Error | null = null;
+
+  async dispatch(args: {
+    consent_audit_id: string;
+    market_id: string;
+    recipient_id: string;
+    delivery_decision_id: string;
+    request_id: string;
+  }): Promise<{ provider_message_id: string | null }> {
+    this.calls.push({ ...args });
+    if (this.failWith) {
+      throw this.failWith;
+    }
+    return { provider_message_id: "msg_fake_1" };
+  }
+}
+
 class FakeEvents implements EventEmitterPort {
   public events: Array<{
     event_type: string;
@@ -187,6 +213,7 @@ function buildService(): {
   events: FakeEvents;
   idempotency: InMemoryIdempotencyAdapter;
   rateLimit: InMemoryTokenBucketAdapter;
+  notifications: FakeNotificationDispatch;
 } {
   const pii = new FakePiiPort();
   const audit = new FakeAuditPort();
@@ -194,6 +221,7 @@ function buildService(): {
   const events = new FakeEvents();
   const idempotency = new InMemoryIdempotencyAdapter();
   const rateLimit = new InMemoryTokenBucketAdapter();
+  const notifications = new FakeNotificationDispatch();
   const service = new VoucherPiiService({
     pii,
     audit,
@@ -201,8 +229,9 @@ function buildService(): {
     events,
     idempotency,
     rateLimit,
+    notifications,
   });
-  return { service, pii, audit, delivery, events, idempotency, rateLimit };
+  return { service, pii, audit, delivery, events, idempotency, rateLimit, notifications };
 }
 
 // ---------------------------------------------------------------------------
@@ -298,7 +327,9 @@ describe("executeDeliveryStep (AC-VPII-PIPE-2.2-03)", () => {
 
     expect(result.outcome).toBe("dispatched");
     expect(result.audit_chain_verified).toBe(true);
-    expect(result.provider_ref).toBe("stub-email-v1");
+    // Story 2.2 (AC4): asercja zaktualizowana ŚWIADOMIE — `stub-email-v1`
+    // zastąpiony realnym providerem z portu notyfikacji (`brevo`).
+    expect(result.provider_ref).toBe("brevo");
 
     // Step 4 — chained DELIVERY_DECISION_RECORDED audit row written.
     const chainedRow = audit.rows.find(
@@ -310,7 +341,7 @@ describe("executeDeliveryStep (AC-VPII-PIPE-2.2-03)", () => {
     // Delivery decision row terminal-stated.
     const ddRow = delivery.rows[0];
     expect(ddRow.outcome).toBe("dispatched");
-    expect(ddRow.provider_ref).toBe("stub-email-v1");
+    expect(ddRow.provider_ref).toBe("brevo");
 
     // Step 5 — observability event emitted.
     const dispatchedEvent = events.events.find(
@@ -348,6 +379,60 @@ describe("executeDeliveryStep (AC-VPII-PIPE-2.2-03)", () => {
     expect(dlqEvents).toHaveLength(1);
 
     expect(delivery.rows.length).toBe(0); // we never inserted dd_x via insertPending
+  });
+
+  // Story 2.2 (AC4): realna wysyłka = realna semantyka awarii.
+  test("dispatch rzuca → dlq_provider_failed, BEZ rollbacku konsentu i BEZ utraty audytu", async () => {
+    const { service, audit, delivery, events, notifications, pii } = buildService();
+    const consent = await service.recordConsentTransaction({
+      market_id: "bonbeauty",
+      order_id: "ord_009",
+      entitlement_id: "ent_009",
+      recipient_email: null,
+      recipient_phone: null,
+      locale: "pl",
+      is_gift: false,
+      request_id: "req_f",
+    });
+    const piiRowsBefore = pii.inserts.length;
+    const consentAuditRows = audit.rows.length;
+
+    notifications.failWith = Object.assign(new Error("template not configured"), {
+      error_code: "BREVO_TEMPLATE_NOT_CONFIGURED",
+    });
+
+    const result = await service.executeDeliveryStep({
+      consent_audit_id: consent.consent_audit_id,
+      market_id: "bonbeauty",
+      recipient_id: consent.recipient_pii_id,
+      request_id: "req_f",
+      delivery_decision_id: consent.delivery_decision_id,
+      delivery_attempt_n: 0,
+    });
+
+    // Degradacja, nie wyjątek — mail NIE wywraca transakcji biznesowej.
+    expect(result.outcome).toBe("dlq_provider_failed");
+    expect(result.provider_ref).toBe("brevo");
+    expect(notifications.calls).toHaveLength(1);
+
+    // Konsent i jego audyt nietknięte (D-66/D-67).
+    expect(pii.inserts.length).toBe(piiRowsBefore);
+    expect(audit.rows.length).toBeGreaterThan(consentAuditRows);
+
+    // Wpis audytowy o awarii niesie kod błędu i ZERO PII.
+    const failedAudit = audit.rows.find(
+      (r) => r.payload.outcome === "dlq_provider_failed"
+    );
+    expect(failedAudit).toBeDefined();
+    expect(failedAudit!.payload.error_code).toBe("BREVO_TEMPLATE_NOT_CONFIGURED");
+    expect(JSON.stringify(failedAudit!.payload)).not.toContain("@");
+
+    // Decyzja dostawy w stanie terminalnym + event obserwowalności.
+    expect(delivery.rows[0].outcome).toBe("dlq_provider_failed");
+    const dispatched = events.events.filter(
+      (e) => (e.payload as { outcome?: string }).outcome === "dispatched"
+    );
+    expect(dispatched).toHaveLength(0);
   });
 
   test("rate-limit exhausted → dlq_rate_limited (no dispatch)", async () => {

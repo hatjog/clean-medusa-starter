@@ -12,6 +12,9 @@ import {
   renderBuyerClaimText,
 } from "../modules/vendor-notifications/email-templates/buyer-claim/i18n"
 import { VOUCHER_MODULE } from "../modules/voucher"
+// Story 2.2 (AC5 poz.5): klucz szablonu WYŁĄCZNIE ze stałej rejestru (AD-6).
+import { NOTIFICATION_TEMPLATE_KEYS } from "@gp/messaging"
+import { resolveNotificationMarketId } from "../lib/notification-market-context"
 
 /**
  * voucher-claimed-buyer-notification — Story v160-6-6 backend subscriber.
@@ -161,8 +164,13 @@ function createBuyerClaimNotificationDispatcher(
       const payload = {
         to: input.to,
         channel: "email",
-        template: "buyer_claim_notification",
+        // `template` = pole kontraktu Medusy; `data.template_key` = kanoniczne GP
+        // (ADR-158). Obie wartości z tej samej stałej rejestru.
+        template: NOTIFICATION_TEMPLATE_KEYS.BUYER_CLAIM_NOTIFICATION,
         data: {
+          template_key: NOTIFICATION_TEMPLATE_KEYS.BUYER_CLAIM_NOTIFICATION,
+          market_id: resolveNotificationMarketId(),
+          flow_id: "voucher_claim",
           voucher_id: input.voucher_id,
           locale: input.locale,
           subject: input.subject,
@@ -175,7 +183,7 @@ function createBuyerClaimNotificationDispatcher(
           html: input.html,
         },
         metadata: {
-          notification_type: "buyer_claim_notification",
+          notification_type: NOTIFICATION_TEMPLATE_KEYS.BUYER_CLAIM_NOTIFICATION,
           triggered_by: "system",
           voucher_id: input.voucher_id,
           locale: input.locale,

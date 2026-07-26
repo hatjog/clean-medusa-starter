@@ -94,6 +94,32 @@ export interface RateLimitPort {
   }): Promise<{ allowed: boolean; retry_after_ms: number }>;
 }
 
+/**
+ * Notification dispatch port — Step 3 kontraktu D-72 (Story 2.2, AC4).
+ *
+ * Do v1.14.0 Step 3 był STUB-em (`provider_ref = "stub-email-v1"`, brak realnej
+ * wysyłki). Po rejestracji modułu Notification dispatch idzie przez
+ * `Modules.NOTIFICATION` (AD-5 — jedna ścieżka wysyłki), ale WYŁĄCZNIE przez ten
+ * port: orchestrator nie może twardo importować kontenera Medusy, bo testy
+ * jednostkowe D-72 muszą działać bez żywego kontenera i bez sieci.
+ *
+ * Kontrakt błędu: implementacja RZUCA przy awarii wysyłki. Orchestrator łapie i
+ * mapuje na `dlq_provider_failed` — awaria maila NIGDY nie cofa transakcji
+ * konsentu ani nie gubi rekordu audytu (D-66/D-67, inwariant AD-6).
+ */
+export interface NotificationDispatchPort {
+  /** Kanoniczny identyfikator providera zapisywany do `provider_ref`. */
+  readonly providerRef: string;
+
+  dispatch(args: {
+    consent_audit_id: string;
+    market_id: string;
+    recipient_id: string;
+    delivery_decision_id: string;
+    request_id: string;
+  }): Promise<{ provider_message_id: string | null }>;
+}
+
 /** Event bus port — publishes redacted observability envelopes. */
 export interface EventEmitterPort {
   emit(event: {

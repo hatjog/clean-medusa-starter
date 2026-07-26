@@ -14,6 +14,9 @@ import type {
   VoucherAppointmentLifecycleStatus,
 } from "../modules/voucher-delivery/ics-generator"
 import { VOUCHER_MODULE } from "../modules/voucher"
+// Story 2.2 (AC5 poz.5): klucz szablonu WYŁĄCZNIE ze stałej rejestru (AD-6).
+import { NOTIFICATION_TEMPLATE_KEYS } from "@gp/messaging"
+import { resolveNotificationMarketId } from "../lib/notification-market-context"
 
 export const VOUCHER_APPOINTMENT_CONFIRMED_EVENT =
   "gp.voucher.appointment_confirmed.v1" as const
@@ -237,8 +240,13 @@ function buildNotificationPayload(input: {
   return {
     to: input.to,
     channel: "email",
-    template: "voucher_appointment_confirmation",
+    // `template` = pole kontraktu Medusy; `data.template_key` = kanoniczne GP
+    // (ADR-158). Obie wartości z tej samej stałej rejestru.
+    template: NOTIFICATION_TEMPLATE_KEYS.VOUCHER_APPOINTMENT_CONFIRMATION,
     data: {
+      template_key: NOTIFICATION_TEMPLATE_KEYS.VOUCHER_APPOINTMENT_CONFIRMATION,
+      market_id: resolveNotificationMarketId(),
+      flow_id: "voucher_appointment",
       entitlement_instance_id: input.entitlementId,
       locale: input.locale,
       subject: input.email.subject,
@@ -254,7 +262,7 @@ function buildNotificationPayload(input: {
     },
     attachments: input.email.attachments,
     metadata: {
-      notification_type: "voucher_appointment_confirmation",
+      notification_type: NOTIFICATION_TEMPLATE_KEYS.VOUCHER_APPOINTMENT_CONFIRMATION,
       triggered_by: "system",
       event_type: VOUCHER_APPOINTMENT_CONFIRMED_EVENT,
       entitlement_instance_id: input.entitlementId,

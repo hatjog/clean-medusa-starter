@@ -4,7 +4,10 @@ export class NotificationProviderNotReadyError extends Error {
   constructor() {
     super(
       "Vendor notification provider is not configured for live dispatch. " +
-        "Set RESEND_API_KEY, SENDGRID_API_KEY, SMTP_URL, or SMTP_HOST/SMTP_USER/SMTP_PASS, " +
+        // v1.14.0 Story 2.2 (AC3): brevo jest kanałem produkcyjnym (AD-5), więc
+        // BREVO_API_KEY stoi na pierwszym miejscu — bez tego operator dostawał
+        // instrukcję ustawienia nieaktualnego providera.
+        "Set BREVO_API_KEY, RESEND_API_KEY, SENDGRID_API_KEY, SMTP_URL, or SMTP_HOST/SMTP_USER/SMTP_PASS, " +
         "or explicitly mark GP_VENDOR_NOTIFICATIONS_PROVIDER_READY=true after validating the provider.",
     )
     this.name = "NotificationProviderNotReadyError"
@@ -28,6 +31,12 @@ export function shouldEnforceNotificationProviderReady(): boolean {
 
 export function isNotificationProviderReady(): boolean {
   if (isTruthy(process.env.GP_VENDOR_NOTIFICATIONS_PROVIDER_READY)) {
+    return true
+  }
+
+  // v1.14.0 Story 2.2 (AC3, AD-5): provider brevo zarejestrowany w
+  // medusa-config.ts jest kanałem produkcyjnym platformy.
+  if (hasValue(process.env.BREVO_API_KEY)) {
     return true
   }
 

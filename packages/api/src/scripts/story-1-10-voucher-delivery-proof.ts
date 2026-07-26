@@ -7,6 +7,7 @@ import { PgDeliveryAdapter } from "../modules/voucher-pii/adapters/pg-delivery";
 import { PgVoucherPiiAdapter } from "../modules/voucher-pii/adapters/pg-pii";
 import { createInProcessIdempotencyPort } from "../modules/voucher-pii/adapters/pg-idempotency";
 import { createInProcessRateLimitPort } from "../modules/voucher-pii/adapters/in-memory-rate-limit";
+import { MedusaNotificationDispatchAdapter } from "../modules/voucher-pii/adapters/medusa-notification-dispatch";
 import { VoucherPiiService } from "../modules/voucher-pii/voucher-pii.service";
 import type { EventEmitterPort } from "../modules/voucher-pii";
 
@@ -100,6 +101,14 @@ async function main() {
       events,
       idempotency: createInProcessIdempotencyPort(),
       rateLimit: createInProcessRateLimitPort(),
+      // Story 2.2 (AC4): Step 3 idzie przez Modules.NOTIFICATION. Skrypt proof
+      // biegnie poza kontenerem Medusy (`ts-node`), więc dostaje adapter
+      // rozwiązujący moduł ze scope'u, jeśli jest — inaczej fail-loud zamiast
+      // udawanego sukcesu stuba.
+      notifications: new MedusaNotificationDispatchAdapter(
+        { resolve: () => undefined },
+        db
+      ),
     });
 
     let consentAuditId = existing?.consent_audit_id;

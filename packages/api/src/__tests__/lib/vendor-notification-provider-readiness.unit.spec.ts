@@ -10,6 +10,7 @@ describe("vendor-notification-provider-readiness", () => {
     delete process.env.NODE_ENV
     delete process.env.GP_VENDOR_NOTIFICATIONS_ENFORCE_PROVIDER_READY
     delete process.env.GP_VENDOR_NOTIFICATIONS_PROVIDER_READY
+    delete process.env.BREVO_API_KEY
     delete process.env.RESEND_API_KEY
     delete process.env.SENDGRID_API_KEY
     delete process.env.SMTP_URL
@@ -30,6 +31,25 @@ describe("vendor-notification-provider-readiness", () => {
   it("enforces readiness when explicitly requested", () => {
     process.env.GP_VENDOR_NOTIFICATIONS_ENFORCE_PROVIDER_READY = "true"
     expect(shouldEnforceNotificationProviderReady()).toBe(true)
+  })
+
+  // v1.14.0 Story 2.2 (AC3): brevo jako kanał produkcyjny (AD-5).
+  // Świadomie NIE asertujemy wartości klucza — wyłącznie obecność/brak.
+  it("detects readiness from BREVO_API_KEY", () => {
+    process.env.BREVO_API_KEY = "placeholder-not-a-real-key"
+    expect(isNotificationProviderReady()).toBe(true)
+  })
+
+  it.each([
+    ["empty", ""],
+    ["whitespace", "   "],
+  ])("does not treat %s BREVO_API_KEY as ready", (_label, value) => {
+    process.env.BREVO_API_KEY = value
+    expect(isNotificationProviderReady()).toBe(false)
+  })
+
+  it("names BREVO_API_KEY in the operator-facing not-ready message", () => {
+    expect(new NotificationProviderNotReadyError().message).toContain("BREVO_API_KEY")
   })
 
   it("detects readiness from RESEND_API_KEY", () => {
