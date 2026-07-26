@@ -87,6 +87,13 @@ type EntitySummary = {
   /** AD-4: ile encji miało już identyczny `content_bar` (idempotencja). */
   content_bar_unchanged: number
   /**
+   * Review 1-4-F2: ile zapisów `content_bar` NIE powiodło się. Nieudany zapis
+   * cofa inkrement `content_bar_updated`, dokłada warning z typem encji,
+   * handle i id — i NIE przerywa przebiegu. Fail-closed jest w WYNIKU:
+   * `ok: false` + exit 1 PO wypisaniu pełnego summary.
+   */
+  content_bar_write_failed: number
+  /**
    * Code review 4.2 F3: ile zmaterializowanych rekordów tłumaczeń NIE miało
    * `review_status: shipped` dla swojego locale (brak markera liczy się jako
    * "nie shipped"). Materializacja i tak je synchronizuje — patrz deferral
@@ -109,7 +116,8 @@ type ContentBarTarget = {
 }
 
 type I18nContentSummary = {
-  ok: true
+  /** Review 1-4-F2: `false`, gdy którykolwiek zapis `content_bar` padł. */
+  ok: boolean
   dry_run: boolean
   locales: string[]
   i18n_root: string
@@ -396,6 +404,7 @@ function emptyEntitySummary(): EntitySummary {
     missing_handles: [],
     content_bar_updated: 0,
     content_bar_unchanged: 0,
+    content_bar_write_failed: 0,
     unshipped_records: 0,
   }
 }
@@ -725,8 +734,17 @@ async function applyTranslationPayloads(
  * gp-cli (FR-22) i raport (FR-23).
  *
  * Zapis jest idempotentny: identyczna mapa nie generuje update'u.
+ *
+ * Semantyka błędów zapisu (review 1-4-F2, klasa defektu ze Story 4.2 naprawiona
+ * w zakresie fixu 1.4): fail-loud PER ENCJA — nieudany zapis dokłada warning
+ * (typ encji + handle + id), cofa inkrement `content_bar_updated` i zlicza się
+ * w `content_bar_write_failed`; przebieg ŻYJE dalej, a summary i warnings są
+ * emitowane ZAWSZE. Fail-closed realizuje entrypoint: `ok: false` + exit 1
+ * dopiero PO wypisaniu summary.
+ *
+ * Eksport wyłącznie dla testów jednostkowych (regresja 1-4-F1/F2).
  */
-async function applyContentBarMetadata(
+export async function applyContentBarMetadata(
   services: { productModuleService: any; sellerModuleService: any },
   targets: ContentBarTarget[],
   options: {
@@ -737,7 +755,7 @@ async function applyContentBarMetadata(
 ): Promise<void> {
   const updatesByEntity = new Map<
     EntityType,
-    Array<{ id: string; metadata: Record<string, unknown> }>
+    Array<{ id: string; handle: string; metadata: Record<string, unknown> }>
   >()
 
   for (const target of targets) {
@@ -768,6 +786,7 @@ async function applyContentBarMetadata(
       ...(updatesByEntity.get(target.entityType) ?? []),
       {
         id: target.entityId,
+        handle: target.handle,
         // Merge, nie podmiana: `metadata.gp` niesie też `market_id`,
         // `images[]` (AD-10) i inne pola, których ten sync nie jest właścicielem.
         metadata: { ...metadata, gp: { ...gp, content_bar: nextBar } },
@@ -782,6 +801,7 @@ async function applyContentBarMetadata(
   for (const [entityType, updates] of updatesByEntity.entries()) {
     if (updates.length === 0) continue
 
+    const summary = options.summaries[entityType]
     const service =
       entityType === "seller" ? services.sellerModuleService : services.productModuleService
     const methodNames =
@@ -800,7 +820,40 @@ async function applyContentBarMetadata(
     }
 
     for (const update of updates) {
-      await updateFn(update.id, { metadata: update.metadata })
+      // Review 1-4-F1 rec. 2: pusty id łapiemy PRZED ORM-em — MedusaError
+      // `with id "" not found` nie niesie ani typu encji, ani handle'a
+      // (evidence 1-4-sync-i18n-failure.log kosztował cały przebieg diagnozy).
+      if (!update.id) {
+        summary.content_bar_updated -= 1
+        summary.content_bar_write_failed += 1
+        options.warnings.push(
+          `${entityType} '${update.handle}': content_bar write skipped — empty entity id`
+        )
+        continue
+      }
+
+      try {
+        // Review 1-4-F1 (defekt Story 4.2, pierwszy raz blokujący w 1.4):
+        // konwencja wywołania zależy od serwisu. Ręcznie pisany core'owy
+        // ProductModuleService ma overload `(id, data)` dla
+        // updateProducts/updateProductCategories. Auto-generowane metody
+        // MedusaService (updateSellers w module sellera) przyjmują JEDEN
+        // argument danych (`data | data[] | {selector, data}`) — pozycyjny
+        // string NIE jest tam id i schodzi jako pusty selektor
+        // (`Seller with id "" not found`).
+        if (entityType === "seller") {
+          await updateFn([{ id: update.id, metadata: update.metadata }])
+        } else {
+          await updateFn(update.id, { metadata: update.metadata })
+        }
+      } catch (error: any) {
+        summary.content_bar_updated -= 1
+        summary.content_bar_write_failed += 1
+        options.warnings.push(
+          `${entityType} '${update.handle}' (${update.id}): content_bar write failed — ` +
+            `${error?.message ?? String(error)}`
+        )
+      }
     }
   }
 }
@@ -955,8 +1008,14 @@ export async function gpConfigSyncI18nContent({
     }
   )
   summary.warnings.push(...categoryPlWarnings)
+  const contentBarWriteFailures = Object.values(summary.entities).reduce(
+    (total, entitySummary) => total + entitySummary.content_bar_write_failed,
+    0
+  )
   const result: I18nContentSummary = {
-    ok: true,
+    // Review 1-4-F2: fail-closed w WYNIKU, nie w przerwaniu — nieudane zapisy
+    // content_bar dają ok:false i exit 1, ale dopiero PO wypisaniu summary.
+    ok: contentBarWriteFailures === 0,
     dry_run: parsedArgs.dryRun,
     locales,
     i18n_root: i18nDir,
@@ -970,10 +1029,20 @@ export async function gpConfigSyncI18nContent({
         `created=${entitySummary.created}, updated=${entitySummary.updated}, ` +
         `unchanged=${entitySummary.unchanged}, skipped=${entitySummary.skipped}, ` +
         `content_bar_updated=${entitySummary.content_bar_updated}, ` +
-        `content_bar_unchanged=${entitySummary.content_bar_unchanged}`
+        `content_bar_unchanged=${entitySummary.content_bar_unchanged}, ` +
+        `content_bar_write_failed=${entitySummary.content_bar_write_failed}`
     )
   }
   console.log(JSON.stringify(result, null, 2))
+
+  if (contentBarWriteFailures > 0) {
+    throw new Error(
+      `content_bar write failed for ${contentBarWriteFailures} entity(-ies) — ` +
+        `per-entity details are in \`warnings\` of the summary above (review 1-4-F2: ` +
+        `summary is always emitted, exit is non-zero AFTER reporting)`
+    )
+  }
+
   return result
 }
 
