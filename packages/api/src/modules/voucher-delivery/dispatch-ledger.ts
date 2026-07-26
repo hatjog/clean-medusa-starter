@@ -177,10 +177,33 @@ export interface ScanDeliveryGapsInput {
   template_keys: readonly string[]
   /** Stany `entitlement_instance`, w których wysyłka jest jeszcze oczekiwana. */
   source_states: readonly string[]
+  /**
+   * R-2.5-H4 — typy z taksonomii L1, których dotyczy matryca AD-7 (dziś:
+   * warianty voucherowe). Bez tego filtra `SUBSCRIPTION_*`/`CREDIT_PACK`/`BUNDLE`
+   * są „lukami buyer-maila", których automat nigdy nie domknie: wracają
+   * w KAŻDYM przebiegu, zajmują batch i nie pozwalają zgasnąć alertowi.
+   * Pusty zbiór jest błędem wołającego, nie „skanuj wszystkie typy".
+   */
+  entitlement_types: readonly string[]
   /** ISO 8601 — entitlementy MŁODSZE są pomijane (grace-window sweepa). */
   created_before: string
+  /**
+   * R-2.5-H1 — DOLNA granica wieku (backfill-guard). Bez niej pierwszy przebieg
+   * na środowisku readiness-green traktuje CAŁĄ historię sprzed istnienia
+   * ledgera (2.3) jako luki i dosyła do niej maile — nieodwracalnie. Okno jest
+   * TYM SAMYM oknem, w którym liczona jest granica H1
+   * (`countGapsBeyondSourceStates`), więc obie liczby mówią o tym samym zbiorze.
+   */
+  created_after: string
   /** ISO 8601 — `queued` starsze = rezerwacja PORZUCONA, nie wysyłka w locie. */
   stale_queued_before: string
+  /**
+   * R-2.5-H3 — wiersze z wyczerpanym budżetem prób (`attempt_count >=`) są
+   * ZAPARKOWANE i NIE wracają ze skanu: inaczej 200 takich wierszy zajmuje cały
+   * batch i sweep nigdy nie zobaczy świeżych luk (starvation). Są nadal
+   * widoczne — przez `countParkedDispatchesByMarket`, nie przez zjadanie batcha.
+   */
+  max_attempt_count: number
   /** Bounded batch: maksymalna liczba wierszy na przebieg. */
   limit: number
 }
@@ -198,9 +221,44 @@ export interface DeliveryGapScanResult {
 export interface CountGapsBeyondSourceStatesInput {
   template_keys: readonly string[]
   source_states: readonly string[]
+  /** Ten sam filtr typów co skan — inaczej licznik mierzyłby inny zbiór. */
+  entitlement_types: readonly string[]
   created_before: string
   /** ISO 8601 — dolna granica okna (skan bez niej byłby pełnym seq-scanem). */
   created_after: string
+}
+
+/**
+ * Story 2.5 (R-2.5-M8) — skan STALLED sterowany LEDGEREM, nie
+ * `entitlement_instance`. Uzupełnia `scanDeliveryGaps`, który wchodzi wyłącznie
+ * przez zbiór szablonów OCZEKIWANYCH: wiersz szablonu warunkowego (np. handoff
+ * z 2.4) w stanie `failed`/`retrying` nie ma jak wrócić z tamtego skanu, gdy
+ * buyer-mail jest już `sent` — a wtedy nie ma go kto ponowić.
+ *
+ * Ten skan nie potrzebuje predykatu warunku (gift itp.): wiersz ledgera istnieje
+ * WYŁĄCZNIE dlatego, że predykat już raz przeszedł.
+ */
+export interface ScanStalledDispatchesInput {
+  source_states: readonly string[]
+  entitlement_types: readonly string[]
+  created_before: string
+  created_after: string
+  max_attempt_count: number
+  limit: number
+}
+
+/** Wiersz zaparkowany: wyczerpał budżet prób i czeka na decyzję operatora. */
+export interface ParkedDispatchRow {
+  entitlement_id: string
+  market_id: string | null
+  template_key: string
+  attempt_count: number
+}
+
+/** Zaparkowane wiersze per rynek — nośnik alertu, gdy sweep ich nie dosyła. */
+export interface ParkedDispatchMarketCount {
+  market_id: string | null
+  parked: number
 }
 
 /**
@@ -228,6 +286,40 @@ export interface DeliveryGapScanPort {
   abandonStaleQueued(input: {
     dispatch_id: string
     stale_queued_before: string
+    error_code: string
+  }): Promise<boolean>
+  /** R-2.5-M8 — skan stalled wierszy ledgera (szablony warunkowe też). */
+  scanStalledDispatches(
+    input: ScanStalledDispatchesInput,
+  ): Promise<DeliveryGapCandidate[]>
+  /**
+   * R-2.5-M6 — wiersze ZAPARKOWANE dla wskazanych entitlementów. Decyzja
+   * o wyczerpaniu budżetu żyje PRZY WIERSZU, ale dosyłka jest per entitlement
+   * (handler wysyła wszystkie szablony naraz), więc sweep musi wiedzieć, że dla
+   * tego entitlementu istnieje wiersz zaparkowany — inaczej dołożenie drugiego
+   * szablonu obchodziłoby próg przez `reserveDispatch`.
+   */
+  listParkedDispatches(input: {
+    entitlement_ids: readonly string[]
+    max_attempt_count: number
+  }): Promise<ParkedDispatchRow[]>
+  /** R-2.5-H3 — zaparkowane per rynek (alert; wiersze NIE wracają ze skanu). */
+  countParkedDispatchesByMarket(input: {
+    max_attempt_count: number
+  }): Promise<ParkedDispatchMarketCount[]>
+  /**
+   * R-2.5-H3 — zwrot budżetu prób po awarii GLOBALNEJ (kill-switch, brak
+   * szablonu locale, brak klucza providera). Taka awaria nie jest odrzuceniem
+   * wysyłki przez providera, tylko brakiem konfiguracji: gdyby zużywała budżet,
+   * odwracalna awaria konfiguracji zamieniałaby się po 5 przebiegach (75 min)
+   * w TRWAŁĄ utratę maili dla całego okna awarii, bez ścieżki odparkowania.
+   *
+   * Guard `status='failed' AND error_code = …` sprawia, że dekrement dotyczy
+   * WYŁĄCZNIE wiersza, który właśnie padł z tym kodem — nie cofa prób zużytych
+   * na realne odrzucenia providera.
+   */
+  releaseAttemptBudget(input: {
+    dispatch_id: string
     error_code: string
   }): Promise<boolean>
 }
@@ -524,8 +616,14 @@ export class PgDispatchLedger
    * `sent`/`delivered`/`degraded` i `dead_lettered` NIE pasują do żadnego z nich,
    * więc nie wracają ze skanu (blokada jest w SQL-u i powtórnie w ledgerze).
    *
-   * Sortowanie jest deterministyczne (`created_at, id, template_key`), żeby
-   * bounded batch dogonił zaległości od najstarszych, a nie losowo.
+   * Sortowanie jest deterministyczne, ale NIE jest samym „od najstarszych":
+   * pierwszym kluczem jest liczba dotychczasowych prób (R-2.5-H3/H4). Inaczej
+   * najstarsze wiersze, które padają w każdym przebiegu, zajmowałyby początek
+   * batcha bez końca i świeże luki nigdy nie zmieściłyby się w limicie.
+   *
+   * `truncated` jest liczone przez pobranie `limit + 1` wiersza (R-2.5-I13):
+   * zaległość o rozmiarze DOKŁADNIE `limit` nie jest już fałszywie raportowana
+   * jako „reszta czeka".
    */
   async scanDeliveryGaps(
     input: ScanDeliveryGapsInput,
@@ -543,6 +641,15 @@ export class PgDispatchLedger
         "VOUCHER_DELIVERY_GAP_SCAN_SOURCE_STATES_EMPTY",
       )
     }
+    if (input.entitlement_types.length === 0) {
+      throw new DispatchLedgerError(
+        "scanDeliveryGaps wymaga niepustego zbioru entitlement_types — skan bez " +
+          "filtra typu traktuje subskrypcje i credit-packi jako luki buyer-maila",
+        "VOUCHER_DELIVERY_GAP_SCAN_ENTITLEMENT_TYPES_EMPTY",
+      )
+    }
+    assertGapScanWindow(input.created_after, input.created_before)
+    assertMaxAttemptCount(input.max_attempt_count)
     if (!Number.isInteger(input.limit) || input.limit < 1) {
       throw new DispatchLedgerError(
         "scanDeliveryGaps wymaga limitu >= 1 — skan bez limitu może wystrzelić " +
@@ -553,19 +660,25 @@ export class PgDispatchLedger
 
     const templateKeys = [...input.template_keys]
     const sourceStates = [...input.source_states]
+    const entitlementTypes = [...input.entitlement_types]
     const retryStates = [...DISPATCH_STATES_ALLOWING_RETRY]
 
     // Numeracja `$N` jest rosnąca wzdłuż tekstu zapytania — kolejność bindingów
-    // to: szablony, stany źródłowe, created_before, stale_queued_before,
-    // stany retry, limit.
+    // to: szablony, stany źródłowe, typy, created_before, created_after,
+    // stale_queued_before, stany retry, max_attempt_count, limit.
     let position = 0
     const templatePlaceholders = templateKeys
       .map(() => `($${++position})`)
       .join(", ")
     const statePlaceholders = sourceStates.map(() => `$${++position}`).join(", ")
+    const typePlaceholders = entitlementTypes
+      .map(() => `$${++position}`)
+      .join(", ")
     const createdBeforePlaceholder = `$${++position}`
+    const createdAfterPlaceholder = `$${++position}`
     const staleQueuedPlaceholder = `$${++position}`
     const retryPlaceholders = retryStates.map(() => `$${++position}`).join(", ")
+    const maxAttemptPlaceholder = `$${++position}`
     const limitPlaceholder = `$${++position}`
 
     const rows = await this.queryRows<Record<string, unknown>>(
@@ -583,27 +696,188 @@ export class PgDispatchLedger
                 ON d.entitlement_id = e.id
                AND d.template_key = t.template_key
         WHERE e.state IN (${statePlaceholders})
+          AND e.entitlement_type IN (${typePlaceholders})
           AND e.created_at < ${createdBeforePlaceholder}
+          AND e.created_at >= ${createdAfterPlaceholder}
           AND (
                 d.dispatch_id IS NULL
              OR (d.status = 'queued' AND d.queued_at < ${staleQueuedPlaceholder})
              OR d.status IN (${retryPlaceholders})
           )
-        ORDER BY e.created_at ASC, e.id ASC, t.template_key ASC
+          AND (d.dispatch_id IS NULL OR d.attempt_count < ${maxAttemptPlaceholder})
+        ORDER BY COALESCE(d.attempt_count, 0) ASC, e.created_at ASC, e.id ASC,
+                 t.template_key ASC
         LIMIT ${limitPlaceholder}`,
       [
         ...templateKeys,
         ...sourceStates,
+        ...entitlementTypes,
         input.created_before,
+        input.created_after,
         input.stale_queued_before,
         ...retryStates,
+        input.max_attempt_count,
+        // +1 wiersz sondujący: obecność `limit + 1` znaczy „reszta ISTNIEJE".
+        input.limit + 1,
+      ],
+    )
+
+    const truncated = rows.length > input.limit
+    const candidates = rows
+      .slice(0, input.limit)
+      .map((row) => normalizeGapCandidate(row))
+
+    return { candidates, truncated }
+  }
+
+  /**
+   * R-2.5-M8 — skan STALLED sterowany ledgerem: wiersze `failed`/`retrying`
+   * (dowolnego szablonu, także warunkowego) dla entitlementów, które nadal są
+   * w matrycy AD-7. `scanDeliveryGaps` ich nie znajdzie, gdy szablon
+   * bezwarunkowy jest już `sent` — a wtedy nic ich nie ponawia.
+   */
+  async scanStalledDispatches(
+    input: ScanStalledDispatchesInput,
+  ): Promise<DeliveryGapCandidate[]> {
+    if (input.source_states.length === 0 || input.entitlement_types.length === 0) {
+      throw new DispatchLedgerError(
+        "scanStalledDispatches wymaga niepustych zbiorów source_states " +
+          "i entitlement_types",
+        "VOUCHER_DELIVERY_STALLED_SCAN_INPUT_EMPTY",
+      )
+    }
+    assertGapScanWindow(input.created_after, input.created_before)
+    assertMaxAttemptCount(input.max_attempt_count)
+    if (!Number.isInteger(input.limit) || input.limit < 1) {
+      throw new DispatchLedgerError(
+        "scanStalledDispatches wymaga limitu >= 1",
+        "VOUCHER_DELIVERY_STALLED_SCAN_LIMIT_INVALID",
+      )
+    }
+
+    const retryStates = [...DISPATCH_STATES_ALLOWING_RETRY]
+    const sourceStates = [...input.source_states]
+    const entitlementTypes = [...input.entitlement_types]
+
+    let position = 0
+    const retryPlaceholders = retryStates.map(() => `$${++position}`).join(", ")
+    const maxAttemptPlaceholder = `$${++position}`
+    const statePlaceholders = sourceStates.map(() => `$${++position}`).join(", ")
+    const typePlaceholders = entitlementTypes
+      .map(() => `$${++position}`)
+      .join(", ")
+    const createdBeforePlaceholder = `$${++position}`
+    const createdAfterPlaceholder = `$${++position}`
+    const limitPlaceholder = `$${++position}`
+
+    const rows = await this.queryRows<Record<string, unknown>>(
+      `SELECT e.id            AS entitlement_id,
+              e.market_id     AS market_id,
+              e.state         AS entitlement_state,
+              d.template_key  AS template_key,
+              d.dispatch_id   AS dispatch_id,
+              d.status        AS dispatch_status,
+              d.queued_at     AS queued_at,
+              d.attempt_count AS attempt_count
+         FROM ${VOUCHER_DELIVERY_DISPATCH_TABLE} d
+         JOIN ${ENTITLEMENT_INSTANCE_TABLE} e ON e.id = d.entitlement_id
+        WHERE d.status IN (${retryPlaceholders})
+          AND d.attempt_count < ${maxAttemptPlaceholder}
+          AND e.state IN (${statePlaceholders})
+          AND e.entitlement_type IN (${typePlaceholders})
+          AND e.created_at < ${createdBeforePlaceholder}
+          AND e.created_at >= ${createdAfterPlaceholder}
+        ORDER BY d.attempt_count ASC, e.created_at ASC, e.id ASC,
+                 d.template_key ASC
+        LIMIT ${limitPlaceholder}`,
+      [
+        ...retryStates,
+        input.max_attempt_count,
+        ...sourceStates,
+        ...entitlementTypes,
+        input.created_before,
+        input.created_after,
         input.limit,
       ],
     )
 
-    const candidates = rows.map((row) => normalizeGapCandidate(row))
+    return rows.map((row) => normalizeGapCandidate(row))
+  }
 
-    return { candidates, truncated: candidates.length >= input.limit }
+  /** R-2.5-M6 — zaparkowane wiersze wskazanych entitlementów. */
+  async listParkedDispatches(input: {
+    entitlement_ids: readonly string[]
+    max_attempt_count: number
+  }): Promise<ParkedDispatchRow[]> {
+    assertMaxAttemptCount(input.max_attempt_count)
+    const ids = [...input.entitlement_ids]
+    if (ids.length === 0) return []
+
+    let position = 0
+    const maxAttemptPlaceholder = `$${++position}`
+    const idPlaceholders = ids.map(() => `$${++position}`).join(", ")
+
+    const rows = await this.queryRows<Record<string, unknown>>(
+      `SELECT entitlement_id, market_id, template_key, attempt_count
+         FROM ${VOUCHER_DELIVERY_DISPATCH_TABLE}
+        WHERE attempt_count >= ${maxAttemptPlaceholder}
+          AND status <> 'sent'
+          AND status <> 'delivered'
+          AND status <> 'degraded'
+          AND entitlement_id IN (${idPlaceholders})`,
+      [input.max_attempt_count, ...ids],
+    )
+
+    return rows.map((row) => ({
+      entitlement_id: String(row.entitlement_id ?? ""),
+      market_id: row.market_id == null ? null : String(row.market_id),
+      template_key: String(row.template_key ?? ""),
+      attempt_count: Number(row.attempt_count ?? 0),
+    }))
+  }
+
+  /** R-2.5-H3 — nośnik alertu dla wierszy, których sweep świadomie nie dosyła. */
+  async countParkedDispatchesByMarket(input: {
+    max_attempt_count: number
+  }): Promise<ParkedDispatchMarketCount[]> {
+    assertMaxAttemptCount(input.max_attempt_count)
+
+    const rows = await this.queryRows<Record<string, unknown>>(
+      `SELECT market_id, COUNT(*)::int AS parked
+         FROM ${VOUCHER_DELIVERY_DISPATCH_TABLE}
+        WHERE attempt_count >= $1
+          AND status <> 'sent'
+          AND status <> 'delivered'
+          AND status <> 'degraded'
+        GROUP BY market_id`,
+      [input.max_attempt_count],
+    )
+
+    return rows.map((row) => ({
+      market_id: row.market_id == null ? null : String(row.market_id),
+      parked: Number(row.parked ?? 0),
+    }))
+  }
+
+  /** R-2.5-H3 — awaria konfiguracyjna nie zużywa budżetu prób (odparkowanie). */
+  async releaseAttemptBudget(input: {
+    dispatch_id: string
+    error_code: string
+  }): Promise<boolean> {
+    const nowIso = this.now().toISOString()
+    const rows = await this.queryRows<DispatchRow>(
+      `UPDATE ${VOUCHER_DELIVERY_DISPATCH_TABLE}
+          SET attempt_count = GREATEST(attempt_count - 1, 0),
+              updated_at = $1
+        WHERE dispatch_id = $2
+          AND status = 'failed'
+          AND error_code = $3
+          AND attempt_count > 0
+      RETURNING ${SELECT_COLUMNS}`,
+      [nowIso, input.dispatch_id, input.error_code],
+    )
+
+    return rows.length > 0
   }
 
   /**
@@ -615,42 +889,58 @@ export class PgDispatchLedger
   async countGapsBeyondSourceStates(
     input: CountGapsBeyondSourceStatesInput,
   ): Promise<number> {
-    if (input.template_keys.length === 0 || input.source_states.length === 0) {
+    if (
+      input.template_keys.length === 0 ||
+      input.source_states.length === 0 ||
+      input.entitlement_types.length === 0
+    ) {
       throw new DispatchLedgerError(
-        "countGapsBeyondSourceStates wymaga niepustych zbiorów template_keys " +
-          "i source_states",
+        "countGapsBeyondSourceStates wymaga niepustych zbiorów template_keys, " +
+          "source_states i entitlement_types",
         "VOUCHER_DELIVERY_GAP_COUNT_INPUT_EMPTY",
       )
     }
 
     const sourceStates = [...input.source_states]
     const templateKeys = [...input.template_keys]
+    const entitlementTypes = [...input.entitlement_types]
 
     let position = 0
     const statePlaceholders = sourceStates.map(() => `$${++position}`).join(", ")
+    const typePlaceholders = entitlementTypes
+      .map(() => `$${++position}`)
+      .join(", ")
     const createdBeforePlaceholder = `$${++position}`
     const createdAfterPlaceholder = `$${++position}`
     const templatePlaceholders = templateKeys
       .map(() => `$${++position}`)
       .join(", ")
+    const expectedTemplateCountPlaceholder = `$${++position}`
 
+    // R-2.5-L11: licznik pyta o TĘ SAMĄ jednostkę co skan (para entitlement ×
+    // oczekiwany szablon). Wariant `NOT EXISTS (… template_key IN (…))` pytał
+    // o „ŻADNEGO wiersza" — po dołożeniu drugiego szablonu entitlement z samym
+    // handoffem przestałby być liczony, choć buyer-maila nie ma.
     const rows = await this.queryRows<{ gap_count: number | string }>(
       `SELECT COUNT(*)::int AS gap_count
          FROM ${ENTITLEMENT_INSTANCE_TABLE} e
         WHERE e.state NOT IN (${statePlaceholders})
+          AND e.entitlement_type IN (${typePlaceholders})
           AND e.created_at < ${createdBeforePlaceholder}
           AND e.created_at >= ${createdAfterPlaceholder}
-          AND NOT EXISTS (
-                SELECT 1
+          AND (
+                SELECT COUNT(DISTINCT d.template_key)
                   FROM ${VOUCHER_DELIVERY_DISPATCH_TABLE} d
                  WHERE d.entitlement_id = e.id
                    AND d.template_key IN (${templatePlaceholders})
-              )`,
+              ) < ${expectedTemplateCountPlaceholder}`,
       [
         ...sourceStates,
+        ...entitlementTypes,
         input.created_before,
         input.created_after,
         ...templateKeys,
+        templateKeys.length,
       ],
     )
 
@@ -827,6 +1117,38 @@ function normalizeTimestamp(value: unknown): string | null {
   }
   const text = String(value)
   return text.length > 0 ? text : null
+}
+
+/**
+ * R-2.5-H1 — okno skanu MUSI być domknięte z obu stron i niepuste. Brak dolnej
+ * granicy nie jest „szerszym skanem", tylko dosyłką do całej historii sprzed
+ * istnienia ledgera; odwrócone okno byłoby cichym no-opem.
+ */
+function assertGapScanWindow(createdAfter: string, createdBefore: string): void {
+  if (!createdAfter || !createdBefore) {
+    throw new DispatchLedgerError(
+      "skan luk wymaga OBU granic okna (created_after, created_before) — skan " +
+        "bez dolnej granicy dosyła maile do całej historii",
+      "VOUCHER_DELIVERY_GAP_SCAN_WINDOW_INVALID",
+    )
+  }
+  if (!(createdAfter < createdBefore)) {
+    throw new DispatchLedgerError(
+      `skan luk dostał odwrócone okno (created_after=${createdAfter} >= ` +
+        `created_before=${createdBefore}) — to cichy no-op, nie skan`,
+      "VOUCHER_DELIVERY_GAP_SCAN_WINDOW_INVALID",
+    )
+  }
+}
+
+/** R-2.5-H3 — próg parkowania jest kontraktem SQL-a, nie sugestią wołającego. */
+function assertMaxAttemptCount(value: number): void {
+  if (!Number.isInteger(value) || value < 1) {
+    throw new DispatchLedgerError(
+      "max_attempt_count musi być liczbą całkowitą >= 1",
+      "VOUCHER_DELIVERY_MAX_ATTEMPT_COUNT_INVALID",
+    )
+  }
 }
 
 function assertRecipientHash(value: string): void {

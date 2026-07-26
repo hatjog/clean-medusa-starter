@@ -55,6 +55,28 @@ export function isNotificationProviderReady(): boolean {
   return false
 }
 
+/**
+ * v1.14.0 Story 2.5 (R-2.5-M5) — gotowość dla AUTOMATÓW dosyłających
+ * (reconciliation sweep). WĘŻSZA niż `isNotificationProviderReady`, bo shim
+ * RESEND/SENDGRID/SMTP przepuszcza dispatch, który i tak padnie na
+ * `BREVO_API_KEY_NOT_CONFIGURED` — dla ścieżki interaktywnej to jeden wiersz
+ * `failed` na zakup, a dla sweepa maszynowa produkcja wierszy `failed`/DLQ co
+ * 15 minut na środowisku dev/staging z zastanym SMTP.
+ *
+ * To NIE jest druga definicja gotowości: warunek jest PODZBIOREM tego samego
+ * helpera (jawny opt-in operatora albo realny klucz brevo), a nie równoległym
+ * słownikiem zmiennych.
+ */
+export function isNotificationProviderReadyForSweep(): boolean {
+  if (!isNotificationProviderReady()) {
+    return false
+  }
+  return (
+    isTruthy(process.env.GP_VENDOR_NOTIFICATIONS_PROVIDER_READY) ||
+    hasValue(process.env.BREVO_API_KEY)
+  )
+}
+
 /** Zastane zmienne providerów e-mail bez zarejestrowanego providera (shim). */
 export function hasLegacyEmailProviderEnv(): boolean {
   return (

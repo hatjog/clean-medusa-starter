@@ -184,16 +184,51 @@ async function recordSweepScanCalls(): Promise<Call[]> {
     // numeracji przy rozwiniętej liście wartości (przyszłe 2.4).
     template_keys: ["voucher_purchase_confirmation", "voucher_handoff_link"],
     source_states: ["ISSUED", "ACTIVE"],
+    entitlement_types: ["VOUCHER_AMOUNT", "VOUCHER_SERVICE"],
     created_before: "2026-07-26T11:30:00.000Z",
+    created_after: "2026-07-19T12:00:00.000Z",
     stale_queued_before: "2026-07-26T11:45:00.000Z",
+    max_attempt_count: 5,
     limit: 200,
   })
   calls.push(...scan.calls)
+
+  const stalled = new RecordingSql(() => [])
+  await new PgDispatchLedger(stalled).scanStalledDispatches({
+    source_states: ["ISSUED", "ACTIVE"],
+    entitlement_types: ["VOUCHER_AMOUNT", "VOUCHER_SERVICE"],
+    created_before: "2026-07-26T11:30:00.000Z",
+    created_after: "2026-07-19T12:00:00.000Z",
+    max_attempt_count: 5,
+    limit: 200,
+  })
+  calls.push(...stalled.calls)
+
+  const parked = new RecordingSql(() => [])
+  await new PgDispatchLedger(parked).listParkedDispatches({
+    entitlement_ids: ["ent_1", "ent_2"],
+    max_attempt_count: 5,
+  })
+  calls.push(...parked.calls)
+
+  const parkedCount = new RecordingSql(() => [{ market_id: "bonbeauty", parked: 1 }])
+  await new PgDispatchLedger(parkedCount).countParkedDispatchesByMarket({
+    max_attempt_count: 5,
+  })
+  calls.push(...parkedCount.calls)
+
+  const release = new RecordingSql(() => [])
+  await new PgDispatchLedger(release).releaseAttemptBudget({
+    dispatch_id: "dispatch-1",
+    error_code: "FLOW_DISABLED",
+  })
+  calls.push(...release.calls)
 
   const count = new RecordingSql(() => [{ gap_count: 0 }])
   await new PgDispatchLedger(count).countGapsBeyondSourceStates({
     template_keys: ["voucher_purchase_confirmation"],
     source_states: ["ISSUED", "ACTIVE"],
+    entitlement_types: ["VOUCHER_AMOUNT", "VOUCHER_SERVICE"],
     created_before: "2026-07-26T11:30:00.000Z",
     created_after: "2026-07-19T12:00:00.000Z",
   })
@@ -241,6 +276,65 @@ describe("Story 2.5 — SQL sweepa jest wykonywalny przez REALNY formatter Knexa
     expect(scan).toBeDefined()
     expect(scan?.sql).not.toMatch(/\b(INSERT|UPDATE|DELETE)\b/i)
     expect(scan?.sql).toMatch(/\bLIMIT\b/)
+  })
+
+  /**
+   * R-2.5-L12 — atrapa SQL REIMPLEMENTUJE predykaty skanu w JS, więc odwrócenie
+   * warunku w prawdziwym zapytaniu (`created_at >` zamiast `<`, zgubiona dolna
+   * granica, brak filtra typu) zostawiłoby ją zieloną. Tu asercje biegną po
+   * TEKŚCIE zapytania, które trafia do sterownika — to jedyny gate na kształt
+   * `WHERE`, jaki mamy bez żywego Postgresa (AC5).
+   */
+  describe("semantyka `WHERE` skanu jest asertowana na tekście zapytania", () => {
+    function scanSql(): string {
+      const scan = calls.find((call) => call.sql.includes("CROSS JOIN (VALUES"))
+      expect(scan).toBeDefined()
+      return (scan as Call).sql.replace(/\s+/g, " ")
+    }
+
+    it("okno wieku jest DOMKNIĘTE z obu stron (górna + dolna granica)", () => {
+      expect(scanSql()).toContain("e.created_at < ?")
+      // R-2.5-H1: bez tego skan dosyła maile do całej historii.
+      expect(scanSql()).toContain("e.created_at >= ?")
+    })
+
+    it("skan filtruje typ entitlementu i stany źródłowe", () => {
+      expect(scanSql()).toMatch(/e\.state IN \(\?, \?\)/)
+      expect(scanSql()).toMatch(/e\.entitlement_type IN \(\?, \?\)/)
+    })
+
+    it("gałąź `queued` wymaga staleness, a wiersze zaparkowane są wykluczone", () => {
+      expect(scanSql()).toContain("d.status = 'queued' AND d.queued_at < ?")
+      expect(scanSql()).toContain("d.attempt_count < ?")
+    })
+
+    it("sortowanie stawia najmniej próbowane wiersze PIERWSZE (anty-starvation)", () => {
+      expect(scanSql()).toContain(
+        "ORDER BY COALESCE(d.attempt_count, 0) ASC, e.created_at ASC",
+      )
+    })
+
+    it("skan stalled wchodzi przez LEDGER i respektuje próg prób", () => {
+      const stalled = calls.find((call) =>
+        call.sql.includes("JOIN entitlement_instance e ON e.id = d.entitlement_id"),
+      )
+      expect(stalled).toBeDefined()
+      const sql = (stalled as Call).sql.replace(/\s+/g, " ")
+      expect(sql).toMatch(/d\.status IN \(\?, \?\)/)
+      expect(sql).toContain("d.attempt_count < ?")
+      expect(sql).not.toMatch(/\b(INSERT|UPDATE|DELETE)\b/i)
+    })
+
+    it("zwrot budżetu prób ma guard statusu i kodu błędu", () => {
+      const release = calls.find((call) =>
+        call.sql.includes("SET attempt_count = GREATEST"),
+      )
+      expect(release).toBeDefined()
+      const sql = (release as Call).sql.replace(/\s+/g, " ")
+      expect(sql).toContain("AND status = 'failed'")
+      expect(sql).toContain("AND error_code = ?")
+      expect(sql).toContain("AND attempt_count > 0")
+    })
   })
 
   it("przejęcie `queued` niesie OBA guardy (status + staleness) i jedno UPDATE", () => {
