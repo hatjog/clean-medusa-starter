@@ -8,24 +8,28 @@
  * `marketContextStorage`, więc ich rynek jest daną konfiguracyjną, nie danymi
  * żądania.
  *
- * DŁUG (świadomy, odnotowany) — R-2.2-M4 poszerza ten zapis, bo poprzedni
- * ograniczał go WYŁĄCZNIE do call-site'ów administracyjnych, a fallback jest
- * realnie używany także przez dwa call-site'y VOUCHEROWE (dokładnie domena S3):
+ * ── Stan po Story 2.3 (ADR-162, `Accepted`) ────────────────────────────────
+ * Dług R-2.2-M4 jest DOMKNIĘTY w części kontraktowej: `market_id` JEST już daną
+ * domenową. Normatywnym nośnikiem jest `scope.market_id` koperty `envelope.v1`
+ * (pole wymagane), a **obie** projekcje voucherowe (`findBuyerClaimSource`,
+ * `findAppointmentConfirmationDeliverySource`) zwracają `market_id`
+ * z `entitlement_instance.market_id` (fallback `policy_snapshot->>'market_id'`).
+ * Kolejność u każdego konsumenta: `scope` → projekcja → *dopiero* ta funkcja.
  *
- *   - administracyjne: decyzja vendora, T-30 (rynek = dana konfiguracyjna),
- *   - voucherowe: `voucher-claimed-buyer-notification`,
- *     `voucher-appointment-confirmed-delivery`. Te są z natury market-scoped, ale
- *     ani event, ani projekcja źródłowa (`findBuyerClaimSource`,
- *     `findAppointmentConfirmationDeliverySource`) NIE niosą dziś `market_id`.
- *     Oba subscribery preferują `market_id` z eventu/źródła, gdy się pojawi
- *     (pole opcjonalne już jest), i logują ostrzeżenie, gdy muszą sięgnąć po
- *     fallback — cichy „poprawnie wyglądający wynik z błędnym rynkiem" jest tu
- *     groźniejszy niż głośny brak.
+ * Fallback konfiguracyjny zostaje jako OSTATNIA linia obrony dla:
+ *   - call-site'ów administracyjnych (decyzja vendora, T-30 — rynek jest tam
+ *     daną konfiguracyjną, nie danymi żądania),
+ *   - zastanych wierszy bez `market_id` (pole jest NULLABLE; 2.3 nie robi
+ *     backfillu danych).
+ * Każde jego użycie loguje `warn` — cichy „poprawnie wyglądający wynik
+ * z błędnym rynkiem" jest groźniejszy niż głośny brak.
  *
- * Domknięcie długu (przeniesienie `market_id` do danych domenowych vouchera /
- * na rekord vendora + rozszerzenie projekcji SQL) wymaga zmiany kontraktu
- * eventów i zapytań domenowych — WŁAŚCICIEL: Story 2.3, wymaga ADR. Do tego
- * czasu wysyłka na drugim rynku rozwiąże nadawcę rynku domyślnego.
+ * Ścieżka wycofania fallbacku jest zapisana w ADR-162 (tabela semver):
+ *   v1 (v1.14.0)  — pole opcjonalne z pierwszeństwem, fallback + `warn`,
+ *   v1.1 (v1.15.0) — backfill `entitlement_instance.market_id` + metryka liczby
+ *                    `warn`-ów (oczekiwana: 0 na ścieżce produkcyjnej),
+ *   v2 (v1.16.0)  — `market_id` wymagane, `GP_DEFAULT_MARKET_ID` usunięty.
+ * Kontrakt `purchase_locale` (ten sam ADR) konsumują 2.4 i 2.5.
  */
 
 /** Zgodne z `DEFAULT_MARKET_ID` w payment-stripe-multi-market (v1.9.x BonBeauty-only). */
@@ -50,7 +54,8 @@ type MarketFallbackLogger = {
  * Fallback jest tu gorszy niż dla call-site'ów administracyjnych: nadawca i
  * `market_id` w audycie będą z rynku domyślnego, a wynik i tak wygląda poprawnie.
  * Ostrzeżenie jest jedynym sygnałem, dopóki `market_id` nie wejdzie do danych
- * domenowych (patrz dług w nagłówku pliku).
+ * domenowych; po 2.3 ta ścieżka NIE powinna się już odpalać na ruchu
+ * produkcyjnym (patrz nagłówek pliku + tabela semver w ADR-162).
  */
 export function resolveMarketScopedNotificationMarketId(input: {
   market_id?: string | null

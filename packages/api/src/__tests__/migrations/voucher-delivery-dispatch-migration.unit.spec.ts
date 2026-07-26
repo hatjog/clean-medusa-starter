@@ -62,6 +62,14 @@ describe("Migration1778933000000 — voucher_delivery_dispatch (AC1)", () => {
     }
   })
 
+  it("R-2.3-INFO11: DEFAULT `attempt_count` zgadza się z semantyką „liczba prób\" (od 1)", async () => {
+    const sql = (await runUp()).replace(/\s+/g, " ")
+    // INSERT ledgera podaje 1 jawnie; DEFAULT 0 sugerowałby licznik retry,
+    // czyli inną semantykę niż faktyczna.
+    expect(sql).toMatch(/attempt_count\s+integer NOT NULL DEFAULT 1 CHECK \(attempt_count >= 1\)/i)
+    expect(sql).not.toMatch(/attempt_count\s+integer NOT NULL DEFAULT 0/i)
+  })
+
   it("klucz idempotencji to UNIQUE (entitlement_id, template_key, recipient_hash)", async () => {
     const sql = (await runUp()).replace(/\s+/g, " ")
     expect(sql).toMatch(

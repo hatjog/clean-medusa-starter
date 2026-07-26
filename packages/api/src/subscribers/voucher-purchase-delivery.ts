@@ -37,6 +37,12 @@
  * + log. ŚWIADOMIE NIE degradujemy do `pl`: mail w złym języku jest gorszy niż
  * brak maila, którego widać w ledgerze i który retry dogoni po uzupełnieniu
  * szablonu. Zapis decyzji: story Dev Agent Record + ADR-161.
+ *
+ * Fail-loud działa tylko wtedy, gdy REALNIE znamy `locales.supported` rynku.
+ * Gdy konfiguracja locale jest niedostępna (błąd odczytu / brak bloku), a dane
+ * domenowe niosą inne locale, wysyłka jest wstrzymywana z
+ * `VOUCHER_DELIVERY_MARKET_LOCALES_UNAVAILABLE` zamiast cichego downgrade'u
+ * do locale domyślnego (R-2.3-M6).
  */
 
 import type { SubscriberArgs, SubscriberConfig } from "@medusajs/framework"
@@ -65,7 +71,10 @@ import {
   hashRecipientEmail,
   RecipientHashError,
 } from "../modules/voucher-delivery/recipient-hash"
-import { NOTIFICATION_TEMPLATE_KEYS } from "@gp/messaging"
+import {
+  extractErrorCodeMarker,
+  NOTIFICATION_TEMPLATE_KEYS,
+} from "@gp/messaging"
 
 /** Ten sam literał, co `ENTITLEMENT_STATE_CHANGED_EVENT_TYPE` z 2.1 (AR-EVENTS). */
 export const ENTITLEMENT_STATE_CHANGED_EVENT =
@@ -76,6 +85,23 @@ export const ENTITLEMENT_STATE_CHANGED_EVENT =
  * szablonu — służy WYŁĄCZNIE dogonieniu tych samych kluczy.
  */
 const DELIVERABLE_TO_STATES = new Set(["ISSUED", "ACTIVE"])
+
+/**
+ * Kod błędu dla „konfiguracja locale rynku nieznana" (R-2.3-M6). Odróżnia
+ * degradację KONFIGURACJI od legalnego „locale niewspierane przez rynek" —
+ * bez niego jedno i drugie kończyło się cichym mailem po polsku.
+ */
+export const MARKET_LOCALES_UNAVAILABLE_ERROR_CODE =
+  "VOUCHER_DELIVERY_MARKET_LOCALES_UNAVAILABLE"
+
+/**
+ * Próg staleness porzuconej rezerwacji (R-2.3-L9). `queued` starsze niż ten
+ * próg nie jest „wysyłką w locie u innego workera" — z dużym prawdopodobieństwem
+ * to wiersz po crashu procesu między INSERT-em a `markSent/markFailed`.
+ * Do czasu dostarczenia sweepa (Story 2.5 — TWARDA zależność 2.3 → 2.5) jedynym
+ * sygnałem alarmowym jest log: dlatego wtedy `warn`, nie `info`.
+ */
+export const STALE_QUEUED_THRESHOLD_MS = 15 * 60 * 1000
 
 type LoggerLike = {
   info?: (message: string, meta?: Record<string, unknown>) => void
@@ -158,6 +184,8 @@ export interface PurchaseDeliveryDeps {
   env?: NodeJS.ProcessEnv
   /** Provider zapisywany do ledgera (audit korelacji), domyślnie `brevo`. */
   provider?: string
+  /** Zegar — wstrzykiwalny dla testów progu staleness (`STALE_QUEUED_THRESHOLD_MS`). */
+  now?: () => Date
 }
 
 export function extractPurchaseDeliveryTrigger(
@@ -261,17 +289,48 @@ export async function handleVoucherPurchaseDelivery(
     return result("skipped_missing_voucher_code", trigger, null, marketId, null)
   }
 
-  const marketLocaleConfig = await deps.marketLocales.read(marketId)
+  // AC3: locale ZAKUPU z `order.metadata.purchase_locale`; `buyer_locale`
+  // (snapshot polityki) jest wtórnym nośnikiem tej samej intencji.
+  const requestedLocale = source.purchase_locale ?? source.buyer_locale ?? null
+  const marketLocaleRead = await deps.marketLocales.read(marketId)
   const localeResolution = resolveMarketLocale({
-    // AC3: locale ZAKUPU z `order.metadata.purchase_locale`; `buyer_locale`
-    // (snapshot polityki) jest wtórnym nośnikiem tej samej intencji.
-    requested: source.purchase_locale ?? source.buyer_locale ?? null,
+    requested: requestedLocale,
     marketId,
-    locales: marketLocaleConfig,
+    locales: marketLocaleRead.config,
     callSite: "voucher-purchase-delivery",
     logger: deps.logger,
   })
   const locale = localeResolution.locale
+
+  // R-2.3-M6 / AC4 („FAIL-LOUD, bez downgrade'u"): gdy konfiguracja locale rynku
+  // jest NIEZNANA (błąd odczytu / brak bloku `locales` → shim env), a dane
+  // domenowe niosą locale, którego ten shim nie zna, to NIE jest „locale
+  // niewspierane przez rynek" — to niewiedza o rynku. Cichy downgrade do `pl`
+  // dałby maila w złym języku wyglądającego jak sukces, więc wstrzymujemy
+  // wysyłkę z własnym kodem błędu; retry dogoni po naprawie konfiguracji.
+  //
+  // Brak `purchase_locale` (zamówienia historyczne, ścieżki admin/import) NIE
+  // jest tym przypadkiem — tam `locales.default` jest legalnym wyborem (AC3).
+  if (marketLocaleRead.degraded && localeResolution.reason === "not_supported_by_market") {
+    deps.logger?.error?.(
+      "[voucher-purchase-delivery] konfiguracja locale rynku niedostępna, a dane domenowe " +
+        "niosą inne locale — wysyłka wstrzymana zamiast downgrade'u do locale domyślnego",
+      {
+        entitlement_id: entitlementId,
+        market_id: marketId,
+        requested_locale: requestedLocale,
+        error_code: MARKET_LOCALES_UNAVAILABLE_ERROR_CODE,
+      },
+    )
+    return {
+      outcome: "failed",
+      entitlement_id: entitlementId,
+      dispatch_id: null,
+      market_id: marketId,
+      locale: null,
+      error_code: MARKET_LOCALES_UNAVAILABLE_ERROR_CODE,
+    }
+  }
 
   let recipientHash
   try {
@@ -367,15 +426,31 @@ export async function handleVoucherPurchaseDelivery(
   }
 
   if (reservation.outcome === "in_flight") {
-    deps.logger?.info?.(
-      "[voucher-purchase-delivery] pominięto: rezerwację trzyma inny konsument (queued)",
-      {
-        entitlement_id: entitlementId,
-        market_id: marketId,
-        to_state: trigger.to_state,
-        dispatch_status: reservation.status,
-      },
-    )
+    // R-2.3-L9: rezerwacja starsza niż próg to najpewniej wiersz PORZUCONY
+    // (crash między INSERT-em a domknięciem), a nie wysyłka w locie. Bez sweepa
+    // 2.5 nikt jej nie dogoni, więc utrata maila nie może być `info`.
+    const stale = isStaleQueued(reservation.queued_at, deps.now?.() ?? new Date())
+    const meta = {
+      entitlement_id: entitlementId,
+      market_id: marketId,
+      to_state: trigger.to_state,
+      dispatch_status: reservation.status,
+      queued_at: reservation.queued_at,
+      stale_queued: stale,
+    }
+
+    if (stale) {
+      deps.logger?.warn?.(
+        "[voucher-purchase-delivery] pominięto: rezerwacja `queued` starsza niż próg — " +
+          "prawdopodobnie porzucona po awarii; dogonienie należy do sweepa (Story 2.5)",
+        meta,
+      )
+    } else {
+      deps.logger?.info?.(
+        "[voucher-purchase-delivery] pominięto: rezerwację trzyma inny konsument (queued)",
+        meta,
+      )
+    }
     return {
       outcome: "skipped_in_flight",
       entitlement_id: entitlementId,
@@ -574,8 +649,19 @@ function errorClass(error: unknown): string {
 
 /**
  * Wyciąga KOD błędu (nigdy `message` providera — może zawierać adres albo
- * fragment treści). `MedusaError` z wrappera brevo niesie `code`
- * (np. `BREVO_TEMPLATE_NOT_CONFIGURED`), obiekty `@gp/messaging` — `error_code`.
+ * fragment treści).
+ *
+ * Kolejność źródeł jest podyktowana tym, co REALNIE przeżywa drogę do
+ * subscribera (R-2.3-M3):
+ *  1. `error_code` — obiekty `@gp/messaging` rzucone wprost (seam testowy).
+ *  2. `code` — `MedusaError` z wrappera brevo, gdy nikt go po drodze nie
+ *     przepakował.
+ *  3. **marker w `message`** — ścieżka PRODUKCYJNA: moduł Notification Medusy
+ *     przepakowuje wyjątek w `MedusaError` bez `code`, a `promiseAll
+ *     ({ aggregateErrors: true })` opakowuje to w zwykły `Error`, więc pola 1–2
+ *     nie istnieją. Czytamy WYŁĄCZNIE zawartość markera `[gp_error_code=…]`
+ *     (`[A-Z0-9_]+`), nigdy reszty komunikatu — dzięki temu do ledgera i do logu
+ *     nie może wyciec adres ani fragment treści maila (D-70).
  */
 function readErrorCode(error: unknown, fallback: string): string {
   if (error && typeof error === "object") {
@@ -586,10 +672,45 @@ function readErrorCode(error: unknown, fallback: string): string {
         return value.trim()
       }
     }
+
+    const fromMarker = extractErrorCodeMarker(record.message)
+    if (fromMarker) return fromMarker
   }
+
+  if (typeof error === "string") {
+    const fromMarker = extractErrorCodeMarker(error)
+    if (fromMarker) return fromMarker
+  }
+
   return fallback
 }
 
+/** `queued_at` starsze niż próg = rezerwacja porzucona (R-2.3-L9). */
+function isStaleQueued(queuedAt: string | null, now: Date): boolean {
+  if (!queuedAt) return false
+  const queuedMs = Date.parse(queuedAt)
+  if (Number.isNaN(queuedMs)) return false
+  return now.getTime() - queuedMs > STALE_QUEUED_THRESHOLD_MS
+}
+
+/**
+ * Identyfikator korelacyjny PROVIDERA (R-2.3-M4).
+ *
+ * `createNotifications` zwraca encje `Notification` Medusy: `id` to `noti_<ulid>`
+ * GENEROWANY PRZEZ MEDUSĘ, a identyfikator zwrócony przez providera ląduje
+ * w `external_id` (`notification-module-service`: `entry.data.external_id = res.id`).
+ * ADR-162 definiuje `provider_message_id` jako „nieprzezroczysty identyfikator
+ * korelacyjny **providera**", więc `external_id` ma PIERWSZEŃSTWO — zapis `id`
+ * Medusy zrywał jedyną ścieżkę korelacji wiersza ledgera z wysyłką po stronie
+ * Brevo (reklamacje „nie dostałam maila", sweep 2.5).
+ *
+ * `id` zostaje jako fallback dla seamów/atrapy, które zwracają wprost wynik
+ * providera (`{ id: dispatch.provider_message_id ?? dispatch.dispatch_id }`).
+ *
+ * Uwaga: dla klucza już zdedupowanego przez Medusę (`status = SUCCESS`)
+ * `createdNotifications` jest PUSTE — wtedy `provider_message_id` będzie `null`.
+ * To poprawne: mail poszedł wcześniej, a korelacja żyje przy tamtym wierszu.
+ */
 function extractNotificationId(value: unknown): string | null {
   if (!value) return null
 
@@ -604,6 +725,9 @@ function extractNotificationId(value: unknown): string | null {
   if (typeof value !== "object") return null
 
   const record = value as Record<string, unknown>
+  if (typeof record.external_id === "string" && record.external_id.length > 0) {
+    return record.external_id
+  }
   if (typeof record.id === "string" && record.id.length > 0) {
     return record.id
   }

@@ -32,6 +32,39 @@ import {
 type Row = Record<string, unknown>
 
 /**
+ * Guard dialektu (R-2.3-H1). Wcześniej atrapa mapowała bindingi POZYCYJNIE
+ * i w ogóle nie interpretowała składni placeholderów, więc zieleniła się także
+ * dla SQL-a niewykonywalnego przez realny sterownik (`$N` na Kneksie →
+ * `Expected N bindings, saw 0`). Ten guard odtwarza regułę formattera Knexa:
+ *   - żadnego `$N` (dialekt `pg`) — do `raw` trafia wyłącznie `?`,
+ *   - liczba `?` MUSI się zgadzać z liczbą bindingów,
+ *   - żaden binding nie jest tablicą (Knex rozwija tablicę w listę `?, ?`).
+ * Komplementarnie `voucher-delivery-sql-dialect.unit.spec.ts` przepuszcza ten
+ * sam SQL przez REALNY formatter Knexa.
+ */
+function assertKnexDialect(sql: string, bindings: readonly unknown[]): void {
+  const pgPlaceholders = sql.match(/\$\d+/g)
+  if (pgPlaceholders) {
+    throw new Error(
+      `SQL trafił do sterownika z placeholderami dialektu pg (${pgPlaceholders.join(", ")}) — ` +
+        "Knex ich nie rozumie",
+    )
+  }
+
+  const expected = (sql.match(/\?/g) ?? []).length
+  if (expected !== bindings.length) {
+    throw new Error(`Expected ${expected} bindings, saw ${bindings.length}`)
+  }
+
+  const arrayBinding = bindings.findIndex((value) => Array.isArray(value))
+  if (arrayBinding >= 0) {
+    throw new Error(
+      `Binding #${arrayBinding + 1} jest tablicą — Knex rozwinąłby ją w listę \`?, ?\``,
+    )
+  }
+}
+
+/**
  * Minimalny, ale UCZCIWY fake: rozpoznaje 6 zapytań ledgera i egzekwuje
  * unikalność klucza oraz guardy `WHERE status`.
  */
@@ -41,6 +74,7 @@ class FakeDispatchSql implements DispatchLedgerSql {
   readonly statements: string[] = []
 
   async raw(sql: string, bindings: readonly unknown[] = []): Promise<unknown> {
+    assertKnexDialect(sql, bindings)
     const normalized = sql.replace(/\s+/g, " ").trim()
     this.statements.push(normalized)
 
@@ -118,7 +152,10 @@ class FakeDispatchSql implements DispatchLedgerSql {
 
     if (normalized.includes(`UPDATE ${VOUCHER_DELIVERY_DISPATCH_TABLE}`)) {
       if (normalized.includes("SET status = 'sent'")) {
-        const [dispatch_id, provider, provider_message_id, now] = bindings as string[]
+        // Bindingi są w kolejności WYSTĄPIEŃ `?` w SQL-u (tak widzi je Knex),
+        // a numeracja `$N` w ledgerze jest rosnąca wzdłuż tekstu zapytania.
+        const [provider, provider_message_id, now, , dispatch_id] =
+          bindings as string[]
         const row = this.byId(dispatch_id)
         if (!row || row.status !== "queued") return { rows: [] }
         Object.assign(row, {
@@ -132,7 +169,7 @@ class FakeDispatchSql implements DispatchLedgerSql {
       }
 
       if (normalized.includes("SET status = 'failed'")) {
-        const [dispatch_id, provider, error_code, now] = bindings as string[]
+        const [provider, error_code, now, , dispatch_id] = bindings as string[]
         const row = this.byId(dispatch_id)
         if (!row || row.status !== "queued") return { rows: [] }
         Object.assign(row, {
@@ -144,15 +181,10 @@ class FakeDispatchSql implements DispatchLedgerSql {
         return { rows: [{ ...row }] }
       }
 
-      // Przejęcie retry: guard `status = ANY($6)`.
-      const [dispatch_id, now, locale, market_id, flow_id, allowed] = bindings as [
-        string,
-        string,
-        string,
-        string,
-        string,
-        string[],
-      ]
+      // Przejęcie retry: guard `status IN (?, ?)` — lista stanów jest rozwinięta
+      // na jawne placeholdery (tablica w bindingu byłaby błędem dialektu).
+      const [now, , locale, market_id, flow_id, dispatch_id, ...allowed] =
+        bindings as string[]
       const row = this.byId(dispatch_id)
       if (!row || !allowed.includes(row.status as string)) return { rows: [] }
       Object.assign(row, {
@@ -508,6 +540,36 @@ describe("semantyka stanów — spójność stałych (AC1 / AC5)", () => {
 
   it("`queued` NIE jest retry-owalny — dogonienie porzuconych należy do sweepa 2.5", () => {
     expect(DISPATCH_STATES_ALLOWING_RETRY).not.toContain("queued")
+  })
+
+  it("R-2.3-L7: `degraded` NIE jest ślepą uliczką — blokuje ponowną wysyłkę", () => {
+    // W kontrakcie `degraded` znaczy „dostarczone w trybie zdegradowanym", czyli
+    // mail POSZEDŁ. Wcześniej stan nie należał do żadnej listy i wypadał
+    // w gałąź `in_flight` (ani blokada, ani retry — z mylącym logiem).
+    expect(DISPATCH_STATES_BLOCKING_RESEND).toContain("degraded")
+  })
+
+  it("R-2.3-L7: każdy stan enumu ma zdefiniowaną decyzję rezerwacji", async () => {
+    const undecided = DELIVERY_DISPATCH_STATES.filter(
+      (state) =>
+        state !== "queued" &&
+        state !== "dead_lettered" &&
+        !DISPATCH_STATES_BLOCKING_RESEND.includes(state) &&
+        !DISPATCH_STATES_ALLOWING_RETRY.includes(state),
+    )
+    expect(undecided).toEqual([])
+  })
+
+  it("R-2.3-L7: wiersz `degraded` daje `blocked`, nie `in_flight`", async () => {
+    const sql = new FakeDispatchSql()
+    const ledger = makeLedger(sql)
+
+    await ledger.reserveDispatch(identity())
+    sql.dispatch[0].status = "degraded"
+
+    const again = await ledger.reserveDispatch(identity())
+    expect(again.outcome).toBe("blocked")
+    expect(again.status).toBe("degraded")
   })
 })
 

@@ -8,27 +8,51 @@
  * dlatego odczyt jest DEFENSYWNY: każdy błąd zapytania degraduje do shimu
  * `getMarketLocales(marketId, null)` (env `DEFAULT_LOCALE`) i loguje `warn`.
  *
- * Degradacja NIE jest cicha: bez ostrzeżenia „mail w locale domyślnym" wygląda
- * jak poprawny wynik. Sam wybór locale wysyłki robi `resolveMarketLocale`
+ * ── Degradacja jest RAPORTOWANA, nie tylko logowana ─────────────────────────
+ * Sam `warn` nie wystarczał: konsument (subscriber wysyłki) dostawał wtedy
+ * shim `{ default: 'pl', supported: ['pl'] }` NIEODRÓŻNIALNY od realnej
+ * konfiguracji rynku jednojęzycznego i „normalizował" `purchase_locale = 'ua'`
+ * do `pl`, czyli wysyłał maila w złym języku — dokładnie to, co rozstrzygnięcie
+ * AC4 („FAIL-LOUD, bez downgrade'u") odrzuca. Dlatego `read()` zwraca
+ * `MarketLocaleConfigRead` z flagą `degraded`, a decyzję „czy wolno wysłać"
+ * podejmuje wołający (subscriber: locale nierozstrzygalne → `failed`
+ * z `VOUCHER_DELIVERY_MARKET_LOCALES_UNAVAILABLE`).
+ *
+ * Sam wybór locale wysyłki robi `resolveMarketLocale`
  * (`lib/get-market-locales.ts`) — tutaj wyłącznie dostarczamy konfigurację.
+ *
+ * ── Dialekt bindingów ───────────────────────────────────────────────────────
+ * `PG_CONNECTION` to instancja Knexa (składnia `?`), nie klient `pg` (`$N`) —
+ * zapytanie jest konwertowane przez `toKnexPositionalSql`. Bez tego KAŻDY
+ * odczyt kończył się wyjątkiem formattera i „cichą" degradacją do shimu.
  */
 
 import {
   getMarketLocales,
   type MarketLocaleConfig,
 } from "./get-market-locales"
+import { toKnexPositionalSql } from "./knex-positional-sql"
 
 type LocalesReaderLogger = {
   warn?: (message: string, meta?: Record<string, unknown>) => void
 }
 
-/** Minimalny port SQL — Knex `raw` z kontenera Medusy spełnia go bez adaptera. */
+/** Minimalny port SQL — Knex `raw` z kontenera Medusy (składnia `?`). */
 export interface MarketLocalesSql {
   raw(sql: string, bindings?: readonly unknown[]): Promise<unknown>
 }
 
+export type MarketLocaleConfigRead = {
+  config: MarketLocaleConfig
+  /**
+   * `true` = konfiguracja rynku NIE jest znana (błąd odczytu albo brak bloku
+   * `locales`), a `config` to shim env. `false` = wartości pochodzą z rynku.
+   */
+  degraded: boolean
+}
+
 export interface MarketLocalesReader {
-  read(marketId: string): Promise<MarketLocaleConfig>
+  read(marketId: string): Promise<MarketLocaleConfigRead>
 }
 
 export function createMarketLocalesReader(
@@ -36,12 +60,13 @@ export function createMarketLocalesReader(
   logger?: LocalesReaderLogger,
 ): MarketLocalesReader {
   return {
-    async read(marketId: string): Promise<MarketLocaleConfig> {
+    async read(marketId: string): Promise<MarketLocaleConfigRead> {
       try {
-        const result = await sql.raw(
+        const query = toKnexPositionalSql(
           `SELECT locales FROM market_runtime_config WHERE market_id = $1 LIMIT 1`,
           [marketId],
         )
+        const result = await sql.raw(query.text, query.bindings)
         const rows = extractRows(result)
         const raw = rows.length > 0 ? rows[0]?.locales : null
         const locales = parseLocalesBlock(raw)
@@ -51,10 +76,10 @@ export function createMarketLocalesReader(
             "[market-locales] brak bloku locales dla rynku — użyto shimu env DEFAULT_LOCALE",
             { market_id: marketId },
           )
-          return getMarketLocales(marketId, null)
+          return { config: getMarketLocales(marketId, null), degraded: true }
         }
 
-        return getMarketLocales(marketId, { locales })
+        return { config: getMarketLocales(marketId, { locales }), degraded: false }
       } catch (error) {
         logger?.warn?.(
           "[market-locales] odczyt market_runtime_config.locales nieudany — " +
@@ -65,7 +90,7 @@ export function createMarketLocalesReader(
               error instanceof Error ? error.constructor.name : typeof error,
           },
         )
-        return getMarketLocales(marketId, null)
+        return { config: getMarketLocales(marketId, null), degraded: true }
       }
     },
   }

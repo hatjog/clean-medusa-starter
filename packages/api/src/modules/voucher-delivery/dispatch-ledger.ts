@@ -36,6 +36,7 @@
 
 import { randomUUID } from "node:crypto"
 
+import { toKnexPositionalSql } from "../../lib/knex-positional-sql"
 import {
   DELIVERY_DISPATCH_STATES,
   DISPATCH_STATES_ALLOWING_RETRY,
@@ -50,9 +51,16 @@ export const VOUCHER_DELIVERY_DISPATCH_AUDIT_TABLE =
   "voucher_delivery_dispatch_audit"
 
 /**
- * Minimalny port SQL (Knex `raw` z kontenera Medusy spełnia go bez adaptera).
- * Ledger nie zależy od Knexa jako typu, żeby testy jednostkowe mogły podstawić
- * atrapę bez kontenera i bez żywego Postgresa.
+ * Minimalny port SQL. Ledger nie zależy od Knexa jako typu, żeby testy
+ * jednostkowe mogły podstawić atrapę bez kontenera i bez żywego Postgresa.
+ *
+ * **Dialekt jest częścią kontraktu portu:** implementacją produkcyjną jest
+ * `ContainerRegistrationKeys.PG_CONNECTION`, czyli instancja **Knexa**, której
+ * formatter rozumie WYŁĄCZNIE `?` (przy `$N` rzuca `Expected N bindings, saw 0`,
+ * więc zapytanie nie dochodzi do bazy). Zapytania w tym pliku pisze się w
+ * czytelnej składni `$N`, a `queryRows`/`appendAudit` konwertują je przez
+ * `toKnexPositionalSql` — ten sam wzorzec, co zastane `withClaimTransaction`
+ * (`api/store/vouchers/[code]/claim/helpers.ts`). Do `raw` NIGDY nie trafia `$N`.
  */
 export interface DispatchLedgerSql {
   raw(sql: string, bindings?: readonly unknown[]): Promise<unknown>
@@ -85,6 +93,13 @@ export interface ReserveDispatchResult {
   dispatch_id: string | null
   status: DeliveryDispatchState | null
   attempt_count: number
+  /**
+   * ISO 8601 momentu wejścia w `queued` (R-2.3-L9). Wołający używa go do
+   * rozpoznania PORZUCONEJ rezerwacji: `in_flight` starsze niż próg to nie
+   * „wysyłka w locie", tylko wiersz po crashu — i musi być widoczny jako `warn`,
+   * a nie `info`, dopóki sweep 2.5 nie istnieje.
+   */
+  queued_at: string | null
 }
 
 export interface DispatchRow {
@@ -100,6 +115,8 @@ export interface DispatchRow {
   provider_message_id: string | null
   error_code: string | null
   attempt_count: number
+  /** ISO 8601 — moment wejścia w `queued` (staleness porzuconych rezerwacji). */
+  queued_at: string | null
 }
 
 export interface DispatchLedgerPort {
@@ -129,7 +146,8 @@ export class DispatchLedgerError extends Error {
 
 const SELECT_COLUMNS = `
   dispatch_id, entitlement_id, template_key, recipient_hash, market_id,
-  flow_id, locale, status, provider, provider_message_id, error_code, attempt_count
+  flow_id, locale, status, provider, provider_message_id, error_code, attempt_count,
+  queued_at
 `
 
 export interface PgDispatchLedgerOptions {
@@ -169,7 +187,7 @@ export class PgDispatchLedger implements DispatchLedgerPort {
       `INSERT INTO ${VOUCHER_DELIVERY_DISPATCH_TABLE} (
          dispatch_id, entitlement_id, template_key, recipient_hash, market_id,
          flow_id, locale, status, attempt_count, queued_at, created_at, updated_at
-       ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'queued', 1, $8, $8, $8)
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'queued', 1, $8, $9, $10)
        ON CONFLICT (entitlement_id, template_key, recipient_hash) DO NOTHING
        RETURNING ${SELECT_COLUMNS}`,
       [
@@ -180,6 +198,8 @@ export class PgDispatchLedger implements DispatchLedgerPort {
         input.market_id,
         input.flow_id,
         input.locale,
+        nowIso,
+        nowIso,
         nowIso,
       ],
     )
@@ -192,19 +212,23 @@ export class PgDispatchLedger implements DispatchLedgerPort {
         dispatch_id: row.dispatch_id,
         status: row.status,
         attempt_count: row.attempt_count,
+        queued_at: row.queued_at,
       }
     }
 
     const existing = await this.findByIdentity(input)
     if (!existing) {
-      // Konflikt bez wiersza = wiersz zniknął między INSERT-em a odczytem
-      // (jedyna realna przyczyna: ręczna interwencja). Nie zgadujemy —
-      // traktujemy jak „ktoś inny trzyma to teraz", więc nie wysyłamy.
+      // Konflikt bez wiersza = wiersz zniknął między INSERT-em a odczytem.
+      // `findByIdentity` biegnie POZA transakcją, więc to okno jest normalne
+      // (równoległy retry kasujący/przepisujący wiersz), nie tylko ręczna
+      // interwencja. Nie zgadujemy — traktujemy jak „ktoś inny trzyma to teraz",
+      // więc nie wysyłamy; dogonienie należy do sweepa 2.5.
       return {
         outcome: "in_flight",
         dispatch_id: null,
         status: null,
         attempt_count: 0,
+        queued_at: null,
       }
     }
 
@@ -214,6 +238,7 @@ export class PgDispatchLedger implements DispatchLedgerPort {
         dispatch_id: existing.dispatch_id,
         status: existing.status,
         attempt_count: existing.attempt_count,
+        queued_at: existing.queued_at,
       }
     }
 
@@ -225,33 +250,44 @@ export class PgDispatchLedger implements DispatchLedgerPort {
         dispatch_id: existing.dispatch_id,
         status: existing.status,
         attempt_count: existing.attempt_count,
+        queued_at: existing.queued_at,
       }
     }
 
     if (DISPATCH_STATES_ALLOWING_RETRY.includes(existing.status)) {
-      // Guard `status = ANY(...)` w WHERE czyni przejęcie retry ATOMOWYM:
+      // Guard `status IN (...)` w WHERE czyni przejęcie retry ATOMOWYM:
       // dwa workery widzące ten sam `failed` dają dokładnie jedno UPDATE=1.
+      //
+      // Lista stanów jest rozwijana na JAWNE placeholdery, a nie bindowana jako
+      // tablica do `ANY(?)`: formatter Knexa rozwija tablicę w `?, ?`, więc
+      // `ANY` z bindingiem tablicowym dałby niepoprawny SQL (patrz guard
+      // w `toKnexPositionalSql`).
+      const retryStates = [...DISPATCH_STATES_ALLOWING_RETRY]
+      const retryPlaceholders = retryStates
+        .map((_state, index) => `$${index + 7}`)
+        .join(", ")
       const reclaimed = await this.queryRows<DispatchRow>(
         `UPDATE ${VOUCHER_DELIVERY_DISPATCH_TABLE}
             SET status = 'queued',
                 attempt_count = attempt_count + 1,
                 error_code = NULL,
                 failed_at = NULL,
-                queued_at = $2,
+                queued_at = $1,
                 updated_at = $2,
                 locale = $3,
                 market_id = $4,
                 flow_id = $5
-          WHERE dispatch_id = $1
-            AND status = ANY($6)
+          WHERE dispatch_id = $6
+            AND status IN (${retryPlaceholders})
         RETURNING ${SELECT_COLUMNS}`,
         [
-          existing.dispatch_id,
+          nowIso,
           nowIso,
           input.locale,
           input.market_id,
           input.flow_id,
-          [...DISPATCH_STATES_ALLOWING_RETRY],
+          existing.dispatch_id,
+          ...retryStates,
         ],
       )
 
@@ -262,6 +298,7 @@ export class PgDispatchLedger implements DispatchLedgerPort {
           dispatch_id: existing.dispatch_id,
           status: existing.status,
           attempt_count: existing.attempt_count,
+          queued_at: existing.queued_at,
         }
       }
 
@@ -272,6 +309,7 @@ export class PgDispatchLedger implements DispatchLedgerPort {
         dispatch_id: row.dispatch_id,
         status: row.status,
         attempt_count: row.attempt_count,
+        queued_at: row.queued_at,
       }
     }
 
@@ -282,6 +320,7 @@ export class PgDispatchLedger implements DispatchLedgerPort {
       dispatch_id: existing.dispatch_id,
       status: existing.status,
       attempt_count: existing.attempt_count,
+      queued_at: existing.queued_at,
     }
   }
 
@@ -294,15 +333,21 @@ export class PgDispatchLedger implements DispatchLedgerPort {
     const rows = await this.queryRows<DispatchRow>(
       `UPDATE ${VOUCHER_DELIVERY_DISPATCH_TABLE}
           SET status = 'sent',
-              provider = $2,
-              provider_message_id = $3,
+              provider = $1,
+              provider_message_id = $2,
               error_code = NULL,
-              sent_at = $4,
+              sent_at = $3,
               updated_at = $4
-        WHERE dispatch_id = $1
+        WHERE dispatch_id = $5
           AND status = 'queued'
       RETURNING ${SELECT_COLUMNS}`,
-      [input.dispatch_id, input.provider, input.provider_message_id, nowIso],
+      [
+        input.provider,
+        input.provider_message_id,
+        nowIso,
+        nowIso,
+        input.dispatch_id,
+      ],
     )
 
     if (rows.length === 0) return false
@@ -321,14 +366,20 @@ export class PgDispatchLedger implements DispatchLedgerPort {
     const rows = await this.queryRows<DispatchRow>(
       `UPDATE ${VOUCHER_DELIVERY_DISPATCH_TABLE}
           SET status = 'failed',
-              provider = COALESCE($2, provider),
-              error_code = $3,
-              failed_at = $4,
+              provider = COALESCE($1, provider),
+              error_code = $2,
+              failed_at = $3,
               updated_at = $4
-        WHERE dispatch_id = $1
+        WHERE dispatch_id = $5
           AND status = 'queued'
       RETURNING ${SELECT_COLUMNS}`,
-      [input.dispatch_id, input.provider ?? null, input.error_code, nowIso],
+      [
+        input.provider ?? null,
+        input.error_code,
+        nowIso,
+        nowIso,
+        input.dispatch_id,
+      ],
     )
 
     if (rows.length === 0) return false
@@ -364,7 +415,7 @@ export class PgDispatchLedger implements DispatchLedgerPort {
     errorCode: string | null,
     occurredAtIso: string,
   ): Promise<void> {
-    await this.sql.raw(
+    await this.queryRows(
       `INSERT INTO ${VOUCHER_DELIVERY_DISPATCH_AUDIT_TABLE} (
          dispatch_id, entitlement_id, template_key, recipient_hash, market_id,
          from_status, to_status, error_code, attempt_count, occurred_at
@@ -384,11 +435,16 @@ export class PgDispatchLedger implements DispatchLedgerPort {
     )
   }
 
+  /**
+   * Jedyne miejsce, w którym ledger dotyka sterownika. Konwersja `$N`→`?` jest
+   * tutaj, a nie w wywołaniach, żeby nie dało się jej pominąć w nowym zapytaniu.
+   */
   private async queryRows<T>(
     sql: string,
     bindings: readonly unknown[],
   ): Promise<T[]> {
-    const result = await this.sql.raw(sql, bindings)
+    const { text, bindings: knexBindings } = toKnexPositionalSql(sql, bindings)
+    const result = await this.sql.raw(text, knexBindings)
     return extractRows<T>(result)
   }
 }
@@ -431,7 +487,18 @@ function normalizeRow(raw: unknown): DispatchRow {
         : String(record.provider_message_id),
     error_code: record.error_code == null ? null : String(record.error_code),
     attempt_count: Number(record.attempt_count ?? 0),
+    queued_at: normalizeTimestamp(record.queued_at),
   }
+}
+
+/** `timestamptz` wraca ze sterownika jako `Date`; ledger operuje na ISO 8601. */
+function normalizeTimestamp(value: unknown): string | null {
+  if (value == null) return null
+  if (value instanceof Date) {
+    return Number.isNaN(value.getTime()) ? null : value.toISOString()
+  }
+  const text = String(value)
+  return text.length > 0 ? text : null
 }
 
 function assertRecipientHash(value: string): void {

@@ -44,10 +44,19 @@ export const DELIVERY_STATE_CONTRACT_ID =
  * ponowną wysyłkę tego samego `(entitlement_id, template_key, recipient_hash)`.
  * Mail jest nieodwracalny — kompensacji nie ma, więc `sent`/`delivered` są
  * absorbujące (AC5).
+ *
+ * `degraded` NALEŻY tu (R-2.3-L7): w kontrakcie oznacza dostarczenie w trybie
+ * zdegradowanym — mail POSZEDŁ. Dziś nikt tego stanu nie zapisuje, ale enum jest
+ * zapożyczony w całości i sweep 2.5 może zacząć go używać; bez tego wpisu
+ * `degraded` wpadał w gałąź końcową `reserveDispatch` i był raportowany jako
+ * `in_flight` („wysyłka w locie u innego workera") — czyli ani nie blokował,
+ * ani nie podlegał retry, z mylącym logiem. Domyślnie blokujemy: duplikat maila
+ * jest nieodwracalny, brak retry — nie.
  */
 export const DISPATCH_STATES_BLOCKING_RESEND: readonly DeliveryDispatchState[] = [
   "sent",
   "delivered",
+  "degraded",
 ]
 
 /**

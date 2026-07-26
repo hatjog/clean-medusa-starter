@@ -10,7 +10,7 @@
 import { existsSync, readFileSync } from "node:fs"
 import path from "node:path"
 
-import { NOTIFICATION_TEMPLATE_KEYS } from "@gp/messaging"
+import { extractErrorCodeMarker, NOTIFICATION_TEMPLATE_KEYS } from "@gp/messaging"
 
 import notificationBrevoProvider, {
   BREVO_API_KEY_ENV,
@@ -146,6 +146,34 @@ describe("AC1 — rejestracja modułu Notification z providerem brevo", () => {
       ),
     ).rejects.toThrow(/BREVO_TEMPLATE_NOT_CONFIGURED/)
     expect(logger.warn).toHaveBeenCalled()
+  })
+
+  it("R-2.3-M3: komunikat błędu niesie marker kodu (jedyny nośnik przeżywający Medusę)", async () => {
+    const service = new BrevoNotificationProviderService(
+      { logger: { warn: jest.fn() } as never },
+      {},
+      { env: { [BREVO_SENDERS_ENV]: SENDERS_JSON } as NodeJS.ProcessEnv },
+    )
+
+    const error = await service
+      .send(
+        baseNotification({
+          data: {
+            template_key: "klucz_spoza_rejestru",
+            market_id: "bonbeauty",
+            locale: "pl",
+          },
+        }) as never,
+      )
+      .then(
+        () => null,
+        (e: unknown) => e as Error,
+      )
+
+    expect(error).not.toBeNull()
+    // Moduł Notification Medusy przepakowuje wyjątek BEZ `code`, więc kod musi
+    // dojechać do subscribera w treści komunikatu — w markerze, nie „gdzieś".
+    expect(extractErrorCodeMarker(error!.message)).toBe("BREVO_TEMPLATE_NOT_CONFIGURED")
   })
 })
 

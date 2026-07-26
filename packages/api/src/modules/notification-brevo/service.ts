@@ -56,6 +56,7 @@ import { AbstractNotificationProviderService } from "@medusajs/framework/utils"
 import {
   BrevoHttpClient,
   DefaultMessagingGateway,
+  formatErrorCodeMarker,
   MessagingError,
   NotConfiguredBrevoClient,
   RegistryBackedBrevoProvider,
@@ -66,7 +67,10 @@ import {
   type NotificationAuditEnvelope,
 } from "@gp/messaging"
 
-import { resolveCommunicationWiring } from "./communication-wiring"
+import {
+  createHotReloadingFlagResolver,
+  resolveCommunicationWiring,
+} from "./communication-wiring"
 import { toNotificationIntent } from "./intent"
 import { resolveBrevoSenders } from "./senders"
 
@@ -153,10 +157,17 @@ export class BrevoNotificationProviderService extends AbstractNotificationProvid
 
     if (dispatch.status === "failed") {
       const errorCode = dispatch.audit_event.error_code ?? "BREVO_DISPATCH_FAILED"
+      // R-2.3-M3: `code` NIE przeżywa drogi do konsumenta — moduł Notification
+      // Medusy przepakowuje wyjątek w `MedusaError` BEZ trzeciego argumentu,
+      // a `promiseAll({ aggregateErrors: true })` opakowuje to w zwykły `Error`.
+      // Jedynym nośnikiem, który przeżywa oba opakowania, jest `message`,
+      // dlatego kod idzie tam w deterministycznym markerze (patrz
+      // `formatErrorCodeMarker` — marker niesie sam kod, zero PII).
       throw new MedusaError(
         MedusaError.Types.UNEXPECTED_STATE,
         `[notification-brevo] dispatch failed for template '${intent.template_key}': ` +
-          `${errorCode}${dispatch.audit_event.error_message ? ` — ${dispatch.audit_event.error_message}` : ""}`,
+          `${formatErrorCodeMarker(errorCode)} ${errorCode}` +
+          `${dispatch.audit_event.error_message ? ` — ${dispatch.audit_event.error_message}` : ""}`,
         errorCode,
       )
     }
@@ -211,8 +222,17 @@ export class BrevoNotificationProviderService extends AbstractNotificationProvid
     // konfiguracji brak (kill-switch nieaktywny nie może być domyślany).
     const wiring = resolveCommunicationWiring({ env, logger: this.logger_ })
 
+    // R-2.3-M5: gateway trzyma zależności przez całe życie procesu, więc
+    // kill-switch dostaje resolver HOT-RELOADUJĄCY (odpytuje TTL-cache'owaną
+    // konfigurację przy każdym `resolve`) — inaczej `enabled: false` działałby
+    // dopiero po restarcie, wbrew obietnicy ADR-161 „bez deployu". Hook KPI
+    // celowo pozostaje instancją z bootu (per-procesowy `dedupeStore`).
     this.gateway_ = new DefaultMessagingGateway({ brevo: provider }, "brevo", {
-      flagResolver: this.seams_.flagResolver ?? wiring.flagResolver,
+      flagResolver:
+        this.seams_.flagResolver ??
+        (wiring.flagResolver
+          ? createHotReloadingFlagResolver({ env, logger: this.logger_ })
+          : undefined),
       flowKpiTelemetry: this.seams_.flowKpiTelemetry ?? wiring.flowKpiTelemetry,
     })
 

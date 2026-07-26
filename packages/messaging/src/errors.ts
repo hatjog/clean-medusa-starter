@@ -56,3 +56,38 @@ export class CommunicationConfigNotFoundError extends MessagingError {}
 export class CommunicationConfigValidationError extends MessagingError {}
 
 export class UnknownFlowError extends MessagingError {}
+
+/**
+ * ── Marker kodu błędu w treści komunikatu (Story 2.3, R-2.3-M3) ─────────────
+ *
+ * Problem: wysyłka biegnie przez `Modules.NOTIFICATION.createNotifications`,
+ * a moduł Notification Medusy **przepakowuje** wyjątek providera
+ * (`new MedusaError(UNEXPECTED_STATE, "Failed to send notification with id …")`
+ * — BEZ trzeciego argumentu, czyli bez `code`), a `promiseAll({ aggregateErrors:
+ * true })` opakowuje to jeszcze raz w zwykły `Error`. Do konsumenta (subscriber
+ * ledgera) NIE dociera więc ani `error_code`, ani `code` — tylko `message`.
+ *
+ * Skutek bez markera: każdy wiersz `failed` w ledgerze dostawał kod generyczny,
+ * więc „brak szablonu dla `ua`" był nieodróżnialny od awarii sieci czy
+ * `FLOW_DISABLED` — triage i sweep 2.5 traciły jedyny sygnał kierunkowy.
+ *
+ * Rozwiązanie: kod błędu jest osadzany w komunikacie w DETERMINISTYCZNYM,
+ * maszynowo parsowalnym markerze. Marker niesie WYŁĄCZNIE kod (`[A-Z0-9_]+`) —
+ * nigdy adresu ani treści maila (D-70), więc przetrwanie go w logach jest
+ * bezpieczne. Parser czyta wyłącznie zawartość markera, nigdy reszty komunikatu.
+ */
+const ERROR_CODE_MARKER_PATTERN = /\[gp_error_code=([A-Z0-9_]+)\]/
+
+/** Formatuje marker doklejany do komunikatu wyjątku przepakowywanego przez Medusę. */
+export function formatErrorCodeMarker(errorCode: string): string {
+  return `[gp_error_code=${errorCode}]`
+}
+
+/**
+ * Wyciąga kod błędu z komunikatu (dowolnie zagnieżdżonego), o ile marker jest
+ * obecny. `null`, gdy markera nie ma — wołający decyduje o fallbacku.
+ */
+export function extractErrorCodeMarker(message: unknown): string | null {
+  if (typeof message !== "string") return null
+  return ERROR_CODE_MARKER_PATTERN.exec(message)?.[1] ?? null
+}

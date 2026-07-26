@@ -19,6 +19,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 
 import {
+  UnknownFlowError,
   DefaultMessagingGateway,
   createFlowKpiTelemetryHook,
   loadCommunicationDefaults,
@@ -30,6 +31,7 @@ import {
 } from "@gp/messaging"
 
 import {
+  createHotReloadingFlagResolver,
   GovernedFlowFlagResolver,
   loadFlowApprovalLookup,
   resolveCommunicationWiring,
@@ -475,5 +477,139 @@ describe("AC6a — resolveCommunicationWiring: brak konfiguracji degraduje GŁO�
     expect(
       wiring.flagResolver?.resolve({ flow_id: FLOW_ID, market_id: MARKET_ID }).enabled,
     ).toBe(false)
+  })
+})
+
+// ── Findingi review 2.3 (R-2.3-M5 / L8) ────────────────────────────────────
+
+describe("R-2.3-L8 — fail-open dotyczy WYŁĄCZNIE nieznanego flow", () => {
+  it("inny błąd resolvera NIE włącza wysyłki — propaguje zamiast otwierać bramkę", () => {
+    const warnings: string[] = []
+    const broken = {
+      resolve() {
+        throw new Error("zły kształt wpisu override")
+      },
+    }
+    const resolver = new GovernedFlowFlagResolver(broken, {
+      warn: (message) => warnings.push(message),
+    })
+
+    expect(() => resolver.resolve({ flow_id: FLOW_ID, market_id: MARKET_ID })).toThrow(
+      "zły kształt wpisu override",
+    )
+    // Żadnego „fail-open + warn" dla defektu, który nie jest nieznanym flow.
+    expect(warnings).toHaveLength(0)
+  })
+
+  it("UnknownFlowError nadal daje fail-open (decyzja ADR-161 pkt 3 zachowana)", () => {
+    const unknown = {
+      resolve() {
+        throw new UnknownFlowError("flow spoza rejestru", {
+          error_code: "FLOW_UNKNOWN",
+        })
+      },
+    }
+    const resolver = new GovernedFlowFlagResolver(unknown)
+
+    expect(resolver.resolve({ flow_id: "x_flow", market_id: MARKET_ID }).enabled).toBe(
+      true,
+    )
+  })
+})
+
+describe("R-2.3-M5 — kill-switch działa BEZ restartu procesu (ADR-161)", () => {
+  beforeEach(() => {
+    __resetCommunicationWiringForTests()
+  })
+
+  function envFor(dir: string): NodeJS.ProcessEnv {
+    return {
+      GP_COMMUNICATION_DEFAULTS_PATH: join(dir, "defaults.yaml"),
+      GP_COMMUNICATION_MARKET_FLOWS_DIR: join(dir, "markets"),
+    }
+  }
+
+  it("edycja override rynku jest widoczna po TTL — bez restartu", () => {
+    const dir = writeTempTree({
+      "defaults.yaml": DEFAULTS_YAML,
+      [`markets/${MARKET_ID}/communication-flows.yaml`]:
+        `version: 1\nmarket_id: ${MARKET_ID}\noverrides:\n  ${FLOW_ID}:\n    enabled: true\n`,
+    })
+    const env = { ...envFor(dir), GP_COMMUNICATION_WIRING_TTL_MS: "1000" }
+
+    // Zegar wiringu jest wstrzykiwany, żeby TTL był deterministyczny.
+    let clock = 0
+    expect(
+      resolveCommunicationWiring({ env, now: () => clock }).flagResolver?.resolve({
+        flow_id: FLOW_ID,
+        market_id: MARKET_ID,
+      }).enabled,
+    ).toBe(true)
+
+    // Operator ustawia kill-switch w trakcie incydentu.
+    writeFileSync(
+      join(dir, "markets", MARKET_ID, "communication-flows.yaml"),
+      `version: 1\nmarket_id: ${MARKET_ID}\noverrides:\n  ${FLOW_ID}:\n    enabled: false\n`,
+      "utf8",
+    )
+
+    // Przed upływem TTL nadal obowiązuje poprzedni odczyt (cache jest celowy).
+    clock = 500
+    expect(
+      resolveCommunicationWiring({ env, now: () => clock }).flagResolver?.resolve({
+        flow_id: FLOW_ID,
+        market_id: MARKET_ID,
+      }).enabled,
+    ).toBe(true)
+
+    // Po TTL — bez restartu procesu — wysyłka jest zablokowana.
+    clock = 2000
+    expect(
+      resolveCommunicationWiring({ env, now: () => clock }).flagResolver?.resolve({
+        flow_id: FLOW_ID,
+        market_id: MARKET_ID,
+      }).enabled,
+    ).toBe(false)
+  })
+
+  it("hot-reloading resolver nie zamraża decyzji z bootu (gateway trzyma jedną instancję)", () => {
+    const dir = writeTempTree({
+      "defaults.yaml": DEFAULTS_YAML,
+      [`markets/${MARKET_ID}/communication-flows.yaml`]:
+        `version: 1\nmarket_id: ${MARKET_ID}\noverrides:\n  ${FLOW_ID}:\n    enabled: true\n`,
+    })
+    // TTL = 0 → zawsze świeży odczyt (deterministyczne w teście).
+    const env = { ...envFor(dir), GP_COMMUNICATION_WIRING_TTL_MS: "0" }
+    const resolver = createHotReloadingFlagResolver({ env })
+
+    expect(resolver.resolve({ flow_id: FLOW_ID, market_id: MARKET_ID }).enabled).toBe(
+      true,
+    )
+
+    writeFileSync(
+      join(dir, "markets", MARKET_ID, "communication-flows.yaml"),
+      `version: 1\nmarket_id: ${MARKET_ID}\noverrides:\n  ${FLOW_ID}:\n    enabled: false\n`,
+      "utf8",
+    )
+
+    expect(resolver.resolve({ flow_id: FLOW_ID, market_id: MARKET_ID }).enabled).toBe(
+      false,
+    )
+  })
+
+  it("zniknięcie konfiguracji po starcie = brak bramki, ale GŁOŚNO", () => {
+    const warnings: string[] = []
+    const resolver = createHotReloadingFlagResolver({
+      env: {
+        GP_COMMUNICATION_DEFAULTS_PATH: "/tmp/gp-nie-ma/defaults.yaml",
+        GP_COMMUNICATION_WIRING_TTL_MS: "0",
+      },
+      logger: { warn: (message) => warnings.push(message) },
+    })
+
+    expect(resolver.resolve({ flow_id: FLOW_ID, market_id: MARKET_ID }).enabled).toBe(
+      true,
+    )
+    expect(warnings.some((w) => w.includes("NIE jest"))).toBe(true)
   })
 })

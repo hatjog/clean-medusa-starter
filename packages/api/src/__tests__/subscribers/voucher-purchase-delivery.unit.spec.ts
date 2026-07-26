@@ -8,6 +8,8 @@
 import {
   extractPurchaseDeliveryTrigger,
   handleVoucherPurchaseDelivery,
+  MARKET_LOCALES_UNAVAILABLE_ERROR_CODE,
+  STALE_QUEUED_THRESHOLD_MS,
   type PurchaseDeliveryDeps,
   type PurchaseDeliverySource,
 } from "../../subscribers/voucher-purchase-delivery"
@@ -23,7 +25,10 @@ import {
   resolveStorefrontBaseUrl,
   StorefrontBaseUrlNotConfiguredError,
 } from "../../modules/voucher-delivery/purchase-confirmation-intent"
-import { NOTIFICATION_TEMPLATE_KEYS } from "@gp/messaging"
+import {
+  formatErrorCodeMarker,
+  NOTIFICATION_TEMPLATE_KEYS,
+} from "@gp/messaging"
 
 const BUYER_EMAIL = "Kupujaca@Example.Test"
 const ENTITLEMENT_ID = "entinst_2_3_001"
@@ -101,7 +106,8 @@ class FakeSql implements DispatchLedgerSql {
 
     if (q.includes("UPDATE voucher_delivery_dispatch")) {
       if (q.includes("SET status = 'sent'")) {
-        const [id, provider, messageId] = bindings as string[]
+        // Bindingi w kolejności WYSTĄPIEŃ `?` (dialekt Knexa) — patrz R-2.3-H1.
+        const [provider, messageId, , , id] = bindings as string[]
         const row = this.byId(id)
         if (!row || row.status !== "queued") return { rows: [] }
         Object.assign(row, {
@@ -113,7 +119,7 @@ class FakeSql implements DispatchLedgerSql {
         return { rows: [{ ...row }] }
       }
       if (q.includes("SET status = 'failed'")) {
-        const [id, provider, errorCode] = bindings as string[]
+        const [provider, errorCode, , , id] = bindings as string[]
         const row = this.byId(id)
         if (!row || row.status !== "queued") return { rows: [] }
         Object.assign(row, {
@@ -123,16 +129,10 @@ class FakeSql implements DispatchLedgerSql {
         })
         return { rows: [{ ...row }] }
       }
-      const [id, , locale, market_id, flow_id, allowed] = bindings as [
-        string,
-        string,
-        string,
-        string,
-        string,
-        string[],
-      ]
+      const [now, , locale, market_id, flow_id, id, ...allowed] = bindings as string[]
       const row = this.byId(id)
       if (!row || !allowed.includes(row.status as string)) return { rows: [] }
+      void now
       Object.assign(row, {
         status: "queued",
         attempt_count: Number(row.attempt_count ?? 0) + 1,
@@ -178,6 +178,8 @@ function makeDeps(overrides: {
   sourceError?: Error
   dispatchImpl?: (payload: Record<string, unknown>) => Promise<unknown>
   locales?: { default: string; supported: string[] }
+  /** R-2.3-M6: konfiguracja locale rynku NIEZNANA (błąd odczytu / brak bloku). */
+  localesDegraded?: boolean
   sql?: FakeSql
   env?: NodeJS.ProcessEnv
   ledgerOverride?: PurchaseDeliveryDeps["ledger"]
@@ -216,9 +218,11 @@ function makeDeps(overrides: {
     },
     marketLocales: {
       async read() {
-        return (
-          overrides.locales ?? { default: "pl", supported: ["pl", "en", "ua", "de"] }
-        )
+        return {
+          config:
+            overrides.locales ?? { default: "pl", supported: ["pl", "en", "ua", "de"] },
+          degraded: overrides.localesDegraded ?? false,
+        }
       },
     },
     logger,
@@ -454,6 +458,7 @@ describe("AC5 — idempotencja end-to-end (NFR3)", () => {
             dispatch_id: existing.dispatch_id,
             status: "queued",
             attempt_count: 1,
+            queued_at: null,
           }
         }
         const row = { dispatch_id: `broken-${++seq}`, status: "queued" }
@@ -463,6 +468,7 @@ describe("AC5 — idempotencja end-to-end (NFR3)", () => {
           dispatch_id: row.dispatch_id,
           status: "queued",
           attempt_count: 1,
+          queued_at: null,
         }
       },
       async markSent() {
@@ -851,6 +857,223 @@ describe("AC6b — market_id z danych domenowych, nie z GP_DEFAULT_MARKET_ID", (
       logger.entries.some(
         (e) =>
           e.level === "warn" && e.message.includes("[notification-market-context]"),
+      ),
+    ).toBe(true)
+  })
+})
+
+// ── Findingi review 2.3 (R-2.3-M3 / M4 / M6 / L9) ──────────────────────────
+
+describe("R-2.3-M3 — kod błędu przeżywa przepakowanie przez moduł Notification Medusy", () => {
+  /**
+   * Kształt błędu wytwarzany PRODUKCYJNIE: moduł Notification Medusy robi
+   * `new MedusaError(UNEXPECTED_STATE, "Failed to send notification with id …")`
+   * BEZ trzeciego argumentu (czyli bez `code`), a `promiseAll({ aggregateErrors:
+   * true })` opakowuje to w ZWYKŁY `Error`. Ani `error_code`, ani `code` nie
+   * istnieją na obiekcie, który dociera do subscribera.
+   */
+  function medusaRewrapped(providerErrorCode: string): Error {
+    const providerMessage =
+      `[notification-brevo] dispatch failed for template 'voucher_purchase_confirmation': ` +
+      `${formatErrorCodeMarker(providerErrorCode)} ${providerErrorCode}`
+    return new Error(
+      `Failed to send notification with id noti_01:\n${providerMessage}`,
+    )
+  }
+
+  it("wyciąga kod z markera, gdy `code`/`error_code` NIE przeżyły opakowań", async () => {
+    const { deps, sql } = makeDeps({
+      dispatchImpl: async () => {
+        throw medusaRewrapped("BREVO_TEMPLATE_NOT_CONFIGURED")
+      },
+    })
+
+    const result = await handleVoucherPurchaseDelivery(envelope("ISSUED"), deps)
+
+    expect(result.outcome).toBe("failed")
+    expect(result.error_code).toBe("BREVO_TEMPLATE_NOT_CONFIGURED")
+    expect(sql.dispatch[0].error_code).toBe("BREVO_TEMPLATE_NOT_CONFIGURED")
+  })
+
+  it("rozróżnia FLOW_DISABLED od awarii szablonu (sygnał kierunkowy dla triage'u)", async () => {
+    const { deps, sql } = makeDeps({
+      dispatchImpl: async () => {
+        throw medusaRewrapped("FLOW_DISABLED")
+      },
+    })
+
+    await handleVoucherPurchaseDelivery(envelope("ISSUED"), deps)
+    expect(sql.dispatch[0].error_code).toBe("FLOW_DISABLED")
+  })
+
+  it("test-the-test: bez markera kod jest generyczny (to był stan przed poprawką)", async () => {
+    const { deps, sql } = makeDeps({
+      dispatchImpl: async () => {
+        throw new Error("Failed to send notification with id noti_01:\nboom")
+      },
+    })
+
+    await handleVoucherPurchaseDelivery(envelope("ISSUED"), deps)
+    expect(sql.dispatch[0].error_code).toBe("VOUCHER_DELIVERY_DISPATCH_FAILED")
+  })
+
+  it("marker NIE przepuszcza treści komunikatu do ledgera ani do logów (D-70)", async () => {
+    const { deps, sql, logger } = makeDeps({
+      dispatchImpl: async () => {
+        throw new Error(
+          `Failed to send notification with id noti_01:\n` +
+            `${formatErrorCodeMarker("BREVO_RECIPIENT_REJECTED")} rejected ${BUYER_EMAIL}`,
+        )
+      },
+    })
+
+    await handleVoucherPurchaseDelivery(envelope("ISSUED"), deps)
+
+    const trace = JSON.stringify({ d: sql.dispatch, a: sql.audit, l: logger.entries })
+    expect(sql.dispatch[0].error_code).toBe("BREVO_RECIPIENT_REJECTED")
+    expect(trace).not.toContain("rejected")
+    expect(trace).not.toContain("Kupujaca")
+  })
+})
+
+describe("R-2.3-M4 — provider_message_id to identyfikator PROVIDERA, nie Medusy", () => {
+  it("czyta `external_id` (tam Medusa zapisuje ID providera), nie `id`", async () => {
+    const { deps, sql } = makeDeps({
+      dispatchImpl: async () => [{ id: "noti_01JMEDUSA", external_id: "brevo-msg-77" }],
+    })
+
+    const result = await handleVoucherPurchaseDelivery(envelope("ISSUED"), deps)
+
+    expect(result.outcome).toBe("sent")
+    expect(sql.dispatch[0].provider_message_id).toBe("brevo-msg-77")
+  })
+
+  it("dedup Medusy (pusta lista notyfikacji) → provider_message_id `null`, nie błąd", async () => {
+    const { deps, sql } = makeDeps({ dispatchImpl: async () => [] })
+
+    const result = await handleVoucherPurchaseDelivery(envelope("ISSUED"), deps)
+
+    expect(result.outcome).toBe("sent")
+    expect(sql.dispatch[0].provider_message_id).toBeNull()
+  })
+})
+
+describe("R-2.3-M6 — degradacja konfiguracji locale NIE degraduje maila do locale domyślnego", () => {
+  it("konfiguracja locale nieznana + locale zakupu `ua` → `failed`, NIE mail po polsku", async () => {
+    const { deps, sql, dispatchCalls, logger } = makeDeps({
+      source: {
+        buyer_email: BUYER_EMAIL,
+        voucher_code: VOUCHER_CODE,
+        market_id: MARKET_ID,
+        purchase_locale: "ua",
+      },
+      locales: { default: "pl", supported: ["pl"] },
+      localesDegraded: true,
+    })
+
+    const result = await handleVoucherPurchaseDelivery(envelope("ISSUED"), deps)
+
+    expect(result.outcome).toBe("failed")
+    expect(result.error_code).toBe(MARKET_LOCALES_UNAVAILABLE_ERROR_CODE)
+    // Ani maila, ani rezerwacji — to błąd konfiguracji, nie nieudana wysyłka.
+    expect(dispatchCalls).toHaveLength(0)
+    expect(sql.dispatch).toHaveLength(0)
+    expect(logger.entries.some((e) => e.level === "error")).toBe(true)
+  })
+
+  it("konfiguracja locale ZNANA + locale spoza listy rynku → legalny fallback (bez zmiany zachowania)", async () => {
+    const { deps, dispatchCalls } = makeDeps({
+      source: {
+        buyer_email: BUYER_EMAIL,
+        voucher_code: VOUCHER_CODE,
+        market_id: MARKET_ID,
+        purchase_locale: "ua",
+      },
+      locales: { default: "pl", supported: ["pl"] },
+      localesDegraded: false,
+    })
+
+    const result = await handleVoucherPurchaseDelivery(envelope("ISSUED"), deps)
+
+    expect(result.outcome).toBe("sent")
+    expect(result.locale).toBe("pl")
+    expect(dispatchCalls).toHaveLength(1)
+  })
+
+  it("degradacja BEZ locale w danych domenowych → wysyłka w `locales.default` (AC3)", async () => {
+    const { deps, dispatchCalls } = makeDeps({
+      source: {
+        buyer_email: BUYER_EMAIL,
+        voucher_code: VOUCHER_CODE,
+        market_id: MARKET_ID,
+        purchase_locale: null,
+      },
+      localesDegraded: true,
+    })
+
+    const result = await handleVoucherPurchaseDelivery(envelope("ISSUED"), deps)
+
+    expect(result.outcome).toBe("sent")
+    expect(dispatchCalls).toHaveLength(1)
+  })
+})
+
+describe("R-2.3-L9 — porzucone `queued` jest widoczne jako `warn`, nie `info`", () => {
+  function ledgerInFlight(queuedAt: string | null): PurchaseDeliveryDeps["ledger"] {
+    return {
+      async reserveDispatch() {
+        return {
+          outcome: "in_flight",
+          dispatch_id: "dispatch-stale",
+          status: "queued",
+          attempt_count: 1,
+          queued_at: queuedAt,
+        }
+      },
+      async markSent() {
+        return true
+      },
+      async markFailed() {
+        return true
+      },
+      async findByIdentity() {
+        return null
+      },
+    }
+  }
+
+  const NOW = new Date("2026-07-26T12:00:00.000Z")
+
+  it("`queued` starsze niż próg → `warn` z odesłaniem do sweepa 2.5", async () => {
+    const { deps, logger } = makeDeps({
+      ledgerOverride: ledgerInFlight(
+        new Date(NOW.getTime() - STALE_QUEUED_THRESHOLD_MS - 1_000).toISOString(),
+      ),
+    })
+    deps.now = () => NOW
+
+    const result = await handleVoucherPurchaseDelivery(envelope("ISSUED"), deps)
+
+    expect(result.outcome).toBe("skipped_in_flight")
+    const warned = logger.entries.find(
+      (e) => e.level === "warn" && e.message.includes("porzucona"),
+    )
+    expect(warned).toBeDefined()
+    expect(warned?.meta).toMatchObject({ stale_queued: true })
+  })
+
+  it("świeże `queued` (realnie w locie) zostaje `info` — bez fałszywego alarmu", async () => {
+    const { deps, logger } = makeDeps({
+      ledgerOverride: ledgerInFlight(new Date(NOW.getTime() - 1_000).toISOString()),
+    })
+    deps.now = () => NOW
+
+    await handleVoucherPurchaseDelivery(envelope("ISSUED"), deps)
+
+    expect(logger.entries.some((e) => e.level === "warn")).toBe(false)
+    expect(
+      logger.entries.some(
+        (e) => e.level === "info" && e.message.includes("inny konsument"),
       ),
     ).toBe(true)
   })

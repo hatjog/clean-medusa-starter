@@ -161,8 +161,8 @@ describe("createMarketLocalesReader (AC3)", () => {
     })
 
     expect(await reader.read(MARKET_ID)).toEqual({
-      default: "ua",
-      supported: ["ua", "pl"],
+      config: { default: "ua", supported: ["ua", "pl"] },
+      degraded: false,
     })
   })
 
@@ -175,7 +175,7 @@ describe("createMarketLocalesReader (AC3)", () => {
       },
     })
 
-    expect((await reader.read(MARKET_ID)).default).toBe("de")
+    expect((await reader.read(MARKET_ID)).config.default).toBe("de")
   })
 
   it("brak wiersza → shim env + OSTRZEŻENIE (degradacja nie jest cicha)", async () => {
@@ -191,7 +191,10 @@ describe("createMarketLocalesReader (AC3)", () => {
 
     const result = await reader.read(MARKET_ID)
 
-    expect(result.supported.length).toBeGreaterThan(0)
+    expect(result.config.supported.length).toBeGreaterThan(0)
+    // R-2.3-M6: brak bloku locales = konfiguracja rynku NIEZNANA, nie „rynek
+    // jednojęzyczny" — wołający musi móc to odróżnić.
+    expect(result.degraded).toBe(true)
     expect(warnings).toHaveLength(1)
     expect(warnings[0].meta).toMatchObject({ market_id: MARKET_ID })
   })
@@ -208,7 +211,8 @@ describe("createMarketLocalesReader (AC3)", () => {
     )
 
     await expect(reader.read(MARKET_ID)).resolves.toMatchObject({
-      default: expect.any(String),
+      config: { default: expect.any(String) },
+      degraded: true,
     })
     expect(warnings[0].message).toContain("market_runtime_config")
     // Komunikat błędu sterownika NIE jest przepisywany do loga w całości —

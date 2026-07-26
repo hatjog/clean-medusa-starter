@@ -57,6 +57,7 @@ import {
   type FlowApprovalLookup,
   type FlowFlagState,
   type FlowKpiTelemetryHook,
+  UnknownFlowError,
   type ICommunicationFlowFlagResolver,
   type MarketFlowsConfig,
 } from "@gp/messaging"
@@ -101,6 +102,15 @@ export class GovernedFlowFlagResolver implements ICommunicationFlowFlagResolver 
     try {
       return this.inner.resolve(input)
     } catch (error) {
+      // R-2.3-L8: fail-open dotyczy WYŁĄCZNIE „flow spoza rejestru flag".
+      // Łapanie każdego wyjątku odwracało kierunek bezpieczeństwa dokładnie tam,
+      // gdzie kill-switch ma znaczenie: dowolny inny defekt resolvera (zły
+      // kształt wpisu, błąd mapy override, przyszła logika quiet-hours) włączał
+      // wysyłkę flow celowo ustawionego `enabled: false`. Inne błędy propagują.
+      if (!(error instanceof UnknownFlowError)) {
+        throw error
+      }
+
       const key = `${input.market_id}|${input.flow_id}`
       if (!this.warned.has(key)) {
         this.warned.add(key)
@@ -128,15 +138,41 @@ export class GovernedFlowFlagResolver implements ICommunicationFlowFlagResolver 
   }
 }
 
+/**
+ * ── TTL cache zamiast cache'a „raz na proces" (R-2.3-M5) ────────────────────
+ * ADR-161 obiecuje kill-switch działający **bez deployu**: operator ustawia
+ * `enabled: false` w YAML-u i wysyłka staje. Cache module-level bez inwalidacji
+ * czynił z tego „edycja pliku + restart procesu" — czyli dokładnie to, czego
+ * kill-switch ma uniknąć w trakcie incydentu.
+ *
+ * Konfiguracja jest więc re-czytana po upływie TTL (domyślnie 60 s, env
+ * `GP_COMMUNICATION_WIRING_TTL_MS`; `0` = zawsze świeżo). Koszt: kilka
+ * `readFileSync` na minutę na proces — pomijalny wobec wysyłki HTTP.
+ *
+ * Konsument, który ma widzieć zmianę bez restartu, MUSI odpytywać przez
+ * `createHotReloadingFlagResolver`, a nie trzymać instancji resolvera z bootu
+ * (gateway memoizuje swoje zależności).
+ */
+const DEFAULT_WIRING_TTL_MS = 60_000
+
 let cached: CommunicationWiring | null = null
+let cachedAtMs = 0
 
 /** Reset cache — wyłącznie dla testów. */
 export function __resetCommunicationWiringForTests(): void {
   cached = null
+  cachedAtMs = 0
+}
+
+function resolveTtlMs(env: NodeJS.ProcessEnv): number {
+  const raw = env.GP_COMMUNICATION_WIRING_TTL_MS?.trim()
+  if (!raw) return DEFAULT_WIRING_TTL_MS
+  const parsed = Number(raw)
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULT_WIRING_TTL_MS
 }
 
 /**
- * Buduje (raz na proces) wiring flag + KPI. Nigdy nie rzuca: awaria wiringu nie
+ * Buduje wiring flag + KPI (z cache'em TTL). Nigdy nie rzuca: awaria wiringu nie
  * może wywrócić rejestracji providera ani startu backendu.
  */
 export function resolveCommunicationWiring(options: {
@@ -144,15 +180,63 @@ export function resolveCommunicationWiring(options: {
   logger?: WiringLogger
   /** Pomija cache (testy). */
   fresh?: boolean
+  /** Zegar — wstrzykiwalny dla testów TTL. */
+  now?: () => number
 } = {}): CommunicationWiring {
-  if (cached && !options.fresh) return cached
-
   const env = options.env ?? process.env
+  const now = options.now ?? (() => Date.now())
+  const ttlMs = resolveTtlMs(env)
+
+  if (cached && !options.fresh && ttlMs > 0 && now() - cachedAtMs < ttlMs) {
+    return cached
+  }
+
   const logger = options.logger
   const wiring = buildWiring(env, logger)
 
-  if (!options.fresh) cached = wiring
+  if (!options.fresh) {
+    cached = wiring
+    cachedAtMs = now()
+  }
   return wiring
+}
+
+/**
+ * Resolver flag, który przy KAŻDYM `resolve` sięga po (TTL-cache'owany) wiring.
+ *
+ * To jest ta połowa mechanizmu, bez której sam TTL nic nie daje: gateway trzyma
+ * wstrzyknięty resolver przez całe życie procesu, więc resolver MUSI sam
+ * odpytywać konfigurację, a nie zostać zamrożony w chwili bootu.
+ *
+ * Świadomie NIE dotyczy to hooka KPI — ma on per-procesowy `dedupeStore`,
+ * którego odtwarzanie co TTL produkowałoby duplikaty zdarzeń KPI. Kill-switch
+ * jest tym, co musi działać w trakcie incydentu; KPI nie.
+ */
+export function createHotReloadingFlagResolver(options: {
+  env?: NodeJS.ProcessEnv
+  logger?: WiringLogger
+}): ICommunicationFlowFlagResolver {
+  return {
+    resolve(input: FlagResolverInput): FlowFlagState {
+      const resolver = resolveCommunicationWiring(options).flagResolver
+      if (resolver) return resolver.resolve(input)
+
+      // Konfiguracja zniknęła po boocie (skasowany/przeniesiony plik) —
+      // zachowujemy zachowanie „brak konfiguracji = brak bramki", ale głośno.
+      options.logger?.warn?.(
+        "[communication-wiring] konfiguracja flag zniknęła po starcie — wysyłka NIE jest " +
+          "bramkowana kill-switchem",
+        { flow_id: input.flow_id, market_id: input.market_id },
+      )
+      return {
+        enabled: true,
+        consent_basis: "transactional_critical",
+        source: "default",
+        flow_id: input.flow_id,
+        market_id: input.market_id,
+      }
+    },
+  }
 }
 
 function buildWiring(

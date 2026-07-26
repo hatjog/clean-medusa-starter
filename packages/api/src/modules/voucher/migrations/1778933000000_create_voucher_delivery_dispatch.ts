@@ -88,7 +88,10 @@ export class Migration1778933000000 extends Migration {
         provider            text NULL,
         provider_message_id text NULL,
         error_code          text NULL,
-        attempt_count       integer NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+        -- Semantyka: LICZBA PRÓB (nie „liczba retry"), więc pierwszy wiersz ma 1.
+        -- INSERT ledgera podaje 1 jawnie; DEFAULT jest z nim zgodny, żeby zapis
+        -- spoza modułu nie tworzył rezerwacji z zerową liczbą prób.
+        attempt_count       integer NOT NULL DEFAULT 1 CHECK (attempt_count >= 1),
         queued_at           timestamptz NOT NULL,
         sent_at             timestamptz NULL,
         failed_at           timestamptz NULL,
@@ -126,7 +129,8 @@ export class Migration1778933000000 extends Migration {
         from_status     text NULL CHECK (from_status IS NULL OR from_status IN (${statusList})),
         to_status       text NOT NULL CHECK (to_status IN (${statusList})),
         error_code      text NULL,
-        attempt_count   integer NOT NULL DEFAULT 0,
+        -- Kopia licznika prób z wiersza dispatch w momencie tranzycji (od 1).
+        attempt_count   integer NOT NULL DEFAULT 1,
         occurred_at     timestamptz NOT NULL,
         created_at      timestamptz NOT NULL DEFAULT NOW()
       )
