@@ -40,22 +40,43 @@ export function isNotificationProviderReady(): boolean {
     return true
   }
 
-  if (hasValue(process.env.RESEND_API_KEY)) {
+  // R-2.2-I1: RESEND/SENDGRID/SMTP to SHIM MIGRACYJNY, nie realna gotowość.
+  // Po AD-5 („jedna ścieżka wysyłki") żaden z nich nie ma odpowiadającego
+  // providera w `medusa-config.ts` — gate przepuszcza dispatch, który i tak
+  // padnie na `BREVO_API_KEY_NOT_CONFIGURED`. Zostawiamy je świadomie (usunięcie
+  // = zmiana zachowania zastanych środowisk, poza AC3 tej story), ale NIE po
+  // cichu: każde takie przepuszczenie zostawia ślad w logu.
+  // WŁAŚCICIEL usunięcia: Story 2.3 (sunset legacy providerów e-mail).
+  if (hasLegacyEmailProviderEnv()) {
+    warnLegacyProviderShim()
     return true
   }
 
-  if (hasValue(process.env.SENDGRID_API_KEY)) {
-    return true
-  }
+  return false
+}
 
-  if (hasValue(process.env.SMTP_URL)) {
-    return true
-  }
-
+/** Zastane zmienne providerów e-mail bez zarejestrowanego providera (shim). */
+export function hasLegacyEmailProviderEnv(): boolean {
   return (
-    hasValue(process.env.SMTP_HOST) &&
-    hasValue(process.env.SMTP_USER) &&
-    hasValue(process.env.SMTP_PASS)
+    hasValue(process.env.RESEND_API_KEY) ||
+    hasValue(process.env.SENDGRID_API_KEY) ||
+    hasValue(process.env.SMTP_URL) ||
+    (hasValue(process.env.SMTP_HOST) &&
+      hasValue(process.env.SMTP_USER) &&
+      hasValue(process.env.SMTP_PASS))
+  )
+}
+
+function warnLegacyProviderShim(): void {
+  if (process.env.NODE_ENV === "test") {
+    return
+  }
+  // eslint-disable-next-line no-console
+  console.warn(
+    "[vendor-notification-readiness] gotowość providera uznana na podstawie " +
+      "zastanej zmiennej (RESEND/SENDGRID/SMTP), a jedynym zarejestrowanym " +
+      "providerem e-mail jest brevo (AD-5) — dispatch padnie na " +
+      "BREVO_API_KEY_NOT_CONFIGURED. Ustaw BREVO_API_KEY.",
   )
 }
 

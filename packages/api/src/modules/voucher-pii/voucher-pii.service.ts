@@ -297,14 +297,19 @@ export class VoucherPiiService {
         // wyjątek z providera jest tu ŁAPANY i zamieniany na stan degradacyjny.
         const provider_ref = this.deps.defaultProviderRef;
 
+        let providerMessageId: string | null = null;
         try {
-          await this.deps.notifications.dispatch({
+          // R-2.2-L7: `provider_message_id` jest ZAPISYWANY (audyt + event), a nie
+          // wyrzucany — bez niego kontrakt portu był martwy, a reconciliation
+          // sweep 2.3/2.5 nie miałby po czym korelować dostawy.
+          const dispatched = await this.deps.notifications.dispatch({
             consent_audit_id: args.consent_audit_id,
             market_id: args.market_id,
             recipient_id: args.recipient_id,
             delivery_decision_id: args.delivery_decision_id,
             request_id: args.request_id,
           });
+          providerMessageId = dispatched?.provider_message_id ?? null;
         } catch (error) {
           const failedLatency = this.deps.now() - start;
           await this.deps.delivery.recordOutcome({
@@ -360,6 +365,8 @@ export class VoucherPiiService {
             delivery_decision_id: args.delivery_decision_id,
             outcome: "dispatched",
             provider_ref,
+            // Nieprzezroczysty ID providera — zero PII, korelacja dla sweepu.
+            provider_message_id: providerMessageId,
             request_id: args.request_id,
           },
         });
@@ -371,6 +378,7 @@ export class VoucherPiiService {
           latency_ms,
           provider_ref,
           audit_chain_verified: true,
+          provider_message_id: providerMessageId,
         });
 
         return {
@@ -496,6 +504,13 @@ export class VoucherPiiService {
     provider_ref: string | null;
     audit_chain_verified: boolean;
     delivery_attempt_n: number;
+    /**
+     * R-2.2-L7: identyfikator wiadomości po stronie providera. Nie jest PII —
+     * to nieprzezroczysty ID Brevo — a bez niego nie da się skorelować dostawy
+     * z reconciliation sweepem (2.3/2.5). Wcześniej port go zwracał, adapter
+     * wydobywał, a orchestrator wyrzucał.
+     */
+    provider_message_id?: string | null;
   }): Promise<void> {
     await this.deps.events.emit({
       event_type: "gp.voucher.delivery_decision.v1",
@@ -510,6 +525,7 @@ export class VoucherPiiService {
         delivery_attempt_n: args.delivery_attempt_n,
         provider_ref: args.provider_ref,
         audit_chain_verified: args.audit_chain_verified,
+        provider_message_id: args.provider_message_id ?? null,
       },
     });
   }

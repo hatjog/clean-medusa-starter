@@ -349,6 +349,11 @@ describe("executeDeliveryStep (AC-VPII-PIPE-2.2-03)", () => {
     );
     expect(dispatchedEvent).toBeDefined();
     expect(dispatchedEvent!.payload.outcome).toBe("dispatched");
+    // R-2.2-L7: `provider_message_id` z portu jest ZAPISYWANY (audyt + event),
+    // a nie wyrzucany — bez niego reconciliation sweep 2.3/2.5 nie ma po czym
+    // korelować dostawy. To ID providera, nie PII.
+    expect(dispatchedEvent!.payload.provider_message_id).toBe("msg_fake_1");
+    expect(chainedRow!.payload.provider_message_id).toBe("msg_fake_1");
   });
 
   test("audit NOT confirmed → DLQ + state error-audit-failed + ZERO dispatched event", async () => {

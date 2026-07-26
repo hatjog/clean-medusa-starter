@@ -13,8 +13,25 @@
  * `BrevoAdapter.toBrevoPayload` niesie kontrakt: „produkcyjne callsite MUSZĄ
  * wywoływać przez `MessagingGateway.send` — bezpośrednie użycie pomija invariant
  * `audit_event`". Wrapper WOŁA GATEWAY (`DefaultMessagingGateway`), a nie adapter
- * wprost, więc invariant `audit_event`, idempotency-cache i telemetria KPI
- * zostają zachowane bez odtwarzania ich tutaj.
+ * wprost.
+ *
+ * Stan po review 2.2 (R-2.2-H1) — bez zaokrągleń, bo AC1 wymaga zapisu, który
+ * odpowiada kodowi:
+ *   - `audit_event` — ODTWORZONY TUTAJ. Gateway buduje envelope, a wrapper go
+ *     KONSUMUJE: `emitAuditEnvelope()` oddaje go do `auditSink` (domyślnie
+ *     structured log przez `logger`). Envelope jest PII-free z konstrukcji
+ *     (`hashed_recipient`), więc log nie łamie D-70. Bez tego envelope powstawał
+ *     i przepadał — invariant był deklarowany, nie realizowany.
+ *   - `idempotency-cache` — ZACHOWANY (to natywna własność gatewaya; pre-flight
+ *     faile nie są cache'owane, patrz R-2.2-M2 w `gateway.ts`).
+ *   - `flagResolver` (per-market kill-switch flow) i `flowKpiTelemetry` (KPI
+ *     `sent` → denominator `delivered_rate`) — WSTRZYKIWALNE przez `seams`, ale
+ *     produkcyjnie NIEPODPIĘTE. Podpięcie wymaga loadera czytającego konfigurację
+ *     flag komunikacyjnych i rejestr approvali 5-8 (PostHog client) — infrastruktura
+ *     spoza zakresu 2.2. WŁAŚCICIEL: Story 2.3, deferral architektoniczny
+ *     (wymaga ADR na wiring flag/KPI w module Notification). Do tego czasu:
+ *     kill-switch per rynek/flow NIE działa na tej ścieżce, a KPI `sent` nie są
+ *     emitowane — to jawny dług, nie spełniona własność.
  *
  * Konsekwencja wymagająca jawnej obsługi: gateway ŁAPIE `MessagingProviderError`
  * i zwraca `NotificationDispatch{status:"failed"}` zamiast rzucać (patrz
@@ -42,8 +59,11 @@ import {
   MessagingError,
   NotConfiguredBrevoClient,
   RegistryBackedBrevoProvider,
+  type FlowKpiTelemetryHook,
   type IBrevoClient,
+  type ICommunicationFlowFlagResolver,
   type MessagingGateway,
+  type NotificationAuditEnvelope,
 } from "@gp/messaging"
 
 import { toNotificationIntent } from "./intent"
@@ -63,11 +83,28 @@ type InjectedDependencies = {
   logger?: Logger
 }
 
+/**
+ * Sink envelope'u audytowego (R-2.2-H1).
+ *
+ * `NotificationAuditEnvelope` jest PII-free z konstrukcji (`hashed_recipient`),
+ * więc domyślną implementacją jest structured log. Gdy 2.3 doda trwały ledger,
+ * wystarczy wstrzyknąć inny sink — wrapper nie zmienia się.
+ */
+export type NotificationAuditSink = (envelope: NotificationAuditEnvelope) => void
+
 /** Seamy testowe — pozwalają sprawdzić wrapper bez sieci i bez kontenera Medusy. */
 export interface BrevoNotificationProviderSeams {
   client?: IBrevoClient
   gateway?: MessagingGateway
   env?: NodeJS.ProcessEnv
+  auditSink?: NotificationAuditSink
+  /**
+   * R-2.2-H1: gniazda na kill-switch per rynek/flow i telemetrię KPI. Produkcyjny
+   * wiring (config flag + rejestr approvali) należy do Story 2.3 — tutaj są
+   * wstrzykiwalne, żeby gateway dostał je BEZ zmiany tego pliku, gdy powstaną.
+   */
+  flagResolver?: ICommunicationFlowFlagResolver
+  flowKpiTelemetry?: FlowKpiTelemetryHook
 }
 
 export class BrevoNotificationProviderService extends AbstractNotificationProviderService {
@@ -109,6 +146,10 @@ export class BrevoNotificationProviderService extends AbstractNotificationProvid
     const intent = toNotificationIntent(notification)
     const dispatch = await this.gateway().send(intent)
 
+    // R-2.2-H1: envelope audytowy MUSI zostać skonsumowany — na obu ścieżkach,
+    // zanim wrapper zwróci wynik albo rzuci. Wcześniej powstawał i przepadał.
+    this.emitAuditEnvelope(dispatch.audit_event)
+
     if (dispatch.status === "failed") {
       const errorCode = dispatch.audit_event.error_code ?? "BREVO_DISPATCH_FAILED"
       throw new MedusaError(
@@ -122,9 +163,36 @@ export class BrevoNotificationProviderService extends AbstractNotificationProvid
     return { id: dispatch.provider_message_id ?? dispatch.dispatch_id }
   }
 
+  /**
+   * Oddaje envelope audytowy do sinka. Domyślnie structured log — envelope jest
+   * PII-free (`hashed_recipient`), więc nie łamie D-70. Sink NIGDY nie może
+   * wywrócić wysyłki, dlatego jest w try/catch.
+   */
+  private emitAuditEnvelope(envelope: NotificationAuditEnvelope): void {
+    try {
+      if (this.seams_.auditSink) {
+        this.seams_.auditSink(envelope)
+        return
+      }
+      this.logger_?.info?.(
+        `[notification-brevo] audit_event ${JSON.stringify(envelope)}`,
+      )
+    } catch {
+      // Awaria sinka audytowego nie może zmienić wyniku wysyłki.
+    }
+  }
+
   /** Lazy-init: gateway + provider + klient powstają przy pierwszej wysyłce. */
   private gateway(): MessagingGateway {
     if (this.gateway_) {
+      return this.gateway_
+    }
+
+    // R-2.2-L3: seam `gateway` sprawdzany PRZED budową providera/klienta —
+    // inaczej wstrzyknięty gateway i tak powodował powstanie `BrevoHttpClient`
+    // (seam nie izolował tak, jak sugeruje nazwa).
+    if (this.seams_.gateway) {
+      this.gateway_ = this.seams_.gateway
       return this.gateway_
     }
 
@@ -136,8 +204,13 @@ export class BrevoNotificationProviderService extends AbstractNotificationProvid
 
     const provider = new RegistryBackedBrevoProvider(this.resolveClient(env), { senders })
 
-    this.gateway_ =
-      this.seams_.gateway ?? new DefaultMessagingGateway({ brevo: provider }, "brevo")
+    this.gateway_ = new DefaultMessagingGateway({ brevo: provider }, "brevo", {
+      // R-2.2-H1: gniazda podpięte do gatewaya. Dziś zwykle `undefined`
+      // (kill-switch/KPI = Story 2.3), ale wiring istnieje i jest testowalny —
+      // nie ma już rozjazdu „opcje pominięte w całości" vs deklaracja w AC1.
+      flagResolver: this.seams_.flagResolver,
+      flowKpiTelemetry: this.seams_.flowKpiTelemetry,
+    })
 
     return this.gateway_
   }

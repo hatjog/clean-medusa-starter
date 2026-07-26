@@ -178,6 +178,34 @@ describe("DefaultMessagingGateway", () => {
     expect(second.status).toBe("failed");
   });
 
+  it("NIE cache'uje failu pre-flight — retry po naprawie configu woła providera (R-2.2-M2)", async () => {
+    // Klasy pre-flight (BREVO_TEMPLATE_NOT_CONFIGURED itd.) są jednoznaczne:
+    // nic nie poszło do providera. Cache'owanie ich na 24 h blokowałoby główny
+    // scenariusz wyjścia ze stanu „rejestr pusty" — po uzupełnieniu ID retry
+    // z tym samym idempotency_key nie dotknąłby providera.
+    const provider = makeProvider();
+    const sendMock = provider.send as jest.Mock;
+    sendMock.mockRejectedValueOnce(
+      new MessagingProviderError("Brevo template is not configured", {
+        error_code: "BREVO_TEMPLATE_NOT_CONFIGURED",
+        preflight: true,
+      }),
+    );
+    const gateway = new DefaultMessagingGateway({ brevo: provider }, "brevo", {
+      clock: () => fixedNow,
+      uuid: makeUuid(["audit-preflight-1", "audit-preflight-2"]),
+    });
+
+    const first = await gateway.send(makeIntent());
+    expect(first.status).toBe("failed");
+    expect(first.audit_event.error_code).toBe("BREVO_TEMPLATE_NOT_CONFIGURED");
+
+    // Drugie wywołanie (operator uzupełnił rejestr) MUSI trafić do providera.
+    const second = await gateway.send(makeIntent());
+    expect(sendMock).toHaveBeenCalledTimes(2);
+    expect(second.status).toBe("queued");
+  });
+
   it("rzuca MessagingValidationError dla email channel bez recipient.email", async () => {
     const gateway = new DefaultMessagingGateway(
       { brevo: makeProvider() },

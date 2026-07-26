@@ -580,6 +580,10 @@ describe("admin vendors AuthN — fail-closed extractActorIdOrThrow", () => {
         ),
       }
       const { knex, updates } = makeObservableIdempotencyKnex()
+      // R-2.2-L8: log serwerowy idzie przez logger z kontenera (jak w magic-linku),
+      // bez bramki NODE_ENV — inaczej w normalnym przebiegu suite'u (NODE_ENV=test)
+      // gałąź w ogóle się nie wykonywała i „log serwerowy" nie był niczym pokryty.
+      const containerLogger = { error: jest.fn(), warn: jest.fn(), info: jest.fn() }
 
       const req = createReq({
         authContext: { actor_id: "user_admin_01", actor_type: "user" },
@@ -588,6 +592,7 @@ describe("admin vendors AuthN — fail-closed extractActorIdOrThrow", () => {
           sellerModuleService,
           [Modules.NOTIFICATION]: notificationModule,
           [ContainerRegistrationKeys.PG_CONNECTION]: knex,
+          [ContainerRegistrationKeys.LOGGER]: containerLogger,
         },
       })
       const res = createRes()
@@ -604,6 +609,13 @@ describe("admin vendors AuthN — fail-closed extractActorIdOrThrow", () => {
       expect(updates.some((patch) => patch.status_code === 503)).toBe(true)
       // (4) Odpowiedź nie przecieka treści maila ani adresu.
       expect(JSON.stringify(res.body)).not.toContain("open@example.com")
+      // (5) Log serwerowy POWSTAŁ i niesie kod błędu — bez adresu i bez treści
+      //     komunikatu providera (D-70).
+      expect(containerLogger.error).toHaveBeenCalledTimes(1)
+      const logged = containerLogger.error.mock.calls[0][0] as string
+      expect(logged).toContain("BREVO_TEMPLATE_NOT_CONFIGURED")
+      expect(logged).toContain("vendor_id=vendor_01")
+      expect(logged).not.toContain("open@example.com")
     } finally {
       process.env.NODE_ENV = previousNodeEnv
       if (previousBrevoKey === undefined) {

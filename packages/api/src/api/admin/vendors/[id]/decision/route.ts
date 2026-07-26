@@ -21,6 +21,7 @@
  */
 
 import type { MedusaRequest, MedusaResponse } from "@medusajs/framework/http"
+import { ContainerRegistrationKeys } from "@medusajs/framework/utils"
 import {
   renderDecisionConfirmationHtml,
   renderDecisionConfirmationSubject,
@@ -84,6 +85,26 @@ type ErrorResponse = {
 }
 
 const VALID_DECISIONS: DecisionType[] = ["opted_in", "opted_out"]
+
+/**
+ * Logger z kontenera Medusy (R-2.2-L8). `resolve` może rzucić, gdy klucz nie jest
+ * zarejestrowany (testy jednostkowe ze sztucznym scope'em) — brak loggera nie
+ * może wywrócić obsługi błędu dispatchu.
+ */
+type DecisionLogger = {
+  error?: (message: string) => void
+  warn?: (message: string) => void
+}
+
+function resolveDecisionLogger(scope: {
+  resolve: (key: string) => unknown
+}): DecisionLogger | null {
+  try {
+    return (scope.resolve(ContainerRegistrationKeys.LOGGER) as DecisionLogger) ?? null
+  } catch {
+    return null
+  }
+}
 
 export async function POST(
   req: MedusaRequest<CaptureBody>,
@@ -347,12 +368,16 @@ export async function POST(
       })
       finalised = true
 
-      if (process.env.NODE_ENV !== "test") {
-        // eslint-disable-next-line no-console
-        console.error(
-          `[decision_capture] dispatch failed vendor_id=${id} code=${errBody.code} message=${(err as Error)?.message ?? String(err)}`,
-        )
-      }
+      // R-2.2-L8: log serwerowy przez logger z kontenera (tak jak magic-link,
+      // ten sam AC5) i BEZ bramki `NODE_ENV` — wcześniej w normalnym przebiegu
+      // suite'u (`NODE_ENV=test`) gałąź w ogóle się nie wykonywała, więc
+      // deklarowana własność „log serwerowy" nie była niczym pokryta.
+      // Logujemy `code` + `name`, NIE `err.message` — po 2.2 message może nieść
+      // treść z odpowiedzi providera (D-70: zero PII w logu/audycie).
+      resolveDecisionLogger(scope)?.error?.(
+        `[decision_capture] dispatch failed vendor_id=${id} code=${errBody.code} ` +
+          `error=${(err as Error)?.name ?? "UnknownError"}`,
+      )
 
       res.status(503).json(errBody)
       return

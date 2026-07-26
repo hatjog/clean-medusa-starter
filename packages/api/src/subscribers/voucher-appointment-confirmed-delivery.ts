@@ -16,7 +16,7 @@ import type {
 import { VOUCHER_MODULE } from "../modules/voucher"
 // Story 2.2 (AC5 poz.5): klucz szablonu WYŁĄCZNIE ze stałej rejestru (AD-6).
 import { NOTIFICATION_TEMPLATE_KEYS } from "@gp/messaging"
-import { resolveNotificationMarketId } from "../lib/notification-market-context"
+import { resolveMarketScopedNotificationMarketId } from "../lib/notification-market-context"
 
 export const VOUCHER_APPOINTMENT_CONFIRMED_EVENT =
   "gp.voucher.appointment_confirmed.v1" as const
@@ -42,6 +42,12 @@ type AppointmentConfirmedPayload = {
   appointment_id?: string | null
   sequence?: number | null
   lifecycle_status?: VoucherAppointmentLifecycleStatus | null
+  /**
+   * R-2.2-M4: rynek z danych domenowych, gdy event go niesie. Dziś opcjonalny —
+   * emitent go nie ustawia — ale gdy się pojawi, wysyłka przestaje zależeć od
+   * `GP_DEFAULT_MARKET_ID`.
+   */
+  market_id?: string | null
 }
 
 type AppointmentConfirmedEnvelope = {
@@ -57,6 +63,8 @@ type AppointmentConfirmationDeliverySource = {
   salon_name?: string | null
   location_address?: string | null
   seller_handle?: string | null
+  /** R-2.2-M4: rynek z projekcji źródłowej, gdy zostanie do niej dodany. */
+  market_id?: string | null
 }
 
 type AppointmentSourceReader = {
@@ -155,6 +163,8 @@ export async function handleVoucherAppointmentConfirmedDelivery(
     entitlementId,
     locale: source.buyer_locale ?? "pl",
     email,
+    marketId: payload.market_id ?? source.market_id ?? null,
+    logger: deps.logger,
   })
   const result = await deps.dispatcher.dispatch(notificationPayload)
   const notificationId = extractNotificationId(result)
@@ -236,7 +246,17 @@ function buildNotificationPayload(input: {
   entitlementId: string
   locale: string
   email: VoucherAppointmentDeliveryEmail
+  marketId?: string | null
+  logger?: LoggerLike
 }): Record<string, unknown> {
+  // R-2.2-M4: rynek z danych domenowych (event → źródło), fallback konfiguracyjny
+  // wyłącznie z głośnym ostrzeżeniem — to wysyłka market-scoped.
+  const marketId = resolveMarketScopedNotificationMarketId({
+    market_id: input.marketId,
+    call_site: "voucher-appointment-confirmed-delivery",
+    logger: input.logger,
+  })
+
   return {
     to: input.to,
     channel: "email",
@@ -245,7 +265,7 @@ function buildNotificationPayload(input: {
     template: NOTIFICATION_TEMPLATE_KEYS.VOUCHER_APPOINTMENT_CONFIRMATION,
     data: {
       template_key: NOTIFICATION_TEMPLATE_KEYS.VOUCHER_APPOINTMENT_CONFIRMATION,
-      market_id: resolveNotificationMarketId(),
+      market_id: marketId,
       flow_id: "voucher_appointment",
       entitlement_instance_id: input.entitlementId,
       locale: input.locale,

@@ -7,7 +7,7 @@
  * konstruuje realnego `BrevoHttpClient` bez wstrzykniętego `fetch`.
  */
 
-import { readFileSync } from "node:fs"
+import { existsSync, readFileSync } from "node:fs"
 import path from "node:path"
 
 import { NOTIFICATION_TEMPLATE_KEYS } from "@gp/messaging"
@@ -78,9 +78,34 @@ describe("AC1 — rejestracja modułu Notification z providerem brevo", () => {
     expect(moduleBlock).toContain('channels: ["feed"]')
   })
 
-  it("default export to ModuleProvider z serwisem providera", () => {
-    expect(notificationBrevoProvider).toBeDefined()
+  it("wpis configu wskazuje ISTNIEJĄCY katalog modułu (nie tylko podłańcuch)", () => {
+    // R-2.2-L4: asercja na tekście configu wyłapie usunięcie wpisu, ale nie
+    // dowodzi, że `moduleRoot("notification-brevo")` w ogóle się rozwiązuje.
+    // Literówka w ścieżce dawała zielony test i czerwony boot.
+    const moduleDir = path.join(
+      BACKEND_ROOT,
+      "packages",
+      "api",
+      "src",
+      "modules",
+      "notification-brevo",
+    )
+    expect(existsSync(moduleDir)).toBe(true)
+    expect(existsSync(path.join(moduleDir, "index.ts"))).toBe(true)
+  })
+
+  it("default export to ModuleProvider modułu notification z serwisem brevo", () => {
+    // R-2.2-L4: sprawdzamy STRUKTURĘ tego, czego oczekuje loader providerów
+    // (`@medusajs/notification/dist/loaders/providers.js`): `services[]`
+    // z klasą, której `identifier` daje runtime key `np_brevo`.
+    const provider = notificationBrevoProvider as unknown as {
+      services?: unknown[]
+    }
+    expect(Array.isArray(provider.services)).toBe(true)
+    expect(provider.services).toContain(BrevoNotificationProviderService)
     expect(BrevoNotificationProviderService.identifier).toBe("brevo")
+    // Runtime key = NotificationProviderRegistrationPrefix + pinowany `id`.
+    expect(`np_${BrevoNotificationProviderService.identifier}`).toBe("np_brevo")
   })
 
   it("boot BEZ BREVO_API_KEY nie rzuca — konstrukcja providera jest leniwa", () => {
@@ -264,5 +289,163 @@ describe("resolveBrevoSenders", () => {
     const { senders, warning } = resolveBrevoSenders(env as NodeJS.ProcessEnv)
     expect(senders).toEqual({})
     expect(warning).toBeTruthy()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Review 2.2 — envelope audytowy, seam gatewaya, załączniki
+// ---------------------------------------------------------------------------
+
+describe("R-2.2-H1 — envelope audytowy jest KONSUMOWANY, nie wyrzucany", () => {
+  function makeServiceWithSink(gatewayResult: "ok" | "failed") {
+    const audited: Array<Record<string, unknown>> = []
+    const gateway = {
+      send: jest.fn(async () => ({
+        dispatch_id: "dispatch-1",
+        provider: "brevo" as const,
+        status: gatewayResult === "ok" ? ("queued" as const) : ("failed" as const),
+        provider_message_id: gatewayResult === "ok" ? "brevo-1" : undefined,
+        audit_event: {
+          audit_id: "audit-1",
+          event_type: "notification.dispatch",
+          status: gatewayResult === "ok" ? "queued" : "failed",
+          dispatch_id: "dispatch-1",
+          provider: "brevo",
+          flow_id: "voucher_purchase_delivery",
+          template_key: "voucher_purchase_confirmation",
+          channel: "email",
+          market_id: "bonbeauty",
+          locale: "pl-PL",
+          consent_basis: "transactional_critical",
+          idempotency_key: "idem-1",
+          hashed_recipient: "hash",
+          occurred_at: "2026-07-26T00:00:00.000Z",
+          ...(gatewayResult === "failed"
+            ? { error_code: "BREVO_TEMPLATE_NOT_CONFIGURED" }
+            : {}),
+        },
+      })),
+    }
+    const service = new BrevoNotificationProviderService({}, {}, {
+      gateway: gateway as never,
+      auditSink: (envelope) => audited.push(envelope as never),
+      env: {} as NodeJS.ProcessEnv,
+    })
+    return { service, audited, gateway }
+  }
+
+  it("ścieżka sukcesu oddaje envelope do sinka", async () => {
+    const { service, audited } = makeServiceWithSink("ok")
+
+    await expect(service.send(baseNotification() as never)).resolves.toEqual({
+      id: "brevo-1",
+    })
+    expect(audited).toHaveLength(1)
+    expect(audited[0]).toMatchObject({
+      status: "queued",
+      template_key: "voucher_purchase_confirmation",
+      hashed_recipient: "hash",
+    })
+    // Envelope jest PII-free z konstrukcji — adres NIGDY w audycie (D-70).
+    expect(JSON.stringify(audited[0])).not.toContain("buyer@example.test")
+  })
+
+  it("ścieżka błędu oddaje envelope ZANIM wrapper rzuci", async () => {
+    const { service, audited } = makeServiceWithSink("failed")
+
+    await expect(service.send(baseNotification() as never)).rejects.toThrow(
+      /BREVO_TEMPLATE_NOT_CONFIGURED/,
+    )
+    expect(audited).toHaveLength(1)
+    expect(audited[0]).toMatchObject({ status: "failed" })
+  })
+
+  it("awaria sinka nie zmienia wyniku wysyłki", async () => {
+    const { gateway } = makeServiceWithSink("ok")
+    const service = new BrevoNotificationProviderService({}, {}, {
+      gateway: gateway as never,
+      auditSink: () => {
+        throw new Error("sink down")
+      },
+      env: {} as NodeJS.ProcessEnv,
+    })
+
+    await expect(service.send(baseNotification() as never)).resolves.toEqual({
+      id: "brevo-1",
+    })
+  })
+
+  it("wstrzyknięty gateway izoluje w pełni — provider/klient NIE powstają (R-2.2-L3)", async () => {
+    const logger = { warn: jest.fn(), info: jest.fn() }
+    const gateway = {
+      send: jest.fn(async () => {
+        throw new Error("nie powinno dojść do wysyłki w tym teście")
+      }),
+    }
+    const service = new BrevoNotificationProviderService(
+      { logger: logger as never },
+      {},
+      {
+        gateway: gateway as never,
+        // Celowo POPSUTA mapa senderów: gdyby wrapper budował providera mimo
+        // wstrzykniętego gatewaya, `resolveBrevoSenders` zalogowałby warning.
+        env: { [BREVO_SENDERS_ENV]: "{nope", [BREVO_API_KEY_ENV]: "x" } as NodeJS.ProcessEnv,
+      },
+    )
+
+    await expect(service.send(baseNotification() as never)).rejects.toThrow()
+    expect(logger.warn).not.toHaveBeenCalled()
+  })
+})
+
+describe("R-2.2-M1 — załączniki nie giną w mapowaniu", () => {
+  it("top-level `attachments` (kontrakt Medusy) trafia do intentu jako base64", () => {
+    const intent = toNotificationIntent({
+      to: "b@example.test",
+      channel: "email",
+      template: "t",
+      data: { market_id: "bonbeauty", locale: "pl" },
+      attachments: [{ filename: "wizyta.ics", content: "BEGIN:VCALENDAR" }],
+    } as never)
+
+    expect(intent.attachments).toEqual([
+      {
+        name: "wizyta.ics",
+        content_base64: Buffer.from("BEGIN:VCALENDAR", "utf8").toString("base64"),
+      },
+    ])
+  })
+
+  it("`data.attachments` (zastana forma call-site'u) działa tak samo i NIE zasila params", () => {
+    const intent = toNotificationIntent({
+      to: "b@example.test",
+      channel: "email",
+      template: "t",
+      data: {
+        market_id: "bonbeauty",
+        locale: "pl",
+        attachments: [
+          { filename: "wizyta.ics", content: "QkVHSU4=", encoding: "base64" },
+        ],
+        voucher_code: "ABC",
+      },
+    } as never)
+
+    expect(intent.attachments).toEqual([
+      { name: "wizyta.ics", content_base64: "QkVHSU4=" },
+    ])
+    expect(intent.variables).toEqual({ voucher_code: "ABC" })
+  })
+
+  it("załącznik bez nazwy albo bez treści jest pomijany (zero pustego attachment[])", () => {
+    const intent = toNotificationIntent({
+      to: "b@example.test",
+      channel: "email",
+      template: "t",
+      data: { market_id: "bonbeauty", locale: "pl" },
+      attachments: [{ content: "x" }, { filename: "pusty.ics" }],
+    } as never)
+
+    expect(intent.attachments).toBeUndefined()
   })
 })

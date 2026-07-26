@@ -14,7 +14,7 @@ import {
 import { VOUCHER_MODULE } from "../modules/voucher"
 // Story 2.2 (AC5 poz.5): klucz szablonu WYŁĄCZNIE ze stałej rejestru (AD-6).
 import { NOTIFICATION_TEMPLATE_KEYS } from "@gp/messaging"
-import { resolveNotificationMarketId } from "../lib/notification-market-context"
+import { resolveMarketScopedNotificationMarketId } from "../lib/notification-market-context"
 
 /**
  * voucher-claimed-buyer-notification — Story v160-6-6 backend subscriber.
@@ -40,6 +40,12 @@ interface VoucherClaimedEventPayload {
   voucher_id: string
   voucher_code?: string
   claimed_at?: string
+  /**
+   * R-2.2-M4: rynek z danych domenowych, gdy event go niesie. Dziś opcjonalny —
+   * emitent jeszcze go nie ustawia — ale gdy się pojawi, wysyłka przestaje
+   * zależeć od `GP_DEFAULT_MARKET_ID` bez zmiany tego pliku.
+   */
+  market_id?: string
 }
 
 type LoggerLike = {
@@ -67,6 +73,7 @@ interface BuyerClaimNotificationDispatcher {
     html: string
     locale: "pl" | "en"
     voucher_id: string
+    market_id?: string | null
   }): Promise<{ notificationId: string | null }>
 }
 
@@ -158,6 +165,7 @@ function createVoucherClaimAuditFetcher(
 
 function createBuyerClaimNotificationDispatcher(
   notificationModule: NotificationModuleLike,
+  logger?: LoggerLike,
 ): BuyerClaimNotificationDispatcher {
   return {
     async dispatch(input) {
@@ -169,7 +177,13 @@ function createBuyerClaimNotificationDispatcher(
         template: NOTIFICATION_TEMPLATE_KEYS.BUYER_CLAIM_NOTIFICATION,
         data: {
           template_key: NOTIFICATION_TEMPLATE_KEYS.BUYER_CLAIM_NOTIFICATION,
-          market_id: resolveNotificationMarketId(),
+          // R-2.2-M4: rynek z danych domenowych, gdy jest; fallback konfiguracyjny
+          // wyłącznie z głośnym ostrzeżeniem (to wysyłka market-scoped).
+          market_id: resolveMarketScopedNotificationMarketId({
+            market_id: input.market_id,
+            call_site: "voucher-claimed-buyer-notification",
+            logger,
+          }),
           flow_id: "voucher_claim",
           voucher_id: input.voucher_id,
           locale: input.locale,
@@ -271,6 +285,7 @@ export async function handleVoucherClaimedForBuyerNotification(
         html,
         locale: projected.locale,
         voucher_id,
+        market_id: payload.market_id ?? null,
       })
 
       deps.logger?.info?.("[buyer-claim] notification sent", {
@@ -329,7 +344,7 @@ export default async function voucherClaimedBuyerNotificationSubscriber({
     event.data as VoucherClaimedEventPayload,
   )
   const notificationModule = container.resolve(Modules.NOTIFICATION) as NotificationModuleLike
-  const dispatcher = createBuyerClaimNotificationDispatcher(notificationModule)
+  const dispatcher = createBuyerClaimNotificationDispatcher(notificationModule, logger)
 
   await handleVoucherClaimedForBuyerNotification(
     event.data as VoucherClaimedEventPayload,

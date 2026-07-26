@@ -70,12 +70,23 @@ describe("buildBrevoTemplateMap (AD-6 allowlist)", () => {
     }
   });
 
-  it("dziś rejestr jest w całości not_configured → mapa pusta (zamierzone, AC2)", () => {
-    // Ten test celowo dokumentuje stan wejściowy v1.14.0: ID szablonów Brevo to
-    // dana operacyjna. Gdy operator uzupełni rejestr, test zacznie pokazywać
-    // realne ID — i to jest sygnał do świadomej aktualizacji, nie regresja.
+  it("mapa dla każdego locale zawiera DOKŁADNIE skonfigurowane wpisy rejestru", () => {
+    // R-2.2-L6: wcześniej ten test asertował `toEqual({})` — czyli zapalał się na
+    // czerwono w chwili, gdy operator (PO) uzupełni PIERWSZE ID szablonu Brevo,
+    // czyli wykona dokładnie tę czynność, na którą story czeka. Pułapka na
+    // legalną operację nie jest sygnałem, tylko szumem. Testujemy INWARIANT:
+    // mapa == wpisy rejestru z ID ≠ `not_configured`, dla każdego locale.
     for (const locale of ["pl-PL", "uk-UA", "de-DE", "en-US"] as const) {
-      expect(buildBrevoTemplateMap(locale)).toEqual({});
+      const registryLocale = toRegistryLocale(locale);
+      const expected = Object.fromEntries(
+        NOTIFICATION_TEMPLATE_REGISTRY.filter(
+          (entry) => entry.brevo[registryLocale] !== BREVO_TEMPLATE_NOT_CONFIGURED,
+        ).map((entry) => [
+          entry.template_key,
+          Number(entry.brevo[registryLocale]),
+        ]),
+      );
+      expect(buildBrevoTemplateMap(locale)).toEqual(expected);
     }
   });
 

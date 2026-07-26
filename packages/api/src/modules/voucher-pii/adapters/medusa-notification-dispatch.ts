@@ -68,11 +68,7 @@ export class MedusaNotificationDispatchAdapter implements NotificationDispatchPo
   }): Promise<{ provider_message_id: string | null }> {
     const notificationModule = this.resolveNotificationModule();
 
-    const recipient = await this.db("voucher_recipient_pii")
-      .select("recipient_email", "locale")
-      .where({ id: args.recipient_id, market_id: args.market_id })
-      .whereNull("tombstoned_at")
-      .first();
+    const recipient = await this.readRecipient(args.recipient_id, args.market_id);
 
     const to = typeof recipient?.recipient_email === "string" ? recipient.recipient_email.trim() : "";
     if (!to) {
@@ -84,16 +80,23 @@ export class MedusaNotificationDispatchAdapter implements NotificationDispatchPo
       );
     }
 
+    const idempotencyKey = `voucher-delivery:${args.consent_audit_id}`;
     const payload = {
       to,
       channel: "email",
       template: NOTIFICATION_TEMPLATE_KEYS.VOUCHER_PURCHASE_CONFIRMATION,
+      // R-2.2-I2: Medusa dedupikuje po TOP-LEVELOWYM `idempotency_key`
+      // (`NotificationModuleService.createNotifications_` robi lookup
+      // `notificationService_.list({ idempotency_key })`) — to trwały,
+      // międzyprocesowy dedupe, którego dotąd nie używaliśmy. Kopia w `data`
+      // zostaje, bo konsumuje ją in-memory cache gatewaya (inna warstwa).
+      idempotency_key: idempotencyKey,
       data: {
         template_key: NOTIFICATION_TEMPLATE_KEYS.VOUCHER_PURCHASE_CONFIRMATION,
         market_id: args.market_id,
         locale: typeof recipient?.locale === "string" ? recipient.locale : "pl",
         flow_id: "voucher_purchase_delivery",
-        idempotency_key: `voucher-delivery:${args.consent_audit_id}`,
+        idempotency_key: idempotencyKey,
         consent_audit_id: args.consent_audit_id,
         delivery_decision_id: args.delivery_decision_id,
         request_id: args.request_id,
@@ -106,6 +109,33 @@ export class MedusaNotificationDispatchAdapter implements NotificationDispatchPo
         : await notificationModule.send?.(payload);
 
     return { provider_message_id: extractNotificationId(result) };
+  }
+
+  /**
+   * R-2.2-H2: odczyt `voucher_recipient_pii` w JAWNYM kontekście rynku.
+   *
+   * Tabela ma `ENABLE` **oraz** `FORCE ROW LEVEL SECURITY` (jedyna taka w repo),
+   * a polityka porównuje `market_id` z GUC `app.gp_market_id`. GUC ustawia
+   * wyłącznie `lib/rls-pool-hook.ts` i tylko wtedy, gdy ALS ma kontekst rynku
+   * store-requestu. `executeDeliveryStep` biegnie z SUBSCRIBERA — poza tym ALS —
+   * więc bez tego `set_config` polityka jest fail-closed: 0 wierszy → każdy
+   * realny Step-3 degradowałby do `dlq_provider_failed`, wyglądając jak „problem
+   * z Brevo", a nie jak błąd izolacji. Na dev (superuser omija RLS) byłoby to
+   * niewidoczne — dlatego kontekst ustawiamy jawnie, transakcyjnie
+   * (`is_local = true` → GUC znika razem z transakcją, zero wycieku na pulę).
+   */
+  private async readRecipient(
+    recipientId: string,
+    marketId: string,
+  ): Promise<{ recipient_email?: unknown; locale?: unknown } | undefined> {
+    return this.db.transaction(async (trx) => {
+      await trx.raw("SELECT set_config('app.gp_market_id', ?, true)", [marketId]);
+      return trx("voucher_recipient_pii")
+        .select("recipient_email", "locale")
+        .where({ id: recipientId, market_id: marketId })
+        .whereNull("tombstoned_at")
+        .first();
+    });
   }
 
   private resolveNotificationModule(): NotificationModuleLike {

@@ -22,8 +22,23 @@ import {
   MessagingValidationError,
   type ConsentBasis,
   type Locale,
+  type NotificationAttachment,
   type NotificationIntent,
 } from "@gp/messaging"
+
+/**
+ * R-2.2-M1: `attachments` JEST polem kontraktu Medusy
+ * (`ProviderSendNotificationDTO`) i realnie dociera do providera — przed fixem
+ * wrapper go nie znał, więc mail potwierdzenia wizyty jechał bez pliku ICS
+ * (cicha utrata treści, bez fail-loud).
+ */
+type ProviderAttachmentLike = {
+  filename?: unknown
+  name?: unknown
+  content?: unknown
+  content_base64?: unknown
+  encoding?: unknown
+}
 
 type ProviderSendNotificationLike = {
   to: string
@@ -32,6 +47,7 @@ type ProviderSendNotificationLike = {
   data?: Record<string, unknown> | null
   content?: unknown
   provider_data?: Record<string, unknown> | null
+  attachments?: ProviderAttachmentLike[] | null
 }
 
 /** Klucze sterujące — kontekst GP, nie zmienne szablonu Brevo. */
@@ -42,6 +58,10 @@ const CONTROL_KEYS = new Set([
   "flow_id",
   "consent_basis",
   "idempotency_key",
+  // `attachments` w `data` to duplikat pola top-level (tak robi call-site
+  // appointment-confirmed) — jest konsumowany jako załącznik, nie jako zmienna
+  // szablonu; bez tego cała treść ICS trafiłaby do `params` Brevo.
+  "attachments",
 ])
 
 const LOCALE_ALIASES: Readonly<Record<string, Locale>> = {
@@ -73,6 +93,55 @@ export function normalizeLocale(raw: unknown): Locale | undefined {
 function readString(source: Record<string, unknown> | null | undefined, key: string): string | undefined {
   const value = source?.[key]
   return typeof value === "string" && value.trim() ? value.trim() : undefined
+}
+
+/**
+ * Mapuje załączniki call-site'u na kontrakt `NotificationAttachment`
+ * (`content_base64` ZAWSZE base64 — R-2.2-M1).
+ *
+ * Reguła jest jawna, nie zgadywana:
+ *   - `content_base64` podane            → bierzemy verbatim,
+ *   - `encoding: "base64"`               → `content` jest już base64,
+ *   - w pozostałych przypadkach          → `content` to tekst (np. surowy ICS)
+ *                                          i kodujemy go tutaj.
+ * Załącznik bez nazwy albo bez treści jest pomijany — pusty `attachment[]`
+ * Brevo odrzuca, a wysłanie pliku bez nazwy nie ma sensu biznesowego.
+ */
+function toNotificationAttachments(
+  raw: ProviderAttachmentLike[] | null | undefined,
+): NotificationAttachment[] | undefined {
+  if (!Array.isArray(raw) || raw.length === 0) {
+    return undefined
+  }
+
+  const attachments: NotificationAttachment[] = []
+  for (const entry of raw) {
+    if (!entry || typeof entry !== "object") {
+      continue
+    }
+    const name =
+      (typeof entry.filename === "string" && entry.filename.trim()) ||
+      (typeof entry.name === "string" && entry.name.trim()) ||
+      ""
+    const alreadyBase64 =
+      typeof entry.content_base64 === "string" && entry.content_base64.trim()
+        ? entry.content_base64.trim()
+        : entry.encoding === "base64" && typeof entry.content === "string"
+          ? entry.content
+          : undefined
+    const content =
+      alreadyBase64 ??
+      (typeof entry.content === "string" && entry.content
+        ? Buffer.from(entry.content, "utf8").toString("base64")
+        : undefined)
+
+    if (!name || !content) {
+      continue
+    }
+    attachments.push({ name, content_base64: content })
+  }
+
+  return attachments.length > 0 ? attachments : undefined
 }
 
 /**
@@ -137,6 +206,12 @@ export function toNotificationIntent(
     }
   }
 
+  // Top-level `attachments` (kontrakt Medusy) ma pierwszeństwo; `data.attachments`
+  // to forma używana przez zastane call-site'y i jest równoważna.
+  const attachments = toNotificationAttachments(
+    notification.attachments ?? (data.attachments as ProviderAttachmentLike[] | undefined),
+  )
+
   return {
     flow_id: readString(data, "flow_id") ?? templateKey,
     channel: "email",
@@ -146,5 +221,6 @@ export function toNotificationIntent(
     locale,
     consent_basis: consentBasis,
     idempotency_key: readString(data, "idempotency_key") ?? uuid(),
+    ...(attachments ? { attachments } : {}),
   }
 }

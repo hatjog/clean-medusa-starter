@@ -5,6 +5,13 @@ loadEnv("test", process.cwd());
 // Te testy musza isc z kontekstu monorepo GP (`GP/backend && yarn test:unit`).
 // Samodzielny checkout submodulu poza monorepo zakonczy sie MODULE_NOT_FOUND.
 // To znane sprzezenie monorepo: test konceptualnie nalezy do GP/portal, ale wymaga mockow Jest.
+//
+// DRUGI PRZYPADEK (v1.14.0 Story 2.2, R-2.2-I3): testy pakietu @gp/messaging
+// (`packages/messaging/src/__tests__/notification-template-registry.test.ts`)
+// czytaja rejestr `specs/contracts/notifications/templates.yaml` z SUPER-REPO
+// (REPO_ROOT = piec poziomow w gore) — to swiadoma cena za drift-test
+// bajt-w-bajt projekcji YAML->TS (tak samo robi codegen). Samodzielny checkout
+// submodulu GP/backend poza monorepo nie przejdzie tych testow.
 
 module.exports = {
   transform: {

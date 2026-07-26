@@ -41,8 +41,15 @@ export type DispatchVendorEmailInput = {
   triggerBy: string
   /** Rynek odbiorcy; domyślnie `resolveNotificationMarketId()` (patrz dług tam). */
   marketId?: string
-  /** Locale wiadomości (pl/en/ua/de albo BCP-47); wymagane przez providera. */
-  locale?: string
+  /**
+   * Locale wiadomości (pl/en/ua/de albo BCP-47) — WYMAGANE.
+   *
+   * R-2.2-L1: wcześniej pole było opcjonalne z cichym defaultem `"pl"`, co łamało
+   * kontrakt fail-loud `GP_NOTIFICATION_LOCALE_UNSUPPORTED` z `intent.ts`:
+   * pominięcie locale przez nowego wołającego wysłałoby polski szablon zamiast
+   * wybuchnąć. Oba dzisiejsze call-site'y i tak je podają.
+   */
+  locale: string
   /** Flow dla KPI/feature-flag; domyślnie `templateKey`. */
   flowId?: string
   /** Klucz idempotencji gatewaya; brak = wysyłka bez dedupe. */
@@ -118,16 +125,24 @@ export async function dispatchVendorEmail(
     // (ADR-158) jedzie w `data` i ma pierwszeństwo po stronie wrappera brevo;
     // obie wartości pochodzą z tej samej stałej rejestru.
     template: input.templateKey,
+    // R-2.2-I2: top-level `idempotency_key` włącza TRWAŁY, międzyprocesowy dedupe
+    // modułu Notification Medusy (lookup `list({ idempotency_key })`) — kopia
+    // w `data` obsługuje osobną warstwę (in-memory cache gatewaya).
+    ...(input.idempotencyKey ? { idempotency_key: input.idempotencyKey } : {}),
     data: {
+      // R-2.2-L2: metadane call-site'u rozlewają się PRZED kluczami sterującymi,
+      // więc przypadkowy `template_key`/`market_id`/`locale` w `metadata` nie
+      // nadpisze allowlisty AD-6 ani rozwiązania nadawcy. Wcześniej spread stał
+      // na końcu i był niejawnym kanałem nadpisania.
+      ...input.metadata,
       template_key: input.templateKey,
       market_id: input.marketId ?? resolveNotificationMarketId(),
-      locale: input.locale ?? "pl",
+      locale: input.locale,
       flow_id: input.flowId ?? input.templateKey,
       ...(input.idempotencyKey ? { idempotency_key: input.idempotencyKey } : {}),
       subject: input.subject,
       text: input.text,
       html: input.html,
-      ...input.metadata,
     },
     content: {
       subject: input.subject,

@@ -6,12 +6,25 @@ interface MessagingErrorOptions {
   audit_event?: NotificationAuditEnvelope;
   cause?: unknown;
   status_code?: number;
+  /**
+   * R-2.2-M2: błąd PRE-FLIGHT — rzucony ZANIM cokolwiek poszło do providera
+   * (walidacja payloadu, brak sendera/szablonu w allowliście, brak API key).
+   * Semantycznie jednoznaczny: „na pewno nic nie wysłano".
+   *
+   * Gateway używa tej flagi do rozstrzygnięcia, czy wolno zacache'ować `failed`
+   * pod idempotency cache key. Cache'owanie ma sens WYŁĄCZNIE dla błędów
+   * niejednoznacznych (timeout-after-send) — dla pre-flight zablokowałoby
+   * retry po naprawie konfiguracji na cały TTL (24 h).
+   */
+  preflight?: boolean;
 }
 
 export class MessagingError extends Error {
   readonly error_code: string;
   readonly audit_event?: NotificationAuditEnvelope;
   readonly status_code?: number;
+  /** patrz `MessagingErrorOptions.preflight` — „na pewno nic nie wysłano". */
+  readonly preflight: boolean;
 
   constructor(message: string, options: MessagingErrorOptions) {
     // Root tsconfig targets ES2021 (lib.es2021) where Error constructor
@@ -26,6 +39,7 @@ export class MessagingError extends Error {
     this.error_code = options.error_code;
     this.audit_event = options.audit_event;
     this.status_code = options.status_code;
+    this.preflight = options.preflight ?? false;
   }
 }
 

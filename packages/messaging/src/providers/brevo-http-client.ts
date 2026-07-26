@@ -124,7 +124,9 @@ export class NotConfiguredBrevoClient implements IBrevoClient {
   async sendTransacEmail(): Promise<BrevoSendResponse> {
     throw new MessagingProviderError(
       "Brevo API key is not configured — refusing to dispatch (set BREVO_API_KEY)",
-      { error_code: "BREVO_API_KEY_NOT_CONFIGURED" },
+      // R-2.2-M2: nic nie poszło do Brevo → gateway nie cache'uje tego failu,
+      // więc retry po ustawieniu sekretu realnie dotknie providera.
+      { error_code: "BREVO_API_KEY_NOT_CONFIGURED", preflight: true },
     );
   }
 }
