@@ -24,6 +24,7 @@ export type {
   DeliveryDecisionPort,
   EventEmitterPort,
   IdempotencyPort,
+  NotificationDispatchPort,
   RateLimitPort,
   VoucherPiiPort,
 } from "./ports";

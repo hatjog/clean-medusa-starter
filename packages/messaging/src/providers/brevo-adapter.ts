@@ -57,6 +57,7 @@ export class BrevoAdapter implements IMessagingProvider {
     if (!recipientEmail) {
       throw new MessagingValidationError("Email recipient is required for Brevo", {
         error_code: "BREVO_RECIPIENT_EMAIL_REQUIRED",
+        preflight: true,
       });
     }
 
@@ -66,6 +67,10 @@ export class BrevoAdapter implements IMessagingProvider {
         `Brevo sender is not configured for market '${intent.recipient.market_id}'`,
         {
           error_code: "BREVO_SENDER_NOT_CONFIGURED",
+          // R-2.2-M2: błąd konfiguracji — nic nie poszło do Brevo, więc gateway
+          // NIE MOŻE go zacache'ować (inaczej retry po naprawie configu przez
+          // 24 h nie dotknąłby providera).
+          preflight: true,
         },
       );
     }
@@ -76,6 +81,7 @@ export class BrevoAdapter implements IMessagingProvider {
         `Brevo template is not configured for '${intent.template_key}'`,
         {
           error_code: "BREVO_TEMPLATE_NOT_CONFIGURED",
+          preflight: true,
         },
       );
     }
@@ -98,6 +104,16 @@ export class BrevoAdapter implements IMessagingProvider {
       headers: {
         "X-Mailin-Tag": `${intent.recipient.market_id}:${intent.flow_id}:${intent.template_key}`,
       },
+      // R-2.2-M1: załączniki jadą do Brevo jako `attachment: [{content(base64), name}]`.
+      // Pole jest pomijane, gdy intent ich nie niesie (Brevo odrzuca pustą tablicę).
+      ...(intent.attachments?.length
+        ? {
+            attachment: intent.attachments.map((attachment) => ({
+              content: attachment.content_base64,
+              name: attachment.name,
+            })),
+          }
+        : {}),
     };
   }
 }
@@ -122,11 +138,15 @@ function toMessagingProviderError(error: unknown): MessagingProviderError {
     extractNestedString(error, ["body", "code"]) ??
     extractNestedString(error, ["code"]) ??
     (statusCode ? `BREVO_HTTP_${statusCode}` : "BREVO_PROVIDER_ERROR");
-  const message =
-    extractNestedString(error, ["response", "body", "message"]) ??
-    extractNestedString(error, ["body", "message"]) ??
-    extractNestedString(error, ["message"]) ??
-    "Brevo provider request failed";
+  // R-2.2-M5 (D-70: zero PII w audycie): treść `message` z odpowiedzi Brevo
+  // rutynowo cytuje odrzucony adres ("Invalid email address: …"), a
+  // `MessagingProviderError.message` ląduje w `NotificationAuditEnvelope.error_message`
+  // — envelope, który z założenia jest PII-free (`hashed_recipient`). Dlatego
+  // budujemy komunikat WYŁĄCZNIE z kodu i statusu HTTP; surowa odpowiedź
+  // providera zostaje na `cause` (do debug/logu operatora), nie w audycie.
+  const message = statusCode
+    ? `Brevo provider request failed (${errorCode}, HTTP ${statusCode})`
+    : `Brevo provider request failed (${errorCode})`;
 
   return new MessagingProviderError(message, {
     error_code: errorCode,

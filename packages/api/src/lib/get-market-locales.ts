@@ -116,3 +116,83 @@ export function getMarketLocales(
   void marketId;
   return fallback;
 }
+
+/**
+ * Story 2.3 (v1.14.0, AC3) — KANONICZNA normalizacja locale wysyłki wobec
+ * konfiguracji locale rynku.
+ *
+ * Powstaje TUTAJ, w istniejącym SSOT locale rynku, a nie jako trzeci lokalny
+ * `resolveLocale` w kodzie wysyłkowym (repo ma już dwa: `lib/auth/
+ * recover-magic-link-email.ts` i `modules/vendor-notifications/
+ * buyer-claim-projection.ts` — story 2.3 zakazuje dodawania trzeciego).
+ *
+ * Kontrakt (AC3):
+ *   - wartość obecna I obecna na liście `supported` rynku → używana,
+ *   - wartość NIEOBECNA (null/puste) → fallback `locales.default` + `warn`,
+ *   - wartość SPOZA listy rynku → fallback `locales.default` + `warn`
+ *     (nigdy wysyłka w locale, którego rynek nie obsługuje).
+ * Fallback jest ZAWSZE jawny i logowany — cichy fallback dawałby maila
+ * w złym języku, który wygląda jak sukces.
+ */
+export type MarketLocaleResolution = {
+  locale: LocaleTag;
+  source: "requested" | "market_default";
+  reason: "requested_supported" | "missing" | "not_supported_by_market";
+};
+
+type MarketLocaleLogger = {
+  warn?: (message: string, meta?: Record<string, unknown>) => void;
+};
+
+export function resolveMarketLocale(input: {
+  requested?: string | null;
+  marketId: string;
+  locales: MarketLocaleConfig;
+  callSite: string;
+  logger?: MarketLocaleLogger;
+}): MarketLocaleResolution {
+  const requested =
+    typeof input.requested === "string" ? input.requested.trim().toLowerCase() : "";
+  const supported = input.locales.supported.map((tag) => tag.toLowerCase());
+  const fallback = input.locales.default;
+
+  if (!requested) {
+    input.logger?.warn?.(
+      `[market-locale] ${input.callSite}: brak locale w danych domenowych — ` +
+        `użyto locales.default rynku ('${fallback}')`,
+      {
+        call_site: input.callSite,
+        market_id: input.marketId,
+        locale: fallback,
+        reason: "missing",
+      }
+    );
+    return { locale: fallback, source: "market_default", reason: "missing" };
+  }
+
+  if (!supported.includes(requested)) {
+    input.logger?.warn?.(
+      `[market-locale] ${input.callSite}: locale '${requested}' nie jest wspierane ` +
+        `przez rynek — użyto locales.default ('${fallback}')`,
+      {
+        call_site: input.callSite,
+        market_id: input.marketId,
+        requested_locale: requested,
+        locale: fallback,
+        reason: "not_supported_by_market",
+      }
+    );
+    return {
+      locale: fallback,
+      source: "market_default",
+      reason: "not_supported_by_market",
+    };
+  }
+
+  // Zwracamy wariant z listy rynku (a nie surowe wejście), żeby kanoniczna
+  // wielkość znaków pochodziła z konfiguracji, nie od wołającego.
+  const canonical =
+    input.locales.supported.find((tag) => tag.toLowerCase() === requested) ?? requested;
+
+  return { locale: canonical, source: "requested", reason: "requested_supported" };
+}

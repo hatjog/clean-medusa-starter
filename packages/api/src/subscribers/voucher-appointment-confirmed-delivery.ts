@@ -1,5 +1,5 @@
 import type { SubscriberArgs, SubscriberConfig } from "@medusajs/framework"
-import { Modules } from "@medusajs/framework/utils"
+import { ContainerRegistrationKeys, Modules } from "@medusajs/framework/utils"
 
 import {
   buildVoucherAppointmentDeliveryEmail,
@@ -14,6 +14,19 @@ import type {
   VoucherAppointmentLifecycleStatus,
 } from "../modules/voucher-delivery/ics-generator"
 import { VOUCHER_MODULE } from "../modules/voucher"
+// Story 2.2 (AC5 poz.5): klucz szablonu WYŁĄCZNIE ze stałej rejestru (AD-6).
+import { NOTIFICATION_TEMPLATE_KEYS } from "@gp/messaging"
+import { resolveMarketScopedNotificationMarketId } from "../lib/notification-market-context"
+// RLC005/M3 (code-review 2.4): locale odbiorcy NIE może być zaszyte —
+// ten sam resolver + fail-loud co ścieżka 2.3 (voucher-purchase-delivery.ts).
+import { resolveMarketLocale } from "../lib/get-market-locales"
+import {
+  createMarketLocalesReader,
+  type MarketLocalesReader,
+} from "../lib/read-market-locales"
+
+export const APPOINTMENT_MARKET_LOCALES_UNAVAILABLE_ERROR_CODE =
+  "VOUCHER_DELIVERY_MARKET_LOCALES_UNAVAILABLE"
 
 export const VOUCHER_APPOINTMENT_CONFIRMED_EVENT =
   "gp.voucher.appointment_confirmed.v1" as const
@@ -41,10 +54,28 @@ type AppointmentConfirmedPayload = {
   lifecycle_status?: VoucherAppointmentLifecycleStatus | null
 }
 
+/**
+ * Story 2.3 (AC6b) — rynek przychodzi w `scope` KOPERTY, nie w payloadzie.
+ *
+ * Domknięcie R-2.2-M4: 2.2 dodało opcjonalne `payload.market_id`, ale schema
+ * `gp.voucher.appointment_confirmed.v1` ma `additionalProperties: false` i NIE
+ * deklaruje tego pola — czyli emiter nie mógłby go legalnie wysłać, a odczyt
+ * z payloadu był martwy. Normatywnym nośnikiem rynku jest `envelope.v1`
+ * `scope.market_id` (pole WYMAGANE w kopercie), uzupełniony przez projekcję
+ * `findAppointmentConfirmationDeliverySource` (od 2.3 zwraca `market_id`).
+ */
+type AppointmentConfirmedScope = {
+  instance_id?: string
+  market_id?: string | null
+  vendor_id?: string | null
+  location_id?: string | null
+}
+
 type AppointmentConfirmedEnvelope = {
   event_type?: string
   occurred_at?: string
   causation_id?: string
+  scope?: AppointmentConfirmedScope
   payload?: Partial<AppointmentConfirmedPayload>
 }
 
@@ -54,6 +85,8 @@ type AppointmentConfirmationDeliverySource = {
   salon_name?: string | null
   location_address?: string | null
   seller_handle?: string | null
+  /** R-2.2-M4 domknięte w Story 2.3: projekcja zwraca rynek z danych domenowych. */
+  market_id?: string | null
 }
 
 type AppointmentSourceReader = {
@@ -86,11 +119,13 @@ export async function handleVoucherAppointmentConfirmedDelivery(
     artifactStorage: Pick<IVoucherPdfStorage, "store">
     downloadBaseUrl: string
     hmacSecret: string
+    marketLocales: MarketLocalesReader
     logger?: LoggerLike
     now?: Date
   },
 ): Promise<AppointmentConfirmationDeliveryResult> {
   const payload = extractAppointmentPayload(data)
+  const scopeMarketId = extractAppointmentScopeMarketId(data)
   const entitlementId = payload.entitlement_instance_id ?? null
 
   if (!entitlementId) {
@@ -112,6 +147,52 @@ export async function handleVoucherAppointmentConfirmedDelivery(
       error_message: "appointment delivery source not found",
     }
   }
+
+  // RLC005/M3: locale odbiorcy pochodzi WYŁĄCZNIE z `resolveMarketLocale`
+  // (ten sam resolver co 2.3) — nigdy z literału ani z `?? "pl"` w kodzie.
+  // marketId liczymy raz, przed rozstrzygnięciem locale, żeby oba call-site'y
+  // (locale + `market_id` notyfikacji) dzieliły ten sam rynek.
+  const marketId = resolveMarketScopedNotificationMarketId({
+    market_id: scopeMarketId ?? source.market_id ?? null,
+    call_site: "voucher-appointment-confirmed-delivery",
+    logger: deps.logger,
+  })
+  const marketLocaleRead = await deps.marketLocales.read(marketId)
+  const localeResolution = resolveMarketLocale({
+    requested: source.buyer_locale ?? null,
+    marketId,
+    locales: marketLocaleRead.config,
+    callSite: "voucher-appointment-confirmed-delivery",
+    logger: deps.logger,
+  })
+
+  // Wzorzec 2.3 (AC4 „FAIL-LOUD, bez downgrade'u"): konfiguracja locale rynku
+  // NIEZNANA + dane domenowe niosą locale, którego ten shim nie zna → to
+  // niewiedza o rynku, nie „locale niewspierane" — cichy downgrade do `pl`
+  // dałby maila w złym języku wyglądającego jak sukces.
+  if (
+    marketLocaleRead.degraded &&
+    localeResolution.reason === "not_supported_by_market"
+  ) {
+    deps.logger?.error?.(
+      "[voucher-appointment-confirmed] konfiguracja locale rynku niedostępna, a dane " +
+        "domenowe niosą inne locale — wysyłka wstrzymana zamiast downgrade'u do locale domyślnego",
+      {
+        entitlement_instance_id: entitlementId,
+        market_id: marketId,
+        requested_locale: source.buyer_locale ?? null,
+        error_code: APPOINTMENT_MARKET_LOCALES_UNAVAILABLE_ERROR_CODE,
+      },
+    )
+    return {
+      entitlement_instance_id: entitlementId,
+      status: "failed",
+      notification_id: null,
+      error_message: APPOINTMENT_MARKET_LOCALES_UNAVAILABLE_ERROR_CODE,
+    }
+  }
+
+  const locale = localeResolution.locale
 
   const now = deps.now ?? new Date()
   const appointment = buildAppointmentInput(payload, source, now)
@@ -150,8 +231,9 @@ export async function handleVoucherAppointmentConfirmedDelivery(
   const notificationPayload = buildNotificationPayload({
     to: source.buyer_email,
     entitlementId,
-    locale: source.buyer_locale ?? "pl",
+    locale,
     email,
+    marketId,
   })
   const result = await deps.dispatcher.dispatch(notificationPayload)
   const notificationId = extractNotificationId(result)
@@ -228,17 +310,37 @@ function extractAppointmentPayload(
   return data as Partial<AppointmentConfirmedPayload>
 }
 
+/** Story 2.3 (AC6b) — rynek z `scope` koperty envelope.v1 (pole wymagane). */
+function extractAppointmentScopeMarketId(
+  data: AppointmentConfirmedEnvelope | Record<string, unknown>,
+): string | null {
+  const scope = (data as AppointmentConfirmedEnvelope).scope
+  if (!scope || typeof scope !== "object") return null
+  const marketId = scope.market_id
+  if (typeof marketId !== "string") return null
+  const trimmed = marketId.trim()
+  return trimmed.length > 0 ? trimmed : null
+}
+
 function buildNotificationPayload(input: {
   to: string
   entitlementId: string
   locale: string
   email: VoucherAppointmentDeliveryEmail
+  marketId: string
 }): Record<string, unknown> {
+  const marketId = input.marketId
+
   return {
     to: input.to,
     channel: "email",
-    template: "voucher_appointment_confirmation",
+    // `template` = pole kontraktu Medusy; `data.template_key` = kanoniczne GP
+    // (ADR-158). Obie wartości z tej samej stałej rejestru.
+    template: NOTIFICATION_TEMPLATE_KEYS.VOUCHER_APPOINTMENT_CONFIRMATION,
     data: {
+      template_key: NOTIFICATION_TEMPLATE_KEYS.VOUCHER_APPOINTMENT_CONFIRMATION,
+      market_id: marketId,
+      flow_id: "voucher_appointment",
       entitlement_instance_id: input.entitlementId,
       locale: input.locale,
       subject: input.email.subject,
@@ -254,7 +356,7 @@ function buildNotificationPayload(input: {
     },
     attachments: input.email.attachments,
     metadata: {
-      notification_type: "voucher_appointment_confirmation",
+      notification_type: NOTIFICATION_TEMPLATE_KEYS.VOUCHER_APPOINTMENT_CONFIRMATION,
       triggered_by: "system",
       event_type: VOUCHER_APPOINTMENT_CONFIRMED_EVENT,
       entitlement_instance_id: input.entitlementId,
@@ -330,6 +432,7 @@ export default async function voucherAppointmentConfirmedDeliverySubscriber({
   const sourceReader = container.resolve(VOUCHER_MODULE) as AppointmentSourceReader
   const notificationModule = container.resolve(Modules.NOTIFICATION) as NotificationModuleLike
   const artifactStorage = container.resolve(STORAGE_CONTAINER_KEY) as IVoucherPdfStorage
+  const sql = container.resolve(ContainerRegistrationKeys.PG_CONNECTION)
 
   try {
     const result = await handleVoucherAppointmentConfirmedDelivery(event.data, {
@@ -338,6 +441,7 @@ export default async function voucherAppointmentConfirmedDeliverySubscriber({
       artifactStorage,
       downloadBaseUrl: resolveDownloadBaseUrl(),
       hmacSecret: getHmacSecret(),
+      marketLocales: createMarketLocalesReader(sql, logger),
       logger,
     })
 

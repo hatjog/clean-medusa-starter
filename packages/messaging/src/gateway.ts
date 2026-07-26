@@ -232,7 +232,16 @@ export class DefaultMessagingGateway implements MessagingGateway {
           }),
         };
 
-        this.cacheDispatch(cacheKey, failedDispatch);
+        // R-2.2-M2: pre-flight fail (BREVO_TEMPLATE_NOT_CONFIGURED,
+        // BREVO_SENDER_NOT_CONFIGURED, BREVO_API_KEY_NOT_CONFIGURED, walidacja
+        // payloadu) jest JEDNOZNACZNY — nic nie wyszło do providera. Cache'owanie
+        // go przez DEFAULT_TTL_MS (24 h) zablokowałoby główny scenariusz wyjścia
+        // ze stanu „rejestr pusty": po uzupełnieniu ID szablonów retry z tym
+        // samym idempotency_key nie zawołałby providera. Cache'ujemy WYŁĄCZNIE
+        // fail niejednoznaczny (timeout-after-send — wiadomość mogła pójść).
+        if (!error.preflight) {
+          this.cacheDispatch(cacheKey, failedDispatch);
+        }
 
         return failedDispatch;
       }

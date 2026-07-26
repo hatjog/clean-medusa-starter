@@ -82,6 +82,55 @@ function makeDefaultIdempotencyKnex(idempotencyKey = "a1b2c3d4-e5f6-4a7b-b8c9-d0
   })
 }
 
+/**
+ * Story 2.2 (AC5 poz.1): knex fake, który UJAWNIA wywołania finalizacji
+ * idempotency-record — bez tego nie da się dowieść, że rekord został
+ * sfinalizowany po awarii dispatchu (zamiast zostać w PENDING → wieczne 409).
+ */
+function makeObservableIdempotencyKnex() {
+  const synthRow = {
+    id: "idem-observable",
+    idempotency_key: "a1b2c3d4-e5f6-4a7b-b8c9-d0e1f2a3b4c5",
+    vendor_id: "vendor_01",
+    request_hash: "default-hash",
+    status_code: 200,
+    response_body: {},
+    created_at: new Date().toISOString(),
+  }
+  const updates: Array<Record<string, unknown>> = []
+  const deletes: number[] = []
+  const updateReturningMock = jest.fn().mockResolvedValue([synthRow])
+  const updateMock = jest.fn((patch: Record<string, unknown>) => {
+    updates.push(patch)
+    return { returning: updateReturningMock }
+  })
+  const whereMock = jest.fn(() => ({
+    first: jest.fn().mockResolvedValue(undefined),
+    update: updateMock,
+    delete: jest.fn(async () => {
+      deletes.push(1)
+      return 0
+    }),
+  }))
+  const insertMock = jest.fn(() => ({
+    onConflict: jest.fn(() => ({
+      ignore: jest.fn(() => ({ returning: jest.fn().mockResolvedValue([synthRow]) })),
+    })),
+  }))
+  const capabilityChainMock = {
+    select: jest.fn().mockReturnThis(),
+    where: jest.fn().mockReturnThis(),
+    whereIn: jest.fn().mockReturnThis(),
+    whereNull: jest.fn().mockReturnThis(),
+    limit: jest.fn().mockResolvedValue([]),
+  }
+  const knex = jest.fn((tableName: string) => {
+    if (tableName === "admin_capability_grants") return capabilityChainMock
+    return { where: whereMock, insert: insertMock }
+  })
+  return { knex, updates, deletes }
+}
+
 function createReq(opts: {
   authContext?: { actor_id?: string; actor_type?: string }
   body?: Record<string, unknown>
@@ -446,7 +495,7 @@ describe("admin vendors AuthN — fail-closed extractActorIdOrThrow", () => {
       ).toMatchObject({
         audit_log_id: "notif_decision_01",
         recipient_email: "open@example.com",
-        template: "vendor-decision-confirmation",
+        template_key: "vendor-decision-confirmation",
         dispatched_by: "user_admin_01",
         status: "sent",
       })
@@ -495,6 +544,85 @@ describe("admin vendors AuthN — fail-closed extractActorIdOrThrow", () => {
     } finally {
       process.env.NODE_ENV = previousNodeEnv
       process.env.RESEND_API_KEY = previousResendApiKey
+    }
+  })
+
+  // Story 2.2 (AC5 poz.1): po rejestracji providera brevo dispatch potrafi rzucić
+  // klasą, której zastany catch NIE łapał (BREVO_*, błędy HTTP) → 500 PO zapisanej
+  // mutacji i BEZ finalizacji idempotency-record. Ten test failuje na zastanej
+  // gałęzi re-throw.
+  it("POST /admin/vendors/:id/decision → mutacja zapisana + DOWOLNY błąd dispatchu → 503 + sfinalizowany idempotency-record", async () => {
+    const previousNodeEnv = process.env.NODE_ENV
+    const previousBrevoKey = process.env.BREVO_API_KEY
+    process.env.NODE_ENV = "production"
+    process.env.BREVO_API_KEY = "placeholder-not-a-real-key"
+
+    try {
+      const sellerModuleService = createSellerModuleService([
+        {
+          id: "vendor_01",
+          handle: "salon-open",
+          name: "Salon Open",
+          email: "open@example.com",
+          preferred_locale: "en",
+          store_status: "ACTIVE", // noqa: mercur15-drift — legacy seller-module fixture
+          metadata: { gp: { lifecycle_status: "open" } },
+        },
+      ])
+
+      // Moduł Notification JEST zarejestrowany i rzuca błędem providera —
+      // klasa nietypowana z punktu widzenia route'a.
+      const notificationModule = {
+        createNotifications: jest.fn().mockRejectedValue(
+          Object.assign(new Error("Brevo template is not configured"), {
+            error_code: "BREVO_TEMPLATE_NOT_CONFIGURED",
+          }),
+        ),
+      }
+      const { knex, updates } = makeObservableIdempotencyKnex()
+      // R-2.2-L8: log serwerowy idzie przez logger z kontenera (jak w magic-linku),
+      // bez bramki NODE_ENV — inaczej w normalnym przebiegu suite'u (NODE_ENV=test)
+      // gałąź w ogóle się nie wykonywała i „log serwerowy" nie był niczym pokryty.
+      const containerLogger = { error: jest.fn(), warn: jest.fn(), info: jest.fn() }
+
+      const req = createReq({
+        authContext: { actor_id: "user_admin_01", actor_type: "user" },
+        body: { decision: "opted_out", reason: "Vendor declined migration." },
+        scopeOverrides: {
+          sellerModuleService,
+          [Modules.NOTIFICATION]: notificationModule,
+          [ContainerRegistrationKeys.PG_CONNECTION]: knex,
+          [ContainerRegistrationKeys.LOGGER]: containerLogger,
+        },
+      })
+      const res = createRes()
+
+      await decisionPost(req, res as any)
+
+      // (1) Degradacja, nie 500 — awaria maila nie wywraca operacji biznesowej.
+      expect(res.statusCode).toBe(503)
+      expect(res.body).toMatchObject({ code: "BREVO_TEMPLATE_NOT_CONFIGURED" })
+      // (2) Mutacja vendora POZOSTAJE zapisana (nie cofamy jej przez mail).
+      expect(sellerModuleService.update).toHaveBeenCalled()
+      expect(sellerModuleService.sellers[0].metadata.gp.decision_status).toBe("opted_out")
+      // (3) Idempotency-record SFINALIZOWANY na 503 → replay jest deterministyczny.
+      expect(updates.some((patch) => patch.status_code === 503)).toBe(true)
+      // (4) Odpowiedź nie przecieka treści maila ani adresu.
+      expect(JSON.stringify(res.body)).not.toContain("open@example.com")
+      // (5) Log serwerowy POWSTAŁ i niesie kod błędu — bez adresu i bez treści
+      //     komunikatu providera (D-70).
+      expect(containerLogger.error).toHaveBeenCalledTimes(1)
+      const logged = containerLogger.error.mock.calls[0][0] as string
+      expect(logged).toContain("BREVO_TEMPLATE_NOT_CONFIGURED")
+      expect(logged).toContain("vendor_id=vendor_01")
+      expect(logged).not.toContain("open@example.com")
+    } finally {
+      process.env.NODE_ENV = previousNodeEnv
+      if (previousBrevoKey === undefined) {
+        delete process.env.BREVO_API_KEY
+      } else {
+        process.env.BREVO_API_KEY = previousBrevoKey
+      }
     }
   })
 

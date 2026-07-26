@@ -25,6 +25,10 @@ describe("t30-dispatch-service", () => {
     delete process.env.GP_FLAG_FLIP_DATE
     delete process.env.GP_VENDOR_NOTIFICATIONS_ENFORCE_PROVIDER_READY
     delete process.env.GP_VENDOR_NOTIFICATIONS_PROVIDER_READY
+    // Story 2.2 (AC3): BREVO_API_KEY jest teraz źródłem gotowości providera, a
+    // lokalny `.env` może go ustawiać — bez tego czyszczenia test „enforcement
+    // bez providera" przestaje testować cokolwiek (readiness byłby zawsze true).
+    delete process.env.BREVO_API_KEY
     delete process.env.RESEND_API_KEY
     delete process.env.SENDGRID_API_KEY
     delete process.env.SMTP_URL

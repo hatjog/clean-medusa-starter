@@ -232,16 +232,26 @@ function parseMarketFlows(
       );
     }
     const override = expectRecord(rawOverride, yamlPath, `overrides.${flowId}`);
-    if (typeof override.enabled !== "boolean") {
-      throw validationError(
-        yamlPath,
-        `overrides.${flowId}.enabled must be boolean`,
-      );
-    }
     if ("consent_basis" in override) {
       throw validationError(
         yamlPath,
         `overrides.${flowId}.consent_basis is not allowed`,
+      );
+    }
+    // Story 2.3 (AC6a): `enabled` jest OPCJONALNE. FR-E.7 rozszerzyło override
+    // o pola niezwiązane z kill-switchem (`copy_variant`, `sender_identity`,
+    // `quiet_hours_override`) i realne pliki marketów mają wpisy WYŁĄCZNIE
+    // z tymi polami (np. `bonbeauty.voucher_delivery_recipient.sender_identity`).
+    // Wymaganie `enabled` wywracało loader na produkcyjnej konfiguracji, czyli
+    // uniemożliwiało podpięcie kill-switcha w ogóle. Brak `enabled` = brak
+    // override flagi (flow dziedziczy default), NIE „wyłączone".
+    if (!("enabled" in override)) {
+      continue;
+    }
+    if (typeof override.enabled !== "boolean") {
+      throw validationError(
+        yamlPath,
+        `overrides.${flowId}.enabled must be boolean`,
       );
     }
     overrides[flowId] = {

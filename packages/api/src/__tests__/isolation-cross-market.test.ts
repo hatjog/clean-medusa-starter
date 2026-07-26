@@ -183,6 +183,15 @@ describe("v160-cleanup-27 AC4: voucher-pii cross-market isolation (DPIA R-12)", 
       events: new FakeEvents(),
       idempotency: new FakeIdempotency(),
       rateLimit: new FakeRateLimit(),
+      // Story 2.2 (AC4): port notyfikacji jest wymagany. Ten test dotyczy
+      // izolacji rynków w Step 1-2, więc dispatch nie jest tu wołany — fake
+      // pilnuje jednak, że nic się nie wysyła (ZERO wywołań).
+      notifications: {
+        providerRef: "brevo",
+        dispatch: async () => {
+          throw new Error("dispatch nie powinien być wołany w tym teście")
+        },
+      },
     })
   }
 

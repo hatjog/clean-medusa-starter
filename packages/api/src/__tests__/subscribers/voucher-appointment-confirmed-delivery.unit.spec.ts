@@ -1,11 +1,23 @@
 import { describe, expect, it, jest } from "@jest/globals"
-import { Modules } from "@medusajs/framework/utils"
+import { ContainerRegistrationKeys, Modules } from "@medusajs/framework/utils"
 
 import voucherAppointmentConfirmedDeliverySubscriber, {
+  APPOINTMENT_MARKET_LOCALES_UNAVAILABLE_ERROR_CODE,
   VOUCHER_APPOINTMENT_CONFIRMED_EVENT,
   handleVoucherAppointmentConfirmedDelivery,
 } from "../../subscribers/voucher-appointment-confirmed-delivery"
 import { VOUCHER_MODULE } from "../../modules/voucher"
+
+/** Stub `MarketLocalesReader` — `degraded: false` = konfiguracja rynku znana. */
+function stubMarketLocales(
+  config: { default: string; supported: string[] } = {
+    default: "pl",
+    supported: ["pl", "en", "ua", "de"],
+  },
+  degraded = false,
+) {
+  return { read: jest.fn(async () => ({ config, degraded })) }
+}
 
 const EVENT_ENVELOPE = {
   schema_version: "1",
@@ -57,6 +69,9 @@ function buildContainer(
       if (key === VOUCHER_MODULE) return voucherService
       if (key === Modules.NOTIFICATION) return notificationModule
       if (key === "voucher_pdf_storage") return storage
+      if (key === ContainerRegistrationKeys.PG_CONNECTION) {
+        return { raw: jest.fn(async () => ({ rows: [] })) }
+      }
       throw new Error(`Unexpected container key: ${key}`)
     }),
     logger,
@@ -83,6 +98,7 @@ describe("voucher appointment confirmed delivery subscriber", () => {
         artifactStorage: { store },
         downloadBaseUrl: "https://api.bonbeauty.example",
         hmacSecret: "appointment-subscriber-secret",
+        marketLocales: stubMarketLocales(),
         now: new Date("2026-06-02T08:00:00Z"),
       },
     )
@@ -138,12 +154,45 @@ describe("voucher appointment confirmed delivery subscriber", () => {
         },
         downloadBaseUrl: "https://api.bonbeauty.example",
         hmacSecret: "appointment-subscriber-secret",
+        marketLocales: stubMarketLocales(),
         now: new Date("2026-06-02T08:00:00Z"),
       },
     )
 
     expect(result.status).toBe("failed")
     expect(result.error_message).toBe("appointment delivery source not found")
+  })
+
+  it("RLC005/M3: locale rynku niedostępna + locale spoza znanej listy → failed, NIE downgrade do 'pl'", async () => {
+    const findAppointmentConfirmationDeliverySource = jest.fn(async () => ({
+      buyer_email: "buyer@example.test",
+      buyer_locale: "ua",
+      salon_name: "Salon Alfa",
+      location_address: "ul. Karmelicka 10, Krakow",
+      seller_handle: "salon-alfa",
+    }))
+    const createNotifications = jest.fn(async () => ({ id: "noti_appointment_3" }))
+    const store = jest.fn(async () => ({ stored_at: "2026-06-02T08:31:00Z", version: 1 }))
+
+    const result = await handleVoucherAppointmentConfirmedDelivery(
+      EVENT_ENVELOPE,
+      {
+        sourceReader: { findAppointmentConfirmationDeliverySource },
+        dispatcher: { dispatch: createNotifications },
+        artifactStorage: { store },
+        downloadBaseUrl: "https://api.bonbeauty.example",
+        hmacSecret: "appointment-subscriber-secret",
+        // degraded=true + locale 'ua' spoza shimu env ('pl') → not_supported_by_market.
+        marketLocales: stubMarketLocales({ default: "pl", supported: ["pl"] }, true),
+        now: new Date("2026-06-02T08:00:00Z"),
+      },
+    )
+
+    expect(result.status).toBe("failed")
+    expect(result.error_message).toBe(
+      APPOINTMENT_MARKET_LOCALES_UNAVAILABLE_ERROR_CODE,
+    )
+    expect(createNotifications).not.toHaveBeenCalled()
   })
 
   it("default subscriber resolves Medusa modules and delegates to the pure handler", async () => {

@@ -21,6 +21,7 @@
  */
 
 import type { MedusaRequest, MedusaResponse } from "@medusajs/framework/http"
+import { ContainerRegistrationKeys } from "@medusajs/framework/utils"
 import {
   renderDecisionConfirmationHtml,
   renderDecisionConfirmationSubject,
@@ -34,6 +35,8 @@ import {
   NotificationModuleUnavailableError,
 } from "../../../../../lib/vendor-notification-dispatch"
 import { NotificationProviderNotReadyError } from "../../../../../lib/vendor-notification-provider-readiness"
+// Story 2.2 (AC5 poz.5): klucz szablonu WYŁĄCZNIE ze stałej rejestru (AD-6).
+import { NOTIFICATION_TEMPLATE_KEYS } from "@gp/messaging"
 import {
   getSellerById,
   mergeSellerGpMetadata,
@@ -82,6 +85,26 @@ type ErrorResponse = {
 }
 
 const VALID_DECISIONS: DecisionType[] = ["opted_in", "opted_out"]
+
+/**
+ * Logger z kontenera Medusy (R-2.2-L8). `resolve` może rzucić, gdy klucz nie jest
+ * zarejestrowany (testy jednostkowe ze sztucznym scope'em) — brak loggera nie
+ * może wywrócić obsługi błędu dispatchu.
+ */
+type DecisionLogger = {
+  error?: (message: string) => void
+  warn?: (message: string) => void
+}
+
+function resolveDecisionLogger(scope: {
+  resolve: (key: string) => unknown
+}): DecisionLogger | null {
+  try {
+    return (scope.resolve(ContainerRegistrationKeys.LOGGER) as DecisionLogger) ?? null
+  } catch {
+    return null
+  }
+}
 
 export async function POST(
   req: MedusaRequest<CaptureBody>,
@@ -297,8 +320,10 @@ export async function POST(
         subject,
         text,
         html,
-        template: "vendor-decision-confirmation",
+        templateKey: NOTIFICATION_TEMPLATE_KEYS.VENDOR_DECISION_CONFIRMATION,
+        locale,
         triggerBy: actorId,
+        idempotencyKey,
         metadata: {
           vendor_id: id,
           decision,
@@ -308,27 +333,54 @@ export async function POST(
       auditLogId =
         dispatchResult.notificationId ?? `decision_capture_${id}_${Date.now()}`
     } catch (err) {
-      if (
-        err instanceof NotificationProviderNotReadyError ||
-        err instanceof NotificationModuleUnavailableError
-      ) {
-        // Persist the 503 so the same key replay returns the same failure
-        // instead of re-running side effects (M1 partial-failure fix).
-        const errBody: ErrorResponse = {
-          code: (err as { code: string }).code,
-          message: (err as Error).message,
-        }
-        await finalizeIdempotencyRecord(scope, {
-          idempotencyKey,
-          requestHash,
-          statusCode: 503,
-          responseBody: errBody as Record<string, unknown>,
-        })
-        finalised = true
-        res.status(503).json(errBody)
-        return
+      // Story 2.2 (AC5 poz.1): defensywa obejmuje WSZYSTKIE klasy błędów
+      // dispatchu, nie tylko NotReady/ModuleUnavailable.
+      //
+      // Przed 2.2: każdy inny wyjątek szedł re-throw → 500 PO zapisanej mutacji
+      // vendora i BEZ finalizacji idempotency-record (replay tego samego klucza
+      // trafiał w PENDING → 409 na zawsze). Po rejestracji providera brevo doszły
+      // nowe klasy (BREVO_TEMPLATE_NOT_CONFIGURED, BREVO_SENDER_NOT_CONFIGURED,
+      // BREVO_API_KEY_NOT_CONFIGURED, błędy HTTP) — wszystkie trafiałyby dokładnie
+      // w tę gałąź. Inwariant AD-6: awaria maila NIE MOŻE wywrócić operacji
+      // biznesowej ani zostawić idempotency-record w stanie nieskończonego 409.
+      const errBody: ErrorResponse = {
+        // `error_code` niosą klasy z @gp/messaging (BREVO_*), `code` — zastane
+        // klasy NotReady/ModuleUnavailable. Bierzemy pierwszy dostępny, żeby
+        // operator widział realną przyczynę, a nie generyczną etykietę.
+        code:
+          readErrorCode(err, "error_code") ??
+          readErrorCode(err, "code") ??
+          "VENDOR_NOTIFICATION_DISPATCH_FAILED",
+        message:
+          err instanceof NotificationProviderNotReadyError ||
+          err instanceof NotificationModuleUnavailableError
+            ? err.message
+            : "Vendor decision was captured, but the confirmation e-mail could not be dispatched.",
       }
-      throw err
+
+      // Persist the 503 so the same key replay returns the same failure
+      // instead of re-running side effects (M1 partial-failure fix).
+      await finalizeIdempotencyRecord(scope, {
+        idempotencyKey,
+        requestHash,
+        statusCode: 503,
+        responseBody: errBody as Record<string, unknown>,
+      })
+      finalised = true
+
+      // R-2.2-L8: log serwerowy przez logger z kontenera (tak jak magic-link,
+      // ten sam AC5) i BEZ bramki `NODE_ENV` — wcześniej w normalnym przebiegu
+      // suite'u (`NODE_ENV=test`) gałąź w ogóle się nie wykonywała, więc
+      // deklarowana własność „log serwerowy" nie była niczym pokryta.
+      // Logujemy `code` + `name`, NIE `err.message` — po 2.2 message może nieść
+      // treść z odpowiedzi providera (D-70: zero PII w logu/audycie).
+      resolveDecisionLogger(scope)?.error?.(
+        `[decision_capture] dispatch failed vendor_id=${id} code=${errBody.code} ` +
+          `error=${(err as Error)?.name ?? "UnknownError"}`,
+      )
+
+      res.status(503).json(errBody)
+      return
     }
 
     // Durable audit row (v160-cleanup-7-followup — AC4 closure).
@@ -354,7 +406,7 @@ export async function POST(
         dispatched_at: capturedAt,
         recipient_email: seller.email,
         locale,
-        template: "vendor-decision-confirmation",
+        template_key: NOTIFICATION_TEMPLATE_KEYS.VENDOR_DECISION_CONFIRMATION,
         dispatched_by: actorId,
         status: "sent",
       },
@@ -400,4 +452,14 @@ export async function POST(
     }
     throw err
   }
+}
+
+/**
+ * Story 2.2 (AC5 poz.1): odczyt kodu błędu dispatchu do odpowiedzi degradacyjnej.
+ * Zwraca undefined dla wartości nie-stringowych, żeby nie wstawić `[object Object]`
+ * do kontraktu odpowiedzi.
+ */
+function readErrorCode(error: unknown, key: "code" | "error_code"): string | undefined {
+  const value = (error as Record<string, unknown> | null | undefined)?.[key]
+  return typeof value === "string" && value.trim() ? value : undefined
 }

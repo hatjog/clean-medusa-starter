@@ -1,5 +1,10 @@
 import { Modules } from "@medusajs/framework/utils"
 
+// Story 2.2 (AC5 poz.5): klucz szablonu WYŁĄCZNIE ze stałej rejestru (AD-6).
+import { NOTIFICATION_TEMPLATE_KEYS } from "@gp/messaging"
+
+import { resolveNotificationMarketId } from "../notification-market-context"
+
 type ScopeResolver = {
   resolve: (key: string) => unknown
 }
@@ -14,6 +19,12 @@ export type RecoverMagicLinkEmailInput = {
   to: string
   locale: string
   token: string
+  /**
+   * Rynek odbiorcy — wymagany przez providera brevo (nadawca + market-scoped
+   * audit). Route recover ma go z `marketContextStorage`; brak = fallback
+   * konfiguracyjny (patrz notification-market-context.ts).
+   */
+  marketId?: string
 }
 
 type RecoverEmailLocale = "pl" | "en" | "ua" | "de"
@@ -150,6 +161,7 @@ export async function dispatchRecoverMagicLinkEmail({
   to,
   locale,
   token,
+  marketId,
 }: RecoverMagicLinkEmailInput): Promise<boolean> {
   const notificationModule = resolveNotificationModule(scope)
   if (!notificationModule) {
@@ -165,8 +177,13 @@ export async function dispatchRecoverMagicLinkEmail({
   const payload = {
     to,
     channel: "email",
-    template: "customer-recover-magic-link",
+    // `template` = pole kontraktu Medusy; `data.template_key` = kanoniczne GP
+    // (ADR-158). Obie wartości pochodzą z tej samej stałej rejestru.
+    template: NOTIFICATION_TEMPLATE_KEYS.CUSTOMER_RECOVER_MAGIC_LINK,
     data: {
+      template_key: NOTIFICATION_TEMPLATE_KEYS.CUSTOMER_RECOVER_MAGIC_LINK,
+      market_id: marketId ?? resolveNotificationMarketId(),
+      flow_id: "customer_recover",
       subject,
       text,
       html,

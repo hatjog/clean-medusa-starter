@@ -13,6 +13,8 @@
  *   - events:      InProcessEventEmitter (no-op stub; v1.7.0: real EventBus)
  *   - idempotency: InMemoryIdempotencyAdapter singleton (v1.7.0: Redis)
  *   - rateLimit:   InMemoryTokenBucketAdapter singleton (v1.7.0: Redis)
+ *   - notifications: MedusaNotificationDispatchAdapter (v1.14.0 Story 2.2 —
+ *     Step 3 D-72 przez Modules.NOTIFICATION zamiast stub-email-v1)
  *
  * OQ resolutions:
  *   OQ#1 (adapter): Opcja A — in-memory token bucket (single-process staging)
@@ -35,6 +37,7 @@ import { PgDeliveryAdapter } from "../modules/voucher-pii/adapters/pg-delivery";
 import { InProcessEventEmitter } from "../modules/voucher-pii/adapters/in-process-events";
 import { createInProcessIdempotencyPort } from "../modules/voucher-pii/adapters/pg-idempotency";
 import { createInProcessRateLimitPort } from "../modules/voucher-pii/adapters/in-memory-rate-limit";
+import { MedusaNotificationDispatchAdapter } from "../modules/voucher-pii/adapters/medusa-notification-dispatch";
 import { VoucherPiiService } from "../modules/voucher-pii/voucher-pii.service";
 
 export default async function voucherPiiLoader({
@@ -69,6 +72,13 @@ export default async function voucherPiiLoader({
   const events = new InProcessEventEmitter(logger);
   const idempotency = createInProcessIdempotencyPort();
   const rateLimit = createInProcessRateLimitPort();
+  // Story 2.2 (AC4): Step 3 D-72 idzie przez Modules.NOTIFICATION zamiast stubu
+  // `stub-email-v1`. Port jest wstrzykiwany (seam testowy) — orchestrator nadal
+  // nie zna kontenera Medusy.
+  const notifications = new MedusaNotificationDispatchAdapter(
+    container as unknown as { resolve: (key: string) => unknown },
+    db
+  );
 
   // Instantiate the service.
   const service = new VoucherPiiService({
@@ -78,6 +88,7 @@ export default async function voucherPiiLoader({
     events,
     idempotency,
     rateLimit,
+    notifications,
   });
 
   // Register in Medusa container as singleton.

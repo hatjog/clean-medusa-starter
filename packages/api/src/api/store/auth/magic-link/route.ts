@@ -1,5 +1,5 @@
 import type { MedusaRequest, MedusaResponse } from "@medusajs/framework/http"
-import { Modules } from "@medusajs/framework/utils"
+import { ContainerRegistrationKeys, Modules } from "@medusajs/framework/utils"
 
 import { generateMagicLink } from "../../../../lib/auth/magic-link"
 import { dispatchRecoverMagicLinkEmail } from "../../../../lib/auth/recover-magic-link-email"
@@ -53,6 +53,19 @@ function success(res: MedusaResponse): void {
   res.status(202).json({ success: true })
 }
 
+type RecoverLogger = {
+  warn?: (message: string) => void
+  error?: (message: string) => void
+}
+
+function resolveLogger(req: MedusaRequest): RecoverLogger | null {
+  try {
+    return (req.scope.resolve(ContainerRegistrationKeys.LOGGER) as RecoverLogger) ?? null
+  } catch {
+    return null
+  }
+}
+
 export async function POST(
   req: MedusaRequest,
   res: MedusaResponse
@@ -102,15 +115,33 @@ export async function POST(
       customer_id: customer.id,
       market_id: marketId,
     })
-    await dispatchRecoverMagicLinkEmail({
+    const dispatched = await dispatchRecoverMagicLinkEmail({
       scope: req.scope,
       to: email,
       locale,
       token,
+      marketId,
     })
-  } catch {
-    // Enumeration-safe and fail-closed: no token leaves the backend and the
-    // user-facing request result remains indistinguishable.
+    if (!dispatched) {
+      // Story 2.2 (AC5 poz.2): no-op dispatchu przestaje być niewidzialny.
+      resolveLogger(req)?.warn?.(
+        `[magic-link] recover e-mail not dispatched (notification module unavailable) market_id=${marketId}`
+      )
+    }
+  } catch (err) {
+    // Story 2.2 (AC5 poz.2): catch DOSTAJE ŚLAD (dziś był całkowicie cichy —
+    // dług obserwowalności z inwentaryzacji 2.1). Po rejestracji modułu tu lądują
+    // realne błędy providera (BREVO_*, HTTP) — bez logu operator nie miał
+    // żadnego sygnału, że recover-maile nie wychodzą.
+    //
+    // Odpowiedź POZOSTAJE bez zmian: enumeration-safe i fail-closed —
+    // logujemy WYŁĄCZNIE market_id i klasę/kod błędu, NIGDY adresu e-mail,
+    // istnienia konta ani tokenu.
+    resolveLogger(req)?.error?.(
+      `[magic-link] recover dispatch failed market_id=${marketId} ` +
+        `error=${(err as Error)?.name ?? "Error"} ` +
+        `code=${String((err as { error_code?: unknown; code?: unknown })?.error_code ?? (err as { code?: unknown })?.code ?? "unknown")}`
+    )
   }
 
   success(res)

@@ -817,6 +817,10 @@ describe("VoucherService", () => {
         salon_name: "Salon Snapshot",
         location_address: "ul. Snapshot 1",
         seller_handle: "salon-alfa",
+        // Story 2.3 (AC6b): projekcja zwraca market_id z danych domenowych;
+        // `null` = wiersz bez rynku (legalny stan zastanych danych → konsument
+        // loguje fallback konfiguracyjny).
+        market_id: null,
       })
       expect(JSON.stringify(source)).not.toContain("RAW-CODE-DO-NOT-RETURN")
     })
@@ -849,7 +853,316 @@ describe("VoucherService", () => {
         salon_name: "Salon Alfa",
         location_address: null,
         seller_handle: "salon-alfa",
+        market_id: null,
       })
+    })
+
+    // Story 2.3 (AC6b) — domknięcie deferralu R-2.2-M4: rynek MUSI przyjść
+    // z danych domenowych, żeby wysyłka przestała spadać na GP_DEFAULT_MARKET_ID.
+    it("zwraca market_id z kolumny entitlement_instance.market_id", async () => {
+      const pool = makeMockPool({
+        queryResponses: [
+          {
+            rows: [
+              {
+                ei_id: "entinst_apt_003",
+                policy_snapshot: {},
+                order_email: "order-buyer@example.test",
+                ei_market_id: "bongarden",
+                seller_name: "Salon Alfa",
+                seller_handle: "salon-alfa",
+              },
+            ],
+          },
+        ],
+      })
+      const svc = makeService(pool)
+
+      const source = await svc.findAppointmentConfirmationDeliverySource(
+        "entinst_apt_003",
+      )
+
+      expect(source?.market_id).toBe("bongarden")
+    })
+
+    it("fallbackuje market_id do policy_snapshot.market_id", async () => {
+      const pool = makeMockPool({
+        queryResponses: [
+          {
+            rows: [
+              {
+                ei_id: "entinst_apt_004",
+                policy_snapshot: { market_id: "bonevent" },
+                order_email: "order-buyer@example.test",
+                ei_market_id: null,
+                seller_name: "Salon Alfa",
+                seller_handle: "salon-alfa",
+              },
+            ],
+          },
+        ],
+      })
+      const svc = makeService(pool)
+
+      const source = await svc.findAppointmentConfirmationDeliverySource(
+        "entinst_apt_004",
+      )
+
+      expect(source?.market_id).toBe("bonevent")
+    })
+  })
+
+  // Story 2.3 (AC3 + AC6b) — projekcja buyer-claim niesie teraz `market_id`
+  // i `purchase_locale` (locale zakupu z order.metadata).
+  describe("buyer claim source — market_id + purchase_locale (Story 2.3)", () => {
+    it("zwraca purchase_locale z order.metadata i market_id z kolumny Layer-4", async () => {
+      const pool = makeMockPool({
+        queryResponses: [
+          {
+            rows: [
+              {
+                ei_id: "entinst_buy_001",
+                policy_snapshot: { buyer_email: "buyer@example.test" },
+                order_id: "order_1",
+                ei_market_id: "bonbeauty",
+                voucher_code: "VCH-1",
+                seller_name: "Salon Alfa",
+                seller_handle: "salon-alfa",
+                product_title: "Masaż",
+                order_email: "order-buyer@example.test",
+                order_metadata: { purchase_locale: "ua" },
+                claimed_at: null,
+              },
+            ],
+          },
+        ],
+      })
+      const svc = makeService(pool)
+
+      const source = await svc.findBuyerClaimSource("entinst_buy_001", null)
+
+      expect(source?.market_id).toBe("bonbeauty")
+      expect(source?.purchase_locale).toBe("ua")
+    })
+
+    it("toleruje order.metadata jako string JSON (kształt zależny od sterownika)", async () => {
+      const pool = makeMockPool({
+        queryResponses: [
+          {
+            rows: [
+              {
+                ei_id: "entinst_buy_002",
+                policy_snapshot: {},
+                order_id: "order_2",
+                ei_market_id: null,
+                voucher_code: "VCH-2",
+                order_email: "order-buyer@example.test",
+                order_metadata: JSON.stringify({ purchase_locale: "de" }),
+                claimed_at: null,
+              },
+            ],
+          },
+        ],
+      })
+      const svc = makeService(pool)
+
+      const source = await svc.findBuyerClaimSource("entinst_buy_002", null)
+
+      expect(source?.purchase_locale).toBe("de")
+    })
+
+    it("zwraca null dla purchase_locale i market_id, gdy dane ich nie niosą", async () => {
+      const pool = makeMockPool({
+        queryResponses: [
+          {
+            rows: [
+              {
+                ei_id: "entinst_buy_003",
+                policy_snapshot: {},
+                order_id: "order_3",
+                voucher_code: "VCH-3",
+                order_email: "order-buyer@example.test",
+                order_metadata: null,
+                claimed_at: null,
+              },
+            ],
+          },
+        ],
+      })
+      const svc = makeService(pool)
+
+      const source = await svc.findBuyerClaimSource("entinst_buy_003", null)
+
+      expect(source?.purchase_locale).toBeNull()
+      expect(source?.market_id).toBeNull()
+    })
+
+    it("puste/whitespace market_id NIE udaje danej domenowej", async () => {
+      const pool = makeMockPool({
+        queryResponses: [
+          {
+            rows: [
+              {
+                ei_id: "entinst_buy_004",
+                policy_snapshot: {},
+                order_id: "order_4",
+                ei_market_id: "   ",
+                voucher_code: "VCH-4",
+                order_email: "order-buyer@example.test",
+                order_metadata: {},
+                claimed_at: null,
+              },
+            ],
+          },
+        ],
+      })
+      const svc = makeService(pool)
+
+      const source = await svc.findBuyerClaimSource("entinst_buy_004", null)
+
+      expect(source?.market_id).toBeNull()
+    })
+  })
+
+  describe("gift contract z line_item.metadata (Story 2.4, ADR-163)", () => {
+    /** Wiersz projekcji z metadanymi line-itemu wskazanego przez `ei.line_item_id`. */
+    const giftRow = (lineItemMetadata: unknown) => ({
+      ei_id: "entinst_gift_001",
+      policy_snapshot: {},
+      order_id: "order_gift_1",
+      ei_market_id: "bonbeauty",
+      voucher_code: "VCH-GIFT",
+      order_email: "kupujaca@example.test",
+      order_metadata: { purchase_locale: "pl" },
+      line_item_metadata: lineItemMetadata,
+      claimed_at: null,
+    })
+
+    it("projektuje purchase_mode + gift_recipient_* z metadanych line-itemu", async () => {
+      const pool = makeMockPool({
+        queryResponses: [
+          {
+            rows: [
+              giftRow({
+                purchase_mode: "gift",
+                gift_recipient_email: "obdarowana@example.test",
+                gift_recipient_message: "Wszystkiego najlepszego!",
+                gift_recipient_send_timing: "now",
+                gift_recipient_bound_to_voucher_issue: true,
+              }),
+            ],
+          },
+        ],
+      })
+      const svc = makeService(pool)
+
+      const source = await svc.findBuyerClaimSource("entinst_gift_001", null)
+
+      expect(source?.purchase_mode).toBe("gift")
+      expect(source?.gift_recipient_email).toBe("obdarowana@example.test")
+      expect(source?.gift_recipient_send_timing).toBe("now")
+      expect(source?.gift_recipient_bound_to_voucher_issue).toBe(true)
+    })
+
+    it("toleruje line_item.metadata jako string JSON (kształt zależny od sterownika)", async () => {
+      const pool = makeMockPool({
+        queryResponses: [
+          {
+            rows: [
+              giftRow(
+                JSON.stringify({
+                  purchase_mode: "gift",
+                  gift_recipient_email: "obdarowana@example.test",
+                  gift_recipient_send_timing: "handover",
+                  gift_recipient_bound_to_voucher_issue: true,
+                }),
+              ),
+            ],
+          },
+        ],
+      })
+      const svc = makeService(pool)
+
+      const source = await svc.findBuyerClaimSource("entinst_gift_001", null)
+
+      expect(source?.purchase_mode).toBe("gift")
+      expect(source?.gift_recipient_send_timing).toBe("handover")
+    })
+
+    it("brak line-itemu (ścieżka bez koszyka) → same null, nigdy wyjątek", async () => {
+      const pool = makeMockPool({
+        queryResponses: [{ rows: [giftRow(null)] }],
+      })
+      const svc = makeService(pool)
+
+      const source = await svc.findBuyerClaimSource("entinst_gift_001", null)
+
+      expect(source?.purchase_mode).toBeNull()
+      expect(source?.gift_recipient_email).toBeNull()
+      expect(source?.gift_recipient_send_timing).toBeNull()
+      expect(source?.gift_recipient_bound_to_voucher_issue).toBeNull()
+    })
+
+    it("zastany kształt metadanych (`scheduled`, bez flagi powiązania) nie wywraca projekcji", async () => {
+      const pool = makeMockPool({
+        queryResponses: [
+          {
+            rows: [
+              giftRow({
+                purchase_mode: "gift",
+                gift_recipient_email: "obdarowana@example.test",
+                gift_recipient_send_timing: "scheduled",
+                gift_recipient_send_date: "2026-12-24",
+              }),
+            ],
+          },
+        ],
+      })
+      const svc = makeService(pool)
+
+      const source = await svc.findBuyerClaimSource("entinst_gift_001", null)
+
+      expect(source?.gift_recipient_send_timing).toBe("scheduled")
+      expect(source?.gift_recipient_bound_to_voucher_issue).toBeNull()
+    })
+
+    it("`gift_recipient_bound_to_voucher_issue` inne niż `true` NIE udaje powiązania", async () => {
+      const pool = makeMockPool({
+        queryResponses: [
+          {
+            rows: [
+              giftRow({
+                purchase_mode: "gift",
+                gift_recipient_email: "obdarowana@example.test",
+                gift_recipient_send_timing: "now",
+                // Stringowe "true" jest właśnie tym, czego nie wolno przepuścić.
+                gift_recipient_bound_to_voucher_issue: "true",
+              }),
+            ],
+          },
+        ],
+      })
+      const svc = makeService(pool)
+
+      const source = await svc.findBuyerClaimSource("entinst_gift_001", null)
+
+      expect(source?.gift_recipient_bound_to_voucher_issue).toBe(false)
+    })
+
+    it("projekcja czyta line-item WSKAZANY przez entitlement (`ei.line_item_id`)", async () => {
+      const captured: string[] = []
+      const pool = makeMockPool({
+        queryResponses: [{ rows: [giftRow(null)] }],
+        captureQuerySql: captured,
+      })
+      const svc = makeService(pool)
+
+      await svc.findBuyerClaimSource("entinst_gift_001", null)
+
+      expect(captured[0]).toContain("order_line_item li")
+      expect(captured[0]).toContain("li.id = ei.line_item_id")
+      // Bez tego joina „który item niesie prezent” byłoby zgadywaniem.
+      expect(captured[0]).toContain("li.metadata")
     })
   })
 })

@@ -120,6 +120,53 @@ module.exports = withMercur({
       options: { disable: true },
     },
     {
+      // v1.14.0 Story 2.2 (FR-12, NFR8; AD-5/AD-6): JEDNA produkcyjna ścieżka
+      // wysyłki e-mail. Do tej story moduł Notification NIE był zarejestrowany,
+      // więc część call-site'ów była cichym no-opem (inwentaryzacja Story 2.1).
+      //
+      // Provider to CIENKI WRAPPER interfejsu notification-providera Medusy
+      // (packages/api/src/modules/notification-brevo) delegujący do
+      // DefaultMessagingGateway → BrevoAdapter z @gp/messaging. Mapa `templates`
+      // pochodzi WYŁĄCZNIE z rejestru specs/contracts/notifications/templates.yaml
+      // (AD-6 allowlist) — klucz spoza rejestru kończy się fail-loud
+      // BREVO_TEMPLATE_NOT_CONFIGURED, nigdy cichym no-opem.
+      //
+      // `id: "brevo"` pinowany jawnie → runtime key `np_brevo`
+      // (NotificationProviderRegistrationPrefix + id). Bez tego powstałby
+      // identyfikator pochodny od nazwy pluginu — ta sama klasa regresji, której
+      // pilnuje `id: "stripe"` w module payment (`pp_stripe` vs `pp_stripe_stripe`).
+      //
+      // BREVO_API_KEY / BREVO_SENDERS są celowo NIEobecne w tym configu: sekret i
+      // dane operacyjne rozwiązuje wrapper leniwie z env przy pierwszej wysyłce,
+      // więc brak konfiguracji NIE wywraca bootu backendu.
+      key: "notification",
+      resolve: "@medusajs/notification",
+      options: {
+        providers: [
+          {
+            resolve: moduleRoot("notification-brevo"),
+            id: "brevo",
+            options: {
+              channels: ["email"],
+            },
+          },
+          {
+            // Zachowany default Medusy (`defineConfig` rejestruje moduł
+            // notification z providerem `notification-local` na kanale `feed`).
+            // Jawny wpis modułu ZASTĘPUJE cały default, więc bez tej linii
+            // kanał `feed` cicho by zniknął. `validateProviders` wymaga, by dwa
+            // providery nie dzieliły kanału — `feed` vs `email` się nie kolidują.
+            resolve: "@medusajs/medusa/notification-local",
+            id: "local",
+            options: {
+              name: "Local Notification Provider",
+              channels: ["feed"],
+            },
+          },
+        ],
+      },
+    },
+    {
       key: "event_bus",
       resolve: "@medusajs/event-bus-redis",
       options: {

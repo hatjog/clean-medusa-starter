@@ -32,6 +32,8 @@ import {
   NotificationProviderNotReadyError,
 } from "./vendor-notification-provider-readiness"
 import { dispatchVendorEmail } from "./vendor-notification-dispatch"
+// Story 2.2 (AC5 poz.5): klucz szablonu WYŁĄCZNIE ze stałej rejestru (AD-6).
+import { NOTIFICATION_TEMPLATE_KEYS } from "@gp/messaging"
 import { appendNotificationLogBestEffort } from "./vendor-notification-log"
 import {
   listSellers,
@@ -214,7 +216,8 @@ async function dispatchEmailStub(
         subject,
         text,
         html,
-        template: "t30_migration",
+        templateKey: NOTIFICATION_TEMPLATE_KEYS.T30_MIGRATION,
+        locale,
         triggerBy: "system",
         metadata: {
           vendor_id: vendor.id,

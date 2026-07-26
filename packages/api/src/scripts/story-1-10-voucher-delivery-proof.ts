@@ -7,6 +7,7 @@ import { PgDeliveryAdapter } from "../modules/voucher-pii/adapters/pg-delivery";
 import { PgVoucherPiiAdapter } from "../modules/voucher-pii/adapters/pg-pii";
 import { createInProcessIdempotencyPort } from "../modules/voucher-pii/adapters/pg-idempotency";
 import { createInProcessRateLimitPort } from "../modules/voucher-pii/adapters/in-memory-rate-limit";
+import { MedusaNotificationDispatchAdapter } from "../modules/voucher-pii/adapters/medusa-notification-dispatch";
 import { VoucherPiiService } from "../modules/voucher-pii/voucher-pii.service";
 import type { EventEmitterPort } from "../modules/voucher-pii";
 
@@ -30,6 +31,17 @@ const databaseUrl = process.env.DATABASE_URL;
 if (!databaseUrl) {
   throw new Error("DATABASE_URL is required");
 }
+
+/**
+ * Scope „bez kontenera Medusy" — skrypt biegnie przez `ts-node`, nie przez
+ * `medusa exec`, więc modułu Notification NIE DA SIĘ tu rozwiązać. Nazwana stała
+ * zamiast anonimowego literału, żeby intencja była czytelna w miejscu użycia
+ * (R-2.2-M3).
+ */
+const NO_MEDUSA_CONTAINER_SCOPE = { resolve: () => undefined };
+/** Znacznik semantyki artefaktu proof po Story 2.2 (patrz komentarz przy użyciu). */
+const NOTIFICATION_DISPATCH_MODE =
+  "degraded_only:no_medusa_container (Story 2.2 — `dispatched` nieosiągalne z tego skryptu)";
 
 class CapturingEvents implements EventEmitterPort {
   events: Array<{ event_type: string; market_id: string; payload: Record<string, unknown> }> = [];
@@ -100,6 +112,21 @@ async function main() {
       events,
       idempotency: createInProcessIdempotencyPort(),
       rateLimit: createInProcessRateLimitPort(),
+      // Story 2.2 (AC4): Step 3 idzie przez Modules.NOTIFICATION.
+      //
+      // R-2.2-M3 — ZAPIS ZGODNY Z KODEM (poprzedni komentarz opisywał zachowanie
+      // warunkowe, którego tu nie ma): ten skrypt biegnie przez `ts-node` z gołym
+      // knexem, BEZ kontenera Medusy, więc scope jest stałą zwracającą `undefined`
+      // i `resolveNotificationModule()` rzuca ZAWSZE
+      // (`VOUCHER_DELIVERY_NOTIFICATION_MODULE_UNAVAILABLE`).
+      // Konsekwencja dla konsumenta artefaktu: od v1.14.0 proof Story 1.10 dowodzi
+      // WYŁĄCZNIE ścieżki degradacyjnej (`dlq_provider_failed`) — `dispatched` jest
+      // z tego skryptu nieosiągalne. Jest to zaznaczone w samym artefakcie
+      // (`notification_dispatch_mode`), żeby nie dało się go odczytać jako regresji.
+      notifications: new MedusaNotificationDispatchAdapter(
+        NO_MEDUSA_CONTAINER_SCOPE,
+        db
+      ),
     });
 
     let consentAuditId = existing?.consent_audit_id;
@@ -186,6 +213,7 @@ async function main() {
           typeof row.payload === "string" ? JSON.parse(row.payload) : row.payload,
       })),
       emitted_events: events.events.map(safeEvent),
+      notification_dispatch_mode: NOTIFICATION_DISPATCH_MODE,
       pii_redaction: "recipient_email and recipient_phone were not stored for this proof run",
     };
 

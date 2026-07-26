@@ -49,6 +49,19 @@ export interface NotificationRecipient {
   market_id: string;
 }
 
+/**
+ * Załącznik wiadomości (R-2.2-M1).
+ *
+ * Kontrakt jest JEDNOZNACZNY: `content_base64` to zawsze base64 — normalizacja
+ * (np. surowy tekst ICS → base64) należy do warstwy mapującej payload
+ * call-site'u na intent, nie do providera. Dzięki temu adapter Brevo nie zgaduje
+ * kodowania i nie może po cichu wysłać uszkodzonego pliku.
+ */
+export interface NotificationAttachment {
+  name: string;
+  content_base64: string;
+}
+
 export interface NotificationIntent {
   flow_id: string;
   channel: Channel;
@@ -58,6 +71,12 @@ export interface NotificationIntent {
   locale: Locale;
   consent_basis: ConsentBasis;
   idempotency_key: string;
+  /**
+   * Załączniki (R-2.2-M1). Przed 2.2 pole nie istniało, a `attachments`
+   * z `ProviderSendNotificationDTO` były cicho gubione — dla maila potwierdzenia
+   * wizyty sens biznesowy = plik ICS, więc utrata była cichą utratą treści.
+   */
+  attachments?: NotificationAttachment[];
 }
 
 // Sentinel convention (Story 5.5 Path Y subscriber + Story 5.10 pre-parse reject):

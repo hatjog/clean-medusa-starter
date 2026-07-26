@@ -12,6 +12,9 @@ import {
   renderBuyerClaimText,
 } from "../modules/vendor-notifications/email-templates/buyer-claim/i18n"
 import { VOUCHER_MODULE } from "../modules/voucher"
+// Story 2.2 (AC5 poz.5): klucz szablonu WYŁĄCZNIE ze stałej rejestru (AD-6).
+import { NOTIFICATION_TEMPLATE_KEYS } from "@gp/messaging"
+import { resolveMarketScopedNotificationMarketId } from "../lib/notification-market-context"
 
 /**
  * voucher-claimed-buyer-notification — Story v160-6-6 backend subscriber.
@@ -37,12 +40,27 @@ interface VoucherClaimedEventPayload {
   voucher_id: string
   voucher_code?: string
   claimed_at?: string
+  /**
+   * R-2.2-M4: rynek z danych domenowych, gdy event go niesie. Dziś opcjonalny —
+   * emitent jeszcze go nie ustawia — ale gdy się pojawi, wysyłka przestaje
+   * zależeć od `GP_DEFAULT_MARKET_ID` bez zmiany tego pliku.
+   */
+  market_id?: string
 }
 
 type LoggerLike = {
   info?: (message: string, meta?: Record<string, unknown>) => void
   warn?: (message: string, meta?: Record<string, unknown>) => void
   error?: (message: string, error?: unknown) => void
+}
+
+/**
+ * Story 2.3 (AC6b): rekord źródłowy niesie też `market_id` z danych domenowych.
+ * Pole jest ŚWIADOMIE poza `VoucherClaimSourceRecord` (granica AR45 projekcji
+ * treści maila) — rynek jest metadaną routingu wysyłki, nie treścią.
+ */
+type VoucherClaimSourceWithMarket = VoucherClaimSourceRecord & {
+  market_id?: string | null
 }
 
 interface VoucherClaimAuditFetcher {
@@ -53,7 +71,7 @@ interface VoucherClaimAuditFetcher {
    */
   fetchVoucherClaimSource(
     voucher_id: string,
-  ): Promise<VoucherClaimSourceRecord | null>
+  ): Promise<VoucherClaimSourceWithMarket | null>
 }
 
 interface BuyerClaimNotificationDispatcher {
@@ -64,6 +82,7 @@ interface BuyerClaimNotificationDispatcher {
     html: string
     locale: "pl" | "en"
     voucher_id: string
+    market_id?: string | null
   }): Promise<{ notificationId: string | null }>
 }
 
@@ -82,7 +101,7 @@ type VoucherModuleSourceReader = {
   findBuyerClaimSource(
     voucher_id: string,
     voucher_code: string | null,
-  ): Promise<VoucherClaimSourceRecord | null>
+  ): Promise<(VoucherClaimSourceRecord & { market_id?: string | null }) | null>
 }
 
 function extractNotificationId(value: unknown): string | null {
@@ -148,6 +167,10 @@ function createVoucherClaimAuditFetcher(
         claimed_at: eventPayload.claimed_at ?? source.claimed_at ?? null,
         voucher_code:
           source.voucher_code ?? eventPayload.voucher_code ?? voucher_id,
+        // Story 2.3 (AC6b): rynek z danych domenowych — od tej story projekcja
+        // `findBuyerClaimSource` go zwraca, więc call-site przestaje spadać na
+        // `GP_DEFAULT_MARKET_ID`.
+        market_id: source.market_id ?? null,
       }
     },
   }
@@ -155,14 +178,26 @@ function createVoucherClaimAuditFetcher(
 
 function createBuyerClaimNotificationDispatcher(
   notificationModule: NotificationModuleLike,
+  logger?: LoggerLike,
 ): BuyerClaimNotificationDispatcher {
   return {
     async dispatch(input) {
       const payload = {
         to: input.to,
         channel: "email",
-        template: "buyer_claim_notification",
+        // `template` = pole kontraktu Medusy; `data.template_key` = kanoniczne GP
+        // (ADR-158). Obie wartości z tej samej stałej rejestru.
+        template: NOTIFICATION_TEMPLATE_KEYS.BUYER_CLAIM_NOTIFICATION,
         data: {
+          template_key: NOTIFICATION_TEMPLATE_KEYS.BUYER_CLAIM_NOTIFICATION,
+          // R-2.2-M4: rynek z danych domenowych, gdy jest; fallback konfiguracyjny
+          // wyłącznie z głośnym ostrzeżeniem (to wysyłka market-scoped).
+          market_id: resolveMarketScopedNotificationMarketId({
+            market_id: input.market_id,
+            call_site: "voucher-claimed-buyer-notification",
+            logger,
+          }),
+          flow_id: "voucher_claim",
           voucher_id: input.voucher_id,
           locale: input.locale,
           subject: input.subject,
@@ -175,7 +210,7 @@ function createBuyerClaimNotificationDispatcher(
           html: input.html,
         },
         metadata: {
-          notification_type: "buyer_claim_notification",
+          notification_type: NOTIFICATION_TEMPLATE_KEYS.BUYER_CLAIM_NOTIFICATION,
           triggered_by: "system",
           voucher_id: input.voucher_id,
           locale: input.locale,
@@ -263,6 +298,9 @@ export async function handleVoucherClaimedForBuyerNotification(
         html,
         locale: projected.locale,
         voucher_id,
+        // AC6b: event (gdy niesie) → projekcja źródłowa → fallback konfiguracyjny
+        // (ten ostatni wyłącznie z głośnym `warn`).
+        market_id: payload.market_id ?? source.market_id ?? null,
       })
 
       deps.logger?.info?.("[buyer-claim] notification sent", {
@@ -321,7 +359,7 @@ export default async function voucherClaimedBuyerNotificationSubscriber({
     event.data as VoucherClaimedEventPayload,
   )
   const notificationModule = container.resolve(Modules.NOTIFICATION) as NotificationModuleLike
-  const dispatcher = createBuyerClaimNotificationDispatcher(notificationModule)
+  const dispatcher = createBuyerClaimNotificationDispatcher(notificationModule, logger)
 
   await handleVoucherClaimedForBuyerNotification(
     event.data as VoucherClaimedEventPayload,

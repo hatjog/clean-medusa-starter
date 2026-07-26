@@ -174,10 +174,13 @@ describe("BrevoAdapter", () => {
     await expect(adapter.send(makeIntent())).rejects.toBeInstanceOf(
       MessagingProviderError,
     );
+    // R-2.2-M5: `message` NIE cytuje treści z odpowiedzi Brevo (komunikaty
+    // walidacyjne rutynowo zawierają odrzucony adres), bo ląduje w PII-free
+    // `NotificationAuditEnvelope.error_message`. Surowa odpowiedź zostaje na `cause`.
     await expect(adapter.send(makeIntent())).rejects.toMatchObject({
       error_code: "invalid_parameter",
       status_code: 400,
-      message: "Invalid template id",
+      message: "Brevo provider request failed (invalid_parameter, HTTP 400)",
     });
   });
 
@@ -222,16 +225,16 @@ describe("BrevoAdapter", () => {
 
     await expect(makeAdapter(bodyCodeClient).send(makeIntent())).rejects.toMatchObject({
       error_code: "body_code",
-      message: "Brevo provider request failed",
+      message: "Brevo provider request failed (body_code, HTTP 422)",
       status_code: 422,
     });
     await expect(makeAdapter(rootCodeClient).send(makeIntent())).rejects.toMatchObject({
       error_code: "root_code",
-      message: "Brevo provider request failed",
+      message: "Brevo provider request failed (root_code)",
     });
     await expect(makeAdapter(fallbackClient).send(makeIntent())).rejects.toMatchObject({
       error_code: "BREVO_PROVIDER_ERROR",
-      message: "Brevo provider request failed",
+      message: "Brevo provider request failed (BREVO_PROVIDER_ERROR)",
     });
   });
 
@@ -251,7 +254,7 @@ describe("BrevoAdapter", () => {
     await expect(adapter.send(makeIntent())).rejects.toMatchObject({
       error_code: "BREVO_HTTP_503",
       status_code: 503,
-      message: "Service unavailable",
+      message: "Brevo provider request failed (BREVO_HTTP_503, HTTP 503)",
     });
   });
 
@@ -298,5 +301,70 @@ describe("BrevoAdapter", () => {
     expect(() =>
       adapter.toBrevoPayload(makeIntent({ template_key: "unknown_template" })),
     ).toThrow(MessagingProviderError);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Story 2.2 review — załączniki (R-2.2-M1) i higiena PII w błędach (R-2.2-M5)
+// ---------------------------------------------------------------------------
+
+describe("załączniki i higiena błędów (review 2.2)", () => {
+  it("mapuje intent.attachments na kontrakt Brevo `attachment[{content,name}]`", () => {
+    const client: IBrevoClient = { sendTransacEmail: jest.fn() };
+    const payload = makeAdapter(client).toBrevoPayload(
+      makeIntent({
+        attachments: [{ name: "wizyta.ics", content_base64: "QkVHSU46VkNBTEVOREFS" }],
+      }),
+    );
+
+    expect(payload.attachment).toEqual([
+      { content: "QkVHSU46VkNBTEVOREFS", name: "wizyta.ics" },
+    ]);
+  });
+
+  it("bez załączników pole `attachment` w ogóle nie powstaje", () => {
+    const client: IBrevoClient = { sendTransacEmail: jest.fn() };
+    const payload = makeAdapter(client).toBrevoPayload(makeIntent());
+
+    expect("attachment" in payload).toBe(false);
+  });
+
+  it("adres odbiorcy z komunikatu Brevo NIE wycieka do message błędu", async () => {
+    const client: IBrevoClient = {
+      sendTransacEmail: jest.fn(async () => {
+        throw {
+          status: 400,
+          body: {
+            code: "invalid_parameter",
+            message: "Invalid email address: buyer@example.com",
+          },
+        };
+      }),
+    };
+
+    await expect(makeAdapter(client).send(makeIntent())).rejects.toMatchObject({
+      error_code: "invalid_parameter",
+    });
+    await expect(makeAdapter(client).send(makeIntent())).rejects.not.toMatchObject({
+      message: expect.stringContaining("buyer@example.com"),
+    });
+  });
+
+  it("błędy konfiguracji są oznaczone jako pre-flight (nic nie wysłano)", async () => {
+    const client: IBrevoClient = { sendTransacEmail: jest.fn() };
+
+    await expect(
+      makeAdapter(client).send(makeIntent({ template_key: "spoza_rejestru" })),
+    ).rejects.toMatchObject({
+      error_code: "BREVO_TEMPLATE_NOT_CONFIGURED",
+      preflight: true,
+    });
+    await expect(
+      makeAdapter(client).send(makeIntent({ recipient: { email: "x@y.z", market_id: "xx" } })),
+    ).rejects.toMatchObject({
+      error_code: "BREVO_SENDER_NOT_CONFIGURED",
+      preflight: true,
+    });
+    expect(client.sendTransacEmail).not.toHaveBeenCalled();
   });
 });
