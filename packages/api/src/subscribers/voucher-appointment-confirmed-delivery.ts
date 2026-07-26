@@ -42,18 +42,30 @@ type AppointmentConfirmedPayload = {
   appointment_id?: string | null
   sequence?: number | null
   lifecycle_status?: VoucherAppointmentLifecycleStatus | null
-  /**
-   * R-2.2-M4: rynek z danych domenowych, gdy event go niesie. Dziś opcjonalny —
-   * emitent go nie ustawia — ale gdy się pojawi, wysyłka przestaje zależeć od
-   * `GP_DEFAULT_MARKET_ID`.
-   */
+}
+
+/**
+ * Story 2.3 (AC6b) — rynek przychodzi w `scope` KOPERTY, nie w payloadzie.
+ *
+ * Domknięcie R-2.2-M4: 2.2 dodało opcjonalne `payload.market_id`, ale schema
+ * `gp.voucher.appointment_confirmed.v1` ma `additionalProperties: false` i NIE
+ * deklaruje tego pola — czyli emiter nie mógłby go legalnie wysłać, a odczyt
+ * z payloadu był martwy. Normatywnym nośnikiem rynku jest `envelope.v1`
+ * `scope.market_id` (pole WYMAGANE w kopercie), uzupełniony przez projekcję
+ * `findAppointmentConfirmationDeliverySource` (od 2.3 zwraca `market_id`).
+ */
+type AppointmentConfirmedScope = {
+  instance_id?: string
   market_id?: string | null
+  vendor_id?: string | null
+  location_id?: string | null
 }
 
 type AppointmentConfirmedEnvelope = {
   event_type?: string
   occurred_at?: string
   causation_id?: string
+  scope?: AppointmentConfirmedScope
   payload?: Partial<AppointmentConfirmedPayload>
 }
 
@@ -63,7 +75,7 @@ type AppointmentConfirmationDeliverySource = {
   salon_name?: string | null
   location_address?: string | null
   seller_handle?: string | null
-  /** R-2.2-M4: rynek z projekcji źródłowej, gdy zostanie do niej dodany. */
+  /** R-2.2-M4 domknięte w Story 2.3: projekcja zwraca rynek z danych domenowych. */
   market_id?: string | null
 }
 
@@ -102,6 +114,7 @@ export async function handleVoucherAppointmentConfirmedDelivery(
   },
 ): Promise<AppointmentConfirmationDeliveryResult> {
   const payload = extractAppointmentPayload(data)
+  const scopeMarketId = extractAppointmentScopeMarketId(data)
   const entitlementId = payload.entitlement_instance_id ?? null
 
   if (!entitlementId) {
@@ -163,7 +176,8 @@ export async function handleVoucherAppointmentConfirmedDelivery(
     entitlementId,
     locale: source.buyer_locale ?? "pl",
     email,
-    marketId: payload.market_id ?? source.market_id ?? null,
+    // AC6b: rynek z danych domenowych — `scope` koperty, potem projekcja.
+    marketId: scopeMarketId ?? source.market_id ?? null,
     logger: deps.logger,
   })
   const result = await deps.dispatcher.dispatch(notificationPayload)
@@ -239,6 +253,18 @@ function extractAppointmentPayload(
   }
 
   return data as Partial<AppointmentConfirmedPayload>
+}
+
+/** Story 2.3 (AC6b) — rynek z `scope` koperty envelope.v1 (pole wymagane). */
+function extractAppointmentScopeMarketId(
+  data: AppointmentConfirmedEnvelope | Record<string, unknown>,
+): string | null {
+  const scope = (data as AppointmentConfirmedEnvelope).scope
+  if (!scope || typeof scope !== "object") return null
+  const marketId = scope.market_id
+  if (typeof marketId !== "string") return null
+  const trimmed = marketId.trim()
+  return trimmed.length > 0 ? trimmed : null
 }
 
 function buildNotificationPayload(input: {

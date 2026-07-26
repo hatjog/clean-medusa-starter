@@ -54,6 +54,15 @@ type LoggerLike = {
   error?: (message: string, error?: unknown) => void
 }
 
+/**
+ * Story 2.3 (AC6b): rekord źródłowy niesie też `market_id` z danych domenowych.
+ * Pole jest ŚWIADOMIE poza `VoucherClaimSourceRecord` (granica AR45 projekcji
+ * treści maila) — rynek jest metadaną routingu wysyłki, nie treścią.
+ */
+type VoucherClaimSourceWithMarket = VoucherClaimSourceRecord & {
+  market_id?: string | null
+}
+
 interface VoucherClaimAuditFetcher {
   /**
    * Resolves the AR45 source record for a voucher_id. Stub-tier callers may
@@ -62,7 +71,7 @@ interface VoucherClaimAuditFetcher {
    */
   fetchVoucherClaimSource(
     voucher_id: string,
-  ): Promise<VoucherClaimSourceRecord | null>
+  ): Promise<VoucherClaimSourceWithMarket | null>
 }
 
 interface BuyerClaimNotificationDispatcher {
@@ -92,7 +101,7 @@ type VoucherModuleSourceReader = {
   findBuyerClaimSource(
     voucher_id: string,
     voucher_code: string | null,
-  ): Promise<VoucherClaimSourceRecord | null>
+  ): Promise<(VoucherClaimSourceRecord & { market_id?: string | null }) | null>
 }
 
 function extractNotificationId(value: unknown): string | null {
@@ -158,6 +167,10 @@ function createVoucherClaimAuditFetcher(
         claimed_at: eventPayload.claimed_at ?? source.claimed_at ?? null,
         voucher_code:
           source.voucher_code ?? eventPayload.voucher_code ?? voucher_id,
+        // Story 2.3 (AC6b): rynek z danych domenowych — od tej story projekcja
+        // `findBuyerClaimSource` go zwraca, więc call-site przestaje spadać na
+        // `GP_DEFAULT_MARKET_ID`.
+        market_id: source.market_id ?? null,
       }
     },
   }
@@ -285,7 +298,9 @@ export async function handleVoucherClaimedForBuyerNotification(
         html,
         locale: projected.locale,
         voucher_id,
-        market_id: payload.market_id ?? null,
+        // AC6b: event (gdy niesie) → projekcja źródłowa → fallback konfiguracyjny
+        // (ten ostatni wyłącznie z głośnym `warn`).
+        market_id: payload.market_id ?? source.market_id ?? null,
       })
 
       deps.logger?.info?.("[buyer-claim] notification sent", {

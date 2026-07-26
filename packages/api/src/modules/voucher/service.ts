@@ -297,6 +297,40 @@ function resolveDatabaseUrl(override?: string): string {
   return url
 }
 
+/**
+ * Story 2.3 — normalizacja pola projekcji do `string | null`. Pusty string i
+ * whitespace traktujemy jak brak wartości: „ ” w kolumnie `market_id` byłoby
+ * gorsze niż null, bo przeszłoby przez `??` i udawało daną domenową.
+ */
+function firstNonEmptyString(value: unknown): string | null {
+  if (typeof value !== "string") return null
+  const trimmed = value.trim()
+  return trimmed.length > 0 ? trimmed : null
+}
+
+/**
+ * Story 2.3 — odczyt pola z kolumny `metadata` (jsonb albo string, zależnie od
+ * sterownika/kształtu wiersza). Zwraca `null` przy każdym niejednoznacznym
+ * wejściu — projekcja nigdy nie zgaduje.
+ */
+function readMetadataString(value: unknown, key: string): string | null {
+  let parsed: unknown = value
+
+  if (typeof value === "string") {
+    try {
+      parsed = JSON.parse(value)
+    } catch {
+      return null
+    }
+  }
+
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return null
+  }
+
+  return firstNonEmptyString((parsed as Record<string, unknown>)[key])
+}
+
 export class VoucherService {
   private readonly container_: Record<string, any>
   private readonly moduleOptions_: VoucherModuleOptions
@@ -711,6 +745,17 @@ export class VoucherService {
    * Returns null when no matching entitlement_instance / voucher row is
    * found — caller emits audit_status='failed' with
    * error_message='voucher source not found'.
+   *
+   * ── Story 2.3 (v1.14.0, AC6b + AC3): rozszerzenie projekcji ───────────────
+   * Domknięcie deferralu R-2.2-M4: projekcja zwraca teraz `market_id` z danych
+   * DOMENOWYCH (`entitlement_instance.market_id`, fallback
+   * `policy_snapshot->>'market_id'`), więc wysyłki market-scoped przestają
+   * zależeć od `GP_DEFAULT_MARKET_ID` (`lib/notification-market-context.ts`).
+   * Dodatkowo zwraca `purchase_locale` — locale zakupu utrwalone przez
+   * storefront w `order.metadata` (kontrakt v1 ADR-162; fallback
+   * `policy_snapshot->>'purchase_locale'` dla ścieżek bez zamówienia).
+   * Oba pola są NULLABLE: brak wartości to legalny stan zastanych danych,
+   * a konsument stosuje jawny, logowany fallback (nigdy cichy).
    */
   async findBuyerClaimSource(
     voucher_id: string,
@@ -723,6 +768,10 @@ export class VoucherService {
     service_title: string | null
     claimed_at: string | null
     voucher_code: string | null
+    /** R-2.2-M4: rynek z danych domenowych (Story 2.3, AC6b). */
+    market_id: string | null
+    /** Locale zakupu z `order.metadata.purchase_locale` (Story 2.3, AC3). */
+    purchase_locale: string | null
   } | null> {
     const lookupCode = voucher_code ?? voucher_id
     const pool = this.getPool()
@@ -731,11 +780,13 @@ export class VoucherService {
          ei.id                                       AS ei_id,
          ei.policy_snapshot                          AS policy_snapshot,
          ei.order_id                                 AS order_id,
+         ei.market_id                                AS ei_market_id,
          v.code                                      AS voucher_code,
          v.seller_name                               AS seller_name,
          v.seller_handle                             AS seller_handle,
          v.product_title                             AS product_title,
          o.email                                     AS order_email,
+         o.metadata                                  AS order_metadata,
          (
            SELECT ve.occurred_at FROM voucher_event ve
             WHERE ve.voucher_code = v.code
@@ -805,6 +856,18 @@ export class VoucherService {
           ? (snapshot.voucher_code as string)
           : null) ??
         lookupCode,
+      // R-2.2-M4 (Story 2.3, AC6b): rynek z danych domenowych. Kolejność
+      // pierwszeństwa: kolumna Layer-4 → snapshot polityki. Brak = null, żeby
+      // konsument mógł jawnie zalogować fallback konfiguracyjny.
+      market_id:
+        firstNonEmptyString(row.ei_market_id) ??
+        firstNonEmptyString(snapshot.market_id),
+      // Story 2.3 (AC3): locale zakupu utrwalone w checkoucie przez storefront
+      // (`cart.metadata` → `order.metadata`). Snapshot polityki jest fallbackiem
+      // dla ścieżek bez zamówienia (np. live-issue Path Y bez cart metadata).
+      purchase_locale:
+        readMetadataString(row.order_metadata, "purchase_locale") ??
+        firstNonEmptyString(snapshot.purchase_locale),
     }
   }
 
@@ -815,6 +878,10 @@ export class VoucherService {
    * email must not receive a voucher code or service title. It only resolves
    * the dispatch recipient plus neutral salon/location labels used in the
    * confirmation body and .ics payload.
+   *
+   * Story 2.3 (v1.14.0, AC6b): projekcja zwraca `market_id` z danych domenowych
+   * (`entitlement_instance.market_id`, fallback `policy_snapshot->>'market_id'`)
+   * — domknięcie deferralu R-2.2-M4 dla DRUGIEGO call-site'u voucherowego.
    */
   async findAppointmentConfirmationDeliverySource(
     entitlement_instance_id: string,
@@ -824,6 +891,8 @@ export class VoucherService {
     salon_name: string | null
     location_address: string | null
     seller_handle: string | null
+    /** R-2.2-M4: rynek z danych domenowych (Story 2.3, AC6b). */
+    market_id: string | null
   } | null> {
     const pool = this.getPool()
     const res = await pool.query<Record<string, unknown>>(
@@ -831,6 +900,7 @@ export class VoucherService {
          ei.id                                       AS ei_id,
          ei.policy_snapshot                          AS policy_snapshot,
          ei.order_id                                 AS order_id,
+         ei.market_id                                AS ei_market_id,
          v.seller_name                               AS seller_name,
          v.seller_handle                             AS seller_handle,
          o.email                                     AS order_email
@@ -894,6 +964,10 @@ export class VoucherService {
       salon_name: salonName,
       location_address: locationAddress,
       seller_handle: sellerHandle,
+      // R-2.2-M4 (Story 2.3, AC6b) — rynek z danych domenowych.
+      market_id:
+        firstNonEmptyString(row.ei_market_id) ??
+        firstNonEmptyString(snapshot.market_id),
     }
   }
 

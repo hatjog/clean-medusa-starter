@@ -25,13 +25,13 @@
  *   - `idempotency-cache` — ZACHOWANY (to natywna własność gatewaya; pre-flight
  *     faile nie są cache'owane, patrz R-2.2-M2 w `gateway.ts`).
  *   - `flagResolver` (per-market kill-switch flow) i `flowKpiTelemetry` (KPI
- *     `sent` → denominator `delivered_rate`) — WSTRZYKIWALNE przez `seams`, ale
- *     produkcyjnie NIEPODPIĘTE. Podpięcie wymaga loadera czytającego konfigurację
- *     flag komunikacyjnych i rejestr approvali 5-8 (PostHog client) — infrastruktura
- *     spoza zakresu 2.2. WŁAŚCICIEL: Story 2.3, deferral architektoniczny
- *     (wymaga ADR na wiring flag/KPI w module Notification). Do tego czasu:
- *     kill-switch per rynek/flow NIE działa na tej ścieżce, a KPI `sent` nie są
- *     emitowane — to jawny dług, nie spełniona własność.
+ *     `sent` → denominator `delivered_rate`) — **PODPIĘTE PRODUKCYJNIE w Story
+ *     2.3** (ADR-161, domknięcie deferralu R-2.2-H1). Wiring żyje w
+ *     `communication-wiring.ts` i czyta `communication-defaults.yaml` +
+ *     `communication-flows.yaml` per rynek + rejestr approvali 5-8. Seamy
+ *     `flagResolver`/`flowKpiTelemetry` zachowują PIERWSZEŃSTWO (testy), a brak
+ *     konfiguracji degraduje do stanu sprzed 2.3 — ale ZAWSZE z ostrzeżeniem
+ *     w logu, nigdy po cichu.
  *
  * Konsekwencja wymagająca jawnej obsługi: gateway ŁAPIE `MessagingProviderError`
  * i zwraca `NotificationDispatch{status:"failed"}` zamiast rzucać (patrz
@@ -66,6 +66,7 @@ import {
   type NotificationAuditEnvelope,
 } from "@gp/messaging"
 
+import { resolveCommunicationWiring } from "./communication-wiring"
 import { toNotificationIntent } from "./intent"
 import { resolveBrevoSenders } from "./senders"
 
@@ -204,12 +205,15 @@ export class BrevoNotificationProviderService extends AbstractNotificationProvid
 
     const provider = new RegistryBackedBrevoProvider(this.resolveClient(env), { senders })
 
+    // Story 2.3 (AC6a) — domknięcie R-2.2-H1: gniazda są teraz WYPEŁNIANE
+    // produkcyjnie. Seam testowy ma pierwszeństwo; gdy go nie ma, wiring czyta
+    // rejestr flag komunikacyjnych + rejestr approvali 5-8 i loguje głośno, gdy
+    // konfiguracji brak (kill-switch nieaktywny nie może być domyślany).
+    const wiring = resolveCommunicationWiring({ env, logger: this.logger_ })
+
     this.gateway_ = new DefaultMessagingGateway({ brevo: provider }, "brevo", {
-      // R-2.2-H1: gniazda podpięte do gatewaya. Dziś zwykle `undefined`
-      // (kill-switch/KPI = Story 2.3), ale wiring istnieje i jest testowalny —
-      // nie ma już rozjazdu „opcje pominięte w całości" vs deklaracja w AC1.
-      flagResolver: this.seams_.flagResolver,
-      flowKpiTelemetry: this.seams_.flowKpiTelemetry,
+      flagResolver: this.seams_.flagResolver ?? wiring.flagResolver,
+      flowKpiTelemetry: this.seams_.flowKpiTelemetry ?? wiring.flowKpiTelemetry,
     })
 
     return this.gateway_

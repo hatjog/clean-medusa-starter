@@ -817,6 +817,10 @@ describe("VoucherService", () => {
         salon_name: "Salon Snapshot",
         location_address: "ul. Snapshot 1",
         seller_handle: "salon-alfa",
+        // Story 2.3 (AC6b): projekcja zwraca market_id z danych domenowych;
+        // `null` = wiersz bez rynku (legalny stan zastanych danych → konsument
+        // loguje fallback konfiguracyjny).
+        market_id: null,
       })
       expect(JSON.stringify(source)).not.toContain("RAW-CODE-DO-NOT-RETURN")
     })
@@ -849,7 +853,174 @@ describe("VoucherService", () => {
         salon_name: "Salon Alfa",
         location_address: null,
         seller_handle: "salon-alfa",
+        market_id: null,
       })
+    })
+
+    // Story 2.3 (AC6b) — domknięcie deferralu R-2.2-M4: rynek MUSI przyjść
+    // z danych domenowych, żeby wysyłka przestała spadać na GP_DEFAULT_MARKET_ID.
+    it("zwraca market_id z kolumny entitlement_instance.market_id", async () => {
+      const pool = makeMockPool({
+        queryResponses: [
+          {
+            rows: [
+              {
+                ei_id: "entinst_apt_003",
+                policy_snapshot: {},
+                order_email: "order-buyer@example.test",
+                ei_market_id: "bongarden",
+                seller_name: "Salon Alfa",
+                seller_handle: "salon-alfa",
+              },
+            ],
+          },
+        ],
+      })
+      const svc = makeService(pool)
+
+      const source = await svc.findAppointmentConfirmationDeliverySource(
+        "entinst_apt_003",
+      )
+
+      expect(source?.market_id).toBe("bongarden")
+    })
+
+    it("fallbackuje market_id do policy_snapshot.market_id", async () => {
+      const pool = makeMockPool({
+        queryResponses: [
+          {
+            rows: [
+              {
+                ei_id: "entinst_apt_004",
+                policy_snapshot: { market_id: "bonevent" },
+                order_email: "order-buyer@example.test",
+                ei_market_id: null,
+                seller_name: "Salon Alfa",
+                seller_handle: "salon-alfa",
+              },
+            ],
+          },
+        ],
+      })
+      const svc = makeService(pool)
+
+      const source = await svc.findAppointmentConfirmationDeliverySource(
+        "entinst_apt_004",
+      )
+
+      expect(source?.market_id).toBe("bonevent")
+    })
+  })
+
+  // Story 2.3 (AC3 + AC6b) — projekcja buyer-claim niesie teraz `market_id`
+  // i `purchase_locale` (locale zakupu z order.metadata).
+  describe("buyer claim source — market_id + purchase_locale (Story 2.3)", () => {
+    it("zwraca purchase_locale z order.metadata i market_id z kolumny Layer-4", async () => {
+      const pool = makeMockPool({
+        queryResponses: [
+          {
+            rows: [
+              {
+                ei_id: "entinst_buy_001",
+                policy_snapshot: { buyer_email: "buyer@example.test" },
+                order_id: "order_1",
+                ei_market_id: "bonbeauty",
+                voucher_code: "VCH-1",
+                seller_name: "Salon Alfa",
+                seller_handle: "salon-alfa",
+                product_title: "Masaż",
+                order_email: "order-buyer@example.test",
+                order_metadata: { purchase_locale: "ua" },
+                claimed_at: null,
+              },
+            ],
+          },
+        ],
+      })
+      const svc = makeService(pool)
+
+      const source = await svc.findBuyerClaimSource("entinst_buy_001", null)
+
+      expect(source?.market_id).toBe("bonbeauty")
+      expect(source?.purchase_locale).toBe("ua")
+    })
+
+    it("toleruje order.metadata jako string JSON (kształt zależny od sterownika)", async () => {
+      const pool = makeMockPool({
+        queryResponses: [
+          {
+            rows: [
+              {
+                ei_id: "entinst_buy_002",
+                policy_snapshot: {},
+                order_id: "order_2",
+                ei_market_id: null,
+                voucher_code: "VCH-2",
+                order_email: "order-buyer@example.test",
+                order_metadata: JSON.stringify({ purchase_locale: "de" }),
+                claimed_at: null,
+              },
+            ],
+          },
+        ],
+      })
+      const svc = makeService(pool)
+
+      const source = await svc.findBuyerClaimSource("entinst_buy_002", null)
+
+      expect(source?.purchase_locale).toBe("de")
+    })
+
+    it("zwraca null dla purchase_locale i market_id, gdy dane ich nie niosą", async () => {
+      const pool = makeMockPool({
+        queryResponses: [
+          {
+            rows: [
+              {
+                ei_id: "entinst_buy_003",
+                policy_snapshot: {},
+                order_id: "order_3",
+                voucher_code: "VCH-3",
+                order_email: "order-buyer@example.test",
+                order_metadata: null,
+                claimed_at: null,
+              },
+            ],
+          },
+        ],
+      })
+      const svc = makeService(pool)
+
+      const source = await svc.findBuyerClaimSource("entinst_buy_003", null)
+
+      expect(source?.purchase_locale).toBeNull()
+      expect(source?.market_id).toBeNull()
+    })
+
+    it("puste/whitespace market_id NIE udaje danej domenowej", async () => {
+      const pool = makeMockPool({
+        queryResponses: [
+          {
+            rows: [
+              {
+                ei_id: "entinst_buy_004",
+                policy_snapshot: {},
+                order_id: "order_4",
+                ei_market_id: "   ",
+                voucher_code: "VCH-4",
+                order_email: "order-buyer@example.test",
+                order_metadata: {},
+                claimed_at: null,
+              },
+            ],
+          },
+        ],
+      })
+      const svc = makeService(pool)
+
+      const source = await svc.findBuyerClaimSource("entinst_buy_004", null)
+
+      expect(source?.market_id).toBeNull()
     })
   })
 })
