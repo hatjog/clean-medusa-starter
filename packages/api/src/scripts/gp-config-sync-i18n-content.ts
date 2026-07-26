@@ -9,7 +9,7 @@ import * as yaml from "js-yaml"
 import { parseDryRunFlag } from "./gp-sync-dry-run"
 import { loadMarketSupportedLocaleCodes } from "./gp-config-sync-translations"
 import { isTranslationFeatureFlagEnabled } from "../lib/translation-ff-config"
-import { buildContentBarMap, type ContentBarMap } from "./lib/content-bar"
+import { buildContentBarMap, localeRoutingSlug, type ContentBarMap } from "./lib/content-bar"
 import { readCategoryPlSource } from "./gp-config-content-bar"
 
 type EntityType = "product_category" | "product" | "seller"
@@ -104,8 +104,10 @@ type EntitySummary = {
 }
 
 /**
- * Encja rozwiązana w DB wraz z jej opisami z source YAML — wejście do
- * materializacji `metadata.gp.content_bar` (AD-4).
+ * Encja rozwiązana w DB wraz z jej opisami per locale — wejście do
+ * materializacji `metadata.gp.content_bar` (AD-4). Locale tłumaczone pochodzą
+ * z source YAML; natywny PL z realnego body (DB `description` dla
+ * product/seller, gp-config `products.yaml` dla kategorii — fix 1-4-c2).
  */
 type ContentBarTarget = {
   entityType: EntityType
@@ -317,16 +319,18 @@ async function listEntitiesByHandle(
     })
   }
 
+  // Fix 1-4-c2: `description` w select produktu/sellera to źródło natywnego
+  // PL body dla baru — bez niego bar.pl liczyłby się ze stubów YAML.
   if (entityType === "product") {
     return tryList(services.productModuleService, ["listProducts", "list"], {
       filters: { handle },
-      config: { select: ["id", "handle", "metadata"], take: null },
+      config: { select: ["id", "handle", "metadata", "description"], take: null },
     })
   }
 
   return tryList(services.sellerModuleService, ["list", "listSellers"], {
     filters: { handle },
-    config: { select: ["id", "handle", "metadata"], take: null },
+    config: { select: ["id", "handle", "metadata", "description"], take: null },
   })
 }
 
@@ -428,6 +432,19 @@ function createEntitySummaries(): Record<EntityType, EntitySummary> {
     product_category: emptyEntitySummary(),
     product: emptyEntitySummary(),
     seller: emptyEntitySummary(),
+  }
+}
+
+/**
+ * Fix 1-4-c2: czy klucz locale z source YAML wskazuje na natywny PL (slug
+ * routingu `pl`). Klucz niebędący poprawnym locale zwraca `false` — zostaje
+ * w mapie i to `buildContentBarMap` zgłosi go fail-loud per encja.
+ */
+function isNativePlLocale(locale: string): boolean {
+  try {
+    return localeRoutingSlug(locale) === "pl"
+  } catch {
+    return false
   }
 }
 
@@ -569,13 +586,27 @@ async function collectTranslationPayloads(
 
       summary.resolved_entries += 1
 
-      // AD-4: bar mierzymy z SOURCE YAML (nie z tego, co akurat wylądowało
-      // w DB) i dla WSZYSTKICH locale, także PL — gate FAZY 1 czyta
+      // AD-4: bar locale TŁUMACZONYCH mierzymy z SOURCE YAML (ciała tłumaczeń),
+      // a bar locale natywnego PL z REALNEGO PL body — gate FAZY 1 czyta
       // `content_bar.pl`, więc pominięcie PL wyzerowałoby katalog.
+      //
+      // Fix 1-4-c2 (regresja zerowego katalogu): PL w source YAML tłumaczeń to
+      // stuby (10-14 słów) — liczenie z nich dało bar.pl=false dla 113/113
+      // produktów i 452/452 smoke FAIL, włącznie z /pl. Natywny PL produktów
+      // i sellerów żyje na encji w DB (`description`), analogicznie do
+      // gp-config `products.yaml` dla kategorii (AD-12). Klucze PL z YAML są
+      // usuwane, żeby stub nigdy nie konkurował z realnym body.
       const bodyValues = entry.fields?.["description"]
       const bodies: Record<string, unknown> = isRecord(bodyValues) ? { ...bodyValues } : {}
+      for (const key of Object.keys(bodies)) {
+        if (isNativePlLocale(key)) {
+          delete bodies[key]
+        }
+      }
       if (config.entityType === "product_category") {
         bodies["pl-PL"] = options.categoryPlByHandle.get(handle) ?? ""
+      } else {
+        bodies["pl-PL"] = typeof match.description === "string" ? match.description : ""
       }
       options.barTargets.push({
         entityType: config.entityType,
