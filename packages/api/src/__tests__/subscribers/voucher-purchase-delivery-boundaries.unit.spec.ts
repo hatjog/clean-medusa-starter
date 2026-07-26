@@ -12,10 +12,12 @@
  *     voucher-delivery (ledger ma jednego pisarza — subscriber).
  *  3. Zero literałów `template_key` w kodzie produkcyjnym (AD-6) — klucze
  *     wyłącznie ze stałych rejestru.
- *  4. Zakres 2.3: żadnego gift/handoff (2.4) ani joba sweepa (2.5).
+ *  4. Zakres: Story 2.4 dokłada DRUGI `template_key` w tej samej mechanice —
+ *     żadnego drugiego subscribera, żadnej drugiej tabeli, żadnej kopii logiki
+ *     linku claim. Sweep (2.5) nadal nie jest implementowany.
  */
 
-import { readFileSync } from "node:fs"
+import { readdirSync, readFileSync } from "node:fs"
 import { resolve } from "node:path"
 
 const SRC = resolve(__dirname, "../..")
@@ -26,6 +28,9 @@ const DELIVERY_PATH_FILES = [
   "modules/voucher-delivery/delivery-state.ts",
   "modules/voucher-delivery/recipient-hash.ts",
   "modules/voucher-delivery/purchase-confirmation-intent.ts",
+  // Story 2.4 — handoff wchodzi w TE SAME granice, nie obok nich.
+  "modules/voucher-delivery/gift-handoff.ts",
+  "modules/voucher-delivery/handoff-link-intent.ts",
 ] as const
 
 function read(relative: string): string {
@@ -142,11 +147,59 @@ describe("AD-6 — zero literałów template_key w kodzie produkcyjnym", () => {
   })
 })
 
-describe("granice zakresu 2.3 — 2.4 i 2.5 nie są implementowane", () => {
-  it.each(DELIVERY_PATH_FILES)("%s nie implementuje gift/handoff (Story 2.4)", (file) => {
-    const code = stripComments(read(file))
-    expect(code).not.toContain("voucher_handoff_link")
-    expect(code).not.toContain("VOUCHER_HANDOFF_LINK")
+describe("granice zakresu 2.4 — handoff rozszerza mechanikę 2.3, nie duplikuje jej", () => {
+  it.each(DELIVERY_PATH_FILES)(
+    "%s nie zawiera literału `voucher_handoff_link` (AD-6: klucz ze stałej rejestru)",
+    (file) => {
+      const code = stripComments(read(file))
+      expect(code).not.toContain('"voucher_handoff_link"')
+      expect(code).not.toContain("'voucher_handoff_link'")
+    },
+  )
+
+  it("intent handoffu bierze klucz z NOTIFICATION_TEMPLATE_KEYS.VOUCHER_HANDOFF_LINK", () => {
+    const code = read("modules/voucher-delivery/handoff-link-intent.ts")
+    expect(code).toContain("NOTIFICATION_TEMPLATE_KEYS.VOUCHER_HANDOFF_LINK")
+  })
+
+  it("nie powstał DRUGI subscriber dla handoffu — matryca AD-7 ma jednego konsumenta", () => {
+    const subscribers = readdirSync(resolve(SRC, "subscribers")).filter((name) =>
+      name.endsWith(".ts"),
+    )
+    const handoffSubscribers = subscribers.filter((name) =>
+      /handoff|gift/i.test(name),
+    )
+    expect(handoffSubscribers).toEqual([])
+
+    // Klucz handoffu konsumuje WYŁĄCZNIE subscriber 2.3 — nikt inny nie wysyła.
+    const writers = subscribers.filter((name) =>
+      stripComments(read(`subscribers/${name}`)).includes("VOUCHER_HANDOFF_LINK"),
+    )
+    expect(writers).toEqual(["voucher-purchase-delivery.ts"])
+  })
+
+  it("handoff NIE dostał własnej tabeli ani własnej migracji delivery", () => {
+    // Ledger 2.3 jest jedynym nośnikiem idempotencji wysyłki; drugi klucz
+    // szablonu mieści się w istniejącym UNIQUE bez zmiany schematu.
+    const migrations = readdirSync(resolve(SRC, "migrations")).filter((name) =>
+      /handoff|gift/i.test(name),
+    )
+    expect(migrations).toEqual([])
+
+    const handoffIntent = stripComments(
+      read("modules/voucher-delivery/handoff-link-intent.ts"),
+    )
+    expect(handoffIntent).not.toContain("CREATE TABLE")
+    expect(handoffIntent).not.toContain("INSERT INTO")
+  })
+
+  it("handoff reużywa link claim i klucz idempotencji 2.3 (zero kopii logiki)", () => {
+    const code = read("modules/voucher-delivery/handoff-link-intent.ts")
+    expect(code).toContain("buildDispatchIdempotencyKey")
+    // Własnego `resolveStorefrontBaseUrl`/`buildClaimUrl` NIE ma — base URL
+    // i link claim liczy subscriber raz, wspólnie dla obu wysyłek.
+    expect(code).not.toMatch(/function\s+buildClaimUrl/)
+    expect(code).not.toMatch(/function\s+resolveStorefrontBaseUrl/)
   })
 
   it("nie powstał job sweepa (Story 2.5)", () => {

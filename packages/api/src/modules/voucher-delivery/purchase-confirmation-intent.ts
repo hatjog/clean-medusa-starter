@@ -148,10 +148,22 @@ export function buildPurchaseConfirmationNotification(
   }
 }
 
+/**
+ * Klucz idempotencji Medusy wyprowadzony z klucza ledgera
+ * `(entitlement_id, template_key, recipient_hash)`.
+ *
+ * Story 2.4: `template_key` jest PARAMETREM (domyślnie potwierdzenie zakupu),
+ * bo handoff-mail (`voucher_handoff_link`) współistnieje z buyer-mailem na tym
+ * samym entitlemencie. Gdyby klucz pozostał zaszyty na jednym szablonie, dwie
+ * różne wysyłki miałyby jedną tożsamość w Medusie i druga zostałaby cicho
+ * zdedupowana — czyli obdarowana nie dostałaby maila.
+ */
 export function buildDispatchIdempotencyKey(input: {
   entitlement_id: string
   recipient_hash: RecipientHash
+  template_key?: string
 }): string {
-  const templateKey = NOTIFICATION_TEMPLATE_KEYS.VOUCHER_PURCHASE_CONFIRMATION
+  const templateKey =
+    input.template_key ?? NOTIFICATION_TEMPLATE_KEYS.VOUCHER_PURCHASE_CONFIRMATION
   return `voucher-purchase-delivery:${input.entitlement_id}:${templateKey}:${input.recipient_hash}`
 }

@@ -2,15 +2,21 @@
  * voucher-purchase-delivery.ts — subscriber pierwszej REALNEJ wysyłki produktowej
  * strumienia S3 (Story 2.3; FR-13, NFR3; AD-5 / AD-6 / AD-7).
  *
+ * Story 2.4 (FR-15, FR-15a; AD-8) rozszerza go o DRUGI `template_key`
+ * (`voucher_handoff_link` → obdarowana) — ta sama mechanika, ten sam ledger,
+ * ten sam plik. Żadnej drugiej ścieżki wysyłki.
+ *
  * ── Matryca normatywna AD-7 (stan → szablon) ────────────────────────────────
  *   `to_state = ISSUED` → `voucher_purchase_confirmation` → buyer
+ *                       → `voucher_handoff_link` → recipient, WYŁĄCZNIE gdy
+ *                         `purchase_mode = gift` ∧ send-timing „od razu" (2.4)
  *   `to_state = ACTIVE` → **ŻADEN nowy szablon**; konsumowane WYŁĄCZNIE dla
- *                          idempotentnego dogonienia TEGO SAMEGO `template_key`
+ *                          idempotentnego dogonienia TYCH SAMYCH kluczy
  *                          (gdy ISSUED przepadł — emit jest best-effort)
  *   każdy inny stan      → **no-op** (nie błąd)
  *
- * Gift/handoff (`voucher_handoff_link`) NIE jest tutaj implementowany — to 2.4,
- * nawet jeśli matryca AD-7 wymienia go w tym samym akapicie.
+ * Obie wysyłki są NIEZALEŻNE: osobne wiersze ledgera (różny `template_key`
+ * i różny `recipient_hash`), osobny retry, `failed` jednej nie rusza drugiej.
  *
  * ── Single-writer ledgera ───────────────────────────────────────────────────
  * Ten plik jest JEDYNYM pisarzem `voucher_delivery_dispatch`. Provider `brevo`
@@ -61,6 +67,11 @@ import {
   type DispatchLedgerPort,
   type DispatchLedgerSql,
 } from "../modules/voucher-delivery/dispatch-ledger"
+import {
+  evaluateGiftHandoff,
+  type GiftHandoffSkipReason,
+} from "../modules/voucher-delivery/gift-handoff"
+import { buildHandoffLinkNotification } from "../modules/voucher-delivery/handoff-link-intent"
 import {
   buildClaimUrl,
   buildPurchaseConfirmationNotification,
@@ -142,6 +153,15 @@ export type PurchaseDeliverySource = {
   market_id?: string | null
   purchase_locale?: string | null
   buyer_locale?: string | null
+  /**
+   * Story 2.4 (ADR-163 gift-flow-v1) — kontrakt prezentu z `line_item.metadata`.
+   * Pola są OPCJONALNE: zamówienia sprzed 2.4 i ścieżki bez koszyka ich nie
+   * niosą, co jest legalnym „to nie prezent", a nie błędem.
+   */
+  purchase_mode?: string | null
+  gift_recipient_email?: string | null
+  gift_recipient_send_timing?: string | null
+  gift_recipient_bound_to_voucher_issue?: boolean | null
 }
 
 export type PurchaseDeliverySourceReader = {
@@ -163,8 +183,23 @@ export type PurchaseDeliveryOutcome =
   | "skipped_missing_voucher_code"
   | "skipped_already_sent"
   | "skipped_in_flight"
+  /** Story 2.4 — predykat gift/handoff nie przepuścił wysyłki (AC2). */
+  | "skipped_not_eligible"
   | "sent"
   | "failed"
+
+/**
+ * Story 2.4 — wynik handoffu. Rozłączny od wyniku buyer-maila, bo obie wysyłki
+ * są NIEZALEŻNE (osobne wiersze ledgera, osobny retry). `skip_reason` jest
+ * enumem, nigdy adresem — ta struktura bywa logowana (D-70).
+ */
+export type GiftHandoffResult = {
+  outcome: PurchaseDeliveryOutcome
+  dispatch_id: string | null
+  locale: string | null
+  error_code: string | null
+  skip_reason: GiftHandoffSkipReason | null
+}
 
 export type PurchaseDeliveryResult = {
   outcome: PurchaseDeliveryOutcome
@@ -173,6 +208,24 @@ export type PurchaseDeliveryResult = {
   market_id: string | null
   locale: string | null
   error_code: string | null
+  /**
+   * Story 2.4 — wynik handoffu; `null` gdy w ogóle nie był rozważany (stan
+   * spoza matrycy, brak encji źródłowej, brak kodu vouchera, błąd konfiguracji).
+   */
+  handoff: GiftHandoffResult | null
+}
+
+/** Która z dwóch wysyłek matrycy AD-7 jest właśnie realizowana. */
+type DispatchKind = "buyer" | "handoff"
+
+/** Kontekst wspólny dla obu wysyłek — liczony RAZ, nie per szablon. */
+type DispatchAttemptContext = {
+  trigger: PurchaseDeliveryTrigger
+  entitlementId: string
+  marketId: string
+  locale: string
+  voucherCode: string
+  claimUrl: string
 }
 
 export interface PurchaseDeliveryDeps {
@@ -217,7 +270,6 @@ export async function handleVoucherPurchaseDelivery(
   deps: PurchaseDeliveryDeps,
 ): Promise<PurchaseDeliveryResult> {
   const trigger = extractPurchaseDeliveryTrigger(data)
-  const templateKey = NOTIFICATION_TEMPLATE_KEYS.VOUCHER_PURCHASE_CONFIRMATION
 
   if (!trigger.to_state || !DELIVERABLE_TO_STATES.has(trigger.to_state)) {
     // No-op, NIE błąd: subscriber słucha wszystkich tranzycji L4, a matryca
@@ -275,7 +327,9 @@ export async function handleVoucherPurchaseDelivery(
       "[voucher-purchase-delivery] pominięto: brak adresu odbiorcy w danych domenowych",
       { entitlement_id: entitlementId, market_id: marketId },
     )
-    return result("skipped_missing_recipient", trigger, null, marketId, null)
+    // Story 2.4: brak adresu KUPUJĄCEJ nie kończy konsumpcji — handoff ma
+    // własnego odbiorcę i własny wiersz ledgera, więc nie może paść przez
+    // brak buyer-maila (AC2: obie wysyłki są niezależne w awarii).
   }
 
   const voucherCode = nonEmpty(source.voucher_code)
@@ -329,25 +383,8 @@ export async function handleVoucherPurchaseDelivery(
       market_id: marketId,
       locale: null,
       error_code: MARKET_LOCALES_UNAVAILABLE_ERROR_CODE,
+      handoff: null,
     }
-  }
-
-  let recipientHash
-  try {
-    recipientHash = hashRecipientEmail(recipientEmail)
-  } catch (error) {
-    deps.logger?.warn?.(
-      "[voucher-purchase-delivery] pominięto: nie udało się wyznaczyć recipient_hash",
-      {
-        entitlement_id: entitlementId,
-        market_id: marketId,
-        error_code:
-          error instanceof RecipientHashError
-            ? error.error_code
-            : "VOUCHER_DELIVERY_RECIPIENT_HASH_INVALID",
-      },
-    )
-    return result("skipped_missing_recipient", trigger, null, marketId, locale)
   }
 
   // Link claim liczymy PRZED rezerwacją: brak base URL to błąd konfiguracji,
@@ -372,7 +409,136 @@ export async function handleVoucherPurchaseDelivery(
       market_id: marketId,
       locale,
       error_code: errorCode,
+      handoff: null,
     }
+  }
+
+  // Wszystko poniżej jest WSPÓLNE dla obu wysyłek: ten sam rynek, to samo
+  // locale (`purchase_locale` — locale KUPUJĄCEJ, AD-8) i ten sam link claim.
+  const context: DispatchAttemptContext = {
+    trigger,
+    entitlementId,
+    marketId,
+    locale,
+    voucherCode,
+    claimUrl,
+  }
+
+  // ── Buyer-mail (Story 2.3) ────────────────────────────────────────────────
+  // Brak adresu kupującej NIE przerywa konsumpcji — handoff ma własnego
+  // odbiorcę i własny wiersz ledgera (AC2: niezależność w awarii).
+  const buyerResult: PurchaseDeliveryResult = recipientEmail
+    ? await runDispatchAttempt("buyer", recipientEmail, context, deps)
+    : result("skipped_missing_recipient", trigger, null, marketId, null)
+
+  // ── Handoff do obdarowanej (Story 2.4, AC1/AC2) ───────────────────────────
+  // TA SAMA sekwencja, TEN SAM ledger, TEN SAM subscriber — różni się wyłącznie
+  // `template_key` i `recipient_hash`. Awaria buyer-maila nie może zabrać
+  // handoffu ani odwrotnie, więc kolejność jest bez znaczenia dla wyniku.
+  const handoff = await runGiftHandoff(source, context, deps)
+
+  return { ...buyerResult, handoff }
+}
+
+/**
+ * Story 2.4 (AC1/AC2) — decyzja o handoffie + wysyłka tą samą sekwencją.
+ *
+ * NIGDY nie rzuca i NIGDY nie loguje adresu: powodem odmowy jest zawsze enum
+ * `GiftHandoffSkipReason`. Rezerwacja w ledgerze powstaje DOPIERO po przejściu
+ * predykatu — dzięki temu wariant „przekażę osobiście" i zastane `scheduled`
+ * nie zostawiają sierocego wiersza `queued`.
+ */
+async function runGiftHandoff(
+  source: PurchaseDeliverySource,
+  context: DispatchAttemptContext,
+  deps: PurchaseDeliveryDeps,
+): Promise<GiftHandoffResult> {
+  const decision = evaluateGiftHandoff(source)
+
+  if (!decision.eligible) {
+    if (decision.reason !== "not_gift") {
+      // `not_gift` to zdecydowana większość ruchu (zakup dla siebie) — logowanie
+      // go zalałoby log. Każdy inny powód oznacza „to MIAŁ być prezent, a mail
+      // nie poszedł" i musi być widoczny.
+      deps.logger?.info?.(
+        "[voucher-purchase-delivery/handoff] pominięto wysyłkę do obdarowanej",
+        {
+          entitlement_id: context.entitlementId,
+          market_id: context.marketId,
+          to_state: context.trigger.to_state,
+          reason: decision.reason,
+        },
+      )
+    }
+    return {
+      outcome: "skipped_not_eligible",
+      dispatch_id: null,
+      locale: null,
+      error_code: null,
+      skip_reason: decision.reason,
+    }
+  }
+
+  const attempt = await runDispatchAttempt(
+    "handoff",
+    decision.recipient_email,
+    context,
+    deps,
+  )
+
+  return {
+    outcome: attempt.outcome,
+    dispatch_id: attempt.dispatch_id,
+    locale: attempt.locale,
+    error_code: attempt.error_code,
+    skip_reason: null,
+  }
+}
+
+/**
+ * Jedyna sekwencja wysyłki w tym subscriberze: `recipient_hash` → rezerwacja
+ * (INSERT-first `ON CONFLICT DO NOTHING`) → `Modules.NOTIFICATION` →
+ * `queued→sent|failed`. Buyer-mail i handoff różnią się WYŁĄCZNIE kluczem
+ * szablonu, odbiorcą i budowniczym payloadu — reszta jest wspólna, żeby nie
+ * mogły się rozjechać (największe ryzyko Story 2.4: druga ścieżka wysyłki).
+ */
+async function runDispatchAttempt(
+  kind: DispatchKind,
+  recipientEmail: string,
+  context: DispatchAttemptContext,
+  deps: PurchaseDeliveryDeps,
+): Promise<PurchaseDeliveryResult> {
+  const { trigger, entitlementId, marketId, locale, voucherCode, claimUrl } =
+    context
+  const templateKey =
+    kind === "buyer"
+      ? NOTIFICATION_TEMPLATE_KEYS.VOUCHER_PURCHASE_CONFIRMATION
+      : NOTIFICATION_TEMPLATE_KEYS.VOUCHER_HANDOFF_LINK
+  const tag =
+    kind === "buyer"
+      ? "[voucher-purchase-delivery]"
+      : "[voucher-purchase-delivery/handoff]"
+  const buildNotification =
+    kind === "buyer"
+      ? buildPurchaseConfirmationNotification
+      : buildHandoffLinkNotification
+
+  let recipientHash
+  try {
+    recipientHash = hashRecipientEmail(recipientEmail)
+  } catch (error) {
+    deps.logger?.warn?.(
+      `${tag} pominięto: nie udało się wyznaczyć recipient_hash`,
+      {
+        entitlement_id: entitlementId,
+        market_id: marketId,
+        error_code:
+          error instanceof RecipientHashError
+            ? error.error_code
+            : "VOUCHER_DELIVERY_RECIPIENT_HASH_INVALID",
+      },
+    )
+    return result("skipped_missing_recipient", trigger, null, marketId, locale)
   }
 
   let reservation
@@ -390,7 +556,7 @@ export async function handleVoucherPurchaseDelivery(
     // idempotencję (NFR3) w najgorszym możliwym momencie: przy retry.
     const errorCode = readErrorCode(error, "VOUCHER_DELIVERY_LEDGER_UNAVAILABLE")
     deps.logger?.error?.(
-      "[voucher-purchase-delivery] rezerwacja w ledgerze nieudana — wysyłka wstrzymana",
+      `${tag} rezerwacja w ledgerze nieudana — wysyłka wstrzymana`,
       { entitlement_id: entitlementId, market_id: marketId, error_code: errorCode },
     )
     return {
@@ -400,21 +566,19 @@ export async function handleVoucherPurchaseDelivery(
       market_id: marketId,
       locale,
       error_code: errorCode,
+      handoff: null,
     }
   }
 
   if (reservation.outcome === "blocked") {
     // `sent`/`delivered` blokują BEZWARUNKOWO (AC5) — to jest miejsce, w którym
     // ACTIVE-po-ISSUED przestaje generować drugi mail.
-    deps.logger?.info?.(
-      "[voucher-purchase-delivery] pominięto: wysyłka już zamknięta dla tego klucza",
-      {
-        entitlement_id: entitlementId,
-        market_id: marketId,
-        to_state: trigger.to_state,
-        dispatch_status: reservation.status,
-      },
-    )
+    deps.logger?.info?.(`${tag} pominięto: wysyłka już zamknięta dla tego klucza`, {
+      entitlement_id: entitlementId,
+      market_id: marketId,
+      to_state: trigger.to_state,
+      dispatch_status: reservation.status,
+    })
     return {
       outcome: "skipped_already_sent",
       entitlement_id: entitlementId,
@@ -422,6 +586,7 @@ export async function handleVoucherPurchaseDelivery(
       market_id: marketId,
       locale,
       error_code: null,
+      handoff: null,
     }
   }
 
@@ -441,13 +606,13 @@ export async function handleVoucherPurchaseDelivery(
 
     if (stale) {
       deps.logger?.warn?.(
-        "[voucher-purchase-delivery] pominięto: rezerwacja `queued` starsza niż próg — " +
+        `${tag} pominięto: rezerwacja \`queued\` starsza niż próg — ` +
           "prawdopodobnie porzucona po awarii; dogonienie należy do sweepa (Story 2.5)",
         meta,
       )
     } else {
       deps.logger?.info?.(
-        "[voucher-purchase-delivery] pominięto: rezerwację trzyma inny konsument (queued)",
+        `${tag} pominięto: rezerwację trzyma inny konsument (queued)`,
         meta,
       )
     }
@@ -458,6 +623,7 @@ export async function handleVoucherPurchaseDelivery(
       market_id: marketId,
       locale,
       error_code: null,
+      handoff: null,
     }
   }
 
@@ -465,10 +631,10 @@ export async function handleVoucherPurchaseDelivery(
   if (!dispatchId) {
     // Rezerwacja bez identyfikatora jest niedomykalna (nie da się przejść
     // queued→sent), więc traktujemy to jak awarię, nie jak sukces.
-    deps.logger?.error?.(
-      "[voucher-purchase-delivery] rezerwacja bez dispatch_id — wysyłka wstrzymana",
-      { entitlement_id: entitlementId, market_id: marketId },
-    )
+    deps.logger?.error?.(`${tag} rezerwacja bez dispatch_id — wysyłka wstrzymana`, {
+      entitlement_id: entitlementId,
+      market_id: marketId,
+    })
     return {
       outcome: "failed",
       entitlement_id: entitlementId,
@@ -476,11 +642,12 @@ export async function handleVoucherPurchaseDelivery(
       market_id: marketId,
       locale,
       error_code: "VOUCHER_DELIVERY_RESERVATION_INCOMPLETE",
+      handoff: null,
     }
   }
 
   const provider = deps.provider ?? "brevo"
-  const notification = buildPurchaseConfirmationNotification({
+  const notification = buildNotification({
     recipient_email: recipientEmail,
     recipient_hash: recipientHash,
     entitlement_id: entitlementId,
@@ -505,13 +672,13 @@ export async function handleVoucherPurchaseDelivery(
       // Wiersz nie był już w `queued` — wysyłka poszła, ale stan zmienił ktoś
       // inny. Logujemy głośno: to jedyny sygnał rozjazdu single-writera.
       deps.logger?.warn?.(
-        "[voucher-purchase-delivery] mail wysłany, ale tranzycja queued→sent nie zaskoczyła " +
+        `${tag} mail wysłany, ale tranzycja queued→sent nie zaskoczyła ` +
           "(wiersz zmieniony współbieżnie)",
         { entitlement_id: entitlementId, market_id: marketId, dispatch_id: dispatchId },
       )
     }
 
-    deps.logger?.info?.("[voucher-purchase-delivery] mail wysłany", {
+    deps.logger?.info?.(`${tag} mail wysłany`, {
       entitlement_id: entitlementId,
       market_id: marketId,
       locale,
@@ -529,6 +696,7 @@ export async function handleVoucherPurchaseDelivery(
       market_id: marketId,
       locale,
       error_code: null,
+      handoff: null,
     }
   } catch (error) {
     // Do ledgera i logu idzie KOD błędu — nigdy treść odpowiedzi providera
@@ -542,18 +710,15 @@ export async function handleVoucherPurchaseDelivery(
         provider,
       })
     } catch (ledgerError) {
-      deps.logger?.error?.(
-        "[voucher-purchase-delivery] nie udało się zapisać stanu failed w ledgerze",
-        {
-          entitlement_id: entitlementId,
-          market_id: marketId,
-          dispatch_id: dispatchId,
-          error_class: errorClass(ledgerError),
-        },
-      )
+      deps.logger?.error?.(`${tag} nie udało się zapisać stanu failed w ledgerze`, {
+        entitlement_id: entitlementId,
+        market_id: marketId,
+        dispatch_id: dispatchId,
+        error_class: errorClass(ledgerError),
+      })
     }
 
-    deps.logger?.warn?.("[voucher-purchase-delivery] wysyłka nieudana", {
+    deps.logger?.warn?.(`${tag} wysyłka nieudana`, {
       entitlement_id: entitlementId,
       market_id: marketId,
       locale,
@@ -568,6 +733,7 @@ export async function handleVoucherPurchaseDelivery(
       market_id: marketId,
       locale,
       error_code: errorCode,
+      handoff: null,
     }
   }
 }
@@ -634,6 +800,7 @@ function result(
     market_id: marketId ?? trigger.market_id,
     locale,
     error_code: null,
+    handoff: null,
   }
 }
 

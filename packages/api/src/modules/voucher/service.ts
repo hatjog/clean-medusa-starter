@@ -331,6 +331,68 @@ function readMetadataString(value: unknown, key: string): string | null {
   return firstNonEmptyString((parsed as Record<string, unknown>)[key])
 }
 
+/**
+ * Story 2.4 (AC1/AC2): `metadata` line-itemu bywa `jsonb` (obiekt ze sterownika)
+ * albo `text` z JSON-em. Jedno miejsce normalizacji — bez niego każdy czytelnik
+ * gift-metadanych powtarzałby ten sam `JSON.parse` w try/catch.
+ */
+function readMetadataObject(value: unknown): Record<string, unknown> | null {
+  let parsed: unknown = value
+
+  if (typeof value === "string") {
+    try {
+      parsed = JSON.parse(value)
+    } catch {
+      return null
+    }
+  }
+
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return null
+  }
+
+  return parsed as Record<string, unknown>
+}
+
+/**
+ * Story 2.4 (AC1/AC2, ADR-163): projekcja kontraktu prezentu z metadanych
+ * line-itemu. `gift_recipient_message` i `gift_recipient_send_date` świadomie
+ * NIE wchodzą do projekcji — pierwszy to personalizacja treści (poza zakresem
+ * FR-15), drugi obsługuje scheduler deferowany do v1.15.0.
+ */
+function readGiftContract(value: unknown): {
+  purchase_mode: string | null
+  gift_recipient_email: string | null
+  gift_recipient_send_timing: string | null
+  gift_recipient_bound_to_voucher_issue: boolean | null
+} {
+  const metadata = readMetadataObject(value)
+  if (!metadata) {
+    return {
+      purchase_mode: null,
+      gift_recipient_email: null,
+      gift_recipient_send_timing: null,
+      gift_recipient_bound_to_voucher_issue: null,
+    }
+  }
+
+  return {
+    purchase_mode: firstNonEmptyString(metadata.purchase_mode),
+    gift_recipient_email: firstNonEmptyString(metadata.gift_recipient_email),
+    gift_recipient_send_timing: firstNonEmptyString(
+      metadata.gift_recipient_send_timing,
+    ),
+    // Zawężenie do `true` jest celowe: `"true"`, `1` czy `null` NIE dowodzą
+    // powiązania danych odbiorczyni z wydaniem vouchera.
+    gift_recipient_bound_to_voucher_issue:
+      metadata.gift_recipient_bound_to_voucher_issue === true
+        ? true
+        : metadata.gift_recipient_bound_to_voucher_issue === undefined
+          ? null
+          : false,
+  }
+}
+
 export class VoucherService {
   private readonly container_: Record<string, any>
   private readonly moduleOptions_: VoucherModuleOptions
@@ -772,6 +834,17 @@ export class VoucherService {
     market_id: string | null
     /** Locale zakupu z `order.metadata.purchase_locale` (Story 2.3, AC3). */
     purchase_locale: string | null
+    /**
+     * Story 2.4 (AC1/AC2, ADR-163 gift-flow-v1): kontrakt prezentu z
+     * `line_item.metadata` line-itemu wskazanego przez
+     * `entitlement_instance.line_item_id`. `null` gdy entitlement nie ma
+     * powiązanego line-itemu (ścieżki bez koszyka) — wtedy handoff się nie
+     * odpala, bo nie ma czym udowodnić powiązania z wydaniem vouchera.
+     */
+    purchase_mode: string | null
+    gift_recipient_email: string | null
+    gift_recipient_send_timing: string | null
+    gift_recipient_bound_to_voucher_issue: boolean | null
   } | null> {
     const lookupCode = voucher_code ?? voucher_id
     const pool = this.getPool()
@@ -787,6 +860,7 @@ export class VoucherService {
          v.product_title                             AS product_title,
          o.email                                     AS order_email,
          o.metadata                                  AS order_metadata,
+         li.metadata                                 AS line_item_metadata,
          (
            SELECT ve.occurred_at FROM voucher_event ve
             WHERE ve.voucher_code = v.code
@@ -797,6 +871,9 @@ export class VoucherService {
        FROM entitlement_instance ei
        LEFT JOIN voucher v ON v.code = (ei.policy_snapshot->>'voucher_code')
        LEFT JOIN public.order o ON o.id = ei.order_id
+       LEFT JOIN order_line_item li
+              ON li.id = ei.line_item_id
+             AND li.deleted_at IS NULL
        WHERE ei.id = $1
           OR (ei.policy_snapshot->>'voucher_code') = $2
           OR v.code = $2
@@ -868,6 +945,12 @@ export class VoucherService {
       purchase_locale:
         readMetadataString(row.order_metadata, "purchase_locale") ??
         firstNonEmptyString(snapshot.purchase_locale),
+      // Story 2.4 (ADR-163): kontrakt prezentu jest PER LINE-ITEM — nośnikiem
+      // jest `line_item.metadata` tego itemu, z którego wydano entitlement
+      // (`ei.line_item_id`). Świadomie NIE szukamy „jakiegoś" gift-itemu w
+      // zamówieniu: w koszyku z kilkoma voucherami zgadywanie, który prezent
+      // należy do którego wydania, wysłałoby mail nie tej osobie.
+      ...readGiftContract(row.line_item_metadata),
     }
   }
 
