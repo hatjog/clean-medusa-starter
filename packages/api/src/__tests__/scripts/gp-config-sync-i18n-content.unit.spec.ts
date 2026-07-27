@@ -74,6 +74,11 @@ function makeServices(existingTranslations: any[] = []) {
         ? [{ id: "prod_1", handle: "oczyszczanie-twarzy", metadata: { gp: { market_id: "bonbeauty" } } }]
         : []
     ),
+    // Review 1-4-F1: materializacja content_bar potrzebuje metod zapisu —
+    // wcześniej ich brak trzymał tę suitę w baseline-red („Cannot materialize
+    // content_bar"). Core'owy serwis produktowy ma overload `(id, data)`.
+    updateProductCategories: jest.fn(async (_id: string, _data: any) => undefined),
+    updateProducts: jest.fn(async (_id: string, _data: any) => undefined),
   }
   const sellerModuleService = {
     list: jest.fn(async (filters) =>
@@ -81,6 +86,9 @@ function makeServices(existingTranslations: any[] = []) {
         ? [{ id: "sel_1", handle: "city-beauty", metadata: { gp: { market_id: "bonbeauty" } } }]
         : []
     ),
+    // Auto-generowany MedusaService: JEDEN argument danych (review 1-4-F1);
+    // wierny mock semantyki żyje w scripts/__tests__/gp-config-sync-i18n-content.unit.spec.ts.
+    updateSellers: jest.fn(async (_data: any) => undefined),
   }
   const translationService = {
     listTranslations: jest.fn(async (filters) => {

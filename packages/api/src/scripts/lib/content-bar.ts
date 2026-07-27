@@ -1,6 +1,11 @@
 /**
  * AD-4 — kanoniczny moduł progów baru treści i pomiaru wordcount.
  *
+ * KANONICZNA ŚCIEŻKA TEGO MODUŁU: `GP/backend/packages/api/src/scripts/lib/content-bar.ts`
+ * (potwierdzona w Story 1.4 — notatki 4.2/4.3 zapisały ją błędnie jako
+ * `GP/backend/scripts/lib/content-bar.ts`; taki plik nie istnieje i NIE wolno
+ * go tworzyć). Backendowym korzeniem źródeł jest `packages/api/src`.
+ *
  * To jest JEDYNE miejsce w repo, w którym żyją liczby 80 / 40 oraz JEDYNA
  * implementacja liczenia słów. Wszyscy konsumenci (sync `content_bar`,
  * pipeline gp-cli z FR-22, raport FR-23) MUSZĄ czytać stąd — bezpośrednim
@@ -70,7 +75,7 @@ export class UnknownContentTypeError extends Error {
       `Unknown content type '${contentType}'. Bar threshold is undefined for it. ` +
         `Known types: ${CONTENT_BAR_ENTITY_TYPES.join(", ")}. ` +
         `AD-4 forbids falling back to a default threshold — add the type to ` +
-        `CONTENT_BAR_THRESHOLDS in scripts/lib/content-bar.ts instead.`
+        `CONTENT_BAR_THRESHOLDS in packages/api/src/scripts/lib/content-bar.ts instead.`
     )
     this.name = "UnknownContentTypeError"
     this.contentType = contentType
