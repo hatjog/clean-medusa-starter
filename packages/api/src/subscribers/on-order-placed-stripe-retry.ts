@@ -36,6 +36,7 @@
 import type { SubscriberArgs, SubscriberConfig } from "@medusajs/framework"
 import { ContainerRegistrationKeys } from "@medusajs/framework/utils"
 
+import { toKnexPositionalSql } from "../lib/knex-positional-sql"
 import {
   issueEntitlementsForAllLineItems,
   MissingEntitlementProfileError,
@@ -119,11 +120,13 @@ function createKnexPgClient(db: KnexLike): PgClient {
       text: string,
       values: ReadonlyArray<unknown> = []
     ) => {
-      const bindings: unknown[] = []
-      const sql = text.replace(/\$(\d+)/g, (_m, idx: string) => {
-        bindings.push(values[Number(idx) - 1])
-        return "?"
-      })
+      // Kanoniczna konwersja `$N` → `?` zamiast lokalnej kopii. Lokalna wersja
+      // nie miała guardu na SQL zawierający już `?`, więc jsonb-owy operator
+      // istnienia klucza (`envelope ? 'klucz'`) przechodził jako placeholder
+      // Knexa i cały subscriber padał na `Expected 1 bindings, saw 3` — cicho,
+      // przy każdym `order.placed`. Guard zamienia tę klasę błędu w wyjątek
+      // przy pierwszym wywołaniu zamiast w produkcyjną ciszę.
+      const { text: sql, bindings } = toKnexPositionalSql(text, values)
       const result = await db.raw(sql, bindings)
       if (Array.isArray(result)) {
         return { rows: result as T[], rowCount: result.length }
@@ -210,8 +213,11 @@ async function findDeferredCapturesForOrder(
       WHERE opc.order_id = $1
         AND wep.provider = 'stripe'
         AND wep.envelope->>'event_type' = 'payment.captured'
-        AND wep.envelope ? 'entitlement_issue_deferred_reason'
-        AND NOT (wep.envelope ? 'entitlement_issue_resolved_at')
+        -- jsonb_exists() zamiast operatora istnienia klucza: znak zapytania jest
+        -- jednocześnie placeholderem bindingu Knexa, więc wersja operatorowa
+        -- nigdy nie doszła do bazy (Expected 1 bindings, saw 3).
+        AND jsonb_exists(wep.envelope, 'entitlement_issue_deferred_reason')
+        AND NOT jsonb_exists(wep.envelope, 'entitlement_issue_resolved_at')
     `,
     [orderId]
   )

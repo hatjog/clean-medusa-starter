@@ -38,10 +38,13 @@
  *   "time since PSP confirmation was expected".
  *
  * Access:
- *   Requires customer authentication and verifies the requested order belongs
- *   to the authenticated customer. Publishable-key market guard alone is not
- *   enough for an order-specific read endpoint because publishable keys are
- *   intentionally public.
+ *   Publishable-key market guard alone is not enough for an order-specific read
+ *   endpoint, bo klucze publishable są z założenia publiczne. Dostęp rozstrzyga
+ *   `lib/orders/guest-order-access.ts`: sesja klienta (właścicielka zamówienia)
+ *   ALBO dowód posiadania koszyka, który to zamówienie wyprodukował
+ *   (`?cart_id=`, weryfikowany w `order_cart`). Druga droga istnieje, bo
+ *   checkout gościa nie zakłada konta — bez niej kupująca bez sesji dostaje 401
+ *   na ekranie statusu własnej, właśnie opłaconej transakcji.
  *
  * @see GP/storefront/src/app/api/v1/orders/[id]/payment-status/route.ts (consumer proxy)
  * @see specs/contracts/governance/examples/lifecycle-state-machine.v1.example.json
@@ -53,10 +56,12 @@ import { randomBytes } from "crypto"
 import { ContainerRegistrationKeys } from "@medusajs/framework/utils"
 import type { MedusaRequest, MedusaResponse } from "@medusajs/framework/http"
 import { marketContextStorage } from "../../../../../lib/market-context"
+import { assertOrderAccess, parseCartProof } from "../../../../../lib/orders/guest-order-access"
 import { classifyPaymentAttempt } from "../../../../../lib/payment/failure-classification"
 import {
   retrieveOrderByStatusIdentifier,
   resolveOrderModule,
+  withComputedPaymentStatus,
 } from "./helpers"
 
 // Customer auth is installed for this route in api/middlewares.ts. Keep the
@@ -286,8 +291,11 @@ export async function GET(
 
   const logger = resolveLogger(req)
   const customerId = (req as AuthenticatedMedusaRequest).auth_context?.actor_id
+  const proof = parseCartProof((req.query as { cart_id?: unknown } | undefined)?.cart_id)
 
-  if (!customerId) {
+  // Bez sesji i bez dowodu nie ma czego rozstrzygać — odmawiamy zanim
+  // dotkniemy bazy, więc odpowiedź nie zdradza, czy zamówienie istnieje.
+  if (!customerId && !proof) {
     res.status(401).json({ type: "unauthorized", message: "Customer authentication required", request_id })
     return
   }
@@ -296,8 +304,33 @@ export async function GET(
     const orderModule = resolveOrderModule(req)
     const order = await retrieveOrderByStatusIdentifier(req, orderModule, orderId)
 
-    if (!order || order.customer_id !== customerId) {
-      res.status(404).json({ type: "not_found", message: "Order not found", request_id })
+    if (!order) {
+      res.status(customerId ? 404 : 401).json(
+        customerId
+          ? { type: "not_found", message: "Order not found", request_id }
+          : { type: "unauthorized", message: "Customer authentication required", request_id }
+      )
+      return
+    }
+
+    const access = await assertOrderAccess({ req, order, orderId, customerId, proof })
+
+    if (!access.granted) {
+      // Audyt odmowy jest równie potrzebny jak audyt zgody: bez niego próby
+      // zgadywania identyfikatora koszyka nie zostawiają żadnego śladu.
+      logger.warn?.(JSON.stringify({
+        actor: customerId ? "customer" : "guest",
+        scope: `order:${orderId}`,
+        request_id,
+        outcome: "order_access_denied",
+        reason: access.reason,
+        timestamp: new Date().toISOString(),
+      }))
+      if (access.reason === "no_proof") {
+        res.status(401).json({ type: "unauthorized", message: "Customer authentication required", request_id })
+      } else {
+        res.status(404).json({ type: "not_found", message: "Order not found", request_id })
+      }
       return
     }
 
@@ -311,9 +344,27 @@ export async function GET(
       return
     }
 
+    // Audit: odczyt przyznany na dowód posiadania koszyka (bez sesji klienta).
+    // Ślad jest potrzebny do analizy powłamaniowej — sesja nie zostawia tu
+    // żadnego innego identyfikatora aktora.
+    if (access.actor === "guest") {
+      logger.info?.(JSON.stringify({
+        actor: "guest",
+        scope: `order:${orderId}`,
+        request_id,
+        outcome: "guest_order_access_granted",
+        proof: access.proof,
+        timestamp: new Date().toISOString(),
+      }))
+    }
+
+    // Dopiero teraz liczymy status: workflow order-detail jest drogi i nie może
+    // wykonywać się dla żądania, które i tak dostanie 401/404.
+    const authorizedOrder = (await withComputedPaymentStatus(req, order, logger)) ?? order
+
     const baseStatus =
-      mapMedusaOrderStatus(order.status) ??
-      mapMedusaPaymentStatus(order.payment_status, logger)
+      mapMedusaOrderStatus(authorizedOrder.status) ??
+      mapMedusaPaymentStatus(authorizedOrder.payment_status, logger)
     const latestAttempt = await resolveLatestPaymentAttempt(req, orderId)
     const failureStatus = refineFailureStatus(baseStatus, latestAttempt)
     const status = failureStatus.status
@@ -328,10 +379,10 @@ export async function GET(
     // Anchor: order.created_at (immutable) — represents the moment the order
     // was placed. Using created_at avoids false clock resets from unrelated
     // order mutations (line-item edits, metadata writes) that update updated_at.
-    if (status === "pending_psp_confirmation" && order.created_at) {
-      const createdAt = order.created_at instanceof Date
-        ? order.created_at
-        : new Date(order.created_at)
+    if (status === "pending_psp_confirmation" && authorizedOrder.created_at) {
+      const createdAt = authorizedOrder.created_at instanceof Date
+        ? authorizedOrder.created_at
+        : new Date(authorizedOrder.created_at)
       const orderAge = Date.now() - createdAt.getTime()
 
       if (orderAge > RECONCILIATION_POKE_THRESHOLD_MS) {
