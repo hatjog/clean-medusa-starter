@@ -744,7 +744,11 @@ export default defineMiddlewares({
     {
       method: ["GET"],
       matcher: "/store/orders/:id/payment-status",
-      middlewares: [authenticate("customer", ["session", "bearer"])],
+      // allowUnauthenticated: `auth_context` nadal jest wypełniany dla zalogowanych,
+      // ale gość nie jest odbijany na poziomie middleware'u — trasa sama rozstrzyga
+      // dostęp przez `lib/orders/guest-order-access.ts` (sesja ALBO dowód koszyka).
+      // Twarde `authenticate` tutaj oznaczało 401 dla każdego checkoutu bez konta.
+      middlewares: [authenticate("customer", ["session", "bearer"], { allowUnauthenticated: true })],
     },
     {
       method: ["POST"],
