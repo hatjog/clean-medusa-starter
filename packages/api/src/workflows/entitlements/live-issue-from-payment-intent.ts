@@ -32,8 +32,9 @@ import { VoucherPostingInvariantError } from "../../modules/voucher/posting-prof
  * custom route / `GpCoreService.createEntitlement`), FR10/FR11/FR15/FR32.
  *
  * ── CO ROBI (AC2/AC3/AC4) ───────────────────────────────────────────────────
- *   1. EVENT-LEVEL dedupe (DEC-5 pkt 3.i): INSERT do `event_processed`
- *      (external_id = payment_intent_id, event_type) `ON CONFLICT DO NOTHING`
+ *   1. EVENT-LEVEL dedupe (ADR-166 amendment do DEC-5): INSERT do
+ *      `event_processed` (external_id = `payment_intent_id:order_id`, event_type)
+ *      `ON CONFLICT DO NOTHING`
  *      jako PIERWSZY krok transakcji. 0 affected ⇒ event już skonsumowany ⇒
  *      pomiń tworzenie entitlementów (replay/multi-replica = no-op).
  *   2. Czyta recipientów + profil z line-item metadata. ŹRÓDŁO ZAMROŻENIA (finding
@@ -147,6 +148,19 @@ type ChoiceSetSnapshotItem = {
 export const LIVE_ISSUE_PATH = "path-y:subscriber:gp.stripe.payment_intent_succeeded.v1" as const
 
 /**
+ * Jednostka konsumpcji biznesowej po ADR-166: jedno zdarzenie Stripe może
+ * odpowiadać N zamówieniom Mercur (po jednym per seller), więc sam PI nie
+ * wystarcza jako dedupe. Separator jest bezpieczny dla identyfikatorów Stripe/
+ * Medusa i odpowiada semantyce klucza koperty (market jest w osobnym scope).
+ */
+export function buildPaymentIntentOrderExternalId(
+  paymentIntentId: string,
+  orderId: string
+): string {
+  return `${paymentIntentId}:${orderId}`
+}
+
+/**
  * Wystawia entitlementy ISSUED dla faktu płatności W OBRĘBIE przekazanej DB-tx
  * (atomicity: event_processed + INSERT-y entitlementów w jednej transakcji).
  * Idempotentne na DWÓCH poziomach (DEC-5). NIE wykonuje side-effectów — te idą
@@ -168,7 +182,10 @@ export async function liveIssueEntitlementsWithinTx(
 
   // ── (i) EVENT-LEVEL dedupe (DEC-5 pkt 3.i) — PIERWSZY krok transakcji ──────
   const dedupeInsert = buildEventProcessedDedupeInsert({
-    external_id: payload.payment_intent_id,
+    external_id: buildPaymentIntentOrderExternalId(
+      payload.payment_intent_id,
+      payload.order_id
+    ),
     event_type,
     processed_at: now.getTime(),
   })

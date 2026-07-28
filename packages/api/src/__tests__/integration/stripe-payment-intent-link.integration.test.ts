@@ -120,12 +120,16 @@ runOrSkip("Story 5.1 AC4 — SQL rozwiązania powiązania działa na realnym sch
       // powód ma być czytelny bez zaglądania do bazy.
       expect({
         ok: resolution.ok,
-        detail: resolution.ok ? resolution.source : resolution.detail,
+        detail: resolution.ok
+          ? resolution.orders.map((order) => order.source)
+          : resolution.detail,
       }).toEqual(expect.objectContaining({ ok: true }))
 
       if (resolution.ok && expectedOrderId) {
-        expect(resolution.order_id).toBe(expectedOrderId)
-        expect(resolution.market_id).toBeTruthy()
+        expect(resolution.orders.map((order) => order.order_id)).toContain(
+          expectedOrderId
+        )
+        expect(resolution.orders.every((order) => Boolean(order.market_id))).toBe(true)
       }
     }
   )

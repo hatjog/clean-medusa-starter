@@ -77,7 +77,12 @@ type FixtureOptions = {
   /** Powiązanie payment_session → order; pusta lista = brak linku. */
   linkedOrderIds?: string[]
   order?: OrderFixture | null
+  orders?: OrderFixture[]
   lines?: Array<{ line_item_id: string; metadata: Record<string, unknown> | null }>
+  linesByOrder?: Record<
+    string,
+    Array<{ line_item_id: string; metadata: Record<string, unknown> | null }>
+  >
 }
 
 /**
@@ -87,7 +92,7 @@ type FixtureOptions = {
  */
 function makeFixturePg(options: FixtureOptions = {}) {
   const linkedOrderIds = options.linkedOrderIds ?? [ORDER_ID]
-  const order =
+  const defaultOrder =
     options.order === undefined
       ? {
           order_id: ORDER_ID,
@@ -96,6 +101,7 @@ function makeFixturePg(options: FixtureOptions = {}) {
           sales_channel_market_id: MARKET_ID,
         }
       : options.order
+  const orders = options.orders ?? (defaultOrder ? [defaultOrder] : [])
   const lines = options.lines ?? [
     {
       line_item_id: "li_voucher_1",
@@ -122,7 +128,8 @@ function makeFixturePg(options: FixtureOptions = {}) {
         return { rows: rows as unknown as T[], rowCount: rows.length }
       }
       if (sql === RESOLVE_ORDER_MARKET_CONTEXT_SQL) {
-        if (!order || order.order_id !== values[0]) return { rows: [], rowCount: 0 }
+        const order = orders.find((candidate) => candidate.order_id === values[0])
+        if (!order) return { rows: [], rowCount: 0 }
         return {
           rows: [
             {
@@ -155,6 +162,7 @@ function makeFixturePg(options: FixtureOptions = {}) {
         return { rows: [], rowCount: 1 }
       }
       if (/FROM "order"\s/i.test(sql)) {
+        const order = orders.find((candidate) => candidate.order_id === values[0])
         if (!order) return { rows: [], rowCount: 0 }
         return {
           rows: [
@@ -164,7 +172,8 @@ function makeFixturePg(options: FixtureOptions = {}) {
         }
       }
       if (/FROM order_item/i.test(sql)) {
-        return { rows: lines as unknown as T[], rowCount: lines.length }
+        const orderLines = options.linesByOrder?.[String(values[0])] ?? lines
+        return { rows: orderLines as unknown as T[], rowCount: orderLines.length }
       }
       if (/INSERT INTO entitlement_instance/i.test(sql)) {
         const dedupeKey = values[11] as string
@@ -378,8 +387,103 @@ describe("Story 5.1 AC4 — rozłączne klasy odrzucenia (zero emisji, czytelny 
     expect(pg.webhookDeliveries.size).toBe(0)
   })
 
-  it("link wskazuje dwa zamówienia ⇒ 400 link_ambiguous (nie bierzemy pierwszego)", async () => {
-    const pg = makeFixturePg({ linkedOrderIds: [ORDER_ID, "order_inne"] })
+  it("jedna payment_collection z dwoma zamówieniami ⇒ dwie koperty i vouchery dla obu", async () => {
+    const secondOrderId = "order_drugi_seller"
+    const secondSalesChannelId = "sc_drugi_seller"
+    const pg = makeFixturePg({
+      linkedOrderIds: [ORDER_ID, secondOrderId],
+      orders: [
+        {
+          order_id: ORDER_ID,
+          metadata: null,
+          sales_channel_id: SALES_CHANNEL_ID,
+          sales_channel_market_id: MARKET_ID,
+        },
+        {
+          order_id: secondOrderId,
+          metadata: null,
+          sales_channel_id: secondSalesChannelId,
+          sales_channel_market_id: MARKET_ID,
+        },
+      ],
+      linesByOrder: {
+        [ORDER_ID]: [
+          {
+            line_item_id: "li_seller_1",
+            metadata: {
+              entitlement_profile_id: "voucher-seller-1",
+              entitlement_type: "VOUCHER_SERVICE",
+              policy: { validity_months: 12, vat_rate_uniqueness: true },
+            },
+          },
+        ],
+        [secondOrderId]: [
+          {
+            line_item_id: "li_seller_2",
+            metadata: {
+              entitlement_profile_id: "voucher-seller-2",
+              entitlement_type: "VOUCHER_SERVICE",
+              policy: { validity_months: 12, vat_rate_uniqueness: true },
+            },
+          },
+        ],
+      },
+    })
+    const { req, emitted } = makeReq(incidentEvent(), pg)
+
+    const res = await post(req)
+
+    expect(res.statusCode).toBe(200)
+    expect(res.body.emitted_count).toBe(2)
+    expect(res.body.order_ids).toEqual([ORDER_ID, secondOrderId].sort())
+    expect(emitted).toHaveLength(2)
+    expect(
+      emitted.map(
+        (delivery) =>
+          (delivery.data as { payload: { order_id: string } }).payload.order_id
+      )
+    ).toEqual([ORDER_ID, secondOrderId].sort())
+
+    for (const delivery of emitted) {
+      const envelope = delivery.data as {
+        scope: { market_id: string }
+        payload: Parameters<typeof liveIssueEntitlementsWithinTx>[1]["payload"]
+      }
+      await liveIssueEntitlementsWithinTx(
+        pg.client,
+        {
+          event_type: PAYMENT_INTENT_SUCCEEDED_EVENT,
+          scope: envelope.scope,
+          payload: envelope.payload,
+        },
+        new Date("2026-07-28T12:00:00.000Z")
+      )
+    }
+
+    expect(pg.entitlements.size).toBe(2)
+    expect(
+      [...pg.entitlements.values()].map((row) => row.order_id).sort()
+    ).toEqual([ORDER_ID, secondOrderId].sort())
+  })
+
+  it("link wskazuje zamówienia z różnych rynków ⇒ 400 link_ambiguous", async () => {
+    const pg = makeFixturePg({
+      linkedOrderIds: [ORDER_ID, "order_inny_rynek"],
+      orders: [
+        {
+          order_id: ORDER_ID,
+          metadata: null,
+          sales_channel_id: SALES_CHANNEL_ID,
+          sales_channel_market_id: MARKET_ID,
+        },
+        {
+          order_id: "order_inny_rynek",
+          metadata: null,
+          sales_channel_id: "sc_inny_rynek",
+          sales_channel_market_id: "inny-rynek",
+        },
+      ],
+    })
     const { req, emitted } = makeReq(incidentEvent(), pg)
 
     const res = await post(req)
@@ -485,7 +589,8 @@ describe("Story 5.1 AC4 — idempotencja obu warstw po naprawie", () => {
     expect(b.emitted).toHaveLength(1)
     expect(pg.webhookDeliveries.size).toBe(2)
 
-    // Warstwa issuance (klucz = payment_intent_id) dopuszcza tylko jedno wydanie.
+    // Warstwa issuance (klucz = payment_intent_id + order_id) dopuszcza tylko
+    // jedno wydanie dla tego zamówienia.
     for (const delivery of [a, b]) {
       const envelope = delivery.emitted[0].data as Record<string, unknown>
       await liveIssueEntitlementsWithinTx(

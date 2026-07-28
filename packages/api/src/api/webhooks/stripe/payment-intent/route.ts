@@ -5,10 +5,10 @@
  * Tryb TEST (Stripe TEST). Route robi dokładnie tyle, ile trzeba, żeby fakt
  * Stripe stał się faktem GP (ADR-118, ADR-137 DEC pkt 2):
  *   1. weryfikuje sygnaturę Stripe (`stripe-signature`, HMAC-SHA256);
- *   2. USTALA `order_id` + `market_id` — z metadata, a gdy ich tam nie ma,
- *      z istniejącego powiązania płatność→zamówienie;
- *   3. buduje + waliduje envelope `gp.stripe.payment_intent_succeeded.v1`
- *      (kontrakt Story 3.1);
+ *   2. USTALA listę `order_id` + wspólny `market_id` — z metadata, a gdy ich
+ *      tam nie ma, z istniejącego powiązania płatność→zamówienia;
+ *   3. buduje + waliduje N envelope'ów `gp.stripe.payment_intent_succeeded.v1`,
+ *      po jednym na zamówienie (kontrakt Story 3.1 + ADR-166);
  *   4. rezerwuje dostawę w `webhook_event_processed` (idempotencja transportu);
  *   5. EMITUJE kopertę na event bus.
  *
@@ -186,9 +186,13 @@ export async function POST(
     if (identifiers.order_id && identifiers.market_id) {
       resolution = {
         ok: true,
-        order_id: identifiers.order_id,
-        market_id: identifiers.market_id,
-        source: { order_id: "metadata", market_id: "metadata" },
+        orders: [
+          {
+            order_id: identifiers.order_id,
+            market_id: identifiers.market_id,
+            source: { order_id: "metadata", market_id: "metadata" },
+          },
+        ],
       }
     } else {
       try {
@@ -224,13 +228,16 @@ export async function POST(
       return
     }
 
-    // ── krok 3: koperta (kontrakt 3.1 NIENARUSZONY, NFR4) ─────────────────────
-    let envelope
+    // ── krok 3: N kopert po jednej na zamówienie (ADR-166, NFR4) ──────────────
+    let envelopes
     try {
-      envelope = buildPaymentIntentSucceededEnvelope(stripeEvent, new Date(), {
-        order_id: resolution.order_id,
-        market_id: resolution.market_id,
-      })
+      const occurredAt = new Date()
+      envelopes = resolution.orders.map((order) =>
+        buildPaymentIntentSucceededEnvelope(stripeEvent, occurredAt, {
+          order_id: order.order_id,
+          market_id: order.market_id,
+        })
+      )
     } catch (err) {
       const error = err as Error
       if (error instanceof StripeEventMappingError) {
@@ -242,14 +249,23 @@ export async function POST(
       res.status(400).json({ type: "invalid_contract", reason: error.message })
       return
     }
+    const marketId = resolution.orders[0].market_id
+    const storedEnvelope =
+      envelopes.length === 1
+        ? envelopes[0]
+        : {
+            event_type: PAYMENT_INTENT_SUCCEEDED_EVENT,
+            envelope_count: envelopes.length,
+            envelopes,
+          }
 
     // ── krok 4: idempotencja transportu ───────────────────────────────────────
     let reserved: boolean
     try {
       reserved = await reserveWebhookDelivery(handle.client, {
         event_id: deliveryEventId,
-        market_id: resolution.market_id,
-        envelope,
+        market_id: marketId,
+        envelope: storedEnvelope,
       })
     } catch (err) {
       logger.error?.(
@@ -261,8 +277,9 @@ export async function POST(
 
     if (!reserved) {
       // Ta sama dostawa już przyjęta (np. `stripe events resend`). ACK bez emisji.
-      // Druga warstwa (`event_processed` po payment_intent_id) i tak nie dopuści
-      // drugiego vouchera, ale zatrzymanie tutaj oszczędza cały przebieg.
+      // Druga warstwa (`event_processed` po payment_intent_id + order_id) i tak
+      // nie dopuści drugiego kompletu voucherów, ale zatrzymanie tutaj oszczędza
+      // cały przebieg.
       logger.info?.(
         `[stripe/payment-intent] dostawa ${deliveryEventId} już przyjęta — ACK bez emisji`
       )
@@ -277,7 +294,9 @@ export async function POST(
     // ── krok 5: EMIT — jedyny side-effect domenowy webhooka ───────────────────
     try {
       const eventBus = req.scope.resolve(Modules.EVENT_BUS) as EventBusLike
-      await eventBus.emit({ name: PAYMENT_INTENT_SUCCEEDED_EVENT, data: envelope })
+      for (const envelope of envelopes) {
+        await eventBus.emit({ name: PAYMENT_INTENT_SUCCEEDED_EVENT, data: envelope })
+      }
     } catch (err) {
       const error = err as Error
       // Kompensacja rezerwacji: bez niej nieudana emisja wyciszyłaby ponowienia
@@ -299,20 +318,30 @@ export async function POST(
 
     logger.info?.(
       `[stripe/payment-intent] emitted ${PAYMENT_INTENT_SUCCEEDED_EVENT} ` +
-        `payment_intent=${envelope.payload.payment_intent_id} ` +
-        `order=${envelope.payload.order_id} market=${resolution.market_id} ` +
-        `źródło=${resolution.source.order_id}/${resolution.source.market_id}`
+        `payment_intent=${paymentIntentId} envelopes=${envelopes.length} ` +
+        `orders=${resolution.orders.map((order) => order.order_id).join(",")} ` +
+        `market=${marketId}`
     )
-    res.status(200).json({ received: true, emitted: PAYMENT_INTENT_SUCCEEDED_EVENT })
+    res.status(200).json({
+      received: true,
+      emitted: PAYMENT_INTENT_SUCCEEDED_EVENT,
+      ...(envelopes.length > 1
+        ? {
+            emitted_count: envelopes.length,
+            order_ids: resolution.orders.map((order) => order.order_id),
+          }
+        : {}),
+    })
 
     // ── wariant A (uzupełnienie): stempel metadata PO odpowiedzi ──────────────
     // Best-effort i celowo PO `res` — kolejne zdarzenia tego PI poniosą fakty
     // wprost, ale awaria Stripe API nie może opóźnić ani wywrócić dostawy.
-    if (resolvedFromLink) {
+    if (resolvedFromLink && resolution.orders.length === 1) {
+      const [order] = resolution.orders
       await stampPaymentIntentOrderFacts({
         payment_intent_id: paymentIntentId,
-        order_id: resolution.order_id,
-        market_id: resolution.market_id,
+        order_id: order.order_id,
+        market_id: order.market_id,
         logger,
       })
     }

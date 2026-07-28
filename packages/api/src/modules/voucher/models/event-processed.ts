@@ -30,8 +30,9 @@
  *       transportowa: „czy ten konkretny pakiet webhooka był już odebrany?".
  *
  *   • `event_processed`          — dedupe KONSUMPCJI BIZNESOWEJ (issuance).
- *       Klucz: `external_id` (= `payment_intent.id`, `pi_...`) + `event_type`.
- *       Chroni przed PODWOJENIEM ISSUE dla tego samego faktu płatności, nawet
+ *       Klucz: `external_id` (= `payment_intent.id:order_id`, ADR-166) +
+ *       `event_type`. Chroni przed PODWOJENIEM ISSUE dla tego samego zamówienia,
+ *       nawet
  *       gdy dotarł innym kanałem/innym `event_id` (np. webhook vs reconcile job).
  *       Warstwa domenowa: „czy ten payment_intent był już skonsumowany do issue?".
  *
@@ -56,15 +57,15 @@
 export const EVENT_PROCESSED_TABLE = "event_processed" as const
 
 /**
- * Kolumny composite PK = klucz dedupe event-level (ADR-137 DEC-5 pkt 3.i):
- * `external_id` (= `payment_intent.id`, kontrakt Story 3.1) + `event_type`
+ * Kolumny composite PK = klucz dedupe event-level (ADR-166 amendment do
+ * ADR-137 DEC-5 pkt 3.i): `external_id` (= `payment_intent.id:order_id`) + `event_type`
  * (envelope event_type, naming AR-EVENTS).
  */
 export const EVENT_PROCESSED_PK_COLUMNS = ["external_id", "event_type"] as const
 
 /** Persisted shape `event_processed` (1:1 z DDL migracji). */
 export interface EventProcessedRow {
-  /** external_id = payment_intent.id (envelope.v1 payload, Story 3.1). */
+  /** external_id = payment_intent.id:order_id (jednostka issuance, ADR-166). */
   external_id: string
   /** event_type, np. `gp.stripe.payment_intent_succeeded.v1` (AR-EVENTS). */
   event_type: string

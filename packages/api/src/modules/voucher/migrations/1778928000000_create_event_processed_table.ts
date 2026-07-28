@@ -5,8 +5,8 @@ import { Migration } from "@medusajs/framework/mikro-orm/migrations"
  * eventów: tabela `event_processed` (event-level dedupe).
  *
  * Podstawa normatywna: ADR-137 §Decyzja pkt 3 / DEC-5 — dwupoziomowa idempotencja:
- *   (i)  EVENT-LEVEL  — TA TABELA: dedupe po `external_id` (= `payment_intent.id`,
- *        kontrakt eventu Story 3.1 `gp.stripe.payment_intent_succeeded.v1`) + `event_type`.
+ *   (i)  EVENT-LEVEL  — TA TABELA: dedupe po `external_id`
+ *        (= `payment_intent.id:order_id`, ADR-166) + `event_type`.
  *   (ii) PER-ENTITLEMENT — `entitlement_dedupe_key` jako DB unique constraint na
  *        `entitlement_instance`, egzekwowany w Story 3.3 (subscriber). NIE tutaj —
  *        FR10: jeden zakup ⇒ wiele entitlementów per-recipient, więc dedupe po
@@ -58,7 +58,7 @@ export class Migration1778928000000 extends Migration {
     // gwarantem idempotencji — replay tego samego eventu ⇒ konflikt PK ⇒ no-op.
     this.addSql(`
       CREATE TABLE IF NOT EXISTS event_processed (
-        -- external_id = payment_intent.id (kontrakt Story 3.1, envelope.v1 payload).
+        -- external_id = payment_intent.id:order_id (jednostka issuance, ADR-166).
         external_id   text NOT NULL CHECK (char_length(external_id) > 0),
         -- event_type = envelope event_type, np. 'gp.stripe.payment_intent_succeeded.v1'
         -- (naming AR-EVENTS). Dedupe jest per (external_id, event_type), bo ten sam

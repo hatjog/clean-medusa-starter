@@ -8,8 +8,9 @@
  *     powtórną EMISJĄ przy `stripe events resend` / multi-replice forwardera.
  *  2. ISSUANCE — `event_processed (external_id, event_type)` w rdzeniu
  *     `live-issue-from-payment-intent.ts`: „ten PaymentIntent już wystawił
- *     entitlementy". Klucz to `payment_intent_id`. Chroni przed drugim voucherem
- *     nawet wtedy, gdy Stripe przyśle DWA różne `evt_…` dla tego samego PI.
+ *     entitlementy". Klucz to `payment_intent_id:order_id` (ADR-166). Chroni
+ *     przed drugim voucherem per zamówienie nawet wtedy, gdy Stripe przyśle
+ *     DWA różne `evt_…` dla tego samego PI.
  *
  * Obie są potrzebne i żadna nie zastępuje drugiej: warstwa 1 nie wie nic
  * o entitlementach, warstwa 2 nie wie nic o dostawach. Po tej zmianie ponowna

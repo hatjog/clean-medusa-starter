@@ -247,7 +247,10 @@ export function buildPaymentIntentSucceededEnvelope(
       vendor_id: null,
       location_id: null,
     },
-    idempotency_key: `${marketId}:${paymentIntentId}:payment_intent_succeeded`,
+    // ADR-166: jedna płatność Mercur może utworzyć N zamówień (per seller),
+    // więc jednostką issuance jest para PI + order, nie sam PaymentIntent.
+    idempotency_key:
+      `${marketId}:${paymentIntentId}:${orderId}:payment_intent_succeeded`,
     correlation_id: orderId,
     payload,
   }

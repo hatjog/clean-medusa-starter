@@ -1,7 +1,7 @@
 /**
  * stripe-payment-intent-link.ts — Story 5.1 AC4 (v1.14.0) — rozwiązanie
- * `order_id` + `market_id` dla webhooka Path Y, gdy metadata PaymentIntenta
- * ich NIE niesie.
+ * listy `order_id` + `market_id` dla webhooka Path Y, gdy metadata
+ * PaymentIntenta ich NIE niesie.
  *
  * ── Dlaczego to istnieje (zmierzony defekt, nie hipoteza) ───────────────────
  * Realny zakup 2026-07-28 (`order_01KYMN7XQX06FKHSWFT0QV2NNY`, PI
@@ -21,10 +21,9 @@
  *                              →  order_payment_collection  →  order
  *
  * ── Kontrakt zdarzenia NIENARUSZONY ─────────────────────────────────────────
- * `gp.stripe.payment_intent_succeeded.v1` wymaga, żeby payload ZAWIERAŁ
- * `order_id`/`market_id` — nie narzuca, że pochodzą z `payment_intent.metadata`.
- * Ten moduł rozwiązuje je PRZED zbudowaniem koperty; schemat i walidacja NFR4
- * zostają bez zmian.
+ * `gp.stripe.payment_intent_succeeded.v1` zachowuje skalarny `order_id`: dla
+ * jednej kolekcji powiązanej z N zamówieniami route emituje N kopert, po jednej
+ * na zamówienie (ADR-166). Schemat i walidacja NFR4 zostają bez zmian.
  *
  * ── Zasada twarda: NIE ZGADUJEMY RYNKU ──────────────────────────────────────
  * `market_id` pochodzi z danych domenowych zamówienia albo z mapy
@@ -54,7 +53,7 @@ export type PaymentLinkQueryClient = {
  *
  *  - `link_unresolved`  — brak `order_id` w metadata i brak linku w bazie
  *                         (sesja nieznana / nigdy nie doszło do zamówienia) → DANE
- *  - `link_ambiguous`   — link wskazuje >1 różnych zamówień → DANE (anomalia)
+ *  - `link_ambiguous`   — wielozamówieniowy link przecina granicę rynku → DANE
  *  - `order_not_found`  — `order_id` znane, ale zamówienia nie ma → DANE
  *  - `market_unresolved`— zamówienie jest, ale rynku nie da się przypisać → KONFIG
  *  - `market_ambiguous` — `order.metadata` i `sales_channel` wskazują różne rynki → KONFIG
@@ -72,12 +71,16 @@ export type PaymentIntentLinkSource = {
   market_id: "metadata" | "order_metadata" | "sales_channel"
 }
 
+export type ResolvedPaymentIntentOrder = {
+  order_id: string
+  market_id: string
+  source: PaymentIntentLinkSource
+}
+
 export type PaymentIntentLinkResolution =
   | {
       ok: true
-      order_id: string
-      market_id: string
-      source: PaymentIntentLinkSource
+      orders: ResolvedPaymentIntentOrder[]
     }
   | {
       ok: false
@@ -103,9 +106,9 @@ export type PaymentIntentLinkHints = {
  * (ten sam wzorzec czyta `subscribers/stripe-payment-audit.ts`), więc zdarzenie
  * bez `session_id` też jest rozwiązywalne.
  *
- * `DISTINCT` + kontrola liczności: jedna kolekcja płatności może mieć wiele
- * sesji (retry), ale POWINNA wskazywać jedno zamówienie. Więcej niż jedno =
- * anomalia danych, nie „weź pierwsze".
+ * `DISTINCT` usuwa powtórzenia wynikające z retry sesji. Jedna kolekcja
+ * płatności MOŻE wskazywać wiele zamówień — Mercur dzieli checkout per
+ * seller. Każde `order_id` jest osobną jednostką issuance (ADR-166).
  */
 export const RESOLVE_ORDER_BY_PAYMENT_LINK_SQL = `
   SELECT DISTINCT opc.order_id
@@ -119,6 +122,7 @@ export const RESOLVE_ORDER_BY_PAYMENT_LINK_SQL = `
         OR ($2::text IS NOT NULL AND ps.data->>'id' = $2)
         OR ($2::text IS NOT NULL AND ps.data->>'payment_intent' = $2)
      )
+   ORDER BY opc.order_id ASC
 `
 
 /**
@@ -149,7 +153,8 @@ type OrderMarketContextRow = {
 }
 
 /**
- * Rozwiązuje `order_id` + `market_id` dla faktu `payment_intent.succeeded`.
+ * Rozwiązuje wszystkie pary `order_id` + `market_id` dla faktu
+ * `payment_intent.succeeded`.
  *
  * Kolejność (decyzja PO 2026-07-28, wariant B):
  *   1. metadata PaymentIntenta (gdy checkout zdążył je ostemplować),
@@ -171,17 +176,17 @@ export async function resolvePaymentIntentLink(
   const metadataMarketId = normalize(hints.market_id)
   const sessionId = normalize(hints.session_id)
 
-  let orderId = metadataOrderId
+  let orderIds = metadataOrderId ? [metadataOrderId] : []
   let orderIdSource: PaymentIntentLinkSource["order_id"] = "metadata"
 
-  if (!orderId) {
+  if (orderIds.length === 0) {
     const linked = await client.query<{ order_id: string | null }>(
       RESOLVE_ORDER_BY_PAYMENT_LINK_SQL,
       [sessionId ?? null, hints.payment_intent_id]
     )
-    const orderIds = unique(
+    orderIds = unique(
       linked.rows.map((row) => normalize(row.order_id)).filter(isPresent)
-    )
+    ).sort()
     if (orderIds.length === 0) {
       return {
         ok: false,
@@ -193,23 +198,51 @@ export async function resolvePaymentIntentLink(
           "— zdarzenie nie da się przypisać do zamówienia",
       }
     }
-    if (orderIds.length > 1) {
-      return {
-        ok: false,
-        reason: "link_ambiguous",
-        detail:
-          `payment_intent ${hints.payment_intent_id} wskazuje ${orderIds.length} różnych ` +
-          `zamówień (${orderIds.join(", ")}) — anomalia danych; NIE wybieramy ` +
-          "pierwszego z brzegu",
-      }
-    }
-    orderId = orderIds[0]
     orderIdSource = "payment_session_link"
   }
 
+  const orders: ResolvedPaymentIntentOrder[] = []
+  for (const orderId of orderIds) {
+    const resolved = await resolveOrderContext(client, {
+      order_id: orderId,
+      order_id_source: orderIdSource,
+      metadata_market_id: metadataMarketId,
+      payment_intent_id: hints.payment_intent_id,
+    })
+    if (!resolved.ok) return resolved
+    orders.push(resolved.order)
+  }
+
+  const markets = unique(orders.map((order) => order.market_id))
+  if (markets.length > 1) {
+    return {
+      ok: false,
+      reason: "link_ambiguous",
+      detail:
+        `payment_intent ${hints.payment_intent_id} wskazuje ${orders.length} zamówień ` +
+        `w wielu rynkach (${markets.join(", ")}) — jedna rezerwacja transportowa ` +
+        "nie może bezpiecznie przekroczyć granicy izolacji rynku",
+    }
+  }
+
+  return { ok: true, orders }
+}
+
+async function resolveOrderContext(
+  client: PaymentLinkQueryClient,
+  input: {
+    order_id: string
+    order_id_source: PaymentIntentLinkSource["order_id"]
+    metadata_market_id: string | null
+    payment_intent_id: string
+  }
+): Promise<
+  | { ok: true; order: ResolvedPaymentIntentOrder }
+  | Extract<PaymentIntentLinkResolution, { ok: false }>
+> {
   const contextResult = await client.query<OrderMarketContextRow>(
     RESOLVE_ORDER_MARKET_CONTEXT_SQL,
-    [orderId]
+    [input.order_id]
   )
   const context = contextResult.rows[0]
   if (!context || !normalize(context.order_id)) {
@@ -217,8 +250,8 @@ export async function resolvePaymentIntentLink(
       ok: false,
       reason: "order_not_found",
       detail:
-        `order ${orderId} (źródło: ${orderIdSource}) nie istnieje albo jest usunięte ` +
-        `— payment_intent ${hints.payment_intent_id} bez zamówienia do obsłużenia`,
+        `order ${input.order_id} (źródło: ${input.order_id_source}) nie istnieje albo jest usunięte ` +
+        `— payment_intent ${input.payment_intent_id} bez zamówienia do obsłużenia`,
     }
   }
 
@@ -226,12 +259,13 @@ export async function resolvePaymentIntentLink(
     readNestedString(context.order_metadata, ["gp", "market_id"]) ??
     readNestedString(context.order_metadata, ["market_id"])
   const salesChannelMarketId = normalize(context.sales_channel_market_id)
-
   const candidates: Array<{
     value: string
     source: PaymentIntentLinkSource["market_id"]
   }> = []
-  if (metadataMarketId) candidates.push({ value: metadataMarketId, source: "metadata" })
+  if (input.metadata_market_id) {
+    candidates.push({ value: input.metadata_market_id, source: "metadata" })
+  }
   if (orderMarketId) candidates.push({ value: orderMarketId, source: "order_metadata" })
   if (salesChannelMarketId) {
     candidates.push({ value: salesChannelMarketId, source: "sales_channel" })
@@ -242,7 +276,7 @@ export async function resolvePaymentIntentLink(
       ok: false,
       reason: "market_unresolved",
       detail:
-        `order ${orderId} nie ma market_id ani w metadata (gp.market_id / market_id), ` +
+        `order ${input.order_id} nie ma market_id ani w metadata (gp.market_id / market_id), ` +
         `ani przez sales_channel ${context.sales_channel_id ?? "brak"} ` +
         "(metadata->>'gp_market_id') — rynek jest nieprzypisywalny; odrzucamy " +
         "zamiast podstawiać wartość domyślną",
@@ -255,17 +289,22 @@ export async function resolvePaymentIntentLink(
       ok: false,
       reason: "market_ambiguous",
       detail:
-        `order ${orderId} ma sprzeczne przypisania rynku: ` +
-        candidates.map((c) => `${c.source}=${c.value}`).join(", ") +
+        `order ${input.order_id} ma sprzeczne przypisania rynku: ` +
+        candidates.map((candidate) => `${candidate.source}=${candidate.value}`).join(", ") +
         " — cicha podmiana rynku byłaby groźniejsza niż odrzucenie",
     }
   }
 
   return {
     ok: true,
-    order_id: orderId,
-    market_id: candidates[0].value,
-    source: { order_id: orderIdSource, market_id: candidates[0].source },
+    order: {
+      order_id: input.order_id,
+      market_id: candidates[0].value,
+      source: {
+        order_id: input.order_id_source,
+        market_id: candidates[0].source,
+      },
+    },
   }
 }
 

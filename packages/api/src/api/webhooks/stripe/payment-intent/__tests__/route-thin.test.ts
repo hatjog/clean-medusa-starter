@@ -171,6 +171,11 @@ describe("Story 3.3 AC1 — POST route cienki (verify + emit, ZERO biznes-logiki
     expect(res.statusCode).toBe(200)
     expect(emitted).toHaveLength(1)
     expect(emitted[0].name).toBe(PAYMENT_INTENT_SUCCEEDED_EVENT)
+    expect(
+      (emitted[0].data as { idempotency_key: string }).idempotency_key
+    ).toBe(
+      "bonbeauty:pi_3Pabc1234567890:order_4421:payment_intent_succeeded"
+    )
 
     // ZERO biznes-logiki: żadnego service'u domenowego ani modułu entitlementów.
     expect(resolved.some((k) => /entitlement|voucher|gp[-_]core/i.test(k))).toBe(false)
