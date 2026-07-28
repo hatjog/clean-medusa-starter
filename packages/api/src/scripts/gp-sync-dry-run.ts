@@ -13,7 +13,21 @@ export type FieldDiff = {
   incoming: string
 }
 
-function parseCliBooleanFlag(args: string[] | undefined, flag: string, envVar: string): boolean {
+/**
+ * Kanał boolean skryptu: flaga argv LUB zmienna środowiskowa.
+ *
+ * Eksportowany, bo `medusa exec` parsuje argv yargs-em w trybie strict i
+ * ODRZUCA nieznane flagi (`error: Unknown argument: apply`) — separator `--`
+ * też nie pomaga. Skrypt uruchamiany przez `medusa exec` ma więc realnie
+ * DOSTĘPNĄ tylko połówkę środowiskową tego kanału, a druga połówka zostaje
+ * dla wywołań bezpośrednich (testy, import programistyczny). Jedna
+ * implementacja, żeby nie było drugiego miejsca do rozjechania (cykl 7 R8).
+ */
+export function parseCliBooleanFlag(
+  args: string[] | undefined,
+  flag: string,
+  envVar: string
+): boolean {
   if (args?.includes(flag)) return true
 
   const envValue = (process.env[envVar] ?? "").trim().toLowerCase()

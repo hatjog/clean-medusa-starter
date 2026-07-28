@@ -28,14 +28,35 @@
  *
  * ## Domyślnie NIC NIE PISZE
  *
- * Bez `--apply` skrypt jest planem. To celowo odwrotna domyślność niż w
- * `gp-config-sync-*`: skrypt naprawczy uruchamia się rzadko, zwykle na bazie,
- * o której ktoś już się martwi.
+ * Bez jawnego kanału zapisu skrypt jest planem. To celowo odwrotna domyślność
+ * niż w `gp-config-sync-*`: skrypt naprawczy uruchamia się rzadko, zwykle na
+ * bazie, o której ktoś już się martwi.
+ *
+ * ## Kanał zapisu: `GP_BACKFILL_APPLY` (cykl 7 R8)
+ *
+ * `medusa exec` parsuje argv yargs-em w trybie STRICT i odrzuca nieznane
+ * flagi ZANIM dotrą do skryptu:
+ *
+ *     $ npx medusa exec ./…/gp-config-backfill-seller-columns.ts bonbeauty --apply
+ *     error: Unknown argument: apply
+ *
+ * Separator `--` też nie pomaga. Udokumentowana wcześniej forma `--apply`
+ * była więc nieosiągalna przez jedyną drogę uruchomienia, czyli skrypt nigdy
+ * nie mógł zapisać — był w praktyce wyłącznie planem, mimo że jego jedynym
+ * celem jest zapis. Kanałem operatorskim jest zmienna środowiskowa, tym samym
+ * wzorcem, co `GP_OVERWRITE` / `GP_SYNC_PRUNE` / `GP_DRY_RUN`.
+ *
+ * Flaga `--apply` żyje dalej w argv jako alias dla wywołań BEZPOŚREDNICH
+ * (testy, import programistyczny) — nie jest formą operatorską i nie jest
+ * pokazywana jako użycie.
  *
  * ## Użycie
  *
- *   medusa exec ./src/scripts/gp-config-backfill-seller-columns.ts [marketId]
- *   medusa exec ./src/scripts/gp-config-backfill-seller-columns.ts bonbeauty --apply
+ *   # plan (nic nie zapisuje):
+ *   pnpm gp-config-backfill-seller-columns bonbeauty
+ *
+ *   # zapis:
+ *   GP_BACKFILL_APPLY=true pnpm gp-config-backfill-seller-columns bonbeauty
  *
  * Bez `marketId` obejmuje wszystkich sellerów; z `marketId` — tylko tych
  * z `metadata.gp.market_id === marketId`.
@@ -46,6 +67,13 @@ import { ExecArgs } from "@medusajs/framework/types"
 // Jedna implementacja zapisu sellera dla obu skryptów — wariantów metod update
 // w module sellera jest trzy i nie chcemy drugiego miejsca do rozjechania.
 import { updateSellerRecord } from "./gp-config-sync-vendors"
+// Ta sama implementacja kanału boolean, co w `gp-config-sync-*` — jeden parser
+// „flaga argv LUB zmienna środowiskowa", żeby domyślności nie rozjechały się
+// między skryptami.
+import { parseCliBooleanFlag } from "./gp-sync-dry-run"
+
+/** Kanał środowiskowy włączający ZAPIS. Bez niego skrypt jest planem. */
+export const BACKFILL_APPLY_ENV = "GP_BACKFILL_APPLY"
 
 /** Pola seedowane, które mają WŁASNĄ kolumnę encji: rejestr → kolumna. */
 const COLUMN_BACKED_SEED_FIELDS = [
@@ -157,7 +185,10 @@ async function listSellers(sellerModuleService: any): Promise<Record<string, unk
 export default async function gpConfigBackfillSellerColumns({ container, args }: ExecArgs) {
   const positional = (args ?? []).filter((arg) => !arg.startsWith("--"))
   const marketId = (positional[0] ?? process.env.GP_MARKET_ID ?? "").trim() || null
-  const apply = (args ?? []).includes("--apply")
+  // `--apply` w argv jest nieosiągalne przez `medusa exec` (yargs strict
+  // odrzuca nieznane flagi), więc kanałem operatorskim jest `GP_BACKFILL_APPLY`.
+  // Alias argv zostaje dla wywołań bezpośrednich — patrz docblock.
+  const apply = parseCliBooleanFlag(args, "--apply", BACKFILL_APPLY_ENV)
 
   const summary: SellerColumnBackfillSummary = {
     ok: true,
@@ -217,7 +248,8 @@ export default async function gpConfigBackfillSellerColumns({ container, args }:
 
   if (!apply && summary.planned > 0) {
     console.log(
-      `\n${summary.planned} seller(s) require a backfill. Re-run with --apply to write.`
+      `\n${summary.planned} seller(s) require a backfill. ` +
+        `Re-run with ${BACKFILL_APPLY_ENV}=true to write.`
     )
   }
 

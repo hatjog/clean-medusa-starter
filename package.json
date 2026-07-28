@@ -39,6 +39,7 @@
     "gp-config-sync-media": "medusa exec ./packages/api/src/scripts/gp-config-sync-media.ts",
     "gp-config-sync-reviews": "medusa exec ./packages/api/src/scripts/gp-config-sync-reviews.ts",
     "gp-config-sync-accounts": "medusa exec ./packages/api/src/scripts/gp-config-sync-accounts.ts",
+    "gp-config-backfill-seller-columns": "medusa exec ./packages/api/src/scripts/gp-config-backfill-seller-columns.ts",
     "test:integration:http": "TEST_TYPE=integration:http NODE_OPTIONS=--experimental-vm-modules jest --silent=false --runInBand --forceExit",
     "test:integration:modules": "TEST_TYPE=integration:modules NODE_OPTIONS=--experimental-vm-modules jest --silent=false --runInBand --forceExit",
     "test:unit": "TEST_TYPE=unit NODE_OPTIONS=--experimental-vm-modules jest --silent --runInBand --forceExit",

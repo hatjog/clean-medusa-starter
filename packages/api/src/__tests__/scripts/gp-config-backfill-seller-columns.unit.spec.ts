@@ -14,7 +14,10 @@
  * należy do orkiestratora.
  */
 
+import path from 'node:path'
+
 import gpConfigBackfillSellerColumns, {
+  BACKFILL_APPLY_ENV,
   planSellerColumnBackfill,
 } from '../../scripts/gp-config-backfill-seller-columns'
 
@@ -116,6 +119,7 @@ describe('gpConfigBackfillSellerColumns — entrypoint', () => {
   afterEach(() => {
     logSpy.mockRestore()
     process.exitCode = undefined
+    delete process.env[BACKFILL_APPLY_ENV]
   })
 
   function makeService(sellers: any[]) {
@@ -190,6 +194,78 @@ describe('gpConfigBackfillSellerColumns — entrypoint', () => {
 
     expect(summary.scanned).toBe(0)
     expect(service.update).not.toHaveBeenCalled()
+  })
+
+  // Cykl 7 R8 — `medusa exec` odrzuca `--apply` (yargs strict: „Unknown
+  // argument: apply"), więc argv NIE JEST osiągalnym kanałem operatorskim.
+  // Jedyny kanał, którym operator może realnie włączyć zapis, to zmienna
+  // środowiskowa — i to jego testujemy na tym samym entrypoincie, który
+  // uruchamia `medusa exec`, a nie na atrapie decyzji.
+  describe(`kanał zapisu ${BACKFILL_APPLY_ENV} (cykl 7 R8)`, () => {
+    it('bez kanału (argv jak z `medusa exec`) — ZERO zapisów, sam plan', async () => {
+      const service = makeService([needsBackfill()])
+
+      const summary = await gpConfigBackfillSellerColumns({
+        container: makeContainer(service),
+        args: ['bonbeauty'],
+      } as any)
+
+      expect(service.update).not.toHaveBeenCalled()
+      expect(summary.apply).toBe(false)
+      expect(summary.applied).toBe(0)
+      expect(summary.planned).toBe(1)
+    })
+
+    it('z kanałem GP_BACKFILL_APPLY=true — zapis, bez żadnej flagi w argv', async () => {
+      process.env[BACKFILL_APPLY_ENV] = 'true'
+      const service = makeService([needsBackfill()])
+
+      const summary = await gpConfigBackfillSellerColumns({
+        container: makeContainer(service),
+        args: ['bonbeauty'],
+      } as any)
+
+      expect(service.update).toHaveBeenCalledWith('seller-studio-nova', {
+        description: SEEDED_DESCRIPTION,
+      })
+      expect(summary.apply).toBe(true)
+      expect(summary.applied).toBe(1)
+    })
+
+    it('wartość inna niż prawdziwościowa NIE włącza zapisu (bezpieczna domyślność)', async () => {
+      process.env[BACKFILL_APPLY_ENV] = 'false'
+      const service = makeService([needsBackfill()])
+
+      const summary = await gpConfigBackfillSellerColumns({
+        container: makeContainer(service),
+        args: ['bonbeauty'],
+      } as any)
+
+      expect(service.update).not.toHaveBeenCalled()
+      expect(summary.apply).toBe(false)
+    })
+
+    it('skrypt ma wpis w package.json — inaczej nie ma jak go uruchomić', () => {
+      // Pozostałe `gp-config-sync-*` mają swój wpis; ten go nie miał, więc
+      // jedyną drogą było ręczne `npx medusa exec` z pełną ścieżką.
+      const pkg = require(path.resolve(__dirname, '../../../../..', 'package.json'))
+      expect(pkg.scripts['gp-config-backfill-seller-columns']).toBe(
+        'medusa exec ./packages/api/src/scripts/gp-config-backfill-seller-columns.ts'
+      )
+    })
+
+    it('podpowiedź w planie wskazuje kanał, który realnie działa', async () => {
+      const service = makeService([needsBackfill()])
+
+      await gpConfigBackfillSellerColumns({
+        container: makeContainer(service),
+        args: ['bonbeauty'],
+      } as any)
+
+      const printed = logSpy.mock.calls.map((call) => String(call[0])).join('\n')
+      expect(printed).toContain(`${BACKFILL_APPLY_ENV}=true`)
+      expect(printed).not.toContain('Re-run with --apply')
+    })
   })
 
   it('błąd zapisu jest głośny: warning + niezerowy kod wyjścia', async () => {
