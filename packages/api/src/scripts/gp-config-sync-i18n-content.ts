@@ -448,6 +448,36 @@ function isNativePlLocale(locale: string): boolean {
   }
 }
 
+/**
+ * Natywne PL body SELLERA odczytane z encji.
+ *
+ * Review 4-6-H1 (znalezione na żywej bazie dev, nie w analizie). Ten sam
+ * kształt co regresja 1-4-c2, tylko na innej encji i o klasę cichszy:
+ * `gp-config-sync-vendors` NIGDY nie zapisuje kolumny `seller.description`.
+ * `createPayload` jej nie zawiera, a ścieżka UPDATE pisze wyłącznie
+ * `gpMetaUpdate.description` (i czyta `existingGp.description ??
+ * existingSeller.description`) — opis z `market.yaml → vendors[].description`
+ * żyje więc w `metadata.gp.description`.
+ *
+ * Czytanie samej kolumny dawało `bodies["pl-PL"] = ""` dla KAŻDEGO sellera i
+ * `content_bar.pl = {words: 0, bar: false}` — czyli storefront gasił polskie
+ * profile salonów, podczas gdy metryka AD-4 (czytająca `i18n/sellers.yaml`)
+ * pokazywała `3/3, bar = true`. Stan bazy dev w chwili fixu potwierdzał to
+ * co do liczby: `pl {words: 0}` przy `de/en/ua {words: 5..19}`.
+ *
+ * Kolejność (`metadata.gp.description` → kolumna) jest ta sama, co w
+ * `gp-config-sync-vendors.resolveSeedIfEmpty`, żeby obie ścieżki widziały
+ * dokładnie ten sam byt.
+ */
+function resolveSellerPlBody(match: any): string {
+  const metadata = isRecord(match?.metadata) ? match.metadata : {}
+  const gp = isRecord(metadata.gp) ? metadata.gp : {}
+  if (typeof gp.description === "string" && gp.description.trim().length > 0) {
+    return gp.description
+  }
+  return typeof match?.description === "string" ? match.description : ""
+}
+
 function materializedLocales(supportedLocales: string[]): string[] {
   return supportedLocales.filter((locale) => !locale.toLowerCase().startsWith("pl"))
 }
@@ -605,6 +635,8 @@ async function collectTranslationPayloads(
       }
       if (config.entityType === "product_category") {
         bodies["pl-PL"] = options.categoryPlByHandle.get(handle) ?? ""
+      } else if (config.entityType === "seller") {
+        bodies["pl-PL"] = resolveSellerPlBody(match)
       } else {
         bodies["pl-PL"] = typeof match.description === "string" ? match.description : ""
       }

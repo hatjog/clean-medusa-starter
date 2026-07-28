@@ -28,12 +28,30 @@
  *
  *   - klucze PL z `i18n/*.yaml` są USUWANE (stub nigdy nie konkuruje z body),
  *   - `product_category` → PL z gp-config `products.yaml → categories[]`,
- *   - `product` / `seller` → PL z `description` encji w DB, a ta jest
- *     seedowana z gp-config (`products[].description` / `vendors[].description`).
+ *   - `product` → PL z kolumny `description` encji w DB,
+ *   - `seller` → PL z `metadata.gp.description` encji w DB (fallback: kolumna).
  *
  * Jeśli sync zmieni źródło PL, ten test zacznie kłamać — dlatego pilnuje go
  * `it("reguła sourcingu PL w sync-i18n-content nie zmieniła kształtu")`, który
  * czyta kod skryptu i failuje, gdy zniknie któryś z jego znaczników.
+ *
+ * ## Review 4-6-H1 — dlaczego seller czyta ENCJĘ, a nie gp-config
+ *
+ * Pierwsza wersja tego testu podstawiała za encję sellera plik
+ * `market.yaml → vendors[].description` („wiarygodny stand-in dla DB").
+ * Stand-in jest wiarygodny wyłącznie wtedy, gdy encja == gp-config — czyli
+ * dokładnie przy założeniu, którego lekcja sprint-3 kazała nie robić. Na
+ * żywej bazie dev to założenie było FAŁSZYWE i test świecił się na zielono:
+ *
+ *   - `description` sellera jest polem `seed_if_empty` z ochroną własności
+ *     vendora, więc `--stage ship` BEZ `--overwrite` nie przenosi nowych
+ *     opisów PL z gp-config na encję (Case 2: „vendor edited → skip"),
+ *   - opis żyje w `metadata.gp.description`, nie w kolumnie `description`
+ *     (`gp-config-sync-vendors` nigdy tej kolumny nie zapisuje).
+ *
+ * Dlatego gałąź `seller` pyta teraz REALNĄ bazę. Brak połączenia = `describe.skip`
+ * (widoczny w raporcie), nigdy cichy pass — pominięta bramka nie może wyglądać
+ * jak bramka, która przeszła.
  */
 
 import fs from "node:fs"
@@ -95,30 +113,60 @@ function syncCategoryPl(configRoot: string): Map<string, string> {
 }
 
 /**
- * PL widziany przez SYNC dla sellera: `description` encji w DB. Encja jest
- * seedowana z gp-config `market.yaml → vendors[].description`, więc to ten
- * plik jest tu wiarygodnym stand-inem dla DB (i jednocześnie to on jest
- * rozstrzygniętym ŹRÓDŁEM PL sellera wg Story 4.6 / AC-A1).
+ * PL widziany przez SYNC dla sellera — odczytany z ENCJI (review 4-6-H1),
+ * dokładnie tą samą regułą co `resolveSellerPlBody`: `metadata.gp.description`,
+ * a dopiero potem kolumna `description`.
  */
-function syncSellerPl(configRoot: string): Map<string, string> {
-  const doc = loadYaml(path.join(configRoot, INSTANCE, "markets", MARKET, "market.yaml"))
+async function syncSellerPlFromDb(
+  pool: any,
+  marketId: string
+): Promise<Map<string, string>> {
+  const { rows } = await pool.query(
+    `select handle, description, metadata from seller where deleted_at is null`
+  )
   const out = new Map<string, string>()
-  const vendors = isRecord(doc) && Array.isArray(doc.vendors) ? doc.vendors : []
-  for (const vendor of vendors) {
-    if (!isRecord(vendor)) continue
-    const handle =
-      typeof vendor.slug === "string" && vendor.slug.trim()
-        ? vendor.slug.trim()
-        : typeof vendor.vendor_id === "string"
-          ? vendor.vendor_id.trim()
-          : ""
-    if (!handle) continue
-    out.set(handle, typeof vendor.description === "string" ? vendor.description : "")
+  for (const row of rows) {
+    const metadata = isRecord(row.metadata) ? row.metadata : {}
+    const gp = isRecord(metadata.gp) ? metadata.gp : {}
+    if (gp.market_id !== marketId) continue
+    const fromMeta = typeof gp.description === "string" ? gp.description : ""
+    const body = fromMeta.trim().length > 0
+      ? fromMeta
+      : typeof row.description === "string"
+        ? row.description
+        : ""
+    out.set(String(row.handle ?? "").trim(), body)
   }
   return out
 }
 
 const PL_SLUG = localeRoutingSlug("pl-PL")
+
+/**
+ * Reguła sourcingu SYNC-u zastosowana do wpisu i18n: PL z YAML-a wypada,
+ * na jego miejsce wchodzi PL z bytu, który sync realnie czyta.
+ */
+function truthBarFor(
+  entityType: "product_category" | "seller",
+  entry: Record<string, unknown>,
+  plBody: string
+) {
+  const fields = isRecord(entry.fields) ? entry.fields : {}
+  const description = isRecord(fields.description) ? { ...fields.description } : {}
+  for (const locale of Object.keys(description)) {
+    if (localeRoutingSlug(locale) === PL_SLUG) {
+      delete description[locale]
+    }
+  }
+  description["pl-PL"] = plBody
+  return buildContentBarMap(entityType, description)
+}
+
+function readI18nEntries(fileName: string): Array<Record<string, unknown>> {
+  const doc = loadYaml(path.join(marketI18nDir, fileName))
+  const entries = isRecord(doc) && Array.isArray(doc.entries) ? doc.entries : []
+  return entries.filter(isRecord)
+}
 
 maybeDescribe("AD-4 — metryka baru i materializacja czytają to samo body", () => {
   // Metryka czyta assembled `gp-ops/config` (default `gp-config-content-bar`).
@@ -133,42 +181,21 @@ maybeDescribe("AD-4 — metryka baru i materializacja czytają to samo body", ()
     marketId: MARKET,
   })
 
-  it.each(["product_category", "seller"] as const)(
-    "%s: content_bar z metryki == content_bar policzony ze źródła prawdy (wszystkie wpisy, wszystkie locale)",
-    (entityType) => {
-      const fileName = entityType === "seller" ? "sellers.yaml" : "categories.yaml"
-      const doc = loadYaml(path.join(marketI18nDir, fileName))
-      const entries = isRecord(doc) && Array.isArray(doc.entries) ? doc.entries : []
-      expect(entries.length).toBeGreaterThan(0)
+  const measuredFor = (entityType: "product_category" | "seller") =>
+    new Map(report.entities[entityType].map((entity) => [entity.handle, entity.content_bar]))
 
-      const plByHandle =
-        entryTypeIsCategory(entityType)
-          ? syncCategoryPl(syncConfigRoot)
-          : syncSellerPl(syncConfigRoot)
+  it("product_category: content_bar z metryki == content_bar policzony ze źródła prawdy (gp-config)", () => {
+    const entries = readI18nEntries("categories.yaml")
+    expect(entries.length).toBeGreaterThan(0)
+    const plByHandle = syncCategoryPl(syncConfigRoot)
+    const measured = measuredFor("product_category")
 
-      const measured = new Map(
-        report.entities[entityType].map((entity) => [entity.handle, entity.content_bar])
-      )
-
-      for (const entry of entries) {
-        if (!isRecord(entry)) continue
-        const handle = String(entry.handle ?? "").trim()
-        const fields = isRecord(entry.fields) ? entry.fields : {}
-        const description = isRecord(fields.description) ? { ...fields.description } : {}
-
-        // Reguła sourcingu SYNC-u, krok po kroku.
-        for (const locale of Object.keys(description)) {
-          if (localeRoutingSlug(locale) === PL_SLUG) {
-            delete description[locale]
-          }
-        }
-        description["pl-PL"] = plByHandle.get(handle) ?? ""
-
-        const truth = buildContentBarMap(entityType, description)
-        expect({ handle, bar: measured.get(handle) }).toEqual({ handle, bar: truth })
-      }
+    for (const entry of entries) {
+      const handle = String(entry.handle ?? "").trim()
+      const truth = truthBarFor("product_category", entry, plByHandle.get(handle) ?? "")
+      expect({ handle, bar: measured.get(handle) }).toEqual({ handle, bar: truth })
     }
-  )
+  })
 
   it("każdy wpis kategorii i sellera ma pomiar dla wszystkich czterech slugów locale", () => {
     for (const entityType of ["product_category", "seller"] as const) {
@@ -189,12 +216,100 @@ maybeDescribe("AD-4 — metryka baru i materializacja czytają to samo body", ()
     )
     expect(source).toContain("isNativePlLocale(key)")
     expect(source).toContain('bodies["pl-PL"] = options.categoryPlByHandle.get(handle)')
+    expect(source).toContain('bodies["pl-PL"] = resolveSellerPlBody(match)')
     expect(source).toContain(
       'bodies["pl-PL"] = typeof match.description === "string" ? match.description : ""'
     )
+    // Review 4-6-H1: kolejność odczytu sellera MUSI zostać przy metadanych gp.
+    expect(source).toContain('typeof gp.description === "string"')
   })
 })
 
-function entryTypeIsCategory(entityType: string): boolean {
-  return entityType === "product_category"
-}
+// ---------------------------------------------------------------------------
+// Gałąź `seller` — parity przeciwko REALNEJ encji (review 4-6-H1).
+// ---------------------------------------------------------------------------
+
+/**
+ * `.env.test` backendu ustawia `DATABASE_URL=` (puste), więc pusta wartość
+ * musi znaczyć „brak DB", nie „połącz się z niczym". `GP_CONTENT_PARITY_DATABASE_URL`
+ * jest jawnym wejściem dla przebiegu po materializacji.
+ */
+const parityDbUrl = (
+  process.env.GP_CONTENT_PARITY_DATABASE_URL ||
+  process.env.DATABASE_URL ||
+  ""
+).trim()
+
+const maybeDbDescribe = marketI18nDir && fs.existsSync(marketI18nDir) && parityDbUrl
+  ? describe
+  : describe.skip
+
+maybeDbDescribe("AD-4 / 4-6-H1 — seller: metryka == content_bar policzony z ENCJI", () => {
+  let pool: any
+  let plByHandle: Map<string, string>
+
+  beforeAll(async () => {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { Pool } = require("pg")
+    pool = new Pool({ connectionString: parityDbUrl })
+    plByHandle = await syncSellerPlFromDb(pool, MARKET)
+  })
+
+  afterAll(async () => {
+    await pool?.end()
+  })
+
+  it("każdy seller z i18n ma encję w bazie tego marketu", () => {
+    for (const entry of readI18nEntries("sellers.yaml")) {
+      const handle = String(entry.handle ?? "").trim()
+      // Brak encji = metryka mierzy byt, którego sync nigdy nie zobaczy.
+      expect({ handle, market: MARKET, present: plByHandle.has(handle) }).toEqual({
+        handle,
+        market: MARKET,
+        present: true,
+      })
+    }
+  })
+
+  it("content_bar z metryki == content_bar policzony z encji (wszystkie wpisy, wszystkie locale)", () => {
+    const entries = readI18nEntries("sellers.yaml")
+    expect(entries.length).toBeGreaterThan(0)
+    const measured = new Map(
+      measureMarketContentBar({
+        configRoot: path.join(projectRoot, "gp-ops", "config"),
+        i18nRoot,
+        instanceId: INSTANCE,
+        marketId: MARKET,
+      }).entities.seller.map((entity) => [entity.handle, entity.content_bar])
+    )
+
+    for (const entry of entries) {
+      const handle = String(entry.handle ?? "").trim()
+      const truth = truthBarFor("seller", entry, plByHandle.get(handle) ?? "")
+      expect({ handle, bar: measured.get(handle) }).toEqual({ handle, bar: truth })
+    }
+  })
+
+  it("zmaterializowany metadata.gp.content_bar na encji zgadza się z metryką", async () => {
+    const { rows } = await pool.query(
+      `select handle, metadata->'gp'->'content_bar' as content_bar
+         from seller
+        where deleted_at is null and metadata->'gp'->>'market_id' = $1`,
+      [MARKET]
+    )
+    const persisted = new Map(rows.map((row: any) => [String(row.handle), row.content_bar]))
+    const measured = measureMarketContentBar({
+      configRoot: path.join(projectRoot, "gp-ops", "config"),
+      i18nRoot,
+      instanceId: INSTANCE,
+      marketId: MARKET,
+    })
+
+    for (const entity of measured.entities.seller) {
+      expect({ handle: entity.handle, bar: persisted.get(entity.handle) }).toEqual({
+        handle: entity.handle,
+        bar: entity.content_bar,
+      })
+    }
+  })
+})
