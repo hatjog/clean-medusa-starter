@@ -18,7 +18,7 @@ import {
   computeFieldDiffs,
   DryRunCollector,
   parseDryRunFlag,
-  parseForceVendorOverwriteFlag,
+  resolveForceVendorOverwrite,
   parseOverwriteFlag,
   parsePruneFlag,
 } from "./gp-sync-dry-run"
@@ -181,6 +181,8 @@ function parseArgs(args: string[] | undefined): {
   dryRun: boolean
   overwrite: boolean
   forceVendorOverwrite: boolean
+  /** Verify-B5 V1 — kanał ustawiony jednostronnie i zignorowany; MUSI być głośny. */
+  forceVendorOverwriteIgnoredReason?: string
   prune: boolean
 } {
   const instanceId = (args?.[0] ?? process.env.GP_INSTANCE_ID ?? "gp-dev").trim()
@@ -188,14 +190,25 @@ function parseArgs(args: string[] | undefined): {
   const configRoot = (process.env.GP_CONFIG_ROOT ?? path.resolve(process.cwd(), "../config")).trim()
   const dryRun = parseDryRunFlag(args)
   const overwrite = parseOverwriteFlag(args)
-  const forceVendorOverwrite = parseForceVendorOverwriteFlag(args)
+  const forceVendorOverwriteDecision = resolveForceVendorOverwrite(args)
   const prune = parsePruneFlag(args)
 
   if (!instanceId) throw new Error("instanceId is required (args[0] or GP_INSTANCE_ID)")
   if (!marketId) throw new Error("marketId is required (args[1] or GP_MARKET_ID)")
   if (!configRoot) throw new Error("configRoot is required (GP_CONFIG_ROOT)")
 
-  return { instanceId, marketId, configRoot, dryRun, overwrite, forceVendorOverwrite, prune }
+  return {
+    instanceId,
+    marketId,
+    configRoot,
+    dryRun,
+    overwrite,
+    forceVendorOverwrite: forceVendorOverwriteDecision.enabled,
+    ...(forceVendorOverwriteDecision.ignoredReason
+      ? { forceVendorOverwriteIgnoredReason: forceVendorOverwriteDecision.ignoredReason }
+      : {}),
+    prune,
+  }
 }
 
 async function readYamlFile<T>(filePath: string): Promise<T> {
@@ -576,6 +589,17 @@ function deepEqual(a: unknown, b: unknown): boolean {
  * Nie przełamuje Case 2 ani 4 — przed ADR-165 przełamywał oba bezwarunkowo,
  * co było cichą utratą treści vendora (finding 4-6-H1). Jedynym kanałem, który
  * je przełamuje, jest `forceVendorOverwrite`.
+ *
+ * Verify-B5 V3 — podział pracy między Case 1 a Case 3 (dlaczego `overwrite`
+ * nie jest tu no-opem):
+ *   - Case 3 to SEED pola pustego. To podstawowa funkcja `seed_if_empty`,
+ *     działa na każdym runie, z flagą i bez niej — bramkowanie jej flagą
+ *     zabiłoby sync przy pierwszym uruchomieniu.
+ *   - Case 1 to ODŚWIEŻENIE istniejącego seeda, czyli zapis do pola, które już
+ *     ma wartość. Zwykły run tego NIE robi („seed if empty" znaczy empty);
+ *     robi to dopiero jawna intencja `--overwrite`. Po fixie cyklu 2 `overwrite`
+ *     trafiał wyłącznie do `ownershipProtected`, więc nie wpływał na ŻADNĄ
+ *     decyzję o zapisie i był flagą bez działania.
  */
 function resolveSeedIfEmpty(
   fieldName: string,
@@ -600,6 +624,19 @@ function resolveSeedIfEmpty(
       // raportujemy tylko gdy ktoś FAKTYCZNIE prosił o nadpisanie — zwykły run
       // bez flagi to normalna praca seeda, nie pominięcie do zgłoszenia
       ownershipProtected: overwrite,
+    }
+  }
+
+  // Case 1 — pole już zasiane i nietknięte przez vendora. Odświeżenie seeda
+  // wymaga jawnej intencji (`--overwrite` albo silniejszy kanał force).
+  const isRefreshOfExistingSeed = isSeeded && !dbEmpty
+  if (isRefreshOfExistingSeed && !overwrite && !forceVendorOverwrite) {
+    return {
+      value: dbValue,
+      shouldWrite: false,
+      isNewSeed: false,
+      // nikt nie prosił o nadpisanie — to nie jest pominięcie do zgłoszenia
+      ownershipProtected: false,
     }
   }
 
@@ -860,9 +897,24 @@ export async function upsertSeller(
 // ---- Default export: Medusa script entrypoint ----
 
 export default async function gpConfigSyncVendors({ container, args }: ExecArgs) {
-  const { instanceId, marketId, configRoot, dryRun, overwrite, forceVendorOverwrite, prune } =
-    parseArgs(args)
+  const {
+    instanceId,
+    marketId,
+    configRoot,
+    dryRun,
+    overwrite,
+    forceVendorOverwrite,
+    forceVendorOverwriteIgnoredReason,
+    prune,
+  } = parseArgs(args)
   const collector = dryRun ? new DryRunCollector() : undefined
+
+  if (forceVendorOverwriteIgnoredReason) {
+    // Verify-B5 V1 — kanał był ustawiony jednostronnie. Nic nie zniszczyliśmy,
+    // ale operator MUSI się dowiedzieć, że jego (lub odziedziczone) ustawienie
+    // nie zadziałało. Cichy no-op zostawiałby przekonanie, że force zadziałał.
+    console.warn(`[GP_FORCE_VENDOR_OVERWRITE] ${forceVendorOverwriteIgnoredReason}`)
+  }
 
   if (forceVendorOverwrite) {
     // ADR-165 — jedyny kanał, który NADPISUJE treść napisaną przez vendora.
@@ -944,6 +996,12 @@ export default async function gpConfigSyncVendors({ container, args }: ExecArgs)
 
   const warnings: string[] = []
   const seenWarnings = new Set<string>()
+
+  if (forceVendorOverwriteIgnoredReason) {
+    // stderr znika w logach orchestratora — sygnał musi być też w raporcie.
+    pushUniqueWarning(warnings, seenWarnings, forceVendorOverwriteIgnoredReason)
+  }
+
   const vendorCounts = { created: 0, updated: 0, skipped: 0 }
   const splCounts = { created: 0, skipped: 0, missing_products: 0, pruned: 0 }
   const staleSellerCounts = { inactivated: 0, skipped: 0 }

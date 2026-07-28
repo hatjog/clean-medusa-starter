@@ -2,10 +2,13 @@ import {
   assertTranslationStageGate,
   buildHealthReport,
   callRevalidateAll,
+  invokeStageEntrypoint,
   parseOrchestratorArgs,
   runStage,
   sendSlackNotification,
+  withStageEnv,
 } from "../../scripts/gp-config-sync-orchestrator"
+import type { StageExitSignal } from "../../scripts/gp-config-sync-orchestrator"
 import fs from "node:fs"
 import path from "node:path"
 
@@ -314,5 +317,101 @@ describe("callRevalidateAll", () => {
         headers: { "x-revalidate-secret": "secret-123" },
       })
     )
+  })
+})
+
+// ---- Verify-B5 V1/V4: kanały env etapu i sygnał kodu wyjścia ----
+
+const STAGE_ARGS = {
+  instanceId: "gp-dev",
+  marketId: "bonbeauty",
+  configRoot: "/tmp/gp-config",
+  dryRun: false,
+  overwrite: false,
+  prune: false,
+  apply: false,
+} as any
+
+describe("withStageEnv — normalizacja kanałów destrukcyjnych (V1)", () => {
+  const originalEnv = process.env
+
+  beforeEach(() => {
+    process.env = { ...originalEnv }
+  })
+
+  afterAll(() => {
+    process.env = originalEnv
+  })
+
+  it("zeruje odziedziczone GP_FORCE_VENDOR_OVERWRITE na czas etapu", async () => {
+    // `invokeStageEntrypoint` woła etapy IN-PROCESS, więc bez tej normalizacji
+    // odziedziczona zmienna docierała do gp-config-sync-vendors 1:1.
+    process.env.GP_FORCE_VENDOR_OVERWRITE = "true"
+
+    const seen = await withStageEnv(
+      STAGE_ARGS,
+      async () => process.env.GP_FORCE_VENDOR_OVERWRITE
+    )
+
+    expect(seen).toBe("false")
+  })
+
+  it("przywraca wartość operatora po etapie (i usuwa, gdy jej nie było)", async () => {
+    process.env.GP_FORCE_VENDOR_OVERWRITE = "true"
+    await withStageEnv(STAGE_ARGS, async () => undefined)
+    expect(process.env.GP_FORCE_VENDOR_OVERWRITE).toBe("true")
+
+    delete process.env.GP_FORCE_VENDOR_OVERWRITE
+    await withStageEnv(STAGE_ARGS, async () => undefined)
+    expect(process.env.GP_FORCE_VENDOR_OVERWRITE).toBeUndefined()
+  })
+})
+
+describe("invokeStageEntrypoint — nie połyka kodu wyjścia etapu (V4)", () => {
+  afterEach(() => {
+    process.exitCode = undefined
+  })
+
+  it("przechwytuje niezerowy process.exitCode etapu do sinka sygnałów", async () => {
+    const sink: StageExitSignal[] = []
+
+    await invokeStageEntrypoint(
+      async () => {
+        // dokładnie to robi gp-config-sync-vendors przy warnings.length > 0
+        process.exitCode = 1
+      },
+      {},
+      [],
+      { stage: "sync-vendors", sink }
+    )
+
+    expect(sink).toEqual([{ stage: "sync-vendors", exitCode: 1 }])
+  })
+
+  it("nie zaraża orchestratora kodem wyjścia etapu (izolacja zachowana)", async () => {
+    const sink: StageExitSignal[] = []
+    process.exitCode = undefined
+
+    await invokeStageEntrypoint(
+      async () => {
+        process.exitCode = 1
+      },
+      {},
+      [],
+      { stage: "sync-vendors", sink }
+    )
+
+    expect(process.exitCode).toBeUndefined()
+  })
+
+  it("nie zgłasza sygnału, gdy etap zakończył się zerem", async () => {
+    const sink: StageExitSignal[] = []
+
+    await invokeStageEntrypoint(async () => undefined, {}, [], {
+      stage: "sync-catalog",
+      sink,
+    })
+
+    expect(sink).toEqual([])
   })
 })

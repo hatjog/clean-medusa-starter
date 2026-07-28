@@ -327,13 +327,14 @@ function buildStageArgs(orchestratorArgs: OrchestratorArgs): string[] {
   return args
 }
 
-async function withStageEnv<T>(
+export async function withStageEnv<T>(
   orchestratorArgs: OrchestratorArgs,
   action: () => Promise<T>
 ): Promise<T> {
   const previous = {
     GP_CONFIG_ROOT: process.env.GP_CONFIG_ROOT,
     GP_DRY_RUN: process.env.GP_DRY_RUN,
+    GP_FORCE_VENDOR_OVERWRITE: process.env.GP_FORCE_VENDOR_OVERWRITE,
     GP_INSTANCE_ID: process.env.GP_INSTANCE_ID,
     GP_MARKET_ID: process.env.GP_MARKET_ID,
     GP_OVERWRITE: process.env.GP_OVERWRITE,
@@ -346,6 +347,13 @@ async function withStageEnv<T>(
   process.env.GP_MARKET_ID = orchestratorArgs.marketId
   process.env.GP_OVERWRITE = orchestratorArgs.overwrite ? "true" : "false"
   process.env.GP_SYNC_PRUNE = orchestratorArgs.prune ? "true" : "false"
+  // Verify-B5 V1 / ADR-165: orchestrator NIE zna intencji „zniszcz treść
+  // vendor-owned" — nie ma dla niej ani argumentu, ani pola w `OrchestratorArgs`.
+  // `invokeStageEntrypoint` woła etapy IN-PROCESS, więc odziedziczone
+  // `GP_FORCE_VENDOR_OVERWRITE=true` przechodziło do `gp-config-sync-vendors`
+  // 1:1. Normalizujemy tak samo jak GP_OVERWRITE/GP_SYNC_PRUNE: jawne "false",
+  // nigdy „cokolwiek odziedziczysz".
+  process.env.GP_FORCE_VENDOR_OVERWRITE = "false"
 
   try {
     return await action()
@@ -355,6 +363,10 @@ async function withStageEnv<T>(
 
     if (previous.GP_DRY_RUN === undefined) delete process.env.GP_DRY_RUN
     else process.env.GP_DRY_RUN = previous.GP_DRY_RUN
+
+    if (previous.GP_FORCE_VENDOR_OVERWRITE === undefined)
+      delete process.env.GP_FORCE_VENDOR_OVERWRITE
+    else process.env.GP_FORCE_VENDOR_OVERWRITE = previous.GP_FORCE_VENDOR_OVERWRITE
 
     if (previous.GP_INSTANCE_ID === undefined) delete process.env.GP_INSTANCE_ID
     else process.env.GP_INSTANCE_ID = previous.GP_INSTANCE_ID
@@ -370,10 +382,33 @@ async function withStageEnv<T>(
   }
 }
 
-async function invokeStageEntrypoint<T>(
+/**
+ * Sygnał „etap zakończył się niezerowym kodem wyjścia", przechwycony z
+ * `process.exitCode` ustawionego przez wywołany in-process entrypoint.
+ */
+export type StageExitSignal = {
+  readonly stage: string
+  readonly exitCode: number
+}
+
+/**
+ * Woła entrypoint etapu IN-PROCESS, izolując jego `process.exitCode` od kodu
+ * wyjścia orchestratora — ale NIE połykając go.
+ *
+ * Verify-B5 V4: wcześniejsza wersja bezwarunkowo przywracała `previousExitCode`
+ * w `finally`, więc `process.exitCode = 1` z `gp-config-sync-vendors`
+ * (`warnings.length > 0 && !dryRun`) znikał bez śladu. Na podstawowej ścieżce
+ * operatora (`gp catalog sync`) pominięcie pola vendor-owned wyglądało wtedy na
+ * pełny sukces — czyli gwarancja ADR-165 §2 („cichy skip byłby powtórzeniem
+ * tego samego defektu w drugą stronę") była unieważniona dokładnie tam, gdzie
+ * ma znaczenie. Kod wyjścia etapu trafia teraz do `signals`, a wołający
+ * podnosi go do warningów i do kodu wyjścia całego runu.
+ */
+export async function invokeStageEntrypoint<T>(
   entrypoint: (ctx: ExecArgs) => Promise<T>,
   container: any,
-  args: string[]
+  args: string[],
+  exitSignal?: { readonly stage: string; readonly sink: StageExitSignal[] }
 ): Promise<T> {
   const previousExitCode = process.exitCode
 
@@ -381,6 +416,10 @@ async function invokeStageEntrypoint<T>(
     process.exitCode = undefined
     return await entrypoint({ container, args })
   } finally {
+    const stageExitCode = process.exitCode
+    if (exitSignal && typeof stageExitCode === "number" && stageExitCode !== 0) {
+      exitSignal.sink.push({ stage: exitSignal.stage, exitCode: stageExitCode })
+    }
     process.exitCode = previousExitCode
   }
 }
@@ -593,6 +632,8 @@ export default async function gpConfigSyncOrchestrator({ container, args }: Exec
 
   const stageArgs = buildStageArgs(orchestratorArgs)
   const warnings: string[] = []
+  /** Verify-B5 V4 — niezerowe kody wyjścia etapów; nie wolno ich połknąć. */
+  const stageExitSignals: StageExitSignal[] = []
 
   try {
     const changedEntityIds = await collectChangedEntityIds(orchestratorArgs)
@@ -606,7 +647,10 @@ export default async function gpConfigSyncOrchestrator({ container, args }: Exec
           }
 
           await withStageEnv(orchestratorArgs, async () => {
-            await invokeStageEntrypoint(gpConfigSyncCatalog, container, stageArgs)
+            await invokeStageEntrypoint(gpConfigSyncCatalog, container, stageArgs, {
+              stage: "sync-catalog",
+              sink: stageExitSignals,
+            })
           })
           return "catalog sync completed"
         },
@@ -616,7 +660,10 @@ export default async function gpConfigSyncOrchestrator({ container, args }: Exec
         required: true,
         execute: async () => {
           const result = await withStageEnv(orchestratorArgs, async () => {
-            return await invokeStageEntrypoint(gpConfigSyncTranslations, container, stageArgs)
+            return await invokeStageEntrypoint(gpConfigSyncTranslations, container, stageArgs, {
+              stage: "sync-translations",
+              sink: stageExitSignals,
+            })
           })
 
           if ("skipped" in result && result.skipped) {
@@ -642,7 +689,10 @@ export default async function gpConfigSyncOrchestrator({ container, args }: Exec
         required: true,
         execute: async () => {
           await withStageEnv(orchestratorArgs, async () => {
-            await invokeStageEntrypoint(gpConfigSyncMedia, container, stageArgs)
+            await invokeStageEntrypoint(gpConfigSyncMedia, container, stageArgs, {
+              stage: "sync-media",
+              sink: stageExitSignals,
+            })
           })
           return orchestratorArgs.dryRun ? "media dry-run completed" : "media sync completed"
         },
@@ -652,7 +702,10 @@ export default async function gpConfigSyncOrchestrator({ container, args }: Exec
         required: true,
         execute: async () => {
           await withStageEnv(orchestratorArgs, async () => {
-            await invokeStageEntrypoint(gpConfigSyncVendors, container, stageArgs)
+            await invokeStageEntrypoint(gpConfigSyncVendors, container, stageArgs, {
+              stage: "sync-vendors",
+              sink: stageExitSignals,
+            })
           })
           return orchestratorArgs.dryRun ? "vendor dry-run completed" : "vendor sync completed"
         },
@@ -662,7 +715,10 @@ export default async function gpConfigSyncOrchestrator({ container, args }: Exec
         required: true,
         execute: async () => {
           const result = await withStageEnv(orchestratorArgs, async () => {
-            return await invokeStageEntrypoint(gpConfigSyncI18nContent, container, stageArgs)
+            return await invokeStageEntrypoint(gpConfigSyncI18nContent, container, stageArgs, {
+              stage: "sync-i18n-content",
+              sink: stageExitSignals,
+            })
           })
 
           if ("skipped" in result && result.skipped) {
@@ -702,7 +758,10 @@ export default async function gpConfigSyncOrchestrator({ container, args }: Exec
         required: false,
         execute: async () => {
           await withStageEnv(orchestratorArgs, async () => {
-            await invokeStageEntrypoint(gpConfigSyncReviews, container, stageArgs)
+            await invokeStageEntrypoint(gpConfigSyncReviews, container, stageArgs, {
+              stage: "sync-reviews",
+              sink: stageExitSignals,
+            })
           })
           return orchestratorArgs.apply
             ? "reviews sync completed"
@@ -714,7 +773,10 @@ export default async function gpConfigSyncOrchestrator({ container, args }: Exec
         required: true,
         execute: async () => {
           await withStageEnv(orchestratorArgs, async () => {
-            await invokeStageEntrypoint(gpConfigSyncAccounts, container, stageArgs)
+            await invokeStageEntrypoint(gpConfigSyncAccounts, container, stageArgs, {
+              stage: "sync-accounts",
+              sink: stageExitSignals,
+            })
           })
           return orchestratorArgs.dryRun ? "accounts dry-run completed" : "accounts sync completed"
         },
@@ -724,7 +786,10 @@ export default async function gpConfigSyncOrchestrator({ container, args }: Exec
         required: true,
         execute: async () => {
           await withStageEnv(orchestratorArgs, async () => {
-            await invokeStageEntrypoint(gpConfigSyncPayments, container, stageArgs)
+            await invokeStageEntrypoint(gpConfigSyncPayments, container, stageArgs, {
+              stage: "sync-payments",
+              sink: stageExitSignals,
+            })
           })
           return orchestratorArgs.dryRun ? "payments dry-run completed" : "payments sync completed"
         },
@@ -734,7 +799,10 @@ export default async function gpConfigSyncOrchestrator({ container, args }: Exec
         required: true,
         execute: async () => {
           await withStageEnv(orchestratorArgs, async () => {
-            await invokeStageEntrypoint(gpConfigSyncShipping, container, stageArgs)
+            await invokeStageEntrypoint(gpConfigSyncShipping, container, stageArgs, {
+              stage: "sync-shipping",
+              sink: stageExitSignals,
+            })
           })
           return orchestratorArgs.dryRun ? "shipping dry-run completed" : "shipping sync completed"
         },
@@ -744,7 +812,10 @@ export default async function gpConfigSyncOrchestrator({ container, args }: Exec
         required: false,
         execute: async () => {
           await withStageEnv(orchestratorArgs, async () => {
-            await invokeStageEntrypoint(gpConfigSyncBlog, container, stageArgs)
+            await invokeStageEntrypoint(gpConfigSyncBlog, container, stageArgs, {
+              stage: "sync-blog",
+              sink: stageExitSignals,
+            })
           })
           return orchestratorArgs.dryRun ? "blog dry-run completed" : "blog sync completed"
         },
@@ -763,6 +834,22 @@ export default async function gpConfigSyncOrchestrator({ container, args }: Exec
       if (result.status === "warning" && result.message) {
         warnings.push(`${result.name}: ${result.message}`)
       }
+    }
+
+    // Verify-B5 V4 — etap, który sam zgłosił niezerowy kod wyjścia, nie może
+    // wyglądać na pełny sukces tylko dlatego, że nie rzucił wyjątku.
+    for (const signal of stageExitSignals) {
+      const stageResult = stages.find((entry) => entry.name === signal.stage)
+      const message =
+        `zakończył się kodem wyjścia ${signal.exitCode} — patrz warningi tego etapu ` +
+        `(m.in. ADR-165: pola vendor-owned pominięte mimo --overwrite)`
+      if (stageResult && stageResult.status === "ok") {
+        stageResult.status = "warning"
+        stageResult.message = stageResult.message
+          ? `${stageResult.message}; ${message}`
+          : message
+      }
+      warnings.push(`${signal.stage}: ${message}`)
     }
 
     const health = await buildHealthReport(productModuleService, db, orchestratorArgs.marketId)
@@ -819,6 +906,15 @@ export default async function gpConfigSyncOrchestrator({ container, args }: Exec
       slack,
       warnings,
       report_path: reportPath,
+    }
+
+    // Verify-B5 V4 — sygnał głośności musi dożyć do raportu I do kodu wyjścia
+    // procesu. `gp catalog sync` czyta wyłącznie exit code orchestratora; bez
+    // tego pominięcie treści vendor-owned kończyło się zerem, czyli wyglądało
+    // na pełny sukces. Dry-run niczego nie zapisał, więc tam zostaje 0.
+    if (stageExitSignals.length > 0 && !orchestratorArgs.dryRun) {
+      summary.ok = false
+      process.exitCode = Math.max(...stageExitSignals.map((signal) => signal.exitCode))
     }
 
     if (!orchestratorArgs.dryRun && process.env.SLACK_WEBHOOK_URL?.trim()) {

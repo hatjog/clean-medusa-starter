@@ -3,6 +3,7 @@ import {
   DryRunCollector,
   normalizeHtml,
   parseDryRunFlag,
+  resolveForceVendorOverwrite,
 } from '../../scripts/gp-sync-dry-run'
 
 describe('parseDryRunFlag', () => {
@@ -66,5 +67,60 @@ describe('DryRunCollector', () => {
     expect(table).toContain('product')
     expect(table).toContain('nail-art')
     expect(table).toContain('status=draft')
+  })
+})
+
+// ---- Verify-B5 V1: kanał destrukcyjny ADR-165 jest DWUSTRONNY ----
+
+describe('resolveForceVendorOverwrite', () => {
+  const originalEnv = process.env
+
+  beforeEach(() => {
+    process.env = { ...originalEnv }
+    delete process.env.GP_FORCE_VENDOR_OVERWRITE
+  })
+
+  afterAll(() => {
+    process.env = originalEnv
+  })
+
+  it('włącza kanał tylko przy koniunkcji argv + env', () => {
+    process.env.GP_FORCE_VENDOR_OVERWRITE = 'true'
+
+    const decision = resolveForceVendorOverwrite(['gp-dev', 'bonbeauty', '--force-vendor-overwrite'])
+
+    expect(decision.enabled).toBe(true)
+    expect(decision.ignoredReason).toBeUndefined()
+  })
+
+  it('IGNORUJE samą odziedziczoną zmienną środowiskową i mówi o tym głośno', () => {
+    // sanitizeEnv nie strippuje GP_*, więc env dociera do dziecka verbatim
+    process.env.GP_FORCE_VENDOR_OVERWRITE = 'true'
+
+    const decision = resolveForceVendorOverwrite(['gp-dev', 'bonbeauty'])
+
+    expect(decision.enabled).toBe(false)
+    expect(decision.ignoredReason).toMatch(/ZIGNOROWANE/)
+    expect(decision.ignoredReason).toMatch(/--force-vendor-overwrite/)
+  })
+
+  it('IGNORUJE sam argument bez potwierdzenia w env i mówi o tym głośno', () => {
+    const decision = resolveForceVendorOverwrite(['gp-dev', 'bonbeauty', '--force-vendor-overwrite'])
+
+    expect(decision.enabled).toBe(false)
+    expect(decision.ignoredReason).toMatch(/GP_FORCE_VENDOR_OVERWRITE/)
+  })
+
+  it('milczy, gdy nikt kanału nie dotknął', () => {
+    expect(resolveForceVendorOverwrite(['gp-dev', 'bonbeauty'])).toEqual({ enabled: false })
+  })
+
+  it('jawne GP_FORCE_VENDOR_OVERWRITE=false wyłącza kanał mimo argumentu', () => {
+    process.env.GP_FORCE_VENDOR_OVERWRITE = 'false'
+
+    const decision = resolveForceVendorOverwrite(['gp-dev', 'bonbeauty', '--force-vendor-overwrite'])
+
+    expect(decision.enabled).toBe(false)
+    expect(decision.ignoredReason).toMatch(/ZIGNOROWANE/)
   })
 })

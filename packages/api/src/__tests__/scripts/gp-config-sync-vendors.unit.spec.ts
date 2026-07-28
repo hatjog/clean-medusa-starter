@@ -38,7 +38,12 @@ describe('upsertSeller dry-run', () => {
     expect(sellerModuleService.update).not.toHaveBeenCalled()
   })
 
-  it('forces config-owned overwrite for seeded fields when overwrite=true', async () => {
+  // Verify-B5 V5: ten test kodował kontrakt SPRZED ADR-165 („--overwrite wymusza
+  // zapis config-owned"). Po odwróceniu semantyki przechodził wakacyjnie —
+  // asertował wyłącznie notę diffu, która w dry-runie powstaje niezależnie od
+  // decyzji o zapisie. Przepisany na kontrakt PO ADR-165: pole edytowane przez
+  // vendora jest POMIJANE mimo `--overwrite`, a pominięcie jest raportowane.
+  it('dry-run z overwrite=true raportuje pole vendor-owned jako pominięte (ADR-165), a nie jako nadpisane', async () => {
     const sellerModuleService = {
       list: jest.fn().mockResolvedValue([
         {
@@ -71,7 +76,10 @@ describe('upsertSeller dry-run', () => {
     )
 
     expect(result.action).toBe('updated')
-    expect(result.note).toContain('description: Vendor custom description -> Canonical config description')
+    // pole jest seeded, ale DB != config → vendor je edytował (Case 2)
+    expect(result.ownershipProtectedFields).toEqual(['description'])
+    expect(result.note).toContain('vendor-owned (pominięte mimo --overwrite, ADR-165)')
+    expect(result.note).toContain('description')
     expect(sellerModuleService.update).not.toHaveBeenCalled()
   })
 

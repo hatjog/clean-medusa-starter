@@ -106,18 +106,73 @@ export function parseOverwriteFlag(args?: string[]): boolean {
   return parseCliBooleanFlag(args, "--overwrite", "GP_OVERWRITE")
 }
 
+export const FORCE_VENDOR_OVERWRITE_FLAG = "--force-vendor-overwrite"
+export const FORCE_VENDOR_OVERWRITE_ENV = "GP_FORCE_VENDOR_OVERWRITE"
+
+export type ForceVendorOverwriteDecision = {
+  /** true ⟺ kanał był ustawiony DWUSTRONNIE (argv + env). */
+  enabled: boolean
+  /**
+   * Ustawione ⟺ kanał był ustawiony JEDNOSTRONNIE i został ZIGNOROWANY.
+   * Musi trafić do warningów i na stderr — cichy no-op byłby tym samym
+   * defektem co cichy destroy, tylko z drugiej strony.
+   */
+  ignoredReason?: string
+}
+
 /**
- * --force-vendor-overwrite / GP_FORCE_VENDOR_OVERWRITE: ŚWIADOME zniszczenie
+ * --force-vendor-overwrite + GP_FORCE_VENDOR_OVERWRITE: ŚWIADOME zniszczenie
  * treści należącej do vendora.
  *
  * ADR-165 („treść vendor-owned wygrywa", ratyfikowany 2026-07-28): gp-config
  * WYŁĄCZNIE seeduje pola `seed_if_empty` sellera i nigdy nie jest ich
  * właścicielem. `--overwrite` nie przełamuje tej granicy — pomija pola
- * vendor-owned i raportuje je jawnie. Ten flag jest jedynym kanałem, który je
- * przełamuje, i musi być użyty świadomie (fail-loud ostrzeżenie na starcie).
+ * vendor-owned i raportuje je jawnie. Ten kanał jest jedynym, który je
+ * przełamuje.
+ *
+ * Verify-B5 V1 — dlaczego to NIE jest `parseCliBooleanFlag` (OR argv|env):
+ * `sanitizeEnv` (`packages/cli/src/adapters/PythonAdapter.ts`) kopiuje do
+ * dziecka każdą niesekretną zmienną rodzica, a `GP_*` nie pasuje do żadnego
+ * wzorca sekretu. Przy semantyce OR odziedziczone
+ * `GP_FORCE_VENDOR_OVERWRITE=true` — z poprzedniej sesji diagnostycznej, z
+ * shell profile'u, z CI — kasowało treść salonów bez ŻADNEJ intencji w
+ * wywołaniu. To ta sama klasa co 3.4 H-2 i 4.4 M2, tylko destrukcyjna.
+ *
+ * Dlatego kanał jest DWUSTRONNY i wymaga koniunkcji:
+ *   - argv `--force-vendor-overwrite` = intencja tego konkretnego wywołania,
+ *   - env `GP_FORCE_VENDOR_OVERWRITE=true` = świadome potwierdzenie operatora.
+ * Każda ze stron osobno jest IGNOROWANA i raportowana głośno.
  */
-export function parseForceVendorOverwriteFlag(args?: string[]): boolean {
-  return parseCliBooleanFlag(args, "--force-vendor-overwrite", "GP_FORCE_VENDOR_OVERWRITE")
+export function resolveForceVendorOverwrite(args?: string[]): ForceVendorOverwriteDecision {
+  const intentInArgs = args?.includes(FORCE_VENDOR_OVERWRITE_FLAG) === true
+  const rawEnv = (process.env[FORCE_VENDOR_OVERWRITE_ENV] ?? "").trim().toLowerCase()
+  const envEnabled = rawEnv === "true" || rawEnv === "1" || rawEnv === "yes" || rawEnv === "on"
+
+  if (intentInArgs && envEnabled) return { enabled: true }
+
+  if (envEnabled) {
+    return {
+      enabled: false,
+      ignoredReason:
+        `${FORCE_VENDOR_OVERWRITE_ENV}='${rawEnv}' ZIGNOROWANE: brak jawnej intencji ` +
+        `${FORCE_VENDOR_OVERWRITE_FLAG} w argumentach wywołania. Kanał destrukcyjny ` +
+        `ADR-165 jest DWUSTRONNY — sama odziedziczona zmienna środowiskowa go nie ` +
+        `włącza (treść vendor-owned pozostaje nietknięta).`,
+    }
+  }
+
+  if (intentInArgs) {
+    return {
+      enabled: false,
+      ignoredReason:
+        `${FORCE_VENDOR_OVERWRITE_FLAG} ZIGNOROWANE: brak potwierdzenia ` +
+        `${FORCE_VENDOR_OVERWRITE_ENV}=true. Kanał destrukcyjny ADR-165 jest ` +
+        `DWUSTRONNY — sam argument go nie włącza (treść vendor-owned pozostaje ` +
+        `nietknięta).`,
+    }
+  }
+
+  return { enabled: false }
 }
 
 /**
