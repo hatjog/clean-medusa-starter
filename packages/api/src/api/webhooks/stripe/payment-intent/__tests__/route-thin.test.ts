@@ -3,11 +3,28 @@
  *
  * Dowodzi: webhook (1) weryfikuje sygnaturę Stripe, (2) buduje+waliduje envelope
  * kontraktu Story 3.1 i EMITUJE go — i NIC WIĘCEJ: NIE tworzy entitlementu, NIE
- * woła service'ów domenowych, NIE dotyka DB (brak resolve PG). Niepoprawna
- * sygnatura ⇒ 400 + brak emit. (ADR-118, ADR-137 DEC pkt 2, NFR4.)
+ * woła service'ów domenowych. Niepoprawna sygnatura ⇒ 400 + brak emit.
+ * (ADR-118, ADR-137 DEC pkt 2, NFR4.)
+ *
+ * ── Korekta zakresu „cienkości" (Story 5.1 AC4, 2026-07-28) ─────────────────
+ * Ten plik twierdził wcześniej, że route NIE dotyka bazy w ogóle. To twierdzenie
+ * było ZA MOCNE i kosztowało realnego vouchera: metadata PaymentIntenta niesie
+ * wyłącznie `session_id` (sesja płatności powstaje przed zamówieniem), więc route
+ * bez dostępu do powiązania płatność→zamówienie odrzucał 100 % prawdziwych
+ * zakupów kodem 400.
+ *
+ * Niezmiennik ADR-118, którego pilnujemy tutaj, brzmi: route nie ma BIZNES-LOGIKI
+ * — nie woła service'ów domenowych, nie tworzy entitlementów, nie otwiera
+ * transakcji biznesowej. Odczyt własnego powiązania i rezerwacja dostawy nią nie
+ * są. Test egzekwuje więc listę DOZWOLONYCH zależności zamiast zakazu PG.
  */
-import { describe, it, expect } from "@jest/globals"
+import { describe, it, expect, jest } from "@jest/globals"
 import { createHmac } from "node:crypto"
+
+// Wariant A (stempel metadata) sięga do Stripe API — poza zakresem tego pliku.
+jest.mock("../../../../../lib/payment/stripe-payment-intent-metadata-stamp", () => ({
+  stampPaymentIntentOrderFacts: jest.fn(async () => true),
+}))
 
 import { POST } from "../route"
 import { STRIPE_SIGNATURE_HEADER } from "../helpers"
@@ -110,6 +127,21 @@ function makeRes(): FakeRes {
 function makeReq(rawBody: string, sigHeader: string | undefined) {
   const emitted: { name: string; data: unknown }[] = []
   const resolved: string[] = []
+  const sqlSeen: string[] = []
+  const deliveries = new Set<string>()
+  const client = {
+    query: async (sql: string, values: ReadonlyArray<unknown> = []) => {
+      sqlSeen.push(sql)
+      if (/INSERT INTO webhook_event_processed/i.test(sql)) {
+        const key = `${values[0]}|${values[1]}`
+        if (deliveries.has(key)) return { rows: [], rowCount: 0 }
+        deliveries.add(key)
+        return { rows: [], rowCount: 1 }
+      }
+      return { rows: [], rowCount: 0 }
+    },
+    release: () => {},
+  }
   const req = {
     rawBody: Buffer.from(rawBody, "utf8"),
     headers: sigHeader ? { [STRIPE_SIGNATURE_HEADER]: sigHeader } : {},
@@ -117,6 +149,7 @@ function makeReq(rawBody: string, sigHeader: string | undefined) {
       resolve: (key: string) => {
         resolved.push(key)
         if (key === "logger") return { info() {}, warn() {}, error() {} }
+        if (key === "__pg_pool__") return { connect: async () => client }
         if (key === Modules.EVENT_BUS) {
           return { emit: async (e: { name: string; data: unknown }) => emitted.push(e) }
         }
@@ -124,23 +157,31 @@ function makeReq(rawBody: string, sigHeader: string | undefined) {
       },
     },
   }
-  return { req, emitted, resolved }
+  return { req, emitted, resolved, sqlSeen }
 }
 
 describe("Story 3.3 AC1 — POST route cienki (verify + emit, ZERO biznes-logiki)", () => {
-  it("poprawna sygnatura ⇒ 200 + emit eventu kontraktu 3.1, BEZ resolve PG", async () => {
+  it("poprawna sygnatura + kompletne metadata ⇒ 200 + emit, BEZ zapytania o powiązanie", async () => {
     process.env.STRIPE_WEBHOOK_SECRET = SECRET
     const raw = JSON.stringify(stripePiEvent())
-    const { req, emitted, resolved } = makeReq(raw, signedHeader(raw))
+    const { req, emitted, resolved, sqlSeen } = makeReq(raw, signedHeader(raw))
     const res = makeRes()
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await POST(req as any, res as any)
     expect(res.statusCode).toBe(200)
     expect(emitted).toHaveLength(1)
     expect(emitted[0].name).toBe(PAYMENT_INTENT_SUCCEEDED_EVENT)
-    // ZERO biznes-logiki: webhook NIE resolve'uje PG/connection/service domenowego
-    expect(resolved).not.toContain("__pg_pool__")
-    expect(resolved.some((k) => /pg|connection|entitlement|voucher/i.test(k))).toBe(false)
+
+    // ZERO biznes-logiki: żadnego service'u domenowego ani modułu entitlementów.
+    expect(resolved.some((k) => /entitlement|voucher|gp[-_]core/i.test(k))).toBe(false)
+    // Dozwolone zależności route'u — dokładnie trzy, nic ponadto.
+    expect(new Set(resolved)).toEqual(new Set(["logger", "__pg_pool__", Modules.EVENT_BUS]))
+
+    // Metadata były kompletne ⇒ powiązanie NIE jest odpytywane; jedyny SQL to
+    // rezerwacja dostawy (idempotencja transportu).
+    expect(sqlSeen).toHaveLength(1)
+    expect(sqlSeen[0]).toMatch(/INSERT INTO webhook_event_processed/i)
+    expect(sqlSeen.some((s) => /payment_session|entitlement_instance/i.test(s))).toBe(false)
   })
 
   it("niepoprawna sygnatura ⇒ 400 + BRAK emit", async () => {

@@ -113,18 +113,73 @@ export class StripeEventMappingError extends Error {
 }
 
 /**
+ * Fakty tożsamościowe odczytane WPROST z `payment_intent.metadata` — bez żadnego
+ * I/O. Pozwalają wołającemu rozstrzygnąć, czy w ogóle musi sięgać do bazy po
+ * powiązanie (Story 5.1 AC4): checkout, który zdążył ostemplować metadata, jest
+ * obsługiwany bez ani jednego zapytania.
+ *
+ * `session_id` jest tu polem pierwszej klasy, bo w praktyce to JEDYNE, co niesie
+ * PaymentIntent utworzony przez sesję płatności — sesja powstaje, zanim
+ * zamówienie zaczyna istnieć.
+ */
+export type StripePaymentIntentIdentifiers = {
+  payment_intent_id: string | null
+  order_id: string | null
+  market_id: string | null
+  instance_id: string | null
+  session_id: string | null
+}
+
+export function readPaymentIntentIdentifiers(
+  event: StripePaymentIntentEvent
+): StripePaymentIntentIdentifiers {
+  const pi = event.data?.object ?? {}
+  const metadata = (pi.metadata ?? {}) as Record<string, unknown>
+  return {
+    payment_intent_id: readString(pi.id) ?? null,
+    order_id: readString(metadata.order_id) ?? readString(metadata.gp_order_id) ?? null,
+    market_id: readString(metadata.market_id) ?? readString(metadata.gp_market_id) ?? null,
+    instance_id: readString(metadata.instance_id) ?? null,
+    session_id:
+      readString(metadata.session_id) ?? readString(metadata.gp_session_id) ?? null,
+  }
+}
+
+/**
+ * Fakty rozwiązane POZA metadata (Story 5.1 AC4, decyzja PO 2026-07-28 wariant B):
+ * `order_id`/`market_id` wyliczone z powiązania płatność→zamówienie.
+ *
+ * Kontrakt `gp.stripe.payment_intent_succeeded.v1` wymaga, żeby payload je
+ * ZAWIERAŁ — nie narzuca, skąd pochodzą. Metadata pozostaje pierwszeństwem;
+ * to jest uzupełnienie, nie nadpisanie.
+ */
+export type ResolvedPaymentIntentFacts = {
+  order_id?: string | null
+  market_id?: string | null
+}
+
+/**
  * Buduje i WALIDUJE envelope `gp.stripe.payment_intent_succeeded.v1` z faktu
  * Stripe (kontrakt Story 3.1, envelope.v1). Mapowanie minimalne, audytowalne —
  * BEZ raw provider error / sekretów (zgodnie z payload-schema). `order_id`,
- * `market_id`, `instance_id` czytane z `payment_intent.metadata` (ustawione na
- * etapie checkout). Rzuca `StripeEventMappingError` przy brakach / złym typie.
+ * `market_id`, `instance_id` czytane z `payment_intent.metadata`, a gdy metadata
+ * ich NIE niesie — z `resolved` (fakty wyliczone przez wołającego z powiązania
+ * płatność→zamówienie; Story 5.1 AC4). Rzuca `StripeEventMappingError` przy
+ * brakach / złym typie.
+ *
+ * Dlaczego `resolved` w ogóle istnieje: sesja płatności powstaje ZANIM zamówienie
+ * zaczyna istnieć, więc PaymentIntent realnego zakupu niesie w metadata wyłącznie
+ * `session_id`. Wariant „wymagaj order_id w metadata" oznaczał w praktyce 400 na
+ * każdym prawdziwym zakupie (zmierzone 2026-07-28). Kontrakt zdarzenia jest
+ * NIENARUSZONY — zmienia się źródło faktu, nie schemat.
  *
  * `now` wstrzykiwalny (determinizm testów). Walidacja kontraktu jest TWARDA:
  * niezgodny payload/envelope ⇒ wyjątek (NFR4), webhook zwróci 400 i NIE wyemituje.
  */
 export function buildPaymentIntentSucceededEnvelope(
   event: StripePaymentIntentEvent,
-  now: Date = new Date()
+  now: Date = new Date(),
+  resolved: ResolvedPaymentIntentFacts = {}
 ): GpEventEnvelope<PaymentIntentSucceededPayload> {
   if (event.type !== "payment_intent.succeeded") {
     throw new StripeEventMappingError(
@@ -137,10 +192,14 @@ export function buildPaymentIntentSucceededEnvelope(
     throw new StripeEventMappingError("payment_intent.id wymagany")
   }
   const metadata = (pi.metadata ?? {}) as Record<string, unknown>
-  const orderId = readString(metadata.order_id) ?? readString(metadata.gp_order_id)
+  const orderId =
+    readString(metadata.order_id) ??
+    readString(metadata.gp_order_id) ??
+    readString(resolved.order_id)
   if (!orderId) {
     throw new StripeEventMappingError(
-      `payment_intent ${paymentIntentId} bez order_id w metadata (precondition live-issue)`
+      `payment_intent ${paymentIntentId} bez order_id — ani w metadata, ani z ` +
+        "powiązania payment_session→order (precondition live-issue)"
     )
   }
   const currency = readString(pi.currency)?.toUpperCase()
@@ -154,10 +213,14 @@ export function buildPaymentIntentSucceededEnvelope(
     )
   }
   const instanceId = readString(metadata.instance_id) ?? "gp"
-  const marketId = readString(metadata.market_id) ?? readString(metadata.gp_market_id)
+  const marketId =
+    readString(metadata.market_id) ??
+    readString(metadata.gp_market_id) ??
+    readString(resolved.market_id)
   if (!marketId) {
     throw new StripeEventMappingError(
-      `payment_intent ${paymentIntentId} bez market_id w metadata (ontologia 3.2)`
+      `payment_intent ${paymentIntentId} bez market_id — ani w metadata, ani ` +
+        "z kontekstu zamówienia (ontologia 3.2)"
     )
   }
 

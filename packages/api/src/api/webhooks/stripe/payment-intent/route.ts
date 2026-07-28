@@ -1,20 +1,41 @@
 /**
- * POST /webhooks/stripe/payment-intent — CIENKI webhook Path Y (Story 3.3, AC1).
+ * POST /webhooks/stripe/payment-intent — CIENKI webhook Path Y (Story 3.3 AC1,
+ * naprawiony w Story 5.1 AC4).
  *
- * Tryb TEST (Stripe TEST). Robi WYŁĄCZNIE dwie rzeczy (ADR-118, ADR-137 DEC pkt 2):
+ * Tryb TEST (Stripe TEST). Route robi dokładnie tyle, ile trzeba, żeby fakt
+ * Stripe stał się faktem GP (ADR-118, ADR-137 DEC pkt 2):
  *   1. weryfikuje sygnaturę Stripe (`stripe-signature`, HMAC-SHA256);
- *   2. buduje + waliduje envelope `gp.stripe.payment_intent_succeeded.v1` (kontrakt
- *      Story 3.1) i EMITUJE go na event bus.
+ *   2. USTALA `order_id` + `market_id` — z metadata, a gdy ich tam nie ma,
+ *      z istniejącego powiązania płatność→zamówienie;
+ *   3. buduje + waliduje envelope `gp.stripe.payment_intent_succeeded.v1`
+ *      (kontrakt Story 3.1);
+ *   4. rezerwuje dostawę w `webhook_event_processed` (idempotencja transportu);
+ *   5. EMITUJE kopertę na event bus.
  *
- * ZERO biznes-logiki: NIE tworzy entitlementu, NIE woła service'ów domenowych,
- * NIE czyta/zapisuje DB entitlement. Cała logika live-issue → ISSUED jest w
- * `@MedusaSubscriber` (`subscribers/voucher-live-issue.ts`), który konsumuje ten
- * event (Path Y, ADR-052/118 — zakaz custom route jako ścieżki issue).
+ * ZERO biznes-logiki nadal obowiązuje: route NIE tworzy entitlementu, NIE woła
+ * service'ów domenowych, NIE otwiera transakcji biznesowej i NIE dotyka tabel
+ * entitlementów. Cała logika live-issue → ISSUED jest w `@MedusaSubscriber`
+ * (`subscribers/voucher-live-issue.ts`), Path Y (ADR-052/118).
  *
- * Uwaga: produkcyjna ścieżka płatności GP używa natywnego hooka Medusy
- * (`/hooks/payment/stripe`); root `/webhooks/stripe` jest RETIRED (410). Ten route
- * dostarcza TEST-owy, audytowalny most fakt-Stripe → event GP envelope dla rdzenia
- * live-issue (3.1/3.3), bez naruszania retired-invariantu root route.
+ * ── Dlaczego krok 2 musiał powstać (Story 5.1 AC4) ──────────────────────────
+ * Realny zakup 2026-07-28 (250 PLN, `order_01KYMN7XQX06FKHSWFT0QV2NNY`,
+ * PI `pi_3TyCqiHG9Rf5NslT0vAfkVtW` = `succeeded`) dostał tu **HTTP 400**:
+ * metadata PaymentIntenta niosła wyłącznie `{ session_id }`, bo sesja płatności
+ * powstaje ZANIM zamówienie zaczyna istnieć. Efekt: `webhook_event_processed`,
+ * `event_processed`, `entitlement_instance` = 0 / 0 / 0 — klientka zapłaciła,
+ * zobaczyła potwierdzenie i nie dostała vouchera.
+ *
+ * „Cienki" nigdy nie znaczyło „ślepy na własne dane". Route czyta z bazy
+ * WYŁĄCZNIE powiązanie płatności z zamówieniem i rezerwację dostawy — bez tego
+ * nie da się zbudować koperty, której wymaga kontrakt.
+ *
+ * ── Rozłączne klasy odrzucenia (operator ma wiedzieć, co jest zepsute) ──────
+ *   400 `invalid_signature`  — zły podpis / brak nagłówka / skew  → KONFIG sekretu
+ *   400 `unresolved_link`    — nie da się przypisać zamówienia     → DANE
+ *   400 `invalid_contract`   — koperta niezgodna z kontraktem      → KOD
+ *   500 `db_unavailable`     — brak dostępu do bazy                → INFRA (retry)
+ *   500 `emit_failed`        — event bus odmówił                   → INFRA (retry)
+ *   200 `duplicate`          — dostawa już przyjęta                → OK, no-op
  */
 import type { MedusaRequest, MedusaResponse } from "@medusajs/framework/http"
 import { Modules } from "@medusajs/framework/utils"
@@ -22,10 +43,22 @@ import { Modules } from "@medusajs/framework/utils"
 import {
   buildPaymentIntentSucceededEnvelope,
   PAYMENT_INTENT_SUCCEEDED_EVENT,
+  readPaymentIntentIdentifiers,
   StripeEventMappingError,
   verifyStripeSignature,
   type StripePaymentIntentEvent,
 } from "../../../../lib/payment/stripe-payment-intent-event"
+import {
+  resolvePaymentIntentLink,
+  type PaymentIntentLinkResolution,
+} from "../../../../lib/payment/stripe-payment-intent-link"
+import { stampPaymentIntentOrderFacts } from "../../../../lib/payment/stripe-payment-intent-metadata-stamp"
+import {
+  releaseWebhookDelivery,
+  reserveWebhookDelivery,
+  resolveWebhookPgHandle,
+  type WebhookPgHandle,
+} from "../../../../lib/payment/stripe-payment-intent-transport"
 import {
   STRIPE_SIGNATURE_HEADER,
   STRIPE_WEBHOOK_SECRET_ENV,
@@ -115,36 +148,175 @@ export async function POST(
     return
   }
 
-  let envelope
+  const identifiers = readPaymentIntentIdentifiers(stripeEvent)
+  if (!identifiers.payment_intent_id) {
+    logger.warn?.("[stripe/payment-intent] zdarzenie bez payment_intent.id — odrzucono")
+    res.status(400).json({ type: "invalid", reason: "payment_intent_id_missing" })
+    return
+  }
+  const paymentIntentId = identifiers.payment_intent_id
+
+  // Klucz idempotencji transportu. Zdarzenie bez `id` (poza realnym Stripe'em)
+  // dostaje klucz wyprowadzony z PI — dedupe nie może zależeć od pola opcjonalnego.
+  const deliveryEventId = stripeEvent.id ?? `stripe:pi:${paymentIntentId}`
+
+  let handle: WebhookPgHandle | null
   try {
-    envelope = buildPaymentIntentSucceededEnvelope(stripeEvent)
+    handle = await resolveWebhookPgHandle(req.scope)
   } catch (err) {
-    const error = err as Error
-    if (error instanceof StripeEventMappingError) {
-      logger.warn?.(`[stripe/payment-intent] mapowanie odrzucone: ${error.message}`)
-      res.status(400).json({ type: "invalid", reason: error.message })
+    logger.error?.(
+      `[stripe/payment-intent] brak połączenia z bazą: ${(err as Error).message}`
+    )
+    res.status(500).json({ type: "db_unavailable", reason: "pg_connect_failed" })
+    return
+  }
+  if (!handle) {
+    // Fail-closed z kodem RETRIABLE: 400 wyglądałoby jak defekt danych i Stripe
+    // przestałby ponawiać, gubiąc opłaconą transakcję na awarii infrastruktury.
+    logger.error?.("[stripe/payment-intent] brak dostępu do PG w kontenerze")
+    res.status(500).json({ type: "db_unavailable", reason: "pg_not_registered" })
+    return
+  }
+
+  try {
+    // ── krok 2: ustal order_id + market_id ────────────────────────────────────
+    // Metadata mają pierwszeństwo i gdy są kompletne, baza nie jest pytana o link.
+    let resolution: PaymentIntentLinkResolution
+    let resolvedFromLink = false
+    if (identifiers.order_id && identifiers.market_id) {
+      resolution = {
+        ok: true,
+        order_id: identifiers.order_id,
+        market_id: identifiers.market_id,
+        source: { order_id: "metadata", market_id: "metadata" },
+      }
+    } else {
+      try {
+        resolution = await resolvePaymentIntentLink(handle.client, {
+          payment_intent_id: paymentIntentId,
+          order_id: identifiers.order_id,
+          market_id: identifiers.market_id,
+          session_id: identifiers.session_id,
+        })
+      } catch (err) {
+        logger.error?.(
+          `[stripe/payment-intent] rozwiązanie powiązania nieudane dla ` +
+            `${paymentIntentId}: ${(err as Error).message}`
+        )
+        res.status(500).json({ type: "db_unavailable", reason: "link_query_failed" })
+        return
+      }
+      resolvedFromLink = resolution.ok
+    }
+
+    if (!resolution.ok) {
+      // Defekt DANYCH/KONFIGURACJI, nie transportu — 400 z rozłącznym `reason`,
+      // żeby operator nie musiał zgadywać, czy szukać w Stripe, w bazie, czy
+      // w mapie rynków.
+      logger.warn?.(
+        `[stripe/payment-intent] ${resolution.reason}: ${resolution.detail}`
+      )
+      res.status(400).json({
+        type: "unresolved_link",
+        reason: resolution.reason,
+        detail: resolution.detail,
+      })
       return
     }
-    // Walidacja kontraktu (NFR4) lub inny błąd — fail-loud 400.
-    logger.error?.(`[stripe/payment-intent] envelope invalid: ${error.message}`)
-    res.status(400).json({ type: "invalid_contract", reason: error.message })
-    return
-  }
 
-  // EMIT — jedyny side-effect webhooka. Biznes-logika żyje w subscriberze.
-  try {
-    const eventBus = req.scope.resolve(Modules.EVENT_BUS) as EventBusLike
-    await eventBus.emit({ name: PAYMENT_INTENT_SUCCEEDED_EVENT, data: envelope })
-  } catch (err) {
-    const error = err as Error
-    logger.error?.(`[stripe/payment-intent] emit failed: ${error.message}`)
-    res.status(500).json({ type: "emit_failed", reason: error.message })
-    return
-  }
+    // ── krok 3: koperta (kontrakt 3.1 NIENARUSZONY, NFR4) ─────────────────────
+    let envelope
+    try {
+      envelope = buildPaymentIntentSucceededEnvelope(stripeEvent, new Date(), {
+        order_id: resolution.order_id,
+        market_id: resolution.market_id,
+      })
+    } catch (err) {
+      const error = err as Error
+      if (error instanceof StripeEventMappingError) {
+        logger.warn?.(`[stripe/payment-intent] mapowanie odrzucone: ${error.message}`)
+        res.status(400).json({ type: "invalid", reason: error.message })
+        return
+      }
+      logger.error?.(`[stripe/payment-intent] envelope invalid: ${error.message}`)
+      res.status(400).json({ type: "invalid_contract", reason: error.message })
+      return
+    }
 
-  logger.info?.(
-    `[stripe/payment-intent] emitted ${PAYMENT_INTENT_SUCCEEDED_EVENT} ` +
-      `payment_intent=${envelope.payload.payment_intent_id} order=${envelope.payload.order_id}`
-  )
-  res.status(200).json({ received: true, emitted: PAYMENT_INTENT_SUCCEEDED_EVENT })
+    // ── krok 4: idempotencja transportu ───────────────────────────────────────
+    let reserved: boolean
+    try {
+      reserved = await reserveWebhookDelivery(handle.client, {
+        event_id: deliveryEventId,
+        market_id: resolution.market_id,
+        envelope,
+      })
+    } catch (err) {
+      logger.error?.(
+        `[stripe/payment-intent] rezerwacja dostawy nieudana: ${(err as Error).message}`
+      )
+      res.status(500).json({ type: "db_unavailable", reason: "dedupe_insert_failed" })
+      return
+    }
+
+    if (!reserved) {
+      // Ta sama dostawa już przyjęta (np. `stripe events resend`). ACK bez emisji.
+      // Druga warstwa (`event_processed` po payment_intent_id) i tak nie dopuści
+      // drugiego vouchera, ale zatrzymanie tutaj oszczędza cały przebieg.
+      logger.info?.(
+        `[stripe/payment-intent] dostawa ${deliveryEventId} już przyjęta — ACK bez emisji`
+      )
+      res.status(200).json({
+        received: true,
+        duplicate: true,
+        reason: "delivery_already_processed",
+      })
+      return
+    }
+
+    // ── krok 5: EMIT — jedyny side-effect domenowy webhooka ───────────────────
+    try {
+      const eventBus = req.scope.resolve(Modules.EVENT_BUS) as EventBusLike
+      await eventBus.emit({ name: PAYMENT_INTENT_SUCCEEDED_EVENT, data: envelope })
+    } catch (err) {
+      const error = err as Error
+      // Kompensacja rezerwacji: bez niej nieudana emisja wyciszyłaby ponowienia
+      // Stripe'a na zawsze — opłacony zakup bez vouchera, a transport raportujący
+      // „przyjęte". Zwolnienie przywraca ponawialność.
+      try {
+        await releaseWebhookDelivery(handle.client, deliveryEventId)
+      } catch (releaseErr) {
+        logger.error?.(
+          `[stripe/payment-intent] KOMPENSACJA rezerwacji ${deliveryEventId} ` +
+            `nieudana: ${(releaseErr as Error).message} — ponowna dostawa zostanie ` +
+            "zdeduplikowana mimo braku emisji; wymaga ręcznego usunięcia wiersza"
+        )
+      }
+      logger.error?.(`[stripe/payment-intent] emit failed: ${error.message}`)
+      res.status(500).json({ type: "emit_failed", reason: error.message })
+      return
+    }
+
+    logger.info?.(
+      `[stripe/payment-intent] emitted ${PAYMENT_INTENT_SUCCEEDED_EVENT} ` +
+        `payment_intent=${envelope.payload.payment_intent_id} ` +
+        `order=${envelope.payload.order_id} market=${resolution.market_id} ` +
+        `źródło=${resolution.source.order_id}/${resolution.source.market_id}`
+    )
+    res.status(200).json({ received: true, emitted: PAYMENT_INTENT_SUCCEEDED_EVENT })
+
+    // ── wariant A (uzupełnienie): stempel metadata PO odpowiedzi ──────────────
+    // Best-effort i celowo PO `res` — kolejne zdarzenia tego PI poniosą fakty
+    // wprost, ale awaria Stripe API nie może opóźnić ani wywrócić dostawy.
+    if (resolvedFromLink) {
+      await stampPaymentIntentOrderFacts({
+        payment_intent_id: paymentIntentId,
+        order_id: resolution.order_id,
+        market_id: resolution.market_id,
+        logger,
+      })
+    }
+  } finally {
+    handle.release()
+  }
 }
