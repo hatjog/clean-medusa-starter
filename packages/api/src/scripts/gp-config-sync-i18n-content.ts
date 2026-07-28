@@ -465,17 +465,32 @@ function isNativePlLocale(locale: string): boolean {
  * pokazywała `3/3, bar = true`. Stan bazy dev w chwili fixu potwierdzał to
  * co do liczby: `pl {words: 0}` przy `de/en/ua {words: 5..19}`.
  *
- * Kolejność (`metadata.gp.description` → kolumna) jest ta sama, co w
- * `gp-config-sync-vendors.resolveSeedIfEmpty`, żeby obie ścieżki widziały
- * dokładnie ten sam byt.
+ * ## Odwrócenie kolejności — review cykl 4 (doprecyzowanie PO, 2026-07-28)
+ *
+ * Powyższy opis dotyczy stanu SPRZED cyklu 4. Po przebudowie modelu własności
+ * kolumna `seller.description` jest wartością KANONICZNĄ: pisze do niej seed
+ * (`gp-config-sync-vendors`), pisze do niej admin/panel vendora i to ją czyta
+ * `GET /store/seller/:handle`. `metadata.gp.description` jest wyłącznie
+ * rejestrem pochodzenia seeda.
+ *
+ * Czytanie lustra jako pierwszego mierzyłoby więc NIE tę treść, którą widzi
+ * storefront: po edycji opisu przez vendora bar liczyłby stary seed. Kolejność
+ * jest odtąd `kolumna → lustro`, gdzie lustro jest wyłącznie **przejściowym**
+ * fallbackiem dla encji sprzed backfillu (`gp-config-backfill-seller-columns`),
+ * które mają treść w rejestrze i `NULL` w kolumnie. Po backfillu fallback jest
+ * martwy — jego usunięcie jest nazwanym deferralem w ADR-165.
  */
 function resolveSellerPlBody(match: any): string {
+  const column = typeof match?.description === "string" ? match.description : ""
+  if (column.trim().length > 0) {
+    return column
+  }
   const metadata = isRecord(match?.metadata) ? match.metadata : {}
   const gp = isRecord(metadata.gp) ? metadata.gp : {}
   if (typeof gp.description === "string" && gp.description.trim().length > 0) {
     return gp.description
   }
-  return typeof match?.description === "string" ? match.description : ""
+  return column
 }
 
 function materializedLocales(supportedLocales: string[]): string[] {

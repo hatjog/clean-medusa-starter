@@ -1,22 +1,32 @@
 /**
- * ADR-165 — "treść vendor-owned wygrywa" — bramki własności vs `--overwrite`.
+ * ADR-165 — model własności treści sellera po doprecyzowaniu PO (2026-07-28).
  *
- * Story 4.6, review-fix cykl 2 (finding 4-6-H1). Decyzja PO (Robert, 2026-07-28):
- * gp-config WYŁĄCZNIE seeduje treść sellera; nigdy nie jest jej właścicielem.
+ * Story 4.6, review-fix cykl 4. Doprecyzowanie PO (Robert): *„musi być możliwość
+ * wprowadzenia zmian przy pomocy gp-cli, ale potem powinna być możliwość
+ * aktualizacji tych danych przy pomocy admin, storefront powinien czytać dane
+ * z bazy"*.
  *
- * Kontrakt egzekwowany przez ten plik:
- *   - Case 1 (seeded, DB == config)      → `--overwrite` MOŻE pisać
- *   - Case 2 (seeded, DB != config)      → vendor edytował → `--overwrite` NIE MOŻE pisać
- *   - Case 3 (nie-seeded, DB puste)      → `--overwrite` MOŻE zasiać
- *   - Case 4 (nie-seeded, DB niepuste)   → vendor-owned → `--overwrite` NIE MOŻE pisać
- *   - pominięcia z Case 2/4 są raportowane JAWNIE (nie po cichu)
- *   - kanał `--force-vendor-overwrite` + `GP_FORCE_VENDOR_OVERWRITE` jest osobny,
- *     mocniejszy i DWUSTRONNY: MOŻE zniszczyć treść vendora, ale tylko gdy
- *     intencja wywołania i zmienna środowiskowa zgadzają się obie (verify-B5 V1).
+ * Trzy reguły egzekwowane przez ten plik:
+ *   1. KOLUMNA encji (`seller.name/description/logo`) jest wartością kanoniczną —
+ *      to ją czyta API, to ją edytuje admin, i to do niej pisze seed.
+ *   2. gp-cli seeduje DO KOLUMNY, nie obok niej.
+ *   3. `metadata.gp.<pole>` + `seeded_fields` to REJESTR POCHODZENIA — służy
+ *      wyłącznie rozstrzygnięciu własności, nigdy odczytowi treści.
  *
- * RED-FIRST: przed fixem `if (overwrite) return { shouldWrite: true }` omijało
- * obie bramki, więc testy Case 2/Case 4 z `--overwrite` przechodziły dokładnie
- * odwrotnie (opis vendora był kasowany).
+ * Wykrywanie własności sprowadza się wtedy do:
+ *   kolumna === rejestr            ⇒ vendor nie tknął ⇒ gp-cli może odświeżyć
+ *   kolumna !== rejestr            ⇒ vendor edytował  ⇒ NIGDY nie nadpisuj
+ *   kolumna niepusta, brak w rejestrze ⇒ treść vendora od początku ⇒ nie nadpisuj
+ *   kolumna pusta                  ⇒ nie ma czego chronić ⇒ seeduj (także backfill)
+ *
+ * RED-FIRST (cykl 4): przed fixem wołający podawał `dbValue = metadata.gp.<pole>
+ * ?? kolumna`, czyli porównywał LUSTRO zamiast prawdy. Skutkiem były dwa defekty
+ * ćwiczone niżej wprost:
+ *   - W0 — seed nigdy nie trafiał do kolumny `description` (`createPayload` jej
+ *     nie zawierał), więc `GET /store/seller/:handle` zwracał `null`;
+ *   - W1 — logo wgrane przez vendora DO KOLUMNY było kasowane przez zwykłe
+ *     `--overwrite`, bo `deepEqual(lustro, config)` wychodziło prawdziwe
+ *     i bramka własności w ogóle się nie odzywała.
  *
  * Bez realnego DB — in-memory mock sellerService (wzorzec z
  * sync-vendors-ownership.test.ts / gp-config-sync-vendors.idempotency.spec.ts).
@@ -30,6 +40,8 @@ import gpConfigSyncVendors, { upsertSeller } from '../../scripts/gp-config-sync-
 
 const CONFIG_DESCRIPTION = 'Opis z gp-config (seed)'
 const VENDOR_DESCRIPTION = 'Opis napisany przez sprzedawczynię'
+const CONFIG_LOGO = 'https://cdn.example/gp-config/studio-nova.png'
+const VENDOR_LOGO = 'https://cdn.example/vendor-upload/studio-nova.png'
 
 function makeSellerService(existingSellers: any[] = []) {
   return {
@@ -52,50 +64,183 @@ function baseVendor(overrides: Record<string, unknown> = {}) {
 }
 
 /**
- * Istniejący seller z jawnie sterowanym stanem własności pola `description`.
- *
- * `gpSnapshot: false` zostawia `metadata.gp.description` PUSTE, a wartość tylko
- * w kolumnie encji — realny stan sellerów sprzed 4.6 (`gp-config-sync-vendors`
- * nigdy nie pisał kolumny `seller.description`, patrz fix 4-6-H1). To jedyny
- * układ, w którym decyzja Case 1 jest obserwowalna na wartości: przy
- * `gp.description === kolumna` odświeżenie seeda jest z definicji idempotentne.
+ * Istniejący seller z ROZDZIELONYMI rolami: `column` to wartość kanoniczna
+ * (to, co widzi storefront), `registry` to `metadata.gp.<pole>` (zapis, co
+ * zasialiśmy). Rozdzielenie jest sednem tego cyklu — dopóki test podawał jedną
+ * wartość w obu miejscach, defekt W1 był niewidoczny.
  */
 function existingSellerWith(opts: {
-  seeded: boolean
-  dbDescription: string | null
-  gpSnapshot?: boolean
+  seededFields?: string[]
+  column?: string | null
+  registry?: string | null
+  logoColumn?: string | null
+  logoRegistry?: string | null
 }) {
-  const withGpSnapshot = opts.gpSnapshot !== false && opts.dbDescription !== null
+  const gp: Record<string, unknown> = {
+    market_id: 'bonbeauty',
+    seeded_fields: opts.seededFields ?? [],
+  }
+  if (opts.registry !== undefined && opts.registry !== null) gp.description = opts.registry
+  if (opts.logoRegistry !== undefined && opts.logoRegistry !== null) {
+    gp.photo_url = opts.logoRegistry
+  }
+
   return {
     id: 'seller-studio-nova',
     handle: 'studio-nova',
     name: 'Studio Nova',
-    description: opts.dbDescription,
-    metadata: {
-      gp: {
-        market_id: 'bonbeauty',
-        seeded_fields: opts.seeded ? ['description'] : [],
-        ...(withGpSnapshot ? { description: opts.dbDescription } : {}),
-      },
-    },
+    description: opts.column ?? null,
+    logo: opts.logoColumn ?? null,
+    metadata: { gp },
   }
 }
 
-function updatedGp(sellerService: ReturnType<typeof makeSellerService>) {
-  return sellerService.update.mock.calls[0][1].metadata.gp
+/** Payload zapisu — czyli KOLUMNY encji. To on rozstrzyga, co zobaczy API. */
+function updatedColumns(sellerService: ReturnType<typeof makeSellerService>) {
+  return sellerService.update.mock.calls[0][1] as Record<string, unknown>
 }
 
-// ---- Case 1: seeded + DB == config → overwrite może pisać ----
+/** Rejestr pochodzenia po zapisie. NIE jest wartością — jest zapisem seeda. */
+function updatedGp(sellerService: ReturnType<typeof makeSellerService>) {
+  return (updatedColumns(sellerService).metadata as any).gp as Record<string, unknown>
+}
 
-describe('ADR-165 Case 1 — pole seeded i NIEtknięte przez vendora', () => {
-  it('--overwrite zapisuje wartość z configu (własność nadal po stronie seeda)', async () => {
+// ---- W0: seed MUSI dojechać do kolumny, bo to ją czyta storefront ----
+
+describe('W0 — seed pisze do KOLUMNY encji, nie tylko do lustra', () => {
+  it('CREATE zapisuje `description` w kolumnie encji', async () => {
+    const sellerService = makeSellerService([])
+
+    await upsertSeller(sellerService, baseVendor(), false, 'bonbeauty')
+
+    const payload = sellerService.create.mock.calls[0][0]
+    expect(payload.description).toBe(CONFIG_DESCRIPTION)
+    // ...a lustro zostaje rejestrem pochodzenia, nie jedynym miejscem wartości
+    expect(payload.metadata.gp.description).toBe(CONFIG_DESCRIPTION)
+    expect(payload.metadata.gp.seeded_fields).toContain('description')
+  })
+
+  it('UPDATE pustej kolumny zapisuje `description` w kolumnie encji', async () => {
     const sellerService = makeSellerService([
-      existingSellerWith({ seeded: true, dbDescription: CONFIG_DESCRIPTION }),
+      existingSellerWith({ seededFields: [], column: null }),
+    ])
+
+    await upsertSeller(sellerService, baseVendor(), false, 'bonbeauty')
+
+    expect(updatedColumns(sellerService).description).toBe(CONFIG_DESCRIPTION)
+  })
+
+  it('BACKFILL: seeded + kolumna pusta + lustro z treścią → uzupełnia kolumnę', async () => {
+    // Realny stan 4 sellerów bazy dev sprzed tego fixu. Pusta kolumna nie
+    // zawiera niczyjej treści, więc to nie jest nadpisanie pracy vendora.
+    const sellerService = makeSellerService([
+      existingSellerWith({
+        seededFields: ['description'],
+        column: null,
+        registry: CONFIG_DESCRIPTION,
+      }),
+    ])
+
+    const result = await upsertSeller(sellerService, baseVendor(), false, 'bonbeauty')
+
+    expect(updatedColumns(sellerService).description).toBe(CONFIG_DESCRIPTION)
+    expect(result.ownershipProtectedFields ?? []).toEqual([])
+  })
+})
+
+// ---- W1: własność rozstrzyga KOLUMNA vs REJESTR, nie rejestr vs config ----
+
+describe('W1 — vendor edytował KOLUMNĘ, lustro zostało stare', () => {
+  it('`--overwrite` NIE nadpisuje logo wgranego przez vendora', async () => {
+    // RED-FIRST: przed fixem `dbValue = existingGp.photo_url ?? existingSeller.logo`
+    // nigdy nie oglądało kolumny, dopóki lustro było niepuste. `deepEqual(lustro,
+    // config)` = true ⇒ `vendorOwned = false` ⇒ bramka przepuszczała, a
+    // `--overwrite-prune` kasowało wgrane logo bez jednego słowa.
+    const sellerService = makeSellerService([
+      existingSellerWith({
+        seededFields: ['photo_url'],
+        logoColumn: VENDOR_LOGO,
+        logoRegistry: CONFIG_LOGO,
+      }),
     ])
 
     const result = await upsertSeller(
       sellerService,
-      baseVendor({ description: CONFIG_DESCRIPTION }),
+      baseVendor({ description: undefined, photo_url: CONFIG_LOGO }),
+      false,
+      'bonbeauty',
+      'pln',
+      true
+    )
+
+    expect(updatedColumns(sellerService).logo).toBeUndefined()
+    expect(result.ownershipProtectedFields).toEqual(['photo_url'])
+  })
+
+  it('`--overwrite` NIE nadpisuje nazwy zmienionej przez vendora', async () => {
+    const sellerService = makeSellerService([
+      {
+        ...existingSellerWith({ seededFields: ['name'] }),
+        name: 'Studio Nova — Salon Kosmetyczny',
+        metadata: {
+          gp: { market_id: 'bonbeauty', seeded_fields: ['name'], name: 'Studio Nova' },
+        },
+      },
+    ])
+
+    const result = await upsertSeller(
+      sellerService,
+      baseVendor({ description: undefined, display_name: 'Studio Nova' }),
+      false,
+      'bonbeauty',
+      'pln',
+      true
+    )
+
+    expect(updatedColumns(sellerService).name).toBeUndefined()
+    expect(result.ownershipProtectedFields).toEqual(['name'])
+  })
+
+  it('gdy kolumna == rejestr, `--overwrite` odświeża seed w kolumnie', async () => {
+    const sellerService = makeSellerService([
+      existingSellerWith({
+        seededFields: ['photo_url'],
+        logoColumn: CONFIG_LOGO,
+        logoRegistry: CONFIG_LOGO,
+      }),
+    ])
+
+    const nextLogo = 'https://cdn.example/gp-config/studio-nova-v2.png'
+    const result = await upsertSeller(
+      sellerService,
+      baseVendor({ description: undefined, photo_url: nextLogo }),
+      false,
+      'bonbeauty',
+      'pln',
+      true
+    )
+
+    expect(updatedColumns(sellerService).logo).toBe(nextLogo)
+    expect(updatedGp(sellerService).photo_url).toBe(nextLogo)
+    expect(result.ownershipProtectedFields ?? []).toEqual([])
+  })
+})
+
+// ---- Case 1: seeded + kolumna == rejestr → overwrite może pisać ----
+
+describe('ADR-165 Case 1 — pole seeded i NIEtknięte przez vendora', () => {
+  it('--overwrite zapisuje wartość z configu (własność nadal po stronie seeda)', async () => {
+    const sellerService = makeSellerService([
+      existingSellerWith({
+        seededFields: ['description'],
+        column: 'Stary opis z poprzedniego seeda',
+        registry: 'Stary opis z poprzedniego seeda',
+      }),
+    ])
+
+    const result = await upsertSeller(
+      sellerService,
+      baseVendor(),
       false,
       'bonbeauty',
       'pln',
@@ -103,29 +248,51 @@ describe('ADR-165 Case 1 — pole seeded i NIEtknięte przez vendora', () => {
     )
 
     expect(result.action).toBe('updated')
+    expect(updatedColumns(sellerService).description).toBe(CONFIG_DESCRIPTION)
     expect(updatedGp(sellerService).description).toBe(CONFIG_DESCRIPTION)
+    expect(result.ownershipProtectedFields ?? []).toEqual([])
+  })
+
+  it('BEZ --overwrite nie odświeża istniejącego seeda', async () => {
+    const sellerService = makeSellerService([
+      existingSellerWith({
+        seededFields: ['description'],
+        column: 'Stary opis z poprzedniego seeda',
+        registry: 'Stary opis z poprzedniego seeda',
+      }),
+    ])
+
+    const result = await upsertSeller(sellerService, baseVendor(), false, 'bonbeauty')
+
+    // „seed if empty" znaczy empty — pełna kolumna nie jest odświeżana bez flagi
+    expect(updatedColumns(sellerService).description).toBeUndefined()
     expect(result.ownershipProtectedFields ?? []).toEqual([])
   })
 })
 
-// ---- Case 2: seeded + vendor edytował → overwrite NIE MOŻE pisać ----
+// ---- Case 2: seeded + vendor edytował kolumnę → overwrite NIE MOŻE pisać ----
 
 describe('ADR-165 Case 2 — pole seeded, ale vendor je edytował', () => {
-  it('--overwrite NIE nadpisuje treści vendora', async () => {
-    const sellerService = makeSellerService([
-      existingSellerWith({ seeded: true, dbDescription: VENDOR_DESCRIPTION }),
+  function case2Service() {
+    return makeSellerService([
+      existingSellerWith({
+        seededFields: ['description'],
+        column: VENDOR_DESCRIPTION,
+        registry: CONFIG_DESCRIPTION,
+      }),
     ])
+  }
+
+  it('--overwrite NIE nadpisuje treści vendora', async () => {
+    const sellerService = case2Service()
 
     await upsertSeller(sellerService, baseVendor(), false, 'bonbeauty', 'pln', true)
 
-    expect(updatedGp(sellerService).description).toBe(VENDOR_DESCRIPTION)
-    expect(updatedGp(sellerService).description).not.toBe(CONFIG_DESCRIPTION)
+    expect(updatedColumns(sellerService).description).toBeUndefined()
   })
 
   it('raportuje pominięcie JAWNIE w ownershipProtectedFields i w note', async () => {
-    const sellerService = makeSellerService([
-      existingSellerWith({ seeded: true, dbDescription: VENDOR_DESCRIPTION }),
-    ])
+    const sellerService = case2Service()
 
     const result = await upsertSeller(
       sellerService,
@@ -141,9 +308,7 @@ describe('ADR-165 Case 2 — pole seeded, ale vendor je edytował', () => {
   })
 
   it('zachowuje description w seeded_fields (znacznik własności nie znika)', async () => {
-    const sellerService = makeSellerService([
-      existingSellerWith({ seeded: true, dbDescription: VENDOR_DESCRIPTION }),
-    ])
+    const sellerService = case2Service()
 
     await upsertSeller(sellerService, baseVendor(), false, 'bonbeauty', 'pln', true)
 
@@ -151,12 +316,12 @@ describe('ADR-165 Case 2 — pole seeded, ale vendor je edytował', () => {
   })
 })
 
-// ---- Case 3: nie-seeded + DB puste → overwrite może zasiać ----
+// ---- Case 3: nie-seeded + kolumna pusta → overwrite może zasiać ----
 
-describe('ADR-165 Case 3 — pole nie-seeded i puste w DB', () => {
+describe('ADR-165 Case 3 — pole nie-seeded i puste w kolumnie', () => {
   it('--overwrite zasiewa wartość i dopisuje pole do seeded_fields', async () => {
     const sellerService = makeSellerService([
-      existingSellerWith({ seeded: false, dbDescription: null }),
+      existingSellerWith({ seededFields: [], column: null }),
     ])
 
     const result = await upsertSeller(
@@ -168,28 +333,28 @@ describe('ADR-165 Case 3 — pole nie-seeded i puste w DB', () => {
       true
     )
 
-    expect(updatedGp(sellerService).description).toBe(CONFIG_DESCRIPTION)
+    expect(updatedColumns(sellerService).description).toBe(CONFIG_DESCRIPTION)
     expect(updatedGp(sellerService).seeded_fields).toContain('description')
     expect(result.ownershipProtectedFields ?? []).toEqual([])
   })
 })
 
-// ---- Case 4: nie-seeded + DB niepuste → overwrite NIE MOŻE pisać ----
+// ---- Case 4: nie-seeded + kolumna niepusta → overwrite NIE MOŻE pisać ----
 
 describe('ADR-165 Case 4 — pole vendor-owned od początku (nigdy nie seedowane)', () => {
   it('--overwrite NIE nadpisuje treści vendora', async () => {
     const sellerService = makeSellerService([
-      existingSellerWith({ seeded: false, dbDescription: VENDOR_DESCRIPTION }),
+      existingSellerWith({ seededFields: [], column: VENDOR_DESCRIPTION }),
     ])
 
     await upsertSeller(sellerService, baseVendor(), false, 'bonbeauty', 'pln', true)
 
-    expect(updatedGp(sellerService).description).toBe(VENDOR_DESCRIPTION)
+    expect(updatedColumns(sellerService).description).toBeUndefined()
   })
 
   it('raportuje pominięcie i NIE dopisuje pola do seeded_fields', async () => {
     const sellerService = makeSellerService([
-      existingSellerWith({ seeded: false, dbDescription: VENDOR_DESCRIPTION }),
+      existingSellerWith({ seededFields: [], column: VENDOR_DESCRIPTION }),
     ])
 
     const result = await upsertSeller(
@@ -211,103 +376,78 @@ describe('ADR-165 Case 4 — pole vendor-owned od początku (nigdy nie seedowane
 describe('ADR-165 — brak flag: zachowanie sprzed fixu bez zmian', () => {
   it('Case 2 bez --overwrite nadal zachowuje treść vendora', async () => {
     const sellerService = makeSellerService([
-      existingSellerWith({ seeded: true, dbDescription: VENDOR_DESCRIPTION }),
+      existingSellerWith({
+        seededFields: ['description'],
+        column: VENDOR_DESCRIPTION,
+        registry: CONFIG_DESCRIPTION,
+      }),
     ])
 
     const result = await upsertSeller(sellerService, baseVendor(), false, 'bonbeauty')
 
-    expect(updatedGp(sellerService).description).toBe(VENDOR_DESCRIPTION)
+    expect(updatedColumns(sellerService).description).toBeUndefined()
     // bez --overwrite nie ma czego raportować: nikt nie prosił o nadpisanie
     expect(result.ownershipProtectedFields ?? []).toEqual([])
   })
 
-  it('Case 3 bez --overwrite nadal zasiewa puste pole', async () => {
+  it('Case 3 bez --overwrite nadal zasiewa pustą kolumnę', async () => {
     const sellerService = makeSellerService([
-      existingSellerWith({ seeded: false, dbDescription: null }),
+      existingSellerWith({ seededFields: [], column: null }),
     ])
 
     await upsertSeller(sellerService, baseVendor(), false, 'bonbeauty')
 
-    expect(updatedGp(sellerService).description).toBe(CONFIG_DESCRIPTION)
+    expect(updatedColumns(sellerService).description).toBe(CONFIG_DESCRIPTION)
   })
 })
 
-// ---- Verify-B5 V3: macierz 4 Case'ów × `--overwrite` on/off ----
+// ---- Macierz 4 Case'ów × `--overwrite` on/off ----
 //
 // Kontrakt: `--overwrite` MA wpływ na Case 1 (odświeżenie istniejącego seeda)
-// i Case 3 (zasiew pustego pola), a NIE MA wpływu na Case 2 i Case 4.
-// Przed tym fixem parametr `overwrite` trafiał wyłącznie do `ownershipProtected`
-// i nie wpływał na ŻADNĄ decyzję o zapisie — był flagą bez działania.
+// i NIE MA wpływu na Case 2, 3 i 4.
 
 describe('ADR-165 — `--overwrite` a decyzja o zapisie (4 Case × flaga)', () => {
-  /** Zwraca wartość `description`, którą sync REALNIE zapisał do metadata.gp. */
-  async function writtenDescription(
-    opts: { seeded: boolean; dbDescription: string | null },
+  /** Zwraca wartość `description`, którą sync REALNIE zapisał do KOLUMNY. */
+  async function writtenColumn(
+    opts: Parameters<typeof existingSellerWith>[0],
     overwrite: boolean
   ) {
     const sellerService = makeSellerService([existingSellerWith(opts)])
     await upsertSeller(sellerService, baseVendor(), false, 'bonbeauty', 'pln', overwrite)
-    return updatedGp(sellerService).description
+    return updatedColumns(sellerService).description
   }
 
-  it('Case 1 (seeded, vendor nietknięty): BEZ --overwrite nie odświeża seeda', async () => {
-    // Pole jest śledzone jako zasiane, wartość w DB == config → vendor niczego
-    // nie napisał. Snapshot `metadata.gp.description` jest pusty (stan sprzed
-    // 4.6), więc zapis albo go uzupełni, albo nie — i to widać.
-    const sellerService = makeSellerService([
-      existingSellerWith({
-        seeded: true,
-        dbDescription: CONFIG_DESCRIPTION,
-        gpSnapshot: false,
-      }),
-    ])
+  const CASE_1 = {
+    seededFields: ['description'],
+    column: 'Stary seed',
+    registry: 'Stary seed',
+  }
+  const CASE_2 = {
+    seededFields: ['description'],
+    column: VENDOR_DESCRIPTION,
+    registry: CONFIG_DESCRIPTION,
+  }
+  const CASE_3 = { seededFields: [], column: null }
+  const CASE_4 = { seededFields: [], column: VENDOR_DESCRIPTION }
 
-    await upsertSeller(sellerService, baseVendor(), false, 'bonbeauty', 'pln', false)
-
-    // zwykły run to „seed if empty", nie refresh istniejącej wartości
-    expect(updatedGp(sellerService).description).toBeUndefined()
-    expect(updatedGp(sellerService).seeded_fields).toContain('description')
-  })
-
-  it('Case 1 (seeded, vendor nietknięty): Z --overwrite odświeża seed wartością z configu', async () => {
-    const sellerService = makeSellerService([
-      existingSellerWith({
-        seeded: true,
-        dbDescription: CONFIG_DESCRIPTION,
-        gpSnapshot: false,
-      }),
-    ])
-
-    await upsertSeller(sellerService, baseVendor(), false, 'bonbeauty', 'pln', true)
-
-    expect(updatedGp(sellerService).description).toBe(CONFIG_DESCRIPTION)
+  it('Case 1 (seeded, vendor nietknięty): flaga decyduje o odświeżeniu', async () => {
+    expect(await writtenColumn(CASE_1, false)).toBeUndefined()
+    expect(await writtenColumn(CASE_1, true)).toBe(CONFIG_DESCRIPTION)
   })
 
   it('Case 2 (seeded, vendor edytował): --overwrite NIE zmienia decyzji', async () => {
-    expect(
-      await writtenDescription({ seeded: true, dbDescription: VENDOR_DESCRIPTION }, false)
-    ).toBe(VENDOR_DESCRIPTION)
-    expect(
-      await writtenDescription({ seeded: true, dbDescription: VENDOR_DESCRIPTION }, true)
-    ).toBe(VENDOR_DESCRIPTION)
+    expect(await writtenColumn(CASE_2, false)).toBeUndefined()
+    expect(await writtenColumn(CASE_2, true)).toBeUndefined()
   })
 
-  it('Case 3 (nie-seeded, DB puste): zasiewa z flagą i bez niej', async () => {
-    expect(await writtenDescription({ seeded: false, dbDescription: null }, false)).toBe(
-      CONFIG_DESCRIPTION
-    )
-    expect(await writtenDescription({ seeded: false, dbDescription: null }, true)).toBe(
-      CONFIG_DESCRIPTION
-    )
+  it('Case 3 (nie-seeded, kolumna pusta): zasiewa z flagą i bez niej', async () => {
+    expect(await writtenColumn(CASE_3, false)).toBe(CONFIG_DESCRIPTION)
+    expect(await writtenColumn(CASE_3, true)).toBe(CONFIG_DESCRIPTION)
   })
 
-  it('Case 4 (nie-seeded, DB niepuste): --overwrite NIE zmienia decyzji', async () => {
-    expect(
-      await writtenDescription({ seeded: false, dbDescription: VENDOR_DESCRIPTION }, false)
-    ).toBe(VENDOR_DESCRIPTION)
-    expect(
-      await writtenDescription({ seeded: false, dbDescription: VENDOR_DESCRIPTION }, true)
-    ).toBe(VENDOR_DESCRIPTION)
+  it('Case 4 (nie-seeded, kolumna niepusta): --overwrite NIE zmienia decyzji', async () => {
+    expect(await writtenColumn(CASE_4, false)).toBeUndefined()
+    expect(await writtenColumn(CASE_4, true)).toBeUndefined()
   })
 })
 
@@ -316,7 +456,11 @@ describe('ADR-165 — `--overwrite` a decyzja o zapisie (4 Case × flaga)', () =
 describe('ADR-165 — GP_FORCE_VENDOR_OVERWRITE jako jedyny kanał niszczący', () => {
   it('nadpisuje Case 2 (vendor edytował) sam, bez --overwrite', async () => {
     const sellerService = makeSellerService([
-      existingSellerWith({ seeded: true, dbDescription: VENDOR_DESCRIPTION }),
+      existingSellerWith({
+        seededFields: ['description'],
+        column: VENDOR_DESCRIPTION,
+        registry: CONFIG_DESCRIPTION,
+      }),
     ])
 
     const result = await upsertSeller(
@@ -329,18 +473,18 @@ describe('ADR-165 — GP_FORCE_VENDOR_OVERWRITE jako jedyny kanał niszczący', 
       true
     )
 
-    expect(updatedGp(sellerService).description).toBe(CONFIG_DESCRIPTION)
+    expect(updatedColumns(sellerService).description).toBe(CONFIG_DESCRIPTION)
     expect(result.ownershipProtectedFields ?? []).toEqual([])
   })
 
   it('nadpisuje Case 4 (vendor-owned od początku) i przejmuje pole na seed', async () => {
     const sellerService = makeSellerService([
-      existingSellerWith({ seeded: false, dbDescription: VENDOR_DESCRIPTION }),
+      existingSellerWith({ seededFields: [], column: VENDOR_DESCRIPTION }),
     ])
 
     await upsertSeller(sellerService, baseVendor(), false, 'bonbeauty', 'pln', false, true)
 
-    expect(updatedGp(sellerService).description).toBe(CONFIG_DESCRIPTION)
+    expect(updatedColumns(sellerService).description).toBe(CONFIG_DESCRIPTION)
     expect(updatedGp(sellerService).seeded_fields).toContain('description')
   })
 })
@@ -418,21 +562,29 @@ describe('ADR-165 — realna ścieżka: gpConfigSyncVendors z GP_OVERWRITE=true'
     return JSON.parse(payloads[payloads.length - 1])
   }
 
+  function vendorEditedSeller() {
+    return makeSellerService([
+      existingSellerWith({
+        seededFields: ['description'],
+        column: VENDOR_DESCRIPTION,
+        registry: CONFIG_DESCRIPTION,
+      }),
+    ])
+  }
+
   it('NIE kasuje opisu vendora i zgłasza pominięcie w summary.warnings', async () => {
     process.env.GP_CONFIG_ROOT = tmpRoot
     process.env.GP_OVERWRITE = 'true'
     delete process.env.GP_FORCE_VENDOR_OVERWRITE
 
-    const sellerService = makeSellerService([
-      existingSellerWith({ seeded: true, dbDescription: VENDOR_DESCRIPTION }),
-    ])
+    const sellerService = vendorEditedSeller()
 
     await gpConfigSyncVendors({
       container: makeContainer(sellerService),
       args: ['gp-dev', 'bonbeauty'],
     } as any)
 
-    expect(updatedGp(sellerService).description).toBe(VENDOR_DESCRIPTION)
+    expect(updatedColumns(sellerService).description).toBeUndefined()
 
     const summary = readSummary()
     const ownershipWarnings = summary.warnings.filter(
@@ -442,26 +594,78 @@ describe('ADR-165 — realna ścieżka: gpConfigSyncVendors z GP_OVERWRITE=true'
     expect(ownershipWarnings[0]).toMatch(/GP_FORCE_VENDOR_OVERWRITE/)
   })
 
+  it('pominięcie własności trafia do typowanego kanału summary.ownership_protected', async () => {
+    // W2 — to JEDYNA klasa warningu, która eskaluje run. Musi być rozpoznawalna
+    // maszynowo, nie przez dopasowanie tekstu warninga.
+    process.env.GP_CONFIG_ROOT = tmpRoot
+    process.env.GP_OVERWRITE = 'true'
+    delete process.env.GP_FORCE_VENDOR_OVERWRITE
+
+    await gpConfigSyncVendors({
+      container: makeContainer(vendorEditedSeller()),
+      args: ['gp-dev', 'bonbeauty'],
+    } as any)
+
+    expect(readSummary().ownership_protected).toEqual([
+      { vendor_id: 'studio-nova', fields: ['description'] },
+    ])
+    expect(process.exitCode).toBe(1)
+  })
+
+  it('zastany, nieszkodliwy warning NIE podnosi kodu wyjścia', async () => {
+    // RED-FIRST (W2): do cyklu 3 `warnings.length > 0` ustawiało `exitCode = 1`,
+    // a orchestrator (po V4) przestał ten kod połykać — więc „vendor suspended;
+    // skipping seller-product linking" wywracało w pełni udany `gp catalog sync`.
+    process.env.GP_CONFIG_ROOT = tmpRoot
+    delete process.env.GP_OVERWRITE
+    delete process.env.GP_FORCE_VENDOR_OVERWRITE
+
+    const marketDir = path.join(tmpRoot, 'gp-dev', 'markets', 'bonbeauty')
+    await fs.writeFile(
+      path.join(marketDir, 'market.yaml'),
+      [
+        'market_id: bonbeauty',
+        'currency: PLN',
+        'vendors:',
+        '  - vendor_id: studio-nova',
+        '    slug: studio-nova',
+        '    status: suspended',
+        `    description: "${CONFIG_DESCRIPTION}"`,
+      ].join('\n'),
+      'utf8'
+    )
+
+    await gpConfigSyncVendors({
+      container: makeContainer(makeSellerService([existingSellerWith({ column: null })])),
+      args: ['gp-dev', 'bonbeauty'],
+    } as any)
+
+    const summary = readSummary()
+    expect(summary.warnings.some((w: string) => w.includes('suspended'))).toBe(true)
+    expect(summary.ownership_protected).toEqual([])
+    expect(process.exitCode).toBeUndefined()
+  })
+
   it('sam odziedziczony GP_FORCE_VENDOR_OVERWRITE=true NIE nadpisuje treści vendora (kanał dwustronny)', async () => {
     // Verify-B5 V1: `sanitizeEnv` kopiuje każdą niesekretną zmienną rodzica do
     // dziecka, a `GP_*` nie pasuje do żadnego wzorca sekretu. Przy semantyce
     // OR(argv, env) odziedziczona zmienna kasowała opisy salonów bez żadnej
-    // intencji w wywołaniu. Ten test asertuje ODWROTNIE niż jego poprzednia
-    // wersja, która dokumentowała właśnie tę dziurę jako zachowanie.
+    // intencji w wywołaniu.
     process.env.GP_CONFIG_ROOT = tmpRoot
     process.env.GP_FORCE_VENDOR_OVERWRITE = 'true'
     delete process.env.GP_OVERWRITE
     const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => undefined)
 
-    const sellerService = makeSellerService([
-      existingSellerWith({ seeded: true, dbDescription: VENDOR_DESCRIPTION }),
-    ])
+    const sellerService = vendorEditedSeller()
 
-    // BEZ `--force-vendor-overwrite` w argv — dokładnie tak, jak woła
-    // orchestrator i `gp catalog sync`.
-    await gpConfigSyncVendors({ container: makeContainer(sellerService), args: ['gp-dev', 'bonbeauty'] } as any)
+    // BEZ `--force-vendor-overwrite` w argv — tak wygląda odziedziczone env
+    // bez jawnej intencji wywołania.
+    await gpConfigSyncVendors({
+      container: makeContainer(sellerService),
+      args: ['gp-dev', 'bonbeauty'],
+    } as any)
 
-    expect(updatedGp(sellerService).description).toBe(VENDOR_DESCRIPTION)
+    expect(updatedColumns(sellerService).description).toBeUndefined()
 
     // ...i nie po cichu: ignorowany kanał destrukcyjny musi być głośny.
     const warnText = warnSpy.mock.calls.flat().join(' ')
@@ -479,36 +683,32 @@ describe('ADR-165 — realna ścieżka: gpConfigSyncVendors z GP_OVERWRITE=true'
     delete process.env.GP_FORCE_VENDOR_OVERWRITE
     const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => undefined)
 
-    const sellerService = makeSellerService([
-      existingSellerWith({ seeded: true, dbDescription: VENDOR_DESCRIPTION }),
-    ])
+    const sellerService = vendorEditedSeller()
 
     await gpConfigSyncVendors({
       container: makeContainer(sellerService),
       args: ['gp-dev', 'bonbeauty', '--force-vendor-overwrite'],
     } as any)
 
-    expect(updatedGp(sellerService).description).toBe(VENDOR_DESCRIPTION)
+    expect(updatedColumns(sellerService).description).toBeUndefined()
     expect(warnSpy.mock.calls.flat().join(' ')).toMatch(/ZIGNOROWANE/)
     warnSpy.mockRestore()
   })
 
-  it('dwustronnie (argv + env) nadpisuje i ostrzega fail-loud', async () => {
+  it('dwustronnie (argv + env) nadpisuje kolumnę i ostrzega fail-loud', async () => {
     process.env.GP_CONFIG_ROOT = tmpRoot
     process.env.GP_FORCE_VENDOR_OVERWRITE = 'true'
     delete process.env.GP_OVERWRITE
     const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => undefined)
 
-    const sellerService = makeSellerService([
-      existingSellerWith({ seeded: true, dbDescription: VENDOR_DESCRIPTION }),
-    ])
+    const sellerService = vendorEditedSeller()
 
     await gpConfigSyncVendors({
       container: makeContainer(sellerService),
       args: ['gp-dev', 'bonbeauty', '--force-vendor-overwrite'],
     } as any)
 
-    expect(updatedGp(sellerService).description).toBe(CONFIG_DESCRIPTION)
+    expect(updatedColumns(sellerService).description).toBe(CONFIG_DESCRIPTION)
     const warnText = warnSpy.mock.calls.flat().join(' ')
     expect(warnText).toMatch(/GP_FORCE_VENDOR_OVERWRITE/)
     expect(warnText).not.toMatch(/ZIGNOROWANE/)

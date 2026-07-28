@@ -8,6 +8,11 @@ describe('upsertSeller dry-run', () => {
           id: 'seller-1',
           handle: 'city-beauty',
           name: 'City Beauty',
+          // Review cykl 4: wartość kanoniczna mieszka w KOLUMNIE encji;
+          // `metadata.gp.*` to rejestr pochodzenia seeda. Nota dry-run opisuje
+          // stan kolumn, bo to je zobaczy storefront.
+          description: 'A &amp; B',
+          logo: 'https://cdn.example.com/old.jpg',
           metadata: {
             gp: {
               seeded_fields: ['description', 'photo_url'],
@@ -50,11 +55,14 @@ describe('upsertSeller dry-run', () => {
           id: 'seller-1',
           handle: 'city-beauty',
           name: 'City Beauty',
+          // Kolumna (wartość) rozjechana z rejestrem (co zasialiśmy) ⇒ Case 2:
+          // vendor edytował pole po zasianiu.
+          description: 'Vendor custom description',
           metadata: {
             gp: {
               market_id: 'bonbeauty',
               seeded_fields: ['description'],
-              description: 'Vendor custom description',
+              description: 'Seeded description',
             },
           },
         },

@@ -1,6 +1,7 @@
 import {
   assertTranslationStageGate,
   buildHealthReport,
+  buildStageArgs,
   callRevalidateAll,
   invokeStageEntrypoint,
   parseOrchestratorArgs,
@@ -364,6 +365,63 @@ describe("withStageEnv — normalizacja kanałów destrukcyjnych (V1)", () => {
     delete process.env.GP_FORCE_VENDOR_OVERWRITE
     await withStageEnv(STAGE_ARGS, async () => undefined)
     expect(process.env.GP_FORCE_VENDOR_OVERWRITE).toBeUndefined()
+  })
+})
+
+describe("kanał --force-vendor-overwrite jest OSIĄGALNY przez orchestrator (W3)", () => {
+  const originalEnv = process.env
+
+  beforeEach(() => {
+    process.env = { ...originalEnv }
+    delete process.env.GP_FORCE_VENDOR_OVERWRITE
+  })
+
+  afterAll(() => {
+    process.env = originalEnv
+  })
+
+  // RED-FIRST: przed tym fixem `resolveForceVendorOverwrite` nie mógł zwrócić
+  // `enabled: true` poza testami. Wymaga koniunkcji argv+env, a orchestrator
+  // ani nie parsował flagi (brak pola w OrchestratorArgs), ani nie przekazywał
+  // jej do stageArgs, ani nie ustawiał env inaczej niż na sztywne "false".
+  it("parseOrchestratorArgs czyta kanał z env ustawionego przez gp catalog sync", () => {
+    process.env.GP_FORCE_VENDOR_OVERWRITE = "true"
+    expect(parseOrchestratorArgs(["gp-dev", "bonbeauty"]).forceVendorOverwrite).toBe(true)
+  })
+
+  it("domyślnie kanał jest wyłączony", () => {
+    expect(parseOrchestratorArgs(["gp-dev", "bonbeauty"]).forceVendorOverwrite).toBe(false)
+  })
+
+  it("buildStageArgs dokłada --force-vendor-overwrite (druga połówka koniunkcji)", () => {
+    const args = buildStageArgs({
+      ...STAGE_ARGS,
+      forceVendorOverwrite: true,
+    })
+
+    expect(args).toContain("--force-vendor-overwrite")
+  })
+
+  it("buildStageArgs NIE dokłada flagi, gdy kanał jest wyłączony", () => {
+    expect(buildStageArgs({ ...STAGE_ARGS, forceVendorOverwrite: false })).not.toContain(
+      "--force-vendor-overwrite"
+    )
+  })
+
+  it("withStageEnv ustawia env na 'true' dokładnie wtedy, gdy taka jest intencja runu", async () => {
+    const enabled = await withStageEnv(
+      { ...STAGE_ARGS, forceVendorOverwrite: true },
+      async () => process.env.GP_FORCE_VENDOR_OVERWRITE
+    )
+    expect(enabled).toBe("true")
+
+    // ...i nadal jawnie zeruje odziedziczoną wartość, gdy intencji nie ma
+    process.env.GP_FORCE_VENDOR_OVERWRITE = "true"
+    const disabled = await withStageEnv(
+      { ...STAGE_ARGS, forceVendorOverwrite: false },
+      async () => process.env.GP_FORCE_VENDOR_OVERWRITE
+    )
+    expect(disabled).toBe("false")
   })
 })
 

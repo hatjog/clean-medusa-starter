@@ -7,7 +7,13 @@ import path from "node:path"
 
 import * as yaml from "js-yaml"
 
-import { parseDryRunFlag, parseOverwriteFlag, parsePruneFlag } from "./gp-sync-dry-run"
+import {
+  FORCE_VENDOR_OVERWRITE_FLAG,
+  parseDryRunFlag,
+  parseForceVendorOverwriteRelayFlag,
+  parseOverwriteFlag,
+  parsePruneFlag,
+} from "./gp-sync-dry-run"
 import gpConfigSyncAccounts from "./gp-config-sync-accounts"
 import gpConfigSyncBlog from "./gp-config-sync-blog"
 import gpConfigSyncCatalog from "./gp-config-sync-catalog"
@@ -17,7 +23,7 @@ import gpConfigSyncMedia from "./gp-config-sync-media"
 import gpConfigSyncPayments from "./gp-config-sync-payments"
 import gpConfigSyncReviews from "./gp-config-sync-reviews"
 import gpConfigSyncShipping from "./gp-config-sync-shipping"
-import gpConfigSyncVendors from "./gp-config-sync-vendors"
+import gpConfigSyncVendors, { type OwnershipProtectedSkip } from "./gp-config-sync-vendors"
 import { isTranslationFeatureFlagEnabled } from "../lib/translation-ff-config"
 
 const ADVISORY_LOCK_ID = 1234567890
@@ -32,6 +38,15 @@ type OrchestratorArgs = {
   dryRun: boolean
   overwrite: boolean
   prune: boolean
+  /**
+   * ADR-165 / W3 — świadome nadpisanie treści vendor-owned. Osobny, mocniejszy
+   * kanał niż `overwrite`; orchestrator go RELAYUJE (argv etapu + env), a nie
+   * wymyśla. Bez tego relayu `resolveForceVendorOverwrite` nie miał jak
+   * zwrócić `enabled: true` poza testami: `gp catalog sync` wysyła orchestratorowi
+   * wyłącznie argumenty pozycyjne, a `withStageEnv` zerowało env na sztywno,
+   * więc żadna realna ścieżka nie ustawiała OBU połówek koniunkcji.
+   */
+  forceVendorOverwrite: boolean
 }
 
 type StageRunResult = {
@@ -80,6 +95,10 @@ type OrchestratorSummary = {
   market_id: string
   dry_run: boolean
   overwrite: boolean
+  /** ADR-165 §3 — czy run miał zdjętą ochronę treści vendor-owned. */
+  force_vendor_overwrite: boolean
+  /** ADR-165 §2 — pominięcia bramki własności; niepuste ⟹ `ok: false`. */
+  ownership_protected: OwnershipProtectedSkip[]
   stages: StageRunResult[]
   health: HealthReport
   changed_entity_ids: string[]
@@ -107,6 +126,7 @@ export function parseOrchestratorArgs(args: string[] | undefined): OrchestratorA
   const dryRun = parseDryRunFlag(args)
   const overwrite = parseOverwriteFlag(args)
   const prune = parsePruneFlag(args)
+  const forceVendorOverwrite = parseForceVendorOverwriteRelayFlag(args)
   const allowSkip = args?.includes("--allow-skip") === true
   const apply = args?.includes("--apply") === true
 
@@ -114,7 +134,17 @@ export function parseOrchestratorArgs(args: string[] | undefined): OrchestratorA
   if (!marketId) throw new Error("marketId is required (args[1] or GP_MARKET_ID)")
   if (!configRoot) throw new Error("configRoot is required (GP_CONFIG_ROOT)")
 
-  return { allowSkip, apply, instanceId, marketId, configRoot, dryRun, overwrite, prune }
+  return {
+    allowSkip,
+    apply,
+    instanceId,
+    marketId,
+    configRoot,
+    dryRun,
+    forceVendorOverwrite,
+    overwrite,
+    prune,
+  }
 }
 
 export function assertTranslationStageGate(
@@ -310,7 +340,7 @@ export async function runStage(stage: {
   }
 }
 
-function buildStageArgs(orchestratorArgs: OrchestratorArgs): string[] {
+export function buildStageArgs(orchestratorArgs: OrchestratorArgs): string[] {
   const args = [orchestratorArgs.instanceId, orchestratorArgs.marketId]
   if (orchestratorArgs.dryRun) {
     args.push("--dry-run")
@@ -320,6 +350,12 @@ function buildStageArgs(orchestratorArgs: OrchestratorArgs): string[] {
   }
   if (orchestratorArgs.prune) {
     args.push("--prune")
+  }
+  // W3 — druga połówka koniunkcji ADR-165 §3. Bez niej etap `sync-vendors`
+  // widziałby wyłącznie env i zawsze raportowałby „ZIGNOROWANE: brak jawnej
+  // intencji w argumentach wywołania".
+  if (orchestratorArgs.forceVendorOverwrite) {
+    args.push(FORCE_VENDOR_OVERWRITE_FLAG)
   }
   if (orchestratorArgs.apply) {
     args.push("--apply")
@@ -347,13 +383,15 @@ export async function withStageEnv<T>(
   process.env.GP_MARKET_ID = orchestratorArgs.marketId
   process.env.GP_OVERWRITE = orchestratorArgs.overwrite ? "true" : "false"
   process.env.GP_SYNC_PRUNE = orchestratorArgs.prune ? "true" : "false"
-  // Verify-B5 V1 / ADR-165: orchestrator NIE zna intencji „zniszcz treść
-  // vendor-owned" — nie ma dla niej ani argumentu, ani pola w `OrchestratorArgs`.
-  // `invokeStageEntrypoint` woła etapy IN-PROCESS, więc odziedziczone
-  // `GP_FORCE_VENDOR_OVERWRITE=true` przechodziło do `gp-config-sync-vendors`
-  // 1:1. Normalizujemy tak samo jak GP_OVERWRITE/GP_SYNC_PRUNE: jawne "false",
-  // nigdy „cokolwiek odziedziczysz".
-  process.env.GP_FORCE_VENDOR_OVERWRITE = "false"
+  // ADR-165 §3 / W3: kanał destrukcyjny jest odtąd RELAYOWANY, nie zerowany
+  // na sztywno — inaczej `gp catalog sync --force-vendor-overwrite` nie miałby
+  // jak dojechać do etapu (`invokeStageEntrypoint` woła etapy IN-PROCESS, więc
+  // env procesu JEST kanałem). Kluczowe zostaje to samo, co przy
+  // GP_OVERWRITE/GP_SYNC_PRUNE: wartość jest ZAWSZE jawna, wyprowadzona
+  // z intencji runu — nigdy „cokolwiek odziedziczysz".
+  process.env.GP_FORCE_VENDOR_OVERWRITE = orchestratorArgs.forceVendorOverwrite
+    ? "true"
+    : "false"
 
   try {
     return await action()
@@ -634,6 +672,8 @@ export default async function gpConfigSyncOrchestrator({ container, args }: Exec
   const warnings: string[] = []
   /** Verify-B5 V4 — niezerowe kody wyjścia etapów; nie wolno ich połknąć. */
   const stageExitSignals: StageExitSignal[] = []
+  /** ADR-165 / W2 — jedyna klasa sygnału, która zamienia run w porażkę. */
+  const ownershipProtectedSkips: OwnershipProtectedSkip[] = []
 
   try {
     const changedEntityIds = await collectChangedEntityIds(orchestratorArgs)
@@ -701,12 +741,20 @@ export default async function gpConfigSyncOrchestrator({ container, args }: Exec
         name: "sync-vendors",
         required: true,
         execute: async () => {
-          await withStageEnv(orchestratorArgs, async () => {
-            await invokeStageEntrypoint(gpConfigSyncVendors, container, stageArgs, {
+          const vendorSummary = await withStageEnv(orchestratorArgs, async () => {
+            return await invokeStageEntrypoint(gpConfigSyncVendors, container, stageArgs, {
               stage: "sync-vendors",
               sink: stageExitSignals,
             })
           })
+
+          // W2 — typowany sygnał zamiast „jakiś warning". Tylko pominięcie
+          // bramki własności ADR-165 eskaluje run; zastane warningi etapu
+          // (vendor suspended, brak sellerId) zostają warningami.
+          for (const skip of vendorSummary?.ownership_protected ?? []) {
+            ownershipProtectedSkips.push(skip)
+          }
+
           return orchestratorArgs.dryRun ? "vendor dry-run completed" : "vendor sync completed"
         },
       },
@@ -838,11 +886,18 @@ export default async function gpConfigSyncOrchestrator({ container, args }: Exec
 
     // Verify-B5 V4 — etap, który sam zgłosił niezerowy kod wyjścia, nie może
     // wyglądać na pełny sukces tylko dlatego, że nie rzucił wyjątku.
+    //
+    // W2 (review cykl 4) — ale nie może też ZABIJAĆ runu. Kod wyjścia etapu
+    // jest sygnałem grubym: `gp-config-sync-accounts` podnosi go przy KAŻDYM
+    // warningu (domyślne `GP_SYNC_ACCOUNTS_WARNINGS_ARE_ERRORS`), a
+    // `gp-config-sync-catalog` po przekroczeniu progu ich liczby. Podniesienie
+    // tego do porażki całego runu zamieniało w pełni udany `gp catalog sync`
+    // w wyjątek. Sygnał zostaje więc WIDOCZNY (status etapu + `warnings`),
+    // ale o porażce runu decyduje wyłącznie klasa ownership-protected niżej.
     for (const signal of stageExitSignals) {
       const stageResult = stages.find((entry) => entry.name === signal.stage)
       const message =
-        `zakończył się kodem wyjścia ${signal.exitCode} — patrz warningi tego etapu ` +
-        `(m.in. ADR-165: pola vendor-owned pominięte mimo --overwrite)`
+        `zakończył się kodem wyjścia ${signal.exitCode} — patrz warningi tego etapu`
       if (stageResult && stageResult.status === "ok") {
         stageResult.status = "warning"
         stageResult.message = stageResult.message
@@ -850,6 +905,16 @@ export default async function gpConfigSyncOrchestrator({ container, args }: Exec
           : message
       }
       warnings.push(`${signal.stage}: ${message}`)
+    }
+
+    // ADR-165 §2 — „nie zrobiłem tego, o co prosiłeś" nie może wyglądać jak
+    // sukces. To jedyna klasa, która eskaluje.
+    for (const skip of ownershipProtectedSkips) {
+      warnings.push(
+        `sync-vendors: ADR-165 — pola vendor-owned [${skip.fields.join(", ")}] vendora ` +
+          `'${skip.vendor_id}' POMINIĘTE mimo --overwrite (treść vendora wygrywa; ` +
+          `świadome nadpisanie wymaga --force-vendor-overwrite + GP_FORCE_VENDOR_OVERWRITE=true)`
+      )
     }
 
     const health = await buildHealthReport(productModuleService, db, orchestratorArgs.marketId)
@@ -899,6 +964,8 @@ export default async function gpConfigSyncOrchestrator({ container, args }: Exec
       market_id: orchestratorArgs.marketId,
       dry_run: orchestratorArgs.dryRun,
       overwrite: orchestratorArgs.overwrite,
+      force_vendor_overwrite: orchestratorArgs.forceVendorOverwrite,
+      ownership_protected: ownershipProtectedSkips,
       stages,
       health,
       changed_entity_ids: changedEntityIds,
@@ -908,13 +975,15 @@ export default async function gpConfigSyncOrchestrator({ container, args }: Exec
       report_path: reportPath,
     }
 
-    // Verify-B5 V4 — sygnał głośności musi dożyć do raportu I do kodu wyjścia
-    // procesu. `gp catalog sync` czyta wyłącznie exit code orchestratora; bez
-    // tego pominięcie treści vendor-owned kończyło się zerem, czyli wyglądało
-    // na pełny sukces. Dry-run niczego nie zapisał, więc tam zostaje 0.
-    if (stageExitSignals.length > 0 && !orchestratorArgs.dryRun) {
+    // Verify-B5 V4 + W2 — sygnał głośności musi dożyć do raportu I do kodu
+    // wyjścia procesu. `gp catalog sync` czyta wyłącznie exit code
+    // orchestratora; bez tego pominięcie treści vendor-owned kończyło się
+    // zerem, czyli wyglądało na pełny sukces. Eskaluje WYŁĄCZNIE ta klasa —
+    // zastane warningi etapów są widoczne, ale nie wywracają runu.
+    // Dry-run niczego nie zapisał, więc tam zostaje 0.
+    if (ownershipProtectedSkips.length > 0 && !orchestratorArgs.dryRun) {
       summary.ok = false
-      process.exitCode = Math.max(...stageExitSignals.map((signal) => signal.exitCode))
+      process.exitCode = 1
     }
 
     if (!orchestratorArgs.dryRun && process.env.SLACK_WEBHOOK_URL?.trim()) {

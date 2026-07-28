@@ -176,6 +176,27 @@ export function resolveForceVendorOverwrite(args?: string[]): ForceVendorOverwri
 }
 
 /**
+ * Poziom RELAYU kanału force — dla orchestratora, nie dla skryptu docelowego.
+ *
+ * W3 (review cykl 4): `resolveForceVendorOverwrite` wymaga koniunkcji argv+env
+ * i to zostaje, bo to on faktycznie zdejmuje ochronę. Ale orchestrator dostaje
+ * od `gp catalog sync` WYŁĄCZNIE argumenty pozycyjne (`assertPositionalArgs`
+ * odmawia startu przy fladze w argv), więc jego jedynym realnym wejściem jest
+ * env ustawiany jawnie przez verb. Bez tego relayu żadna ścieżka operatora nie
+ * mogła ustawić obu połówek — kanał ADR-165 §3 istniał tylko w testach.
+ *
+ * Semantyka OR(argv, env) jest tu bezpieczna, bo `buildCatalogSyncEnvOverride`
+ * ustawia zmienną DWUSTRONNIE (jawne `"false"`, gdy operator nie podał flagi),
+ * więc odziedziczona wartość nie dociera do orchestratora nietknięta. Na
+ * ścieżce bezpośredniego `medusa exec gp-config-sync-vendors` obowiązuje nadal
+ * koniunkcja z `resolveForceVendorOverwrite`, wraz z głośnym raportowaniem
+ * strony zignorowanej.
+ */
+export function parseForceVendorOverwriteRelayFlag(args?: string[]): boolean {
+  return parseCliBooleanFlag(args, FORCE_VENDOR_OVERWRITE_FLAG, FORCE_VENDOR_OVERWRITE_ENV)
+}
+
+/**
  * --prune / GP_SYNC_PRUNE: reconcile DB rows to match config by also REMOVING
  * (soft-delete) rows the config no longer declares — e.g. a vendor's
  * seller-product links to products dropped from its products.yaml. Destructive,

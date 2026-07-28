@@ -29,7 +29,8 @@
  *   - klucze PL z `i18n/*.yaml` są USUWANE (stub nigdy nie konkuruje z body),
  *   - `product_category` → PL z gp-config `products.yaml → categories[]`,
  *   - `product` → PL z kolumny `description` encji w DB,
- *   - `seller` → PL z `metadata.gp.description` encji w DB (fallback: kolumna).
+ *   - `seller` → PL z kolumny `description` encji w DB (fallback przejściowy:
+ *     `metadata.gp.description`, do czasu backfillu — patrz sekcja niżej).
  *
  * Jeśli sync zmieni źródło PL, ten test zacznie kłamać — dlatego pilnuje go
  * `it("reguła sourcingu PL w sync-i18n-content nie zmieniła kształtu")`, który
@@ -52,6 +53,15 @@
  * Dlatego gałąź `seller` pyta teraz REALNĄ bazę. Brak połączenia = `describe.skip`
  * (widoczny w raporcie), nigdy cichy pass — pominięta bramka nie może wyglądać
  * jak bramka, która przeszła.
+ *
+ * ## Review cykl 4 — kolejność odczytu ODWRÓCONA
+ *
+ * Po doprecyzowaniu modelu własności przez PO (2026-07-28) kolumna
+ * `seller.description` jest wartością KANONICZNĄ: seed pisze do niej,
+ * admin/panel vendora ją edytuje, `GET /store/seller/:handle` ją czyta.
+ * `metadata.gp.description` jest rejestrem pochodzenia seeda. Reguła sourcingu
+ * PL to więc `kolumna → lustro`, gdzie lustro obsługuje wyłącznie encje
+ * sprzed `gp-config-backfill-seller-columns`.
  */
 
 import fs from "node:fs"
@@ -114,8 +124,13 @@ function syncCategoryPl(configRoot: string): Map<string, string> {
 
 /**
  * PL widziany przez SYNC dla sellera — odczytany z ENCJI (review 4-6-H1),
- * dokładnie tą samą regułą co `resolveSellerPlBody`: `metadata.gp.description`,
- * a dopiero potem kolumna `description`.
+ * dokładnie tą samą regułą co `resolveSellerPlBody`.
+ *
+ * Review cykl 4: kolejność ODWRÓCONA na `kolumna → metadata.gp.description`.
+ * Kolumna jest wartością kanoniczną (czyta ją API i storefront, pisze ją admin
+ * i seed); lustro jest już tylko rejestrem pochodzenia i PRZEJŚCIOWYM
+ * fallbackiem dla encji sprzed `gp-config-backfill-seller-columns`. Czytanie
+ * lustra jako pierwszego mierzyłoby stary seed zamiast treści vendora.
  */
 async function syncSellerPlFromDb(
   pool: any,
@@ -129,12 +144,9 @@ async function syncSellerPlFromDb(
     const metadata = isRecord(row.metadata) ? row.metadata : {}
     const gp = isRecord(metadata.gp) ? metadata.gp : {}
     if (gp.market_id !== marketId) continue
+    const fromColumn = typeof row.description === "string" ? row.description : ""
     const fromMeta = typeof gp.description === "string" ? gp.description : ""
-    const body = fromMeta.trim().length > 0
-      ? fromMeta
-      : typeof row.description === "string"
-        ? row.description
-        : ""
+    const body = fromColumn.trim().length > 0 ? fromColumn : fromMeta
     out.set(String(row.handle ?? "").trim(), body)
   }
   return out
@@ -220,7 +232,10 @@ maybeDescribe("AD-4 — metryka baru i materializacja czytają to samo body", ()
     expect(source).toContain(
       'bodies["pl-PL"] = typeof match.description === "string" ? match.description : ""'
     )
-    // Review 4-6-H1: kolejność odczytu sellera MUSI zostać przy metadanych gp.
+    // Review cykl 4: kolejność odczytu sellera MUSI zaczynać się od KOLUMNY —
+    // to ona jest wartością kanoniczną. Lustro zostaje wyłącznie jako
+    // przejściowy fallback dla encji sprzed backfillu.
+    expect(source).toContain('const column = typeof match?.description === "string"')
     expect(source).toContain('typeof gp.description === "string"')
   })
 })

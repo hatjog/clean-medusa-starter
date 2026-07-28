@@ -365,6 +365,20 @@ describe("gp-config-sync-i18n-content — bar.pl sellera z metadata.gp.descripti
     })
     expect(persisted?.gp?.content_bar?.pl).toEqual({ words: 45, bar: true })
   })
+
+  it("kolumna WYGRYWA z lustrem — bar mierzy treść, którą widzi storefront", async () => {
+    // Review cykl 4 (RED-FIRST): przy kolejności `lustro → kolumna` bar liczył
+    // STARY seed z `metadata.gp.description`, mimo że API i storefront czytają
+    // kolumnę. Po edycji opisu przez vendora metryka opisywała treść, której
+    // nikt już nie widzi.
+    const persisted = await runWithSeller({
+      id: "sel_1",
+      handle: "studio-nova",
+      description: LONG_BODY,
+      metadata: { gp: { market_id: MARKET_ID, description: STUB_PL_BODY } },
+    })
+    expect(persisted?.gp?.content_bar?.pl).toEqual({ words: 45, bar: true })
+  })
 })
 
 function emptySummary() {

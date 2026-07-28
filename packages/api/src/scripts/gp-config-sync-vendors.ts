@@ -99,7 +99,17 @@ type SplDetail = {
   reason?: string
 }
 
-type SyncSummary = {
+/**
+ * ADR-165 — pominięcie zabronione przez bramkę własności, per vendor.
+ * Osobna klasa sygnału, nie „jeden z warningów": tylko ona eskaluje run
+ * do porażki (review cykl 4, W2).
+ */
+export type OwnershipProtectedSkip = {
+  vendor_id: string
+  fields: string[]
+}
+
+export type SyncSummary = {
   ok: boolean
   instance_id: string
   market_id: string
@@ -108,6 +118,12 @@ type SyncSummary = {
   stale_sellers: { inactivated: number; skipped: number }
   spl_details: SplDetail[]
   warnings: string[]
+  /**
+   * Pominięcia bramki własności. Puste przy zdrowym runie — a run z zastanymi,
+   * nieszkodliwymi warningami (vendor suspended, brak `sellerId`) ma tu pustkę
+   * i NIE jest porażką.
+   */
+  ownership_protected: OwnershipProtectedSkip[]
 }
 
 type DbLinkOutcome = "inserted" | "restored" | "exists"
@@ -407,7 +423,7 @@ async function createSellerRecord(sellerModuleService: any, payload: Record<stri
   throw new Error("Seller service does not expose a supported create method")
 }
 
-async function updateSellerRecord(
+export async function updateSellerRecord(
   sellerModuleService: any,
   id: string,
   payload: Record<string, unknown>
@@ -554,7 +570,7 @@ function normalizeCurrencyCode(currency: string | undefined): string {
 
 // ---- FR-56 seeded_fields logic ----
 
-type SeedIfEmptyResult = {
+type SeedOwnershipResult = {
   value: unknown
   shouldWrite: boolean
   isNewSeed: boolean
@@ -575,50 +591,88 @@ function deepEqual(a: unknown, b: unknown): boolean {
   return false
 }
 
+function isEmptyValue(value: unknown): boolean {
+  if (value === null || value === undefined || value === "") return true
+  if (Array.isArray(value)) return value.length === 0
+  return false
+}
+
 /**
  * Rozstrzyga własność pojedynczego pola `seed_if_empty` zgodnie z ADR-165
  * („treść vendor-owned wygrywa"; gp-config WYŁĄCZNIE seeduje).
  *
- * Cztery przypadki, sterowane znacznikiem własności `metadata.gp.seeded_fields`:
- *   - Case 1 — seeded ∧ DB == config      → config pisze (własność nadal po stronie seeda)
- *   - Case 2 — seeded ∧ DB != config      → vendor edytował → NIE piszemy
- *   - Case 3 — nie-seeded ∧ DB puste      → seedujemy + zaczynamy śledzić pole
- *   - Case 4 — nie-seeded ∧ DB niepuste   → vendor-owned od początku → NIE piszemy
+ * ## Model po doprecyzowaniu PO (Robert, 2026-07-28) — cykl 4
+ *
+ * Doprecyzowanie brzmiało: *„musi być możliwość wprowadzenia zmian przy pomocy
+ * gp-cli, ale potem powinna być możliwość aktualizacji tych danych przy pomocy
+ * admin, storefront powinien czytać dane z bazy"*. Wynikają z niego trzy role,
+ * które ta funkcja rozdziela:
+ *
+ *   - `canonicalValue` — **wartość**. Kolumna encji (`seller.description`,
+ *     `seller.name`, `seller.logo`). To ją czyta API i storefront, to ją edytuje
+ *     admin/panel vendora, i to do niej pisze seed.
+ *   - `seededValue` — **rejestr pochodzenia**. `metadata.gp.<pole>`: zapis „to
+ *     pole zasialiśmy my, i wpisaliśmy wtedy TAKĄ wartość". Nigdy nie jest
+ *     kandydatem na wartość — służy wyłącznie do rozstrzygnięcia własności.
+ *   - `seededFields` — lista pól, które kiedykolwiek zasialiśmy.
+ *
+ * Do cyklu 3 obie role mieszkały w jednym miejscu: wołający podawał
+ * `dbValue = metadata.gp.<pole> ?? kolumna`, czyli **lustro zamiast prawdy**.
+ * Skutkowało to dwiema klasami defektów naraz:
+ *   - W0 — seed nigdy nie trafiał do kolumny, więc `GET /store/seller/:handle`
+ *     zwracał `description: null` przy 402 znakach w lustrze;
+ *   - W1 — logo wgrane przez vendora do kolumny było kasowane bez
+ *     `--force-vendor-overwrite`, bo porównanie `lustro == config` wychodziło
+ *     prawdziwe i bramka własności w ogóle się nie odzywała.
+ *
+ * ## Cztery przypadki (po rozdzieleniu ról)
+ *
+ *   - Case 3  — kolumna PUSTA                       → seed (podstawowa funkcja
+ *               `seed_if_empty`, działa z flagą i bez niej). Obejmuje też
+ *               backfill kolumny, gdy rejestr ma wartość, a kolumna nie.
+ *   - Case 2  — seeded ∧ kolumna != rejestr         → vendor edytował → NIE piszemy
+ *   - Case 4  — nie-seeded ∧ kolumna niepusta       → vendor-owny od początku → NIE piszemy
+ *   - Case 1  — seeded ∧ kolumna == rejestr         → własność nadal po stronie
+ *               seeda; ODŚWIEŻENIE wymaga jawnej intencji (`--overwrite`).
  *
  * `overwrite` (`--overwrite` / `GP_OVERWRITE`) dotyczy WYŁĄCZNIE Case 1 i 3.
- * Nie przełamuje Case 2 ani 4 — przed ADR-165 przełamywał oba bezwarunkowo,
- * co było cichą utratą treści vendora (finding 4-6-H1). Jedynym kanałem, który
- * je przełamuje, jest `forceVendorOverwrite`.
+ * Nie przełamuje Case 2 ani 4 — jedynym kanałem, który je przełamuje, jest
+ * `forceVendorOverwrite`.
  *
- * Verify-B5 V3 — podział pracy między Case 1 a Case 3 (dlaczego `overwrite`
- * nie jest tu no-opem):
- *   - Case 3 to SEED pola pustego. To podstawowa funkcja `seed_if_empty`,
- *     działa na każdym runie, z flagą i bez niej — bramkowanie jej flagą
- *     zabiłoby sync przy pierwszym uruchomieniu.
- *   - Case 1 to ODŚWIEŻENIE istniejącego seeda, czyli zapis do pola, które już
- *     ma wartość. Zwykły run tego NIE robi („seed if empty" znaczy empty);
- *     robi to dopiero jawna intencja `--overwrite`. Po fixie cyklu 2 `overwrite`
- *     trafiał wyłącznie do `ownershipProtected`, więc nie wpływał na ŻADNĄ
- *     decyzję o zapisie i był flagą bez działania.
+ * Kolejność sprawdzeń ma znaczenie: pusta kolumna jest rozstrzygana PRZED
+ * predykatem `vendorOwned`. Inaczej stan „zasialiśmy do lustra, kolumna NULL"
+ * (realny stan 4 sellerów bazy dev sprzed tego fixu) wyglądałby jak Case 2
+ * i sam siebie zablokował — a przecież pusta kolumna nie zawiera niczyjej treści.
  */
-function resolveSeedIfEmpty(
+function resolveSeedOwnership(
   fieldName: string,
   configValue: unknown,
-  dbValue: unknown,
+  canonicalValue: unknown,
+  seededValue: unknown,
   seededFields: string[],
   overwrite = false,
   forceVendorOverwrite = false
-): SeedIfEmptyResult {
+): SeedOwnershipResult {
   const isSeeded = seededFields.includes(fieldName)
-  const dbEmpty = dbValue === null || dbValue === undefined || dbValue === ""
 
-  // Case 2 (seeded, vendor edytował) i Case 4 (nigdy nie seedowane, niepuste)
-  // to te same semantycznie „pole należy do vendora".
-  const vendorOwned = isSeeded ? !deepEqual(dbValue, configValue) : !dbEmpty
+  // Case 3 (+ backfill) — w kolumnie nie ma niczyjej treści, więc nie ma czego
+  // chronić. Seedujemy bez flagi; to jest sens `seed_if_empty`.
+  if (isEmptyValue(canonicalValue)) {
+    return {
+      value: configValue,
+      shouldWrite: true,
+      isNewSeed: !isSeeded,
+      ownershipProtected: false,
+    }
+  }
+
+  // Case 2 (seeded, kolumna rozjechana z rejestrem) i Case 4 (nigdy nie
+  // seedowane, kolumna niepusta) to semantycznie to samo: „pole należy do vendora".
+  const vendorOwned = isSeeded ? !deepEqual(canonicalValue, seededValue) : true
 
   if (vendorOwned && !forceVendorOverwrite) {
     return {
-      value: dbValue,
+      value: canonicalValue,
       shouldWrite: false,
       isNewSeed: false,
       // raportujemy tylko gdy ktoś FAKTYCZNIE prosił o nadpisanie — zwykły run
@@ -629,10 +683,9 @@ function resolveSeedIfEmpty(
 
   // Case 1 — pole już zasiane i nietknięte przez vendora. Odświeżenie seeda
   // wymaga jawnej intencji (`--overwrite` albo silniejszy kanał force).
-  const isRefreshOfExistingSeed = isSeeded && !dbEmpty
-  if (isRefreshOfExistingSeed && !overwrite && !forceVendorOverwrite) {
+  if (!overwrite && !forceVendorOverwrite) {
     return {
-      value: dbValue,
+      value: canonicalValue,
       shouldWrite: false,
       isNewSeed: false,
       // nikt nie prosił o nadpisanie — to nie jest pominięcie do zgłoszenia
@@ -682,7 +735,9 @@ export async function upsertSeller(
     const seededFields: string[] = []
     const gpMetaSeeded: Record<string, unknown> = {}
 
-    // seed_if_empty fields — all written on first create + tracked
+    // Rejestr pochodzenia (ADR-165 cykl 4): `metadata.gp.<pole>` zapisuje, CO
+    // zasialiśmy — nie jest wartością odczytywaną przez API. Wartość idzie do
+    // kolumny encji w `createPayload` poniżej.
     if (vendor.display_name !== undefined && vendor.display_name !== null) {
       gpMetaSeeded.name = vendor.display_name
       seededFields.push("name")
@@ -710,9 +765,17 @@ export async function upsertSeller(
       ...gpMetaSeeded,
     }
 
+    // W0 (review cykl 4): `description` NIE BYŁO tu wymienione, więc opis
+    // seedowany przez tę story lądował wyłącznie w `metadata.gp.description`.
+    // `GET /store/seller/:handle` czyta kolumnę — zwracał `null` przy 402
+    // znakach w lustrze, czyli treść była niewidoczna na storefroncie.
+    // Kolumna jest wartością kanoniczną; seed pisze DO NIEJ.
     const createPayload: Record<string, unknown> = {
       handle,
       name: vendor.display_name ?? handle,
+      ...(vendor.description !== undefined && vendor.description !== null
+        ? { description: vendor.description }
+        : {}),
       ...(vendor.photo_url ? { logo: vendor.photo_url } : {}),
       email: vendor.email,
       phone: vendor.phone,
@@ -739,15 +802,19 @@ export async function upsertSeller(
     ? (existingGp.seeded_fields as string[])
     : []
 
-  // config_wins fields — always overwrite (only include defined values to avoid clearing existing data)
-  const configWinsPayload: Record<string, unknown> = {
+  // Kolumny encji zapisywane tym runem. Dwa rozłączne źródła wpisów:
+  //   - config_wins (handle/currency/status/email/phone/tax_id) — zawsze,
+  //   - seed_if_empty (name/description/logo) — tylko gdy bramka własności
+  //     ADR-165 na to pozwoli (`applySeedField` poniżej).
+  // Tylko definiowane wartości, żeby nie kasować istniejących danych.
+  const updatePayloadColumns: Record<string, unknown> = {
     handle,
     currency_code: currencyCode,
     status: sellerStatus,
   }
-  if (vendor.email !== undefined) configWinsPayload.email = vendor.email
-  if (vendor.phone !== undefined) configWinsPayload.phone = vendor.phone
-  if (vendor.tax_id !== undefined) configWinsPayload.tax_id = vendor.tax_id
+  if (vendor.email !== undefined) updatePayloadColumns.email = vendor.email
+  if (vendor.phone !== undefined) updatePayloadColumns.phone = vendor.phone
+  if (vendor.tax_id !== undefined) updatePayloadColumns.tax_id = vendor.tax_id
 
   // seed_if_empty fields — check ownership before writing
   const gpMetaUpdate: Record<string, unknown> = {
@@ -762,16 +829,23 @@ export async function upsertSeller(
   // ADR-165 — pola, których `--overwrite` nie ruszył, bo należą do vendora.
   const ownershipProtectedFields: string[] = []
 
+  /**
+   * @param canonicalValue wartość kanoniczna — kolumna encji (to ją czyta API)
+   * @param seededValue    rejestr pochodzenia — `metadata.gp.<pole>`
+   * @param onWrite        MUSI zapisać wartość do kolumny ORAZ odświeżyć rejestr
+   */
   const applySeedField = (
     fieldName: string,
     configValue: unknown,
-    dbValue: unknown,
+    canonicalValue: unknown,
+    seededValue: unknown,
     onWrite: (value: unknown) => void
   ): void => {
-    const r = resolveSeedIfEmpty(
+    const r = resolveSeedOwnership(
       fieldName,
       configValue,
-      dbValue,
+      canonicalValue,
+      seededValue,
       seededFields,
       overwrite,
       forceVendorOverwrite
@@ -783,48 +857,62 @@ export async function upsertSeller(
     }
   }
 
-  // name
+  // name — kolumna `seller.name`, rejestr `metadata.gp.name`
   if (vendor.display_name !== undefined) {
     applySeedField(
       "name",
       vendor.display_name,
-      existingGp.name ?? existingSeller.name,
+      existingSeller.name,
+      existingGp.name,
       (value) => {
+        updatePayloadColumns.name = value
         gpMetaUpdate.name = value
       }
     )
   }
 
-  // description
+  // description — kolumna `seller.description`, rejestr `metadata.gp.description`
   if (vendor.description !== undefined) {
     applySeedField(
       "description",
       vendor.description,
-      existingGp.description ?? existingSeller.description,
+      existingSeller.description,
+      existingGp.description,
       (value) => {
+        updatePayloadColumns.description = value
         gpMetaUpdate.description = value
       }
     )
   }
 
-  // photo_url
+  // photo_url — kolumna `seller.logo`, rejestr `metadata.gp.photo_url`
   if (vendor.photo_url !== undefined) {
     applySeedField(
       "photo_url",
       vendor.photo_url,
-      existingGp.photo_url ?? existingSeller.logo,
+      existingSeller.logo,
+      existingGp.photo_url,
       (value) => {
+        updatePayloadColumns.logo = value
         gpMetaUpdate.photo_url = value
-        configWinsPayload.logo = value
       }
     )
   }
 
-  // gallery
+  // gallery — jedyne pole seedowane BEZ własnej kolumny encji. Wartość
+  // i rejestr dzielą tu `metadata.gp.gallery`, więc Case 2 jest z definicji
+  // nieosiągalny: vendor nie ma kanału, którym by tę wartość edytował.
+  // Ograniczenie nazwane w ADR-165 §Deferrals, nie przemilczane.
   if (vendorGallery !== undefined) {
-    applySeedField("gallery", vendorGallery, existingGp.gallery, (value) => {
-      gpMetaUpdate.gallery = value
-    })
+    applySeedField(
+      "gallery",
+      vendorGallery,
+      existingGp.gallery,
+      existingGp.gallery,
+      (value) => {
+        gpMetaUpdate.gallery = value
+      }
+    )
   }
 
   if (vendor.locations !== undefined) {
@@ -839,7 +927,7 @@ export async function upsertSeller(
   gpMetaUpdate.seeded_fields = updatedSeededFields
 
   const updatePayload: Record<string, unknown> = {
-    ...configWinsPayload,
+    ...updatePayloadColumns,
     metadata: {
       ...existingMetadata,
       gp: {
@@ -853,16 +941,19 @@ export async function upsertSeller(
     const currentSeedValues: Record<string, unknown> = {}
     const incomingSeedValues: Record<string, unknown> = {}
 
+    // Plan pokazuje stan KANONICZNY (kolumny encji) — dokładnie to, co zobaczy
+    // storefront. Do cyklu 3 pokazywał `metadata.gp.<pole> ?? kolumna`, więc
+    // opisywał lustro, a nie bazę, na której operator planował decyzję.
     if (vendor.display_name !== undefined) {
-      currentSeedValues.name = existingGp.name ?? existingSeller.name
+      currentSeedValues.name = existingSeller.name
       incomingSeedValues.name = vendor.display_name
     }
     if (vendor.description !== undefined) {
-      currentSeedValues.description = existingGp.description ?? existingSeller.description
+      currentSeedValues.description = existingSeller.description
       incomingSeedValues.description = vendor.description
     }
     if (vendor.photo_url !== undefined) {
-      currentSeedValues.photo_url = existingGp.photo_url ?? existingSeller.logo
+      currentSeedValues.photo_url = existingSeller.logo
       incomingSeedValues.photo_url = vendor.photo_url
     }
     if (vendorGallery !== undefined) {
@@ -1002,6 +1093,9 @@ export default async function gpConfigSyncVendors({ container, args }: ExecArgs)
     pushUniqueWarning(warnings, seenWarnings, forceVendorOverwriteIgnoredReason)
   }
 
+  /** ADR-165 / W2 — jedyna klasa warningu, która eskaluje run do porażki. */
+  const ownershipProtected: OwnershipProtectedSkip[] = []
+
   const vendorCounts = { created: 0, updated: 0, skipped: 0 }
   const splCounts = { created: 0, skipped: 0, missing_products: 0, pruned: 0 }
   const staleSellerCounts = { inactivated: 0, skipped: 0 }
@@ -1036,8 +1130,14 @@ export default async function gpConfigSyncVendors({ container, args }: ExecArgs)
         forceVendorOverwrite
       )
 
-      // ADR-165 — pominięcia bramki własności muszą być widoczne w raporcie.
+      // ADR-165 — pominięcia bramki własności muszą być widoczne w raporcie
+      // ORAZ w osobnym, typowanym kanale: to jedyna klasa warningu, która
+      // eskaluje run do porażki (W2).
       if (result.ownershipProtectedFields && result.ownershipProtectedFields.length > 0) {
+        ownershipProtected.push({
+          vendor_id: vendor.vendor_id,
+          fields: [...result.ownershipProtectedFields],
+        })
         pushUniqueWarning(
           warnings,
           seenWarnings,
@@ -1384,6 +1484,7 @@ export default async function gpConfigSyncVendors({ container, args }: ExecArgs)
     stale_sellers: staleSellerCounts,
     spl_details: splDetails,
     warnings,
+    ownership_protected: ownershipProtected,
   }
 
   if (dryRun && collector) {
@@ -1392,7 +1493,21 @@ export default async function gpConfigSyncVendors({ container, args }: ExecArgs)
 
   console.log(JSON.stringify(summary, null, 2))
 
-  if (warnings.length > 0 && !dryRun) {
+  // W2 (review cykl 4) — ROZRÓŻNIENIE KLAS WARNINGÓW.
+  //
+  // Do cyklu 3 każdy warning tego etapu ustawiał `exitCode = 1`, a orchestrator
+  // (po fixie V4) przestał ten kod połykać. Efekt uboczny: zastane, nieszkodliwe
+  // warningi — „vendor suspended; skipping seller-product linking", „missing
+  // sellerId", „no vendors in market config" — zamieniały w pełni udany
+  // `gp catalog sync` w twardą porażkę całego runu.
+  //
+  // Intencja ADR-165 §2 była węższa: pominięcie pola vendor-owned nie ma
+  // wyglądać na pełny sukces. Eskalujemy więc WYŁĄCZNIE tę klasę; reszta
+  // warningów zostaje widoczna w `summary.warnings`, tak jak była przez trzy
+  // release'y, i nie zmienia kodu wyjścia.
+  if (ownershipProtected.length > 0 && !dryRun) {
     process.exitCode = 1
   }
+
+  return summary
 }
