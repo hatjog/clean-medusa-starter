@@ -225,13 +225,25 @@ function decideForceVendorOverwrite(
  * — token bez myślnika, więc przechodzi przez `medusa exec`, a środowiska nie da
  * się w niego przebrać. Reguła jest ta sama co niżej: koniunkcja albo głośne
  * zignorowanie.
+ *
+ * Cykl 6 R3 — token jest rozpoznawany WYŁĄCZNIE w swoim slocie (`args[2]`),
+ * a nie przez `.includes` po całym argv. Bez myślnika token dzielił przestrzeń
+ * nazw z argumentami pozycyjnymi `instance`/`market`, a `force-vendor-overwrite`
+ * przechodzi allowlistę identyfikatorów (`MARKET_INSTANCE_ID_REGEX`
+ * w `packages/cli/src/errors.ts`): market albo instancja o takiej nazwie
+ * pełniłaby rolę intencji zniszczenia treści. Kontrakt wywołania jest
+ * pozycyjny (`[instance, market, token]`), więc slot jest tu jedyną
+ * jednoznaczną formą — flaga z myślnikiem takiej kolizji mieć nie może i
+ * zostaje rozpoznawana wszędzie.
  */
+export const FORCE_VENDOR_OVERWRITE_POSITIONAL_SLOT = 2
+
 export function resolveForceVendorOverwriteRelay(
   args?: string[]
 ): ForceVendorOverwriteDecision {
   const intentInArgs =
     args?.includes(FORCE_VENDOR_OVERWRITE_FLAG) === true ||
-    args?.includes(FORCE_VENDOR_OVERWRITE_POSITIONAL) === true
+    args?.[FORCE_VENDOR_OVERWRITE_POSITIONAL_SLOT] === FORCE_VENDOR_OVERWRITE_POSITIONAL
   return decideForceVendorOverwrite(intentInArgs, FORCE_VENDOR_OVERWRITE_POSITIONAL)
 }
 

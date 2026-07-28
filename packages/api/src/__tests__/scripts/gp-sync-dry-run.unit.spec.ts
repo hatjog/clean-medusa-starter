@@ -4,6 +4,8 @@ import {
   normalizeHtml,
   parseDryRunFlag,
   resolveForceVendorOverwrite,
+  resolveForceVendorOverwriteRelay,
+  FORCE_VENDOR_OVERWRITE_POSITIONAL,
 } from '../../scripts/gp-sync-dry-run'
 
 describe('parseDryRunFlag', () => {
@@ -122,5 +124,49 @@ describe('resolveForceVendorOverwrite', () => {
 
     expect(decision.enabled).toBe(false)
     expect(decision.ignoredReason).toMatch(/ZIGNOROWANE/)
+  })
+})
+
+// ---- Cykl 6 R3: token intencji nie dzieli przestrzeni nazw z argv pozycyjnym ----
+
+describe('resolveForceVendorOverwriteRelay — slot tokenu intencji', () => {
+  const originalEnv = process.env
+
+  beforeEach(() => {
+    process.env = { ...originalEnv }
+    process.env.GP_FORCE_VENDOR_OVERWRITE = 'true'
+  })
+
+  afterAll(() => {
+    process.env = originalEnv
+  })
+
+  it('włącza kanał, gdy token stoi w swoim slocie (args[2])', () => {
+    const decision = resolveForceVendorOverwriteRelay([
+      'gp-dev',
+      'bonbeauty',
+      FORCE_VENDOR_OVERWRITE_POSITIONAL,
+    ])
+
+    expect(decision.enabled).toBe(true)
+  })
+
+  it('market o nazwie tokenu NIE jest intencją zniszczenia treści', () => {
+    // `force-vendor-overwrite` przechodzi MARKET_INSTANCE_ID_REGEX, więc do
+    // cyklu 6 market (albo instancja) o tej nazwie pełniłby rolę intencji —
+    // przy odziedziczonym GP_FORCE_VENDOR_OVERWRITE=true wystarczyło to,
+    // żeby zwykły sync skasował treść vendorów.
+    const asMarket = resolveForceVendorOverwriteRelay([
+      'gp-dev',
+      FORCE_VENDOR_OVERWRITE_POSITIONAL,
+    ])
+    expect(asMarket.enabled).toBe(false)
+    expect(asMarket.ignoredReason).toMatch(/ZIGNOROWANE/)
+
+    const asInstance = resolveForceVendorOverwriteRelay([
+      FORCE_VENDOR_OVERWRITE_POSITIONAL,
+      'bonbeauty',
+    ])
+    expect(asInstance.enabled).toBe(false)
   })
 })
