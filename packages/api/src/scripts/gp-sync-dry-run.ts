@@ -108,6 +108,24 @@ export function parseOverwriteFlag(args?: string[]): boolean {
 
 export const FORCE_VENDOR_OVERWRITE_FLAG = "--force-vendor-overwrite"
 export const FORCE_VENDOR_OVERWRITE_ENV = "GP_FORCE_VENDOR_OVERWRITE"
+/**
+ * Cykl 5 — POZYCYJNY nośnik tej samej intencji, dla orchestratora.
+ *
+ * `medusa exec` gubi/odrzuca argumenty z myślnikiem, dlatego
+ * `assertPositionalArgs` (`packages/cli/src/adapters/BackendScriptAdapter.ts`)
+ * odmawia przepuszczenia `--force-vendor-overwrite` do orchestratora. Do cyklu 4
+ * wnioskiem z tego było „relay na poziomie orchestratora musi być OR(argv, env)"
+ * — a to otwierało dokładnie tę dziurę, którą kanał miał zamknąć: samo
+ * odziedziczone `GP_FORCE_VENDOR_OVERWRITE=true` wystarczało, żeby ręczne
+ * `medusa exec gp-config-sync-orchestrator gp-dev bonbeauty` skasowało treść
+ * salonów.
+ *
+ * Token pozycyjny nie ma myślnika, więc przechodzi przez `medusa exec` i przez
+ * `assertPositionalArgs` — a odziedziczone środowisko nie może go podrobić.
+ * Dzięki temu koniunkcja argv ∧ env obowiązuje na KAŻDYM poziomie, nie tylko
+ * w `gp-config-sync-vendors`.
+ */
+export const FORCE_VENDOR_OVERWRITE_POSITIONAL = "force-vendor-overwrite"
 
 export type ForceVendorOverwriteDecision = {
   /** true ⟺ kanał był ustawiony DWUSTRONNIE (argv + env). */
@@ -145,6 +163,19 @@ export type ForceVendorOverwriteDecision = {
  */
 export function resolveForceVendorOverwrite(args?: string[]): ForceVendorOverwriteDecision {
   const intentInArgs = args?.includes(FORCE_VENDOR_OVERWRITE_FLAG) === true
+  return decideForceVendorOverwrite(intentInArgs, FORCE_VENDOR_OVERWRITE_FLAG)
+}
+
+/**
+ * Wspólny rdzeń decyzji dla obu nośników intencji (flaga `--…` dla skryptów
+ * etapowych, token pozycyjny dla orchestratora). Rozdzielone są WYŁĄCZNIE
+ * nośniki — reguła („koniunkcja albo głośne zignorowanie") jest jedna, żeby
+ * nie dało się jej rozjechać między poziomami.
+ */
+function decideForceVendorOverwrite(
+  intentInArgs: boolean,
+  intentToken: string
+): ForceVendorOverwriteDecision {
   const rawEnv = (process.env[FORCE_VENDOR_OVERWRITE_ENV] ?? "").trim().toLowerCase()
   const envEnabled = rawEnv === "true" || rawEnv === "1" || rawEnv === "yes" || rawEnv === "on"
 
@@ -155,7 +186,7 @@ export function resolveForceVendorOverwrite(args?: string[]): ForceVendorOverwri
       enabled: false,
       ignoredReason:
         `${FORCE_VENDOR_OVERWRITE_ENV}='${rawEnv}' ZIGNOROWANE: brak jawnej intencji ` +
-        `${FORCE_VENDOR_OVERWRITE_FLAG} w argumentach wywołania. Kanał destrukcyjny ` +
+        `'${intentToken}' w argumentach wywołania. Kanał destrukcyjny ` +
         `ADR-165 jest DWUSTRONNY — sama odziedziczona zmienna środowiskowa go nie ` +
         `włącza (treść vendor-owned pozostaje nietknięta).`,
     }
@@ -165,7 +196,7 @@ export function resolveForceVendorOverwrite(args?: string[]): ForceVendorOverwri
     return {
       enabled: false,
       ignoredReason:
-        `${FORCE_VENDOR_OVERWRITE_FLAG} ZIGNOROWANE: brak potwierdzenia ` +
+        `'${intentToken}' ZIGNOROWANE: brak potwierdzenia ` +
         `${FORCE_VENDOR_OVERWRITE_ENV}=true. Kanał destrukcyjny ADR-165 jest ` +
         `DWUSTRONNY — sam argument go nie włącza (treść vendor-owned pozostaje ` +
         `nietknięta).`,
@@ -178,22 +209,30 @@ export function resolveForceVendorOverwrite(args?: string[]): ForceVendorOverwri
 /**
  * Poziom RELAYU kanału force — dla orchestratora, nie dla skryptu docelowego.
  *
- * W3 (review cykl 4): `resolveForceVendorOverwrite` wymaga koniunkcji argv+env
- * i to zostaje, bo to on faktycznie zdejmuje ochronę. Ale orchestrator dostaje
- * od `gp catalog sync` WYŁĄCZNIE argumenty pozycyjne (`assertPositionalArgs`
- * odmawia startu przy fladze w argv), więc jego jedynym realnym wejściem jest
- * env ustawiany jawnie przez verb. Bez tego relayu żadna ścieżka operatora nie
- * mogła ustawić obu połówek — kanał ADR-165 §3 istniał tylko w testach.
+ * W3 (review cykl 4) ustalił, że kanał musi być OSIĄGALNY: orchestrator dostaje
+ * od `gp catalog sync` wyłącznie argumenty POZYCYJNE, bo `assertPositionalArgs`
+ * odmawia przepuszczenia flagi z myślnikiem przez `medusa exec`.
  *
- * Semantyka OR(argv, env) jest tu bezpieczna, bo `buildCatalogSyncEnvOverride`
- * ustawia zmienną DWUSTRONNIE (jawne `"false"`, gdy operator nie podał flagi),
- * więc odziedziczona wartość nie dociera do orchestratora nietknięta. Na
- * ścieżce bezpośredniego `medusa exec gp-config-sync-vendors` obowiązuje nadal
- * koniunkcja z `resolveForceVendorOverwrite`, wraz z głośnym raportowaniem
- * strony zignorowanej.
+ * Cykl 5 koryguje sposób, w jaki to osiągnięto. Poprzednia wersja robiła tu
+ * `OR(argv, env)` z uzasadnieniem „verb i tak ustawia env dwustronnie". To jest
+ * prawda o ścieżce verb-a i NIEPRAWDA o świecie: ręczne
+ * `medusa exec gp-config-sync-orchestrator gp-dev bonbeauty` z odziedziczonym
+ * `GP_FORCE_VENDOR_OVERWRITE=true` (`.envrc`, CI, poprzednia sesja) włączało
+ * kanał destrukcyjny bez jednego słowa intencji — czyli dokładnie scenariusz,
+ * przed którym koniunkcja miała chronić.
+ *
+ * Odtąd intencję na tym poziomie niesie {@link FORCE_VENDOR_OVERWRITE_POSITIONAL}
+ * — token bez myślnika, więc przechodzi przez `medusa exec`, a środowiska nie da
+ * się w niego przebrać. Reguła jest ta sama co niżej: koniunkcja albo głośne
+ * zignorowanie.
  */
-export function parseForceVendorOverwriteRelayFlag(args?: string[]): boolean {
-  return parseCliBooleanFlag(args, FORCE_VENDOR_OVERWRITE_FLAG, FORCE_VENDOR_OVERWRITE_ENV)
+export function resolveForceVendorOverwriteRelay(
+  args?: string[]
+): ForceVendorOverwriteDecision {
+  const intentInArgs =
+    args?.includes(FORCE_VENDOR_OVERWRITE_FLAG) === true ||
+    args?.includes(FORCE_VENDOR_OVERWRITE_POSITIONAL) === true
+  return decideForceVendorOverwrite(intentInArgs, FORCE_VENDOR_OVERWRITE_POSITIONAL)
 }
 
 /**

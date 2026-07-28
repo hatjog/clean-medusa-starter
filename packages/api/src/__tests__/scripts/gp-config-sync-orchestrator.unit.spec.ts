@@ -384,9 +384,31 @@ describe("kanał --force-vendor-overwrite jest OSIĄGALNY przez orchestrator (W3
   // `enabled: true` poza testami. Wymaga koniunkcji argv+env, a orchestrator
   // ani nie parsował flagi (brak pola w OrchestratorArgs), ani nie przekazywał
   // jej do stageArgs, ani nie ustawiał env inaczej niż na sztywne "false".
-  it("parseOrchestratorArgs czyta kanał z env ustawionego przez gp catalog sync", () => {
+  it("parseOrchestratorArgs wymaga env ORAZ pozycyjnego tokenu intencji (cykl 5)", () => {
     process.env.GP_FORCE_VENDOR_OVERWRITE = "true"
-    expect(parseOrchestratorArgs(["gp-dev", "bonbeauty"]).forceVendorOverwrite).toBe(true)
+    const args = parseOrchestratorArgs(["gp-dev", "bonbeauty", "force-vendor-overwrite"])
+    expect(args.forceVendorOverwrite).toBe(true)
+    expect(args.forceVendorOverwriteIgnoredReason).toBeUndefined()
+  })
+
+  // RED-FIRST (cykl 5): do cyklu 4 relay orchestratora był `OR(argv, env)`
+  // z uzasadnieniem „verb i tak ustawia env dwustronnie". To prawda o ścieżce
+  // verb-a i nieprawda o świecie: ręczne `medusa exec gp-config-sync-orchestrator
+  // gp-dev bonbeauty` z odziedziczonym `GP_FORCE_VENDOR_OVERWRITE=true`
+  // (`.envrc`, CI, poprzednia sesja) kasowało treść salonów bez jednego słowa
+  // intencji — czyli dokładnie scenariusz, przed którym kanał miał chronić.
+  it("samo odziedziczone env NIE włącza kanału i jest raportowane głośno", () => {
+    process.env.GP_FORCE_VENDOR_OVERWRITE = "true"
+    const args = parseOrchestratorArgs(["gp-dev", "bonbeauty"])
+    expect(args.forceVendorOverwrite).toBe(false)
+    expect(args.forceVendorOverwriteIgnoredReason).toContain("ZIGNOROWANE")
+    expect(args.forceVendorOverwriteIgnoredReason).toContain("force-vendor-overwrite")
+  })
+
+  it("sam token bez potwierdzenia w env też jest ignorowany i raportowany", () => {
+    const args = parseOrchestratorArgs(["gp-dev", "bonbeauty", "force-vendor-overwrite"])
+    expect(args.forceVendorOverwrite).toBe(false)
+    expect(args.forceVendorOverwriteIgnoredReason).toContain("ZIGNOROWANE")
   })
 
   it("domyślnie kanał jest wyłączony", () => {

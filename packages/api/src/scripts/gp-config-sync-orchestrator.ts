@@ -10,9 +10,9 @@ import * as yaml from "js-yaml"
 import {
   FORCE_VENDOR_OVERWRITE_FLAG,
   parseDryRunFlag,
-  parseForceVendorOverwriteRelayFlag,
   parseOverwriteFlag,
   parsePruneFlag,
+  resolveForceVendorOverwriteRelay,
 } from "./gp-sync-dry-run"
 import gpConfigSyncAccounts from "./gp-config-sync-accounts"
 import gpConfigSyncBlog from "./gp-config-sync-blog"
@@ -23,7 +23,10 @@ import gpConfigSyncMedia from "./gp-config-sync-media"
 import gpConfigSyncPayments from "./gp-config-sync-payments"
 import gpConfigSyncReviews from "./gp-config-sync-reviews"
 import gpConfigSyncShipping from "./gp-config-sync-shipping"
-import gpConfigSyncVendors, { type OwnershipProtectedSkip } from "./gp-config-sync-vendors"
+import gpConfigSyncVendors, {
+  type OwnershipProtectedSkip,
+  type VendorContentOverwrite,
+} from "./gp-config-sync-vendors"
 import { isTranslationFeatureFlagEnabled } from "../lib/translation-ff-config"
 
 const ADVISORY_LOCK_ID = 1234567890
@@ -47,6 +50,12 @@ type OrchestratorArgs = {
    * więc żadna realna ścieżka nie ustawiała OBU połówek koniunkcji.
    */
   forceVendorOverwrite: boolean
+  /**
+   * Cykl 5 — kanał ustawiony JEDNOSTRONNIE (sam odziedziczony env albo sam
+   * token) i w efekcie zignorowany. Musi trafić do `warnings`: cichy no-op
+   * zostawia operatora w przekonaniu, że force zadziałał.
+   */
+  forceVendorOverwriteIgnoredReason?: string
 }
 
 type StageRunResult = {
@@ -99,6 +108,12 @@ type OrchestratorSummary = {
   force_vendor_overwrite: boolean
   /** ADR-165 §2 — pominięcia bramki własności; niepuste ⟹ `ok: false`. */
   ownership_protected: OwnershipProtectedSkip[]
+  /**
+   * ADR-165 §4 (cykl 5) — treść vendora, którą `--force` REALNIE nadpisał.
+   * Niepuste NIE oznacza porażki (operator o to prosił), ale `gp catalog sync`
+   * odróżnia po tym polu „nadpisano treść vendora" od zwykłego sukcesu.
+   */
+  vendor_overwritten: VendorContentOverwrite[]
   stages: StageRunResult[]
   health: HealthReport
   changed_entity_ids: string[]
@@ -126,7 +141,7 @@ export function parseOrchestratorArgs(args: string[] | undefined): OrchestratorA
   const dryRun = parseDryRunFlag(args)
   const overwrite = parseOverwriteFlag(args)
   const prune = parsePruneFlag(args)
-  const forceVendorOverwrite = parseForceVendorOverwriteRelayFlag(args)
+  const forceVendorOverwriteDecision = resolveForceVendorOverwriteRelay(args)
   const allowSkip = args?.includes("--allow-skip") === true
   const apply = args?.includes("--apply") === true
 
@@ -141,7 +156,10 @@ export function parseOrchestratorArgs(args: string[] | undefined): OrchestratorA
     marketId,
     configRoot,
     dryRun,
-    forceVendorOverwrite,
+    forceVendorOverwrite: forceVendorOverwriteDecision.enabled,
+    ...(forceVendorOverwriteDecision.ignoredReason
+      ? { forceVendorOverwriteIgnoredReason: forceVendorOverwriteDecision.ignoredReason }
+      : {}),
     overwrite,
     prune,
   }
@@ -670,10 +688,22 @@ export default async function gpConfigSyncOrchestrator({ container, args }: Exec
 
   const stageArgs = buildStageArgs(orchestratorArgs)
   const warnings: string[] = []
+
+  if (orchestratorArgs.forceVendorOverwriteIgnoredReason) {
+    // Cykl 5 — kanał destrukcyjny ustawiony jednostronnie. Nic nie zniszczyliśmy,
+    // ale operator musi wiedzieć, że jego (albo odziedziczone) ustawienie nie
+    // zadziałało; inaczej uzna, że force był aktywny, i wyciągnie z runu zły wniosek.
+    console.warn(
+      `[GP_FORCE_VENDOR_OVERWRITE] ${orchestratorArgs.forceVendorOverwriteIgnoredReason}`
+    )
+    warnings.push(orchestratorArgs.forceVendorOverwriteIgnoredReason)
+  }
   /** Verify-B5 V4 — niezerowe kody wyjścia etapów; nie wolno ich połknąć. */
   const stageExitSignals: StageExitSignal[] = []
   /** ADR-165 / W2 — jedyna klasa sygnału, która zamienia run w porażkę. */
   const ownershipProtectedSkips: OwnershipProtectedSkip[] = []
+  /** ADR-165 §4 / cykl 5 — druga klasa sygnału tej samej bramki: co force zniszczył. */
+  const vendorContentOverwrites: VendorContentOverwrite[] = []
 
   try {
     const changedEntityIds = await collectChangedEntityIds(orchestratorArgs)
@@ -753,6 +783,13 @@ export default async function gpConfigSyncOrchestrator({ container, args }: Exec
           // (vendor suspended, brak sellerId) zostają warningami.
           for (const skip of vendorSummary?.ownership_protected ?? []) {
             ownershipProtectedSkips.push(skip)
+          }
+
+          // ADR-165 §4 (cykl 5) — to samo dla drugiej strony bramki. Bez tego
+          // relayu raport orchestratora (jedyne, co widzi `gp catalog sync`)
+          // nie niósł ANI JEDNEGO śladu po tym, co force skasował.
+          for (const overwrite of vendorSummary?.vendor_overwritten ?? []) {
+            vendorContentOverwrites.push(overwrite)
           }
 
           return orchestratorArgs.dryRun ? "vendor dry-run completed" : "vendor sync completed"
@@ -913,7 +950,18 @@ export default async function gpConfigSyncOrchestrator({ container, args }: Exec
       warnings.push(
         `sync-vendors: ADR-165 — pola vendor-owned [${skip.fields.join(", ")}] vendora ` +
           `'${skip.vendor_id}' POMINIĘTE mimo --overwrite (treść vendora wygrywa; ` +
-          `świadome nadpisanie wymaga --force-vendor-overwrite + GP_FORCE_VENDOR_OVERWRITE=true)`
+          `świadome nadpisanie: gp catalog sync <instance> <market> --force)`
+      )
+    }
+
+    // ADR-165 §4 (cykl 5) — nadpisanie treści vendora NIE wywraca runu, ale
+    // nie ma prawa być ciche: to jedyna operacja syncu, której nie da się
+    // cofnąć z drzewa configu.
+    for (const overwrite of vendorContentOverwrites) {
+      warnings.push(
+        `sync-vendors: ADR-165 §4 — pola vendor-owned [${overwrite.fields.join(", ")}] vendora ` +
+          `'${overwrite.vendor_id}' NADPISANE przez --force wartościami z gp-config ` +
+          `(treść vendora bezpowrotnie utracona)`
       )
     }
 
@@ -966,6 +1014,7 @@ export default async function gpConfigSyncOrchestrator({ container, args }: Exec
       overwrite: orchestratorArgs.overwrite,
       force_vendor_overwrite: orchestratorArgs.forceVendorOverwrite,
       ownership_protected: ownershipProtectedSkips,
+      vendor_overwritten: vendorContentOverwrites,
       stages,
       health,
       changed_entity_ids: changedEntityIds,

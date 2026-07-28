@@ -591,7 +591,9 @@ describe('ADR-165 — realna ścieżka: gpConfigSyncVendors z GP_OVERWRITE=true'
       (w: string) => w.includes('studio-nova') && w.includes('description')
     )
     expect(ownershipWarnings).toHaveLength(1)
-    expect(ownershipWarnings[0]).toMatch(/GP_FORCE_VENDOR_OVERWRITE/)
+    // Cykl 5: warning wskazuje INTERFEJS OPERATORSKI (`--force`), a nie nazwę
+    // zmiennej środowiskowej — operator ma sięgnąć po flagę, nie po `export`.
+    expect(ownershipWarnings[0]).toMatch(/--force/)
   })
 
   it('pominięcie własności trafia do typowanego kanału summary.ownership_protected', async () => {
@@ -607,7 +609,14 @@ describe('ADR-165 — realna ścieżka: gpConfigSyncVendors z GP_OVERWRITE=true'
     } as any)
 
     expect(readSummary().ownership_protected).toEqual([
-      { vendor_id: 'studio-nova', fields: ['description'] },
+      {
+        vendor_id: 'studio-nova',
+        fields: ['description'],
+        // Cykl 5 — przyczyna per pole. Preflight `--force` musi umieć powiedzieć
+        // operatorowi, że wartość na encji rozjechała się z zapisanym seedem,
+        // a nie tylko „pole chronione".
+        details: [{ field: 'description', reason: 'vendor-edited-seeded-field' }],
+      },
     ])
     expect(process.exitCode).toBe(1)
   })
@@ -713,5 +722,119 @@ describe('ADR-165 — realna ścieżka: gpConfigSyncVendors z GP_OVERWRITE=true'
     expect(warnText).toMatch(/GP_FORCE_VENDOR_OVERWRITE/)
     expect(warnText).not.toMatch(/ZIGNOROWANE/)
     warnSpy.mockRestore()
+  })
+
+  // ---- Cykl 5: rejestr TEGO, CO FORCE ZNISZCZYŁ (ADR-165 §4) ----
+  //
+  // RED-FIRST: do cyklu 4 raport miał wyłącznie kanał „odmówiłem"
+  // (`ownership_protected`). Run z force przechodził bramkę, kasował treść
+  // vendora i kończył się dokładnie takim samym raportem jak run, który nie
+  // miał czego kasować — więc `gp catalog sync` nie miał z czego zbudować ani
+  // raportu po wykonaniu, ani rozróżnienia wyniku.
+
+  it('force nadpisujący Case 2 zapisuje się w summary.vendor_overwritten', async () => {
+    process.env.GP_CONFIG_ROOT = tmpRoot
+    process.env.GP_OVERWRITE = 'true'
+    process.env.GP_FORCE_VENDOR_OVERWRITE = 'true'
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => undefined)
+
+    const sellerService = vendorEditedSeller()
+
+    await gpConfigSyncVendors({
+      container: makeContainer(sellerService),
+      args: ['gp-dev', 'bonbeauty', '--force-vendor-overwrite'],
+    } as any)
+
+    expect(updatedColumns(sellerService).description).toBe(CONFIG_DESCRIPTION)
+
+    const summary = readSummary()
+    expect(summary.vendor_overwritten).toEqual([
+      { vendor_id: 'studio-nova', fields: ['description'] },
+    ])
+    // Odmowy nie było — bramka została przełamana, nie uruchomiona.
+    expect(summary.ownership_protected).toEqual([])
+    expect(
+      summary.warnings.some((w: string) => w.includes('NADPISAŁ') && w.includes('studio-nova'))
+    ).toBe(true)
+    // Nadpisanie NIE jest porażką runu: operator o nie prosił.
+    expect(process.exitCode).toBeUndefined()
+    warnSpy.mockRestore()
+  })
+
+  it('force nadpisujący Case 4 (nigdy nie seedowane) też trafia do rejestru', async () => {
+    process.env.GP_CONFIG_ROOT = tmpRoot
+    process.env.GP_OVERWRITE = 'true'
+    process.env.GP_FORCE_VENDOR_OVERWRITE = 'true'
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => undefined)
+
+    const sellerService = makeSellerService([
+      existingSellerWith({ seededFields: [], column: VENDOR_DESCRIPTION }),
+    ])
+
+    await gpConfigSyncVendors({
+      container: makeContainer(sellerService),
+      args: ['gp-dev', 'bonbeauty', '--force-vendor-overwrite'],
+    } as any)
+
+    expect(updatedColumns(sellerService).description).toBe(CONFIG_DESCRIPTION)
+    expect(readSummary().vendor_overwritten).toEqual([
+      { vendor_id: 'studio-nova', fields: ['description'] },
+    ])
+    warnSpy.mockRestore()
+  })
+
+  it('bez force TE SAME przypadki są chronione i rejestr zostaje pusty', async () => {
+    process.env.GP_CONFIG_ROOT = tmpRoot
+    process.env.GP_OVERWRITE = 'true'
+    delete process.env.GP_FORCE_VENDOR_OVERWRITE
+
+    const case4Service = makeSellerService([
+      existingSellerWith({ seededFields: [], column: VENDOR_DESCRIPTION }),
+    ])
+
+    await gpConfigSyncVendors({
+      container: makeContainer(case4Service),
+      args: ['gp-dev', 'bonbeauty'],
+    } as any)
+
+    expect(updatedColumns(case4Service).description).toBeUndefined()
+    const summary = readSummary()
+    expect(summary.vendor_overwritten).toEqual([])
+    expect(summary.ownership_protected).toEqual([
+      {
+        vendor_id: 'studio-nova',
+        fields: ['description'],
+        details: [{ field: 'description', reason: 'never-seeded-vendor-content' }],
+      },
+    ])
+  })
+
+  it('preflight `gp catalog sync --force` widzi konflikty w dry-runie, nic nie pisząc', async () => {
+    // To jest dokładnie zapytanie, które zadaje `collectVendorOwnedConflicts`:
+    // dry-run + GP_OVERWRITE, force WYŁĄCZONY. Odpowiedź pochodzi z tej samej
+    // bramki, która potem realnie decyduje — nie z jej kopii w CLI.
+    process.env.GP_CONFIG_ROOT = tmpRoot
+    process.env.GP_OVERWRITE = 'true'
+    process.env.GP_DRY_RUN = 'true'
+    delete process.env.GP_FORCE_VENDOR_OVERWRITE
+
+    const sellerService = vendorEditedSeller()
+
+    await gpConfigSyncVendors({
+      container: makeContainer(sellerService),
+      args: ['gp-dev', 'bonbeauty'],
+    } as any)
+
+    // Zero zapisów — asercja na spy usługi, nie na treści raportu.
+    expect(sellerService.update).not.toHaveBeenCalled()
+    expect(readSummary().ownership_protected).toEqual([
+      {
+        vendor_id: 'studio-nova',
+        fields: ['description'],
+        details: [{ field: 'description', reason: 'vendor-edited-seeded-field' }],
+      },
+    ])
+    // Dry-run niczego nie zapisał, więc nie ma czego eskalować.
+    expect(process.exitCode).toBeUndefined()
   })
 })

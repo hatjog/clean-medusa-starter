@@ -89,6 +89,21 @@ export type SellerSyncResult = {
    * należą do vendora (Case 2/4). Puste/nieobecne przy runie bez `--overwrite`.
    */
   ownershipProtectedFields?: string[]
+  /**
+   * ADR-165 §4 (cykl 5) — to samo z rozróżnieniem PRZYCZYNY. `gp catalog sync
+   * --force` robi z tego preflight: operator ma zobaczyć nie „3 pola", tylko
+   * „studio-nova/description, bo wartość na encji rozjechała się z zapisanym
+   * seedem" — czyli że to vendor je edytował.
+   */
+  ownershipProtectedDetails?: OwnershipProtectedDetail[]
+  /**
+   * ADR-165 §4 (cykl 5) — pola vendor-owned, które kanał `--force` FAKTYCZNIE
+   * nadpisał. Osobno od `ownershipProtectedFields`: tamto mówi „odmówiłem",
+   * to mówi „zniszczyłem cudzą pracę". Bez tego rejestru raport po runie nie
+   * odróżniał force-runu, który coś skasował, od force-runu, który trafił
+   * w sam seed i był no-opem.
+   */
+  vendorOverwrittenFields?: string[]
 }
 
 type SplDetail = {
@@ -100,11 +115,47 @@ type SplDetail = {
 }
 
 /**
+ * ADR-165 — powód, dla którego bramka własności odmówiła zapisu.
+ *
+ * Rozróżnienie nie jest kosmetyczne: `gp catalog sync --force` musi PRZED
+ * wykonaniem powiedzieć operatorowi, że wartość na encji różni się od
+ * zapisanego seeda (czyli vendor ją edytował), a nie tylko „pole chronione".
+ */
+export type OwnershipProtectedReason =
+  /** Case 2 — pole zasiane przez nas, ale kolumna encji != rejestr `metadata.gp.*`. */
+  | "vendor-edited-seeded-field"
+  /** Case 4 — kolumna niepusta, pola nigdy nie zasialiśmy. Treść vendora od początku. */
+  | "never-seeded-vendor-content"
+
+export type OwnershipProtectedDetail = {
+  field: string
+  reason: OwnershipProtectedReason
+}
+
+/**
  * ADR-165 — pominięcie zabronione przez bramkę własności, per vendor.
  * Osobna klasa sygnału, nie „jeden z warningów": tylko ona eskaluje run
  * do porażki (review cykl 4, W2).
  */
 export type OwnershipProtectedSkip = {
+  vendor_id: string
+  fields: string[]
+  /**
+   * Cykl 5 — per-pole przyczyna. Opcjonalne, żeby nie zerwać konsumentów
+   * czytających samo `fields` (orchestrator, testy, zastane raporty na dysku).
+   */
+  details?: OwnershipProtectedDetail[]
+}
+
+/**
+ * ADR-165 §4 (cykl 5) — treść vendora, którą kanał `--force` REALNIE nadpisał.
+ *
+ * Symetria wobec {@link OwnershipProtectedSkip} jest celowa: raport ma dwie
+ * osobne, typowane klasy — „odmówiłem" i „zniszczyłem". Zlepienie ich w jeden
+ * licznik warningów było dokładnie tym defektem, który W2 rozplątał w drugą
+ * stronę.
+ */
+export type VendorContentOverwrite = {
   vendor_id: string
   fields: string[]
 }
@@ -124,6 +175,12 @@ export type SyncSummary = {
    * i NIE jest porażką.
    */
   ownership_protected: OwnershipProtectedSkip[]
+  /**
+   * ADR-165 §4 (cykl 5) — co kanał `--force` faktycznie zniszczył. Puste przy
+   * każdym runie bez tego kanału; niepuste = raport MUSI to pokazać operatorowi
+   * po wykonaniu, bo tej pracy nie da się odzyskać z drzewa configu.
+   */
+  vendor_overwritten: VendorContentOverwrite[]
 }
 
 type DbLinkOutcome = "inserted" | "restored" | "exists"
@@ -182,11 +239,34 @@ function appendOwnershipProtectedNote(
   return note ? `${note}; ${suffix}` : suffix
 }
 
+/**
+ * ADR-165 §4 (cykl 5) — dopina do noty to, co kanał `--force` ZNISZCZYŁ.
+ * Symetrycznie do {@link appendOwnershipProtectedNote}, bo w raporcie muszą
+ * być widoczne oba zdarzenia, a nie tylko odmowa.
+ */
+function appendVendorOverwriteNote(
+  note: string | undefined,
+  vendorOverwrittenFields: string[]
+): string | undefined {
+  if (vendorOverwrittenFields.length === 0) return note
+
+  const suffix = `treść vendora NADPISANA przez --force (ADR-165 §4): ${vendorOverwrittenFields.join(",")}`
+  return note ? `${note}; ${suffix}` : suffix
+}
+
 function formatOwnershipProtectedWarning(vendorId: string, fields: string[]): string {
   return (
     `Vendor '${vendorId}': --overwrite NIE nadpisał pól vendor-owned [${fields.join(", ")}] ` +
     `(ADR-165: treść vendora wygrywa; gp-config wyłącznie seeduje). ` +
-    `Świadome nadpisanie wymaga GP_FORCE_VENDOR_OVERWRITE=true.`
+    `Świadome nadpisanie: gp catalog sync <instance> <market> --force.`
+  )
+}
+
+function formatVendorOverwriteWarning(vendorId: string, fields: string[]): string {
+  return (
+    `Vendor '${vendorId}': --force NADPISAŁ pola vendor-owned [${fields.join(", ")}] ` +
+    `wartościami z gp-config (ADR-165 §4). Ta treść była napisana przez vendora ` +
+    `i NIE DA SIĘ jej odtworzyć z drzewa configu.`
   )
 }
 
@@ -579,6 +659,19 @@ type SeedOwnershipResult = {
    * zablokowała. Sygnał do jawnego zaraportowania — pominięcie NIE może być ciche.
    */
   ownershipProtected: boolean
+  /**
+   * Przyczyna, dla której pole należy do vendora — ustawiona ZAWSZE gdy bramka
+   * uznała pole za vendor-owne, niezależnie od tego, czy je ochroniła
+   * (`ownershipProtected`), czy przełamała (`vendorOverwritten`). Zasila
+   * preflight `--force`.
+   */
+  ownershipReason?: OwnershipProtectedReason
+  /**
+   * true ⟺ pole było vendor-owne (Case 2/4), a kanał `--force` mimo to je
+   * nadpisał. To jest ta jedna operacja w całym syncu, która NISZCZY cudzą
+   * pracę bez możliwości odtworzenia jej z configu.
+   */
+  vendorOverwritten: boolean
 }
 
 /** Deep equality for primitives and JSON-serialisable values (including arrays). */
@@ -663,12 +756,16 @@ function resolveSeedOwnership(
       shouldWrite: true,
       isNewSeed: !isSeeded,
       ownershipProtected: false,
+      vendorOverwritten: false,
     }
   }
 
   // Case 2 (seeded, kolumna rozjechana z rejestrem) i Case 4 (nigdy nie
   // seedowane, kolumna niepusta) to semantycznie to samo: „pole należy do vendora".
   const vendorOwned = isSeeded ? !deepEqual(canonicalValue, seededValue) : true
+  const ownershipReason: OwnershipProtectedReason = isSeeded
+    ? "vendor-edited-seeded-field"
+    : "never-seeded-vendor-content"
 
   if (vendorOwned && !forceVendorOverwrite) {
     return {
@@ -678,6 +775,21 @@ function resolveSeedOwnership(
       // raportujemy tylko gdy ktoś FAKTYCZNIE prosił o nadpisanie — zwykły run
       // bez flagi to normalna praca seeda, nie pominięcie do zgłoszenia
       ownershipProtected: overwrite,
+      ownershipReason,
+      vendorOverwritten: false,
+    }
+  }
+
+  if (vendorOwned) {
+    // Cykl 5 — jedyna gałąź, w której gp-config kasuje treść, której nie zasiał.
+    // Musi być odróżnialna w raporcie od zwykłego odświeżenia seeda (Case 1).
+    return {
+      value: configValue,
+      shouldWrite: true,
+      isNewSeed: !isSeeded,
+      ownershipProtected: false,
+      ownershipReason,
+      vendorOverwritten: true,
     }
   }
 
@@ -690,6 +802,7 @@ function resolveSeedOwnership(
       isNewSeed: false,
       // nikt nie prosił o nadpisanie — to nie jest pominięcie do zgłoszenia
       ownershipProtected: false,
+      vendorOverwritten: false,
     }
   }
 
@@ -698,6 +811,7 @@ function resolveSeedOwnership(
     shouldWrite: true,
     isNewSeed: !isSeeded,
     ownershipProtected: false,
+    vendorOverwritten: false,
   }
 }
 
@@ -828,6 +942,9 @@ export async function upsertSeller(
   const newlySeededFields: string[] = []
   // ADR-165 — pola, których `--overwrite` nie ruszył, bo należą do vendora.
   const ownershipProtectedFields: string[] = []
+  const ownershipProtectedDetails: OwnershipProtectedDetail[] = []
+  // ADR-165 §4 (cykl 5) — pola vendor-owned, które `--force` REALNIE nadpisał.
+  const vendorOverwrittenFields: string[] = []
 
   /**
    * @param canonicalValue wartość kanoniczna — kolumna encji (to ją czyta API)
@@ -850,7 +967,13 @@ export async function upsertSeller(
       overwrite,
       forceVendorOverwrite
     )
-    if (r.ownershipProtected) ownershipProtectedFields.push(fieldName)
+    if (r.ownershipProtected) {
+      ownershipProtectedFields.push(fieldName)
+      if (r.ownershipReason) {
+        ownershipProtectedDetails.push({ field: fieldName, reason: r.ownershipReason })
+      }
+    }
+    if (r.vendorOverwritten) vendorOverwrittenFields.push(fieldName)
     if (r.shouldWrite) {
       onWrite(r.value)
       if (r.isNewSeed) newlySeededFields.push(fieldName)
@@ -961,9 +1084,12 @@ export async function upsertSeller(
       incomingSeedValues.gallery = vendorGallery
     }
 
-    const note = appendOwnershipProtectedNote(
-      formatSeedDiffNote(currentSeedValues, incomingSeedValues),
-      ownershipProtectedFields
+    const note = appendVendorOverwriteNote(
+      appendOwnershipProtectedNote(
+        formatSeedDiffNote(currentSeedValues, incomingSeedValues),
+        ownershipProtectedFields
+      ),
+      vendorOverwrittenFields
     )
     console.log(
       formatDryRunNote(
@@ -971,17 +1097,28 @@ export async function upsertSeller(
         note
       )
     )
-    return { sellerId: existingSeller.id, action: "updated", note, ownershipProtectedFields }
+    return {
+      sellerId: existingSeller.id,
+      action: "updated",
+      note,
+      ownershipProtectedFields,
+      ownershipProtectedDetails,
+      vendorOverwrittenFields,
+    }
   }
 
   await updateSellerRecord(sellerModuleService, existingSeller.id, updatePayload)
+  const note = appendVendorOverwriteNote(
+    appendOwnershipProtectedNote(undefined, ownershipProtectedFields),
+    vendorOverwrittenFields
+  )
   return {
     sellerId: existingSeller.id,
     action: "updated",
-    ...(ownershipProtectedFields.length > 0
-      ? { note: appendOwnershipProtectedNote(undefined, ownershipProtectedFields) }
-      : {}),
+    ...(note ? { note } : {}),
     ownershipProtectedFields,
+    ownershipProtectedDetails,
+    vendorOverwrittenFields,
   }
 }
 
@@ -1013,7 +1150,8 @@ export default async function gpConfigSyncVendors({ container, args }: ExecArgs)
     console.warn(
       "[GP_FORCE_VENDOR_OVERWRITE] UWAGA: pola seed_if_empty należące do vendora " +
         "(seeded+zmienione lub nigdy nie seedowane) ZOSTANĄ nadpisane wartościami z gp-config. " +
-        "To świadome zniszczenie treści vendora — ADR-165 dopuszcza to wyłącznie tym kanałem."
+        "To świadome zniszczenie treści vendora — ADR-165 §4 dopuszcza to wyłącznie tym kanałem " +
+        "(interfejs operatorski: `gp catalog sync <instance> <market> --force`)."
     )
   }
 
@@ -1095,6 +1233,8 @@ export default async function gpConfigSyncVendors({ container, args }: ExecArgs)
 
   /** ADR-165 / W2 — jedyna klasa warningu, która eskaluje run do porażki. */
   const ownershipProtected: OwnershipProtectedSkip[] = []
+  /** ADR-165 §4 / cykl 5 — co `--force` faktycznie zniszczył. */
+  const vendorOverwritten: VendorContentOverwrite[] = []
 
   const vendorCounts = { created: 0, updated: 0, skipped: 0 }
   const splCounts = { created: 0, skipped: 0, missing_products: 0, pruned: 0 }
@@ -1137,11 +1277,30 @@ export default async function gpConfigSyncVendors({ container, args }: ExecArgs)
         ownershipProtected.push({
           vendor_id: vendor.vendor_id,
           fields: [...result.ownershipProtectedFields],
+          ...(result.ownershipProtectedDetails && result.ownershipProtectedDetails.length > 0
+            ? { details: [...result.ownershipProtectedDetails] }
+            : {}),
         })
         pushUniqueWarning(
           warnings,
           seenWarnings,
           formatOwnershipProtectedWarning(vendor.vendor_id, result.ownershipProtectedFields)
+        )
+      }
+
+      // ADR-165 §4 (cykl 5) — drugie zdarzenie tej samej bramki: `--force`
+      // przełamał ochronę. To NIE jest porażka runu (operator o to prosił),
+      // ale musi być widoczne w raporcie po wykonaniu — inaczej „zniszczyłem
+      // cudzą pracę" wygląda dokładnie jak zwykły sukces.
+      if (result.vendorOverwrittenFields && result.vendorOverwrittenFields.length > 0) {
+        vendorOverwritten.push({
+          vendor_id: vendor.vendor_id,
+          fields: [...result.vendorOverwrittenFields],
+        })
+        pushUniqueWarning(
+          warnings,
+          seenWarnings,
+          formatVendorOverwriteWarning(vendor.vendor_id, result.vendorOverwrittenFields)
         )
       }
 
@@ -1485,6 +1644,7 @@ export default async function gpConfigSyncVendors({ container, args }: ExecArgs)
     spl_details: splDetails,
     warnings,
     ownership_protected: ownershipProtected,
+    vendor_overwritten: vendorOverwritten,
   }
 
   if (dryRun && collector) {
