@@ -32,6 +32,8 @@ const COLLECTION_ID = "paycol_f2_multi_seller"
 const MARKET_ID = "bonbeauty"
 const ORDER_A = "order_f2_seller_a"
 const ORDER_B = "order_f2_seller_b"
+const PRODUCT_A = "prod_f2_seller_a"
+const PRODUCT_B = "prod_f2_seller_b"
 
 type FakeRes = {
   statusCode: number
@@ -166,6 +168,10 @@ runOrSkip("F2 — multi-seller na realnej ścieżce PostgreSQL", () => {
          deleted_at timestamptz
        ) ON COMMIT DROP`,
       `CREATE TEMP TABLE order_line_item (
+         id text PRIMARY KEY, product_id text, unit_price integer NOT NULL,
+         metadata jsonb, deleted_at timestamptz
+       ) ON COMMIT DROP`,
+      `CREATE TEMP TABLE product (
          id text PRIMARY KEY, metadata jsonb, deleted_at timestamptz
        ) ON COMMIT DROP`,
       `CREATE TEMP TABLE order_item (
@@ -221,15 +227,25 @@ runOrSkip("F2 — multi-seller na realnej ścieżce PostgreSQL", () => {
        ($1, $3), ($2, $3)`,
       [ORDER_A, ORDER_B, COLLECTION_ID]
     )
-    const voucherMetadata = JSON.stringify({
-      entitlement_profile_id: "voucher-rezerwacja-otwarta",
-      entitlement_type: "VOUCHER_SERVICE",
-      policy: { validity_months: 12, vat_rate_uniqueness: true },
+    const productMetadata = JSON.stringify({
+      gp: {
+        entitlement_profile: {
+          profile_id: "voucher-rezerwacja-otwarta",
+          entitlement_type: "VOUCHER_SERVICE",
+          currency: "PLN",
+          policy: { validity_months: 12, vat_rate_uniqueness: true },
+        },
+      },
     })
     await client.query(
-      `INSERT INTO order_line_item (id, metadata) VALUES
-       ('li_seller_a', $1::jsonb), ('li_seller_b', $1::jsonb)`,
-      [voucherMetadata]
+      `INSERT INTO product (id, metadata) VALUES
+       ($1, $3::jsonb), ($2, $3::jsonb)`,
+      [PRODUCT_A, PRODUCT_B, productMetadata]
+    )
+    await client.query(
+      `INSERT INTO order_line_item (id, product_id, unit_price, metadata) VALUES
+       ('li_seller_a', $1, 22000, NULL), ('li_seller_b', $2, 20000, NULL)`,
+      [PRODUCT_A, PRODUCT_B]
     )
     await client.query(
       `INSERT INTO order_item (order_id, item_id, created_at) VALUES
@@ -249,6 +265,18 @@ runOrSkip("F2 — multi-seller na realnej ścieżce PostgreSQL", () => {
       (await client.query(`SELECT order_id FROM entitlement_instance ORDER BY order_id`))
         .rows.map((row) => row.order_id)
     ).toEqual([ORDER_A, ORDER_B])
+    expect(
+      (
+        await client.query(
+          `SELECT order_id, (policy_snapshot->>'amount_minor')::integer AS amount_minor
+             FROM entitlement_instance
+            ORDER BY order_id`
+        )
+      ).rows
+    ).toEqual([
+      { order_id: ORDER_A, amount_minor: 22000 },
+      { order_id: ORDER_B, amount_minor: 20000 },
+    ])
     expect(
       (await client.query(`SELECT external_id FROM event_processed ORDER BY external_id`))
         .rows.map((row) => row.external_id)

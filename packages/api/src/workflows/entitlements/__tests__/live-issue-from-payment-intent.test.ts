@@ -60,7 +60,12 @@ type OrderFixture = {
   sales_channel_id: string | null
   metadata: Record<string, unknown> | null
 }
-type LineFixture = { line_item_id: string; metadata: Record<string, unknown> | null }
+type LineFixture = {
+  line_item_id: string
+  metadata: Record<string, unknown> | null
+  product_metadata?: Record<string, unknown> | null
+  line_unit_price?: number | null
+}
 
 /**
  * In-memory fake PgClient odwzorowujący DDL/ON CONFLICT Story 3.2/3.3:
@@ -202,6 +207,38 @@ describe("Story 3.3 AC2 — live-issue → L4 ISSUED ze snapshotem (policy + VAT
     )
     await liveIssueEntitlementsWithinTx(client, baseInput(), NOW)
     expect([...entitlements.values()][0].vat_classification).toBe("MPV")
+  })
+
+  it("historyczna linia bez metadata bierze profil z produktu i kwotę snapshotu linii", async () => {
+    const { client, entitlements } = makeFakeClient(
+      {
+        sales_channel_id: "sc_bonbeauty",
+        metadata: { gp: { market_id: "bonbeauty" } },
+      },
+      [
+        {
+          line_item_id: "li_legacy_multi_seller",
+          metadata: null,
+          line_unit_price: 22000,
+          product_metadata: {
+            gp: {
+              entitlement_profile: {
+                profile_id: "voucher-rezerwacja-otwarta",
+                entitlement_type: "VOUCHER_SERVICE",
+                currency: "PLN",
+                policy: { validity_months: 12, vat_rate_uniqueness: true },
+              },
+            },
+          },
+        },
+      ]
+    )
+
+    await liveIssueEntitlementsWithinTx(client, baseInput(), NOW)
+
+    expect(entitlements.size).toBe(1)
+    const snapshot = JSON.parse([...entitlements.values()][0].policy_snapshot)
+    expect(snapshot.amount_minor).toBe(22000)
   })
 })
 

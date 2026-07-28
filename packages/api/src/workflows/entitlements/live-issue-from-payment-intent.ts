@@ -37,10 +37,10 @@ import { VoucherPostingInvariantError } from "../../modules/voucher/posting-prof
  *      `ON CONFLICT DO NOTHING`
  *      jako PIERWSZY krok transakcji. 0 affected ⇒ event już skonsumowany ⇒
  *      pomiń tworzenie entitlementów (replay/multi-replica = no-op).
- *   2. Czyta recipientów + profil z line-item metadata. ŹRÓDŁO ZAMROŻENIA (finding
- *      L-2): NIE payload płatności (envelope niesie wyłącznie payment_intent_id /
- *      order_id / currency / amount_minor / psp_occurred_at), lecz IMMUTABLE
- *      `order_line_item.metadata` czytane z bieżącego stanu DB. Determinizm
+ *   2. Czyta recipientów + profil z line-item metadata. Dla historycznych linii
+ *      Mercur bez skopiowanego profilu używa `product.metadata.gp.entitlement_profile`,
+ *      ale kwotę bierze ze snapshotu `order_line_item.unit_price`, nigdy z pełnej
+ *      kwoty PaymentIntenta obejmującej wielu sellerów. Determinizm
  *      `recipient_index`/`dedupe_key` opiera się na PRECONDITION ADR-137: metadata
  *      linii (profil + recipients) jest NIEMUTOWALNA po `payment_intent.succeeded`.
  *      Ścieżka redemption/refund/edycji metadata NIE mutuje tych pól (regulamin § 12).
@@ -124,6 +124,8 @@ export type LiveIssueResult = {
 type OrderLineRow = {
   line_item_id: string
   metadata: Record<string, unknown> | null
+  product_metadata: Record<string, unknown> | null
+  line_unit_price: number | null
 }
 
 /** Recipient zamrożony w line-item metadata (immutable, ADR-137). */
@@ -211,11 +213,17 @@ export async function liveIssueEntitlementsWithinTx(
     readNestedString(order?.metadata, ["market_id"]) ??
     null
 
-  // ── voucher line items (immutable metadata = źródło profilu + recipientów) ──
+  // ── voucher line items (snapshot linii + fallback profilu katalogowego) ─────
   const lines = await client.query<OrderLineRow>(
-    `SELECT oli.id AS line_item_id, oli.metadata
+    `SELECT oli.id AS line_item_id,
+            oli.metadata,
+            p.metadata AS product_metadata,
+            oli.unit_price AS line_unit_price
        FROM order_item oi
        JOIN order_line_item oli ON oli.id = oi.item_id
+       LEFT JOIN product p
+         ON p.id = oli.product_id
+        AND p.deleted_at IS NULL
       WHERE oi.order_id = $1
         AND oi.deleted_at IS NULL
         AND oli.deleted_at IS NULL
@@ -226,7 +234,13 @@ export async function liveIssueEntitlementsWithinTx(
   const issued: LiveIssuedEntitlement[] = []
 
   for (const line of lines.rows) {
-    const profile = extractProfile(line.metadata, payload)
+    const profile =
+      extractProfile(line.metadata, payload) ??
+      extractProductProfile(
+        line.product_metadata,
+        line.line_unit_price,
+        payload
+      )
     if (!profile) {
       // H2 (silent-failure na ścieżce finansowej): rozróżnij "linia non-voucher
       // (legalne pominięcie)" od "linia voucherowa bez kompletnego profilu
@@ -235,11 +249,15 @@ export async function liveIssueEntitlementsWithinTx(
       // (w tym `event_processed`), więc Medusa ponawia event / kieruje do DLQ.
       // NIGDY cichy `processed` z zero entitlementów na OPŁACONEJ linii voucherowej
       // (to byłaby utrata realizacji opłaconej usługi — silent financial loss).
-      if (hasVoucherIntent(line.metadata)) {
+      if (
+        hasVoucherIntent(line.metadata) ||
+        hasProductVoucherIntent(line.product_metadata)
+      ) {
         throw new Error(
           `liveIssueEntitlementsWithinTx: linia voucherowa ${line.line_item_id} ` +
-            `(payment_intent ${payload.payment_intent_id}) niesie markery entitlement, ` +
-            `ale profil jest NIEKOMPLETNY (brak profile_id/entitlement_type/policy) — ` +
+            `(payment_intent ${payload.payment_intent_id}) niesie markery entitlement ` +
+            `w linii albo produkcie, ale profil jest NIEKOMPLETNY ` +
+            `(brak profile_id/entitlement_type/policy) — ` +
             `fail-loud (retry/DLQ), NIE ciche pominięcie`
         )
       }
@@ -344,6 +362,13 @@ function hasVoucherIntent(
   return VOUCHER_INTENT_KEYS.some(
     (k) => (metadata as Record<string, unknown>)[k] != null
   )
+}
+
+function hasProductVoucherIntent(
+  metadata: Record<string, unknown> | null | undefined
+): boolean {
+  const gp = readObject(metadata?.gp)
+  return gp?.entitlement_profile != null
 }
 
 /**
@@ -703,6 +728,20 @@ function extractProfile(
     policy,
     currency: readString((metadata as Record<string, unknown>).currency),
     amount_minor: readNumber((metadata as Record<string, unknown>).amount_minor),
+  }
+}
+
+function extractProductProfile(
+  metadata: Record<string, unknown> | null | undefined,
+  lineUnitPrice: number | null,
+  payload: PaymentIntentSucceededPayload
+): ResolvedProfile | null {
+  const embedded = readObject(readObject(metadata?.gp)?.entitlement_profile)
+  if (!isProfileShape(embedded)) return null
+  const profile = normalizeProfile(embedded, payload)
+  return {
+    ...profile,
+    amount_minor: profile.amount_minor ?? readNumber(lineUnitPrice),
   }
 }
 
