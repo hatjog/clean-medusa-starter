@@ -18,6 +18,7 @@ import {
   computeFieldDiffs,
   DryRunCollector,
   parseDryRunFlag,
+  parseForceVendorOverwriteFlag,
   parseOverwriteFlag,
   parsePruneFlag,
 } from "./gp-sync-dry-run"
@@ -83,6 +84,11 @@ export type SellerSyncResult = {
   sellerId: string | null
   action: "created" | "updated" | "skipped"
   note?: string
+  /**
+   * ADR-165 — pola `seed_if_empty`, których `--overwrite` NIE nadpisał, bo
+   * należą do vendora (Case 2/4). Puste/nieobecne przy runie bez `--overwrite`.
+   */
+  ownershipProtectedFields?: string[]
 }
 
 type SplDetail = {
@@ -146,12 +152,35 @@ function formatSeedDiffNote(
     .join("; ")
 }
 
+/**
+ * ADR-165 — dopina do noty listę pól pominiętych przez bramkę własności.
+ * Pominięcie MUSI być widoczne w raporcie; cisza była defektem 4-6-H1.
+ */
+function appendOwnershipProtectedNote(
+  note: string | undefined,
+  ownershipProtectedFields: string[]
+): string | undefined {
+  if (ownershipProtectedFields.length === 0) return note
+
+  const suffix = `vendor-owned (pominięte mimo --overwrite, ADR-165): ${ownershipProtectedFields.join(",")}`
+  return note ? `${note}; ${suffix}` : suffix
+}
+
+function formatOwnershipProtectedWarning(vendorId: string, fields: string[]): string {
+  return (
+    `Vendor '${vendorId}': --overwrite NIE nadpisał pól vendor-owned [${fields.join(", ")}] ` +
+    `(ADR-165: treść vendora wygrywa; gp-config wyłącznie seeduje). ` +
+    `Świadome nadpisanie wymaga GP_FORCE_VENDOR_OVERWRITE=true.`
+  )
+}
+
 function parseArgs(args: string[] | undefined): {
   instanceId: string
   marketId: string
   configRoot: string
   dryRun: boolean
   overwrite: boolean
+  forceVendorOverwrite: boolean
   prune: boolean
 } {
   const instanceId = (args?.[0] ?? process.env.GP_INSTANCE_ID ?? "gp-dev").trim()
@@ -159,13 +188,14 @@ function parseArgs(args: string[] | undefined): {
   const configRoot = (process.env.GP_CONFIG_ROOT ?? path.resolve(process.cwd(), "../config")).trim()
   const dryRun = parseDryRunFlag(args)
   const overwrite = parseOverwriteFlag(args)
+  const forceVendorOverwrite = parseForceVendorOverwriteFlag(args)
   const prune = parsePruneFlag(args)
 
   if (!instanceId) throw new Error("instanceId is required (args[0] or GP_INSTANCE_ID)")
   if (!marketId) throw new Error("marketId is required (args[1] or GP_MARKET_ID)")
   if (!configRoot) throw new Error("configRoot is required (GP_CONFIG_ROOT)")
 
-  return { instanceId, marketId, configRoot, dryRun, overwrite, prune }
+  return { instanceId, marketId, configRoot, dryRun, overwrite, forceVendorOverwrite, prune }
 }
 
 async function readYamlFile<T>(filePath: string): Promise<T> {
@@ -515,6 +545,11 @@ type SeedIfEmptyResult = {
   value: unknown
   shouldWrite: boolean
   isNewSeed: boolean
+  /**
+   * true ⟺ zapis był ŻĄDANY (`--overwrite`), ale bramka własności ADR-165 go
+   * zablokowała. Sygnał do jawnego zaraportowania — pominięcie NIE może być ciche.
+   */
+  ownershipProtected: boolean
 }
 
 /** Deep equality for primitives and JSON-serialisable values (including arrays). */
@@ -527,38 +562,52 @@ function deepEqual(a: unknown, b: unknown): boolean {
   return false
 }
 
+/**
+ * Rozstrzyga własność pojedynczego pola `seed_if_empty` zgodnie z ADR-165
+ * („treść vendor-owned wygrywa"; gp-config WYŁĄCZNIE seeduje).
+ *
+ * Cztery przypadki, sterowane znacznikiem własności `metadata.gp.seeded_fields`:
+ *   - Case 1 — seeded ∧ DB == config      → config pisze (własność nadal po stronie seeda)
+ *   - Case 2 — seeded ∧ DB != config      → vendor edytował → NIE piszemy
+ *   - Case 3 — nie-seeded ∧ DB puste      → seedujemy + zaczynamy śledzić pole
+ *   - Case 4 — nie-seeded ∧ DB niepuste   → vendor-owned od początku → NIE piszemy
+ *
+ * `overwrite` (`--overwrite` / `GP_OVERWRITE`) dotyczy WYŁĄCZNIE Case 1 i 3.
+ * Nie przełamuje Case 2 ani 4 — przed ADR-165 przełamywał oba bezwarunkowo,
+ * co było cichą utratą treści vendora (finding 4-6-H1). Jedynym kanałem, który
+ * je przełamuje, jest `forceVendorOverwrite`.
+ */
 function resolveSeedIfEmpty(
   fieldName: string,
   configValue: unknown,
   dbValue: unknown,
   seededFields: string[],
-  overwrite = false
+  overwrite = false,
+  forceVendorOverwrite = false
 ): SeedIfEmptyResult {
   const isSeeded = seededFields.includes(fieldName)
   const dbEmpty = dbValue === null || dbValue === undefined || dbValue === ""
 
-  if (overwrite) {
-    return { value: configValue, shouldWrite: true, isNewSeed: !isSeeded }
+  // Case 2 (seeded, vendor edytował) i Case 4 (nigdy nie seedowane, niepuste)
+  // to te same semantycznie „pole należy do vendora".
+  const vendorOwned = isSeeded ? !deepEqual(dbValue, configValue) : !dbEmpty
+
+  if (vendorOwned && !forceVendorOverwrite) {
+    return {
+      value: dbValue,
+      shouldWrite: false,
+      isNewSeed: false,
+      // raportujemy tylko gdy ktoś FAKTYCZNIE prosił o nadpisanie — zwykły run
+      // bez flagi to normalna praca seeda, nie pominięcie do zgłoszenia
+      ownershipProtected: overwrite,
+    }
   }
 
-  if (isSeeded) {
-    // Case 1: field tracked AND current DB == config value → apply (config changed, vendor still on config)
-    // Case 2: field tracked AND current DB != config value → skip (vendor edited, preserve)
-    if (deepEqual(dbValue, configValue)) {
-      // values match → config wins (applies even if vendor "reverted")
-      return { value: configValue, shouldWrite: true, isNewSeed: false }
-    } else {
-      // vendor edited → skip
-      return { value: dbValue, shouldWrite: false, isNewSeed: false }
-    }
-  } else {
-    // Case 3: field NOT tracked AND DB empty → seed + track
-    // Case 4: field NOT tracked AND DB non-empty → treat as vendor-owned (never overwrite)
-    if (dbEmpty) {
-      return { value: configValue, shouldWrite: true, isNewSeed: true }
-    } else {
-      return { value: dbValue, shouldWrite: false, isNewSeed: false }
-    }
+  return {
+    value: configValue,
+    shouldWrite: true,
+    isNewSeed: !isSeeded,
+    ownershipProtected: false,
   }
 }
 
@@ -570,7 +619,8 @@ export async function upsertSeller(
   dryRun: boolean,
   marketId: string,
   currencyCode = "pln",
-  overwrite = false
+  overwrite = false,
+  forceVendorOverwrite = false
 ): Promise<SellerSyncResult> {
   const handle = vendor.slug.trim()
   const vendorGallery = normalizeVendorGallery(vendor)
@@ -672,66 +722,72 @@ export async function upsertSeller(
   }
 
   const newlySeededFields: string[] = []
+  // ADR-165 — pola, których `--overwrite` nie ruszył, bo należą do vendora.
+  const ownershipProtectedFields: string[] = []
+
+  const applySeedField = (
+    fieldName: string,
+    configValue: unknown,
+    dbValue: unknown,
+    onWrite: (value: unknown) => void
+  ): void => {
+    const r = resolveSeedIfEmpty(
+      fieldName,
+      configValue,
+      dbValue,
+      seededFields,
+      overwrite,
+      forceVendorOverwrite
+    )
+    if (r.ownershipProtected) ownershipProtectedFields.push(fieldName)
+    if (r.shouldWrite) {
+      onWrite(r.value)
+      if (r.isNewSeed) newlySeededFields.push(fieldName)
+    }
+  }
 
   // name
   if (vendor.display_name !== undefined) {
-    const r = resolveSeedIfEmpty(
+    applySeedField(
       "name",
       vendor.display_name,
       existingGp.name ?? existingSeller.name,
-      seededFields,
-      overwrite
+      (value) => {
+        gpMetaUpdate.name = value
+      }
     )
-    if (r.shouldWrite) {
-      gpMetaUpdate.name = r.value
-      if (r.isNewSeed) newlySeededFields.push("name")
-    }
   }
 
   // description
   if (vendor.description !== undefined) {
-    const r = resolveSeedIfEmpty(
+    applySeedField(
       "description",
       vendor.description,
       existingGp.description ?? existingSeller.description,
-      seededFields,
-      overwrite
+      (value) => {
+        gpMetaUpdate.description = value
+      }
     )
-    if (r.shouldWrite) {
-      gpMetaUpdate.description = r.value
-      if (r.isNewSeed) newlySeededFields.push("description")
-    }
   }
 
   // photo_url
   if (vendor.photo_url !== undefined) {
-    const r = resolveSeedIfEmpty(
+    applySeedField(
       "photo_url",
       vendor.photo_url,
       existingGp.photo_url ?? existingSeller.logo,
-      seededFields,
-      overwrite
+      (value) => {
+        gpMetaUpdate.photo_url = value
+        configWinsPayload.logo = value
+      }
     )
-    if (r.shouldWrite) {
-      gpMetaUpdate.photo_url = r.value
-      configWinsPayload.logo = r.value
-      if (r.isNewSeed) newlySeededFields.push("photo_url")
-    }
   }
 
   // gallery
   if (vendorGallery !== undefined) {
-    const r = resolveSeedIfEmpty(
-      "gallery",
-      vendorGallery,
-      existingGp.gallery,
-      seededFields,
-      overwrite
-    )
-    if (r.shouldWrite) {
-      gpMetaUpdate.gallery = r.value
-      if (r.isNewSeed) newlySeededFields.push("gallery")
-    }
+    applySeedField("gallery", vendorGallery, existingGp.gallery, (value) => {
+      gpMetaUpdate.gallery = value
+    })
   }
 
   if (vendor.locations !== undefined) {
@@ -777,25 +833,46 @@ export async function upsertSeller(
       incomingSeedValues.gallery = vendorGallery
     }
 
-    const note = formatSeedDiffNote(currentSeedValues, incomingSeedValues)
+    const note = appendOwnershipProtectedNote(
+      formatSeedDiffNote(currentSeedValues, incomingSeedValues),
+      ownershipProtectedFields
+    )
     console.log(
       formatDryRunNote(
         `[dry-run] Would UPDATE seller handle='${handle}' id='${existingSeller.id}'`,
         note
       )
     )
-    return { sellerId: existingSeller.id, action: "updated", note }
+    return { sellerId: existingSeller.id, action: "updated", note, ownershipProtectedFields }
   }
 
   await updateSellerRecord(sellerModuleService, existingSeller.id, updatePayload)
-  return { sellerId: existingSeller.id, action: "updated" }
+  return {
+    sellerId: existingSeller.id,
+    action: "updated",
+    ...(ownershipProtectedFields.length > 0
+      ? { note: appendOwnershipProtectedNote(undefined, ownershipProtectedFields) }
+      : {}),
+    ownershipProtectedFields,
+  }
 }
 
 // ---- Default export: Medusa script entrypoint ----
 
 export default async function gpConfigSyncVendors({ container, args }: ExecArgs) {
-  const { instanceId, marketId, configRoot, dryRun, overwrite, prune } = parseArgs(args)
+  const { instanceId, marketId, configRoot, dryRun, overwrite, forceVendorOverwrite, prune } =
+    parseArgs(args)
   const collector = dryRun ? new DryRunCollector() : undefined
+
+  if (forceVendorOverwrite) {
+    // ADR-165 — jedyny kanał, który NADPISUJE treść napisaną przez vendora.
+    // Musi krzyczeć: to nieodwracalna utrata cudzej pracy, nie rutynowy seed.
+    console.warn(
+      "[GP_FORCE_VENDOR_OVERWRITE] UWAGA: pola seed_if_empty należące do vendora " +
+        "(seeded+zmienione lub nigdy nie seedowane) ZOSTANĄ nadpisane wartościami z gp-config. " +
+        "To świadome zniszczenie treści vendora — ADR-165 dopuszcza to wyłącznie tym kanałem."
+    )
+  }
 
   const marketYamlPath = path.resolve(
     configRoot,
@@ -897,8 +974,18 @@ export default async function gpConfigSyncVendors({ container, args }: ExecArgs)
         dryRun,
         marketId,
         currencyCode,
-        overwrite
+        overwrite,
+        forceVendorOverwrite
       )
+
+      // ADR-165 — pominięcia bramki własności muszą być widoczne w raporcie.
+      if (result.ownershipProtectedFields && result.ownershipProtectedFields.length > 0) {
+        pushUniqueWarning(
+          warnings,
+          seenWarnings,
+          formatOwnershipProtectedWarning(vendor.vendor_id, result.ownershipProtectedFields)
+        )
+      }
 
       if (result.action === "created") vendorCounts.created++
       else if (result.action === "updated") vendorCounts.updated++

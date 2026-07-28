@@ -107,6 +107,20 @@ export function parseOverwriteFlag(args?: string[]): boolean {
 }
 
 /**
+ * --force-vendor-overwrite / GP_FORCE_VENDOR_OVERWRITE: ŚWIADOME zniszczenie
+ * treści należącej do vendora.
+ *
+ * ADR-165 („treść vendor-owned wygrywa", ratyfikowany 2026-07-28): gp-config
+ * WYŁĄCZNIE seeduje pola `seed_if_empty` sellera i nigdy nie jest ich
+ * właścicielem. `--overwrite` nie przełamuje tej granicy — pomija pola
+ * vendor-owned i raportuje je jawnie. Ten flag jest jedynym kanałem, który je
+ * przełamuje, i musi być użyty świadomie (fail-loud ostrzeżenie na starcie).
+ */
+export function parseForceVendorOverwriteFlag(args?: string[]): boolean {
+  return parseCliBooleanFlag(args, "--force-vendor-overwrite", "GP_FORCE_VENDOR_OVERWRITE")
+}
+
+/**
  * --prune / GP_SYNC_PRUNE: reconcile DB rows to match config by also REMOVING
  * (soft-delete) rows the config no longer declares — e.g. a vendor's
  * seller-product links to products dropped from its products.yaml. Destructive,
