@@ -64,7 +64,7 @@ type LineFixture = {
   line_item_id: string
   metadata: Record<string, unknown> | null
   product_metadata?: Record<string, unknown> | null
-  line_unit_price?: number | null
+  line_unit_price?: number | string | null
 }
 
 /**
@@ -90,7 +90,11 @@ function makeFakeClient(order: OrderFixture, lines: LineFixture[]) {
         return { rows: [order] as unknown as T[], rowCount: order ? 1 : 0 }
       }
       if (/FROM order_item/i.test(sql)) {
-        return { rows: lines as unknown as T[], rowCount: lines.length }
+        const databaseRows = lines.map((line) => ({
+          ...line,
+          line_unit_price: line.line_unit_price ?? 24900,
+        }))
+        return { rows: databaseRows as unknown as T[], rowCount: databaseRows.length }
       }
       if (/INSERT INTO entitlement_instance/i.test(sql)) {
         const dedupeKey = values[11] as string
@@ -219,7 +223,8 @@ describe("Story 3.3 AC2 — live-issue → L4 ISSUED ze snapshotem (policy + VAT
         {
           line_item_id: "li_legacy_multi_seller",
           metadata: null,
-          line_unit_price: 22000,
+          // Produkcyjny NUMERIC jest przez node-postgres odczytywany jako string.
+          line_unit_price: "22000",
           product_metadata: {
             gp: {
               entitlement_profile: {

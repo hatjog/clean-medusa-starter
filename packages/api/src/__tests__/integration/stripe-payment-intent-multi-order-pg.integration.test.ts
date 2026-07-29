@@ -20,9 +20,8 @@ import { STRIPE_SIGNATURE_HEADER } from "../../api/webhooks/stripe/payment-inten
 import { PAYMENT_INTENT_SUCCEEDED_EVENT } from "../../lib/payment/stripe-payment-intent-event"
 import { liveIssueEntitlementsWithinTx } from "../../workflows/entitlements/live-issue-from-payment-intent"
 
-const ENABLED = process.env.GP_RUN_STRIPE_MULTI_ORDER_PG === "1"
 const DATABASE_URL = process.env.DATABASE_URL
-const runOrSkip = ENABLED && DATABASE_URL ? describe : describe.skip
+const runOrSkip = DATABASE_URL ? describe : describe.skip
 
 const SECRET = "whsec_f2_real_pg"
 const EVENT_ID = "evt_f2_multi_seller"
@@ -168,7 +167,7 @@ runOrSkip("F2 — multi-seller na realnej ścieżce PostgreSQL", () => {
          deleted_at timestamptz
        ) ON COMMIT DROP`,
       `CREATE TEMP TABLE order_line_item (
-         id text PRIMARY KEY, product_id text, unit_price integer NOT NULL,
+         id text PRIMARY KEY, product_id text, unit_price numeric NOT NULL,
          metadata jsonb, deleted_at timestamptz
        ) ON COMMIT DROP`,
       `CREATE TEMP TABLE product (
@@ -206,6 +205,17 @@ runOrSkip("F2 — multi-seller na realnej ścieżce PostgreSQL", () => {
        ) ON COMMIT DROP`,
     ]
     for (const statement of statements) await client.query(statement)
+    // Parity gate: źródłem typu jest migracja Medusa (model.bigNumber() → numeric).
+    expect(
+      (
+        await client.query(
+          `SELECT data_type FROM information_schema.columns
+            WHERE table_schema LIKE 'pg_temp_%'
+              AND table_name = 'order_line_item'
+              AND column_name = 'unit_price'`
+        )
+      ).rows[0]?.data_type
+    ).toBe("numeric")
 
     await client.query(
       `INSERT INTO payment_session (id, payment_collection_id, data)
@@ -320,5 +330,23 @@ runOrSkip("F2 — multi-seller na realnej ścieżce PostgreSQL", () => {
     expect(
       Number((await client.query(`SELECT COUNT(*) AS count FROM entitlement_instance`)).rows[0].count)
     ).toBe(0)
+  })
+
+  it("soft-deleted order w kolekcji nie blokuje aktywnych zamówień", async () => {
+    await client.query(
+      `INSERT INTO "order" (id, sales_channel_id, metadata, deleted_at)
+       VALUES ('order_f2_usuniete', 'sc_seller_a', NULL, NOW())`
+    )
+    await client.query(
+      `INSERT INTO order_payment_collection (order_id, payment_collection_id)
+       VALUES ('order_f2_usuniete', $1)`,
+      [COLLECTION_ID]
+    )
+
+    const delivery = await postThroughRealPath(client, stripeEvent())
+
+    expect(delivery.res.statusCode).toBe(200)
+    expect(delivery.res.body.emitted_count).toBe(2)
+    expect(delivery.res.body.order_ids).toEqual([ORDER_A, ORDER_B])
   })
 })

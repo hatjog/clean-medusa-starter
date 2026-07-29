@@ -47,6 +47,11 @@ if (process.env.TEST_TYPE === "integration:http") {
   module.exports.testMatch = ["**/integration-tests/http/*.spec.[jt]s"];
 } else if (process.env.TEST_TYPE === "integration:modules") {
   module.exports.testMatch = ["**/packages/api/src/modules/*/__tests__/**/*.[jt]s"];
+} else if (process.env.TEST_TYPE === "stripe-multi-order") {
+  // Obowiązkowy, izolowany PG gate ADR-166; DATABASE_URL musi wskazywać DB testową.
+  module.exports.testMatch = [
+    "**/packages/api/src/__tests__/integration/stripe-payment-intent-multi-order-pg.integration.test.[jt]s",
+  ];
 } else if (process.env.TEST_TYPE === "unit") {
   module.exports.testMatch = [
     "**/packages/api/src/**/__tests__/**/*.unit.spec.[jt]s",

@@ -125,7 +125,8 @@ type OrderLineRow = {
   line_item_id: string
   metadata: Record<string, unknown> | null
   product_metadata: Record<string, unknown> | null
-  line_unit_price: number | null
+  /** pg zwraca NUMERIC jako string; nie ufamy deklaracji TypeScript na granicy SQL. */
+  line_unit_price: unknown
 }
 
 /** Recipient zamrożony w line-item metadata (immutable, ADR-137). */
@@ -223,7 +224,6 @@ export async function liveIssueEntitlementsWithinTx(
        JOIN order_line_item oli ON oli.id = oi.item_id
        LEFT JOIN product p
          ON p.id = oli.product_id
-        AND p.deleted_at IS NULL
       WHERE oi.order_id = $1
         AND oi.deleted_at IS NULL
         AND oli.deleted_at IS NULL
@@ -236,11 +236,7 @@ export async function liveIssueEntitlementsWithinTx(
   for (const line of lines.rows) {
     const profile =
       extractProfile(line.metadata, payload) ??
-      extractProductProfile(
-        line.product_metadata,
-        line.line_unit_price,
-        payload
-      )
+      extractProductProfile(line.product_metadata, payload)
     if (!profile) {
       // H2 (silent-failure na ścieżce finansowej): rozróżnij "linia non-voucher
       // (legalne pominięcie)" od "linia voucherowa bez kompletnego profilu
@@ -328,6 +324,8 @@ export async function liveIssueEntitlementsWithinTx(
           lineItemId: line.line_item_id,
           recipient,
           profile,
+          voucherAmountMinor:
+            profile.amount_minor ?? readDatabaseNumber(line.line_unit_price),
           marketId: resolvedMarketId,
           salesChannelId: resolvedSalesChannelId,
         },
@@ -425,6 +423,8 @@ type IssueRowContext = {
   lineItemId: string
   recipient: FrozenRecipient
   profile: ResolvedProfile
+  /** Cena linii SQL; tylko dla snapshotu voucherowego, nigdy dla face value CREDIT_PACK. */
+  voucherAmountMinor: number | undefined
   // H1/M2: rozwiązane fail-loud PRZED wejściem tu (niepuste, nigdy null).
   marketId: string
   salesChannelId: string
@@ -476,10 +476,17 @@ async function issueSingleIssuedRow(
   })
 
   // ── snapshot policy (regulamin § 12 — immutable post-ISSUED) ───────────────
+  // `amount_minor` jest wartością finansową entitlementu, nie faktem PSP.
+  // Brak ceny profilu/linii to anomalia danych: pełna kwota PI mogłaby obejmować
+  // inne zamówienia (ADR-166 pkt 8), więc fallback jest zakazany.
+  const amountMinor = assertPositiveIntegerMinor(
+    ctx.voucherAmountMinor,
+    `amount_minor vouchera (linia ${lineItemId})`
+  )
   const snapshot: EntitlementPolicySnapshot = snapshotPolicy({
     ...profile.policy,
     currency: profile.currency ?? payload.currency,
-    amount_minor: profile.amount_minor ?? payload.amount_minor,
+    amount_minor: amountMinor,
     source_payment_intent_id: payload.payment_intent_id,
     line_item_id: lineItemId,
     recipient_index: recipient.recipient_index,
@@ -733,16 +740,12 @@ function extractProfile(
 
 function extractProductProfile(
   metadata: Record<string, unknown> | null | undefined,
-  lineUnitPrice: number | null,
   payload: PaymentIntentSucceededPayload
 ): ResolvedProfile | null {
   const embedded = readObject(readObject(metadata?.gp)?.entitlement_profile)
   if (!isProfileShape(embedded)) return null
   const profile = normalizeProfile(embedded, payload)
-  return {
-    ...profile,
-    amount_minor: profile.amount_minor ?? readNumber(lineUnitPrice),
-  }
+  return profile
 }
 
 function normalizeProfile(
@@ -885,6 +888,14 @@ function readString(value: unknown): string | undefined {
 
 function readNumber(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined
+}
+
+/** Koercja wyłącznie wartości SQL; pg zwraca NUMERIC jako string. */
+function readDatabaseNumber(value: unknown): number | undefined {
+  if (typeof value === "number") return Number.isFinite(value) ? value : undefined
+  if (typeof value !== "string" || !value.trim()) return undefined
+  const parsed = Number(value)
+  return Number.isFinite(parsed) ? parsed : undefined
 }
 
 function readObject(value: unknown): Record<string, unknown> | undefined {

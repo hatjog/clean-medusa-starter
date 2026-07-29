@@ -180,38 +180,28 @@ export async function POST(
 
   try {
     // ── krok 2: ustal order_id + market_id ────────────────────────────────────
-    // Metadata mają pierwszeństwo i gdy są kompletne, baza nie jest pytana o link.
+    // Link płatności jest źródłem prawdy dla kardynalności także, gdy metadata są
+    // kompletne: pojedyncze metadata.order_id nie może ucinać batcha multi-seller.
     let resolution: PaymentIntentLinkResolution
     let resolvedFromLink = false
-    if (identifiers.order_id && identifiers.market_id) {
-      resolution = {
-        ok: true,
-        orders: [
-          {
-            order_id: identifiers.order_id,
-            market_id: identifiers.market_id,
-            source: { order_id: "metadata", market_id: "metadata" },
-          },
-        ],
-      }
-    } else {
-      try {
-        resolution = await resolvePaymentIntentLink(handle.client, {
-          payment_intent_id: paymentIntentId,
-          order_id: identifiers.order_id,
-          market_id: identifiers.market_id,
-          session_id: identifiers.session_id,
-        })
-      } catch (err) {
-        logger.error?.(
-          `[stripe/payment-intent] rozwiązanie powiązania nieudane dla ` +
-            `${paymentIntentId}: ${(err as Error).message}`
-        )
-        res.status(500).json({ type: "db_unavailable", reason: "link_query_failed" })
-        return
-      }
-      resolvedFromLink = resolution.ok
+    try {
+      resolution = await resolvePaymentIntentLink(handle.client, {
+        payment_intent_id: paymentIntentId,
+        order_id: identifiers.order_id,
+        market_id: identifiers.market_id,
+        session_id: identifiers.session_id,
+      })
+    } catch (err) {
+      logger.error?.(
+        `[stripe/payment-intent] rozwiązanie powiązania nieudane dla ` +
+          `${paymentIntentId}: ${(err as Error).message}`
+      )
+      res.status(500).json({ type: "db_unavailable", reason: "link_query_failed" })
+      return
     }
+    resolvedFromLink = resolution.ok && resolution.orders.some(
+      (order) => order.source.order_id === "payment_session_link"
+    )
 
     if (!resolution.ok) {
       // Defekt DANYCH/KONFIGURACJI, nie transportu — 400 z rozłącznym `reason`,

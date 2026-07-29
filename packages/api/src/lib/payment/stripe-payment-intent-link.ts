@@ -116,6 +116,9 @@ export const RESOLVE_ORDER_BY_PAYMENT_LINK_SQL = `
     JOIN order_payment_collection opc
       ON opc.payment_collection_id = ps.payment_collection_id
      AND opc.deleted_at IS NULL
+    JOIN "order" o
+      ON o.id = opc.order_id
+     AND o.deleted_at IS NULL
    WHERE ps.deleted_at IS NULL
      AND (
            ($1::text IS NOT NULL AND ps.id = $1)
@@ -176,29 +179,31 @@ export async function resolvePaymentIntentLink(
   const metadataMarketId = normalize(hints.market_id)
   const sessionId = normalize(hints.session_id)
 
-  let orderIds = metadataOrderId ? [metadataOrderId] : []
-  let orderIdSource: PaymentIntentLinkSource["order_id"] = "metadata"
+  // Link jest źródłem prawdy dla kardynalności; metadata jest tylko fallbackiem
+  // zanim powstanie link. Dzięki temu pojedyncze metadata.order_id nie ucina batcha.
+  const linked = await client.query<{ order_id: string | null }>(
+    RESOLVE_ORDER_BY_PAYMENT_LINK_SQL,
+    [sessionId ?? null, hints.payment_intent_id]
+  )
+  const linkedOrderIds = unique(
+    linked.rows.map((row) => normalize(row.order_id)).filter(isPresent)
+  ).sort()
+  const orderIds = linkedOrderIds.length > 0
+    ? linkedOrderIds
+    : metadataOrderId ? [metadataOrderId] : []
+  const orderIdSource: PaymentIntentLinkSource["order_id"] =
+    linkedOrderIds.length > 0 ? "payment_session_link" : "metadata"
 
   if (orderIds.length === 0) {
-    const linked = await client.query<{ order_id: string | null }>(
-      RESOLVE_ORDER_BY_PAYMENT_LINK_SQL,
-      [sessionId ?? null, hints.payment_intent_id]
-    )
-    orderIds = unique(
-      linked.rows.map((row) => normalize(row.order_id)).filter(isPresent)
-    ).sort()
-    if (orderIds.length === 0) {
-      return {
-        ok: false,
-        reason: "link_unresolved",
-        detail:
-          `payment_intent ${hints.payment_intent_id} nie niesie order_id w metadata ` +
-          `(metadata.session_id=${sessionId ?? "brak"}) i nie ma powiązania ` +
-          "payment_session → payment_collection → order_payment_collection → order " +
-          "— zdarzenie nie da się przypisać do zamówienia",
-      }
+    return {
+      ok: false,
+      reason: "link_unresolved",
+      detail:
+        `payment_intent ${hints.payment_intent_id} nie niesie order_id w metadata ` +
+        `(metadata.session_id=${sessionId ?? "brak"}) i nie ma powiązania ` +
+        "payment_session → payment_collection → order_payment_collection → order " +
+        "— zdarzenie nie da się przypisać do zamówienia",
     }
-    orderIdSource = "payment_session_link"
   }
 
   const orders: ResolvedPaymentIntentOrder[] = []

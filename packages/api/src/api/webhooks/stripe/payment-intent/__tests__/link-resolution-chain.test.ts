@@ -173,7 +173,8 @@ function makeFixturePg(options: FixtureOptions = {}) {
       }
       if (/FROM order_item/i.test(sql)) {
         const orderLines = options.linesByOrder?.[String(values[0])] ?? lines
-        return { rows: orderLines as unknown as T[], rowCount: orderLines.length }
+        const databaseRows = orderLines.map((line) => ({ ...line, line_unit_price: 25000 }))
+        return { rows: databaseRows as unknown as T[], rowCount: databaseRows.length }
       }
       if (/INSERT INTO entitlement_instance/i.test(sql)) {
         const dedupeKey = values[11] as string
@@ -464,6 +465,27 @@ describe("Story 5.1 AC4 — rozłączne klasy odrzucenia (zero emisji, czytelny 
     expect(
       [...pg.entitlements.values()].map((row) => row.order_id).sort()
     ).toEqual([ORDER_ID, secondOrderId].sort())
+  })
+
+  it("metadata jednego zamówienia NIE ucina batcha z linku", async () => {
+    const secondOrderId = "order_metadata_nie_ucina"
+    const pg = makeFixturePg({
+      linkedOrderIds: [ORDER_ID, secondOrderId],
+      orders: [
+        { order_id: ORDER_ID, metadata: null, sales_channel_id: SALES_CHANNEL_ID, sales_channel_market_id: MARKET_ID },
+        { order_id: secondOrderId, metadata: null, sales_channel_id: "sc_2", sales_channel_market_id: MARKET_ID },
+      ],
+    })
+    const { req, emitted } = makeReq(
+      incidentEvent({ metadata: { session_id: SESSION_ID, order_id: ORDER_ID, market_id: MARKET_ID } }),
+      pg
+    )
+
+    const res = await post(req)
+
+    expect(res.statusCode).toBe(200)
+    expect(res.body.emitted_count).toBe(2)
+    expect(emitted).toHaveLength(2)
   })
 
   it("link wskazuje zamówienia z różnych rynków ⇒ 400 link_ambiguous", async () => {
