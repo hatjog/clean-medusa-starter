@@ -375,13 +375,13 @@ describe("Story 5.1 AC4 — łańcuch webhook → envelope → issuance na realn
 })
 
 describe("Story 5.1 AC4 — rozłączne klasy odrzucenia (zero emisji, czytelny powód)", () => {
-  it("brak linku ⇒ 400 link_unresolved, zero emisji, zero rezerwacji", async () => {
+  it("brak linku ⇒ 503 link_unresolved, zero emisji i retry Stripe", async () => {
     const pg = makeFixturePg({ linkedOrderIds: [] })
     const { req, emitted } = makeReq(incidentEvent(), pg)
 
     const res = await post(req)
 
-    expect(res.statusCode).toBe(400)
+    expect(res.statusCode).toBe(503)
     expect(res.body.type).toBe("unresolved_link")
     expect(res.body.reason).toBe("link_unresolved")
     expect(emitted).toHaveLength(0)

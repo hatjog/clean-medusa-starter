@@ -31,7 +31,8 @@
  *
  * ── Rozłączne klasy odrzucenia (operator ma wiedzieć, co jest zepsute) ──────
  *   400 `invalid_signature`  — zły podpis / brak nagłówka / skew  → KONFIG sekretu
- *   400 `unresolved_link`    — nie da się przypisać zamówienia     → DANE
+ *   503 `unresolved_link`    — zamówienie może jeszcze powstawać   → retry Stripe
+ *   400 `link_ambiguous`     — strukturalnie niejednoznaczne dane  → DANE
  *   400 `invalid_contract`   — koperta niezgodna z kontraktem      → KOD
  *   500 `db_unavailable`     — brak dostępu do bazy                → INFRA (retry)
  *   500 `emit_failed`        — event bus odmówił                   → INFRA (retry)
@@ -204,13 +205,14 @@ export async function POST(
     )
 
     if (!resolution.ok) {
-      // Defekt DANYCH/KONFIGURACJI, nie transportu — 400 z rozłącznym `reason`,
-      // żeby operator nie musiał zgadywać, czy szukać w Stripe, w bazie, czy
-      // w mapie rynków.
+      // `link_unresolved` jest stanem przejściowym: payment_intent.succeeded
+      // może wyprzedzić `completeCart`. 4xx zatrzymuje retry Stripe i zostawia
+      // opłacony voucher bez issuance. `link_ambiguous` oraz pozostałe klasy
+      // są trwałe i pozostają 400, więc nie zacieramy rozróżnienia operatorowi.
       logger.warn?.(
         `[stripe/payment-intent] ${resolution.reason}: ${resolution.detail}`
       )
-      res.status(400).json({
+      res.status(resolution.reason === "link_unresolved" ? 503 : 400).json({
         type: "unresolved_link",
         reason: resolution.reason,
         detail: resolution.detail,

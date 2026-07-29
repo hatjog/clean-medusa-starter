@@ -921,6 +921,28 @@ describe("R-2.3-M3 — kod błędu przeżywa przepakowanie przez moduł Notifica
     expect(sql.dispatch[0].error_code).toBe("BREVO_TEMPLATE_NOT_CONFIGURED")
   })
 
+  it("wyciąga kod z markera zachowanego wyłącznie w zagnieżdżonym cause agregatu Medusy", async () => {
+    const { deps, sql } = makeDeps({
+      dispatchImpl: async () => {
+        const providerError = new Error(
+          `Brevo sender missing ${formatErrorCodeMarker("BREVO_SENDER_NOT_CONFIGURED")}`,
+        )
+        const aggregate = new Error("Failed to send notification with id noti_01") as Error & {
+          cause?: Error
+          errors?: Error[]
+        }
+        aggregate.cause = providerError
+        aggregate.errors = [providerError]
+        throw aggregate
+      },
+    })
+
+    const result = await handleVoucherPurchaseDelivery(envelope("ISSUED"), deps)
+
+    expect(result.error_code).toBe("BREVO_SENDER_NOT_CONFIGURED")
+    expect(sql.dispatch[0].error_code).toBe("BREVO_SENDER_NOT_CONFIGURED")
+  })
+
   it("rozróżnia FLOW_DISABLED od awarii szablonu (sygnał kierunkowy dla triage'u)", async () => {
     const { deps, sql } = makeDeps({
       dispatchImpl: async () => {
