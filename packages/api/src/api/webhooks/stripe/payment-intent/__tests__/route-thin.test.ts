@@ -138,6 +138,26 @@ function makeReq(rawBody: string, sigHeader: string | undefined) {
         deliveries.add(key)
         return { rows: [], rowCount: 1 }
       }
+      // Kontekst rynkowy zamówienia. Route po ADR-166 rozwiązuje `market_id`
+      // ZAWSZE przez zamówienie — także wtedy, gdy metadata je niesie — bo
+      // metadata są mutowalne z zewnątrz, a rynek decyduje o izolacji najemcy.
+      // Bez tego wiersza rezolucja kończy się `order_not_found`, czyli test
+      // mierzyłby brak fixture'a, a nie kontrakt route'u.
+      if (/AS order_id/i.test(sql) && /sales_channel/i.test(sql)) {
+        return {
+          rows: [
+            {
+              order_id: "order_4421",
+              order_metadata: { gp: { market_id: "bonbeauty" } },
+              sales_channel_id: "sc_bonbeauty",
+              sales_channel_market_id: "bonbeauty",
+            },
+          ],
+          rowCount: 1,
+        }
+      }
+      // Link płatność→zamówienie: pusto, żeby ten przypadek testował ścieżkę
+      // fallbacku na `metadata.order_id` (sesja bez linku jeszcze nie istnieje).
       return { rows: [], rowCount: 0 }
     },
     release: () => {},
@@ -161,7 +181,7 @@ function makeReq(rawBody: string, sigHeader: string | undefined) {
 }
 
 describe("Story 3.3 AC1 — POST route cienki (verify + emit, ZERO biznes-logiki)", () => {
-  it("poprawna sygnatura + kompletne metadata ⇒ 200 + emit, BEZ zapytania o powiązanie", async () => {
+  it("poprawna sygnatura + kompletne metadata ⇒ 200 + emit; powiązanie ODPYTANE, biznes-logika NIE", async () => {
     process.env.STRIPE_WEBHOOK_SECRET = SECRET
     const raw = JSON.stringify(stripePiEvent())
     const { req, emitted, resolved, sqlSeen } = makeReq(raw, signedHeader(raw))
@@ -182,11 +202,21 @@ describe("Story 3.3 AC1 — POST route cienki (verify + emit, ZERO biznes-logiki
     // Dozwolone zależności route'u — dokładnie trzy, nic ponadto.
     expect(new Set(resolved)).toEqual(new Set(["logger", "__pg_pool__", Modules.EVENT_BUS]))
 
-    // Metadata były kompletne ⇒ powiązanie NIE jest odpytywane; jedyny SQL to
-    // rezerwacja dostawy (idempotencja transportu).
-    expect(sqlSeen).toHaveLength(1)
-    expect(sqlSeen[0]).toMatch(/INSERT INTO webhook_event_processed/i)
-    expect(sqlSeen.some((s) => /payment_session|entitlement_instance/i.test(s))).toBe(false)
+    // KOREKTA (2026-07-30): poprzednia wersja tego bloku asertowała
+    // `sqlSeen.toHaveLength(1)` i brak dotknięcia `payment_session` — czyli
+    // kontrakt SPRZED ADR-166. Docblock tego pliku został poprawiony przy
+    // story 5.1 AC4, a asercje NIE — i test był czerwony. Route rozwiązuje
+    // powiązanie płatność→zamówienie ZAWSZE (metadata są tylko fallbackiem na
+    // `order_id`, a `market_id` i tak weryfikuje przez zamówienie), więc
+    // odczyty SĄ oczekiwane. Niezmiennik „cienkości" pilnujemy przez BRAK
+    // biznes-logiki, nie przez zakaz SQL-a na własnych tabelach.
+    expect(sqlSeen.some((s) => /FROM payment_session/i.test(s))).toBe(true)
+    expect(sqlSeen.some((s) => /AS order_id/i.test(s) && /sales_channel/i.test(s))).toBe(true)
+    expect(sqlSeen.some((s) => /INSERT INTO webhook_event_processed/i.test(s))).toBe(true)
+    // Granica, która NAPRAWDĘ chroni ADR-118: route nie sięga do tabel domeny
+    // voucherów ani nie tworzy entitlementu — to zadanie subscribera.
+    expect(sqlSeen.some((s) => /entitlement_instance|voucher_/i.test(s))).toBe(false)
+    expect(sqlSeen.some((s) => /^\s*(BEGIN|COMMIT)/im.test(s))).toBe(false)
   })
 
   it("niepoprawna sygnatura ⇒ 400 + BRAK emit", async () => {
