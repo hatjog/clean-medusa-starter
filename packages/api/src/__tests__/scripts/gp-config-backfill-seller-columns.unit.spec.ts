@@ -18,6 +18,7 @@ import path from 'node:path'
 
 import gpConfigBackfillSellerColumns, {
   BACKFILL_APPLY_ENV,
+  BACKFILL_APPLY_POSITIONAL,
   planSellerColumnBackfill,
 } from '../../scripts/gp-config-backfill-seller-columns'
 
@@ -150,12 +151,13 @@ describe('gpConfigBackfillSellerColumns — entrypoint', () => {
     expect(summary.plans[0].columns).toEqual({ description: SEEDED_DESCRIPTION })
   })
 
-  it('z --apply zapisuje kolumnę', async () => {
+  it('z obiema połówkami kanału zapisuje kolumnę', async () => {
+    process.env[BACKFILL_APPLY_ENV] = 'true'
     const service = makeService([needsBackfill()])
 
     const summary = await gpConfigBackfillSellerColumns({
       container: makeContainer(service),
-      args: ['bonbeauty', '--apply'],
+      args: ['bonbeauty', BACKFILL_APPLY_POSITIONAL],
     } as any)
 
     expect(service.update).toHaveBeenCalledWith('seller-studio-nova', {
@@ -165,6 +167,7 @@ describe('gpConfigBackfillSellerColumns — entrypoint', () => {
   })
 
   it('jest idempotentny — drugi przebieg nie ma nic do zrobienia', async () => {
+    process.env[BACKFILL_APPLY_ENV] = 'true'
     const repaired = seller(
       { description: SEEDED_DESCRIPTION },
       { seeded_fields: ['description'], description: SEEDED_DESCRIPTION }
@@ -173,7 +176,7 @@ describe('gpConfigBackfillSellerColumns — entrypoint', () => {
 
     const summary = await gpConfigBackfillSellerColumns({
       container: makeContainer(service),
-      args: ['bonbeauty', '--apply'],
+      args: ['bonbeauty', BACKFILL_APPLY_POSITIONAL],
     } as any)
 
     expect(service.update).not.toHaveBeenCalled()
@@ -181,6 +184,7 @@ describe('gpConfigBackfillSellerColumns — entrypoint', () => {
   })
 
   it('filtruje po markecie — nie dotyka sellerów innego marketu', async () => {
+    process.env[BACKFILL_APPLY_ENV] = 'true'
     const other = seller(
       {},
       { market_id: 'mercur', seeded_fields: ['description'], description: SEEDED_DESCRIPTION }
@@ -189,7 +193,7 @@ describe('gpConfigBackfillSellerColumns — entrypoint', () => {
 
     const summary = await gpConfigBackfillSellerColumns({
       container: makeContainer(service),
-      args: ['bonbeauty', '--apply'],
+      args: ['bonbeauty', BACKFILL_APPLY_POSITIONAL],
     } as any)
 
     expect(summary.scanned).toBe(0)
@@ -216,7 +220,7 @@ describe('gpConfigBackfillSellerColumns — entrypoint', () => {
       expect(summary.planned).toBe(1)
     })
 
-    it('z kanałem GP_BACKFILL_APPLY=true — zapis, bez żadnej flagi w argv', async () => {
+    it('samo odziedziczone GP_BACKFILL_APPLY=true zostaje planem i jest głośno ignorowane', async () => {
       process.env[BACKFILL_APPLY_ENV] = 'true'
       const service = makeService([needsBackfill()])
 
@@ -225,11 +229,25 @@ describe('gpConfigBackfillSellerColumns — entrypoint', () => {
         args: ['bonbeauty'],
       } as any)
 
+      expect(service.update).not.toHaveBeenCalled()
+      expect(summary.apply).toBe(false)
+      expect(summary.applied).toBe(0)
+      expect(summary.warnings[0]).toContain('ZIGNOROWANE')
+    })
+
+    it('token + GP_BACKFILL_APPLY=true razem włączają zapis', async () => {
+      process.env[BACKFILL_APPLY_ENV] = 'true'
+      const service = makeService([needsBackfill()])
+
+      const summary = await gpConfigBackfillSellerColumns({
+        container: makeContainer(service),
+        args: ['bonbeauty', BACKFILL_APPLY_POSITIONAL],
+      } as any)
+
       expect(service.update).toHaveBeenCalledWith('seller-studio-nova', {
         description: SEEDED_DESCRIPTION,
       })
       expect(summary.apply).toBe(true)
-      expect(summary.applied).toBe(1)
     })
 
     it('wartość inna niż prawdziwościowa NIE włącza zapisu (bezpieczna domyślność)', async () => {
@@ -264,17 +282,19 @@ describe('gpConfigBackfillSellerColumns — entrypoint', () => {
 
       const printed = logSpy.mock.calls.map((call) => String(call[0])).join('\n')
       expect(printed).toContain(`${BACKFILL_APPLY_ENV}=true`)
+      expect(printed).toContain(BACKFILL_APPLY_POSITIONAL)
       expect(printed).not.toContain('Re-run with --apply')
     })
   })
 
   it('błąd zapisu jest głośny: warning + niezerowy kod wyjścia', async () => {
+    process.env[BACKFILL_APPLY_ENV] = 'true'
     const service = makeService([needsBackfill()])
     service.update.mockRejectedValue(new Error('db down'))
 
     const summary = await gpConfigBackfillSellerColumns({
       container: makeContainer(service),
-      args: ['bonbeauty', '--apply'],
+      args: ['bonbeauty', BACKFILL_APPLY_POSITIONAL],
     } as any)
 
     expect(summary.ok).toBe(false)

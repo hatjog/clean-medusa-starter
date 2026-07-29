@@ -386,6 +386,7 @@ export async function withStageEnv<T>(
   action: () => Promise<T>
 ): Promise<T> {
   const previous = {
+    GP_BACKFILL_APPLY: process.env.GP_BACKFILL_APPLY,
     GP_CONFIG_ROOT: process.env.GP_CONFIG_ROOT,
     GP_DRY_RUN: process.env.GP_DRY_RUN,
     GP_FORCE_VENDOR_OVERWRITE: process.env.GP_FORCE_VENDOR_OVERWRITE,
@@ -396,6 +397,9 @@ export async function withStageEnv<T>(
   }
 
   process.env.GP_CONFIG_ROOT = orchestratorArgs.configRoot
+  // Orchestrator nie ma kroku backfillu; odziedziczony kanał zapisu nie może
+  // zostać przypadkiem odczytany przez żaden etap uruchamiany in-process.
+  process.env.GP_BACKFILL_APPLY = "false"
   process.env.GP_DRY_RUN = orchestratorArgs.dryRun ? "true" : "false"
   process.env.GP_INSTANCE_ID = orchestratorArgs.instanceId
   process.env.GP_MARKET_ID = orchestratorArgs.marketId
@@ -414,6 +418,9 @@ export async function withStageEnv<T>(
   try {
     return await action()
   } finally {
+    if (previous.GP_BACKFILL_APPLY === undefined) delete process.env.GP_BACKFILL_APPLY
+    else process.env.GP_BACKFILL_APPLY = previous.GP_BACKFILL_APPLY
+
     if (previous.GP_CONFIG_ROOT === undefined) delete process.env.GP_CONFIG_ROOT
     else process.env.GP_CONFIG_ROOT = previous.GP_CONFIG_ROOT
 

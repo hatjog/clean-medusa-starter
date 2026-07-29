@@ -366,6 +366,15 @@ describe("withStageEnv — normalizacja kanałów destrukcyjnych (V1)", () => {
     await withStageEnv(STAGE_ARGS, async () => undefined)
     expect(process.env.GP_FORCE_VENDOR_OVERWRITE).toBeUndefined()
   })
+
+  it("neutralizuje odziedziczone GP_BACKFILL_APPLY na granicy etapu", async () => {
+    process.env.GP_BACKFILL_APPLY = "true"
+
+    const seen = await withStageEnv(STAGE_ARGS, async () => process.env.GP_BACKFILL_APPLY)
+
+    expect(seen).toBe("false")
+    expect(process.env.GP_BACKFILL_APPLY).toBe("true")
+  })
 })
 
 describe("kanał --force-vendor-overwrite jest OSIĄGALNY przez orchestrator (W3)", () => {

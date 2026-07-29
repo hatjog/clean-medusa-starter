@@ -32,7 +32,7 @@
  * niż w `gp-config-sync-*`: skrypt naprawczy uruchamia się rzadko, zwykle na
  * bazie, o której ktoś już się martwi.
  *
- * ## Kanał zapisu: `GP_BACKFILL_APPLY` (cykl 7 R8)
+ * ## Kanał zapisu: `backfill-apply` ∧ `GP_BACKFILL_APPLY=true`
  *
  * `medusa exec` parsuje argv yargs-em w trybie STRICT i odrzuca nieznane
  * flagi ZANIM dotrą do skryptu:
@@ -43,12 +43,12 @@
  * Separator `--` też nie pomaga. Udokumentowana wcześniej forma `--apply`
  * była więc nieosiągalna przez jedyną drogę uruchomienia, czyli skrypt nigdy
  * nie mógł zapisać — był w praktyce wyłącznie planem, mimo że jego jedynym
- * celem jest zapis. Kanałem operatorskim jest zmienna środowiskowa, tym samym
- * wzorcem, co `GP_OVERWRITE` / `GP_SYNC_PRUNE` / `GP_DRY_RUN`.
+ * celem jest zapis. Kanałem operatorskim jest token pozycyjny wraz ze zmienną
+ * środowiskową. Sama odziedziczona zmienna nie może zamienić planu w zapis:
+ * obowiązuje koniunkcja argv ∧ env, tak jak dla kanału ADR-165.
  *
- * Flaga `--apply` żyje dalej w argv jako alias dla wywołań BEZPOŚREDNICH
- * (testy, import programistyczny) — nie jest formą operatorską i nie jest
- * pokazywana jako użycie.
+ * `--apply` nie jest kanałem: strict yargs `medusa exec` go odrzuca. Token
+ * `backfill-apply` nie ma myślnika, więc przechodzi do skryptu.
  *
  * ## Użycie
  *
@@ -56,7 +56,7 @@
  *   pnpm gp-config-backfill-seller-columns bonbeauty
  *
  *   # zapis:
- *   GP_BACKFILL_APPLY=true pnpm gp-config-backfill-seller-columns bonbeauty
+ *   GP_BACKFILL_APPLY=true pnpm gp-config-backfill-seller-columns bonbeauty backfill-apply
  *
  * Bez `marketId` obejmuje wszystkich sellerów; z `marketId` — tylko tych
  * z `metadata.gp.market_id === marketId`.
@@ -67,13 +67,46 @@ import { ExecArgs } from "@medusajs/framework/types"
 // Jedna implementacja zapisu sellera dla obu skryptów — wariantów metod update
 // w module sellera jest trzy i nie chcemy drugiego miejsca do rozjechania.
 import { updateSellerRecord } from "./gp-config-sync-vendors"
-// Ta sama implementacja kanału boolean, co w `gp-config-sync-*` — jeden parser
-// „flaga argv LUB zmienna środowiskowa", żeby domyślności nie rozjechały się
-// między skryptami.
-import { parseCliBooleanFlag } from "./gp-sync-dry-run"
-
 /** Kanał środowiskowy włączający ZAPIS. Bez niego skrypt jest planem. */
 export const BACKFILL_APPLY_ENV = "GP_BACKFILL_APPLY"
+/** Pozycyjna połowa intencji; przechodzi przez strict yargs `medusa exec`. */
+export const BACKFILL_APPLY_POSITIONAL = "backfill-apply"
+
+export type BackfillApplyDecision = {
+  enabled: boolean
+  ignoredReason?: string
+}
+
+/**
+ * Kanał zapisu jest dwustronny: token argv oznacza intencję konkretnego runu,
+ * a env jest jawnym potwierdzeniem. Sama odziedziczona zmienna nie może
+ * zamienić planu w zapis.
+ */
+export function resolveBackfillApply(args?: string[]): BackfillApplyDecision {
+  const intentInArgs = args?.includes(BACKFILL_APPLY_POSITIONAL) === true
+  const rawEnv = (process.env[BACKFILL_APPLY_ENV] ?? "").trim().toLowerCase()
+  const envEnabled = rawEnv === "true" || rawEnv === "1" || rawEnv === "yes" || rawEnv === "on"
+
+  if (intentInArgs && envEnabled) return { enabled: true }
+  if (envEnabled) {
+    return {
+      enabled: false,
+      ignoredReason:
+        `${BACKFILL_APPLY_ENV}='${rawEnv}' ZIGNOROWANE: brak jawnej intencji ` +
+        `'${BACKFILL_APPLY_POSITIONAL}' w argumentach. Kanał zapisu jest DWUSTRONNY, ` +
+        "więc odziedziczona zmienna nie zmienia planu w zapis.",
+    }
+  }
+  if (intentInArgs) {
+    return {
+      enabled: false,
+      ignoredReason:
+        `'${BACKFILL_APPLY_POSITIONAL}' ZIGNOROWANE: brak potwierdzenia ` +
+        `${BACKFILL_APPLY_ENV}=true. Kanał zapisu jest DWUSTRONNY.`,
+    }
+  }
+  return { enabled: false }
+}
 
 /** Pola seedowane, które mają WŁASNĄ kolumnę encji: rejestr → kolumna. */
 const COLUMN_BACKED_SEED_FIELDS = [
@@ -185,10 +218,8 @@ async function listSellers(sellerModuleService: any): Promise<Record<string, unk
 export default async function gpConfigBackfillSellerColumns({ container, args }: ExecArgs) {
   const positional = (args ?? []).filter((arg) => !arg.startsWith("--"))
   const marketId = (positional[0] ?? process.env.GP_MARKET_ID ?? "").trim() || null
-  // `--apply` w argv jest nieosiągalne przez `medusa exec` (yargs strict
-  // odrzuca nieznane flagi), więc kanałem operatorskim jest `GP_BACKFILL_APPLY`.
-  // Alias argv zostaje dla wywołań bezpośrednich — patrz docblock.
-  const apply = parseCliBooleanFlag(args, "--apply", BACKFILL_APPLY_ENV)
+  const applyDecision = resolveBackfillApply(args)
+  const apply = applyDecision.enabled
 
   const summary: SellerColumnBackfillSummary = {
     ok: true,
@@ -199,7 +230,7 @@ export default async function gpConfigBackfillSellerColumns({ container, args }:
     applied: 0,
     skipped: { column_not_empty: 0, not_seeded: 0, registry_empty: 0 },
     plans: [],
-    warnings: [],
+    warnings: applyDecision.ignoredReason ? [applyDecision.ignoredReason] : [],
   }
 
   const sellerModuleService = resolveService(container, [
@@ -249,7 +280,7 @@ export default async function gpConfigBackfillSellerColumns({ container, args }:
   if (!apply && summary.planned > 0) {
     console.log(
       `\n${summary.planned} seller(s) require a backfill. ` +
-        `Re-run with ${BACKFILL_APPLY_ENV}=true to write.`
+        `Re-run with ${BACKFILL_APPLY_ENV}=true and ${BACKFILL_APPLY_POSITIONAL} to write.`
     )
   }
 
