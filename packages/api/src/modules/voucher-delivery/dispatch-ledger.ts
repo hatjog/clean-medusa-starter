@@ -914,6 +914,10 @@ export class PgDispatchLedger
               updated_at = $2
         WHERE status = 'failed'
           AND attempt_count >= $1
+          -- Tylko historyczny summary z utraconą diagnostyką. Gdy późniejsza
+          -- próba zapisała konkretny błąd providera, jej budżet pozostaje
+          -- normalnie ograniczony nawet jeśli pierwsza porażka była globalna.
+          AND error_code = 'VOUCHER_DELIVERY_DISPATCH_FAILED'
           AND first_error_code IS NOT NULL
           AND (
             first_error_code IN (${codePlaceholders})

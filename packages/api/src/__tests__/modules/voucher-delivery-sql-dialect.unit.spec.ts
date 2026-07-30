@@ -347,6 +347,7 @@ describe("Story 2.5 — SQL sweepa jest wykonywalny przez REALNY formatter Knexa
       const release = calls.find((call) => call.sql.includes("SET attempt_count = LEAST"))
       expect(release).toBeDefined()
       const sql = (release as Call).sql.replace(/\s+/g, " ")
+      expect(sql).toContain("AND error_code = 'VOUCHER_DELIVERY_DISPATCH_FAILED'")
       expect(sql).toContain("AND first_error_code IS NOT NULL")
       expect(sql).toContain("first_error_code LIKE '%\\_NOT\\_CONFIGURED'")
       expect(sql).toContain("AND attempt_count >= ?")

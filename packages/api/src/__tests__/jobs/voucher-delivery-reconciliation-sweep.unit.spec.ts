@@ -264,6 +264,7 @@ class FakeSql implements DispatchLedgerSql {
         (row) =>
           row.status === "failed" &&
           Number(row.attempt_count ?? 0) >= maxAttemptCount &&
+          row.error_code === "VOUCHER_DELIVERY_DISPATCH_FAILED" &&
           (globalCodes.includes(String(row.first_error_code)) ||
             String(row.first_error_code).endsWith("_NOT_CONFIGURED")),
       )
@@ -1499,6 +1500,28 @@ describe("R-2.5-H3 — awaria GLOBALNA nie zużywa budżetu prób", () => {
     expect(report.recovered).toBe(1)
     expect(dispatchCalls).toHaveLength(1)
     expect(sql.dispatch[0]).toMatchObject({ status: "sent", attempt_count: SWEEP_MAX_ATTEMPT_COUNT })
+  })
+
+  it("nie odparkuje późniejszego realnego błędu providera tylko dlatego, że pierwsza porażka była konfiguracyjna", async () => {
+    const { deps, sql, dispatchCalls } = makeHarness({
+      entitlements: [issuedEntitlement("ent_real_failure_after_config")],
+      dispatchRows: [
+        {
+          dispatch_id: "dispatch-real-failure-after-config",
+          entitlement_id: "ent_real_failure_after_config",
+          status: "failed",
+          error_code: "BREVO_SEND_FAILED",
+          first_error_code: "BREVO_SENDER_NOT_CONFIGURED",
+          attempt_count: SWEEP_MAX_ATTEMPT_COUNT,
+        },
+      ],
+    })
+
+    const report = await runVoucherDeliveryReconciliationSweep(deps)
+
+    expect(report.attempt_budget_released).toBe(0)
+    expect(dispatchCalls).toHaveLength(0)
+    expect(sql.dispatch[0].attempt_count).toBe(SWEEP_MAX_ATTEMPT_COUNT)
   })
 
   it("`FLOW_DISABLED` zwraca próbę: `attempt_count` nie rośnie między przebiegami", async () => {
