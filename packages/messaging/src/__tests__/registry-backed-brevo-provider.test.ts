@@ -50,9 +50,16 @@ describe("RegistryBackedBrevoProvider", () => {
   it("klucz Z rejestru, ale brevo: not_configured → ten sam fail-loud, zero wysyłki", async () => {
     // Regresja-guard: gdyby ktoś dodał fallback na „domyślny szablon", ten test
     // zacznie failować (mock zostałby wywołany).
+    //
+    // Locale MUSI być takie, które rejestr faktycznie ma jako `not_configured`.
+    // Do ADR-168 był to `pl-PL`; po wyrównaniu rejestru z realnym kontem Brevo
+    // (pl/en dostały ID 4/3 i 2/1) niedostępne pozostają `ua`/`de` — waive członu
+    // B story 4.6, carry-out do v1.15.0. Test celuje więc w `uk-UA`: sprawdza tę
+    // samą własność (klucz jest w rejestrze, locale nie ma szablonu) na locale,
+    // które jest niedostępne DECYZJĄ, a nie przez zastany dryf.
     const { provider, sendTransacEmail } = makeProvider();
 
-    const error = await provider.send(intent()).catch((e) => e);
+    const error = await provider.send(intent({ locale: "uk-UA" })).catch((e) => e);
 
     expect(error.error_code).toBe("BREVO_TEMPLATE_NOT_CONFIGURED");
     expect(sendTransacEmail).not.toHaveBeenCalled();

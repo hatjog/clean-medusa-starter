@@ -199,9 +199,21 @@ describe("AC2/AC5 — allowlista rejestru i zero wysyłki spoza niej", () => {
   it("klucz Z rejestru z brevo: not_configured → ten sam fail-loud, zero wysyłki", async () => {
     const { service, sendTransacEmail } = makeService({ [BREVO_API_KEY_ENV]: "x" })
 
-    await expect(service.send(baseNotification() as never)).rejects.toThrow(
-      /BREVO_TEMPLATE_NOT_CONFIGURED/,
-    )
+    // Locale MUSI być realnie `not_configured` w rejestrze. Do ADR-168 pasowało
+    // domyślne `pl`; po wyrównaniu rejestru z kontem Brevo `pl`/`en` mają ID,
+    // a niedostępne pozostają `ua`/`de` (waive członu B 4.6 → v1.15.0).
+    await expect(
+      service.send(
+        baseNotification({
+          data: {
+            template_key: NOTIFICATION_TEMPLATE_KEYS.VOUCHER_PURCHASE_CONFIRMATION,
+            market_id: "bonbeauty",
+            locale: "ua",
+            voucher_code: "ABC-123",
+          },
+        }) as never,
+      ),
+    ).rejects.toThrow(/BREVO_TEMPLATE_NOT_CONFIGURED/)
     expect(sendTransacEmail).not.toHaveBeenCalled()
   })
 
@@ -219,21 +231,35 @@ describe("AC2/AC5 — allowlista rejestru i zero wysyłki spoza niej", () => {
     expect(sendTransacEmail).not.toHaveBeenCalled()
   })
 
-  it("cały rejestr przechodzi przez wrapper bez ANI JEDNEJ wysyłki (stan v1.14.0)", async () => {
+  // Ten test pilnował „ani jednej wysyłki z całego rejestru" w czasach, gdy KAŻDY
+  // wpis był `not_configured`. Po ADR-168 taki stan globalny już nie zachodzi, a
+  // asercja przywiązana do niego przestałaby cokolwiek dowodzić. Właściwość, o
+  // którą naprawdę chodzi — rejestr JEST allowlistą — jest testowana z obu stron.
+  it("rejestr jest allowlistą: locale bez szablonu nie dotyka klienta, locale z szablonem przechodzi", async () => {
     const { service, sendTransacEmail } = makeService({ [BREVO_API_KEY_ENV]: "x" })
 
+    // Strona zamknięta: `ua` jest `not_configured` dla CAŁEGO rejestru (waive
+    // członu B 4.6), więc żaden klucz nie ma prawa dotknąć klienta Brevo.
     for (const templateKey of Object.values(NOTIFICATION_TEMPLATE_KEYS)) {
       await expect(
         service.send(
           baseNotification({
             template: templateKey,
-            data: { template_key: templateKey, market_id: "bonbeauty", locale: "pl" },
+            data: { template_key: templateKey, market_id: "bonbeauty", locale: "ua" },
           }) as never,
         ),
       ).rejects.toThrow(/BREVO_TEMPLATE_NOT_CONFIGURED/)
     }
 
     expect(sendTransacEmail).toHaveBeenCalledTimes(0)
+
+    // Strona otwarta: kanoniczny klucz w `pl` MA szablon (ADR-168), więc
+    // allowlista go przepuszcza. Dowodem jest DOTKNIĘCIE klienta — samo „rzuca"
+    // by nie wystarczyło, bo mock i tak nie zwraca odpowiedzi Brevo.
+    await expect(service.send(baseNotification() as never)).rejects.toThrow(
+      /BREVO_PROVIDER_ERROR/,
+    )
+    expect(sendTransacEmail).toHaveBeenCalledTimes(1)
   })
 })
 
