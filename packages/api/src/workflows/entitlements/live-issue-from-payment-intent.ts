@@ -127,6 +127,16 @@ type OrderLineRow = {
   product_metadata: Record<string, unknown> | null
   /** pg zwraca NUMERIC jako string; nie ufamy deklaracji TypeScript na granicy SQL. */
   line_unit_price: unknown
+  /**
+   * Dane sprzedawcy i tytuł usługi — nośnik `voucher.seller_*` / `product_title`
+   * przy genezie kodu (patrz `issueVoucherCodeWithinTx`). Kolumny są NOT NULL w
+   * `voucher`, więc brak któregokolwiek MUSI być widoczny, nie łatany pustym
+   * stringiem: pusty „Salon" w mailu to dokładnie ten defekt, który tu domykamy.
+   */
+  line_title: string | null
+  seller_id: string | null
+  seller_name: string | null
+  seller_handle: string | null
 }
 
 /** Recipient zamrożony w line-item metadata (immutable, ADR-137). */
@@ -219,11 +229,20 @@ export async function liveIssueEntitlementsWithinTx(
     `SELECT oli.id AS line_item_id,
             oli.metadata,
             p.metadata AS product_metadata,
-            oli.unit_price AS line_unit_price
+            oli.unit_price AS line_unit_price,
+            COALESCE(oli.title, p.title) AS line_title,
+            s.id     AS seller_id,
+            s.name   AS seller_name,
+            s.handle AS seller_handle
        FROM order_item oi
        JOIN order_line_item oli ON oli.id = oi.item_id
        LEFT JOIN product p
          ON p.id = oli.product_id
+       LEFT JOIN product_product_seller_seller pss
+         ON pss.product_id = oli.product_id
+        AND pss.deleted_at IS NULL
+       LEFT JOIN seller s
+         ON s.id = pss.seller_id
       WHERE oi.order_id = $1
         AND oi.deleted_at IS NULL
         AND oli.deleted_at IS NULL
@@ -328,6 +347,10 @@ export async function liveIssueEntitlementsWithinTx(
             profile.amount_minor ?? readDatabaseNumber(line.line_unit_price),
           marketId: resolvedMarketId,
           salesChannelId: resolvedSalesChannelId,
+          lineTitle: line.line_title,
+          sellerId: line.seller_id,
+          sellerName: line.seller_name,
+          sellerHandle: line.seller_handle,
         },
         now
       )
@@ -428,6 +451,38 @@ type IssueRowContext = {
   // H1/M2: rozwiązane fail-loud PRZED wejściem tu (niepuste, nigdy null).
   marketId: string
   salesChannelId: string
+  /** Nośniki `voucher.*` NOT NULL — patrz `issueVoucherCodeWithinTx`. */
+  lineTitle: string | null
+  sellerId: string | null
+  sellerName: string | null
+  sellerHandle: string | null
+}
+
+/**
+ * Alfabet kodu vouchera BEZ znaków dwuznacznych (0/O, 1/I/L). Kod bywa
+ * przepisywany z ekranu telefonu albo dyktowany przez telefon w salonie, więc
+ * `0` nieodróżnialne od `O` to realny koszt obsługi, nie estetyka.
+ */
+const VOUCHER_CODE_ALPHABET = "23456789ABCDEFGHJKMNPQRSTUVWXYZ"
+
+/**
+ * Kod vouchera jest DETERMINISTYCZNY z `entitlement_dedupe_key`.
+ *
+ * Ścieżka webhooka jest ponawialna (Stripe retry, DLQ, `stripe events resend`),
+ * a `voucher.code` jest kluczem głównym. Losowy kod przy ponowieniu albo
+ * wywróciłby transakcję na kolizji, albo — gorzej — wydał DRUGI kod na to samo
+ * opłacone wydanie. Wyprowadzenie z klucza dedupe daje idempotencję za darmo:
+ * ten sam entitlement zawsze wskazuje ten sam kod, a `ON CONFLICT DO NOTHING`
+ * czyni powtórzony INSERT no-opem.
+ */
+function buildVoucherCode(dedupeKey: string, marketId: string): string {
+  const prefix = (marketId.toUpperCase().replace(/[^A-Z0-9]/g, "") + "XX").slice(0, 2)
+  const digest = createHash("sha256").update(`voucher-code:${dedupeKey}`).digest()
+  let body = ""
+  for (let i = 0; i < 8; i += 1) {
+    body += VOUCHER_CODE_ALPHABET[digest[i] % VOUCHER_CODE_ALPHABET.length]
+  }
+  return `${prefix}-${body.slice(0, 4)}-${body.slice(4)}`
 }
 
 async function issueSingleIssuedRow(
@@ -483,10 +538,19 @@ async function issueSingleIssuedRow(
     ctx.voucherAmountMinor,
     `amount_minor vouchera (linia ${lineItemId})`
   )
+  // ── geneza kodu vouchera (Story 5.3, korekta PO 2026-07-30) ───────────────
+  // Kod POWSTAJE przy wystawieniu i wchodzi do snapshotu polityki, bo snapshot
+  // jest immutable po ISSUED — to czyni kod trwałym faktem wydania, a nie
+  // wartością doklejaną później. Wcześniej kodu nie było wcale, a warstwa
+  // odczytu (`findBuyerClaimSource`) podstawiała identyfikator entitlementu,
+  // przez co kupujący dostawał w mailu `ent_…` zamiast kodu do okazania.
+  const voucherCode = buildVoucherCode(dedupeKey, ctx.marketId)
+  const currency = profile.currency ?? payload.currency
   const snapshot: EntitlementPolicySnapshot = snapshotPolicy({
     ...profile.policy,
-    currency: profile.currency ?? payload.currency,
+    currency,
     amount_minor: amountMinor,
+    voucher_code: voucherCode,
     source_payment_intent_id: payload.payment_intent_id,
     line_item_id: lineItemId,
     recipient_index: recipient.recipient_index,
@@ -528,6 +592,23 @@ async function issueSingleIssuedRow(
   const created = (insert.rowCount ?? insert.rows.length) > 0
   if (created && choiceSetItems.length > 0) {
     await insertChoiceSetItems(client, entitlementId, ctx.marketId, choiceSetItems, now)
+  }
+
+  if (created) {
+    await issueVoucherCodeWithinTx(client, {
+      code: voucherCode,
+      marketId: ctx.marketId,
+      sellerId: ctx.sellerId,
+      sellerName: ctx.sellerName,
+      sellerHandle: ctx.sellerHandle,
+      productTitle: ctx.lineTitle,
+      valueMinor: amountMinor,
+      currency,
+      validityMonths: readNumber(snapshot.validity_months),
+      lineItemId,
+      payload,
+      now,
+    })
   }
 
   return {
@@ -871,6 +952,83 @@ function extractChoiceSetSnapshotItems(
 
 function readVatClassification(value: unknown): VatClassification | undefined {
   return value === "SPV" || value === "MPV" ? value : undefined
+}
+
+/**
+ * Zapisuje wiersz `voucher` — nośnik kodu okazywanego w salonie.
+ *
+ * Idempotencja: `ON CONFLICT (code) DO NOTHING`. Kod jest deterministyczny z
+ * klucza dedupe, więc ponowienie webhooka trafia we WŁASNY wiersz, nigdy w cudzy.
+ *
+ * Fail-loud przy brakach: kolumny `seller_*` i `product_title` są NOT NULL, a
+ * pusty string przeszedłby przez bazę i wyszedł do klienta jako mail z pustym
+ * „Salon" — czyli dokładnie defekt, który ta funkcja domyka. Rzut wycofuje CAŁĄ
+ * transakcję (w tym `event_processed`), więc zdarzenie wraca przez retry/DLQ z
+ * czytelną przyczyną, zamiast utrwalać wydanie bez danych sprzedawcy.
+ */
+async function issueVoucherCodeWithinTx(
+  client: LiveIssuePgClient,
+  args: {
+    code: string
+    marketId: string
+    sellerId: string | null
+    sellerName: string | null
+    sellerHandle: string | null
+    productTitle: string | null
+    valueMinor: number
+    currency: string
+    validityMonths: number | undefined
+    lineItemId: string
+    payload: PaymentIntentSucceededPayload
+    now: Date
+  }
+): Promise<void> {
+  const sellerId = readString(args.sellerId)
+  const sellerName = readString(args.sellerName)
+  const sellerHandle = readString(args.sellerHandle)
+  const productTitle = readString(args.productTitle)
+  const missing = [
+    ["seller_id", sellerId],
+    ["seller_name", sellerName],
+    ["seller_handle", sellerHandle],
+    ["product_title", productTitle],
+  ]
+    .filter(([, value]) => !value)
+    .map(([field]) => field)
+
+  if (missing.length > 0) {
+    throw new Error(
+      `issueVoucherCodeWithinTx: brak wymaganych danych vouchera [${missing.join(", ")}] ` +
+        `(linia ${args.lineItemId}, order ${args.payload.order_id}, payment_intent ` +
+        `${args.payload.payment_intent_id}) — fail-loud przed INSERT. Zapis pustych ` +
+        `wartości dałby kupującemu mail z pustym salonem i kodem bez pokrycia.`
+    )
+  }
+
+  const expiresAt =
+    args.validityMonths && args.validityMonths > 0
+      ? new Date(new Date(args.now).setMonth(args.now.getMonth() + args.validityMonths))
+      : null
+
+  await client.query(
+    `INSERT INTO voucher
+       (code, market_id, seller_id, seller_name, seller_handle, product_title,
+        value_minor, currency_code, status, expires_at, created_at, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'idle', $9, $10, $10)
+     ON CONFLICT (code) DO NOTHING`,
+    [
+      args.code,
+      args.marketId,
+      sellerId,
+      sellerName,
+      sellerHandle,
+      productTitle,
+      args.valueMinor,
+      args.currency,
+      expiresAt,
+      args.now,
+    ]
+  )
 }
 
 function assertPositiveIntegerMinor(value: unknown, field: string): number {

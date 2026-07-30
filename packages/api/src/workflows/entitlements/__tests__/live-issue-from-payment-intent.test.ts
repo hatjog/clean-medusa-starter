@@ -65,6 +65,10 @@ type LineFixture = {
   metadata: Record<string, unknown> | null
   product_metadata?: Record<string, unknown> | null
   line_unit_price?: number | string | null
+  line_title?: string | null
+  seller_id?: string | null
+  seller_name?: string | null
+  seller_handle?: string | null
 }
 
 /**
@@ -93,6 +97,13 @@ function makeFakeClient(order: OrderFixture, lines: LineFixture[]) {
         const databaseRows = lines.map((line) => ({
           ...line,
           line_unit_price: line.line_unit_price ?? 24900,
+          // Domyślny sprzedawca odwzorowuje stan normalny: produkt w katalogu MA
+          // sprzedawcę (join `product_product_seller_seller` → `seller`). Test
+          // badający brak tych danych ustawia je jawnie na `null`.
+          line_title: line.line_title ?? "Masaż relaksacyjny 60 min",
+          seller_id: line.seller_id ?? "sel_bonbeauty_1",
+          seller_name: line.seller_name ?? "Salon Bon Beauty",
+          seller_handle: line.seller_handle ?? "bon-beauty",
         }))
         return { rows: databaseRows as unknown as T[], rowCount: databaseRows.length }
       }
@@ -149,6 +160,14 @@ const NOW = new Date("2026-06-02T10:15:30.000Z")
 function singleVoucherLine(overrides: Partial<Record<string, unknown>> = {}): LineFixture {
   return {
     line_item_id: "li_voucher_1",
+    // Nośniki `voucher.*` (NOT NULL) — projekcja linii dociąga je joinem
+    // `product_product_seller_seller` → `seller`. Fixture MUSI je nieść, bo
+    // geneza kodu vouchera jest fail-loud przy braku: pusty salon w mailu to
+    // defekt, który ten fail-loud ma łapać, a nie coś do obejścia w teście.
+    line_title: "Masaż relaksacyjny 60 min",
+    seller_id: "sel_bonbeauty_1",
+    seller_name: "Salon Bon Beauty",
+    seller_handle: "bon-beauty",
     metadata: {
       entitlement_profile_id: "voucher-rezerwacja-otwarta",
       entitlement_type: "VOUCHER_SERVICE",

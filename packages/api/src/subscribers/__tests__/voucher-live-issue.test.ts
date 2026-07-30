@@ -92,6 +92,12 @@ function makeFakeContainer() {
               // kształt, w którym test broni klasy ADR-166 R-1 (`typeof === "number"`
               // cicho degradujące do fallbacku). Liczba tutaj przepuściłaby regresję.
               line_unit_price: "24900",
+              // Nośniki `voucher.*` (NOT NULL) — geneza kodu vouchera jest przy
+              // ich braku fail-loud, bo pusty salon w mailu to defekt, nie stan.
+              line_title: "Masaż relaksacyjny 60 min",
+              seller_id: "sel_bonbeauty_1",
+              seller_name: "Salon Bon Beauty",
+              seller_handle: "bon-beauty",
               metadata: {
                 entitlement_profile_id: "p",
                 entitlement_type: "VOUCHER_SERVICE",

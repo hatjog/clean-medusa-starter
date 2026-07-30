@@ -173,7 +173,17 @@ function makeFixturePg(options: FixtureOptions = {}) {
       }
       if (/FROM order_item/i.test(sql)) {
         const orderLines = options.linesByOrder?.[String(values[0])] ?? lines
-        const databaseRows = orderLines.map((line) => ({ ...line, line_unit_price: 25000 }))
+        // Sprzedawca i tytuł: projekcja linii dociąga je joinem do `seller`, a
+        // geneza kodu vouchera jest przy ich braku fail-loud. Domyślne wartości
+        // odwzorowują stan normalny (produkt w katalogu MA sprzedawcę).
+        const databaseRows = orderLines.map((line) => ({
+          ...line,
+          line_unit_price: 25000,
+          line_title: "Masaż relaksacyjny 60 min",
+          seller_id: "sel_bonbeauty_1",
+          seller_name: "Salon Bon Beauty",
+          seller_handle: "bon-beauty",
+        }))
         return { rows: databaseRows as unknown as T[], rowCount: databaseRows.length }
       }
       if (/INSERT INTO entitlement_instance/i.test(sql)) {

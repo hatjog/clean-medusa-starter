@@ -925,14 +925,19 @@ export class VoucherService {
           ? (row.product_title as string)
           : null,
       claimed_at: claimedAt,
+      // Story 5.3 (korekta PO 2026-07-30): łańcuch kończy się na `null`, NIE na
+      // `?? lookupCode`. Tamten fallback podstawiał identyfikator entitlementu
+      // (`ent_…`) jako „kod vouchera": kupujący dostawał go w mailu i w linku
+      // claim, a guard `skipped_missing_voucher_code` w subscriberze 2.3 nigdy
+      // nie odpalał, bo wartość NIGDY nie była pusta. Brak kodu ma być widoczny
+      // jako brak — wtedy guard robi swoje i mail nie wychodzi bez pokrycia.
       voucher_code:
         (typeof row.voucher_code === "string" && (row.voucher_code as string).length > 0
           ? (row.voucher_code as string)
           : null) ??
-        (typeof snapshot.voucher_code === "string"
+        (typeof snapshot.voucher_code === "string" && (snapshot.voucher_code as string).length > 0
           ? (snapshot.voucher_code as string)
-          : null) ??
-        lookupCode,
+          : null),
       // R-2.2-M4 (Story 2.3, AC6b): rynek z danych domenowych. Kolejność
       // pierwszeństwa: kolumna Layer-4 → snapshot polityki. Brak = null, żeby
       // konsument mógł jawnie zalogować fallback konfiguracyjny.
