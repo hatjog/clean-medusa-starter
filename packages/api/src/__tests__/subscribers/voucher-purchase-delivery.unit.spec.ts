@@ -20,7 +20,9 @@ import {
 } from "../../modules/voucher-delivery/dispatch-ledger"
 import { hashRecipientEmail } from "../../modules/voucher-delivery/recipient-hash"
 import {
+  assertNonLoopbackAbsoluteUrl,
   buildVoucherPageUrl,
+  isLanOnlyHost,
   marketStorefrontUrlEnvKey,
   resolveStorefrontBaseUrl,
   StorefrontBaseUrlNotConfiguredError,
@@ -692,8 +694,14 @@ describe("AC4 — kod vouchera + link claim z prefiksem locale", () => {
       "VOUCHER_DELIVERY_STOREFRONT_URL_NOT_CONFIGURED",
     )
     expect(dispatchCalls).toHaveLength(0)
-    // Brak konfiguracji nie zostawia po sobie sierotnego wiersza `queued`.
-    expect(sql.dispatch).toHaveLength(0)
+    // Brak konfiguracji nie zostawia po sobie sierotnego wiersza `queued` —
+    // ale ZOSTAWIA wiersz OGRANICZAJĄCY `failed` z kodem konfiguracji (fix-round
+    // 5.7): bez niego sweep 2.5 widzi „brak wiersza" i ponawia bez licznika.
+    expect(sql.dispatch).toHaveLength(1)
+    expect(sql.dispatch[0].status).toBe("failed")
+    expect(sql.dispatch[0].error_code).toBe(
+      "VOUCHER_DELIVERY_STOREFRONT_URL_NOT_CONFIGURED",
+    )
     expect(JSON.stringify(logger.entries)).not.toContain("localhost")
   })
 
@@ -743,6 +751,66 @@ describe("AC4 — kod vouchera + link claim z prefiksem locale", () => {
     }
   })
 
+  // ── Finding #1 review 5.7: nazwa guarda mówi o KSZTAŁCIE, nie o osiągalności
+
+  it("adres LAN PRZECHODZI walidację kształtu — bo to jedyny sposób testu na urządzeniu", () => {
+    // Odrzucenie zakresów prywatnych zabrałoby PO jedyną ścieżkę testu na
+    // telefonie. Guard ma nie kłamać ani w jedną, ani w drugą stronę.
+    expect(
+      assertNonLoopbackAbsoluteUrl("bonbeauty", "http://192.168.100.91:3002"),
+    ).toBe("http://192.168.100.91:3002")
+  })
+
+  it("adres LAN zostawia `warn` — sygnał, którego brakowało przy martwym linku PO", () => {
+    const warnings: Array<{ message: string; meta?: Record<string, unknown> }> = []
+    const logger = {
+      warn: (message: string, meta?: Record<string, unknown>) =>
+        warnings.push({ message, meta }),
+    }
+
+    for (const host of [
+      "192.168.100.91",
+      "10.0.0.5",
+      "172.16.3.9",
+      "169.254.1.1",
+      "macbook.local",
+    ]) {
+      expect(isLanOnlyHost(host)).toBe(true)
+    }
+    // Publiczny host NIE ostrzega — inaczej warn zszedłby do szumu.
+    expect(isLanOnlyHost("dev.bonbeauty.pl")).toBe(false)
+    expect(isLanOnlyHost("172.32.0.1")).toBe(false)
+
+    resolveStorefrontBaseUrl({
+      marketId: "bonbeauty",
+      env: { GP_STOREFRONT_URL_BONBEAUTY: "http://192.168.100.91:3002" },
+      logger,
+    })
+    expect(warnings).toHaveLength(1)
+    expect(warnings[0].message).toContain("SIECI LOKALNEJ")
+    expect(warnings[0].meta?.base_url_host).toBe("192.168.100.91")
+
+    warnings.length = 0
+    resolveStorefrontBaseUrl({
+      marketId: "bonbeauty",
+      env: { GP_STOREFRONT_URL_BONBEAUTY: "https://dev.bonbeauty.pl" },
+      logger,
+    })
+    expect(warnings).toHaveLength(0)
+  })
+
+  it("guard NIE robi I/O — nazwa nie może znów obiecywać osiągalności", () => {
+    // Test-the-name: gdyby ktoś dołożył probe, ta funkcja przestałaby być
+    // synchroniczna. Kontrakt „kształt, zero sieci" jest tu asercją.
+    expect(assertNonLoopbackAbsoluteUrl("bonbeauty", "https://x.test/a/")).toBe(
+      "https://x.test/a",
+    )
+    expect(
+      (assertNonLoopbackAbsoluteUrl as unknown as { constructor: { name: string } })
+        .constructor.name,
+    ).toBe("Function")
+  })
+
   it("kod vouchera w linku jest URL-encoded", () => {
     expect(
       buildVoucherPageUrl({
@@ -790,7 +858,7 @@ describe("AC4 — kod vouchera + link claim z prefiksem locale", () => {
     expect(sql.dispatch[0].status).toBe("failed")
   })
 
-  it("Story 5.7 AC2: brak wiersza market_runtime_config → `failed` przed rezerwacją", async () => {
+  it("Story 5.7 AC2: brak wiersza market_runtime_config → `failed` przed wysyłką, z wierszem OGRANICZAJĄCYM", async () => {
     const { deps, sql, dispatchCalls, logger } = makeDeps({ runtimeConfig: null })
 
     const result = await handleVoucherPurchaseDelivery(envelope("ISSUED"), deps)
@@ -800,7 +868,17 @@ describe("AC4 — kod vouchera + link claim z prefiksem locale", () => {
       "VOUCHER_DELIVERY_MARKET_RUNTIME_CONFIG_INCOMPLETE",
     )
     expect(dispatchCalls).toHaveLength(0)
-    expect(sql.dispatch).toHaveLength(0)
+    // Fix-round 5.7: wiersz POWSTAJE i kończy jako `failed` z kodem konfiguracji.
+    // Żadnego `queued` w spoczynku — przez `queued` przechodzimy tranzytem.
+    expect(sql.dispatch).toHaveLength(1)
+    expect(sql.dispatch[0].status).toBe("failed")
+    expect(sql.dispatch[0].error_code).toBe(
+      "VOUCHER_DELIVERY_MARKET_RUNTIME_CONFIG_INCOMPLETE",
+    )
+    // …i jest to wiersz szablonu, po którym skanuje sweep 2.5 — inaczej
+    // ograniczenie nie zadziałałoby na realnej ścieżce dosyłki.
+    expect(sql.dispatch[0].template_key).toBe("voucher_purchase_confirmation")
+    expect(result.dispatch_id).toBe(sql.dispatch[0].dispatch_id)
     expect(logger.entries.some((e) => e.level === "error")).toBe(true)
   })
 
@@ -1208,9 +1286,14 @@ describe("R-2.3-M6 — degradacja konfiguracji locale NIE degraduje maila do loc
 
     expect(result.outcome).toBe("failed")
     expect(result.error_code).toBe(MARKET_LOCALES_UNAVAILABLE_ERROR_CODE)
-    // Ani maila, ani rezerwacji — to błąd konfiguracji, nie nieudana wysyłka.
+    // Maila nie ma — to błąd konfiguracji, nie nieudana wysyłka. Wiersz
+    // OGRANICZAJĄCY jednak powstaje (fix-round 5.7) i niesie locale ŻĄDANE,
+    // czyli to, którego rynek rzekomo nie wspiera — nie cichy fallback `pl`.
     expect(dispatchCalls).toHaveLength(0)
-    expect(sql.dispatch).toHaveLength(0)
+    expect(sql.dispatch).toHaveLength(1)
+    expect(sql.dispatch[0].status).toBe("failed")
+    expect(sql.dispatch[0].error_code).toBe(MARKET_LOCALES_UNAVAILABLE_ERROR_CODE)
+    expect(sql.dispatch[0].locale).toBe("ua")
     expect(logger.entries.some((e) => e.level === "error")).toBe(true)
   })
 

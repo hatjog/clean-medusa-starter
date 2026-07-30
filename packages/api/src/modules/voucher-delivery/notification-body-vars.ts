@@ -65,6 +65,32 @@ export const NOTIFICATION_BODY_VAR_CONTRACT: Readonly<
 }
 
 /**
+ * DŁUG NAZEWNICZY kontraktu (finding #2 review 5.7) — nazwa klucza manifestu
+ * kłamie o treści, którą niesie.
+ *
+ * Dziś jest tu jedna pozycja: `voucher_pdf_url` niesie link do STRONY vouchera
+ * w storefroncie, nie do PDF-a (PDF przy wystawieniu nie powstaje). Klucz jest
+ * WYMUSZONY przez istniejący manifest, a jego zmiana nie jest darmowa: manifest
+ * × 4 locale + re-upload szablonu w Brevo + bump wersji szablonu. Decyzja 5.7
+ * brzmi: zostawiamy klucz, prostujemy wartość i copy CTA — a dług domykamy przy
+ * najbliższej i tak potrzebnej zmianie szablonu.
+ *
+ * Ta mapa istnieje po to, żeby ta decyzja nie została „zapomniana w komentarzu":
+ * jest maszynowo czytelna, testowana wobec realnego kontraktu i musi zniknąć
+ * razem z kluczem. Dopóki wpis żyje, dług jest widoczny w kodzie, a nie tylko
+ * w notatce z review.
+ */
+export const NOTIFICATION_BODY_VAR_NAMING_DEBT: Readonly<
+  Record<string, { template_key: string; carries: string; target_name: string }>
+> = {
+  voucher_pdf_url: {
+    template_key: "voucher_purchase_confirmation",
+    carries: "link do strony vouchera `/{locale}/voucher/{code}` (nie PDF)",
+    target_name: "voucher_page_url",
+  },
+}
+
+/**
  * Payload nie pokrywa kontraktu szablonu — wysyłka NIE może dojść do skutku.
  *
  * Kod błędu jest stabilny i testowalny; komunikat niesie WYŁĄCZNIE nazwy

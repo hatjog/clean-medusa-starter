@@ -455,7 +455,19 @@ export async function handleVoucherPurchaseDelivery(
     return {
       outcome: "failed",
       entitlement_id: entitlementId,
-      dispatch_id: null,
+      // Wiersz ograniczający: bez niego sweep widzi „brak wiersza" i ponawia
+      // bez licznika. Locale wiersza to locale ŻĄDANE (to, którego rynek
+      // rzekomo nie wspiera) — nie fallback, którego ta gałąź wprost odmawia.
+      dispatch_id: await recordPreflightConfigurationFailure(
+        {
+          entitlementId,
+          marketId,
+          locale: requestedLocale ?? locale,
+          errorCode: MARKET_LOCALES_UNAVAILABLE_ERROR_CODE,
+          recipientEmail,
+        },
+        deps,
+      ),
       market_id: marketId,
       locale: null,
       error_code: MARKET_LOCALES_UNAVAILABLE_ERROR_CODE,
@@ -468,7 +480,13 @@ export async function handleVoucherPurchaseDelivery(
   let voucherPageUrl: string
   try {
     voucherPageUrl = buildVoucherPageUrl({
-      baseUrl: resolveStorefrontBaseUrl({ marketId, env: deps.env }),
+      // Logger jest przekazywany po to, żeby baza z zakresu LAN zostawiła
+      // `warn` (finding #1): guard sprawdza KSZTAŁT, nie osiągalność.
+      baseUrl: resolveStorefrontBaseUrl({
+        marketId,
+        env: deps.env,
+        logger: deps.logger,
+      }),
       locale,
       voucherCode,
     })
@@ -481,7 +499,10 @@ export async function handleVoucherPurchaseDelivery(
     return {
       outcome: "failed",
       entitlement_id: entitlementId,
-      dispatch_id: null,
+      dispatch_id: await recordPreflightConfigurationFailure(
+        { entitlementId, marketId, locale, errorCode, recipientEmail },
+        deps,
+      ),
       market_id: marketId,
       locale,
       error_code: errorCode,
@@ -521,7 +542,10 @@ export async function handleVoucherPurchaseDelivery(
     return {
       outcome: "failed",
       entitlement_id: entitlementId,
-      dispatch_id: null,
+      dispatch_id: await recordPreflightConfigurationFailure(
+        { entitlementId, marketId, locale, errorCode, recipientEmail },
+        deps,
+      ),
       market_id: marketId,
       locale,
       error_code: errorCode,
@@ -948,6 +972,111 @@ export default async function voucherPurchaseDeliverySubscriber({
 
 export const config: SubscriberConfig = {
   event: ENTITLEMENT_STATE_CHANGED_EVENT,
+}
+
+/**
+ * Story 5.7 fix-round (review, „Czego dowody NIE pokrywają" pkt 5) — WIERSZ
+ * OGRANICZAJĄCY dla awarii konfiguracji wykrytej PRZED wysyłką.
+ *
+ * ── Kształt N-1, który to zamyka ────────────────────────────────────────────
+ * Ścieżki `…_STOREFRONT_URL_*`, `…_MARKET_LOCALES_UNAVAILABLE` i
+ * `…_MARKET_RUNTIME_CONFIG_*` kończyły się `failed` BEZ wiersza ledgera. Sweep
+ * 2.5 klasyfikuje taki entitlement jako „brak wiersza" (kształt 1) — a ten
+ * kształt nie ma licznika prób ani ścieżki do `dead_lettered`. Efekt: przy
+ * niepoprawionej konfiguracji sweep ponawia tę samą robotę co 15 minut w
+ * NIESKOŃCZONOŚĆ, dokładnie ta klasa defektu, którą fala naprawiała jako N-1
+ * (odparkowanie co 15 min). Zielony test jednego przebiegu tego nie widzi.
+ *
+ * ── Dlaczego wiersz `failed`, a nie licznik obok ────────────────────────────
+ * Licznik na tej ścieżce musiałby żyć w NOWYM magazynie stanu (subscriber jest
+ * bezstanowy, a sweep nie pamięta poprzedniego przebiegu) — czyli druga,
+ * rozjeżdżalna definicja „ile razy próbowaliśmy". Ledger tę semantykę już ma:
+ * `attempt_count`, próg `SWEEP_MAX_ATTEMPT_COUNT`, parkowanie z wykluczeniem ze
+ * skanu i licznikiem operatorskim, oraz JEDNO odwracalne odparkowanie po
+ * naprawie konfiguracji (`SWEEP_MAX_CONFIGURATION_RECOVERIES`). Zapisujemy więc
+ * to, co się realnie stało, w jedynym miejscu, które już to liczy.
+ *
+ * Wiersz kończy jako `failed` z kodem konfiguracji — NIE jako `queued`. Zakaz
+ * „sierocego `queued` po błędzie konfiguracji" z 5.7 zostaje utrzymany: przez
+ * `queued` przechodzimy wyłącznie tranzytem, w tej samej funkcji, bez wysyłki.
+ *
+ * Zapisujemy WYŁĄCZNIE wiersz `voucher_purchase_confirmation`: to jedyny klucz
+ * w `SWEEP_EXPECTED_TEMPLATE_KEYS`, więc to on i tylko on decyduje, czy sweep
+ * widzi „brak wiersza". Handoff ma własny wiersz zakładany dopiero przy realnej
+ * próbie wysyłki i dokładanie mu tu wiersza `failed` nie zmieniłoby żadnej
+ * granicy, a rozmnażałoby stany.
+ *
+ * NIGDY nie rzuca: awaria ledgera na tej ścieżce nie może zamienić błędu
+ * konfiguracji w wyjątek wychodzący z subscribera (inwariant AD-6).
+ */
+async function recordPreflightConfigurationFailure(
+  input: {
+    entitlementId: string
+    marketId: string
+    locale: string
+    errorCode: string
+    recipientEmail: string | null
+  },
+  deps: PurchaseDeliveryDeps,
+): Promise<string | null> {
+  const tag = "[voucher-purchase-delivery]"
+  if (!input.recipientEmail) {
+    // Bez adresu kupującej nie ma tożsamości wiersza (`recipient_hash` jest
+    // częścią klucza). Taki entitlement i tak nie jest domykalny przez automat
+    // — sweep liczy go jako `unresolvable`, a nie ponawia w nieskończoność.
+    return null
+  }
+
+  let recipientHash
+  try {
+    recipientHash = hashRecipientEmail(input.recipientEmail)
+  } catch {
+    return null
+  }
+
+  try {
+    const reservation = await deps.ledger.reserveDispatch({
+      entitlement_id: input.entitlementId,
+      template_key: NOTIFICATION_TEMPLATE_KEYS.VOUCHER_PURCHASE_CONFIRMATION,
+      recipient_hash: recipientHash,
+      market_id: input.marketId,
+      flow_id: VOUCHER_PURCHASE_DELIVERY_FLOW_ID,
+      locale: input.locale,
+    })
+
+    // `blocked` (mail już poszedł / `dead_lettered`) i `in_flight` (rezerwację
+    // trzyma ktoś inny) NIE są nasze do domknięcia — nadpisanie ich na `failed`
+    // złamałoby single-writera i mogłoby wskrzesić wysyłkę już zamkniętą.
+    if (
+      reservation.outcome !== "reserved" &&
+      reservation.outcome !== "retry_reserved"
+    ) {
+      return reservation.dispatch_id
+    }
+
+    const dispatchId = reservation.dispatch_id
+    if (!dispatchId) {
+      return null
+    }
+
+    await deps.ledger.markFailed({
+      dispatch_id: dispatchId,
+      error_code: input.errorCode,
+    })
+    return dispatchId
+  } catch (error) {
+    deps.logger?.warn?.(
+      `${tag} nie udało się zapisać wiersza ledgera dla awarii konfiguracji — ` +
+        "dosyłka pozostaje nieograniczona do czasu naprawy konfiguracji",
+      {
+        entitlement_id: input.entitlementId,
+        market_id: input.marketId,
+        error_code: input.errorCode,
+        error_class: errorClass(error),
+      },
+    )
+    return null
+  }
 }
 
 function result(

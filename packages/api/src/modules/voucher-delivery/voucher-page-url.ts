@@ -35,6 +35,28 @@ const LOOPBACK_HOSTS = new Set([
   "0.0.0.0",
 ])
 
+/**
+ * Zakresy, które działają najwyżej w sieci lokalnej nadawcy (RFC1918 +
+ * link-local + mDNS `.local`). NIE są odrzucane — patrz `warnIfLanOnlyHost`.
+ */
+const LAN_HOST_PATTERNS: readonly RegExp[] = [
+  /^10\.\d{1,3}\.\d{1,3}\.\d{1,3}$/,
+  /^192\.168\.\d{1,3}\.\d{1,3}$/,
+  /^172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}$/,
+  /^169\.254\.\d{1,3}\.\d{1,3}$/,
+  /\.local$/,
+]
+
+export type VoucherPageUrlLogger = {
+  warn?: (message: string, meta?: Record<string, unknown>) => void
+}
+
+/** `true` dla adresu osiągalnego najwyżej z sieci lokalnej nadawcy. */
+export function isLanOnlyHost(host: string): boolean {
+  const normalized = host.trim().toLowerCase()
+  return LAN_HOST_PATTERNS.some((pattern) => pattern.test(normalized))
+}
+
 export class StorefrontBaseUrlNotConfiguredError extends Error {
   readonly error_code = "VOUCHER_DELIVERY_STOREFRONT_URL_NOT_CONFIGURED"
 
@@ -78,6 +100,7 @@ export function marketStorefrontUrlEnvKey(marketId: string): string {
 export function resolveStorefrontBaseUrl(input: {
   marketId: string
   env?: NodeJS.ProcessEnv
+  logger?: VoucherPageUrlLogger
 }): string {
   const env = input.env ?? process.env
   // AC6.2: WYŁĄCZNIE klucz per rynek. Globalny fallback wysyłałby kupującym
@@ -88,13 +111,35 @@ export function resolveStorefrontBaseUrl(input: {
     throw new StorefrontBaseUrlNotConfiguredError(input.marketId)
   }
 
-  return assertPubliclyReachableBaseUrl(input.marketId, configured)
+  return assertNonLoopbackAbsoluteUrl(input.marketId, configured, input.logger)
 }
 
-/** Walidacja kształtu bazy linku — wydzielona, bo jest wprost testowana (AC6.3). */
-export function assertPubliclyReachableBaseUrl(
+/**
+ * Walidacja KSZTAŁTU bazy linku (AC6.3) — wydzielona, bo jest wprost testowana.
+ *
+ * ── Czego ta funkcja NIE gwarantuje (finding #1 review 5.7) ─────────────────
+ * Nie robi ŻADNEGO I/O: nie odpytuje DNS-u, nie wykonuje probe'u HTTP i nie
+ * wie, czy pod tym adresem cokolwiek odpowiada. Poprzednia nazwa
+ * (`assertPubliclyReachableBaseUrl`) obiecywała „publicznie osiągalny", a kod
+ * sprawdzał „absolutny, http(s), nie-loopback" — i dokładnie ta różnica się
+ * zmaterializowała: `http://192.168.100.91:3002` przeszedł guard, a link był
+ * martwy na telefonie PO.
+ *
+ * ── Dlaczego świadomie NIE dokładamy probe'u ────────────────────────────────
+ *   - probe w ścieżce wysyłki dokłada I/O i nowy tryb awarii (timeout, flaki
+ *     DNS) do operacji, która ma być deterministyczna i szybka;
+ *   - probe z HOSTA BACKENDU nie odpowiada na pytanie AC6 („czy osiągalny z
+ *     telefonu PO"). Backend dosięgnie adresu LAN bez problemu — świeciłby na
+ *     zielono i utwierdzał w błędzie;
+ *   - odrzucanie zakresów prywatnych zablokowałoby JEDYNY sposób, w jaki PO
+ *     może dziś testować na realnym urządzeniu — to byłoby pogorszenie.
+ * Adres LAN daje więc `warn`, nie wyjątek. AC6.6 pozostaje bramką OPERACYJNĄ,
+ * a nie własnością tego kodu.
+ */
+export function assertNonLoopbackAbsoluteUrl(
   marketId: string,
   candidate: string,
+  logger?: VoucherPageUrlLogger,
 ): string {
   let parsed: URL
   try {
@@ -116,7 +161,35 @@ export function assertPubliclyReachableBaseUrl(
     throw new StorefrontBaseUrlNotReachableError(marketId, "loopback_host")
   }
 
+  warnIfLanOnlyHost(marketId, host, logger)
+
   return `${parsed.origin}${parsed.pathname}`.replace(/\/+$/, "")
+}
+
+/**
+ * Sygnał, którego brakowało: baza przechodzi walidację kształtu, ale jest
+ * adresem sieci lokalnej. Mail wyjdzie, `ledger=sent` będzie prawdziwy, a link
+ * i tak będzie martwy poza siecią nadawcy. `warn`, nie wyjątek — patrz wyżej.
+ */
+function warnIfLanOnlyHost(
+  marketId: string,
+  host: string,
+  logger?: VoucherPageUrlLogger,
+): void {
+  if (!isLanOnlyHost(host)) {
+    return
+  }
+  logger?.warn?.(
+    "[voucher-delivery] baza deep-linku jest adresem SIECI LOKALNEJ — link " +
+      "w mailu nie zadziała poza tą siecią (guard sprawdza kształt, nie " +
+      "osiągalność); do wysyłek poza dev ustaw adres publiczny",
+    {
+      market_id: marketId,
+      // Sam host, bez ścieżki i query: env bywa nośnikiem tokenu w URL-u.
+      base_url_host: host,
+      env_key: marketStorefrontUrlEnvKey(marketId),
+    },
+  )
 }
 
 /** Kanoniczny deep-link strony vouchera: `/{locale}/voucher/{code}`. */

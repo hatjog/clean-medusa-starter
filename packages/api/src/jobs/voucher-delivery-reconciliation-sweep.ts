@@ -105,6 +105,8 @@ import {
   ENTITLEMENT_STATE_CHANGED_EVENT,
   handleVoucherPurchaseDelivery,
   MARKET_LOCALES_UNAVAILABLE_ERROR_CODE,
+  MARKET_RUNTIME_CONFIG_INCOMPLETE_ERROR_CODE,
+  MARKET_RUNTIME_CONFIG_UNAVAILABLE_ERROR_CODE,
   STALE_QUEUED_THRESHOLD_MS,
   type PurchaseDeliveryDeps,
   type PurchaseDeliveryOutcome,
@@ -211,6 +213,16 @@ export const SWEEP_SOURCE_ENTITLEMENT_TYPES = [
 export const SWEEP_GLOBAL_FAILURE_ERROR_CODES: readonly string[] = [
   "FLOW_DISABLED",
   MARKET_LOCALES_UNAVAILABLE_ERROR_CODE,
+  // Story 5.7 fix-round: `market_runtime_config` bez tabeli / bez kompletu
+  // danych to stan KONFIGURACJI rynku — ustępuje po `db:migrate:app` albo
+  // `gp-config-sync-market-runtime --apply`, bez udziału wiersza. Bez tego
+  // wpisu poprawka konfiguracji nie odparkowywałaby wierszy, które ta awaria
+  // zaparkowała, i mail przepadałby dla całego okna awarii.
+  MARKET_RUNTIME_CONFIG_UNAVAILABLE_ERROR_CODE,
+  MARKET_RUNTIME_CONFIG_INCOMPLETE_ERROR_CODE,
+  // Kształt bazy deep-linku: `..._NOT_CONFIGURED` łapie sufiks, `..._NOT_REACHABLE`
+  // nie — a jest tą samą klasą (env rynku do poprawienia przez operatora).
+  "VOUCHER_DELIVERY_STOREFRONT_URL_NOT_REACHABLE",
 ]
 
 /** Sufiks kodów konfiguracyjnych (`BREVO_TEMPLATE_NOT_CONFIGURED` itp.). */

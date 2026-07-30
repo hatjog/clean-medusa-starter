@@ -55,9 +55,11 @@ import {
 import { DISPATCH_STATES_ALLOWING_RETRY } from "../../modules/voucher-delivery/delivery-state"
 import {
   handleVoucherPurchaseDelivery,
+  MARKET_RUNTIME_CONFIG_INCOMPLETE_ERROR_CODE,
   STALE_QUEUED_THRESHOLD_MS,
   type PurchaseDeliveryDeps,
 } from "../../subscribers/voucher-purchase-delivery"
+import type { MarketRuntimeConfigRow } from "../../lib/read-market-locales"
 import { hashRecipientEmail } from "../../modules/voucher-delivery/recipient-hash"
 import {
   isNotificationProviderReady,
@@ -603,6 +605,12 @@ type HarnessOptions = {
   /** Prezent SPEŁNIAJĄCY predykat 2.4 (`now` + bound) — realna wysyłka handoffu. */
   eligibleGift?: boolean
   env?: NodeJS.ProcessEnv
+  /**
+   * Story 5.7 fix-round — `market_runtime_config` bez kompletu danych (albo
+   * odczyt niedostępny). Kształt awarii, która kończy się PRZED wysyłką.
+   */
+  runtimeConfigRow?: MarketRuntimeConfigRow | null
+  runtimeConfigDegraded?: boolean
 }
 
 function makeHarness(options: HarnessOptions = {}) {
@@ -678,6 +686,12 @@ function makeHarness(options: HarnessOptions = {}) {
       // Story 5.7 (AC2) — dosyłka idzie tą samą ścieżką co subscriber, więc
       // potrzebuje tego samego, tabelowego źródła kontaktu i URL rynku.
       async readRuntimeConfig() {
+        if (options.runtimeConfigRow !== undefined) {
+          return {
+            row: options.runtimeConfigRow,
+            degraded: options.runtimeConfigDegraded ?? false,
+          }
+        }
         return {
           row: {
             locales: { default: "pl", supported: ["pl", "en", "ua", "de"] },
@@ -1002,6 +1016,156 @@ describe("R-2.5-H4 — skan dotyczy WYŁĄCZNIE typów voucherowych", () => {
       recovered: 0,
       unresolvable: 1,
     })
+  })
+})
+
+// ── Story 5.7 fix-round: awaria konfiguracji rynku JEST ograniczona ────────
+
+describe("Story 5.7 fix-round — `market_runtime_config` bez danych nie robi pętli bez licznika", () => {
+  /** Kształt awarii: `readRuntimeConfig` zwraca wiersz bez kontaktu/URL. */
+  const brokenRuntimeConfig = {
+    entitlements: [issuedEntitlement("ent_runtime_cfg")],
+    runtimeConfigRow: {
+      locales: { default: "pl", supported: ["pl"] },
+      support_email: null,
+      market_url: null,
+    } as MarketRuntimeConfigRow,
+  }
+
+  it("pierwszy przebieg zostawia JEDEN wiersz `failed` z kodem konfiguracji, nie pustkę", async () => {
+    const { deps, sql, dispatchCalls } = makeHarness(brokenRuntimeConfig)
+
+    const report = await runVoucherDeliveryReconciliationSweep(deps)
+
+    expect(dispatchCalls).toHaveLength(0)
+    expect(report.still_failing).toBe(1)
+    expect(sql.dispatch).toHaveLength(1)
+    expect(sql.dispatch[0].status).toBe("failed")
+    expect(sql.dispatch[0].error_code).toBe(
+      MARKET_RUNTIME_CONFIG_INCOMPLETE_ERROR_CODE,
+    )
+  })
+
+  it("WIELE przebiegów: licznik prób rośnie i zatrzymuje się na progu — koniec dosyłek w nieskończoność", async () => {
+    // Sedno finding-u: pojedynczy przebieg wyglądał poprawnie („failed, brak
+    // maila"), a dopiero N przebiegów pokazywało, że nic tego nie ogranicza.
+    // Przed poprawką ścieżka nie zostawiała wiersza, więc KAŻDY przebieg
+    // widział „brak wiersza" i startował od zera — bez licznika i bez
+    // parkowania. Ten test biegnie 12 razy, czyli daleko za progiem.
+    const { deps, sql, dispatchCalls } = makeHarness(brokenRuntimeConfig)
+
+    const attemptCounts: number[] = []
+    const attemptedPerRun: number[] = []
+    for (let run = 0; run < 12; run += 1) {
+      const report = await runVoucherDeliveryReconciliationSweep(deps)
+      attemptedPerRun.push(report.attempted)
+      attemptCounts.push(Number(sql.dispatch[0]?.attempt_count ?? 0))
+    }
+
+    // Zero maili — awaria konfiguracji nadal wstrzymuje wysyłkę.
+    expect(dispatchCalls).toHaveLength(0)
+    // Jeden wiersz, nie dwanaście: dosyłka nie mnoży stanu.
+    expect(sql.dispatch).toHaveLength(1)
+    // Licznik prób jest OGRANICZONY progiem — to jest to, czego brakowało.
+    expect(Math.max(...attemptCounts)).toBeLessThanOrEqual(
+      SWEEP_MAX_ATTEMPT_COUNT,
+    )
+    // …a próby faktycznie ustają: ostatnie przebiegi nie ruszają już handlera.
+    expect(attemptedPerRun[0]).toBe(1)
+    expect(attemptedPerRun[attemptedPerRun.length - 1]).toBe(0)
+    // Zaparkowany wiersz jest WIDOCZNY dla operatora, a nie cicho pominięty.
+    const last = await runVoucherDeliveryReconciliationSweep(deps)
+    expect(last.parked_total).toBe(1)
+    expect(last.scanned).toBe(0)
+  })
+
+  /** Wariant harnessu z PRZESTAWIALNYM runtime configiem (naprawa operatora). */
+  function repairableHarness(entitlementId: string) {
+    let runtimeConfigRow: MarketRuntimeConfigRow = {
+      locales: { default: "pl", supported: ["pl"] },
+      support_email: null,
+      market_url: null,
+    }
+    const sql = new FakeSql()
+    const harness = makeHarness({
+      entitlements: [issuedEntitlement(entitlementId)],
+      sql,
+    })
+    harness.delivery.marketLocales.readRuntimeConfig = async () => ({
+      row: runtimeConfigRow,
+      degraded: false,
+    })
+    return {
+      ...harness,
+      sql,
+      repair: () => {
+        runtimeConfigRow = {
+          locales: { default: "pl", supported: ["pl"] },
+          support_email: "kontakt@bonbeauty.pl",
+          market_url: "https://dev.bonbeauty.test",
+        }
+      },
+    }
+  }
+
+  it("naprawa konfiguracji W OKNIE budżetu domyka lukę bez ręcznego UPDATE", async () => {
+    // Ograniczenie nie jest jednokierunkowe: dopóki wiersz ma budżet, operator
+    // naprawia `market_runtime_config` i sweep sam dowozi maila.
+    const harness = repairableHarness("ent_runtime_cfg_fixed")
+
+    for (let run = 0; run < 3; run += 1) {
+      await runVoucherDeliveryReconciliationSweep(harness.deps)
+    }
+    expect(harness.dispatchCalls).toHaveLength(0)
+
+    // Operator uruchamia `gp-config-sync-market-runtime … --apply`.
+    harness.repair()
+    await runVoucherDeliveryReconciliationSweep(harness.deps)
+
+    expect(harness.dispatchCalls).toHaveLength(1)
+    expect(harness.sql.dispatch[0].status).toBe("sent")
+  })
+
+  it("naprawa PO wyczerpaniu budżetu NIE odparkowuje sama — wiersz czeka na operatora, ale jest WIDOCZNY", async () => {
+    // Jawna granica polityki (R-2.5-H3): jedno automatyczne odzyskanie budżetu
+    // na wiersz. Konfiguracja niepoprawiona w oknie ~6 przebiegów (≈90 min)
+    // kończy się TRWAŁYM parkowaniem — i to jest cena ograniczenia pętli.
+    // Utrata nie jest cicha: wiersz ma licznik operatorski i zostaje w ledgerze
+    // z pierwotnym kodem przyczyny.
+    const harness = repairableHarness("ent_runtime_cfg_parked")
+
+    for (let run = 0; run < 8; run += 1) {
+      await runVoucherDeliveryReconciliationSweep(harness.deps)
+    }
+
+    harness.repair()
+    const afterRepair = await runVoucherDeliveryReconciliationSweep(harness.deps)
+
+    expect(harness.dispatchCalls).toHaveLength(0)
+    expect(afterRepair.scanned).toBe(0)
+    expect(afterRepair.parked_total).toBe(1)
+    expect(harness.sql.dispatch[0].status).toBe("failed")
+    expect(harness.sql.dispatch[0].error_code).toBe(
+      MARKET_RUNTIME_CONFIG_INCOMPLETE_ERROR_CODE,
+    )
+    expect(Number(harness.sql.dispatch[0].attempt_count)).toBe(
+      SWEEP_MAX_ATTEMPT_COUNT,
+    )
+  })
+
+  it("kody `market_runtime_config` są klasą awarii GLOBALNEJ (odparkowanie bez ręcznego UPDATE)", () => {
+    expect(isGlobalFailureErrorCode(MARKET_RUNTIME_CONFIG_INCOMPLETE_ERROR_CODE)).toBe(
+      true,
+    )
+    expect(
+      isGlobalFailureErrorCode("VOUCHER_DELIVERY_MARKET_RUNTIME_CONFIG_UNAVAILABLE"),
+    ).toBe(true)
+    expect(
+      isGlobalFailureErrorCode("VOUCHER_DELIVERY_STOREFRONT_URL_NOT_REACHABLE"),
+    ).toBe(true)
+    // Realne odrzucenie providera NADAL zużywa budżet — inaczej próg nie
+    // znaczyłby nic.
+    expect(isGlobalFailureErrorCode("VOUCHER_DELIVERY_DISPATCH_FAILED")).toBe(false)
   })
 })
 
