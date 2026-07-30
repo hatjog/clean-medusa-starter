@@ -641,7 +641,7 @@ describe("AC3 — locale handoffu to `purchase_locale`, nigdy locale odbiorczyni
     expect(handoffRow?.locale).toBe("ua")
   })
 
-  it("brak base URL storefrontu → fail-loud, ZERO wierszy i ZERO maili (żadnego localhost)", async () => {
+  it("brak base URL storefrontu → fail-loud, ZERO maili i JEDEN wiersz `failed` (żadnego localhost)", async () => {
     const { deps, sql, dispatchCalls } = makeDeps({ env: {} })
 
     const result = await handleVoucherPurchaseDelivery(envelope("ISSUED"), deps)
@@ -649,8 +649,21 @@ describe("AC3 — locale handoffu to `purchase_locale`, nigdy locale odbiorczyni
     expect(result.outcome).toBe("failed")
     expect(result.error_code).toBe("VOUCHER_DELIVERY_STOREFRONT_URL_NOT_CONFIGURED")
     expect(result.handoff).toBeNull()
+    // Istota tego testu jest NIENARUSZONA: zero wysyłek, więc żaden link z
+    // `localhost` nie ma jak wyciec do klientki.
     expect(dispatchCalls).toHaveLength(0)
-    expect(sql.dispatch).toHaveLength(0)
+    // Story 5.7 fix-round — ZMIANA OCZEKIWANIA, świadoma. Wcześniej ta ścieżka
+    // kończyła się BEZ wiersza w ledgerze i to był defekt, nie cecha: sweep 2.5
+    // czyta brak wiersza jako „wysyłki zabrakło" i ponawiał ją co 15 minut bez
+    // licznika prób i bez drogi do `dead_lettered` — ten sam kształt co N-1.
+    // Zapisany wiersz `failed` włącza istniejący licznik ledgera, więc awaria
+    // konfiguracji jest OGRANICZONA i WIDOCZNA dla operatora.
+    expect(sql.dispatch).toHaveLength(1)
+    expect(sql.dispatch[0]).toMatchObject({
+      status: "failed",
+      error_code: "VOUCHER_DELIVERY_STOREFRONT_URL_NOT_CONFIGURED",
+      attempt_count: 1,
+    })
   })
 })
 
