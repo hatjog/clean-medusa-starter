@@ -119,7 +119,13 @@ class FakeSql implements DispatchLedgerSql {
         return { rows: [{ ...row }] }
       }
       if (q.includes("SET status = 'failed'")) {
-        const [provider, errorCode, , , id] = bindings as string[]
+        // `markFailed` powtarza `$2` (`first_error_code`) i `$3` (`first_failed_at`),
+        // a `toKnexPositionalSql` rozwija bindingi w kolejności WYSTĄPIEŃ `?`, więc
+        // lista ma 7 pozycji, nie 5. Pozycyjne `[, , , , id]` trafiało w znacznik
+        // czasu — UPDATE nigdy nie znajdował wiersza i status zostawał `queued`.
+        // `dispatch_id` jest ostatnim placeholderem WHERE, więc bierzemy go z końca.
+        const [provider, errorCode] = bindings as string[]
+        const id = bindings[bindings.length - 1] as string
         const row = this.byId(id)
         if (!row || row.status !== "queued") return { rows: [] }
         Object.assign(row, {

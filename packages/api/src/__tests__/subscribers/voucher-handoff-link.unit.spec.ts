@@ -111,7 +111,10 @@ class FakeSql implements DispatchLedgerSql {
         return { rows: [{ ...row }] }
       }
       if (q.includes("SET status = 'failed'")) {
-        const [provider, errorCode, , , id] = bindings as string[]
+        // Patrz voucher-purchase-delivery.unit.spec.ts: `markFailed` powtarza `$2`/`$3`,
+        // więc po ekspansji Knexa bindingów jest 7, a `dispatch_id` jest ostatni.
+        const [provider, errorCode] = bindings as string[]
+        const id = bindings[bindings.length - 1] as string
         const row = this.byId(id)
         if (!row || row.status !== "queued") return { rows: [] }
         Object.assign(row, {
