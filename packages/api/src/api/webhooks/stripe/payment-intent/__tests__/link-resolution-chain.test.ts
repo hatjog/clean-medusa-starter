@@ -390,8 +390,16 @@ describe("Story 5.1 AC4 — rozłączne klasy odrzucenia (zero emisji, czytelny 
 
   it("stary link_unresolved kończy retry Stripe terminalnym 400", async () => {
     const pg = makeFixturePg({ linkedOrderIds: [] })
+    // UWAGA: `incidentEvent(overrides)` rozlewa nadpisania do `data.object`, czyli
+    // ustawia czas utworzenia PaymentIntenta. Bezpiecznik mierzy natomiast WIEK
+    // ZDARZENIA (`stripeEvent.created`) — to dwie różne rzeczy. Nadpisanie musi
+    // więc trafić na POZIOM ZDARZENIA, inaczej test sprawdza pole, którego route
+    // nie czyta, i przechodzi/failuje z niewłaściwego powodu.
     const { req, emitted } = makeReq(
-      incidentEvent({ created: Math.floor(Date.now() / 1000) - LINK_UNRESOLVED_RETRY_WINDOW_SECONDS - 1 }),
+      {
+        ...incidentEvent(),
+        created: Math.floor(Date.now() / 1000) - LINK_UNRESOLVED_RETRY_WINDOW_SECONDS - 1,
+      },
       pg,
     )
 

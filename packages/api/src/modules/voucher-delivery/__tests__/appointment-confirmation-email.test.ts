@@ -1,4 +1,4 @@
-import { describe, expect, test } from "@jest/globals";
+import { afterAll, beforeAll, describe, expect, jest, test } from "@jest/globals";
 
 import {
   buildVoucherAppointmentDeliveryEmail,
@@ -46,7 +46,25 @@ function render(overrides: Partial<VoucherAppointmentDeliveryEmailInput> = {}) {
   });
 }
 
+/**
+ * Zegar systemowy MUSI być zamrożony na `FIXED_NOW`.
+ *
+ * Builder przyjmuje `now` jawnie, ale `verifySignedToken` czyta REALNE `Date.now()`
+ * (`storage/hmac.ts:82`). Token podpisywany jest na `FIXED_NOW + 24 h`, czyli
+ * 2026-06-03 — więc od 2026-06-03 ten test po cichu poczerwieniał na
+ * `now > expires_at`, mimo że kod produkcyjny jest poprawny. Test zgniły od czasu:
+ * zamrażał czas tylko dla jednej z dwóch stron round-tripu.
+ */
 describe("buildVoucherAppointmentDeliveryEmail", () => {
+  beforeAll(() => {
+    jest.useFakeTimers({ doNotFake: ["nextTick", "setImmediate"] });
+    jest.setSystemTime(FIXED_NOW);
+  });
+
+  afterAll(() => {
+    jest.useRealTimers();
+  });
+
   test("po appointment_confirmed dodaje attachment .ics, scoped download link i tekstowy CTA", () => {
     const email = render();
 
