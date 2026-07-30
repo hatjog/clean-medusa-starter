@@ -176,6 +176,20 @@ function giftSource(
     voucher_code: VOUCHER_CODE,
     market_id: MARKET_ID,
     purchase_locale: "pl",
+    // Story 5.7 — projekcja niesie komplet danych treści maila.
+    customer_first_name: "Magda",
+    seller_name: "Salon Bonbeauty",
+    seller_handle: "salon-bonbeauty",
+    order_id: "order_01KYSYPH78N80PE8YC85X6X3EK",
+    order_display_id: "1042",
+    purchase_date: "2026-07-30T09:15:00.000Z",
+    voucher_expires_at: "2027-07-30T00:00:00.000Z",
+    voucher_value_minor: 20000,
+    voucher_currency: "PLN",
+    salon_address_1: "ul. Handlowa 10",
+    salon_address_2: null,
+    salon_postal_code: "00-001",
+    salon_city: "Warszawa",
     purchase_mode: "gift",
     gift_recipient_email: RECIPIENT_EMAIL,
     gift_recipient_send_timing: GIFT_SEND_TIMING_NOW,
@@ -223,9 +237,22 @@ function makeDeps(overrides: {
           degraded: false,
         }
       },
+      // Story 5.7 (AC2) — `support_email` / `market_url` z ożywionej tabeli.
+      async readRuntimeConfig() {
+        return {
+          row: {
+            locales: { default: "pl", supported: ["pl", "en", "ua", "de"] },
+            support_email: "kontakt@bonbeauty.pl",
+            market_url: "https://dev.bonbeauty.pl",
+          },
+          degraded: false,
+        }
+      },
     },
     logger,
-    env: overrides.env ?? { STOREFRONT_URL: "https://dev.bonbeauty.pl" },
+    env: overrides.env ?? {
+      GP_STOREFRONT_URL_BONBEAUTY: "https://dev.bonbeauty.pl",
+    },
   }
 
   return { deps, sql, logger, dispatchCalls }
@@ -394,12 +421,12 @@ describe("AC1 — `voucher_handoff_link` w matrycy AD-7", () => {
 
   it("zakup NIE-prezentowy → dokładnie JEDEN dispatch (bez regresji 2.3)", async () => {
     const { deps, sql, dispatchCalls } = makeDeps({
-      source: {
-        buyer_email: BUYER_EMAIL,
-        voucher_code: VOUCHER_CODE,
-        market_id: MARKET_ID,
-        purchase_locale: "pl",
-      },
+      source: giftSource({
+        purchase_mode: null,
+        gift_recipient_email: null,
+        gift_recipient_send_timing: null,
+        gift_recipient_bound_to_voucher_issue: null,
+      }),
     })
 
     await handleVoucherPurchaseDelivery(envelope("ISSUED"), deps)
@@ -558,9 +585,11 @@ describe("AC3 — locale handoffu to `purchase_locale`, nigdy locale odbiorczyni
 
     const handoff = dispatchCalls[1].data as Record<string, unknown>
     expect(handoff.locale).toBe("de")
-    expect(handoff.claim_url).toBe(
+    // Story 5.7: nazwą linku handoffu jest `handoff_url` — tę czyta szablon.
+    expect(handoff.handoff_url).toBe(
       `https://dev.bonbeauty.pl/de/voucher/${VOUCHER_CODE}`,
     )
+    expect(handoff.claim_url).toBeUndefined()
   })
 
   it("`recipient_locale` w metadanych NIE nadpisuje `purchase_locale` (ADR-163, v1)", async () => {
@@ -650,8 +679,14 @@ describe("PII — adres obdarowanej nie opuszcza pola `to` (D-70)", () => {
       voucher_code: VOUCHER_CODE,
       market_id: MARKET_ID,
       locale: "pl",
-      claim_url: `https://dev.bonbeauty.pl/pl/voucher/${VOUCHER_CODE}`,
+      voucher_page_url: `https://dev.bonbeauty.pl/pl/voucher/${VOUCHER_CODE}`,
       dispatch_id: "dispatch-1",
+      customer_first_name: "Magda",
+      salon_name: "Salon Bonbeauty",
+      salon_address: "ul. Handlowa 10, 00-001 Warszawa",
+      support_email: "kontakt@bonbeauty.pl",
+      market_url: "https://dev.bonbeauty.pl",
+      voucher_expires_at: "2027-07-30T00:00:00.000Z",
     })
 
     const { to, ...rest } = notification

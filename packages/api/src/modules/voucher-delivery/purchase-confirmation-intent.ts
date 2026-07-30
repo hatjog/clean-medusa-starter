@@ -1,101 +1,91 @@
 /**
  * purchase-confirmation-intent.ts — budowa payloadu maila potwierdzenia zakupu
- * vouchera (Story 2.3, AC4).
+ * vouchera (Story 2.3 AC4; Story 5.7 AC4 — pokrycie kontraktu szablonu).
  *
- * Rozdzielone od subscribera świadomie: kształt payloadu i budowa linku claim to
- * czysta funkcja (testowalna bez kontenera Medusy i bez DB), a subscriber
- * zostaje orkiestracją I/O.
+ * Rozdzielone od subscribera świadomie: kształt payloadu to czysta funkcja
+ * (testowalna bez kontenera Medusy i bez DB), a subscriber zostaje orkiestracją
+ * I/O.
  *
- * ── Link claim z prefiksem locale ───────────────────────────────────────────
- * Deep-link per-kod w storefroncie to `/{locale}/voucher/{code}`
- * (`GP/storefront/src/app/[locale]/(main)/voucher/[code]`). Locale w linku to
- * **locale ZAKUPU** (AC3/AC4) — nigdy twarde `pl`.
+ * ── Story 5.7: payload MUSI pokrywać manifest ───────────────────────────────
+ * Do 5.7 payload niósł dziesięć pól governance i ani jednej zmiennej, której
+ * realnie oczekiwał szablon poza `voucher_code`. Mail wychodził z pustym
+ * imieniem, pustym salonem, pustym „Ważny do" i martwym przyciskiem, a ledger
+ * pokazywał `sent`. Odtąd komplet `body_vars` jest zadeklarowany maszynowo
+ * (`notification-body-vars.ts`) i sprawdzany fail-loud PRZED wywołaniem
+ * providera: payload bez pokrycia kończy się kontrolowanym błędem, który
+ * single-writer ledgera zapisuje jako `failed` — nigdy jako `sent`.
  *
- * ── Base URL: konfiguracja, nigdy hardcode ──────────────────────────────────
- * Kolejność: per-market env (`GP_STOREFRONT_URL_<MARKET>`) → globalny
- * `STOREFRONT_URL` / `STOREFRONT_BASE_URL` / `NEXT_PUBLIC_BASE_URL`. Brak
- * konfiguracji = **fail-loud** z kodem błędu; NIGDY `http://localhost` w linku
- * produkcyjnego maila (to jest realny tryb awarii, nie hipoteza — wzorzec
- * `DEFAULT_STOREFRONT_URL` z `lib/auth/recover-magic-link-email.ts` robi
- * dokładnie to, czego AC4 zakazuje dla tej ścieżki).
+ * ── `voucher_pdf_url` nie obiecuje PDF-a (AC4.6) ────────────────────────────
+ * Klucz zostaje, bo wymaga go istniejący manifest, ale jego wartością jest
+ * strona vouchera w storefroncie — dokładnie ten sam kształt linku co
+ * `handoff_url`. PDF przy wystawieniu nie powstaje, więc link do niego byłby
+ * obietnicą bez pokrycia. Copy CTA w szablonach zostało poprawione na
+ * „Otwórz voucher".
  *
- * ── Zero PII w payloadzie poza polem `to` ───────────────────────────────────
- * Adres pojawia się WYŁĄCZNIE w `to` (wymóg kanału). Do `data`/`metadata` idzie
- * `recipient_hash`, nigdy adres — te struktury trafiają do logów providera
- * i audytu (D-70).
+ * ── Link: jeden builder dla obu maili (AC6.5) ───────────────────────────────
+ * Base URL, walidacja osiągalności i ścieżka `/{locale}/voucher/{code}` żyją w
+ * `voucher-page-url.ts`. Ten plik ich nie liczy i nie renegocjuje.
+ *
+ * ── Zero PII w payloadzie poza polem `to` i personalizacją treści ───────────
+ * Adres pojawia się WYŁĄCZNIE w `to`. Do `data` idzie `recipient_hash`, nigdy
+ * adres (D-70). `customer_first_name` jest świadomym wyjątkiem: to zmienna
+ * treści wymagana przez manifest — imię, nigdy adres, nigdy nazwisko.
  */
 
 import { NOTIFICATION_TEMPLATE_KEYS } from "@gp/messaging"
 
+import {
+  assertBodyVarsCovered,
+  VOUCHER_PURCHASE_CONFIRMATION_BODY_VARS,
+} from "./notification-body-vars"
+import {
+  formatDateForLocale,
+  formatMinorAmountForLocale,
+} from "./notification-formatting"
 import type { RecipientHash } from "./recipient-hash"
 
 /** Flow governance-owy tej wysyłki (parity z `voucher-pii` dispatch adapterem). */
 export const VOUCHER_PURCHASE_DELIVERY_FLOW_ID = "voucher_purchase_delivery"
 
-export class StorefrontBaseUrlNotConfiguredError extends Error {
-  readonly error_code = "VOUCHER_DELIVERY_STOREFRONT_URL_NOT_CONFIGURED"
-
-  constructor(marketId: string) {
-    super(
-      `[voucher-purchase-delivery] brak skonfigurowanego base URL storefrontu dla rynku '${marketId}' ` +
-        "(ustaw GP_STOREFRONT_URL_<MARKET> albo STOREFRONT_URL/STOREFRONT_BASE_URL) — " +
-        "mail z linkiem do localhost jest gorszy niż brak maila",
-    )
-    this.name = "StorefrontBaseUrlNotConfiguredError"
-  }
-}
-
-/** `bonbeauty` → `GP_STOREFRONT_URL_BONBEAUTY`; `bon-garden` → `..._BON_GARDEN`. */
-export function marketStorefrontUrlEnvKey(marketId: string): string {
-  const normalized = marketId
-    .trim()
-    .toUpperCase()
-    .replace(/[^A-Z0-9]+/g, "_")
-  return `GP_STOREFRONT_URL_${normalized}`
-}
-
-export function resolveStorefrontBaseUrl(input: {
-  marketId: string
-  env?: NodeJS.ProcessEnv
-}): string {
-  const env = input.env ?? process.env
-  const candidates = [
-    env[marketStorefrontUrlEnvKey(input.marketId)],
-    env.STOREFRONT_URL,
-    env.STOREFRONT_BASE_URL,
-    env.NEXT_PUBLIC_BASE_URL,
-  ]
-
-  for (const candidate of candidates) {
-    const trimmed = candidate?.trim()
-    if (trimmed) {
-      return trimmed.replace(/\/+$/, "")
-    }
-  }
-
-  throw new StorefrontBaseUrlNotConfiguredError(input.marketId)
-}
-
-export function buildClaimUrl(input: {
-  baseUrl: string
-  locale: string
-  voucherCode: string
-}): string {
-  return (
-    `${input.baseUrl.replace(/\/+$/, "")}/${encodeURIComponent(input.locale)}` +
-    `/voucher/${encodeURIComponent(input.voucherCode)}`
-  )
-}
-
-export interface PurchaseConfirmationIntentInput {
+/**
+ * Wspólne wejście obu intentów voucherowych (Story 5.7).
+ *
+ * Wartości są SUROWE (daty jako ISO/`Date`, kwota w minor units): formatowanie
+ * dla locale należy do buildera, żeby nie mogło się rozjechać między dwoma
+ * mailami ani wyciec do szablonu.
+ */
+export interface VoucherDeliveryIntentInput {
+  /** Adres odbiorcy — jedyne miejsce, w którym opuszcza projekcję. */
   recipient_email: string
   recipient_hash: RecipientHash
   entitlement_id: string
   voucher_code: string
   market_id: string
+  /** `purchase_locale` — locale ZAKUPU (AD-8), nigdy locale odbiorczyni. */
   locale: string
-  claim_url: string
   dispatch_id: string
+  /** Deep-link `/{locale}/voucher/{code}` z `voucher-page-url.ts`. */
+  voucher_page_url: string
+  customer_first_name: string | null
+  salon_name: string | null
+  salon_address: string | null
+  /** `market_runtime_config.support_email` — nigdy env, nigdy hardkod (AC2). */
+  support_email: string | null
+  /** `market_runtime_config.market_url` — nigdy env, nigdy hardkod (AC2). */
+  market_url: string | null
+  voucher_expires_at: string | Date | null
+}
+
+export interface PurchaseConfirmationIntentInput
+  extends VoucherDeliveryIntentInput {
+  /** `order.display_id` (fallback `order.id`) — z prawdziwego zamówienia. */
+  order_id: string | null
+  purchase_date: string | Date | null
+  /** Minor units z wystawionego vouchera; `string` bo `pg` zwraca `numeric`. */
+  voucher_value_minor: unknown
+  voucher_currency: string | null
+  /** `/{locale}/sellers/{handle}` wyprowadzony z tabelowego `market_url`. */
+  salon_url: string | null
 }
 
 /**
@@ -109,12 +99,55 @@ export interface PurchaseConfirmationIntentInput {
  * Medusy (`NotificationModuleService.createNotifications_` szuka po
  * `idempotency_key`) pokrywa się z idempotencją ledgera — dwie warstwy tego
  * samego niezmiennika, nie dwie różne tożsamości wysyłki.
+ *
+ * Rzuca `NotificationBodyVarsIncompleteError`, gdy którakolwiek zmienna
+ * kontraktu jest pusta (Story 5.7 AC4.8).
  */
 export function buildPurchaseConfirmationNotification(
   input: PurchaseConfirmationIntentInput,
 ): Record<string, unknown> {
   const templateKey = NOTIFICATION_TEMPLATE_KEYS.VOUCHER_PURCHASE_CONFIRMATION
   const idempotencyKey = buildDispatchIdempotencyKey(input)
+
+  const data = {
+    template_key: templateKey,
+    // Bez tej trójki provider brevo nie rozwiąże nadawcy ani market-scoped
+    // audytu (Completion Notes 2.2).
+    market_id: input.market_id,
+    flow_id: VOUCHER_PURCHASE_DELIVERY_FLOW_ID,
+    locale: input.locale,
+    idempotency_key: idempotencyKey,
+    entitlement_id: input.entitlement_id,
+    dispatch_id: input.dispatch_id,
+    // D-70: identyfikator odbiorcy w danych = hash, nigdy adres.
+    recipient_hash: input.recipient_hash,
+
+    // ── body_vars manifestu (Story 5.7, AC4) ────────────────────────────────
+    customer_first_name: input.customer_first_name ?? "",
+    voucher_code: input.voucher_code,
+    voucher_value: formatMinorAmountForLocale(
+      input.voucher_value_minor,
+      input.locale,
+    ) ?? "",
+    voucher_currency: input.voucher_currency ?? "",
+    voucher_expires_at:
+      formatDateForLocale(input.voucher_expires_at, input.locale) ?? "",
+    salon_name: input.salon_name ?? "",
+    salon_address: input.salon_address ?? "",
+    salon_url: input.salon_url ?? "",
+    order_id: input.order_id ?? "",
+    purchase_date: formatDateForLocale(input.purchase_date, input.locale) ?? "",
+    // AC4.6: klucz manifestu zostaje, wartością jest strona vouchera.
+    voucher_pdf_url: input.voucher_page_url,
+    market_url: input.market_url ?? "",
+    support_email: input.support_email ?? "",
+  }
+
+  assertBodyVarsCovered(
+    templateKey,
+    VOUCHER_PURCHASE_CONFIRMATION_BODY_VARS,
+    data,
+  )
 
   return {
     // Retry musi aktualizować TEN SAM rekord Notification Medusy. Bez stabilnego
@@ -126,22 +159,7 @@ export function buildPurchaseConfirmationNotification(
     channel: "email",
     template: templateKey,
     idempotency_key: idempotencyKey,
-    data: {
-      template_key: templateKey,
-      // Bez tej trójki provider brevo nie rozwiąże nadawcy ani market-scoped
-      // audytu (Completion Notes 2.2).
-      market_id: input.market_id,
-      flow_id: VOUCHER_PURCHASE_DELIVERY_FLOW_ID,
-      locale: input.locale,
-      idempotency_key: idempotencyKey,
-      entitlement_id: input.entitlement_id,
-      dispatch_id: input.dispatch_id,
-      // AC4: kod vouchera + link claim z prefiksem locale zakupu.
-      voucher_code: input.voucher_code,
-      claim_url: input.claim_url,
-      // D-70: identyfikator odbiorcy w danych = hash, nigdy adres.
-      recipient_hash: input.recipient_hash,
-    },
+    data,
     metadata: {
       notification_type: templateKey,
       triggered_by: "system",

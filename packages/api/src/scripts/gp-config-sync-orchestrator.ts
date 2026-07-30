@@ -18,6 +18,7 @@ import gpConfigSyncAccounts from "./gp-config-sync-accounts"
 import gpConfigSyncBlog from "./gp-config-sync-blog"
 import gpConfigSyncCatalog from "./gp-config-sync-catalog"
 import gpConfigSyncI18nContent from "./gp-config-sync-i18n-content"
+import gpConfigSyncMarketRuntime from "./gp-config-sync-market-runtime"
 import gpConfigSyncTranslations from "./gp-config-sync-translations"
 import gpConfigSyncMedia from "./gp-config-sync-media"
 import gpConfigSyncPayments from "./gp-config-sync-payments"
@@ -715,6 +716,27 @@ export default async function gpConfigSyncOrchestrator({ container, args }: Exec
   try {
     const changedEntityIds = await collectChangedEntityIds(orchestratorArgs)
     const stageDefinitions = [
+      {
+        // Story 5.7 (AC2.6) — PIERWSZY etap: `market_runtime_config` jest
+        // źródłem `locales`/`support_email`/`market_url` dla runtime'u, więc
+        // musi być aktualne zanim cokolwiek zacznie z niego czytać.
+        name: "sync-market-runtime",
+        required: true,
+        execute: async () => {
+          const summary = await withStageEnv(orchestratorArgs, async () => {
+            return await invokeStageEntrypoint(
+              gpConfigSyncMarketRuntime,
+              container,
+              stageArgs,
+              { stage: "sync-market-runtime", sink: stageExitSignals },
+            )
+          })
+
+          return orchestratorArgs.dryRun
+            ? `market runtime dry-run completed (action=${summary?.action})`
+            : `market runtime sync completed (action=${summary?.action})`
+        },
+      },
       {
         name: "sync-catalog",
         required: true,

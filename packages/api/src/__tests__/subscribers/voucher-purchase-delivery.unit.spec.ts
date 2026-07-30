@@ -20,11 +20,12 @@ import {
 } from "../../modules/voucher-delivery/dispatch-ledger"
 import { hashRecipientEmail } from "../../modules/voucher-delivery/recipient-hash"
 import {
-  buildClaimUrl,
+  buildVoucherPageUrl,
   marketStorefrontUrlEnvKey,
   resolveStorefrontBaseUrl,
   StorefrontBaseUrlNotConfiguredError,
-} from "../../modules/voucher-delivery/purchase-confirmation-intent"
+  StorefrontBaseUrlNotReachableError,
+} from "../../modules/voucher-delivery/voucher-page-url"
 import {
   formatErrorCodeMarker,
   NOTIFICATION_TEMPLATE_KEYS,
@@ -35,6 +36,38 @@ const ENTITLEMENT_ID = "entinst_2_3_001"
 const VOUCHER_CODE = "BB-ABCD-1234"
 const MARKET_ID = "bonbeauty"
 const TEMPLATE_KEY = NOTIFICATION_TEMPLATE_KEYS.VOUCHER_PURCHASE_CONFIRMATION
+
+/**
+ * Story 5.7 — projekcja źródłowa niesie KOMPLET danych treści maila. Do 5.7
+ * atrapa zwracała wyłącznie adres, kod i rynek, więc testy przechodziły dla
+ * payloadu, który w produkcji wychodził z pustym imieniem, salonem i „Ważny do".
+ */
+const DEFAULT_SOURCE: PurchaseDeliverySource = {
+  buyer_email: BUYER_EMAIL,
+  voucher_code: VOUCHER_CODE,
+  market_id: MARKET_ID,
+  purchase_locale: "pl",
+  customer_first_name: "Magda",
+  seller_name: "Salon Bonbeauty",
+  seller_handle: "salon-bonbeauty",
+  order_id: "order_01KYSYPH78N80PE8YC85X6X3EK",
+  order_display_id: "1042",
+  purchase_date: "2026-07-30T09:15:00.000Z",
+  voucher_expires_at: "2027-07-30T00:00:00.000Z",
+  voucher_value_minor: 20000,
+  voucher_currency: "PLN",
+  salon_address_1: "ul. Handlowa 10",
+  salon_address_2: null,
+  salon_postal_code: "00-001",
+  salon_city: "Warszawa",
+}
+
+/** Story 5.7 — wiersz `market_runtime_config` zasilony syncem gp-config. */
+const DEFAULT_RUNTIME_CONFIG = {
+  locales: { default: "pl", supported: ["pl", "en", "ua", "de"] },
+  support_email: "kontakt@bonbeauty.pl",
+  market_url: "https://dev.bonbeauty.pl",
+}
 
 // ── Atrapy ─────────────────────────────────────────────────────────────────
 
@@ -189,6 +222,14 @@ function makeDeps(overrides: {
   sql?: FakeSql
   env?: NodeJS.ProcessEnv
   ledgerOverride?: PurchaseDeliveryDeps["ledger"]
+  /** Story 5.7 — wiersz `market_runtime_config` rynku (`null` = brak wiersza). */
+  runtimeConfig?: {
+    locales: Record<string, unknown> | null
+    support_email: string | null
+    market_url: string | null
+  } | null
+  /** Story 5.7 — odczyt `market_runtime_config` nieudany (np. brak tabeli). */
+  runtimeConfigDegraded?: boolean
 }) {
   const sql = overrides.sql ?? new FakeSql()
   const logger = makeLogger()
@@ -200,12 +241,7 @@ function makeDeps(overrides: {
       async findBuyerClaimSource() {
         if (overrides.sourceError) throw overrides.sourceError
         return overrides.source === undefined
-          ? {
-              buyer_email: BUYER_EMAIL,
-              voucher_code: VOUCHER_CODE,
-              market_id: MARKET_ID,
-              purchase_locale: "pl",
-            }
+          ? { ...DEFAULT_SOURCE }
           : overrides.source
       },
     },
@@ -230,9 +266,20 @@ function makeDeps(overrides: {
           degraded: overrides.localesDegraded ?? false,
         }
       },
+      async readRuntimeConfig() {
+        return {
+          row:
+            overrides.runtimeConfig === undefined
+              ? { ...DEFAULT_RUNTIME_CONFIG }
+              : overrides.runtimeConfig,
+          degraded: overrides.runtimeConfigDegraded ?? false,
+        }
+      },
     },
     logger,
-    env: overrides.env ?? { STOREFRONT_URL: "https://dev.bonbeauty.pl" },
+    // Story 5.7 (AC6.2): baza deep-linku jest WYŁĄCZNIE per rynek — globalny
+    // `STOREFRONT_URL` przestał być akceptowany.
+    env: overrides.env ?? { GP_STOREFRONT_URL_BONBEAUTY: "https://dev.bonbeauty.pl" },
   }
 
   return { deps, sql, logger, dispatchCalls }
@@ -535,8 +582,7 @@ describe("AC3 — purchase_locale: odczyt, walidacja, jawny fallback", () => {
   it("purchase_locale obecne i wspierane → mail w tym locale", async () => {
     const { deps, dispatchCalls } = makeDeps({
       source: {
-        buyer_email: BUYER_EMAIL,
-        voucher_code: VOUCHER_CODE,
+        ...DEFAULT_SOURCE,
         market_id: MARKET_ID,
         purchase_locale: "ua",
       },
@@ -550,8 +596,7 @@ describe("AC3 — purchase_locale: odczyt, walidacja, jawny fallback", () => {
   it("brak purchase_locale → fallback `locales.default` Z LOGIEM (nigdy cichy)", async () => {
     const { deps, dispatchCalls, logger } = makeDeps({
       source: {
-        buyer_email: BUYER_EMAIL,
-        voucher_code: VOUCHER_CODE,
+        ...DEFAULT_SOURCE,
         market_id: MARKET_ID,
         purchase_locale: null,
       },
@@ -574,8 +619,7 @@ describe("AC3 — purchase_locale: odczyt, walidacja, jawny fallback", () => {
   it("locale spoza listy rynku → fallback + `warn` (nie wysyłka w nieistniejącym locale)", async () => {
     const { deps, dispatchCalls, logger } = makeDeps({
       source: {
-        buyer_email: BUYER_EMAIL,
-        voucher_code: VOUCHER_CODE,
+        ...DEFAULT_SOURCE,
         market_id: MARKET_ID,
         purchase_locale: "fr",
       },
@@ -598,8 +642,7 @@ describe("AC3 — purchase_locale: odczyt, walidacja, jawny fallback", () => {
   it("`buyer_locale` ze snapshotu polityki jest wtórnym nośnikiem tej samej intencji", async () => {
     const { deps, dispatchCalls } = makeDeps({
       source: {
-        buyer_email: BUYER_EMAIL,
-        voucher_code: VOUCHER_CODE,
+        ...DEFAULT_SOURCE,
         market_id: MARKET_ID,
         purchase_locale: null,
         buyer_locale: "en",
@@ -617,8 +660,7 @@ describe("AC4 — kod vouchera + link claim z prefiksem locale", () => {
   it("payload zawiera kod vouchera i link claim z prefiksem locale ZAKUPU", async () => {
     const { deps, dispatchCalls } = makeDeps({
       source: {
-        buyer_email: BUYER_EMAIL,
-        voucher_code: VOUCHER_CODE,
+        ...DEFAULT_SOURCE,
         market_id: MARKET_ID,
         purchase_locale: "ua",
       },
@@ -628,11 +670,16 @@ describe("AC4 — kod vouchera + link claim z prefiksem locale", () => {
 
     const data = dispatchCalls[0].data as Record<string, unknown>
     expect(data.voucher_code).toBe(VOUCHER_CODE)
-    expect(data.claim_url).toBe(
+    // Story 5.7: nazwą linku w payloadzie potwierdzenia jest `voucher_pdf_url`
+    // (klucz manifestu), a jego wartością strona vouchera — nie PDF.
+    expect(data.voucher_pdf_url).toBe(
       `https://dev.bonbeauty.pl/ua/voucher/${VOUCHER_CODE}`,
     )
+    expect(String(data.voucher_pdf_url)).not.toMatch(/\.pdf$/i)
     // Twarde `pl` w linku to dokładnie regresja, której zakazuje AC4.
-    expect(String(data.claim_url)).not.toContain("/pl/")
+    expect(String(data.voucher_pdf_url)).not.toContain("/pl/")
+    // `claim_url` był nazwą, której nie czytał ŻADEN szablon (defekt 5.3).
+    expect(data.claim_url).toBeUndefined()
   })
 
   it("brak base URL storefrontu → FAIL-LOUD z kodem błędu, nigdy link do localhost", async () => {
@@ -650,19 +697,25 @@ describe("AC4 — kod vouchera + link claim z prefiksem locale", () => {
     expect(JSON.stringify(logger.entries)).not.toContain("localhost")
   })
 
-  it("per-market env ma pierwszeństwo nad globalnym STOREFRONT_URL", () => {
+  it("Story 5.7 AC6.2: liczy się WYŁĄCZNIE env per rynek — globalny nie jest fallbackiem", () => {
     expect(marketStorefrontUrlEnvKey("bonbeauty")).toBe(
       "GP_STOREFRONT_URL_BONBEAUTY",
     )
     expect(
       resolveStorefrontBaseUrl({
         marketId: "bonbeauty",
-        env: {
-          GP_STOREFRONT_URL_BONBEAUTY: "https://bonbeauty.pl/",
-          STOREFRONT_URL: "https://fallback.example",
-        },
+        env: { GP_STOREFRONT_URL_BONBEAUTY: "https://bonbeauty.pl/" },
       }),
     ).toBe("https://bonbeauty.pl")
+
+    // Globalny `STOREFRONT_URL` cicho kierował maile jednego rynku na
+    // storefront innego — po 5.7 nie jest już źródłem.
+    expect(() =>
+      resolveStorefrontBaseUrl({
+        marketId: "bongarden",
+        env: { STOREFRONT_URL: "https://bonbeauty.pl" },
+      }),
+    ).toThrow(StorefrontBaseUrlNotConfiguredError)
   })
 
   it("brak jakiejkolwiek konfiguracji base URL rzuca, a nie zwraca localhost", () => {
@@ -671,14 +724,109 @@ describe("AC4 — kod vouchera + link claim z prefiksem locale", () => {
     )
   })
 
+  it("Story 5.7 AC6.3: loopback, URL względny i zły protokół są odrzucane", () => {
+    for (const value of [
+      "http://localhost:8000",
+      "http://127.0.0.1:8000",
+      "http://[::1]:8000",
+      "http://0.0.0.0:8000",
+      "dev.bonbeauty.pl",
+      "/pl/voucher",
+      "ftp://dev.bonbeauty.pl",
+    ]) {
+      expect(() =>
+        resolveStorefrontBaseUrl({
+          marketId: "bonbeauty",
+          env: { GP_STOREFRONT_URL_BONBEAUTY: value },
+        }),
+      ).toThrow(StorefrontBaseUrlNotReachableError)
+    }
+  })
+
   it("kod vouchera w linku jest URL-encoded", () => {
     expect(
-      buildClaimUrl({
+      buildVoucherPageUrl({
         baseUrl: "https://x.test/",
         locale: "pl",
         voucherCode: "A B/C",
       }),
     ).toBe("https://x.test/pl/voucher/A%20B%2FC")
+  })
+
+  it("Story 5.7 AC3/AC4: payload niesie komplet zmiennych treści z projekcji", async () => {
+    const { deps, dispatchCalls } = makeDeps({})
+
+    await handleVoucherPurchaseDelivery(envelope("ISSUED"), deps)
+
+    const data = dispatchCalls[0].data as Record<string, unknown>
+    expect(data.customer_first_name).toBe("Magda")
+    expect(data.salon_name).toBe("Salon Bonbeauty")
+    expect(data.salon_address).toBe("ul. Handlowa 10, 00-001 Warszawa")
+    expect(data.salon_url).toBe(
+      "https://dev.bonbeauty.pl/pl/sellers/salon-bonbeauty",
+    )
+    expect(data.order_id).toBe("1042")
+    expect(data.purchase_date).toBe("30.07.2026")
+    expect(data.voucher_expires_at).toBe("30.07.2027")
+    expect(data.voucher_value).toBe("200,00")
+    expect(data.voucher_currency).toBe("PLN")
+    // Kontakt i URL rynku pochodzą z TABELI, nie z env.
+    expect(data.support_email).toBe("kontakt@bonbeauty.pl")
+    expect(data.market_url).toBe("https://dev.bonbeauty.pl")
+  })
+
+  it("Story 5.7 AC4.8: brak danych treści → `failed` z kodem, NIGDY `sent`", async () => {
+    const { deps, sql, dispatchCalls } = makeDeps({
+      source: { ...DEFAULT_SOURCE, customer_first_name: null },
+    })
+
+    const result = await handleVoucherPurchaseDelivery(envelope("ISSUED"), deps)
+
+    expect(result.outcome).toBe("failed")
+    expect(result.error_code).toBe("VOUCHER_DELIVERY_PAYLOAD_INCOMPLETE")
+    expect(dispatchCalls).toHaveLength(0)
+    // Rezerwacja istnieje, ale single-writer domknął ją jako `failed`.
+    expect(sql.dispatch).toHaveLength(1)
+    expect(sql.dispatch[0].status).toBe("failed")
+  })
+
+  it("Story 5.7 AC2: brak wiersza market_runtime_config → `failed` przed rezerwacją", async () => {
+    const { deps, sql, dispatchCalls, logger } = makeDeps({ runtimeConfig: null })
+
+    const result = await handleVoucherPurchaseDelivery(envelope("ISSUED"), deps)
+
+    expect(result.outcome).toBe("failed")
+    expect(result.error_code).toBe(
+      "VOUCHER_DELIVERY_MARKET_RUNTIME_CONFIG_INCOMPLETE",
+    )
+    expect(dispatchCalls).toHaveLength(0)
+    expect(sql.dispatch).toHaveLength(0)
+    expect(logger.entries.some((e) => e.level === "error")).toBe(true)
+  })
+
+  it("Story 5.7 AC2: nieudany odczyt tabeli ma WŁASNY kod (migracja vs sync)", async () => {
+    const { deps } = makeDeps({ runtimeConfig: null, runtimeConfigDegraded: true })
+
+    const result = await handleVoucherPurchaseDelivery(envelope("ISSUED"), deps)
+
+    expect(result.error_code).toBe(
+      "VOUCHER_DELIVERY_MARKET_RUNTIME_CONFIG_UNAVAILABLE",
+    )
+  })
+
+  it("Story 5.7 AC2: pusty support_email w tabeli NIE degraduje do env", async () => {
+    const { deps, dispatchCalls } = makeDeps({
+      runtimeConfig: { ...DEFAULT_RUNTIME_CONFIG, support_email: null },
+      env: {
+        GP_STOREFRONT_URL_BONBEAUTY: "https://dev.bonbeauty.pl",
+        SUPPORT_EMAIL: "z-env@bonbeauty.pl",
+      },
+    })
+
+    const result = await handleVoucherPurchaseDelivery(envelope("ISSUED"), deps)
+
+    expect(result.outcome).toBe("failed")
+    expect(dispatchCalls).toHaveLength(0)
   })
 
   it("brak voucher_code → graceful skip (mail bez kodu nie spełnia AC4)", async () => {
@@ -848,12 +996,11 @@ describe("AC6b — market_id z danych domenowych, nie z GP_DEFAULT_MARKET_ID", (
   it("preferuje `scope.market_id` koperty", async () => {
     const { deps, dispatchCalls, logger } = makeDeps({
       source: {
-        buyer_email: BUYER_EMAIL,
-        voucher_code: VOUCHER_CODE,
+        ...DEFAULT_SOURCE,
         market_id: null,
         purchase_locale: "pl",
       },
-      env: { STOREFRONT_URL: "https://dev.bonbeauty.pl", GP_DEFAULT_MARKET_ID: "zly-rynek" },
+      env: { GP_STOREFRONT_URL_BONBEAUTY: "https://dev.bonbeauty.pl", GP_DEFAULT_MARKET_ID: "zly-rynek" },
     })
 
     await handleVoucherPurchaseDelivery(envelope("ISSUED"), deps)
@@ -868,11 +1015,13 @@ describe("AC6b — market_id z danych domenowych, nie z GP_DEFAULT_MARKET_ID", (
   it("gdy koperta nie niesie rynku, bierze go z projekcji źródłowej", async () => {
     const { deps, dispatchCalls, logger } = makeDeps({
       source: {
-        buyer_email: BUYER_EMAIL,
-        voucher_code: VOUCHER_CODE,
+        ...DEFAULT_SOURCE,
         market_id: "bongarden",
         purchase_locale: "pl",
       },
+      // Baza deep-linku jest per rynek (5.7 AC6.2), więc rynek z projekcji
+      // musi mieć własny klucz — brak globalnego fallbacku jest tu POINTĄ.
+      env: { GP_STOREFRONT_URL_BONGARDEN: "https://dev.bongarden.pl" },
     })
 
     await handleVoucherPurchaseDelivery(
@@ -889,13 +1038,12 @@ describe("AC6b — market_id z danych domenowych, nie z GP_DEFAULT_MARKET_ID", (
   it("dopiero brak rynku w danych domenowych daje GŁOŚNY fallback konfiguracyjny", async () => {
     const { deps, dispatchCalls, logger } = makeDeps({
       source: {
-        buyer_email: BUYER_EMAIL,
-        voucher_code: VOUCHER_CODE,
+        ...DEFAULT_SOURCE,
         market_id: null,
         purchase_locale: "pl",
       },
       env: {
-        STOREFRONT_URL: "https://dev.bonbeauty.pl",
+        GP_STOREFRONT_URL_BONBEAUTY: "https://dev.bonbeauty.pl",
         GP_DEFAULT_MARKET_ID: "bonbeauty",
       },
     })
@@ -1048,8 +1196,7 @@ describe("R-2.3-M6 — degradacja konfiguracji locale NIE degraduje maila do loc
   it("konfiguracja locale nieznana + locale zakupu `ua` → `failed`, NIE mail po polsku", async () => {
     const { deps, sql, dispatchCalls, logger } = makeDeps({
       source: {
-        buyer_email: BUYER_EMAIL,
-        voucher_code: VOUCHER_CODE,
+        ...DEFAULT_SOURCE,
         market_id: MARKET_ID,
         purchase_locale: "ua",
       },
@@ -1070,8 +1217,7 @@ describe("R-2.3-M6 — degradacja konfiguracji locale NIE degraduje maila do loc
   it("konfiguracja locale ZNANA + locale spoza listy rynku → legalny fallback (bez zmiany zachowania)", async () => {
     const { deps, dispatchCalls } = makeDeps({
       source: {
-        buyer_email: BUYER_EMAIL,
-        voucher_code: VOUCHER_CODE,
+        ...DEFAULT_SOURCE,
         market_id: MARKET_ID,
         purchase_locale: "ua",
       },
@@ -1089,8 +1235,7 @@ describe("R-2.3-M6 — degradacja konfiguracji locale NIE degraduje maila do loc
   it("degradacja BEZ locale w danych domenowych → wysyłka w `locales.default` (AC3)", async () => {
     const { deps, dispatchCalls } = makeDeps({
       source: {
-        buyer_email: BUYER_EMAIL,
-        voucher_code: VOUCHER_CODE,
+        ...DEFAULT_SOURCE,
         market_id: MARKET_ID,
         purchase_locale: null,
       },

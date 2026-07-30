@@ -51,49 +51,115 @@ export type MarketLocaleConfigRead = {
   degraded: boolean
 }
 
+/**
+ * Story 5.7 (AC2/AC3) — pełny wiersz runtime config rynku.
+ *
+ * `support_email` i `market_url` NIE mają shimu env ani wartości domyślnej:
+ * decyzja PO z 2026-07-30 mówi, że jedynym ich źródłem jest ożywiony kanał
+ * gp-config → `market_runtime_config`. Dlatego ten typ dopuszcza `null`, a
+ * konsument (builder payloadu) traktuje brak jako BŁĄD, nie jako degradację.
+ */
+export type MarketRuntimeConfigRow = {
+  locales: Partial<MarketLocaleConfig> | null
+  support_email: string | null
+  market_url: string | null
+}
+
+export type MarketRuntimeConfigRead = {
+  /** `null` = brak wiersza dla rynku albo nieudany odczyt (patrz `degraded`). */
+  row: MarketRuntimeConfigRow | null
+  /**
+   * `true` = konfiguracja rynku NIE jest znana (błąd odczytu, np. brak tabeli).
+   * Odróżnia „rynek nieskonfigurowany" od „nie wiemy, bo odczyt padł".
+   */
+  degraded: boolean
+}
+
 export interface MarketLocalesReader {
   read(marketId: string): Promise<MarketLocaleConfigRead>
+  /**
+   * Opcjonalna w interfejsie WYŁĄCZNIE ze względu na zastane atrapy testowe.
+   * Konsument, któremu jej brakuje, MUSI zachować się fail-loud — brak metody
+   * nie może oznaczać „konfiguracja jest w porządku" (to byłaby dokładnie ta
+   * cicha degradacja, którą Story 5.7 likwiduje).
+   */
+  readRuntimeConfig?(marketId: string): Promise<MarketRuntimeConfigRead>
 }
 
 export function createMarketLocalesReader(
   sql: MarketLocalesSql,
   logger?: LocalesReaderLogger,
 ): MarketLocalesReader {
+  async function readRuntimeConfig(
+    marketId: string,
+  ): Promise<MarketRuntimeConfigRead> {
+    try {
+      const query = toKnexPositionalSql(
+        `SELECT locales, support_email, market_url
+           FROM market_runtime_config
+          WHERE market_id = $1
+          LIMIT 1`,
+        [marketId],
+      )
+      const result = await sql.raw(query.text, query.bindings)
+      const rows = extractRows(result)
+
+      if (rows.length === 0) {
+        return { row: null, degraded: false }
+      }
+
+      const row = rows[0] ?? {}
+      return {
+        row: {
+          locales: parseLocalesBlock(row.locales),
+          support_email: nonEmptyString(row.support_email),
+          market_url: nonEmptyString(row.market_url),
+        },
+        degraded: false,
+      }
+    } catch (error) {
+      logger?.warn?.(
+        "[market-locales] odczyt market_runtime_config nieudany — " +
+          "konfiguracja rynku NIEZNANA (tabela może nie istnieć w tym runtime)",
+        {
+          market_id: marketId,
+          error_class:
+            error instanceof Error ? error.constructor.name : typeof error,
+        },
+      )
+      return { row: null, degraded: true }
+    }
+  }
+
   return {
+    readRuntimeConfig,
     async read(marketId: string): Promise<MarketLocaleConfigRead> {
-      try {
-        const query = toKnexPositionalSql(
-          `SELECT locales FROM market_runtime_config WHERE market_id = $1 LIMIT 1`,
-          [marketId],
-        )
-        const result = await sql.raw(query.text, query.bindings)
-        const rows = extractRows(result)
-        const raw = rows.length > 0 ? rows[0]?.locales : null
-        const locales = parseLocalesBlock(raw)
+      // Jedna implementacja odczytu runtime config (Project Structure Notes
+      // 5.7: „zachowaj jedną implementację źródła runtime config") — ta metoda
+      // jest wyłącznie projekcją bloku `locales`, nie drugim kanałem SQL.
+      const runtime = await readRuntimeConfig(marketId)
+      const locales = runtime.row?.locales ?? null
 
-        if (!locales) {
-          logger?.warn?.(
-            "[market-locales] brak bloku locales dla rynku — użyto shimu env DEFAULT_LOCALE",
-            { market_id: marketId },
-          )
-          return { config: getMarketLocales(marketId, null), degraded: true }
-        }
-
-        return { config: getMarketLocales(marketId, { locales }), degraded: false }
-      } catch (error) {
+      if (!locales) {
         logger?.warn?.(
-          "[market-locales] odczyt market_runtime_config.locales nieudany — " +
-            "degradacja do shimu env DEFAULT_LOCALE (tabela może nie istnieć w tym runtime)",
-          {
-            market_id: marketId,
-            error_class:
-              error instanceof Error ? error.constructor.name : typeof error,
-          },
+          runtime.degraded
+            ? "[market-locales] odczyt market_runtime_config.locales nieudany — " +
+                "degradacja do shimu env DEFAULT_LOCALE (tabela może nie istnieć w tym runtime)"
+            : "[market-locales] brak bloku locales dla rynku — użyto shimu env DEFAULT_LOCALE",
+          { market_id: marketId },
         )
         return { config: getMarketLocales(marketId, null), degraded: true }
       }
+
+      return { config: getMarketLocales(marketId, { locales }), degraded: false }
     },
   }
+}
+
+function nonEmptyString(value: unknown): string | null {
+  if (typeof value !== "string") return null
+  const trimmed = value.trim()
+  return trimmed.length > 0 ? trimmed : null
 }
 
 function extractRows(result: unknown): Array<Record<string, unknown>> {

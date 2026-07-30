@@ -309,6 +309,25 @@ function firstNonEmptyString(value: unknown): string | null {
 }
 
 /**
+ * Story 5.7 — kolumna `timestamptz` do ISO-8601.
+ *
+ * Sterownik `pg` zwraca `Date`, ale ta sama projekcja bywa karmiona wierszem z
+ * atrapy testowej (string). Obie formy dają ten sam wynik; wszystko inne
+ * (w tym `Invalid Date`) daje `null`, żeby do maila nie trafił napis
+ * „Invalid Date" udający termin ważności.
+ */
+function toIsoStringOrNull(value: unknown): string | null {
+  if (value instanceof Date) {
+    return Number.isNaN(value.getTime()) ? null : value.toISOString()
+  }
+  if (typeof value === "string" && value.trim().length > 0) {
+    const parsed = new Date(value)
+    return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString()
+  }
+  return null
+}
+
+/**
  * Story 2.3 — odczyt pola z kolumny `metadata` (jsonb albo string, zależnie od
  * sterownika/kształtu wiersza). Zwraca `null` przy każdym niejednoznacznym
  * wejściu — projekcja nigdy nie zgaduje.
@@ -845,6 +864,34 @@ export class VoucherService {
     gift_recipient_email: string | null
     gift_recipient_send_timing: string | null
     gift_recipient_bound_to_voucher_issue: boolean | null
+    /**
+     * ── Story 5.7 (v1.14.0, AC3/AC4): projekcja treści maila ────────────────
+     * Do 5.7 projekcja zwracała komplet danych potrzebnych do DECYZJI o wysyłce
+     * i ani jednego pola potrzebnego do jej TREŚCI. Poniższe pola są odczytem
+     * danych, które już leżały w bazie (zamówienie, adres zamówienia, voucher,
+     * seller + `seller_address`) i były gubione przy budowie intentu — stąd
+     * mail z pustym imieniem, salonem, adresem i terminem ważności.
+     *
+     * Wszystkie są NULLABLE: brak wartości to legalny stan zastanych danych.
+     * Decyzję „czy wolno wysłać" podejmuje builder payloadu (fail-loud na
+     * kontrakcie `body_vars`), nie ta projekcja.
+     */
+    customer_first_name: string | null
+    order_id: string | null
+    /** `order.display_id` — identyfikator pokazywany kupującej, nie ULID. */
+    order_display_id: string | null
+    /** ISO-8601 `order.created_at`. */
+    purchase_date: string | null
+    /** ISO-8601 `voucher.expires_at`. */
+    voucher_expires_at: string | null
+    /** Minor units z `voucher.value_minor`; `string` gdy kolumna jest `numeric`. */
+    voucher_value_minor: number | string | null
+    voucher_currency: string | null
+    /** Składniki adresu salonu z relacji `seller_address` (bez formatowania). */
+    salon_address_1: string | null
+    salon_address_2: string | null
+    salon_postal_code: string | null
+    salon_city: string | null
   } | null> {
     const lookupCode = voucher_code ?? voucher_id
     const pool = this.getPool()
@@ -858,9 +905,26 @@ export class VoucherService {
          v.seller_name                               AS seller_name,
          v.seller_handle                             AS seller_handle,
          v.product_title                             AS product_title,
+         v.expires_at                                AS voucher_expires_at,
+         v.value_minor                               AS voucher_value_minor,
+         v.currency_code                             AS voucher_currency,
+         o.id                                        AS order_pk,
+         o.display_id                                AS order_display_id,
+         o.created_at                                AS order_created_at,
          o.email                                     AS order_email,
          o.metadata                                  AS order_metadata,
          li.metadata                                 AS line_item_metadata,
+         -- Story 5.7 (AC3): imię kupującej z KANONICZNYCH danych zamówienia.
+         -- Kolejność: adres rozliczeniowy → adres dostawy → profil klienta.
+         -- Imienia NIE parsujemy z adresu e-mail (Dev Notes 5.7).
+         COALESCE(ba.first_name, sa.first_name, cu.first_name) AS customer_first_name,
+         -- Story 5.7 (AC3): adres salonu z prawdziwej relacji seller_address.
+         -- LATERAL, bo seller może mieć wiele adresów — bierzemy najstarszy
+         -- nieusunięty (adres główny salonu), deterministycznie.
+         sadr.address_1                              AS salon_address_1,
+         sadr.address_2                              AS salon_address_2,
+         sadr.postal_code                            AS salon_postal_code,
+         sadr.city                                   AS salon_city,
          (
            SELECT ve.occurred_at FROM voucher_event ve
             WHERE ve.voucher_code = v.code
@@ -874,6 +938,23 @@ export class VoucherService {
        LEFT JOIN order_line_item li
               ON li.id = ei.line_item_id
              AND li.deleted_at IS NULL
+       LEFT JOIN order_address ba
+              ON ba.id = o.billing_address_id
+             AND ba.deleted_at IS NULL
+       LEFT JOIN order_address sa
+              ON sa.id = o.shipping_address_id
+             AND sa.deleted_at IS NULL
+       LEFT JOIN customer cu
+              ON cu.id = o.customer_id
+             AND cu.deleted_at IS NULL
+       LEFT JOIN LATERAL (
+         SELECT sa2.address_1, sa2.address_2, sa2.postal_code, sa2.city
+           FROM seller_address sa2
+          WHERE sa2.seller_id = v.seller_id
+            AND sa2.deleted_at IS NULL
+          ORDER BY sa2.created_at ASC, sa2.id ASC
+          LIMIT 1
+       ) sadr ON TRUE
        WHERE ei.id = $1
           OR (ei.policy_snapshot->>'voucher_code') = $2
           OR v.code = $2
@@ -956,6 +1037,35 @@ export class VoucherService {
       // zamówieniu: w koszyku z kilkoma voucherami zgadywanie, który prezent
       // należy do którego wydania, wysłałoby mail nie tej osobie.
       ...readGiftContract(row.line_item_metadata),
+
+      // ── Story 5.7 (AC3/AC4): dane treści maila ────────────────────────────
+      customer_first_name: firstNonEmptyString(row.customer_first_name),
+      order_id: firstNonEmptyString(row.order_pk) ?? firstNonEmptyString(row.order_id),
+      order_display_id:
+        row.order_display_id === null || row.order_display_id === undefined
+          ? null
+          : firstNonEmptyString(String(row.order_display_id)),
+      purchase_date: toIsoStringOrNull(row.order_created_at),
+      voucher_expires_at: toIsoStringOrNull(row.voucher_expires_at),
+      // Świadomie BEZ konwersji na `number`: kolumna bywa `numeric`, a wtedy
+      // sterownik `pg` zwraca łańcuch. Konsument (`formatMinorAmountForLocale`)
+      // przyjmuje obie formy; wymuszanie `number` tutaj degradowałoby kwotę
+      // (klasa defektu ADR-166 R-1).
+      voucher_value_minor:
+        typeof row.voucher_value_minor === "number" ||
+        (typeof row.voucher_value_minor === "string" &&
+          (row.voucher_value_minor as string).trim().length > 0)
+          ? (row.voucher_value_minor as number | string)
+          : null,
+      voucher_currency: firstNonEmptyString(row.voucher_currency),
+      // Składniki, nie gotowy napis: formatowanie adresu jest prezentacją i
+      // należy do warstwy delivery (`notification-formatting.ts`). Moduł
+      // voucher nie importuje voucher-delivery — kierunek zależności pilnuje
+      // test `voucher-purchase-delivery-boundaries`.
+      salon_address_1: firstNonEmptyString(row.salon_address_1),
+      salon_address_2: firstNonEmptyString(row.salon_address_2),
+      salon_postal_code: firstNonEmptyString(row.salon_postal_code),
+      salon_city: firstNonEmptyString(row.salon_city),
     }
   }
 

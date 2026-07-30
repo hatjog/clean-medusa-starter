@@ -628,6 +628,21 @@ function makeHarness(options: HarnessOptions = {}) {
           voucher_code: VOUCHER_CODE,
           market_id: MARKET_ID,
           purchase_locale: "pl",
+          // Story 5.7 — projekcja niesie komplet danych treści maila; bez nich
+          // builder odmawia zbudowania payloadu bez pokrycia kontraktu.
+          customer_first_name: "Magda",
+          seller_name: "Salon Bonbeauty",
+          seller_handle: "salon-bonbeauty",
+          order_id: "order_01KYSYPH78N80PE8YC85X6X3EK",
+          order_display_id: "1042",
+          purchase_date: "2026-07-30T09:15:00.000Z",
+          voucher_expires_at: "2027-07-30T00:00:00.000Z",
+          voucher_value_minor: 20000,
+          voucher_currency: "PLN",
+          salon_address_1: "ul. Handlowa 10",
+          salon_address_2: null,
+          salon_postal_code: "00-001",
+          salon_city: "Warszawa",
           ...(options.giftSource
             ? {
                 purchase_mode: "gift",
@@ -660,9 +675,21 @@ function makeHarness(options: HarnessOptions = {}) {
           degraded: false,
         }
       },
+      // Story 5.7 (AC2) — dosyłka idzie tą samą ścieżką co subscriber, więc
+      // potrzebuje tego samego, tabelowego źródła kontaktu i URL rynku.
+      async readRuntimeConfig() {
+        return {
+          row: {
+            locales: { default: "pl", supported: ["pl", "en", "ua", "de"] },
+            support_email: "kontakt@bonbeauty.pl",
+            market_url: "https://dev.bonbeauty.test",
+          },
+          degraded: false,
+        }
+      },
     },
     logger,
-    env: { STOREFRONT_URL: "https://dev.bonbeauty.test" },
+    env: { GP_STOREFRONT_URL_BONBEAUTY: "https://dev.bonbeauty.test" },
   }
 
   const deps: SweepDeps = {

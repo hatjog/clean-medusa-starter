@@ -72,12 +72,17 @@ import {
   type GiftHandoffSkipReason,
 } from "../modules/voucher-delivery/gift-handoff"
 import { buildHandoffLinkNotification } from "../modules/voucher-delivery/handoff-link-intent"
+import { formatSalonAddress } from "../modules/voucher-delivery/notification-formatting"
 import {
-  buildClaimUrl,
   buildPurchaseConfirmationNotification,
-  resolveStorefrontBaseUrl,
   VOUCHER_PURCHASE_DELIVERY_FLOW_ID,
+  type PurchaseConfirmationIntentInput,
 } from "../modules/voucher-delivery/purchase-confirmation-intent"
+import {
+  buildSalonUrl,
+  buildVoucherPageUrl,
+  resolveStorefrontBaseUrl,
+} from "../modules/voucher-delivery/voucher-page-url"
 import {
   hashRecipientEmail,
   RecipientHashError,
@@ -104,6 +109,18 @@ const DELIVERABLE_TO_STATES = new Set(["ISSUED", "ACTIVE"])
  */
 export const MARKET_LOCALES_UNAVAILABLE_ERROR_CODE =
   "VOUCHER_DELIVERY_MARKET_LOCALES_UNAVAILABLE"
+
+/**
+ * Story 5.7 (AC2) — odczyt `market_runtime_config` nie doszedł do skutku
+ * (np. tabela nie istnieje w tym runtime). Odróżnione od „rynek istnieje, ale
+ * nie ma kompletu danych", bo remediacja jest inna: migracja vs sync.
+ */
+export const MARKET_RUNTIME_CONFIG_UNAVAILABLE_ERROR_CODE =
+  "VOUCHER_DELIVERY_MARKET_RUNTIME_CONFIG_UNAVAILABLE"
+
+/** Story 5.7 (AC2) — wiersz rynku istnieje, ale brakuje w nim kontaktu/URL. */
+export const MARKET_RUNTIME_CONFIG_INCOMPLETE_ERROR_CODE =
+  "VOUCHER_DELIVERY_MARKET_RUNTIME_CONFIG_INCOMPLETE"
 
 /**
  * Próg staleness porzuconej rezerwacji (R-2.3-L9). `queued` starsze niż ten
@@ -162,6 +179,25 @@ export type PurchaseDeliverySource = {
   gift_recipient_email?: string | null
   gift_recipient_send_timing?: string | null
   gift_recipient_bound_to_voucher_issue?: boolean | null
+  /**
+   * Story 5.7 (AC3/AC4) — dane TREŚCI maila z projekcji źródłowej. Opcjonalne
+   * w typie, bo tę samą strukturę zwracają zastane atrapy; brak wartości nie
+   * przechodzi jednak dalej niż do buildera, który odmawia zbudowania payloadu
+   * bez pokrycia kontraktu `body_vars`.
+   */
+  customer_first_name?: string | null
+  seller_name?: string | null
+  seller_handle?: string | null
+  order_id?: string | null
+  order_display_id?: string | null
+  purchase_date?: string | null
+  voucher_expires_at?: string | null
+  voucher_value_minor?: number | string | null
+  voucher_currency?: string | null
+  salon_address_1?: string | null
+  salon_address_2?: string | null
+  salon_postal_code?: string | null
+  salon_city?: string | null
 }
 
 export type PurchaseDeliverySourceReader = {
@@ -225,7 +261,20 @@ type DispatchAttemptContext = {
   marketId: string
   locale: string
   voucherCode: string
-  claimUrl: string
+  /** Deep-link `/{locale}/voucher/{code}` — jeden dla obu maili (5.7 AC6.5). */
+  voucherPageUrl: string
+  /** Zmienne treści wspólne dla obu szablonów (5.7 AC3/AC4). */
+  body: Omit<
+    PurchaseConfirmationIntentInput,
+    | "recipient_email"
+    | "recipient_hash"
+    | "entitlement_id"
+    | "voucher_code"
+    | "market_id"
+    | "locale"
+    | "dispatch_id"
+    | "voucher_page_url"
+  >
 }
 
 export interface PurchaseDeliveryDeps {
@@ -414,11 +463,11 @@ export async function handleVoucherPurchaseDelivery(
     }
   }
 
-  // Link claim liczymy PRZED rezerwacją: brak base URL to błąd konfiguracji,
+  // Link liczymy PRZED rezerwacją: brak/zła baza URL to błąd konfiguracji,
   // nie nieudana wysyłka — nie chcemy zostawiać po nim wiersza `queued`.
-  let claimUrl: string
+  let voucherPageUrl: string
   try {
-    claimUrl = buildClaimUrl({
+    voucherPageUrl = buildVoucherPageUrl({
       baseUrl: resolveStorefrontBaseUrl({ marketId, env: deps.env }),
       locale,
       voucherCode,
@@ -440,15 +489,81 @@ export async function handleVoucherPurchaseDelivery(
     }
   }
 
+  // Story 5.7 (AC2): `support_email` i `market_url` pochodzą WYŁĄCZNIE z
+  // ożywionego kanału gp-config → `market_runtime_config`. Brak metody odczytu
+  // (zastana atrapa), błąd odczytu i brak wiersza są traktowane jednakowo —
+  // fail-loud PRZED rezerwacją. Cichy fallback do env był dokładnie tym, co
+  // wysłało do PO maila z pustą stopką i pustym adresem rynku.
+  const runtimeConfig = deps.marketLocales.readRuntimeConfig
+    ? await deps.marketLocales.readRuntimeConfig(marketId)
+    : { row: null, degraded: true }
+  const supportEmail = nonEmpty(runtimeConfig.row?.support_email)
+  const marketUrl = nonEmpty(runtimeConfig.row?.market_url)
+
+  if (!supportEmail || !marketUrl) {
+    const errorCode = runtimeConfig.degraded
+      ? MARKET_RUNTIME_CONFIG_UNAVAILABLE_ERROR_CODE
+      : MARKET_RUNTIME_CONFIG_INCOMPLETE_ERROR_CODE
+    deps.logger?.error?.(
+      "[voucher-purchase-delivery] runtime config rynku bez kompletu danych kontaktowych — " +
+        "wysyłka wstrzymana (uruchom `gp-config-sync-market-runtime … --apply`)",
+      {
+        entitlement_id: entitlementId,
+        market_id: marketId,
+        error_code: errorCode,
+        // Nazwy brakujących pól, nigdy ich wartości.
+        missing: [
+          ...(supportEmail ? [] : ["support_email"]),
+          ...(marketUrl ? [] : ["market_url"]),
+        ],
+      },
+    )
+    return {
+      outcome: "failed",
+      entitlement_id: entitlementId,
+      dispatch_id: null,
+      market_id: marketId,
+      locale,
+      error_code: errorCode,
+      handoff: null,
+    }
+  }
+
+  const sellerHandle = nonEmpty(source.seller_handle)
+
   // Wszystko poniżej jest WSPÓLNE dla obu wysyłek: ten sam rynek, to samo
-  // locale (`purchase_locale` — locale KUPUJĄCEJ, AD-8) i ten sam link claim.
+  // locale (`purchase_locale` — locale KUPUJĄCEJ, AD-8), ten sam deep-link i
+  // ten sam komplet zmiennych treści.
   const context: DispatchAttemptContext = {
     trigger,
     entitlementId,
     marketId,
     locale,
     voucherCode,
-    claimUrl,
+    voucherPageUrl,
+    body: {
+      customer_first_name: nonEmpty(source.customer_first_name),
+      salon_name: nonEmpty(source.seller_name),
+      salon_address: formatSalonAddress({
+        address_1: source.salon_address_1 ?? null,
+        address_2: source.salon_address_2 ?? null,
+        postal_code: source.salon_postal_code ?? null,
+        city: source.salon_city ?? null,
+      }),
+      support_email: supportEmail,
+      market_url: marketUrl,
+      voucher_expires_at: source.voucher_expires_at ?? null,
+      // `display_id` jest tym, co kupująca widzi w koncie i na fakturze; ULID
+      // zamówienia byłby dla niej nieczytelny. Fallback na `order_id` istnieje,
+      // bo zamówienia importowe bywają bez `display_id`.
+      order_id: nonEmpty(source.order_display_id) ?? nonEmpty(source.order_id),
+      purchase_date: source.purchase_date ?? null,
+      voucher_value_minor: source.voucher_value_minor ?? null,
+      voucher_currency: nonEmpty(source.voucher_currency),
+      salon_url: sellerHandle
+        ? buildSalonUrl({ marketUrl, locale, sellerHandle })
+        : null,
+    },
   }
 
   // ── Buyer-mail (Story 2.3) ────────────────────────────────────────────────
@@ -546,7 +661,7 @@ async function runDispatchAttempt(
   context: DispatchAttemptContext,
   deps: PurchaseDeliveryDeps,
 ): Promise<PurchaseDeliveryResult> {
-  const { trigger, entitlementId, marketId, locale, voucherCode, claimUrl } =
+  const { trigger, entitlementId, marketId, locale, voucherCode, voucherPageUrl } =
     context
   const templateKey =
     kind === "buyer"
@@ -556,7 +671,11 @@ async function runDispatchAttempt(
     kind === "buyer"
       ? "[voucher-purchase-delivery]"
       : "[voucher-purchase-delivery/handoff]"
-  const buildNotification =
+  // Handoff przyjmuje WĘŻSZE wejście (bez pól specyficznych dla potwierdzenia),
+  // więc jest przypisywalny do tej sygnatury i ignoruje nadmiarowe pola.
+  const buildNotification: (
+    input: PurchaseConfirmationIntentInput,
+  ) => Record<string, unknown> =
     kind === "buyer"
       ? buildPurchaseConfirmationNotification
       : buildHandoffLinkNotification
@@ -694,13 +813,14 @@ async function runDispatchAttempt(
     // asercję na `claim_url`): wiersz `queued` zostałby bez domknięcia, a
     // wyjątek wyszedłby z subscribera. Koszt przesunięcia: zero.
     const notification = buildNotification({
+      ...context.body,
       recipient_email: recipientEmail,
       recipient_hash: recipientHash,
       entitlement_id: entitlementId,
       voucher_code: voucherCode,
       market_id: marketId,
       locale,
-      claim_url: claimUrl,
+      voucher_page_url: voucherPageUrl,
       dispatch_id: dispatchId,
     })
     const dispatchResult = await deps.dispatcher.dispatch(notification)

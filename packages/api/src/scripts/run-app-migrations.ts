@@ -62,6 +62,20 @@ const APP_SURFACE_CONFIG: MigrationSurfaceConfig = {
       tableExists(connection, "magic_link_issued"),
     Migration20260519081500CreateVoucherConsentTable: (connection) =>
       tableExists(connection, "voucher_consent"),
+    // Story 5.7 (AC1): adopcja WYŁĄCZNIE gdy tabela ma już komplet kolumn
+    // kontraktu. Sam `to_regclass(...)` nie wystarcza — na runtime'ach z
+    // wariantem fixture'owym/legacy tabela ISTNIEJE bez `support_email` i
+    // `market_url`, a adopcja po samej obecności tabeli pominęłaby migrację,
+    // która te kolumny dokłada (`ADD COLUMN IF NOT EXISTS`).
+    Migration20260730120000MarketRuntimeConfigTable: async (connection) => {
+      for (const column of ["locales", "support_email", "market_url"]) {
+        if (!(await columnExists(connection, "market_runtime_config", column))) {
+          return false
+        }
+      }
+
+      return true
+    },
   },
   prerequisites: {
     Migration20260430090100VoucherDeliveryDecisionTable: {
