@@ -450,9 +450,19 @@ async function upsertSellerAddressViaDb(
     updated_at: new Date(),
   }
 
+  // F-2 (review 5.7): TA SAMA regula wyboru co po stronie ODCZYTU projekcji maila
+  // (`ORDER BY created_at ASC, id ASC LIMIT 1`). Bez `orderBy` Postgres zwraca
+  // dowolny wiersz, wiec dla sellera z wiecej niz jednym adresem sync
+  // aktualizowalby inny wiersz, niz renderuje mail — i nic by tego nie zglosilo.
+  // Tabela NIE ma unikalnosci po `seller_id`, wiec „jeden adres na sellera" jest
+  // zalozeniem, nie inwariantem: regula musi byc jawna po obu stronach.
   const existing = await db("seller_address")
     .where({ seller_id: sellerId })
     .whereNull("deleted_at")
+    .orderBy([
+      { column: "created_at", order: "asc" },
+      { column: "id", order: "asc" },
+    ])
     .first()
 
   if (existing) {
