@@ -417,6 +417,59 @@ function buildSellerProductLinkId(sellerId: string, productId: string): string {
   return `spl_${sellerId.slice(-8)}_${productId.slice(-8)}_${ts}_${entropy}`
 }
 
+/**
+ * Zapisuje adres salonu z gp-config (`locations[0]`) do `seller_address`.
+ *
+ * Story 5.7 / korekta PO 2026-07-30: adresy ISTNIALY w gp-config, tabela
+ * `seller_address` istniala w schemacie, a kanal miedzy nimi nie — zero z
+ * dziewieciu sellerow mialo wiersz. Ujawnil to dopiero guard kontraktu
+ * szablonu (`VOUCHER_DELIVERY_PAYLOAD_INCOMPLETE`), bo `salon_address` jest
+ * trescia uzytkowa maila: bez niego klientka nie wie, gdzie zrealizowac voucher.
+ *
+ * Bierzemy WYLACZNIE pierwsza lokalizacje — model `seller_address` trzyma jeden
+ * adres na sellera, wiec wybor kolejnej byloby zgadywaniem. Vendor bez lokalizacji
+ * jest pomijany cicho: to legalny stan konfiguracji, nie blad syncu.
+ */
+async function upsertSellerAddressViaDb(
+  db: any,
+  sellerId: string,
+  sellerName: string,
+  location: VendorLocation
+): Promise<"created" | "updated" | "skipped"> {
+  const address1 = location.address?.trim()
+  if (!address1) return "skipped"
+
+  const payload = {
+    seller_id: sellerId,
+    company: sellerName,
+    address_1: address1,
+    city: location.city?.trim() ?? null,
+    postal_code: location.postal_code?.trim() ?? null,
+    country_code: location.country_code?.trim()?.toLowerCase() ?? null,
+    province: location.region?.trim() ?? null,
+    updated_at: new Date(),
+  }
+
+  const existing = await db("seller_address")
+    .where({ seller_id: sellerId })
+    .whereNull("deleted_at")
+    .first()
+
+  if (existing) {
+    await db("seller_address").where({ id: existing.id }).update(payload)
+    return "updated"
+  }
+
+  const ts = Date.now().toString(36)
+  const entropy = Math.random().toString(36).slice(2, 8)
+  await db("seller_address").insert({
+    id: `saddr_${sellerId.slice(-8)}_${ts}_${entropy}`,
+    ...payload,
+    created_at: new Date(),
+  })
+  return "created"
+}
+
 async function upsertSellerProductLinkViaDb(
   db: any,
   sellerId: string,
@@ -1269,6 +1322,29 @@ export default async function gpConfigSyncVendors({ container, args }: ExecArgs)
         overwrite,
         forceVendorOverwrite
       )
+
+      // Story 5.7 — adres salonu z gp-config do `seller_address`. Po upsercie
+      // sellera, bo potrzebujemy jego id; przed linkami produktowymi, bo mail
+      // potwierdzenia zależy od adresu, a nie od katalogu.
+      const primaryLocation = vendor.locations?.[0]
+      if (!dryRun && result.sellerId && primaryLocation) {
+        try {
+          await upsertSellerAddressViaDb(
+            db,
+            result.sellerId,
+            vendor.display_name ?? vendor.slug,
+            primaryLocation
+          )
+        } catch (error) {
+          pushUniqueWarning(
+            warnings,
+            seenWarnings,
+            `Vendor '${vendor.vendor_id}': zapis seller_address nieudany: ${
+              error instanceof Error ? error.message : String(error)
+            }`
+          )
+        }
+      }
 
       // ADR-165 — pominięcia bramki własności muszą być widoczne w raporcie
       // ORAZ w osobnym, typowanym kanale: to jedyna klasa warningu, która
