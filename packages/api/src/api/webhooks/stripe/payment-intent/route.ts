@@ -67,6 +67,9 @@ import {
 
 export const AUTHENTICATE = false
 
+/** Retry only the bounded race between Stripe success and completeCart. */
+export const LINK_UNRESOLVED_RETRY_WINDOW_SECONDS = 15 * 60
+
 type LoggerLike = {
   info?: (message: string) => void
   warn?: (message: string) => void
@@ -209,10 +212,20 @@ export async function POST(
       // może wyprzedzić `completeCart`. 4xx zatrzymuje retry Stripe i zostawia
       // opłacony voucher bez issuance. `link_ambiguous` oraz pozostałe klasy
       // są trwałe i pozostają 400, więc nie zacieramy rozróżnienia operatorowi.
+      const eventCreated = stripeEvent.created
+      const eventAgeSeconds =
+        typeof eventCreated === "number" && Number.isFinite(eventCreated)
+          ? Math.max(0, Math.floor(Date.now() / 1000) - eventCreated)
+          : null
+      const retryableLinkRace =
+        resolution.reason === "link_unresolved" &&
+        eventAgeSeconds !== null &&
+        eventAgeSeconds <= LINK_UNRESOLVED_RETRY_WINDOW_SECONDS
       logger.warn?.(
-        `[stripe/payment-intent] ${resolution.reason}: ${resolution.detail}`
+        `[stripe/payment-intent] ${resolution.reason}: ${resolution.detail}; ` +
+          `event_age_seconds=${eventAgeSeconds ?? "unknown"}; retryable_link_race=${retryableLinkRace}`,
       )
-      res.status(resolution.reason === "link_unresolved" ? 503 : 400).json({
+      res.status(retryableLinkRace ? 503 : 400).json({
         type: "unresolved_link",
         reason: resolution.reason,
         detail: resolution.detail,

@@ -37,7 +37,7 @@ jest.mock("../../../../../lib/payment/stripe-payment-intent-metadata-stamp", () 
   stampPaymentIntentOrderFacts: jest.fn(async () => true),
 }))
 
-import { POST } from "../route"
+import { LINK_UNRESOLVED_RETRY_WINDOW_SECONDS, POST } from "../route"
 import { STRIPE_SIGNATURE_HEADER } from "../helpers"
 import { PAYMENT_INTENT_SUCCEEDED_EVENT } from "../../../../../lib/payment/stripe-payment-intent-event"
 import {
@@ -222,14 +222,14 @@ function incidentEvent(overrides: Record<string, unknown> = {}) {
   return {
     id: EVENT_ID,
     type: "payment_intent.succeeded",
-    created: 1_785_000_000,
+    created: Math.floor(Date.now() / 1000),
     data: {
       object: {
         id: PAYMENT_INTENT_ID,
         amount: 25000,
         amount_received: 25000,
         currency: "pln",
-        created: 1_785_000_000,
+        created: Math.floor(Date.now() / 1000),
         metadata: { session_id: SESSION_ID },
         ...overrides,
       },
@@ -383,6 +383,21 @@ describe("Story 5.1 AC4 — rozłączne klasy odrzucenia (zero emisji, czytelny 
 
     expect(res.statusCode).toBe(503)
     expect(res.body.type).toBe("unresolved_link")
+    expect(res.body.reason).toBe("link_unresolved")
+    expect(emitted).toHaveLength(0)
+    expect(pg.webhookDeliveries.size).toBe(0)
+  })
+
+  it("stary link_unresolved kończy retry Stripe terminalnym 400", async () => {
+    const pg = makeFixturePg({ linkedOrderIds: [] })
+    const { req, emitted } = makeReq(
+      incidentEvent({ created: Math.floor(Date.now() / 1000) - LINK_UNRESOLVED_RETRY_WINDOW_SECONDS - 1 }),
+      pg,
+    )
+
+    const res = await post(req)
+
+    expect(res.statusCode).toBe(400)
     expect(res.body.reason).toBe("link_unresolved")
     expect(emitted).toHaveLength(0)
     expect(pg.webhookDeliveries.size).toBe(0)

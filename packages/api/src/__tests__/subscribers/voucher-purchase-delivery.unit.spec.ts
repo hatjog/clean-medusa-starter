@@ -921,7 +921,7 @@ describe("R-2.3-M3 — kod błędu przeżywa przepakowanie przez moduł Notifica
     expect(sql.dispatch[0].error_code).toBe("BREVO_TEMPLATE_NOT_CONFIGURED")
   })
 
-  it("wyciąga kod z markera zachowanego wyłącznie w zagnieżdżonym cause agregatu Medusy", async () => {
+  it("nie fabrykuje zagnieżdżonego nośnika błędu, którego Medusa 2.14.2 nie tworzy", async () => {
     const { deps, sql } = makeDeps({
       dispatchImpl: async () => {
         const providerError = new Error(
@@ -939,8 +939,19 @@ describe("R-2.3-M3 — kod błędu przeżywa przepakowanie przez moduł Notifica
 
     const result = await handleVoucherPurchaseDelivery(envelope("ISSUED"), deps)
 
-    expect(result.error_code).toBe("BREVO_SENDER_NOT_CONFIGURED")
-    expect(sql.dispatch[0].error_code).toBe("BREVO_SENDER_NOT_CONFIGURED")
+    expect(result.error_code).toBe("VOUCHER_DELIVERY_DISPATCH_FAILED")
+    expect(sql.dispatch[0].error_code).toBe("VOUCHER_DELIVERY_DISPATCH_FAILED")
+  })
+
+  it("odrzuca zagnieżdżony code poza taksonomią zamiast zapisać go dosłownie", async () => {
+    const { deps, sql } = makeDeps({
+      dispatchImpl: async () => {
+        throw Object.assign(new Error("provider rejected"), { code: "bad code with details" })
+      },
+    })
+
+    await handleVoucherPurchaseDelivery(envelope("ISSUED"), deps)
+    expect(sql.dispatch[0].error_code).toBe("VOUCHER_DELIVERY_DISPATCH_FAILED")
   })
 
   it("rozróżnia FLOW_DISABLED od awarii szablonu (sygnał kierunkowy dla triage'u)", async () => {

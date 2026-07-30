@@ -875,42 +875,17 @@ function errorClass(error: unknown): string {
  *     nie może wyciec adres ani fragment treści maila (D-70).
  */
 function readErrorCode(error: unknown, fallback: string): string {
-  const seen = new Set<unknown>()
-  const visit = (value: unknown): string | null => {
-    if (typeof value === "string") return extractErrorCodeMarker(value)
-    if (!value || typeof value !== "object" || seen.has(value)) return null
-    seen.add(value)
-
-    const record = value as Record<string, unknown>
-    for (const key of ["error_code", "code"] as const) {
-      const code = record[key]
-      if (typeof code === "string" && code.trim().length > 0) {
-        return code.trim()
-      }
+  if (!error || typeof error !== "object") return fallback
+  const record = error as Record<string, unknown>
+  for (const key of ["error_code", "code"] as const) {
+    const candidate = record[key]
+    if (typeof candidate === "string" && /^[A-Z0-9_]+$/.test(candidate.trim())) {
+      return candidate.trim()
     }
-
-    const fromMessage = extractErrorCodeMarker(record.message)
-    if (fromMessage) return fromMessage
-
-    // Medusa's aggregate wrapper can retain the provider exception only below
-    // `cause`/`errors`; the outer message is generic. Traverse only known
-    // error carriers and extract only the marker/code, never raw messages.
-    for (const nestedKey of ["cause", "error", "originalError"] as const) {
-      const nested = visit(record[nestedKey])
-      if (nested) return nested
-    }
-    for (const nestedKey of ["errors", "aggregateErrors"] as const) {
-      const nestedValues = record[nestedKey]
-      if (!Array.isArray(nestedValues)) continue
-      for (const nestedValue of nestedValues) {
-        const nested = visit(nestedValue)
-        if (nested) return nested
-      }
-    }
-    return null
   }
-
-  return visit(error) ?? fallback
+  // Medusa 2.14.2 keeps the provider marker in the outer Error.message;
+  // aggregateErrors does not create a nested cause/errors carrier here.
+  return extractErrorCodeMarker(record.message) ?? fallback
 }
 
 /** `queued_at` starsze niż próg = rezerwacja porzucona (R-2.3-L9). */

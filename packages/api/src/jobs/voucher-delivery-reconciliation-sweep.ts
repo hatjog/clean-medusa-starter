@@ -597,6 +597,25 @@ export async function runVoucherDeliveryReconciliationSweep(
   const staleQueuedBefore = new Date(
     startedAt.getTime() - SWEEP_STALE_QUEUED_MS,
   ).toISOString()
+  const report = emptyReport("completed")
+  report.scan_window_from = createdAfter
+  report.scan_window_to = createdBefore
+
+  // Historical summary rows may have had their mutable `error_code` reset by
+  // retry. `first_error_code` is backfilled from append-only audit, so this
+  // restores only delivery attempts parked by a configuration failure.
+  try {
+    report.attempt_budget_released +=
+      await scanner.releaseParkedConfigurationFailureBudgets({
+        max_attempt_count: SWEEP_MAX_ATTEMPT_COUNT,
+        error_codes: SWEEP_GLOBAL_FAILURE_ERROR_CODES,
+      })
+  } catch (error) {
+    logger.warn(
+      `[${SCHEDULE_NAME}] odparkowanie historycznych awarii konfiguracji nieudane`,
+      { error_class: errorClass(error), error_code: errorCode(error) },
+    )
+  }
 
   let scan
   try {
@@ -622,10 +641,7 @@ export async function runVoucherDeliveryReconciliationSweep(
     return emptyReport("scan_failed")
   }
 
-  const report = emptyReport("completed")
   report.truncated = scan.truncated
-  report.scan_window_from = createdAfter
-  report.scan_window_to = createdBefore
 
   // ── R-2.5-M8: drugi, wąski skan STALLED wierszy ledgera ───────────────────
   // Skan po `entitlement_instance` wchodzi wyłącznie przez zbiór szablonów

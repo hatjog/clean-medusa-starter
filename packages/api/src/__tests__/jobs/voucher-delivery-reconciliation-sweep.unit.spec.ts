@@ -104,6 +104,7 @@ type DispatchSeed = {
   queued_at?: string
   attempt_count?: number
   error_code?: string | null
+  first_error_code?: string | null
   market_id?: string | null
 }
 
@@ -163,6 +164,7 @@ class FakeSql implements DispatchLedgerSql {
       provider: null,
       provider_message_id: null,
       error_code: seed.error_code ?? null,
+      first_error_code: seed.first_error_code ?? null,
       attempt_count: seed.attempt_count ?? 1,
       queued_at: seed.queued_at ?? minutesAgo(60),
       sent_at: null,
@@ -255,6 +257,20 @@ class FakeSql implements DispatchLedgerSql {
       return { rows: this.listParked(bindings) }
     }
 
+    if (q.includes("SET attempt_count = LEAST")) {
+      const [maxAttemptCount] = bindings as number[]
+      const globalCodes = bindings.slice(2).map(String)
+      const released = this.dispatch.filter(
+        (row) =>
+          row.status === "failed" &&
+          Number(row.attempt_count ?? 0) >= maxAttemptCount &&
+          (globalCodes.includes(String(row.first_error_code)) ||
+            String(row.first_error_code).endsWith("_NOT_CONFIGURED")),
+      )
+      for (const row of released) row.attempt_count = maxAttemptCount - 1
+      return { rows: released.map((row) => ({ ...row })) }
+    }
+
     if (q.includes("SET attempt_count = GREATEST")) {
       // releaseAttemptBudget (2.5, R-2.5-H3): guard status + kod błędu.
       const [, id, errorCode] = bindings as string[]
@@ -290,13 +306,14 @@ class FakeSql implements DispatchLedgerSql {
 
       if (q.includes("provider = COALESCE")) {
         // markFailed (2.3): guard `status='queued'`.
-        const [provider, errorCode, now, , id] = bindings as string[]
+        const [provider, errorCode, , now, , , id] = bindings as string[]
         const row = this.byId(id)
         if (!row || row.status !== "queued") return { rows: [] }
         Object.assign(row, {
           status: "failed",
           provider: provider ?? row.provider,
           error_code: errorCode,
+          first_error_code: row.first_error_code ?? errorCode,
           failed_at: now,
         })
         return { rows: [{ ...row }] }
@@ -304,13 +321,14 @@ class FakeSql implements DispatchLedgerSql {
 
       if (q.includes("SET status = 'failed'")) {
         // abandonStaleQueued (2.5, D3): guard `status='queued' AND queued_at < próg`.
-        const [errorCode, now, , id, staleBefore] = bindings as string[]
+        const [errorCode, , now, , , id, staleBefore] = bindings as string[]
         const row = this.byId(id)
         if (!row || row.status !== "queued") return { rows: [] }
         if (!(String(row.queued_at) < staleBefore)) return { rows: [] }
         Object.assign(row, {
           status: "failed",
           error_code: errorCode,
+          first_error_code: row.first_error_code ?? errorCode,
           failed_at: now,
         })
         return { rows: [{ ...row }] }
@@ -668,6 +686,8 @@ function scannerWith(
     listParkedDispatches: scanner.listParkedDispatches.bind(scanner),
     countParkedDispatchesByMarket:
       scanner.countParkedDispatchesByMarket.bind(scanner),
+    releaseParkedConfigurationFailureBudgets:
+      scanner.releaseParkedConfigurationFailureBudgets.bind(scanner),
     abandonStaleQueued: scanner.abandonStaleQueued.bind(scanner),
     releaseAttemptBudget: scanner.releaseAttemptBudget.bind(scanner),
     ...overrides,
@@ -1456,6 +1476,31 @@ describe("AC2 — semantyka stanów ledgera 2.3 jest respektowana", () => {
 // ── R-2.5-H3: parkowanie jest ODWRACALNE, a batch nie jest zagłodzony ──────
 
 describe("R-2.5-H3 — awaria GLOBALNA nie zużywa budżetu prób", () => {
+  it("odparkuje historyczny wiersz po konfiguracji na podstawie pierwszej przyczyny, potem wysyła", async () => {
+    const { deps, sql, dispatchCalls } = makeHarness({
+      entitlements: [issuedEntitlement("ent_historical_brevo")],
+      dispatchRows: [
+        {
+          dispatch_id: "dispatch-historical-brevo",
+          entitlement_id: "ent_historical_brevo",
+          status: "failed",
+          // Mutowalny summary został już nadpisany podczas starego retry.
+          error_code: "VOUCHER_DELIVERY_DISPATCH_FAILED",
+          first_error_code: "BREVO_SENDER_NOT_CONFIGURED",
+          attempt_count: SWEEP_MAX_ATTEMPT_COUNT,
+        },
+      ],
+      dispatchImpl: async () => ({ id: "brevo-after-sender-config" }),
+    })
+
+    const report = await runVoucherDeliveryReconciliationSweep(deps)
+
+    expect(report.attempt_budget_released).toBe(1)
+    expect(report.recovered).toBe(1)
+    expect(dispatchCalls).toHaveLength(1)
+    expect(sql.dispatch[0]).toMatchObject({ status: "sent", attempt_count: SWEEP_MAX_ATTEMPT_COUNT })
+  })
+
   it("`FLOW_DISABLED` zwraca próbę: `attempt_count` nie rośnie między przebiegami", async () => {
     const { deps, sql, logger } = makeHarness({
       entitlements: [issuedEntitlement("ent_kill_switch")],

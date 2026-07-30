@@ -127,6 +127,9 @@ export interface DispatchRow {
   provider: string | null
   provider_message_id: string | null
   error_code: string | null
+  /** Pierwotna przyczyna — nie jest kasowana przez retry summary row. */
+  first_error_code: string | null
+  first_failed_at: string | null
   attempt_count: number
   /** ISO 8601 — moment wejścia w `queued` (staleness porzuconych rezerwacji). */
   queued_at: string | null
@@ -249,10 +252,12 @@ export interface ScanStalledDispatchesInput {
 
 /** Wiersz zaparkowany: wyczerpał budżet prób i czeka na decyzję operatora. */
 export interface ParkedDispatchRow {
+  dispatch_id: string
   entitlement_id: string
   market_id: string | null
   template_key: string
   attempt_count: number
+  first_error_code: string | null
 }
 
 /** Zaparkowane wiersze per rynek — nośnik alertu, gdy sweep ich nie dosyła. */
@@ -322,6 +327,15 @@ export interface DeliveryGapScanPort {
     dispatch_id: string
     error_code: string
   }): Promise<boolean>
+  /**
+   * Odparkuj historyczne wiersze, których pierwotna (niemutowalna) przyczyna
+   * była globalną awarią konfiguracji. To jest mechanizm migracyjno-operacyjny,
+   * nie jednorazowy UPDATE: po usunięciu konfiguracji sweep znów może je wysłać.
+   */
+  releaseParkedConfigurationFailureBudgets(input: {
+    max_attempt_count: number
+    error_codes: readonly string[]
+  }): Promise<number>
 }
 
 export class DispatchLedgerError extends Error {
@@ -337,7 +351,7 @@ export class DispatchLedgerError extends Error {
 const SELECT_COLUMNS = `
   dispatch_id, entitlement_id, template_key, recipient_hash, market_id,
   flow_id, locale, status, provider, provider_message_id, error_code, attempt_count,
-  queued_at
+  first_error_code, first_failed_at, queued_at
 `
 
 export interface PgDispatchLedgerOptions {
@@ -560,6 +574,8 @@ export class PgDispatchLedger
           SET status = 'failed',
               provider = COALESCE($1, provider),
               error_code = $2,
+              first_error_code = COALESCE(first_error_code, $2),
+              first_failed_at = COALESCE(first_failed_at, $3),
               failed_at = $3,
               updated_at = $4
         WHERE dispatch_id = $5
@@ -818,7 +834,8 @@ export class PgDispatchLedger
     const idPlaceholders = ids.map(() => `$${++position}`).join(", ")
 
     const rows = await this.queryRows<Record<string, unknown>>(
-      `SELECT entitlement_id, market_id, template_key, attempt_count
+      `SELECT dispatch_id, entitlement_id, market_id, template_key, attempt_count,
+              first_error_code
          FROM ${VOUCHER_DELIVERY_DISPATCH_TABLE}
         WHERE attempt_count >= ${maxAttemptPlaceholder}
           AND status <> 'sent'
@@ -829,10 +846,13 @@ export class PgDispatchLedger
     )
 
     return rows.map((row) => ({
+      dispatch_id: String(row.dispatch_id ?? ""),
       entitlement_id: String(row.entitlement_id ?? ""),
       market_id: row.market_id == null ? null : String(row.market_id),
       template_key: String(row.template_key ?? ""),
       attempt_count: Number(row.attempt_count ?? 0),
+      first_error_code:
+        row.first_error_code == null ? null : String(row.first_error_code),
     }))
   }
 
@@ -878,6 +898,31 @@ export class PgDispatchLedger
     )
 
     return rows.length > 0
+  }
+
+  async releaseParkedConfigurationFailureBudgets(input: {
+    max_attempt_count: number
+    error_codes: readonly string[]
+  }): Promise<number> {
+    assertMaxAttemptCount(input.max_attempt_count)
+    const codes = [...input.error_codes]
+    const codePlaceholders = codes.map((_code, index) => `$${index + 3}`).join(", ")
+    const nowIso = this.now().toISOString()
+    const rows = await this.queryRows<DispatchRow>(
+      `UPDATE ${VOUCHER_DELIVERY_DISPATCH_TABLE}
+          SET attempt_count = LEAST(attempt_count, $1 - 1),
+              updated_at = $2
+        WHERE status = 'failed'
+          AND attempt_count >= $1
+          AND first_error_code IS NOT NULL
+          AND (
+            first_error_code IN (${codePlaceholders})
+            OR first_error_code LIKE '%\\_NOT\\_CONFIGURED' ESCAPE '\\'
+          )
+      RETURNING ${SELECT_COLUMNS}`,
+      [input.max_attempt_count, nowIso, ...codes],
+    )
+    return rows.length
   }
 
   /**
@@ -969,6 +1014,8 @@ export class PgDispatchLedger
       `UPDATE ${VOUCHER_DELIVERY_DISPATCH_TABLE}
           SET status = 'failed',
               error_code = $1,
+              first_error_code = COALESCE(first_error_code, $1),
+              first_failed_at = COALESCE(first_failed_at, $2),
               failed_at = $2,
               updated_at = $3
         WHERE dispatch_id = $4
@@ -1073,6 +1120,9 @@ function normalizeRow(raw: unknown): DispatchRow {
         ? null
         : String(record.provider_message_id),
     error_code: record.error_code == null ? null : String(record.error_code),
+    first_error_code:
+      record.first_error_code == null ? null : String(record.first_error_code),
+    first_failed_at: normalizeTimestamp(record.first_failed_at),
     attempt_count: Number(record.attempt_count ?? 0),
     queued_at: normalizeTimestamp(record.queued_at),
   }

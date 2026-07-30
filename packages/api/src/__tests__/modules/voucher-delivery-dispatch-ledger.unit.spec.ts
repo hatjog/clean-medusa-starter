@@ -169,13 +169,14 @@ class FakeDispatchSql implements DispatchLedgerSql {
       }
 
       if (normalized.includes("SET status = 'failed'")) {
-        const [provider, error_code, now, , dispatch_id] = bindings as string[]
+        const [provider, error_code, , now, , , dispatch_id] = bindings as string[]
         const row = this.byId(dispatch_id)
         if (!row || row.status !== "queued") return { rows: [] }
         Object.assign(row, {
           status: "failed",
           provider: provider ?? row.provider,
           error_code,
+          first_error_code: row.first_error_code ?? error_code,
           failed_at: now,
         })
         return { rows: [{ ...row }] }
@@ -434,10 +435,29 @@ describe("PgDispatchLedger — tranzycje queued→sent|failed (AC2 / AC5)", () =
     })
 
     expect(sql.dispatch[0].error_code).toBe("BREVO_TEMPLATE_NOT_CONFIGURED")
+    expect(sql.dispatch[0].first_error_code).toBe("BREVO_TEMPLATE_NOT_CONFIGURED")
     expect(sql.audit.at(-1)).toMatchObject({
       from_status: "queued",
       to_status: "failed",
       error_code: "BREVO_TEMPLATE_NOT_CONFIGURED",
+    })
+  })
+
+  it("retry nie kasuje pierwotnej przyczyny ze summary ledgera", async () => {
+    const sql = new FakeDispatchSql()
+    const ledger = makeLedger(sql)
+    const first = await ledger.reserveDispatch(identity())
+    await ledger.markFailed({
+      dispatch_id: first.dispatch_id!,
+      error_code: "BREVO_SENDER_NOT_CONFIGURED",
+    })
+
+    await ledger.reserveDispatch(identity())
+
+    expect(sql.dispatch[0]).toMatchObject({
+      status: "queued",
+      error_code: null,
+      first_error_code: "BREVO_SENDER_NOT_CONFIGURED",
     })
   })
 

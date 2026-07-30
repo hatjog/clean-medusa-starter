@@ -213,6 +213,10 @@ describe("Story 3.3 AC1 — POST route cienki (verify + emit, ZERO biznes-logiki
     expect(sqlSeen.some((s) => /FROM payment_session/i.test(s))).toBe(true)
     expect(sqlSeen.some((s) => /AS order_id/i.test(s) && /sales_channel/i.test(s))).toBe(true)
     expect(sqlSeen.some((s) => /INSERT INTO webhook_event_processed/i.test(s))).toBe(true)
+    // Link → market context → transport reservation: upper bound protects the
+    // route from quietly growing domain reads while keeping ADR-166's allowed
+    // payment-session resolution.
+    expect(sqlSeen).toHaveLength(3)
     // Granica, która NAPRAWDĘ chroni ADR-118: route nie sięga do tabel domeny
     // voucherów ani nie tworzy entitlementu — to zadanie subscribera.
     expect(sqlSeen.some((s) => /entitlement_instance|voucher_/i.test(s))).toBe(false)

@@ -224,6 +224,13 @@ async function recordSweepScanCalls(): Promise<Call[]> {
   })
   calls.push(...release.calls)
 
+  const historicalRelease = new RecordingSql(() => [])
+  await new PgDispatchLedger(historicalRelease).releaseParkedConfigurationFailureBudgets({
+    max_attempt_count: 5,
+    error_codes: ["FLOW_DISABLED", "MARKET_LOCALES_UNAVAILABLE"],
+  })
+  calls.push(...historicalRelease.calls)
+
   const count = new RecordingSql(() => [{ gap_count: 0 }])
   await new PgDispatchLedger(count).countGapsBeyondSourceStates({
     template_keys: ["voucher_purchase_confirmation"],
@@ -334,6 +341,15 @@ describe("Story 2.5 — SQL sweepa jest wykonywalny przez REALNY formatter Knexa
       expect(sql).toContain("AND status = 'failed'")
       expect(sql).toContain("AND error_code = ?")
       expect(sql).toContain("AND attempt_count > 0")
+    })
+
+    it("odparkowanie historycznej awarii używa trwałej pierwszej przyczyny", () => {
+      const release = calls.find((call) => call.sql.includes("SET attempt_count = LEAST"))
+      expect(release).toBeDefined()
+      const sql = (release as Call).sql.replace(/\s+/g, " ")
+      expect(sql).toContain("AND first_error_code IS NOT NULL")
+      expect(sql).toContain("first_error_code LIKE '%\\_NOT\\_CONFIGURED'")
+      expect(sql).toContain("AND attempt_count >= ?")
     })
   })
 
