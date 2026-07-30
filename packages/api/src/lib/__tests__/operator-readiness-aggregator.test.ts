@@ -1,4 +1,11 @@
-import { beforeEach, describe, expect, it, jest } from "@jest/globals"
+// `jest` JEST celowo brany z globala, a NIE z "@jest/globals". Gdy pochodzi
+// z importu, transform @swc/jest nie hoistuje `jest.mock` ponad ten import —
+// mock rejestruje się PO załadowaniu modułu i jest bezużyteczny. Objaw był
+// dokładnie taki: oba testy szły 10 s i wołały PRAWDZIWY `verifyAllGates`
+// (cztery realne bramki), mimo że plik deklarował atrapę. Zielone testy nie
+// dowodziły niczego o atrapie. Dowód: probe z `jest.mock` + importem `jest`
+// z "@jest/globals" nie podmienia modułu; bez tego importu — podmienia.
+import { beforeEach, describe, expect, it } from "@jest/globals"
 
 jest.mock("../alert-evaluator", () => ({
   listConfiguredAlerts: jest.fn(() => new Array(8).fill({})),

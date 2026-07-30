@@ -45,10 +45,29 @@ async function loadPortalInitMarketModule(): Promise<{
   }
 }
 
+/**
+ * Kanoniczny zbiór bloków jest własnością portalu (`homepageSectionsDefaults.ts`)
+ * i rośnie przy redesignach — home v3 podniósł go z 6 do 10. Test czyta go z tego
+ * samego źródła co kod, żeby przestał gnić przy każdym nowym bloku, ale nadal
+ * pilnował KOLEJNOŚCI i kompletności kanonizacji.
+ */
+async function loadCanonicalBlockTypes(): Promise<readonly string[]> {
+  const mod = (await eval(
+    'import("../../../../../portal/src/lib/homepageSectionsDefaults.js")'
+  )) as Record<string, unknown>
+  const source = (
+    Array.isArray(mod.CANONICAL_BLOCK_TYPES) ? mod : (mod.default as Record<string, unknown>)
+  ) as { CANONICAL_BLOCK_TYPES: readonly string[] }
+  return source.CANONICAL_BLOCK_TYPES
+}
+
 beforeAll(async () => {
   ;({ initMarket, buildMarketConfigCreateData } =
     await loadPortalInitMarketModule())
+  canonicalBlockTypes = await loadCanonicalBlockTypes()
 })
+
+let canonicalBlockTypes: readonly string[]
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -284,16 +303,16 @@ describe("buildMarketConfigCreateData", () => {
     expect(data.market_id).toBe("bonbeauty")
     expect(data.slug).toBe("bonbeauty")
     expect(data.storefront_template).toBe("tmpl-1")
-    expect(data.homepage_sections).toMatchObject([
-      { blockType: "hero", heading: "Legacy Hero" },
-      { blockType: "categories_grid" },
-      { blockType: "products_carousel" },
-      { blockType: "banner", label: "Explore collection", cta_link: "/collections" },
-      { blockType: "style_section" },
-      { blockType: "blog_section" },
-    ])
     expect(Array.isArray(data.homepage_sections)).toBe(true)
-    expect((data.homepage_sections as Array<unknown>)).toHaveLength(6)
+    const sections = data.homepage_sections as Array<Record<string, unknown>>
+    // Kanonizacja = DOKŁADNIE kanoniczny zbiór, w kanonicznej kolejności.
+    expect(sections.map((section) => section.blockType)).toEqual([...canonicalBlockTypes])
+    // …a przy tym NIE nadpisuje pól, które szablon dostarczył jawnie.
+    expect(sections[0]).toMatchObject({ blockType: "hero", heading: "Legacy Hero" })
+    expect(sections.find((section) => section.blockType === "banner")).toMatchObject({
+      label: "Explore collection",
+      cta_link: "/collections",
+    })
     expect(data.footer).toEqual({ copyright: "GP" })
   })
 

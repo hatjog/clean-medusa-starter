@@ -50,11 +50,12 @@ type ScopeDim =
   | "signed-token"
   | "verified-magic-link"
   | "vendor-seller"
+  | "psp-signature"
   | "rls"
 
 type CoveragePath = {
   id: string
-  category: "admin" | "import" | "social-attribution" | "vendor"
+  category: "admin" | "import" | "social-attribution" | "vendor" | "psp-webhook"
   operation: "create" | "read"
   file: string | null
   result: CoverageResult
@@ -191,6 +192,18 @@ const COVERED_PATHS: ReadonlyArray<CoveragePath> = [
     result: "covered",
     scope: ["market_id", "bearer-token"],
     guardLiterals: ["marketContextStorage.getStore()?.market_id", "voucher.market_id !== market_id"],
+  },
+  // ── psp-webhook (out-of-scope: PSP-authenticated, no customer principal) ──
+  {
+    id: "psp-webhook.stripe.payment-intent",
+    category: "psp-webhook",
+    operation: "create",
+    file: "api/webhooks/stripe/payment-intent/route.ts",
+    result: "out-of-scope",
+    scope: ["psp-signature", "market_id"],
+    guardLiterals: ["verifyStripeSignature", "market_id"],
+    rationale:
+      "Ścieżka PSP→serwer (ADR-166), nie klient→serwer: nie ma tu principala klienta, który dałoby się przefiltrować, więc customer-scoping nie ma czego egzekwować. Uwierzytelnienie to HMAC-SHA256 na `stripe-signature` (`verifyStripeSignature`, 400 `invalid_signature` przy złym podpisie/skew). Izolacja rynku NIE jest pominięta: `market_id` jest USTALANY z danych domenowych (metadata PI, a przy jej braku przez link payment_session→order) i niesiony w kopercie oraz w każdym wystawionym entitlementcie; brak rozstrzygnięcia kończy się `link_unresolved`/`link_ambiguous`, nie cichym domyślnym rynkiem. Wyliczone jawnie per AC1 — żadna ścieżka nie może zniknąć z rejestru przez milczenie.",
   },
   // ── vendor (out-of-scope: vendor-authenticated, seller-scoped) ────────────
   {

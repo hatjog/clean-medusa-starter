@@ -87,6 +87,11 @@ function makeFakeContainer() {
           rows: [
             {
               line_item_id: "li_1",
+              // `oli.unit_price` to bigNumber Medusy, czyli kolumna NUMERIC — node-pg
+              // zwraca ją jako STRING. Fixture celowo jest stringiem, bo to jedyny
+              // kształt, w którym test broni klasy ADR-166 R-1 (`typeof === "number"`
+              // cicho degradujące do fallbacku). Liczba tutaj przepuściłaby regresję.
+              line_unit_price: "24900",
               metadata: {
                 entitlement_profile_id: "p",
                 entitlement_type: "VOUCHER_SERVICE",

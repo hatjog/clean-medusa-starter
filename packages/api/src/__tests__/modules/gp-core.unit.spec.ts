@@ -17,6 +17,14 @@ const REPO_ROOT = path.resolve(BACKEND_ROOT, "../..")
 const CONFIG_ROOT = path.resolve(BACKEND_ROOT, "../config")
 const SQL_PATH = path.resolve(REPO_ROOT, "infra/postgres/init/02-gp-core-tables.sql")
 
+/** Rynki są własnością fixture'a `GP/config/gp-dev/markets`, nie stałą w teście. */
+async function countFixtureMarkets(): Promise<number> {
+  const entries = await fs.readdir(path.join(CONFIG_ROOT, "gp-dev", "markets"), {
+    withFileTypes: true,
+  })
+  return entries.filter((entry) => entry.isDirectory()).length
+}
+
 function replaceDatabaseName(databaseUrl: string, databaseName: string): string {
   const parsed = new URL(databaseUrl)
   parsed.pathname = `/${databaseName}`
@@ -138,21 +146,27 @@ describe("gp_core schema and service", () => {
     )
   })
 
-  it("seed creates 4 markets and 8 assignments", async () => {
+  it("seed creates every fixture market and one assignment per vendor", async () => {
+    const expectedMarkets = await countFixtureMarkets()
     const summary = await seedGpCoreFromFixtures(service, {
       instanceId: "gp-dev",
       configRoot: CONFIG_ROOT,
     })
 
-    expect(summary.markets.created).toBe(4)
-    expect(summary.assignments.created).toBe(8)
+    expect(summary.markets.created).toBe(expectedMarkets)
+    // Liczba vendorów jest własnością fixture'a i rośnie z każdym rynkiem; wiążemy
+    // ją z faktem domenowym (każdy zaseedowany vendor dostaje DOKŁADNIE jedno
+    // przypisanie), a nie z magiczną stałą, która gnije przy dodaniu rynku.
+    expect(summary.assignments.created).toBe(summary.vendors.created)
+    expect(summary.assignments.created).toBeGreaterThan(0)
 
     const markets = await service.listMarkets("gp-dev")
 
-    expect(markets).toHaveLength(4)
+    expect(markets).toHaveLength(expectedMarkets)
   })
 
   it("seed is idempotent across two runs", async () => {
+    const expectedMarkets = await countFixtureMarkets()
     const first = await seedGpCoreFromFixtures(service, {
       instanceId: "gp-dev",
       configRoot: CONFIG_ROOT,
@@ -162,9 +176,9 @@ describe("gp_core schema and service", () => {
       configRoot: CONFIG_ROOT,
     })
 
-    expect(first.markets.created).toBe(4)
+    expect(first.markets.created).toBe(expectedMarkets)
     expect(second.markets.created).toBe(0)
-    expect(second.markets.updated).toBe(4)
+    expect(second.markets.updated).toBe(expectedMarkets)
 
     const counts = await testPool.query(`
       SELECT
@@ -173,10 +187,12 @@ describe("gp_core schema and service", () => {
         (SELECT COUNT(*) FROM gp_core.vendor_market_assignments) AS assignments
     `)
 
+    // Drugi przebieg NIE MOŻE zwielokrotnić wierszy — to jest właściwy przedmiot
+    // tego testu, więc porównujemy do stanu z pierwszego przebiegu.
     expect(counts.rows[0]).toMatchObject({
-      markets: "4",
-      vendors: "8",
-      assignments: "8",
+      markets: String(expectedMarkets),
+      vendors: String(first.vendors.created),
+      assignments: String(first.assignments.created),
     })
   })
 
