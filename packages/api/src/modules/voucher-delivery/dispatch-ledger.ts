@@ -130,6 +130,8 @@ export interface DispatchRow {
   /** Pierwotna przyczyna — nie jest kasowana przez retry summary row. */
   first_error_code: string | null
   first_failed_at: string | null
+  /** Ile razy automat przywrócił budżet po awarii konfiguracji. */
+  configuration_recovery_count: number
   attempt_count: number
   /** ISO 8601 — moment wejścia w `queued` (staleness porzuconych rezerwacji). */
   queued_at: string | null
@@ -321,19 +323,24 @@ export interface DeliveryGapScanPort {
    *
    * Guard `status='failed' AND error_code = …` sprawia, że dekrement dotyczy
    * WYŁĄCZNIE wiersza, który właśnie padł z tym kodem — nie cofa prób zużytych
-   * na realne odrzucenia providera.
+   * na realne odrzucenia providera. `max_configuration_recoveries` stanowi
+   * trwałą granicę: konfiguracja, której operator nie naprawi, nie może
+   * uruchamiać tego samego wiersza bez końca.
    */
   releaseAttemptBudget(input: {
     dispatch_id: string
     error_code: string
+    max_configuration_recoveries: number
   }): Promise<boolean>
   /**
    * Odparkuj historyczne wiersze, których pierwotna (niemutowalna) przyczyna
-   * była globalną awarią konfiguracji. To jest mechanizm migracyjno-operacyjny,
-   * nie jednorazowy UPDATE: po usunięciu konfiguracji sweep znów może je wysłać.
+   * była globalną awarią konfiguracji. Licznik odzyskań jest zapisywany przy
+   * wierszu, aby uszkodzony albo utracony aktualny kod nie zamienił tego
+   * jednorazowego odzyskania w pętlę co cykl crona.
    */
   releaseParkedConfigurationFailureBudgets(input: {
     max_attempt_count: number
+    max_configuration_recoveries: number
     error_codes: readonly string[]
   }): Promise<number>
 }
@@ -351,7 +358,7 @@ export class DispatchLedgerError extends Error {
 const SELECT_COLUMNS = `
   dispatch_id, entitlement_id, template_key, recipient_hash, market_id,
   flow_id, locale, status, provider, provider_message_id, error_code, attempt_count,
-  first_error_code, first_failed_at, queued_at
+  first_error_code, first_failed_at, configuration_recovery_count, queued_at
 `
 
 export interface PgDispatchLedgerOptions {
@@ -883,18 +890,27 @@ export class PgDispatchLedger
   async releaseAttemptBudget(input: {
     dispatch_id: string
     error_code: string
+    max_configuration_recoveries: number
   }): Promise<boolean> {
+    assertConfigurationRecoveryLimit(input.max_configuration_recoveries)
     const nowIso = this.now().toISOString()
     const rows = await this.queryRows<DispatchRow>(
       `UPDATE ${VOUCHER_DELIVERY_DISPATCH_TABLE}
-          SET attempt_count = GREATEST(attempt_count - 1, 0),
+          SET attempt_count = GREATEST(attempt_count - 1, 1),
+              configuration_recovery_count = configuration_recovery_count + 1,
               updated_at = $1
         WHERE dispatch_id = $2
           AND status = 'failed'
           AND error_code = $3
           AND attempt_count > 0
+          AND configuration_recovery_count < $4
       RETURNING ${SELECT_COLUMNS}`,
-      [nowIso, input.dispatch_id, input.error_code],
+      [
+        nowIso,
+        input.dispatch_id,
+        input.error_code,
+        input.max_configuration_recoveries,
+      ],
     )
 
     return rows.length > 0
@@ -902,29 +918,38 @@ export class PgDispatchLedger
 
   async releaseParkedConfigurationFailureBudgets(input: {
     max_attempt_count: number
+    max_configuration_recoveries: number
     error_codes: readonly string[]
   }): Promise<number> {
     assertMaxAttemptCount(input.max_attempt_count)
+    assertConfigurationRecoveryLimit(input.max_configuration_recoveries)
     const codes = [...input.error_codes]
-    const codePlaceholders = codes.map((_code, index) => `$${index + 3}`).join(", ")
+    const codePlaceholders = codes.map((_code, index) => `$${index + 4}`).join(", ")
     const nowIso = this.now().toISOString()
     const rows = await this.queryRows<DispatchRow>(
       `UPDATE ${VOUCHER_DELIVERY_DISPATCH_TABLE}
           SET attempt_count = LEAST(attempt_count, $1 - 1),
+              configuration_recovery_count = configuration_recovery_count + 1,
               updated_at = $2
         WHERE status = 'failed'
           AND attempt_count >= $1
-          -- Tylko historyczny summary z utraconą diagnostyką. Gdy późniejsza
-          -- próba zapisała konkretny błąd providera, jej budżet pozostaje
-          -- normalnie ograniczony nawet jeśli pierwsza porażka była globalna.
+          -- Tylko historyczny summary z utraconą diagnostyką. Stabilne ID
+          -- notyfikacji chroni aktualny kod od następnej próby; ten fallback
+          -- wolno wykonać ograniczoną liczbę razy, nie w każdym cyklu crona.
           AND error_code = 'VOUCHER_DELIVERY_DISPATCH_FAILED'
+          AND configuration_recovery_count < $3
           AND first_error_code IS NOT NULL
           AND (
             first_error_code IN (${codePlaceholders})
             OR first_error_code LIKE '%\\_NOT\\_CONFIGURED' ESCAPE '\\'
           )
       RETURNING ${SELECT_COLUMNS}`,
-      [input.max_attempt_count, nowIso, ...codes],
+      [
+        input.max_attempt_count,
+        nowIso,
+        input.max_configuration_recoveries,
+        ...codes,
+      ],
     )
     return rows.length
   }
@@ -1127,6 +1152,7 @@ function normalizeRow(raw: unknown): DispatchRow {
     first_error_code:
       record.first_error_code == null ? null : String(record.first_error_code),
     first_failed_at: normalizeTimestamp(record.first_failed_at),
+    configuration_recovery_count: Number(record.configuration_recovery_count ?? 0),
     attempt_count: Number(record.attempt_count ?? 0),
     queued_at: normalizeTimestamp(record.queued_at),
   }
@@ -1201,6 +1227,15 @@ function assertMaxAttemptCount(value: number): void {
     throw new DispatchLedgerError(
       "max_attempt_count musi być liczbą całkowitą >= 1",
       "VOUCHER_DELIVERY_MAX_ATTEMPT_COUNT_INVALID",
+    )
+  }
+}
+
+function assertConfigurationRecoveryLimit(value: number): void {
+  if (!Number.isInteger(value) || value < 0) {
+    throw new DispatchLedgerError(
+      "max_configuration_recoveries musi być liczbą całkowitą >= 0",
+      "VOUCHER_DELIVERY_CONFIGURATION_RECOVERY_LIMIT_INVALID",
     )
   }
 }

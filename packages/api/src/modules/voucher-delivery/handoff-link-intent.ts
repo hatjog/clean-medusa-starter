@@ -72,6 +72,9 @@ export function buildHandoffLinkNotification(
   })
 
   return {
+    // Patrz purchase-confirmation-intent: `dispatch_id` jest stabilnym ID
+    // rekordu Notification Medusy również dla retry handoffu.
+    id: input.dispatch_id,
     to: input.recipient_email,
     channel: "email",
     template: templateKey,

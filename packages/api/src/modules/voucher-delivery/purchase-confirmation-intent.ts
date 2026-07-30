@@ -117,6 +117,11 @@ export function buildPurchaseConfirmationNotification(
   const idempotencyKey = buildDispatchIdempotencyKey(input)
 
   return {
+    // Retry musi aktualizować TEN SAM rekord Notification Medusy. Bez stabilnego
+    // ID Medusa generuje nowe `noti_*`, a jej `finally` próbuje zaktualizować
+    // rekord, którego nie utworzyła przy deduplikacji po `idempotency_key`.
+    // Ten sam błąd zastępuje wtedy marker providera i ledger widzi fallback.
+    id: input.dispatch_id,
     to: input.recipient_email,
     channel: "email",
     template: templateKey,

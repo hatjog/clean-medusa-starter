@@ -492,13 +492,34 @@ describe("AC5 — idempotencja end-to-end (NFR3)", () => {
   })
 
   it("idempotency_key Medusy jest wyprowadzony z klucza ledgera (dwie warstwy, jedna tożsamość)", async () => {
-    const { deps, dispatchCalls } = makeDeps({})
+    const { deps, dispatchCalls, sql } = makeDeps({})
     await handleVoucherPurchaseDelivery(envelope("ISSUED"), deps)
 
     const hash = hashRecipientEmail(BUYER_EMAIL)
     expect(dispatchCalls[0].idempotency_key).toBe(
       `voucher-purchase-delivery:${ENTITLEMENT_ID}:${TEMPLATE_KEY}:${hash}`,
     )
+    expect(dispatchCalls[0].id).toBe(sql.dispatch[0].dispatch_id)
+  })
+
+  it("retry przekazuje stabilne ID notyfikacji tego samego dispatchu", async () => {
+    const sql = new FakeSql()
+    const { deps, dispatchCalls } = makeDeps({
+      sql,
+      dispatchImpl: async () => {
+        throw new Error(
+          "provider failed [gp_error_code=BREVO_TEMPLATE_NOT_CONFIGURED]",
+        )
+      },
+    })
+
+    await handleVoucherPurchaseDelivery(envelope("ISSUED"), deps)
+    await handleVoucherPurchaseDelivery(envelope("ACTIVE", "ISSUED"), deps)
+
+    expect(dispatchCalls).toHaveLength(2)
+    expect(dispatchCalls[0].id).toBe(sql.dispatch[0].dispatch_id)
+    expect(dispatchCalls[1].id).toBe(sql.dispatch[0].dispatch_id)
+    expect(dispatchCalls[1].idempotency_key).toBe(dispatchCalls[0].idempotency_key)
   })
 })
 

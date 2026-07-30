@@ -105,6 +105,7 @@ type DispatchSeed = {
   attempt_count?: number
   error_code?: string | null
   first_error_code?: string | null
+  configuration_recovery_count?: number
   market_id?: string | null
 }
 
@@ -165,6 +166,7 @@ class FakeSql implements DispatchLedgerSql {
       provider_message_id: null,
       error_code: seed.error_code ?? null,
       first_error_code: seed.first_error_code ?? null,
+      configuration_recovery_count: seed.configuration_recovery_count ?? 0,
       attempt_count: seed.attempt_count ?? 1,
       queued_at: seed.queued_at ?? minutesAgo(60),
       sent_at: null,
@@ -228,6 +230,7 @@ class FakeSql implements DispatchLedgerSql {
         provider: null,
         provider_message_id: null,
         error_code: null,
+        configuration_recovery_count: 0,
         attempt_count: 1,
         queued_at: now,
         sent_at: null,
@@ -258,29 +261,41 @@ class FakeSql implements DispatchLedgerSql {
     }
 
     if (q.includes("SET attempt_count = LEAST")) {
-      const [maxAttemptCount] = bindings as number[]
-      const globalCodes = bindings.slice(2).map(String)
+      const [maxAttemptCount, , maxConfigurationRecoveries] = bindings as number[]
+      const globalCodes = bindings.slice(3).map(String)
       const released = this.dispatch.filter(
         (row) =>
           row.status === "failed" &&
           Number(row.attempt_count ?? 0) >= maxAttemptCount &&
           row.error_code === "VOUCHER_DELIVERY_DISPATCH_FAILED" &&
+          Number(row.configuration_recovery_count ?? 0) < maxConfigurationRecoveries &&
           (globalCodes.includes(String(row.first_error_code)) ||
             String(row.first_error_code).endsWith("_NOT_CONFIGURED")),
       )
-      for (const row of released) row.attempt_count = maxAttemptCount - 1
+      for (const row of released) {
+        row.attempt_count = maxAttemptCount - 1
+        row.configuration_recovery_count = Number(row.configuration_recovery_count ?? 0) + 1
+      }
       return { rows: released.map((row) => ({ ...row })) }
     }
 
     if (q.includes("SET attempt_count = GREATEST")) {
       // releaseAttemptBudget (2.5, R-2.5-H3): guard status + kod błędu.
-      const [, id, errorCode] = bindings as string[]
+      const [, id, errorCode, maxConfigurationRecoveries] = bindings as string[]
       const row = this.byId(id)
       if (!row || row.status !== "failed" || row.error_code !== errorCode) {
         return { rows: [] }
       }
       if (Number(row.attempt_count ?? 0) <= 0) return { rows: [] }
-      row.attempt_count = Number(row.attempt_count) - 1
+      if (
+        Number(row.configuration_recovery_count ?? 0) >=
+        Number(maxConfigurationRecoveries)
+      ) {
+        return { rows: [] }
+      }
+      row.attempt_count = Math.max(Number(row.attempt_count) - 1, 1)
+      row.configuration_recovery_count =
+        Number(row.configuration_recovery_count ?? 0) + 1
       return { rows: [{ ...row }] }
     }
 
@@ -1447,7 +1462,7 @@ describe("AC2 — semantyka stanów ledgera 2.3 jest respektowana", () => {
           dispatch_id: "dispatch-exhausted",
           entitlement_id: "ent_exhausted",
           status: "failed",
-          error_code: "BREVO_SEND_FAILED",
+          error_code: "BREVO_TRANSPORT_ERROR",
           attempt_count: SWEEP_MAX_ATTEMPT_COUNT,
         },
       ],
@@ -1499,7 +1514,11 @@ describe("R-2.5-H3 — awaria GLOBALNA nie zużywa budżetu prób", () => {
     expect(report.attempt_budget_released).toBe(1)
     expect(report.recovered).toBe(1)
     expect(dispatchCalls).toHaveLength(1)
-    expect(sql.dispatch[0]).toMatchObject({ status: "sent", attempt_count: SWEEP_MAX_ATTEMPT_COUNT })
+    expect(sql.dispatch[0]).toMatchObject({
+      status: "sent",
+      attempt_count: SWEEP_MAX_ATTEMPT_COUNT,
+      configuration_recovery_count: 1,
+    })
   })
 
   it("nie odparkuje późniejszego realnego błędu providera tylko dlatego, że pierwsza porażka była konfiguracyjna", async () => {
@@ -1510,7 +1529,7 @@ describe("R-2.5-H3 — awaria GLOBALNA nie zużywa budżetu prób", () => {
           dispatch_id: "dispatch-real-failure-after-config",
           entitlement_id: "ent_real_failure_after_config",
           status: "failed",
-          error_code: "BREVO_SEND_FAILED",
+          error_code: "BREVO_TRANSPORT_ERROR",
           first_error_code: "BREVO_SENDER_NOT_CONFIGURED",
           attempt_count: SWEEP_MAX_ATTEMPT_COUNT,
         },
@@ -1524,7 +1543,43 @@ describe("R-2.5-H3 — awaria GLOBALNA nie zużywa budżetu prób", () => {
     expect(sql.dispatch[0].attempt_count).toBe(SWEEP_MAX_ATTEMPT_COUNT)
   })
 
-  it("`FLOW_DISABLED` zwraca próbę: `attempt_count` nie rośnie między przebiegami", async () => {
+  it("historyczny fallback i aktualny `BREVO_TEMPLATE_NOT_CONFIGURED` nie tworzą pętli między przebiegami", async () => {
+    const { deps, sql, dispatchCalls } = makeHarness({
+      entitlements: [issuedEntitlement("ent_bounded_configuration_recovery")],
+      dispatchRows: [
+        {
+          dispatch_id: "dispatch-bounded-configuration-recovery",
+          entitlement_id: "ent_bounded_configuration_recovery",
+          status: "failed",
+          // To jest dokładny kształt z audytu regresji: historyczna pierwsza
+          // przyczyna i utracony, generyczny summary przed retry.
+          error_code: "VOUCHER_DELIVERY_DISPATCH_FAILED",
+          first_error_code: "BREVO_SENDER_NOT_CONFIGURED",
+          attempt_count: SWEEP_MAX_ATTEMPT_COUNT,
+        },
+      ],
+      dispatchImpl: async () => {
+        throw new Error(
+          "Failed to send notification [gp_error_code=BREVO_TEMPLATE_NOT_CONFIGURED]",
+        )
+      },
+    })
+
+    const first = await runVoucherDeliveryReconciliationSweep(deps)
+    const second = await runVoucherDeliveryReconciliationSweep(deps)
+
+    expect(first.attempt_budget_released).toBe(1)
+    expect(second.attempt_budget_released).toBe(0)
+    expect(dispatchCalls).toHaveLength(1)
+    expect(sql.dispatch[0]).toMatchObject({
+      status: "failed",
+      error_code: "BREVO_TEMPLATE_NOT_CONFIGURED",
+      attempt_count: SWEEP_MAX_ATTEMPT_COUNT,
+      configuration_recovery_count: 1,
+    })
+  })
+
+  it("`FLOW_DISABLED` odzyskuje budżet tylko raz, potem wiersz wraca do zwykłego limitu", async () => {
     const { deps, sql, logger } = makeHarness({
       entitlements: [issuedEntitlement("ent_kill_switch")],
       dispatchImpl: async () => {
@@ -1534,15 +1589,13 @@ describe("R-2.5-H3 — awaria GLOBALNA nie zużywa budżetu prób", () => {
 
     await runVoucherDeliveryReconciliationSweep(deps)
     const first = Number(sql.dispatch[0].attempt_count)
-    await runVoucherDeliveryReconciliationSweep(deps)
     const second = await runVoucherDeliveryReconciliationSweep(deps)
 
     expect(sql.dispatch[0].status).toBe("failed")
-    // Bez zwrotu budżetu wiersz byłby zaparkowany po 5 przebiegach (75 min)
-    // BEZ ścieżki powrotu — czyli odwracalna awaria konfiguracji zamieniałaby
-    // się w trwałą utratę maila.
-    expect(Number(sql.dispatch[0].attempt_count)).toBe(first)
-    expect(second.attempt_budget_released).toBe(1)
+    expect(first).toBe(1)
+    expect(Number(sql.dispatch[0].attempt_count)).toBe(2)
+    expect(Number(sql.dispatch[0].configuration_recovery_count)).toBe(1)
+    expect(second.attempt_budget_released).toBe(0)
     expect(logger.entries.some((entry) => entry.level === "warn")).toBe(true)
   })
 
@@ -1558,9 +1611,7 @@ describe("R-2.5-H3 — awaria GLOBALNA nie zużywa budżetu prób", () => {
       },
     })
 
-    for (let run = 0; run < SWEEP_MAX_ATTEMPT_COUNT + 2; run += 1) {
-      await runVoucherDeliveryReconciliationSweep(deps)
-    }
+    await runVoucherDeliveryReconciliationSweep(deps)
     flowDisabled = false
     const recovery = await runVoucherDeliveryReconciliationSweep(deps)
 
@@ -1577,12 +1628,12 @@ describe("R-2.5-H3 — awaria GLOBALNA nie zużywa budżetu prób", () => {
           dispatch_id: "dispatch-provider-reject",
           entitlement_id: "ent_provider_reject",
           status: "failed",
-          error_code: "BREVO_SEND_FAILED",
+          error_code: "BREVO_TRANSPORT_ERROR",
           attempt_count: 1,
         },
       ],
       dispatchImpl: async () => {
-        throw new Error("provider 500 [gp_error_code=BREVO_SEND_FAILED]")
+        throw new Error("provider transport [gp_error_code=BREVO_TRANSPORT_ERROR]")
       },
     })
 
@@ -1596,7 +1647,7 @@ describe("R-2.5-H3 — awaria GLOBALNA nie zużywa budżetu prób", () => {
     expect(isGlobalFailureErrorCode("FLOW_DISABLED")).toBe(true)
     expect(isGlobalFailureErrorCode("BREVO_TEMPLATE_NOT_CONFIGURED")).toBe(true)
     expect(isGlobalFailureErrorCode("BREVO_API_KEY_NOT_CONFIGURED")).toBe(true)
-    expect(isGlobalFailureErrorCode("BREVO_SEND_FAILED")).toBe(false)
+    expect(isGlobalFailureErrorCode("BREVO_TRANSPORT_ERROR")).toBe(false)
     expect(isGlobalFailureErrorCode(null)).toBe(false)
   })
 })
@@ -1616,7 +1667,7 @@ describe("R-2.5-H3/H4 — batch nie jest zagłodzony przez wiersze niedosyłalne
           dispatch_id: "dispatch-parked-old",
           entitlement_id: "ent_parked_old",
           status: "failed",
-          error_code: "BREVO_SEND_FAILED",
+          error_code: "BREVO_TRANSPORT_ERROR",
           attempt_count: SWEEP_MAX_ATTEMPT_COUNT,
         },
       ],
@@ -1647,7 +1698,7 @@ describe("R-2.5-H3/H4 — batch nie jest zagłodzony przez wiersze niedosyłalne
           dispatch_id: "dispatch-chronic",
           entitlement_id: "ent_chronic",
           status: "failed",
-          error_code: "BREVO_SEND_FAILED",
+          error_code: "BREVO_TRANSPORT_ERROR",
           attempt_count: SWEEP_MAX_ATTEMPT_COUNT - 1,
         },
       ],
@@ -1678,7 +1729,7 @@ describe("R-2.5-M6 — próg prób nie jest obchodzony przez drugi szablon", () 
           entitlement_id: "ent_two_templates",
           template_key: TEMPLATE_KEY,
           status: "failed",
-          error_code: "BREVO_SEND_FAILED",
+          error_code: "BREVO_TRANSPORT_ERROR",
           attempt_count: SWEEP_MAX_ATTEMPT_COUNT,
         },
       ],
@@ -1718,7 +1769,7 @@ describe("R-2.5-M8 — handoff w `failed` jest ponawiany, choć buyer-mail jest 
           template_key: NOTIFICATION_TEMPLATE_KEYS.VOUCHER_HANDOFF_LINK,
           recipient_email: "obdarowana@example.test",
           status: "failed",
-          error_code: "BREVO_SEND_FAILED",
+          error_code: "BREVO_TRANSPORT_ERROR",
           attempt_count: 1,
         },
       ],
@@ -1886,7 +1937,7 @@ describe("AC2 — awaria pojedynczego wiersza nie przerywa przebiegu, job nie rz
             ?.entitlement_id ?? "",
         )
         if (failing.has(entitlementId)) {
-          throw new Error("provider 500 [gp_error_code=BREVO_SEND_FAILED]")
+          throw new Error("provider transport [gp_error_code=BREVO_TRANSPORT_ERROR]")
         }
         return { id: "brevo-message-ok" }
       },
@@ -1899,7 +1950,7 @@ describe("AC2 — awaria pojedynczego wiersza nie przerywa przebiegu, job nie rz
     const failed = sql.dispatch.find((r) => r.entitlement_id === "ent_fail_1")
     expect(failed).toMatchObject({
       status: "failed",
-      error_code: "BREVO_SEND_FAILED",
+      error_code: "BREVO_TRANSPORT_ERROR",
     })
   })
 
@@ -2013,7 +2064,7 @@ describe("AC3 — licznik „entitlement bez dispatchu” jako metryka alertu", 
     const { deps, captured } = makeHarness({
       entitlements: [issuedEntitlement("ent_found")],
       dispatchImpl: async () => {
-        throw new Error("padło [gp_error_code=BREVO_SEND_FAILED]")
+        throw new Error("padło [gp_error_code=BREVO_TRANSPORT_ERROR]")
       },
     })
 

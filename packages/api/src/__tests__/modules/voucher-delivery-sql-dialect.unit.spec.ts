@@ -46,6 +46,7 @@ function baseRow(status: string): Record<string, unknown> {
     provider: null,
     provider_message_id: null,
     error_code: status === "failed" ? "BREVO_TEMPLATE_NOT_CONFIGURED" : null,
+    configuration_recovery_count: 0,
     attempt_count: 1,
     queued_at: "2026-07-26T10:00:00.000Z",
   }
@@ -221,12 +222,14 @@ async function recordSweepScanCalls(): Promise<Call[]> {
   await new PgDispatchLedger(release).releaseAttemptBudget({
     dispatch_id: "dispatch-1",
     error_code: "FLOW_DISABLED",
+    max_configuration_recoveries: 1,
   })
   calls.push(...release.calls)
 
   const historicalRelease = new RecordingSql(() => [])
   await new PgDispatchLedger(historicalRelease).releaseParkedConfigurationFailureBudgets({
     max_attempt_count: 5,
+    max_configuration_recoveries: 1,
     error_codes: ["FLOW_DISABLED", "MARKET_LOCALES_UNAVAILABLE"],
   })
   calls.push(...historicalRelease.calls)
@@ -341,6 +344,7 @@ describe("Story 2.5 — SQL sweepa jest wykonywalny przez REALNY formatter Knexa
       expect(sql).toContain("AND status = 'failed'")
       expect(sql).toContain("AND error_code = ?")
       expect(sql).toContain("AND attempt_count > 0")
+      expect(sql).toContain("AND configuration_recovery_count < ?")
     })
 
     it("odparkowanie historycznej awarii używa trwałej pierwszej przyczyny", () => {
@@ -351,6 +355,7 @@ describe("Story 2.5 — SQL sweepa jest wykonywalny przez REALNY formatter Knexa
       expect(sql).toContain("AND first_error_code IS NOT NULL")
       expect(sql).toContain("first_error_code LIKE '%\\_NOT\\_CONFIGURED'")
       expect(sql).toContain("AND attempt_count >= ?")
+      expect(sql).toContain("AND configuration_recovery_count < ?")
     })
   })
 

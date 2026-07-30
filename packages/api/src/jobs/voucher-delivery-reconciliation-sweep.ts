@@ -160,6 +160,16 @@ export const SWEEP_BATCH_LIMIT = 200
 export const SWEEP_MAX_ATTEMPT_COUNT = 5
 
 /**
+ * Najwyżej jedno automatyczne odzyskanie budżetu konfiguracji na wiersz.
+ *
+ * Retry dostaje szansę po poprawce konfiguracji bez ręcznego UPDATE, ale
+ * kod, który został utracony przez warstwę pośrednią, nie może odparkowywać
+ * tego samego dispatchu w nieskończoność. Kolejny przypadek pozostaje
+ * zaparkowany i widoczny w metryce operatorskiej.
+ */
+export const SWEEP_MAX_CONFIGURATION_RECOVERIES = 1
+
+/**
  * Okno skanu i licznika granicy H1 (7 dni) — JEDNA stała, bo obie liczby muszą
  * mówić o tym samym zbiorze (R-2.5-H1/L11). Skan bez dolnej granicy dosyłałby
  * maile do całej historii sprzed ledgera 2.3, a COUNT bez niej rósłby z całą
@@ -603,11 +613,12 @@ export async function runVoucherDeliveryReconciliationSweep(
 
   // Historical summary rows may have had their mutable `error_code` reset by
   // retry. `first_error_code` is backfilled from append-only audit, so this
-  // restores only delivery attempts parked by a configuration failure.
+  // gives each configuration failure one bounded recovery attempt.
   try {
     report.attempt_budget_released +=
       await scanner.releaseParkedConfigurationFailureBudgets({
         max_attempt_count: SWEEP_MAX_ATTEMPT_COUNT,
+        max_configuration_recoveries: SWEEP_MAX_CONFIGURATION_RECOVERIES,
         error_codes: SWEEP_GLOBAL_FAILURE_ERROR_CODES,
       })
   } catch (error) {
@@ -1125,6 +1136,7 @@ async function releaseBudgetOnGlobalFailure(
     const released = await deps.scanner.releaseAttemptBudget({
       dispatch_id: dispatchId,
       error_code: errorCodeValue as string,
+      max_configuration_recoveries: SWEEP_MAX_CONFIGURATION_RECOVERIES,
     })
     if (released) report.attempt_budget_released += 1
   } catch (error) {
