@@ -10,7 +10,10 @@ class RecordingMigration extends Migration1778936000000 {
 
 describe("Migration1778936000000 — granica odzyskiwania budżetu konfiguracji", () => {
   it("dodaje trwały, nieujemny licznik z bezpiecznym domyślnym zerem", async () => {
-    const migration = new RecordingMigration()
+    const migration = new RecordingMigration(
+      undefined as unknown as ConstructorParameters<typeof Migration1778936000000>[0],
+      undefined as unknown as ConstructorParameters<typeof Migration1778936000000>[1]
+    )
     await migration.up()
 
     const sql = migration.recorded.join("\n").replace(/\s+/g, " ")

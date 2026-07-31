@@ -131,7 +131,7 @@ export type OnExpiryConvertTarget = (typeof ON_EXPIRY_CONVERT_TARGETS)[number]
 export const COMPLIANCE_REQUIRED_ENTITLEMENT_TYPES = [
   "CREDIT_PACK",
   "BUNDLE",
-] as const
+] as const satisfies readonly `${EntitlementType}`[]
 export type ComplianceRequiredEntitlementType =
   (typeof COMPLIANCE_REQUIRED_ENTITLEMENT_TYPES)[number]
 
@@ -384,7 +384,7 @@ export const MPV_BREAKAGE_NO_OUTPUT_VAT_CONTRACT = {
 
 function requiresCompliancePolicy(
   entitlementType: EntitlementType
-): entitlementType is ComplianceRequiredEntitlementType {
+): boolean {
   return (COMPLIANCE_REQUIRED_ENTITLEMENT_TYPES as readonly EntitlementType[]).includes(
     entitlementType
   )

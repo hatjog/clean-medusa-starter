@@ -25,7 +25,7 @@ const compliantPolicy = {
 describe("Story 3.8 — compliance boundary for CREDIT_PACK/BUNDLE", () => {
   it("wymaga withdrawal/refund/defensive-expiry dla CREDIT_PACK i BUNDLE", () => {
     for (const type of COMPLIANCE_REQUIRED_ENTITLEMENT_TYPES) {
-      const violations = checkPolicyComplianceForEntitlementType(type, {
+      const violations = checkPolicyComplianceForEntitlementType(EntitlementType[type], {
         validity_months: 12,
       })
 
@@ -41,7 +41,9 @@ describe("Story 3.8 — compliance boundary for CREDIT_PACK/BUNDLE", () => {
 
   it("akceptuje wymagane inwarianty dla nowych typów", () => {
     for (const type of COMPLIANCE_REQUIRED_ENTITLEMENT_TYPES) {
-      expect(checkPolicyComplianceForEntitlementType(type, compliantPolicy)).toEqual([])
+      expect(
+        checkPolicyComplianceForEntitlementType(EntitlementType[type], compliantPolicy)
+      ).toEqual([])
     }
   })
 

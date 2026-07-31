@@ -24,7 +24,10 @@ class RecordingMigration extends Migration1778935000000 {
  */
 describe("Migration1778935000000 — pierwsza porażka dispatchu", () => {
   it("dodaje trwałe pola i backfilluje je z najwcześniejszego append-only audytu", async () => {
-    const migration = new RecordingMigration()
+    const migration = new RecordingMigration(
+      undefined as unknown as ConstructorParameters<typeof Migration1778935000000>[0],
+      undefined as unknown as ConstructorParameters<typeof Migration1778935000000>[1]
+    )
     await migration.up()
     const sql = migration.recorded.join("\n").replace(/\s+/g, " ")
 
@@ -40,7 +43,10 @@ describe("Migration1778935000000 — pierwsza porażka dispatchu", () => {
   })
 
   it("nie używa UPDATE ... FROM LATERAL z referencją do tabeli docelowej (PostgreSQL to odrzuca)", async () => {
-    const migration = new RecordingMigration()
+    const migration = new RecordingMigration(
+      undefined as unknown as ConstructorParameters<typeof Migration1778935000000>[0],
+      undefined as unknown as ConstructorParameters<typeof Migration1778935000000>[1]
+    )
     await migration.up()
     const sql = migration.recorded.join("\n").replace(/\s+/g, " ")
 

@@ -27,7 +27,12 @@ describe("Story 5.1 FINDING-1 — /webhooks/stripe/payment-intent ma preserveRaw
       (r) => r.matcher === "/webhooks/stripe/payment-intent"
     )
     expect(route).toBeDefined()
-    expect(route?.bodyParser?.preserveRawBody).toBe(true)
+    const bodyParser = route?.bodyParser
+    expect(bodyParser).toBeTruthy()
+    if (!bodyParser) {
+      throw new Error("Stripe webhook route must enable body parsing")
+    }
+    expect(bodyParser.preserveRawBody).toBe(true)
     expect(route?.methods).toContain("POST")
   })
 
@@ -35,6 +40,11 @@ describe("Story 5.1 FINDING-1 — /webhooks/stripe/payment-intent ma preserveRaw
     const brevoRoute = middlewaresConfig.routes?.find(
       (r) => typeof r.matcher !== "string" || r.matcher.includes("brevo")
     )
-    expect(brevoRoute?.bodyParser?.preserveRawBody).toBe(true)
+    const bodyParser = brevoRoute?.bodyParser
+    expect(bodyParser).toBeTruthy()
+    if (!bodyParser) {
+      throw new Error("Brevo webhook route must enable body parsing")
+    }
+    expect(bodyParser.preserveRawBody).toBe(true)
   })
 })
