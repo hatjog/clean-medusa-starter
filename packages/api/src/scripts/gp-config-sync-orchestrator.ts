@@ -109,6 +109,8 @@ type OrchestratorSummary = {
   force_vendor_overwrite: boolean
   /** ADR-165 §2 — pominięcia bramki własności; niepuste ⟹ `ok: false`. */
   ownership_protected: OwnershipProtectedSkip[]
+  address_write_failures?: Array<{ vendor_id: string; reason: string }>
+  sellers_without_address?: string[]
   /**
    * ADR-165 §4 (cykl 5) — treść vendora, którą `--force` REALNIE nadpisał.
    * Niepuste NIE oznacza porażki (operator o to prosił), ale `gp catalog sync`
@@ -710,6 +712,10 @@ export default async function gpConfigSyncOrchestrator({ container, args }: Exec
   const stageExitSignals: StageExitSignal[] = []
   /** ADR-165 / W2 — jedyna klasa sygnału, która zamienia run w porażkę. */
   const ownershipProtectedSkips: OwnershipProtectedSkip[] = []
+  /** F-1 (review 5.7) — nieudane zapisy `seller_address` z etapu vendors. */
+  const addressWriteFailures: Array<{ vendor_id: string; reason: string }> = []
+  /** F-5 (review 5.7) — sellerzy bez adresu: ich mail potwierdzenia NIE wyjdzie. */
+  const sellersWithoutAddress: string[] = []
   /** ADR-165 §4 / cykl 5 — druga klasa sygnału tej samej bramki: co force zniszczył. */
   const vendorContentOverwrites: VendorContentOverwrite[] = []
 
@@ -812,6 +818,16 @@ export default async function gpConfigSyncOrchestrator({ container, args }: Exec
           // (vendor suspended, brak sellerId) zostają warningami.
           for (const skip of vendorSummary?.ownership_protected ?? []) {
             ownershipProtectedSkips.push(skip)
+          }
+
+          // F-1/F-5 (review 5.7) — relay do raportu orchestratora, bo to jedyne,
+          // co widzi `gp catalog sync`. Bez niego brak adresu salonu wychodzi na
+          // jaw dopiero jako `failed` w ledgerze PO zakupie klientki.
+          for (const failure of vendorSummary?.address_write_failures ?? []) {
+            addressWriteFailures.push(failure)
+          }
+          for (const vendorId of vendorSummary?.sellers_without_address ?? []) {
+            sellersWithoutAddress.push(vendorId)
           }
 
           // ADR-165 §4 (cykl 5) — to samo dla drugiej strony bramki. Bez tego
@@ -983,6 +999,28 @@ export default async function gpConfigSyncOrchestrator({ container, args }: Exec
       )
     }
 
+    // F-1 (review 5.7) — nieudany zapis adresu salonu NIE jest kosmetyka: jego
+    // skutkiem jest mail bez `salon_address` albo brak maila w ogole, bo bramka
+    // kontraktu szablonu wstrzymuje wysylke. Byl degradowany do warningu, ktory
+    // niczego nie zatrzymywal.
+    for (const failure of addressWriteFailures) {
+      warnings.push(
+        `sync-vendors: zapis seller_address dla '${failure.vendor_id}' NIEUDANY ` +
+          `(${failure.reason}) — mail potwierdzenia dla tego salonu sie NIE wysle ` +
+          `(brak wymaganej zmiennej salon_address w kontrakcie szablonu)`
+      )
+    }
+
+    // F-5 (review 5.7) — pre-flight: to jedyne miejsce, ktore widzi brak adresu
+    // ZANIM ktos kupi. Wczesniej dowiadywalismy sie z `failed` w ledgerze.
+    if (sellersWithoutAddress.length > 0) {
+      warnings.push(
+        `sync-vendors: ${sellersWithoutAddress.length} seller(ow) bez adresu w configu ` +
+          `[${sellersWithoutAddress.join(", ")}] — mail potwierdzenia dla nich NIE wyjdzie, ` +
+          `dopoki 'locations[0].address' nie zostanie uzupelnione w market.yaml`
+      )
+    }
+
     // ADR-165 §4 (cykl 5) — nadpisanie treści vendora NIE wywraca runu, ale
     // nie ma prawa być ciche: to jedyna operacja syncu, której nie da się
     // cofnąć z drzewa configu.
@@ -1043,6 +1081,8 @@ export default async function gpConfigSyncOrchestrator({ container, args }: Exec
       overwrite: orchestratorArgs.overwrite,
       force_vendor_overwrite: orchestratorArgs.forceVendorOverwrite,
       ownership_protected: ownershipProtectedSkips,
+      address_write_failures: addressWriteFailures,
+      sellers_without_address: sellersWithoutAddress,
       vendor_overwritten: vendorContentOverwrites,
       stages,
       health,

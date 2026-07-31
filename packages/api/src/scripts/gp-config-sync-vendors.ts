@@ -176,6 +176,18 @@ export type SyncSummary = {
    */
   ownership_protected: OwnershipProtectedSkip[]
   /**
+   * F-1 (review 5.7) — nieudane zapisy `seller_address`. Osobny, TYPOWANY kanał,
+   * bo skutkiem jest mail bez adresu salonu albo brak maila w ogóle: bramka
+   * kontraktu szablonu wstrzymuje wysyłkę bez `salon_address`.
+   */
+  address_write_failures: Array<{ vendor_id: string; reason: string }>
+  /**
+   * F-5 (review 5.7) — sellerzy bez `locations[0].address` w configu. Sync jest
+   * JEDYNYM miejscem, które widzi to przed zakupem; wcześniej brak adresu
+   * ujawniał się dopiero jako `failed` w ledgerze po opłaceniu vouchera.
+   */
+  sellers_without_address: string[]
+  /**
    * ADR-165 §4 (cykl 5) — co kanał `--force` faktycznie zniszczył. Puste przy
    * każdym runie bez tego kanału; niepuste = raport MUSI to pokazać operatorowi
    * po wykonaniu, bo tej pracy nie da się odzyskać z drzewa configu.
@@ -430,7 +442,27 @@ function buildSellerProductLinkId(sellerId: string, productId: string): string {
  * adres na sellera, wiec wybor kolejnej byloby zgadywaniem. Vendor bez lokalizacji
  * jest pomijany cicho: to legalny stan konfiguracji, nie blad syncu.
  */
-async function upsertSellerAddressViaDb(
+/**
+ * Wybór lokalizacji, z której bierzemy adres salonu.
+ *
+ * Wydzielone i eksportowane ŚWIADOMIE: to jest warunek, na którym opiera się
+ * sygnał F-5 („ten seller nie dostanie maila"), a na obecnych danych nie da się
+ * go wywołać ani jednym żywym przebiegiem — każdy vendor we wszystkich pięciu
+ * rynkach ma dziś adres w configu. Bez wydzielenia gałąź byłaby nietestowalna,
+ * czyli dokładnie „mechanizm, o którym nie wiadomo, czy odpala".
+ *
+ * `null` znaczy: brak nadającego się adresu. Pusty string i sam whitespace są
+ * traktowane jak brak — w mailu wyglądałyby identycznie jak puste pole.
+ */
+export function selectPrimaryVendorLocation(
+  vendor: Pick<VendorFixture, "locations">
+): VendorLocation | null {
+  const first = vendor.locations?.[0]
+  if (!first) return null
+  return first.address?.trim() ? first : null
+}
+
+export async function upsertSellerAddressViaDb(
   db: any,
   sellerId: string,
   sellerName: string,
@@ -1296,6 +1328,10 @@ export default async function gpConfigSyncVendors({ container, args }: ExecArgs)
 
   /** ADR-165 / W2 — jedyna klasa warningu, która eskaluje run do porażki. */
   const ownershipProtected: OwnershipProtectedSkip[] = []
+  /** F-1 (review 5.7) — nieudane zapisy `seller_address`; puste = zdrowy run. */
+  const addressWriteFailures: Array<{ vendor_id: string; reason: string }> = []
+  /** F-5 (review 5.7) — sellerzy bez adresu w configu: ich mail NIE wyjdzie. */
+  const sellersWithoutAddress: string[] = []
   /** ADR-165 §4 / cykl 5 — co `--force` faktycznie zniszczył. */
   const vendorOverwritten: VendorContentOverwrite[] = []
 
@@ -1336,23 +1372,39 @@ export default async function gpConfigSyncVendors({ container, args }: ExecArgs)
       // Story 5.7 — adres salonu z gp-config do `seller_address`. Po upsercie
       // sellera, bo potrzebujemy jego id; przed linkami produktowymi, bo mail
       // potwierdzenia zależy od adresu, a nie od katalogu.
-      const primaryLocation = vendor.locations?.[0]
-      if (!dryRun && result.sellerId && primaryLocation) {
-        try {
-          await upsertSellerAddressViaDb(
-            db,
-            result.sellerId,
-            vendor.display_name ?? vendor.slug,
-            primaryLocation
-          )
-        } catch (error) {
-          pushUniqueWarning(
-            warnings,
-            seenWarnings,
-            `Vendor '${vendor.vendor_id}': zapis seller_address nieudany: ${
-              error instanceof Error ? error.message : String(error)
-            }`
-          )
+      const primaryLocation = selectPrimaryVendorLocation(vendor)
+      if (!dryRun && result.sellerId) {
+        if (!primaryLocation) {
+          // F-5 (review 5.7): brak adresu = ZERO maila potwierdzenia dla tego
+          // salonu, bo `salon_address` jest wymaganą zmienną kontraktu szablonu.
+          // Do 5.7 dowiadywaliśmy się o tym dopiero z `failed` w ledgerze PO
+          // zakupie. Sync jest jedynym miejscem, które widzi to ZANIM ktoś kupi.
+          sellersWithoutAddress.push(vendor.vendor_id)
+        } else {
+          try {
+            await upsertSellerAddressViaDb(
+              db,
+              result.sellerId,
+              vendor.display_name ?? vendor.slug,
+              primaryLocation
+            )
+          } catch (error) {
+            // F-1 (review 5.7): błąd zapisu BYŁ degradowany do warningu, który
+            // niczego nie zatrzymywał — a jego skutkiem jest mail bez adresu
+            // salonu albo brak maila w ogóle. Liczymy go i eskalujemy razem z
+            // resztą sygnałów runu, zamiast liczyć na to, że ktoś przeczyta log.
+            addressWriteFailures.push({
+              vendor_id: vendor.vendor_id,
+              reason: error instanceof Error ? error.message : String(error),
+            })
+            pushUniqueWarning(
+              warnings,
+              seenWarnings,
+              `Vendor '${vendor.vendor_id}': zapis seller_address nieudany: ${
+                error instanceof Error ? error.message : String(error)
+              }`
+            )
+          }
         }
       }
 
@@ -1731,6 +1783,10 @@ export default async function gpConfigSyncVendors({ container, args }: ExecArgs)
     warnings,
     ownership_protected: ownershipProtected,
     vendor_overwritten: vendorOverwritten,
+    // F-1/F-5 (review 5.7): oba kanały są TYPOWANE, nie tylko tekstem w
+    // `warnings` — konsument (gp-cli, CI) ma je czytać, a nie parsować logi.
+    address_write_failures: addressWriteFailures,
+    sellers_without_address: sellersWithoutAddress,
   }
 
   if (dryRun && collector) {
