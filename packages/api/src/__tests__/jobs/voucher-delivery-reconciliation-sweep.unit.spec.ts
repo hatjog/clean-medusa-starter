@@ -324,7 +324,15 @@ class FakeSql implements DispatchLedgerSql {
 
       if (q.includes("provider = COALESCE")) {
         // markFailed (2.3): guard `status='queued'`.
-        const [provider, errorCode, , now, , , id] = bindings as string[]
+        // `toKnexPositionalSql` rozwija bindingi w kolejnosci WYSTAPIEN `?`.
+        // `dispatch_id` (guard WHERE) jest OSTATNIM wystapieniem, a odpowiedz
+        // providera dwoma tuz przed nim — liczymy od konca, zeby dolozenie
+        // kolejnej kolumny SET nie przesunelo znowu calej listy (dokladnie ten
+        // ksztalt zlamal sie przy dodaniu `provider_status_code`).
+        const [provider, errorCode, , now] = bindings as string[]
+        const id = bindings[bindings.length - 1] as string
+        const providerStatusCode = bindings[bindings.length - 3] ?? null
+        const providerMessage = bindings[bindings.length - 2] ?? null
         const row = this.byId(id)
         if (!row || row.status !== "queued") return { rows: [] }
         Object.assign(row, {
@@ -333,12 +341,14 @@ class FakeSql implements DispatchLedgerSql {
           error_code: errorCode,
           first_error_code: row.first_error_code ?? errorCode,
           failed_at: now,
+          provider_status_code: providerStatusCode,
+          provider_message: providerMessage,
         })
         return { rows: [{ ...row }] }
       }
 
       if (q.includes("SET status = 'failed'")) {
-        // abandonStaleQueued (2.5, D3): guard `status='queued' AND queued_at < próg`.
+        // abandonStaleQueued (2.5, D3): guard `status='queued' AND queued_at < prog`.
         const [errorCode, , now, , , id, staleBefore] = bindings as string[]
         const row = this.byId(id)
         if (!row || row.status !== "queued") return { rows: [] }
@@ -348,6 +358,10 @@ class FakeSql implements DispatchLedgerSql {
           error_code: errorCode,
           first_error_code: row.first_error_code ?? errorCode,
           failed_at: now,
+          // Przejecie PORZUCONEJ rezerwacji nie ma odpowiedzi providera:
+          // proces, ktory wysylal, zniknal.
+          provider_status_code: null,
+          provider_message: null,
         })
         return { rows: [{ ...row }] }
       }

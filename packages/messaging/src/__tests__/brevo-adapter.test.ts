@@ -174,13 +174,23 @@ describe("BrevoAdapter", () => {
     await expect(adapter.send(makeIntent())).rejects.toBeInstanceOf(
       MessagingProviderError,
     );
-    // R-2.2-M5: `message` NIE cytuje treści z odpowiedzi Brevo (komunikaty
-    // walidacyjne rutynowo zawierają odrzucony adres), bo ląduje w PII-free
-    // `NotificationAuditEnvelope.error_message`. Surowa odpowiedź zostaje na `cause`.
+    // R-2.2-M5 NADAL OBOWIĄZUJE: `message` nie cytuje SUROWEJ treści z odpowiedzi
+    // Brevo (komunikaty walidacyjne rutynowo zawierają odrzucony adres).
+    //
+    // ZMIANA (2026-08-02): kod jest NORMALIZOWANY do postaci marker-safe, a
+    // przyczyna przenoszona w markerach PO REDAKCJI. `invalid_parameter` małymi
+    // literami nie przechodził przez `[gp_error_code=…]` (`[A-Z0-9_]+`), więc
+    // klasa błędu ginęła i ledger zapisywał generyczny fallback.
     await expect(adapter.send(makeIntent())).rejects.toMatchObject({
-      error_code: "invalid_parameter",
+      error_code: "BREVO_INVALID_PARAMETER",
       status_code: 400,
-      message: "Brevo provider request failed (invalid_parameter, HTTP 400)",
+      message: expect.stringContaining(
+        "Brevo provider request failed (BREVO_INVALID_PARAMETER, HTTP 400)",
+      ),
+    });
+    await expect(adapter.send(makeIntent())).rejects.toMatchObject({
+      message: expect.stringContaining("[gp_provider_status=400]"),
+      provider_detail: "Invalid template id",
     });
   });
 
@@ -223,14 +233,19 @@ describe("BrevoAdapter", () => {
       }),
     };
 
+    // Kody providera są normalizowane do postaci marker-safe — bez tego marker
+    // `[gp_error_code=…]` ich nie przenosi (patrz `normalizeProviderErrorCode`).
     await expect(makeAdapter(bodyCodeClient).send(makeIntent())).rejects.toMatchObject({
-      error_code: "body_code",
-      message: "Brevo provider request failed (body_code, HTTP 422)",
+      error_code: "BREVO_BODY_CODE",
+      message: expect.stringContaining(
+        "Brevo provider request failed (BREVO_BODY_CODE, HTTP 422)",
+      ),
       status_code: 422,
     });
     await expect(makeAdapter(rootCodeClient).send(makeIntent())).rejects.toMatchObject({
-      error_code: "root_code",
-      message: "Brevo provider request failed (root_code)",
+      error_code: "BREVO_ROOT_CODE",
+      // Bez statusu HTTP nie ma markera statusu — nie zmyślamy go.
+      message: "Brevo provider request failed (BREVO_ROOT_CODE)",
     });
     await expect(makeAdapter(fallbackClient).send(makeIntent())).rejects.toMatchObject({
       error_code: "BREVO_PROVIDER_ERROR",
@@ -254,7 +269,15 @@ describe("BrevoAdapter", () => {
     await expect(adapter.send(makeIntent())).rejects.toMatchObject({
       error_code: "BREVO_HTTP_503",
       status_code: 503,
-      message: "Brevo provider request failed (BREVO_HTTP_503, HTTP 503)",
+      message: expect.stringContaining(
+        "Brevo provider request failed (BREVO_HTTP_503, HTTP 503)",
+      ),
+    });
+    // Odpowiedź providera jest przenoszona — bez niej `BREVO_HTTP_503` nie mówi
+    // operatorowi nic ponad "coś padło".
+    await expect(adapter.send(makeIntent())).rejects.toMatchObject({
+      message: expect.stringContaining("[gp_provider_status=503]"),
+      provider_detail: "Service unavailable",
     });
   });
 
@@ -343,10 +366,15 @@ describe("załączniki i higiena błędów (review 2.2)", () => {
     };
 
     await expect(makeAdapter(client).send(makeIntent())).rejects.toMatchObject({
-      error_code: "invalid_parameter",
+      error_code: "BREVO_INVALID_PARAMETER",
     });
     await expect(makeAdapter(client).send(makeIntent())).rejects.not.toMatchObject({
       message: expect.stringContaining("buyer@example.com"),
+    });
+    // Przenoszenie przyczyny NIE osłabia tej gwarancji: treść idzie przez
+    // redaktor, więc adres jest zastąpiony placeholderem, a diagnostyka zostaje.
+    await expect(makeAdapter(client).send(makeIntent())).rejects.toMatchObject({
+      provider_detail: "Invalid email address: <redacted:email>",
     });
   });
 

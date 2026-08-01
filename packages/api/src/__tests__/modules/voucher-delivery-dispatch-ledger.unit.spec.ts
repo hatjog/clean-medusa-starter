@@ -169,7 +169,14 @@ class FakeDispatchSql implements DispatchLedgerSql {
       }
 
       if (normalized.includes("SET status = 'failed'")) {
-        const [provider, error_code, , now, , , dispatch_id] = bindings as string[]
+        // `toKnexPositionalSql` rozwija bindingi w kolejnosci WYSTAPIEN `?`.
+        // `dispatch_id` (guard WHERE) jest OSTATNIM wystapieniem, a odpowiedz
+        // providera dwoma tuz przed nim — liczymy od konca, zeby dolozenie
+        // kolejnej kolumny SET nie przesunelo znowu calej listy.
+        const [provider, error_code, , now] = bindings as string[]
+        const dispatch_id = bindings[bindings.length - 1] as string
+        const provider_status_code = bindings[bindings.length - 3] ?? null
+        const provider_message = bindings[bindings.length - 2] ?? null
         const row = this.byId(dispatch_id)
         if (!row || row.status !== "queued") return { rows: [] }
         Object.assign(row, {
@@ -178,6 +185,8 @@ class FakeDispatchSql implements DispatchLedgerSql {
           error_code,
           first_error_code: row.first_error_code ?? error_code,
           failed_at: now,
+          provider_status_code,
+          provider_message,
         })
         return { rows: [{ ...row }] }
       }

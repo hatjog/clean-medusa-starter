@@ -95,8 +95,12 @@ class FakeSql implements DispatchLedgerSql {
         error_code,
         attempt_count,
         occurred_at,
+        provider_status_code,
+        provider_message,
       ] = bindings
       this.audit.push({
+        provider_status_code,
+        provider_message,
         dispatch_id,
         entitlement_id,
         template_key,
@@ -126,6 +130,8 @@ class FakeSql implements DispatchLedgerSql {
         provider: null,
         provider_message_id: null,
         error_code: null,
+        provider_status_code: null,
+        provider_message: null,
         attempt_count: 1,
         queued_at: now,
       }
@@ -150,6 +156,8 @@ class FakeSql implements DispatchLedgerSql {
           provider,
           provider_message_id: messageId,
           error_code: null,
+          provider_status_code: null,
+          provider_message: null,
         })
         return { rows: [{ ...row }] }
       }
@@ -160,13 +168,19 @@ class FakeSql implements DispatchLedgerSql {
         // czasu — UPDATE nigdy nie znajdował wiersza i status zostawał `queued`.
         // `dispatch_id` jest ostatnim placeholderem WHERE, więc bierzemy go z końca.
         const [provider, errorCode] = bindings as string[]
+        // `dispatch_id` jest OSTATNIM wystapieniem `?` (guard WHERE), a
+        // `provider_status_code`/`provider_message` sa dwoma tuz przed nim.
         const id = bindings[bindings.length - 1] as string
+        const providerStatusCode = bindings[bindings.length - 3] ?? null
+        const providerMessage = bindings[bindings.length - 2] ?? null
         const row = this.byId(id)
         if (!row || row.status !== "queued") return { rows: [] }
         Object.assign(row, {
           status: "failed",
           provider: provider ?? row.provider,
           error_code: errorCode,
+          provider_status_code: providerStatusCode,
+          provider_message: providerMessage,
         })
         return { rows: [{ ...row }] }
       }
@@ -178,6 +192,8 @@ class FakeSql implements DispatchLedgerSql {
         status: "queued",
         attempt_count: Number(row.attempt_count ?? 0) + 1,
         error_code: null,
+        provider_status_code: null,
+        provider_message: null,
         locale,
         market_id,
         flow_id,
@@ -1245,6 +1261,130 @@ describe("R-2.3-M3 — kod błędu przeżywa przepakowanie przez moduł Notifica
     expect(sql.dispatch[0].error_code).toBe("BREVO_RECIPIENT_REJECTED")
     expect(trace).not.toContain("rejected")
     expect(trace).not.toContain("Kupujaca")
+  })
+})
+
+/**
+ * Pozycja 2 (2026-08-02) — ledger MUSI unosic odpowiedz providera.
+ *
+ * Ksztalt z zywego zakupu (zamowienie 18, 2026-08-01): obie koperty wpadly do
+ * `voucher_delivery_dispatch` jako `failed` z generycznym
+ * `VOUCHER_DELIVERY_DISPATCH_FAILED` i NICZYM wiecej. Realna przyczyna — HTTP
+ * 401 `unauthorized`, "unrecognised IP address 37.31.141.48", czyli wlaczona
+ * autoryzacja IP po stronie konta Brevo — byla objawowo nieodrozninalna od
+ * bledu kodu i wyszla dopiero z recznego odpytania API providera.
+ */
+describe("odpowiedz providera w ledgerze (HTTP 401 z zywego zakupu)", () => {
+  /** Dokladnie ta odpowiedz, ktora zablokowala dostawe 2026-08-01. */
+  const LIVE_401_DETAIL =
+    "We have detected you are using an unrecognised IP address <redacted:ip>. " +
+    "If you performed this action make sure to add the new IP address in this link: " +
+    "https://app.brevo.com/security/authorised_ips"
+
+  /**
+   * Komunikat DOKLADNIE takiego ksztaltu, jaki dociera do subscribera na
+   * produkcji: wyjatek providera przepakowany przez modul Notification Medusy
+   * (`Failed to send notification with id …:\n` + `e.message`).
+   */
+  function medusaRewrappedBrevo401(): Error {
+    return new Error(
+      "Failed to send notification with id noti_01:\n" +
+        "Brevo provider request failed (BREVO_UNAUTHORIZED, HTTP 401) " +
+        `${formatErrorCodeMarker("BREVO_UNAUTHORIZED")} ` +
+        "[gp_provider_status=401] " +
+        `[gp_provider_detail=${LIVE_401_DETAIL}]`,
+    )
+  }
+
+  it("zapisuje kod HTTP i zredagowany komunikat providera zamiast samego fallbacku", async () => {
+    const { deps, sql } = makeDeps({
+      dispatchImpl: async () => {
+        throw medusaRewrappedBrevo401()
+      },
+    })
+
+    const result = await handleVoucherPurchaseDelivery(envelope("ISSUED"), deps)
+
+    expect(result.outcome).toBe("failed")
+    // Klasa bledu przestaje byc generyczna...
+    expect(sql.dispatch[0].error_code).toBe("BREVO_UNAUTHORIZED")
+    // ...a operator widzi w ledgerze PRZYCZYNE, nie tylko fakt porazki.
+    expect(sql.dispatch[0].provider_status_code).toBe(401)
+    expect(sql.dispatch[0].provider_message).toContain("unrecognised IP address")
+    // Audyt append-only niesie to samo — retry skasuje podsumowanie, historia zostaje.
+    expect(sql.audit.at(-1)?.provider_status_code).toBe(401)
+    expect(sql.audit.at(-1)?.provider_message).toContain("unrecognised IP address")
+  })
+
+  it("nie zapisuje PII ani sekretu z odpowiedzi providera (D-70)", async () => {
+    const { deps, sql, logger } = makeDeps({
+      dispatchImpl: async () => {
+        throw new Error(
+          "Failed to send notification with id noti_01:\n" +
+            `${formatErrorCodeMarker("BREVO_UNAUTHORIZED")} ` +
+            "[gp_provider_status=401] " +
+            `[gp_provider_detail=rejected ${BUYER_EMAIL} from 37.31.141.48 ` +
+            "key xkeysib-0123456789abcdef0123456789abcdef]",
+        )
+      },
+    })
+
+    await handleVoucherPurchaseDelivery(envelope("ISSUED"), deps)
+
+    const trace = JSON.stringify({ d: sql.dispatch, a: sql.audit, l: logger.entries })
+    expect(sql.dispatch[0].provider_status_code).toBe(401)
+    // Konsument redaguje PONOWNIE — nie ufa temu, ze ktos wyzej zrobil to dobrze.
+    expect(trace).not.toContain(BUYER_EMAIL)
+    expect(trace).not.toContain("37.31.141.48")
+    expect(trace).not.toContain("xkeysib-0123456789abcdef0123456789abcdef")
+    expect(String(sql.dispatch[0].provider_message)).toContain("<redacted:email>")
+    expect(String(sql.dispatch[0].provider_message)).toContain("<redacted:ip>")
+  })
+
+  it("porazka pre-flight (nic nie poszlo do providera) zostawia oba pola null", async () => {
+    const { deps, sql } = makeDeps({
+      dispatchImpl: async () => {
+        // Brak szablonu = fail PRZED dotknieciem providera: jest kod klasy,
+        // nie ma odpowiedzi HTTP i nie ma czego cytowac.
+        throw new Error(
+          "Failed to send notification with id noti_01:\n" +
+            `${formatErrorCodeMarker("BREVO_TEMPLATE_NOT_CONFIGURED")} ` +
+            "BREVO_TEMPLATE_NOT_CONFIGURED",
+        )
+      },
+    })
+
+    await handleVoucherPurchaseDelivery(envelope("ISSUED"), deps)
+
+    expect(sql.dispatch[0].error_code).toBe("BREVO_TEMPLATE_NOT_CONFIGURED")
+    // `null` jest tu INFORMACJA ("nic nie poszlo do providera"), nie brakiem danych.
+    expect(sql.dispatch[0].provider_status_code).toBeNull()
+    expect(sql.dispatch[0].provider_message).toBeNull()
+  })
+
+  it("udana wysylka kasuje diagnostyke poprzedniej porazki z podsumowania", async () => {
+    let attempt = 0
+    const { deps, sql } = makeDeps({
+      dispatchImpl: async () => {
+        attempt += 1
+        if (attempt === 1) throw medusaRewrappedBrevo401()
+        return [{ id: "noti_02", external_id: "brevo-msg-99" }]
+      },
+    })
+
+    await handleVoucherPurchaseDelivery(envelope("ISSUED"), deps)
+    expect(sql.dispatch[0].provider_status_code).toBe(401)
+
+    await handleVoucherPurchaseDelivery(envelope("ACTIVE"), deps)
+
+    expect(sql.dispatch[0].status).toBe("sent")
+    // Wiersz `sent` z HTTP 401 poprzedniej proby czytalby sie jak
+    // "poszlo mimo bledu". Slad porazki zyje w tabeli audytu.
+    expect(sql.dispatch[0].provider_status_code).toBeNull()
+    expect(sql.dispatch[0].provider_message).toBeNull()
+    expect(
+      sql.audit.some((a) => a.provider_status_code === 401),
+    ).toBe(true)
   })
 })
 
