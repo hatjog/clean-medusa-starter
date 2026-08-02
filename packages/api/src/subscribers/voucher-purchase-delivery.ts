@@ -89,7 +89,10 @@ import {
 } from "../modules/voucher-delivery/recipient-hash"
 import {
   extractErrorCodeMarker,
+  extractProviderDetailMarker,
+  extractProviderStatusMarker,
   NOTIFICATION_TEMPLATE_KEYS,
+  sanitizeProviderDetail,
 } from "@gp/messaging"
 
 /** Ten sam literał, co `ENTITLEMENT_STATE_CHANGED_EVENT_TYPE` z 2.1 (AR-EVENTS). */
@@ -887,15 +890,26 @@ async function runDispatchAttempt(
       handoff: null,
     }
   } catch (error) {
-    // Do ledgera i logu idzie KOD błędu — nigdy treść odpowiedzi providera
-    // (może nieść adres albo fragment treści maila).
+    // Do ledgera i logu idzie KOD błędu oraz ZREDAGOWANA odpowiedź providera
+    // (kod HTTP + komunikat po `sanitizeProviderDetail`) — nigdy surowa treść
+    // odpowiedzi, która może nieść adres, fragment maila albo sekret.
+    //
+    // Przed tą zmianą zostawał sam `error_code`, i to zwykle GENERYCZNY: kod
+    // podany przez Brevo (`unauthorized`) nie przechodził przez marker
+    // `[gp_error_code=…]`, bo marker przyjmuje tylko `[A-Z0-9_]+`. Efekt na
+    // żywym zakupie 2026-08-01: dwa wiersze `failed` z
+    // `VOUCHER_DELIVERY_DISPATCH_FAILED` i zero informacji, że to autoryzacja
+    // IP po stronie konta Brevo, a nie defekt kodu.
     const errorCode = readErrorCode(error, "VOUCHER_DELIVERY_DISPATCH_FAILED")
+    const providerResponse = readProviderResponse(error)
 
     try {
       await deps.ledger.markFailed({
         dispatch_id: dispatchId,
         error_code: errorCode,
         provider,
+        provider_status_code: providerResponse.status_code,
+        provider_message: providerResponse.message,
       })
     } catch (ledgerError) {
       deps.logger?.error?.(`${tag} nie udało się zapisać stanu failed w ledgerze`, {
@@ -912,6 +926,11 @@ async function runDispatchAttempt(
       locale,
       dispatch_id: dispatchId,
       error_code: errorCode,
+      // Zredagowane — te same wartości, które idą do ledgera. Log operatora
+      // i ledger MUSZĄ mówić to samo, inaczej triage zaczyna się od pytania,
+      // któremu źródłu wierzyć.
+      provider_status_code: providerResponse.status_code,
+      provider_message: providerResponse.message,
     })
 
     return {
@@ -1135,6 +1154,45 @@ function readErrorCode(error: unknown, fallback: string): string {
   // Medusa 2.14.2 keeps the provider marker in the outer Error.message;
   // aggregateErrors does not create a nested cause/errors carrier here.
   return extractErrorCodeMarker(record.message) ?? fallback
+}
+
+/**
+ * Odczytuje odpowiedź providera z (dowolnie opakowanego) błędu wysyłki.
+ *
+ * Dwa źródła, w tej kolejności:
+ *   1. POLA błędu (`status_code` / `provider_detail`) — dostępne tylko wtedy,
+ *      gdy wyjątek NIE przeszedł przez moduł Notification Medusy (testy, ścieżka
+ *      bezpośrednia). Wtedy są najdokładniejsze.
+ *   2. MARKERY w `message` (`[gp_provider_status=…]`, `[gp_provider_detail=…]`)
+ *      — jedyny nośnik, który przeżywa `MedusaError` + `promiseAll(
+ *      { aggregateErrors: true })`. To ścieżka PRODUKCYJNA.
+ *
+ * Wynik przechodzi jeszcze raz przez `sanitizeProviderDetail`: konsument nie
+ * zakłada, że ktoś wyżej zredagował poprawnie. Redakcja jest idempotentna, więc
+ * powtórzenie niczego nie psuje, a zamyka drogę treści, która weszła bokiem.
+ */
+function readProviderResponse(error: unknown): {
+  status_code: number | null
+  message: string | null
+} {
+  const record =
+    error && typeof error === "object"
+      ? (error as Record<string, unknown>)
+      : {}
+
+  const directStatus = record.status_code
+  const statusCode =
+    typeof directStatus === "number" && Number.isInteger(directStatus)
+      ? directStatus
+      : extractProviderStatusMarker(record.message)
+
+  const directDetail =
+    typeof record.provider_detail === "string" ? record.provider_detail : null
+  const message =
+    sanitizeProviderDetail(directDetail) ??
+    extractProviderDetailMarker(record.message)
+
+  return { status_code: statusCode ?? null, message }
 }
 
 /** `queued_at` starsze niż próg = rezerwacja porzucona (R-2.3-L9). */

@@ -30,6 +30,7 @@ import { marketContextStorage } from "../lib/market-context";
 import { recordRequest } from "../lib/request-log-aggregator";
 import { installRlsPoolHook, type HookLogger } from "../lib/rls-pool-hook";
 import { marketContextCache } from "../loaders/market-context-cache";
+import { listProductIdsForSalesChannel } from "../lib/product-market-scope";
 
 type PublishableKeyContext = {
   key: string;
@@ -54,6 +55,7 @@ type RequestExtensions = {
   auth_context?: AuthContext;
   params?: Record<string, unknown>;
   query?: Record<string, unknown>;
+  filterableFields?: Record<string, unknown>;
   path?: string;
   originalUrl?: string;
   url?: string;
@@ -641,6 +643,34 @@ export async function productListMarketScopeMiddleware(
   res: MedusaResponse,
   next: MedusaNextFunction
 ): Promise<void> {
+  const request = getRequestExtensions(req);
+  const context = marketContextStorage.getStore();
+
+  if (context?.sales_channel_id) {
+    const db = req.scope.resolve(ContainerRegistrationKeys.PG_CONNECTION) as Knex;
+    let scopedProductIds = await listProductIdsForSalesChannel(
+      db,
+      context.sales_channel_id
+    );
+    const existingIdFilter = request.filterableFields?.id ?? request.query?.id;
+    const requestedIds = Array.isArray(existingIdFilter)
+      ? existingIdFilter.filter((id): id is string => typeof id === "string")
+      : typeof existingIdFilter === "string"
+        ? [existingIdFilter]
+        : [];
+
+    if (requestedIds.length) {
+      const requestedIdSet = new Set(requestedIds);
+      scopedProductIds = scopedProductIds.filter((id) => requestedIdSet.has(id));
+    }
+
+    const enforcedIds = scopedProductIds.length
+      ? scopedProductIds
+      : ["__gp_no_products_in_market__"];
+    request.query = { ...request.query, id: enforcedIds };
+    request.filterableFields = { ...request.filterableFields, id: enforcedIds };
+  }
+
   const originalJson = res.json.bind(res);
 
   (res as unknown as { json: (body: unknown) => Promise<void> }).json =

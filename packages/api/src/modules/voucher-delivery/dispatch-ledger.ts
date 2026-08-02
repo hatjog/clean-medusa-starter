@@ -132,9 +132,46 @@ export interface DispatchRow {
   first_failed_at: string | null
   /** Ile razy automat przywrócił budżet po awarii konfiguracji. */
   configuration_recovery_count: number
+  /**
+   * Kod HTTP ostatniej odpowiedzi providera (`401`, `429`, `500`, …) albo
+   * `null`, gdy fail nastąpił ZANIM cokolwiek poszło do providera
+   * (pre-flight: brak szablonu, brak sendera, brak klucza).
+   *
+   * Bez tej pary (`provider_status_code`, `provider_message`) ledger nie
+   * odróżniał problemu konta od błędu kodu — patrz żywy zakup 2026-08-01.
+   */
+  provider_status_code: number | null
+  /**
+   * ZREDAGOWANY komunikat providera. Zapis przechodzi przez
+   * `sanitizeProviderDetail` (`@gp/messaging`): adresy, IP, sekrety i długie
+   * tokeny są zastąpione placeholderami. Surowego body NIE zapisujemy nigdy.
+   */
+  provider_message: string | null
   attempt_count: number
   /** ISO 8601 — moment wejścia w `queued` (staleness porzuconych rezerwacji). */
   queued_at: string | null
+}
+
+/**
+ * Wejście tranzycji `queued → failed`.
+ *
+ * `provider_status_code` / `provider_message` są OPCJONALNE, bo nie każda
+ * porażka pochodzi od providera: fail pre-flight (brak szablonu, brak sendera,
+ * brak klucza) i błędy konfiguracji wykryte przed wysyłką nie mają odpowiedzi
+ * HTTP. Ich `null` jest wtedy INFORMACJĄ („nic nie poszło do providera"), nie
+ * brakiem danych.
+ *
+ * KONTRAKT BEZPIECZEŃSTWA: `provider_message` MUSI być już zredagowane
+ * (`sanitizeProviderDetail` z `@gp/messaging`). Ledger jest ostatnim ogniwem,
+ * a nie miejscem, w którym redakcja się zaczyna — dlatego przycina długość,
+ * ale nie próbuje ratować surowego body.
+ */
+export interface MarkFailedInput {
+  dispatch_id: string
+  error_code: string
+  provider?: string | null
+  provider_status_code?: number | null
+  provider_message?: string | null
 }
 
 export interface DispatchLedgerPort {
@@ -144,11 +181,7 @@ export interface DispatchLedgerPort {
     provider: string
     provider_message_id: string | null
   }): Promise<boolean>
-  markFailed(input: {
-    dispatch_id: string
-    error_code: string
-    provider?: string | null
-  }): Promise<boolean>
+  markFailed(input: MarkFailedInput): Promise<boolean>
   findByIdentity(identity: DispatchIdentity): Promise<DispatchRow | null>
 }
 
@@ -358,7 +391,8 @@ export class DispatchLedgerError extends Error {
 const SELECT_COLUMNS = `
   dispatch_id, entitlement_id, template_key, recipient_hash, market_id,
   flow_id, locale, status, provider, provider_message_id, error_code, attempt_count,
-  first_error_code, first_failed_at, configuration_recovery_count, queued_at
+  first_error_code, first_failed_at, configuration_recovery_count, queued_at,
+  provider_status_code, provider_message
 `
 
 export interface PgDispatchLedgerOptions {
@@ -484,6 +518,12 @@ export class PgDispatchLedger
             SET status = 'queued',
                 attempt_count = attempt_count + 1,
                 error_code = NULL,
+                -- Odpowiedź providera dotyczy KONKRETNEJ próby. Zostawiona przy
+                -- przejęciu retry opisywałaby próbę, która już się nie liczy —
+                -- operator czytałby HTTP 401 sprzed dwóch podejść jak bieżący
+                -- stan. Historia zostaje w tabeli audytu.
+                provider_status_code = NULL,
+                provider_message = NULL,
                 failed_at = NULL,
                 queued_at = $1,
                 updated_at = $2,
@@ -549,6 +589,11 @@ export class PgDispatchLedger
               provider = $1,
               provider_message_id = $2,
               error_code = NULL,
+              -- Sukces kasuje diagnostyke porazki razem ze statusem bledu:
+              -- wiersz 'sent' z HTTP 401 poprzedniej proby czytalby sie jak
+              -- "poszlo mimo bledu". Slad porazki zyje w tabeli audytu.
+              provider_status_code = NULL,
+              provider_message = NULL,
               sent_at = $3,
               updated_at = $4
         WHERE dispatch_id = $5
@@ -570,12 +615,9 @@ export class PgDispatchLedger
     return true
   }
 
-  async markFailed(input: {
-    dispatch_id: string
-    error_code: string
-    provider?: string | null
-  }): Promise<boolean> {
+  async markFailed(input: MarkFailedInput): Promise<boolean> {
     const nowIso = this.now().toISOString()
+    const providerResponse = normalizeProviderResponse(input)
     const rows = await this.queryRows<DispatchRow>(
       `UPDATE ${VOUCHER_DELIVERY_DISPATCH_TABLE}
           SET status = 'failed',
@@ -584,7 +626,9 @@ export class PgDispatchLedger
               first_error_code = COALESCE(first_error_code, $2),
               first_failed_at = COALESCE(first_failed_at, $3),
               failed_at = $3,
-              updated_at = $4
+              updated_at = $4,
+              provider_status_code = $6,
+              provider_message = $7
         WHERE dispatch_id = $5
           AND status = 'queued'
       RETURNING ${SELECT_COLUMNS}`,
@@ -594,13 +638,22 @@ export class PgDispatchLedger
         nowIso,
         nowIso,
         input.dispatch_id,
+        providerResponse.status_code,
+        providerResponse.message,
       ],
     )
 
     if (rows.length === 0) return false
 
     const row = normalizeRow(rows[0])
-    await this.appendAudit(row, "queued", "failed", input.error_code, nowIso)
+    await this.appendAudit(
+      row,
+      "queued",
+      "failed",
+      input.error_code,
+      nowIso,
+      providerResponse,
+    )
     return true
   }
 
@@ -1046,7 +1099,13 @@ export class PgDispatchLedger
               first_error_code = COALESCE(first_error_code, $1),
               first_failed_at = COALESCE(first_failed_at, $2),
               failed_at = $2,
-              updated_at = $3
+              updated_at = $3,
+              -- Przejęcie PORZUCONEJ rezerwacji nie ma odpowiedzi providera:
+              -- proces, który wysyłał, zniknął. Zostawienie tu wartości
+              -- z poprzedniej próby przypisałoby cudzy HTTP status zdarzeniu,
+              -- które nigdy nie dotknęło providera.
+              provider_status_code = NULL,
+              provider_message = NULL
         WHERE dispatch_id = $4
           AND status = 'queued'
           AND queued_at < $5
@@ -1068,8 +1127,14 @@ export class PgDispatchLedger
   }
 
   /**
-   * Append-only wpis audytowy. Zapisujemy WYŁĄCZNIE hash odbiorcy i kod błędu —
-   * nigdy adresu ani treści odpowiedzi providera (D-70 / AC2).
+   * Append-only wpis audytowy. Zapisujemy hash odbiorcy, kod błędu oraz
+   * ZREDAGOWANĄ odpowiedź providera — nigdy adresu, nigdy surowego body,
+   * nigdy sekretu (D-70 / AC2).
+   *
+   * Odpowiedź providera trafia TAKŻE tutaj, bo wiersz `..._dispatch` jest
+   * mutowalnym podsumowaniem ostatniej próby: retry kasuje `provider_message`,
+   * a bez kopii w audycie przyczyna pierwszej porażki znikałaby przy pierwszym
+   * ponowieniu — dokładnie ten problem zamykała migracja `first_error_code`.
    */
   private async appendAudit(
     row: DispatchRow,
@@ -1077,12 +1142,14 @@ export class PgDispatchLedger
     toStatus: DeliveryDispatchState,
     errorCode: string | null,
     occurredAtIso: string,
+    providerResponse: NormalizedProviderResponse = EMPTY_PROVIDER_RESPONSE,
   ): Promise<void> {
     await this.queryRows(
       `INSERT INTO ${VOUCHER_DELIVERY_DISPATCH_AUDIT_TABLE} (
          dispatch_id, entitlement_id, template_key, recipient_hash, market_id,
-         from_status, to_status, error_code, attempt_count, occurred_at
-       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+         from_status, to_status, error_code, attempt_count, occurred_at,
+         provider_status_code, provider_message
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
       [
         row.dispatch_id,
         row.entitlement_id,
@@ -1094,6 +1161,8 @@ export class PgDispatchLedger
         errorCode,
         row.attempt_count,
         occurredAtIso,
+        providerResponse.status_code,
+        providerResponse.message,
       ],
     )
   }
@@ -1120,6 +1189,64 @@ export function extractRows<T>(result: unknown): T[] {
     if (Array.isArray(rows)) return rows as T[]
   }
   return []
+}
+
+/**
+ * Odpowiedź providera po normalizacji — kształt, w którym wolno ją ZAPISAĆ.
+ *
+ * Oba pola są `null`-owalne z tego samego powodu: porażka pre-flight nie ma
+ * odpowiedzi HTTP, a `null` znaczy wtedy „nic nie poszło do providera".
+ */
+interface NormalizedProviderResponse {
+  status_code: number | null
+  message: string | null
+}
+
+const EMPTY_PROVIDER_RESPONSE: NormalizedProviderResponse = {
+  status_code: null,
+  message: null,
+}
+
+/**
+ * Twardy limit długości `provider_message` po stronie aplikacji.
+ *
+ * Redakcja i przycięcie dzieją się WYŻEJ (`sanitizeProviderDetail`
+ * w `@gp/messaging`); ten limit jest drugą, niezależną barierą — CHECK w
+ * bazie jest trzecią. Trzy warstwy, bo pojedyncza bariera na treści od
+ * zewnętrznego providera to za mało.
+ */
+const PROVIDER_MESSAGE_MAX_LENGTH = 512
+
+/**
+ * Sprowadza wejście `markFailed` do zapisywalnego kształtu.
+ *
+ * NIE redaguje — redakcja jest kontraktem wołającego (`MarkFailedInput`).
+ * Tutaj bronimy wyłącznie przed wartościami, które rozwaliłyby CHECK w bazie:
+ * status spoza zakresu HTTP i komunikat dłuższy niż kolumna.
+ */
+function normalizeProviderResponse(
+  input: MarkFailedInput,
+): NormalizedProviderResponse {
+  return {
+    status_code: normalizeStatusCode(input.provider_status_code),
+    message: normalizeProviderMessage(input.provider_message),
+  }
+}
+
+function normalizeStatusCode(raw: unknown): number | null {
+  if (raw == null) return null
+  const parsed = typeof raw === "number" ? raw : Number(raw)
+  if (!Number.isInteger(parsed) || parsed < 100 || parsed > 599) return null
+  return parsed
+}
+
+function normalizeProviderMessage(raw: unknown): string | null {
+  if (typeof raw !== "string") return null
+  const trimmed = raw.trim()
+  if (!trimmed) return null
+  return trimmed.length > PROVIDER_MESSAGE_MAX_LENGTH
+    ? trimmed.slice(0, PROVIDER_MESSAGE_MAX_LENGTH)
+    : trimmed
 }
 
 function normalizeRow(raw: unknown): DispatchRow {
@@ -1153,6 +1280,13 @@ function normalizeRow(raw: unknown): DispatchRow {
       record.first_error_code == null ? null : String(record.first_error_code),
     first_failed_at: normalizeTimestamp(record.first_failed_at),
     configuration_recovery_count: Number(record.configuration_recovery_count ?? 0),
+    // `provider_status_code` jest `integer`, ale sterownik potrafi oddać go
+    // jako string — ten sam kształt defektu co ADR-166 R-1 (`numeric` → string,
+    // `typeof === "number"` cicho degradowało do fallbacku). Konwertujemy
+    // JAWNIE i odrzucamy wartości nieliczbowe zamiast wpuszczać `NaN`.
+    provider_status_code: normalizeStatusCode(record.provider_status_code),
+    provider_message:
+      record.provider_message == null ? null : String(record.provider_message),
     attempt_count: Number(record.attempt_count ?? 0),
     queued_at: normalizeTimestamp(record.queued_at),
   }

@@ -6,6 +6,7 @@ const mockInstallRlsPoolHook = jest.fn();
 const mockEnsureLoaded = jest.fn();
 const mockGet = jest.fn();
 const mockFilterProductIdsByFilters = jest.fn();
+const mockListProductIdsForSalesChannel = jest.fn();
 
 jest.mock("@medusajs/framework/http", () => ({
   defineMiddlewares: (config: unknown) => config,
@@ -33,6 +34,8 @@ jest.mock("../../loaders/market-context-cache", () => ({
 
 jest.mock("../../lib/product-market-scope", () => ({
   filterProductIdsByFilters: (...args: unknown[]) => mockFilterProductIdsByFilters(...args),
+  listProductIdsForSalesChannel: (...args: unknown[]) =>
+    mockListProductIdsForSalesChannel(...args),
 }));
 
 import {
@@ -51,6 +54,8 @@ describe("Market Context Middleware", () => {
     mockEnsureLoaded.mockResolvedValue(undefined);
     mockGet.mockReset();
     mockFilterProductIdsByFilters.mockReset();
+    mockListProductIdsForSalesChannel.mockReset();
+    mockListProductIdsForSalesChannel.mockResolvedValue(["prod_bb"]);
     delete process.env.GP_RLS_DEBUG;
   });
 
@@ -161,7 +166,7 @@ describe("Product List Market Scope Middleware", () => {
         offset: "0",
         fields: "id,title,status,variants.calculated_price,metadata",
       },
-      scope: { resolve: jest.fn() },
+      scope: { resolve: jest.fn().mockReturnValue("db") },
     } as any;
     const originalJson = jest.fn();
     const res = { json: originalJson, status: jest.fn().mockReturnThis() } as any;
@@ -201,11 +206,11 @@ describe("Product List Market Scope Middleware", () => {
     );
 
     expect(next).toHaveBeenCalled();
-    // No re-fetch: the already-priced core response is filtered in place, so the
-    // SQL scope helper is never invoked and the request scope is never resolved
-    // for a DB / query graph.
+    expect(mockListProductIdsForSalesChannel).toHaveBeenCalledWith("db", "sc_bb");
+    expect(req.query.id).toEqual(["prod_bb"]);
+    expect(req.filterableFields.id).toEqual(["prod_bb"]);
+    // No response re-fetch: the already-priced core response is filtered in place.
     expect(mockFilterProductIdsByFilters).not.toHaveBeenCalled();
-    expect(req.scope.resolve).not.toHaveBeenCalled();
 
     const payload = originalJson.mock.calls[0][0];
     expect(payload.products.map((product: { id: string }) => product.id)).toEqual([
@@ -221,7 +226,7 @@ describe("Product List Market Scope Middleware", () => {
   });
 
   it("passes the response through untouched when every product matches the market", async () => {
-    const req = { query: {}, scope: { resolve: jest.fn() } } as any;
+    const req = { query: {}, scope: { resolve: jest.fn().mockReturnValue("db") } } as any;
     const originalJson = jest.fn();
     const res = { json: originalJson, status: jest.fn().mockReturnThis() } as any;
     const next = jest.fn();
@@ -240,6 +245,26 @@ describe("Product List Market Scope Middleware", () => {
 
     expect(mockFilterProductIdsByFilters).not.toHaveBeenCalled();
     expect(originalJson).toHaveBeenCalledWith(body);
+  });
+
+  it("intersects an existing product id filter before the core handler paginates", async () => {
+    mockListProductIdsForSalesChannel.mockResolvedValue(["prod_bb", "prod_other"]);
+    const req = {
+      query: { id: ["prod_bb", "prod_foreign"] },
+      filterableFields: { id: ["prod_bb", "prod_foreign"] },
+      scope: { resolve: jest.fn().mockReturnValue("db") },
+    } as any;
+    const res = { json: jest.fn(), status: jest.fn().mockReturnThis() } as any;
+
+    await marketContextStorage.run(
+      { market_id: "bonbeauty", sales_channel_id: "sc_bb" },
+      async () => {
+        await productListMarketScopeMiddleware(req, res, jest.fn());
+      }
+    );
+
+    expect(req.query.id).toEqual(["prod_bb"]);
+    expect(req.filterableFields.id).toEqual(["prod_bb"]);
   });
 });
 

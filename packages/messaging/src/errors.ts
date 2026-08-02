@@ -17,6 +17,17 @@ interface MessagingErrorOptions {
    * retry po naprawie konfiguracji na cały TTL (24 h).
    */
   preflight?: boolean;
+  /**
+   * ZREDAGOWANA treść odpowiedzi providera (kod HTTP + komunikat), gotowa do
+   * zapisu w logu, audycie i ledgerze.
+   *
+   * MUSI pochodzić z `sanitizeProviderDetail` (`provider-detail.ts`) — nigdy
+   * z surowego body. Pole istnieje po to, żeby operator odróżnił problem konta
+   * (np. autoryzacja IP w Brevo, HTTP 401) od błędu kodu, nie żeby przenieść
+   * odpowiedź providera w całości. `cause` trzyma surowy błąd i celowo NIE
+   * przeżywa przepakowania przez moduł Notification Medusy.
+   */
+  provider_detail?: string;
 }
 
 export class MessagingError extends Error {
@@ -25,6 +36,8 @@ export class MessagingError extends Error {
   readonly status_code?: number;
   /** patrz `MessagingErrorOptions.preflight` — „na pewno nic nie wysłano". */
   readonly preflight: boolean;
+  /** patrz `MessagingErrorOptions.provider_detail` — ZAWSZE po redakcji. */
+  readonly provider_detail?: string;
 
   constructor(message: string, options: MessagingErrorOptions) {
     // Root tsconfig targets ES2021 (lib.es2021) where Error constructor
@@ -40,6 +53,7 @@ export class MessagingError extends Error {
     this.audit_event = options.audit_event;
     this.status_code = options.status_code;
     this.preflight = options.preflight ?? false;
+    this.provider_detail = options.provider_detail;
   }
 }
 

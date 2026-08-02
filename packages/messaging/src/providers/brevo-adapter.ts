@@ -1,6 +1,11 @@
 import { randomUUID } from "node:crypto";
 
 import { MessagingProviderError, MessagingValidationError } from "../errors";
+import {
+  formatProviderResponseMarkers,
+  normalizeProviderErrorCode,
+  sanitizeProviderDetail,
+} from "../provider-detail";
 import type { IMessagingProvider, MessagingProviderResponse } from "../provider";
 import type { NotificationIntent } from "../types";
 import type {
@@ -133,26 +138,65 @@ function toMessagingProviderError(error: unknown): MessagingProviderError {
   }
 
   const statusCode = extractStatusCode(error);
-  const errorCode =
+  // Kod providera jest NORMALIZOWANY do postaci marker-safe (`[A-Z0-9_]+`).
+  // Brevo zwraca `body.code` małymi literami (`unauthorized`,
+  // `invalid_parameter`, …), a marker `[gp_error_code=…]` takiego kodu NIE
+  // parsuje — bez normalizacji KAŻDY kod realnie podany przez providera ginął
+  // i subscriber zapisywał generyczne `VOUCHER_DELIVERY_DISPATCH_FAILED`
+  // (żywy zakup 2026-08-01: HTTP 401 `unauthorized` = autoryzacja IP w Brevo,
+  // objawowo nieodróżnialna od błędu kodu).
+  const rawErrorCode =
     extractNestedString(error, ["response", "body", "code"]) ??
     extractNestedString(error, ["body", "code"]) ??
-    extractNestedString(error, ["code"]) ??
-    (statusCode ? `BREVO_HTTP_${statusCode}` : "BREVO_PROVIDER_ERROR");
-  // R-2.2-M5 (D-70: zero PII w audycie): treść `message` z odpowiedzi Brevo
-  // rutynowo cytuje odrzucony adres ("Invalid email address: …"), a
-  // `MessagingProviderError.message` ląduje w `NotificationAuditEnvelope.error_message`
-  // — envelope, który z założenia jest PII-free (`hashed_recipient`). Dlatego
-  // budujemy komunikat WYŁĄCZNIE z kodu i statusu HTTP; surowa odpowiedź
-  // providera zostaje na `cause` (do debug/logu operatora), nie w audycie.
-  const message = statusCode
-    ? `Brevo provider request failed (${errorCode}, HTTP ${statusCode})`
-    : `Brevo provider request failed (${errorCode})`;
+    extractNestedString(error, ["code"]);
+  const errorCode = rawErrorCode
+    ? normalizeProviderErrorCode(rawErrorCode, "BREVO_PROVIDER_ERROR")
+    : statusCode
+      ? `BREVO_HTTP_${statusCode}`
+      : "BREVO_PROVIDER_ERROR";
+
+  // R-2.2-M5 (D-70) NADAL OBOWIĄZUJE: surowa treść odpowiedzi Brevo rutynowo
+  // cytuje odrzucony adres, więc do komunikatu NIE trafia nic surowego. Zmienia
+  // się jedno: zamiast wyrzucać treść w całości, przepuszczamy ją przez
+  // `sanitizeProviderDetail` (adresy, IP, sekrety i długie tokeny → placeholdery)
+  // i doklejamy jako MARKERY. Bez tego przyczyna dawała się ustalić wyłącznie
+  // ręcznym odpytaniem API providera — a `cause` nie przeżywa przepakowania
+  // wyjątku przez moduł Notification Medusy.
+  const providerDetail = sanitizeProviderDetail(
+    extractNestedRecord(error, ["response", "body"]) ??
+      extractNestedRecord(error, ["body"]) ??
+      error,
+  );
+  const message =
+    (statusCode
+      ? `Brevo provider request failed (${errorCode}, HTTP ${statusCode})`
+      : `Brevo provider request failed (${errorCode})`) +
+    formatProviderResponseMarkers({
+      status_code: statusCode,
+      detail: providerDetail,
+    });
 
   return new MessagingProviderError(message, {
     error_code: errorCode,
     cause: error,
     status_code: statusCode,
+    provider_detail: providerDetail ?? undefined,
   });
+}
+
+/** Zagnieżdżony obiekt spod ścieżki kluczy — nośnik `body` odpowiedzi HTTP. */
+function extractNestedRecord(
+  error: unknown,
+  path: readonly string[],
+): Record<string, unknown> | null {
+  let current: unknown = error;
+  for (const key of path) {
+    if (!current || typeof current !== "object") return null;
+    current = (current as Record<string, unknown>)[key];
+  }
+  return current && typeof current === "object"
+    ? (current as Record<string, unknown>)
+    : null;
 }
 
 function extractStatusCode(error: unknown): number | undefined {
