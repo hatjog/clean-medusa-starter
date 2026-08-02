@@ -33,6 +33,17 @@ function buildScopedProductQuery(db: Knex, salesChannelId: string) {
     .whereNull("psc.deleted_at");
 }
 
+export async function listProductIdsForSalesChannel(
+  db: Knex,
+  salesChannelId: string
+): Promise<string[]> {
+  const rows = await buildScopedProductQuery(db, salesChannelId)
+    .orderBy("product.updated_at", "desc")
+    .orderBy("product.id", "asc");
+
+  return (rows as ProductRow[]).map((row) => row.id);
+}
+
 export async function filterProductIdsForSalesChannel(
   db: Knex,
   salesChannelId: string,
