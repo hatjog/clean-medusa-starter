@@ -1389,6 +1389,21 @@ describe("odpowiedz providera w ledgerze (HTTP 401 z zywego zakupu)", () => {
 })
 
 describe("R-2.3-M4 — provider_message_id to identyfikator PROVIDERA, nie Medusy", () => {
+  it("czyta `createdNotifications[].external_id` z realnego kształtu odpowiedzi Medusy", async () => {
+    const { deps, sql } = makeDeps({
+      dispatchImpl: async () => ({
+        createdNotifications: [
+          { id: "noti_01JMEDUSA", external_id: "brevo-msg-created-77" },
+        ],
+      }),
+    })
+
+    const result = await handleVoucherPurchaseDelivery(envelope("ISSUED"), deps)
+
+    expect(result.outcome).toBe("sent")
+    expect(sql.dispatch[0].provider_message_id).toBe("brevo-msg-created-77")
+  })
+
   it("czyta `external_id` (tam Medusa zapisuje ID providera), nie `id`", async () => {
     const { deps, sql } = makeDeps({
       dispatchImpl: async () => [{ id: "noti_01JMEDUSA", external_id: "brevo-msg-77" }],
