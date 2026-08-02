@@ -1243,6 +1243,7 @@ function extractNotificationId(value: unknown): string | null {
   }
 
   for (const key of [
+    "createdNotifications",
     "data",
     "notification",
     "notifications",
