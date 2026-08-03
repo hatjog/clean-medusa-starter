@@ -147,6 +147,21 @@ export interface DispatchRow {
    * tokeny są zastąpione placeholderami. Surowego body NIE zapisujemy nigdy.
    */
   provider_message: string | null
+  /**
+   * Token wiążący DOSTARCZONĄ wiadomość z przebiegiem, który ją wysłał —
+   * dziś kod vouchera, bo ten jest już obecny w temacie maila.
+   *
+   * Powód istnienia: delivery-smoke (AD-15 punkt 2) potwierdza odbiór
+   * automatycznie. Strategia podstawowa (`rfc822msgid:` po
+   * `provider_message_id`) bywa niedostępna — zakup z 2026-08-01 dał dwa
+   * wiersze `sent` z `provider_message_id IS NULL`. Udokumentowany fallback
+   * pełnotekstowy był wtedy STRUKTURALNIE niewykonalny: nic trwałego nie
+   * łączyło wiadomości z entitlementem.
+   *
+   * KONTRAKT BEZPIECZEŃSTWA: traktuj jak sekret bearer. Narzędzia evidence
+   * zapisują wyłącznie `sha256` i nazwę strategii, nigdy wartość.
+   */
+  correlation_token: string | null
   attempt_count: number
   /** ISO 8601 — moment wejścia w `queued` (staleness porzuconych rezerwacji). */
   queued_at: string | null
@@ -180,6 +195,8 @@ export interface DispatchLedgerPort {
     dispatch_id: string
     provider: string
     provider_message_id: string | null
+    /** Patrz `DispatchRow.correlation_token`. Opcjonalny: brak tokenu nie blokuje wysyłki. */
+    correlation_token?: string | null
   }): Promise<boolean>
   markFailed(input: MarkFailedInput): Promise<boolean>
   findByIdentity(identity: DispatchIdentity): Promise<DispatchRow | null>
@@ -392,7 +409,7 @@ const SELECT_COLUMNS = `
   dispatch_id, entitlement_id, template_key, recipient_hash, market_id,
   flow_id, locale, status, provider, provider_message_id, error_code, attempt_count,
   first_error_code, first_failed_at, configuration_recovery_count, queued_at,
-  provider_status_code, provider_message
+  provider_status_code, provider_message, correlation_token
 `
 
 export interface PgDispatchLedgerOptions {
@@ -581,6 +598,7 @@ export class PgDispatchLedger
     dispatch_id: string
     provider: string
     provider_message_id: string | null
+    correlation_token?: string | null
   }): Promise<boolean> {
     const nowIso = this.now().toISOString()
     const rows = await this.queryRows<DispatchRow>(
@@ -588,20 +606,26 @@ export class PgDispatchLedger
           SET status = 'sent',
               provider = $1,
               provider_message_id = $2,
+              -- COALESCE, nie nadpisanie: ponowna wysyłka bez tokenu (np. ścieżka
+              -- recovery) nie może SKASOWAĆ wiązania ustalonego przy pierwszej
+              -- udanej próbie. Zapisany token jest faktem o dostarczonej
+              -- wiadomości, a nie o ostatnim wywołaniu.
+              correlation_token = COALESCE($3, correlation_token),
               error_code = NULL,
               -- Sukces kasuje diagnostyke porazki razem ze statusem bledu:
               -- wiersz 'sent' z HTTP 401 poprzedniej proby czytalby sie jak
               -- "poszlo mimo bledu". Slad porazki zyje w tabeli audytu.
               provider_status_code = NULL,
               provider_message = NULL,
-              sent_at = $3,
-              updated_at = $4
-        WHERE dispatch_id = $5
+              sent_at = $4,
+              updated_at = $5
+        WHERE dispatch_id = $6
           AND status = 'queued'
       RETURNING ${SELECT_COLUMNS}`,
       [
         input.provider,
         input.provider_message_id,
+        input.correlation_token ?? null,
         nowIso,
         nowIso,
         input.dispatch_id,
@@ -1287,6 +1311,8 @@ function normalizeRow(raw: unknown): DispatchRow {
     provider_status_code: normalizeStatusCode(record.provider_status_code),
     provider_message:
       record.provider_message == null ? null : String(record.provider_message),
+    correlation_token:
+      record.correlation_token == null ? null : String(record.correlation_token),
     attempt_count: Number(record.attempt_count ?? 0),
     queued_at: normalizeTimestamp(record.queued_at),
   }

@@ -154,14 +154,28 @@ class FakeDispatchSql implements DispatchLedgerSql {
       if (normalized.includes("SET status = 'sent'")) {
         // Bindingi są w kolejności WYSTĄPIEŃ `?` w SQL-u (tak widzi je Knex),
         // a numeracja `$N` w ledgerze jest rosnąca wzdłuż tekstu zapytania.
-        const [provider, provider_message_id, now, , dispatch_id] =
-          bindings as string[]
+        // Liczymy od KOŃCA (jak w gałęzi `failed`): `dispatch_id` jest zawsze
+        // ostatnim wystąpieniem, więc dołożenie kolejnej kolumny SET nie
+        // przesuwa guardu i nie wywraca wszystkich testów naraz.
+        const values = bindings as (string | null)[]
+        const dispatch_id = values[values.length - 1] as string
+        const now = values[values.length - 2] as string
+        const [provider, provider_message_id, correlation_token] = values
         const row = this.byId(dispatch_id)
         if (!row || row.status !== "queued") return { rows: [] }
         Object.assign(row, {
           status: "sent",
           provider,
           provider_message_id,
+          // Zachowanie MUSI wynikać z SQL-a pod testem, nie z uprzejmości
+          // atrapy: gdyby fake bezwarunkowo stosował COALESCE, test „null nie
+          // kasuje wiązania" przechodziłby także po usunięciu COALESCE
+          // z ledgera — czyli mierzyłby atrapę, nie kod.
+          correlation_token: normalized.includes(
+            "correlation_token = COALESCE(",
+          )
+            ? correlation_token ?? row.correlation_token ?? null
+            : correlation_token ?? null,
           error_code: null,
           sent_at: now,
         })
@@ -394,6 +408,73 @@ describe("PgDispatchLedger — INSERT-first ON CONFLICT DO NOTHING (AC5)", () =>
 
     expect(other.outcome).toBe("reserved")
     expect(sql.dispatch).toHaveLength(2)
+  })
+})
+
+describe("PgDispatchLedger — token korelacji dostarczonej wiadomości", () => {
+  it("markSent ZAPISUJE token, żeby fallback pełnotekstowy smoke'a miał czego szukać", async () => {
+    const sql = new FakeDispatchSql()
+    const ledger = makeLedger(sql)
+
+    const reservation = await ledger.reserveDispatch(identity())
+    await ledger.markSent({
+      dispatch_id: reservation.dispatch_id!,
+      provider: "brevo",
+      // Zakup 2026-08-01 dał `sent` z `provider_message_id: null`, przez co
+      // strategia `rfc822msgid:` nie miała czym zadziałać.
+      provider_message_id: null,
+      correlation_token: "BO-KV7U-35KV",
+    })
+
+    const row = await ledger.findByIdentity(identity())
+    expect(row?.status).toBe("sent")
+    expect(row?.correlation_token).toBe("BO-KV7U-35KV")
+  })
+
+  it("brak tokenu w kolejnym markSent NIE kasuje wiązania ustalonego wcześniej", async () => {
+    const sql = new FakeDispatchSql()
+    const ledger = makeLedger(sql)
+
+    const reservation = await ledger.reserveDispatch(identity())
+    const dispatchId = reservation.dispatch_id!
+    await ledger.markSent({
+      dispatch_id: dispatchId,
+      provider: "brevo",
+      provider_message_id: null,
+      correlation_token: "BO-KV7U-35KV",
+    })
+
+    // Ścieżka recovery/sweep potrafi wywołać markSent bez tokenu. Gdyby
+    // nadpisywała kolumnę, wiązanie ginęłoby dokładnie w tym scenariuszu,
+    // dla którego powstało (dispatch z `configuration_recovery_count > 0`).
+    const parked = sql.dispatch.find((row) => row.dispatch_id === dispatchId)!
+    parked.status = "queued"
+    await ledger.markSent({
+      dispatch_id: dispatchId,
+      provider: "brevo",
+      provider_message_id: "brevo-late",
+    })
+
+    const row = await ledger.findByIdentity(identity())
+    expect(row?.provider_message_id).toBe("brevo-late")
+    expect(row?.correlation_token).toBe("BO-KV7U-35KV")
+  })
+
+  it("token NIE jest e-mailem ani żadną formą adresu odbiorcy", async () => {
+    const sql = new FakeDispatchSql()
+    const ledger = makeLedger(sql)
+
+    const reservation = await ledger.reserveDispatch(identity())
+    await ledger.markSent({
+      dispatch_id: reservation.dispatch_id!,
+      provider: "brevo",
+      provider_message_id: null,
+      correlation_token: "BO-KV7U-35KV",
+    })
+
+    const serialized = JSON.stringify({ d: sql.dispatch, a: sql.audit })
+    expect(serialized).not.toContain("@example.com")
+    expect(serialized).not.toContain("Kupujaca")
   })
 })
 

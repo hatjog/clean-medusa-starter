@@ -857,6 +857,11 @@ async function runDispatchAttempt(
       dispatch_id: dispatchId,
       provider,
       provider_message_id: providerMessageId,
+      // Wiązanie dostarczonej wiadomości z tym przebiegiem. Kod vouchera jest
+      // już w temacie maila, więc zapis nie tworzy nowej ekspozycji — czyni
+      // istniejący fakt odpytywalnym, gdy provider nie zwróci Message-ID
+      // (zakup 2026-08-01: dwa wiersze `sent` z `provider_message_id IS NULL`).
+      correlation_token: voucherCode ?? null,
     })
 
     if (!transitioned) {

@@ -309,13 +309,22 @@ class FakeSql implements DispatchLedgerSql {
 
     if (q.includes(`UPDATE ${VOUCHER_DELIVERY_DISPATCH_TABLE}`)) {
       if (q.includes("SET status = 'sent'")) {
-        const [provider, messageId, now, , id] = bindings as string[]
+        // Liczymy od KONCA: `dispatch_id` (guard WHERE) jest ostatnim
+        // wystapieniem, wiec dolozenie kolejnej kolumny SET nie przesuwa guardu.
+        const values = bindings as (string | null)[]
+        const id = values[values.length - 1] as string
+        const now = values[values.length - 2] as string
+        const [provider, messageId, correlationToken] = values
         const row = this.byId(id)
         if (!row || row.status !== "queued") return { rows: [] }
         Object.assign(row, {
           status: "sent",
           provider,
           provider_message_id: messageId,
+          // Zachowanie wywodzone z SQL-a pod testem, nie z uprzejmosci atrapy.
+          correlation_token: q.includes("correlation_token = COALESCE(")
+            ? correlationToken ?? row.correlation_token ?? null
+            : correlationToken ?? null,
           error_code: null,
           sent_at: now,
         })
