@@ -32,6 +32,7 @@ import type { MedusaRequest, MedusaResponse } from "@medusajs/framework/http"
 import { ContainerRegistrationKeys } from "@medusajs/framework/utils"
 import type { Knex } from "knex"
 
+import { isWithinMarketScope } from "../../../../../lib/market-scope-guard"
 import { marketContextStorage } from "../../../../../lib/market-context"
 import { getFlagState } from "../../../../../lib/feature-flag-tri-state"
 
@@ -92,16 +93,18 @@ export async function GET(
   // (fail-closed 404 on mismatch). `cartMarketGuardMiddleware` already enforces
   // this on /store/carts*; this in-handler check is defense-in-depth so the
   // route is safe even if middleware ordering changes.
-  if (sales_channel_id) {
-    const cartRow = await db<{ sales_channel_id: string | null }>("cart")
-      .select(["sales_channel_id"])
-      .where("id", cartId)
-      .whereNull("deleted_at")
-      .first()
-    if (!cartRow || cartRow.sales_channel_id !== sales_channel_id) {
-      res.status(404).json({ type: "not_found", message: "Cart not found" })
-      return
-    }
+  // FAIL-CLOSED (decyzja PO 2026-08-01, zakres cross-route). Poprzedni ksztalt
+  // `if (sales_channel_id) { ...sprawdz... }` POMIJAL izolacje w calosci, gdy
+  // kontekst rynku byl pusty — czyli guard nie dzialal dokladnie wtedy, kiedy
+  // najmniej wiadomo, czyj to koszyk.
+  const cartRow = await db<{ sales_channel_id: string | null }>("cart")
+    .select(["sales_channel_id"])
+    .where("id", cartId)
+    .whereNull("deleted_at")
+    .first()
+  if (!cartRow || !isWithinMarketScope(sales_channel_id, cartRow.sales_channel_id)) {
+    res.status(404).json({ type: "not_found", message: "Cart not found" })
+    return
   }
   // Reference market_id for diagnostics (kept in scope for future per-market logic).
   void market_id
