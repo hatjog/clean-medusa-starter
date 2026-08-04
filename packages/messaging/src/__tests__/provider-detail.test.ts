@@ -8,6 +8,7 @@
  */
 import { MessagingProviderError } from "../errors"
 import {
+  classifyProviderErrorKind,
   extractProviderDetailMarker,
   extractProviderStatusMarker,
   formatProviderResponseMarkers,
@@ -256,3 +257,39 @@ describe("BrevoAdapter — realna odpowiedź 401 z żywego zakupu", () => {
     expect(extractProviderStatusMarker(rejection!.message)).toBeNull()
   })
 })
+
+describe("classifyProviderErrorKind — rodzaj awarii bez czytania prozy", () => {
+  it("rozpoznaje autoryzacje IP takze na tresci JUZ zredagowanej", () => {
+    // Wzorzec celuje w SFORMULOWANIE, nie w adres — dlatego `<redacted:ip>`
+    // niczego nie psuje. Gdyby celowal w adres, klasyfikator dzialalby wylacznie
+    // przed redakcja, czyli tam, gdzie i tak wszystko widac.
+    expect(
+      classifyProviderErrorKind({
+        status_code: 401,
+        detail: sanitizeProviderDetail(LIVE_BREVO_401_BODY.message),
+      }),
+    ).toBe("IP_NOT_AUTHORIZED");
+  });
+
+  it("wymaga OBU warunkow: statusu 401 i ksztaltu komunikatu", () => {
+    // Samo 401 to takze zly klucz API — inne lekarstwo, wiec inna klasa.
+    expect(
+      classifyProviderErrorKind({ status_code: 401, detail: "Key not found" }),
+    ).toBeNull();
+    // Sam ksztalt bez 401 tez nie wystarcza.
+    expect(
+      classifyProviderErrorKind({
+        status_code: 500,
+        detail: "unrecognised IP address",
+      }),
+    ).toBeNull();
+  });
+
+  it("brak odpowiedzi HTTP daje null, nie zgadywanie", () => {
+    expect(classifyProviderErrorKind({})).toBeNull();
+    expect(
+      classifyProviderErrorKind({ status_code: null, detail: null }),
+    ).toBeNull();
+  });
+});
+

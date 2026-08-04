@@ -148,7 +148,12 @@ class FakeSql implements DispatchLedgerSql {
     if (q.includes("UPDATE voucher_delivery_dispatch")) {
       if (q.includes("SET status = 'sent'")) {
         // Bindingi w kolejności WYSTĄPIEŃ `?` (dialekt Knexa) — patrz R-2.3-H1.
-        const [provider, messageId, , , id] = bindings as string[]
+        // `markSent` wiąże SZEŚĆ placeholderów (provider, provider_message_id,
+        // correlation_token, sent_at, updated_at, dispatch_id). Pozycyjne
+        // `[, , , , id]` trafiało w znacznik czasu, więc UPDATE NIGDY nie
+        // znajdował wiersza i status zostawał `queued` — 8 asercji `sent` było
+        // przez to CZERWONYCH na `main`.
+        const [provider, messageId, , , , id] = bindings as string[]
         const row = this.byId(id)
         if (!row || row.status !== "queued") return { rows: [] }
         Object.assign(row, {
@@ -158,6 +163,7 @@ class FakeSql implements DispatchLedgerSql {
           error_code: null,
           provider_status_code: null,
           provider_message: null,
+          provider_error_kind: null,
         })
         return { rows: [{ ...row }] }
       }
@@ -169,10 +175,13 @@ class FakeSql implements DispatchLedgerSql {
         // `dispatch_id` jest ostatnim placeholderem WHERE, więc bierzemy go z końca.
         const [provider, errorCode] = bindings as string[]
         // `dispatch_id` jest OSTATNIM wystapieniem `?` (guard WHERE), a
-        // `provider_status_code`/`provider_message` sa dwoma tuz przed nim.
+        // diagnostyka providera lezy tuz przed nim. Liczymy OD KONCA, bo kazda
+        // nowa kolumna SET przesuwa liste — to juz trzeci fake w repo z tym
+        // sprzezeniem (patrz voucher-delivery-dispatch-ledger.unit.spec.ts).
         const id = bindings[bindings.length - 1] as string
-        const providerStatusCode = bindings[bindings.length - 3] ?? null
-        const providerMessage = bindings[bindings.length - 2] ?? null
+        const providerErrorKind = bindings[bindings.length - 2] ?? null
+        const providerMessage = bindings[bindings.length - 3] ?? null
+        const providerStatusCode = bindings[bindings.length - 4] ?? null
         const row = this.byId(id)
         if (!row || row.status !== "queued") return { rows: [] }
         Object.assign(row, {
@@ -181,6 +190,7 @@ class FakeSql implements DispatchLedgerSql {
           error_code: errorCode,
           provider_status_code: providerStatusCode,
           provider_message: providerMessage,
+          provider_error_kind: providerErrorKind,
         })
         return { rows: [{ ...row }] }
       }
@@ -194,6 +204,7 @@ class FakeSql implements DispatchLedgerSql {
         error_code: null,
         provider_status_code: null,
         provider_message: null,
+        provider_error_kind: null,
         locale,
         market_id,
         flow_id,

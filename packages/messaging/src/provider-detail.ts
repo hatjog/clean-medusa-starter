@@ -210,6 +210,58 @@ function extractDetailText(raw: unknown): string | null {
   return null;
 }
 
+/**
+ * Ustrukturyzowane RODZAJE awarii providera, ktore da sie odczytac bez czytania
+ * zredagowanej prozy.
+ *
+ * ── Po co, skoro `provider_message` juz jest ─────────────────────────────────
+ * Redakcja dziala poprawnie i nie zamierzamy jej oslabiac — ale usuwa OBA
+ * nosniki informacji potrzebnej do naprawy: adres IP i link autoryzacyjny.
+ * Ledger zapisywal: „We have detected you are using an unrecognised IP address
+ * <redacted:ip>. If you performed this action make sure to add the new IP
+ * address in this link: https://app.brevo.<redacted:token>". Operator widzial
+ * KLASE problemu, ale nie wiedzial, KTORY adres autoryzowac — a to jedyna
+ * informacja potrzebna do dzialania. Zeby go ustalic, trzeba bylo zapytac
+ * `https://api.ipify.org` z hosta i ZALOZYC, ze to ten sam adres, ktory widzi
+ * Brevo; diagnoza opierala sie wiec na domysle, nie na tresci bledu.
+ *
+ * To pole jest kanalem DIAGNOSTYCZNYM obok redakcji, nie zamiast niej: niesie
+ * enum, nie dane. Adres IP nadal nie trafia do ledgera — operator dostaje
+ * jednoznaczna instrukcje „autoryzuj adres wychodzacy tego hosta w Brevo",
+ * zamiast rekonstruowac ja z prozy.
+ *
+ * ── Dlaczego lista jest tak krotka ──────────────────────────────────────────
+ * Enum rosnie WYLACZNIE o ksztalty realnie zaobserwowane na zywej sciezce.
+ * Dopisanie tu wariantow „na zapas" wyprodukowaloby klasyfikator, ktorego nikt
+ * nie zmierzyl — czyli dokladnie ten rodzaj martwego mechanizmu, ktory to pole
+ * ma pomoc diagnozowac.
+ */
+export type ProviderErrorKind = "IP_NOT_AUTHORIZED";
+
+/** Kszalt komunikatu Brevo przy nieautoryzowanym adresie IP konta. */
+const IP_NOT_AUTHORIZED_PATTERN = /unrecogni[sz]ed ip address/i;
+
+/**
+ * Rozpoznaje rodzaj awarii providera z pary (status HTTP, tresc odpowiedzi).
+ *
+ * Dziala na tresci JUZ ZREDAGOWANEJ — placeholder `<redacted:ip>` nie psuje
+ * dopasowania, bo wzorzec celuje w sformulowanie, nie w adres. Zwraca `null`,
+ * gdy nie ma pewnego dopasowania: zgadywanie rodzaju byloby gorsze niz jego
+ * brak, bo operator dzialalby na podstawie etykiety, ktorej nikt nie zmierzyl.
+ */
+export function classifyProviderErrorKind(input: {
+  status_code?: number | null;
+  detail?: string | null;
+}): ProviderErrorKind | null {
+  const detail = typeof input.detail === "string" ? input.detail : "";
+  // Status 401 jest warunkiem KONIECZNYM, ale nie wystarczajacym: samo 401
+  // niesie takze zly klucz API, ktory ma zupelnie inne lekarstwo.
+  if (input.status_code === 401 && IP_NOT_AUTHORIZED_PATTERN.test(detail)) {
+    return "IP_NOT_AUTHORIZED";
+  }
+  return null;
+}
+
 /** Marker statusu HTTP providera — rodzina `[gp_*]`, patrz `errors.ts`. */
 const PROVIDER_STATUS_MARKER = /\[gp_provider_status=(\d{3})\]/;
 /** Marker zredagowanej treści odpowiedzi providera. */

@@ -99,7 +99,11 @@ class FakeSql implements DispatchLedgerSql {
 
     if (q.includes("UPDATE voucher_delivery_dispatch")) {
       if (q.includes("SET status = 'sent'")) {
-        const [provider, messageId, , , id] = bindings as string[]
+        // `markSent` wiąże SZESC placeholderow (provider, provider_message_id,
+        // correlation_token, sent_at, updated_at, dispatch_id) — pozycyjne
+        // `[, , , , id]` trafialo w znacznik czasu, wiec UPDATE NIGDY nie
+        // znajdowal wiersza i status zostawal `queued`.
+        const [provider, messageId, , , , id] = bindings as string[]
         const row = this.byId(id)
         if (!row || row.status !== "queued") return { rows: [] }
         Object.assign(row, {
