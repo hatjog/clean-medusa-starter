@@ -55,6 +55,7 @@ import { randomBytes } from "crypto"
 
 import { ContainerRegistrationKeys } from "@medusajs/framework/utils"
 import type { MedusaRequest, MedusaResponse } from "@medusajs/framework/http"
+import { isWithinMarketScope } from "../../../../../lib/market-scope-guard"
 import { marketContextStorage } from "../../../../../lib/market-context"
 import { assertOrderAccess, parseCartProof } from "../../../../../lib/orders/guest-order-access"
 import { classifyPaymentAttempt } from "../../../../../lib/payment/failure-classification"
@@ -334,12 +335,22 @@ export async function GET(
       return
     }
 
+    // FAIL-CLOSED (decyzja PO 2026-08-01). Poprzedni warunek wymagal, zeby OBIE
+    // strony byly ustawione, wiec zamowienie bez `sales_channel_id` bylo czytelne
+    // z DOWOLNEGO rynku, a brak kontekstu rynku wylaczal guard w calosci.
+    // `404` (nie `403`), zeby odmowa nie rozniela sie od "nie ma takiego
+    // zamowienia" i nie dawala wyroczni istnienia zasobu.
     const marketContext = marketContextStorage.getStore()
-    if (
-      marketContext?.sales_channel_id &&
-      order.sales_channel_id &&
-      order.sales_channel_id !== marketContext.sales_channel_id
-    ) {
+    if (!isWithinMarketScope(marketContext?.sales_channel_id, order.sales_channel_id)) {
+      logger.warn?.(JSON.stringify({
+        scope: `order:${orderId}`,
+        request_id,
+        outcome: "order_market_scope_denied",
+        // Sam FAKT braku, nigdy wartosci kanalow — log nie jest mapa rynkow.
+        context_channel_present: Boolean(marketContext?.sales_channel_id),
+        order_channel_present: Boolean(order.sales_channel_id),
+        timestamp: new Date().toISOString(),
+      }))
       res.status(404).json({ type: "not_found", message: "Order not found", request_id })
       return
     }

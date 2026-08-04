@@ -13,6 +13,7 @@ import {
   retrieveOrderByStatusIdentifier,
   withComputedPaymentStatus,
 } from "../../../api/store/orders/[id]/payment-status/helpers"
+import { marketContextStorage } from "../../../lib/market-context"
 import { GET as paymentStatusGET } from "../../../api/store/orders/[id]/payment-status/route"
 import {
   assertOrderAccess,
@@ -213,7 +214,11 @@ describe("guest order access proof", () => {
                 payment_status: "captured",
                 status: "pending",
                 created_at: new Date().toISOString(),
-                sales_channel_id: null,
+                // Zamowienie MA kanal, bo guard rynku jest fail-closed od
+                // 2026-08-01: brak ktorejkolwiek ze stron to odmowa. Produkcja
+                // odpowiada temu ksztaltowi — pomiar na bazie dev: 0 z 21
+                // zamowien bez `sales_channel_id`.
+                sales_channel_id: "sc_1",
               }),
             }
           }
@@ -243,11 +248,90 @@ describe("guest order access proof", () => {
       },
     } as any
 
-    await paymentStatusGET(req, res)
+    // `/store/*` przechodzi przez `marketGuardMiddleware`, ktory fail-closuje
+    // zadania bez kontekstu rynku — handler nigdy nie widzi go pustego.
+    await marketContextStorage.run(
+      { market_id: "bonbeauty", sales_channel_id: "sc_1" },
+      async () => {
+        await paymentStatusGET(req, res)
+      },
+    )
 
     expect(captured.status).toBe(200)
     expect(captured.body).toMatchObject({ status: "paid", recommended_action_key: "continue" })
   })
+
+  /**
+   * KONTROLA NEGATYWNA guardu rynku. Poprzedni warunek wymagal, zeby OBIE
+   * strony byly ustawione, wiec zamowienie bez `sales_channel_id` bylo czytelne
+   * z DOWOLNEGO rynku — nawet przy poprawnym dowodzie koszyka. Ten test
+   * przechodzil BY takze przed zmiana, gdyby nie asercja na 404.
+   */
+  it.each([
+    ["zamowienie bez kanalu", "sc_1", null],
+    ["brak kanalu w kontekscie rynku", null, "sc_1"],
+    ["kanal innego rynku", "sc_1", "sc_INNY"],
+  ])(
+    "%s => 404, mimo poprawnego dowodu koszyka (fail-closed)",
+    async (_label, contextChannel, orderChannel) => {
+      const req = {
+        params: { id: "ord_1" },
+        query: { cart_id: "cart_1" },
+        scope: {
+          resolve: (key: string) => {
+            if (key === Modules.ORDER) {
+              return {
+                retrieveOrder: async () => ({
+                  id: "ord_1",
+                  customer_id: null,
+                  payment_status: "captured",
+                  status: "pending",
+                  created_at: new Date().toISOString(),
+                  sales_channel_id: orderChannel,
+                }),
+              }
+            }
+            if (key === ContainerRegistrationKeys.PG_CONNECTION) {
+              return {
+                raw: async (sql: string) => {
+                  if (sql.includes("order_cart")) return { rows: [{ "?column?": 1 }] }
+                  return { rows: [] }
+                },
+              }
+            }
+            if (key === "logger") {
+              return { info: () => undefined, warn: () => undefined, error: () => undefined }
+            }
+            throw new Error(`unexpected resolve ${key}`)
+          },
+        },
+      } as any
+
+      const captured: { status?: number; body?: any } = {}
+      const res = {
+        status(code: number) {
+          captured.status = code
+          return this
+        },
+        json(body: any) {
+          captured.body = body
+          return this
+        },
+      } as any
+
+      await marketContextStorage.run(
+        { market_id: "bonbeauty", sales_channel_id: contextChannel as any },
+        async () => {
+          await paymentStatusGET(req, res)
+        },
+      )
+
+      // 404, nie 403 — odmowa nie moze rozniac sie od "nie ma takiego
+      // zamowienia", inaczej staje sie wyrocznia istnienia zasobu.
+      expect(captured.status).toBe(404)
+      expect(captured.body).toMatchObject({ type: "not_found" })
+    },
+  )
 
   it("handler bez auth_context i bez dowodu oddaje 401", async () => {
     const req = {
