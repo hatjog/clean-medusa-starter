@@ -42,6 +42,11 @@
 
 import { randomUUID } from "node:crypto"
 
+import {
+  classifyProviderErrorKind,
+  type ProviderErrorKind,
+} from "@gp/messaging"
+
 import { toKnexPositionalSql } from "../../lib/knex-positional-sql"
 import {
   DELIVERY_DISPATCH_STATES,
@@ -147,6 +152,19 @@ export interface DispatchRow {
    * tokeny są zastąpione placeholderami. Surowego body NIE zapisujemy nigdy.
    */
   provider_message: string | null
+  /**
+   * RODZAJ awarii providera wyprowadzony z pary (`provider_status_code`,
+   * `provider_message`) — kanał DIAGNOSTYCZNY obok redakcji, nie zamiast niej.
+   *
+   * Redakcja usuwa OBA nośniki informacji potrzebnej do naprawy: adres IP i
+   * link autoryzacyjny. Operator widział klasę problemu, ale nie wiedział, KTÓRY
+   * adres autoryzować — diagnoza opierała się na domyśle (`api.ipify.org` z
+   * hosta plus założenie, że Brevo widzi ten sam adres). To pole niesie ENUM,
+   * nie dane, więc niczego nie odsłania.
+   *
+   * `null` znaczy „nie rozpoznano" — nigdy „nie było awarii".
+   */
+  provider_error_kind: ProviderErrorKind | null
   /**
    * Token wiążący DOSTARCZONĄ wiadomość z przebiegiem, który ją wysłał —
    * dziś kod vouchera, bo ten jest już obecny w temacie maila.
@@ -409,7 +427,7 @@ const SELECT_COLUMNS = `
   dispatch_id, entitlement_id, template_key, recipient_hash, market_id,
   flow_id, locale, status, provider, provider_message_id, error_code, attempt_count,
   first_error_code, first_failed_at, configuration_recovery_count, queued_at,
-  provider_status_code, provider_message, correlation_token
+  provider_status_code, provider_message, provider_error_kind, correlation_token
 `
 
 export interface PgDispatchLedgerOptions {
@@ -541,6 +559,7 @@ export class PgDispatchLedger
                 -- stan. Historia zostaje w tabeli audytu.
                 provider_status_code = NULL,
                 provider_message = NULL,
+                provider_error_kind = NULL,
                 failed_at = NULL,
                 queued_at = $1,
                 updated_at = $2,
@@ -617,6 +636,7 @@ export class PgDispatchLedger
               -- "poszlo mimo bledu". Slad porazki zyje w tabeli audytu.
               provider_status_code = NULL,
               provider_message = NULL,
+              provider_error_kind = NULL,
               sent_at = $4,
               updated_at = $5
         WHERE dispatch_id = $6
@@ -652,7 +672,8 @@ export class PgDispatchLedger
               failed_at = $3,
               updated_at = $4,
               provider_status_code = $6,
-              provider_message = $7
+              provider_message = $7,
+              provider_error_kind = $8
         WHERE dispatch_id = $5
           AND status = 'queued'
       RETURNING ${SELECT_COLUMNS}`,
@@ -664,6 +685,7 @@ export class PgDispatchLedger
         input.dispatch_id,
         providerResponse.status_code,
         providerResponse.message,
+        providerResponse.error_kind,
       ],
     )
 
@@ -1129,7 +1151,8 @@ export class PgDispatchLedger
               -- z poprzedniej próby przypisałoby cudzy HTTP status zdarzeniu,
               -- które nigdy nie dotknęło providera.
               provider_status_code = NULL,
-              provider_message = NULL
+              provider_message = NULL,
+              provider_error_kind = NULL
         WHERE dispatch_id = $4
           AND status = 'queued'
           AND queued_at < $5
@@ -1172,8 +1195,8 @@ export class PgDispatchLedger
       `INSERT INTO ${VOUCHER_DELIVERY_DISPATCH_AUDIT_TABLE} (
          dispatch_id, entitlement_id, template_key, recipient_hash, market_id,
          from_status, to_status, error_code, attempt_count, occurred_at,
-         provider_status_code, provider_message
-       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+         provider_status_code, provider_message, provider_error_kind
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
       [
         row.dispatch_id,
         row.entitlement_id,
@@ -1187,6 +1210,7 @@ export class PgDispatchLedger
         occurredAtIso,
         providerResponse.status_code,
         providerResponse.message,
+        providerResponse.error_kind,
       ],
     )
   }
@@ -1224,11 +1248,13 @@ export function extractRows<T>(result: unknown): T[] {
 interface NormalizedProviderResponse {
   status_code: number | null
   message: string | null
+  error_kind: ProviderErrorKind | null
 }
 
 const EMPTY_PROVIDER_RESPONSE: NormalizedProviderResponse = {
   status_code: null,
   message: null,
+  error_kind: null,
 }
 
 /**
@@ -1251,10 +1277,29 @@ const PROVIDER_MESSAGE_MAX_LENGTH = 512
 function normalizeProviderResponse(
   input: MarkFailedInput,
 ): NormalizedProviderResponse {
+  const status_code = normalizeStatusCode(input.provider_status_code)
+  const message = normalizeProviderMessage(input.provider_message)
   return {
-    status_code: normalizeStatusCode(input.provider_status_code),
-    message: normalizeProviderMessage(input.provider_message),
+    status_code,
+    message,
+    // Rodzaj jest WYPROWADZANY z tego, co i tak zapisujemy — nie jest kolejnym
+    // polem do wypełnienia przez wołającego, które ktoś zapomni podać albo poda
+    // niespójnie z treścią. Klasyfikator działa na tekście JUŻ zredagowanym,
+    // więc nie ma ścieżki, którą wprowadzałby z powrotem PII.
+    error_kind: classifyProviderErrorKind({ status_code, detail: message }),
   }
+}
+
+/** Enum znanych rodzajów — patrz `ProviderErrorKind` w `@gp/messaging`. */
+const KNOWN_PROVIDER_ERROR_KINDS: readonly ProviderErrorKind[] = [
+  "IP_NOT_AUTHORIZED",
+]
+
+function normalizeProviderErrorKind(raw: unknown): ProviderErrorKind | null {
+  if (typeof raw !== "string") return null
+  return KNOWN_PROVIDER_ERROR_KINDS.includes(raw as ProviderErrorKind)
+    ? (raw as ProviderErrorKind)
+    : null
 }
 
 function normalizeStatusCode(raw: unknown): number | null {
@@ -1311,6 +1356,10 @@ function normalizeRow(raw: unknown): DispatchRow {
     provider_status_code: normalizeStatusCode(record.provider_status_code),
     provider_message:
       record.provider_message == null ? null : String(record.provider_message),
+    // Wartość spoza enumu (kolumna jest `text`, więc baza jej nie pilnuje)
+    // degraduje do `null`, a nie przechodzi dalej jako etykieta, której kod nie
+    // zna — `null` znaczy „nie rozpoznano" i to jest uczciwe.
+    provider_error_kind: normalizeProviderErrorKind(record.provider_error_kind),
     correlation_token:
       record.correlation_token == null ? null : String(record.correlation_token),
     attempt_count: Number(record.attempt_count ?? 0),

@@ -90,6 +90,9 @@ class FakeDispatchSql implements DispatchLedgerSql {
         error_code,
         attempt_count,
         occurred_at,
+        provider_status_code,
+        provider_message,
+        provider_error_kind,
       ] = bindings
       this.audit.push({
         audit_id: this.audit.length + 1,
@@ -103,6 +106,9 @@ class FakeDispatchSql implements DispatchLedgerSql {
         error_code,
         attempt_count,
         occurred_at,
+        provider_status_code,
+        provider_message,
+        provider_error_kind,
       })
       return { rows: [] }
     }
@@ -189,8 +195,9 @@ class FakeDispatchSql implements DispatchLedgerSql {
         // kolejnej kolumny SET nie przesunelo znowu calej listy.
         const [provider, error_code, , now] = bindings as string[]
         const dispatch_id = bindings[bindings.length - 1] as string
-        const provider_status_code = bindings[bindings.length - 3] ?? null
-        const provider_message = bindings[bindings.length - 2] ?? null
+        const provider_error_kind = bindings[bindings.length - 2] ?? null
+        const provider_status_code = bindings[bindings.length - 4] ?? null
+        const provider_message = bindings[bindings.length - 3] ?? null
         const row = this.byId(dispatch_id)
         if (!row || row.status !== "queued") return { rows: [] }
         Object.assign(row, {
@@ -201,6 +208,7 @@ class FakeDispatchSql implements DispatchLedgerSql {
           failed_at: now,
           provider_status_code,
           provider_message,
+          provider_error_kind,
         })
         return { rows: [{ ...row }] }
       }
@@ -531,6 +539,67 @@ describe("PgDispatchLedger — tranzycje queued→sent|failed (AC2 / AC5)", () =
       to_status: "failed",
       error_code: "BREVO_TEMPLATE_NOT_CONFIGURED",
     })
+  })
+
+  it("401 z autoryzacji IP zapisuje RODZAJ awarii obok zredagowanej tresci", async () => {
+    // Redakcja usuwa adres IP i link autoryzacyjny — czyli OBA nosniki
+    // informacji, ktorej operator potrzebuje. `provider_error_kind` niesie
+    // ENUM, wiec przywraca diagnostycznosc niczego nie odslaniajac.
+    const sql = new FakeDispatchSql()
+    const ledger = makeLedger(sql)
+
+    const first = await ledger.reserveDispatch(identity())
+    await ledger.markFailed({
+      dispatch_id: first.dispatch_id!,
+      error_code: "BREVO_UNAUTHORIZED",
+      provider: "brevo",
+      provider_status_code: 401,
+      provider_message:
+        "We have detected you are using an unrecognised IP address " +
+        "<redacted:ip>. If you performed this action make sure to add the new " +
+        "IP address in this link: https://app.brevo.<redacted:token>",
+    })
+
+    expect(sql.dispatch[0].provider_error_kind).toBe("IP_NOT_AUTHORIZED")
+    expect(sql.audit.at(-1)).toMatchObject({
+      to_status: "failed",
+      provider_error_kind: "IP_NOT_AUTHORIZED",
+    })
+    // Kanal diagnostyczny NIE moze byc furtka na PII: w calym zapisie nie ma
+    // adresu ani tokenu — dokladnie dlatego rodzaj jest enumem, nie tekstem.
+    const serialized = JSON.stringify({ d: sql.dispatch, a: sql.audit })
+    expect(serialized).not.toMatch(/\b(?:\d{1,3}\.){3}\d{1,3}\b/)
+  })
+
+  it("401 bez ksztaltu autoryzacji IP NIE dostaje rodzaju (zero zgadywania)", async () => {
+    // Samo 401 niesie takze zly klucz API, ktory ma inne lekarstwo. Etykieta
+    // postawiona na domysle byla by gorsza niz jej brak.
+    const sql = new FakeDispatchSql()
+    const ledger = makeLedger(sql)
+
+    const first = await ledger.reserveDispatch(identity())
+    await ledger.markFailed({
+      dispatch_id: first.dispatch_id!,
+      error_code: "BREVO_INVALID_API_KEY",
+      provider: "brevo",
+      provider_status_code: 401,
+      provider_message: "Key not found",
+    })
+
+    expect(sql.dispatch[0].provider_error_kind).toBeNull()
+  })
+
+  it("porazka pre-flight (bez odpowiedzi HTTP) nie zmysla rodzaju", async () => {
+    const sql = new FakeDispatchSql()
+    const ledger = makeLedger(sql)
+
+    const first = await ledger.reserveDispatch(identity())
+    await ledger.markFailed({
+      dispatch_id: first.dispatch_id!,
+      error_code: "BREVO_TEMPLATE_NOT_CONFIGURED",
+    })
+
+    expect(sql.dispatch[0].provider_error_kind).toBeNull()
   })
 
   it("retry nie kasuje pierwotnej przyczyny ze summary ledgera", async () => {
