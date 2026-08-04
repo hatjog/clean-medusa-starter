@@ -1864,6 +1864,43 @@ describe("R-2.5-H3 — awaria GLOBALNA nie zużywa budżetu prób", () => {
     expect(isGlobalFailureErrorCode("BREVO_TRANSPORT_ERROR")).toBe(false)
     expect(isGlobalFailureErrorCode(null)).toBe(false)
   })
+
+  it("BREVO_UNAUTHORIZED (autoryzacja IP) jest awarią GLOBALNĄ, a klucz API nie", () => {
+    // Żywy zakup 2026-08-04: 401 `unauthorized` = adres IP hosta poza listą
+    // autoryzowanych w Brevo. Ustępuje działaniem operatora, bez udziału
+    // wiersza — więc nie wolno mu palić budżetu prób.
+    expect(isGlobalFailureErrorCode("BREVO_UNAUTHORIZED")).toBe(true)
+    // Granica zakresu: nie klasyfikujemy hurtem całego 401. Nieprawidłowy klucz
+    // nie ustępuje sam i nie może odparkowywać wiersza w nieskończoność.
+    expect(isGlobalFailureErrorCode("BREVO_INVALID_API_KEY")).toBe(false)
+  })
+
+  it("401 z autoryzacji IP ZWRACA próbę do budżetu zamiast ją zużyć", async () => {
+    // Kontrast z testem wyżej: ten sam kształt, co REALNE odrzucenie providera,
+    // różni się WYŁĄCZNIE kodem błędu — a wynik dla budżetu ma być odwrotny.
+    const { deps, sql } = makeHarness({
+      entitlements: [issuedEntitlement("ent_ip_401")],
+      dispatchRows: [
+        {
+          dispatch_id: "dispatch-ip-401",
+          entitlement_id: "ent_ip_401",
+          status: "failed",
+          error_code: "BREVO_UNAUTHORIZED",
+          attempt_count: 1,
+        },
+      ],
+      dispatchImpl: async () => {
+        throw new Error(
+          "provider unauthorized [gp_error_code=BREVO_UNAUTHORIZED] [gp_provider_status=401]"
+        )
+      },
+    })
+
+    const report = await runVoucherDeliveryReconciliationSweep(deps)
+
+    expect(report.attempt_budget_released).toBe(1)
+    expect(Number(sql.dispatch[0].attempt_count)).toBe(1)
+  })
 })
 
 describe("R-2.5-H3/H4 — batch nie jest zagłodzony przez wiersze niedosyłalne", () => {
