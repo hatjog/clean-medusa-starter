@@ -223,6 +223,21 @@ export const SWEEP_GLOBAL_FAILURE_ERROR_CODES: readonly string[] = [
   // Kształt bazy deep-linku: `..._NOT_CONFIGURED` łapie sufiks, `..._NOT_REACHABLE`
   // nie — a jest tą samą klasą (env rynku do poprawienia przez operatora).
   "VOUCHER_DELIVERY_STOREFRONT_URL_NOT_REACHABLE",
+  // Żywy zakup 2026-08-04 (zamówienie 20): Brevo odrzucał HTTP 401
+  // `unauthorized`, bo adres IP hosta nie był autoryzowany na koncie. To stan
+  // KONFIGURACJI po stronie operatora, dotyczy WSZYSTKICH wierszy naraz i
+  // ustępuje bez ich udziału — dokładnie ta klasa, dla której ta lista powstała.
+  // Zmierzone: 3 z 5 prób (13:16, 14:00, 14:15) poszły wyłącznie na okno
+  // propagacji autoryzacji IP; sonda o 14:16 na `POST /v3/smtp/email` wróciła
+  // HTTP 201, czyli poprawka operatora ZADZIAŁAŁA, tylko budżet już się palił.
+  // Bez tego wpisu odwracalna blokada zamieniałaby się po 75 min w trwałe
+  // zaparkowanie wiersza.
+  //
+  // ZAKRES ŚWIADOMIE WĄSKI: to NIE jest „każde 401 od providera". Kod
+  // `BREVO_INVALID_API_KEY` (i pochodne dotyczące samego klucza) NIE ustępuje
+  // sam — nie może odparkowywać wierszy w nieskończoność. Ochroną drugiego
+  // rzędu pozostaje `SWEEP_MAX_CONFIGURATION_RECOVERIES`.
+  "BREVO_UNAUTHORIZED",
 ]
 
 /** Sufiks kodów konfiguracyjnych (`BREVO_TEMPLATE_NOT_CONFIGURED` itp.). */
