@@ -18,6 +18,7 @@ import {
   brevoWebhookCircuitBreakerMiddleware,
   brevoWebhookRateLimitMiddleware,
 } from "./middlewares/brevo-hmac-validator";
+import { paymentStatusRateLimitMiddleware } from "./middlewares/payment-status-rate-limit";
 import {
   CUSTOMER_MARKET_FORBIDDEN_MESSAGE,
   isScopedToMarket,
@@ -778,7 +779,13 @@ export default defineMiddlewares({
       // ale gość nie jest odbijany na poziomie middleware'u — trasa sama rozstrzyga
       // dostęp przez `lib/orders/guest-order-access.ts` (sesja ALBO dowód koszyka).
       // Twarde `authenticate` tutaj oznaczało 401 dla każdego checkoutu bez konta.
-      middlewares: [authenticate("customer", ["session", "bearer"], { allowUnauthenticated: true })],
+      // Rate-limit stoi PRZED `authenticate`: dławimy próby DOWODU, więc licznik
+      // musi widzieć również żądania, które uwierzytelnienie odrzuci. Za nim koszt
+      // zgadywania byłby liczony dopiero po przejściu przez auth.
+      middlewares: [
+        paymentStatusRateLimitMiddleware,
+        authenticate("customer", ["session", "bearer"], { allowUnauthenticated: true }),
+      ],
     },
     {
       method: ["POST"],
