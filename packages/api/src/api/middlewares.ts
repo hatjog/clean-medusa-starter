@@ -19,6 +19,7 @@ import {
   brevoWebhookRateLimitMiddleware,
 } from "./middlewares/brevo-hmac-validator";
 import { paymentStatusRateLimitMiddleware } from "./middlewares/payment-status-rate-limit";
+import { upstreamOrderAccessGuardMiddleware } from "./middlewares/upstream-order-access-guard";
 import {
   CUSTOMER_MARKET_FORBIDDEN_MESSAGE,
   isScopedToMarket,
@@ -899,6 +900,24 @@ export default defineMiddlewares({
       method: "ALL",
       matcher: "/store/customers/me*",
       middlewares: [customerResponseSanitizerMiddleware],
+    },
+    {
+      // WYROWNANIE W GORE (decyzja PO 2026-08-01). Upstreamowy
+      // `GET /store/orders/:id` jest BEZ `authenticate` — `order_id` dziala tam
+      // jak capability, wiec kazdy, kto go zna, odczytuje pozycje i e-mail
+      // kupujacej. Handler core niesie to jako otwarte pytanie ("TODO: Do we
+      // want to apply some sort of authentication here?").
+      //
+      // `allowUnauthenticated`, bo checkout goscia nie zaklada konta: prog
+      // egzekwuje guard (sesja ALBO dowod koszyka), a nie twarde `authenticate`,
+      // ktore odcieloby kazdy zakup bez konta. Rozejscie z upstreamem jest
+      // swiadome — patrz specs/constitution/upstream-policy.md (zero kontrybucji).
+      method: ["GET"],
+      matcher: "/store/orders/:id",
+      middlewares: [
+        authenticate("customer", ["session", "bearer"], { allowUnauthenticated: true }),
+        upstreamOrderAccessGuardMiddleware,
+      ],
     },
     {
       method: "ALL",
