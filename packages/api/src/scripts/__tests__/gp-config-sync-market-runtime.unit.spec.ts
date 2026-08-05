@@ -40,8 +40,13 @@ function fakeDb(existing: Record<string, unknown> | null) {
       if (/^\s*SELECT/i.test(sql)) {
         return { rows: row ? [row] : [] }
       }
-      const [, locales, support_email, market_url] = bindings as string[]
-      row = { locales, support_email, market_url }
+      // Kolejność bindingów MUSI odpowiadać INSERT-owi z
+      // `applyMarketRuntimeSync`. Po dodaniu `money_path_brakes` (v1.15.0
+      // Story 2.1) atrapa gubiła tę kolumnę i drugi sync raportował `update`
+      // zamiast `unchanged` — atrapa opisywała nieaktualny kontrakt.
+      const [, locales, support_email, market_url, money_path_brakes] =
+        bindings as string[]
+      row = { locales, support_email, market_url, money_path_brakes }
       return { rows: [] }
     },
   } as unknown as Knex
@@ -87,6 +92,15 @@ describe("AC2.3 — mapowanie i normalizacja market.yaml", () => {
     expect(buildMarketRuntimeRecord("bonbeauty", MARKET_YAML)).toEqual({
       market_id: "bonbeauty",
       locales: MARKET_YAML.locales,
+      // v1.15.0 Story 2.1: rekord runtime niesie też nośnik hamulca. Brak
+      // wpisu w market.yaml = pięć razy wartość bezpieczna (ADR-177).
+      money_path_brakes: {
+        fr_6_7_multi_seller_purchase_return: "engaged",
+        fr_9_delivery_idempotency: "engaged",
+        fr_10_panel_redemption: "engaged",
+        fr_12_redemption_ledger: "engaged",
+        fr_14_market_isolation: "engaged",
+      },
       support_email: "kontakt@bonbeauty.pl",
       market_url: "https://dev.bonbeauty.pl",
     })
@@ -166,6 +180,7 @@ describe("AC2.2 / AC2.7 — idempotentny upsert po market_id", () => {
       locales: record.locales,
       support_email: "stary@bonbeauty.pl",
       market_url: record.market_url,
+      money_path_brakes: record.money_path_brakes,
     })
     expect((await planMarketRuntimeSync(db, record)).action).toBe("update")
   })
@@ -191,6 +206,7 @@ describe("AC2.2 / AC2.7 — idempotentny upsert po market_id", () => {
       }),
       support_email: record.support_email,
       market_url: record.market_url,
+      money_path_brakes: record.money_path_brakes,
     })
 
     expect((await planMarketRuntimeSync(db, record)).action).toBe("unchanged")

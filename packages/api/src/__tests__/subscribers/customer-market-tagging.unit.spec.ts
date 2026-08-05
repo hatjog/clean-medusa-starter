@@ -2,6 +2,9 @@ jest.mock("@medusajs/framework/utils", () => ({
   Modules: {
     CUSTOMER: "customer",
   },
+  ContainerRegistrationKeys: {
+    LOGGER: "logger",
+  },
 }));
 
 import customerMarketTaggingHandler, {
@@ -11,8 +14,16 @@ import { marketContextStorage } from "../../lib/market-context";
 
 describe("customer market tagging subscriber", () => {
   it("sets metadata.gp.market_id on customer.created when ALS is available", async () => {
-    const retrieveCustomer = jest.fn().mockResolvedValue({ metadata: null });
-    const updateCustomers = jest.fn().mockResolvedValue(undefined);
+    // Mock STANOWY: kontrola widoczności po zapisie odczytuje wiersz ponownie,
+    // więc atrapa musi odzwierciedlać skutek zapisu (review-fix HIGH-1).
+    let stored: unknown = null;
+    const retrieveCustomer = jest
+      .fn()
+      .mockImplementation(async () => ({ metadata: stored }));
+    const updateCustomers = jest.fn().mockImplementation(async (_id, data) => {
+      stored = data.metadata;
+      return undefined;
+    });
     const container = {
       resolve: jest.fn().mockReturnValue({ retrieveCustomer, updateCustomers }),
     };
@@ -33,11 +44,15 @@ describe("customer market tagging subscriber", () => {
   });
 
   it("falls back to scoped email prefix when ALS is not available", async () => {
-    const retrieveCustomer = jest.fn().mockResolvedValue({
+    let stored: unknown = null;
+    const retrieveCustomer = jest.fn().mockImplementation(async () => ({
       email: "bonbeauty::user@test.local",
-      metadata: null,
+      metadata: stored,
+    }));
+    const updateCustomers = jest.fn().mockImplementation(async (_id, data) => {
+      stored = data.metadata;
+      return undefined;
     });
-    const updateCustomers = jest.fn().mockResolvedValue(undefined);
     const container = {
       resolve: jest.fn().mockReturnValue({ retrieveCustomer, updateCustomers }),
     };
@@ -90,5 +105,109 @@ describe("customer market tagging subscriber", () => {
 
   it("registers to customer.created", () => {
     expect(config).toEqual({ event: "customer.created" });
+  });
+});
+/**
+ * review-fix HIGH-1 — zapis USTANAWIAJĄCY rynek nie może iść pod RLS.
+ *
+ * Polityka `market_isolation` ukrywa wiersz bez `metadata.gp.market_id` przed
+ * rolą `medusa_store`, więc `UPDATE` w kontekście rynku trafia w ZERO wierszy
+ * (zmierzone: `GP/backend/scripts/story-2-1-customer-rls-probe.sql`). Te testy
+ * pękają, gdy ktoś przeniesie zapis z powrotem do środka kontekstu albo usunie
+ * kontrolę widoczności.
+ */
+describe("customer market tagging — granica kontekstu (HIGH-1)", () => {
+  function makeContainer(overrides: Record<string, unknown> = {}) {
+    const seen: { onUpdate?: unknown; onRetrieveVerify?: unknown } = {};
+    const logger = { warn: jest.fn(), error: jest.fn() };
+    const customer = {
+      email: "bonbeauty::user@test.local",
+      metadata: null as unknown,
+    };
+    const retrieveCustomer = jest.fn().mockImplementation(async () => {
+      if (customer.metadata) {
+        seen.onRetrieveVerify = marketContextStorage.getStore();
+        return { ...customer, metadata: customer.metadata };
+      }
+      return { ...customer };
+    });
+    const updateCustomers = jest.fn().mockImplementation(async (_id, data) => {
+      seen.onUpdate = marketContextStorage.getStore();
+      customer.metadata = data.metadata;
+      return undefined;
+    });
+    const service = { retrieveCustomer, updateCustomers, ...overrides };
+    const container = {
+      resolve: jest.fn().mockImplementation((key: string) =>
+        key === "logger" ? logger : service
+      ),
+    };
+    return { container, seen, logger, retrieveCustomer, updateCustomers };
+  }
+
+  it("zapis ustanawiający leci POZA kontekstem, a kontrola widoczności W kontekście", async () => {
+    const { container, seen } = makeContainer();
+
+    await customerMarketTaggingHandler({
+      event: { data: { id: "cus_123" } },
+      container,
+    } as any);
+
+    expect(seen.onUpdate).toBeUndefined();
+    expect(seen.onRetrieveVerify).toMatchObject({
+      market_id: "bonbeauty",
+      system: { surface: "subscriber", name: "customer-market-tagging" },
+    });
+  });
+
+  it("wiersz niewidoczny po zapisie = GŁOŚNY błąd, nie `warn` i sukces", async () => {
+    const { container, logger } = makeContainer();
+    const service = container.resolve("customer") as {
+      retrieveCustomer: jest.Mock;
+    };
+    let call = 0;
+    service.retrieveCustomer.mockImplementation(async () => {
+      call += 1;
+      if (call === 1) {
+        return { email: "bonbeauty::user@test.local", metadata: null };
+      }
+      const error: Error & { type?: string } = new Error("Customer not found");
+      error.type = "not_found";
+      throw error;
+    });
+
+    await expect(
+      customerMarketTaggingHandler({
+        event: { data: { id: "cus_123" } },
+        container,
+      } as any)
+    ).rejects.toMatchObject({ error_code: "GP_CUSTOMER_MARKET_TAGGING_FAILED" });
+
+    expect(logger.error).toHaveBeenCalled();
+  });
+
+  it("kontrola NIEWYKONALNA (brak RLS w instancji) jest nazwana, nie przemilczana", async () => {
+    const { container, logger } = makeContainer();
+    const service = container.resolve("customer") as {
+      retrieveCustomer: jest.Mock;
+    };
+    let call = 0;
+    service.retrieveCustomer.mockImplementation(async () => {
+      call += 1;
+      if (call === 1) {
+        return { email: "bonbeauty::user@test.local", metadata: null };
+      }
+      throw new Error('role "medusa_store" does not exist');
+    });
+
+    await customerMarketTaggingHandler({
+      event: { data: { id: "cus_123" } },
+      container,
+    } as any);
+
+    expect(logger.warn).toHaveBeenCalledWith(
+      "customerMarketTaggingHandler: kontrola widoczności NIEWYKONANA",
+      expect.objectContaining({ customer_id: "cus_123", market_id: "bonbeauty" })
+    );
   });
 });

@@ -37,6 +37,7 @@ const knex = require("knex")
 const yaml = require(path.join(REPO_ROOT, "GP", "backend", "node_modules", "js-yaml"))
 const sync = require(path.join(BUILD_ROOT, "scripts", "gp-config-sync-market-runtime.js"))
 const brakes = require(path.join(BUILD_ROOT, "lib", "money-path-brakes.js"))
+const migrations = require(path.join(__dirname, "story-2-1-migration-sql.cjs"))
 
 const checks = []
 function assert(label, ok, detail) {
@@ -67,20 +68,25 @@ async function main() {
     pool: { min: 1, max: 2 },
   })
 
-  // Powierzchnia migracji aplikacyjnych: tabela + kolumna nośnika hamulca
-  // (Migration20260730120000MarketRuntimeConfigTable + Migration20260805120000MoneyPathBrakesColumn).
-  await db.raw(`
-    CREATE TABLE IF NOT EXISTS market_runtime_config (
-      market_id      TEXT PRIMARY KEY,
-      locales        JSONB NULL,
-      support_email  TEXT NULL,
-      market_url     TEXT NULL,
-      created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
-      updated_at     TIMESTAMPTZ NOT NULL DEFAULT now()
-    )
-  `)
-  await db.raw(
-    `ALTER TABLE market_runtime_config ADD COLUMN IF NOT EXISTS money_path_brakes JSONB NULL`,
+  // Powierzchnia migracji aplikacyjnych: SQL pochodzi Z MIGRACJI, nie z ręki.
+  // Do review-fixu MEDIUM-5 sonda przepisywała tu kształt dwóch migracji —
+  // zielona kontrola dowodziła wtedy kodu aplikacji, a nie tego, że migracja
+  // się wykonuje (precedens ADR-166: własny DDL zamaskował rozjazd typu).
+  const migrationSql = await migrations.collectMigrationSql([
+    "Migration20260730120000MarketRuntimeConfigTable",
+    "Migration20260805120000MoneyPathBrakesColumn",
+  ])
+  console.log(`# migracje: ${migrationSql.length} instrukcji wykonanych z plików migracji`)
+  for (const statement of migrationSql) {
+    await db.raw(statement)
+  }
+  const columns = await db.raw(
+    `SELECT column_name FROM information_schema.columns
+      WHERE table_name = 'market_runtime_config' AND column_name = 'money_path_brakes'`,
+  )
+  assert(
+    "powierzchnia nośnika powstała Z MIGRACJI (kolumna money_path_brakes istnieje)",
+    (columns.rows || []).length === 1,
   )
 
   const reader = brakes.createMoneyPathBrakeReader(db)
