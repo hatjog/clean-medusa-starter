@@ -5,8 +5,17 @@
  * ── Dlaczego przez trasę, a nie przez `verifyVendorSignature` ──────────────
  * Dowód z funkcji czystej nie jest dowodem o trasie (NFR-1). Każdy przypadek
  * niżej biegnie przez `withVendorAuth` ALBO `vendorAuthMiddleware` — dwa
- * wejścia realnie używane w produkcji (`vouchers/[code]/{redeem,lookup}`,
- * `training-cert/upload`, `middlewares/with-operator-auth.ts`).
+ * EKSPORTOWANE wejścia biblioteki.
+ *
+ * ATRYBUCJA, ŻEBY NIE MYLIĆ POKRYCIA Z ZASIĘGIEM: produkcyjnym wejściem jest
+ * dziś WYŁĄCZNIE `withVendorAuth` (`vouchers/[code]/{redeem,lookup}`,
+ * `training-cert/upload`). `vendorAuthMiddleware` NIE jest zarejestrowany na
+ * żadnej trasie — `api/middlewares.ts` rejestruje `operatorAuthMiddleware`, a
+ * `middlewares/with-operator-auth.ts` wspomina `withVendorAuth` tylko w
+ * komentarzu. Pokrywamy go mimo to, bo jest eksportem publicznym i wejście
+ * przez niego musi mieć tę samą barierę — ale to jest pokrycie MARTWEGO
+ * eksportu, nie drugiej realnej trasy. Rozstrzygnięcie „zostaje czy podziela
+ * los `NonceLru`" należy do 5.4 (patrz ADR-185, Konsekwencje).
  *
  * ── Co znaczy tutaj „druga instancja" ──────────────────────────────────────
  * DWA ODRĘBNE KONTENERY ZALEŻNOŚCI (dwa niezależnie zbudowane `req.scope`),
@@ -32,7 +41,10 @@ import {
   vendorAuthMiddleware,
   VENDOR_AUTH_REPLAY_GUARD_UNAVAILABLE,
 } from "../../lib/vendor-auth"
-import { VENDOR_AUTH_REPLAY_DETECTED } from "../../lib/vendor-hmac"
+import {
+  VENDOR_AUTH_REPLAY_DETECTED,
+  VENDOR_AUTH_SIGNATURE_INVALID,
+} from "../../lib/vendor-hmac"
 import {
   configureVendorSecretCryptoCore,
   resetVendorSecretCryptoCore,
@@ -79,16 +91,27 @@ class SharedGuardTable {
       return { rows: [] }
     }
 
-    const [guardKey, , expiresIso, , nowIso] = bindings as string[]
-    const existing = this.rows.get(guardKey)
+    // Jedno stwierdzenie niesie WSZYSTKIE klucze bariery (dziś dwa: z ciałem
+    // i bez), w bindingach ułożonych w grupy po cztery — `guard_key, seller_id,
+    // expires_at, created_at` — z progiem predykatu na końcu. Zwracamy tylko te
+    // klucze, które były wolne albo wygasłe; werdykt „wszystkie albo nic"
+    // składa `claimReplayGuardKey`.
+    const values = bindings.slice(0, -1) as string[]
+    const nowIso = bindings[bindings.length - 1] as string
 
-    // Predykat okna: wpis blokuje TYLKO dopóki nie wygasł.
-    if (existing !== undefined && !(existing <= nowIso)) {
-      return { rows: [] } // powtórzenie
+    const returned: Array<{ guard_key: string }> = []
+    for (let i = 0; i < values.length; i += 4) {
+      const guardKey = values[i]
+      const expiresIso = values[i + 2]
+      const existing = this.rows.get(guardKey)
+      // Predykat okna: wpis blokuje TYLKO dopóki nie wygasł.
+      if (existing !== undefined && !(existing <= nowIso)) {
+        continue // powtórzenie
+      }
+      this.rows.set(guardKey, expiresIso)
+      returned.push({ guard_key: guardKey })
     }
-
-    this.rows.set(guardKey, expiresIso)
-    return { rows: [{ guard_key: guardKey }] }
+    return { rows: returned }
   }
 }
 
@@ -298,14 +321,22 @@ describe("Story 5.3 — replay-guard cross-instance na trasie /vendor/*", () => 
 
     // 3. to samo żądanie po rotacji: podpis nie pasuje już do nowego sekretu,
     //    więc trasa odmawia — ale NIE dlatego, że klucz bariery się zmienił.
+    //
+    //    KOD, nie sam status. `toBe(401)` przechodziłby także wtedy, gdyby ktoś
+    //    przesunął barierę PRZED weryfikację podpisu (defekt, przed którym broni
+    //    AC5): dostalibyśmy wtedy 401 REPLAY_DETECTED zamiast 401 z podpisu, a
+    //    niezweryfikowany nadawca zapisywałby wiersze. Kolejność kroków w
+    //    `resolveSellerFromRequest` jest tu asertowana przez KOD odmowy.
     const afterRotation = await buildInstance(shared).callViaHof(header)
     expect(afterRotation.status).toBe(401)
+    expect(afterRotation.body.code).toBe(VENDOR_AUTH_SIGNATURE_INVALID)
 
-    // 4. Sedno AC2: klucz bariery jest NIEZALEŻNY od sekretu, więc wpis
-    //    postawiony PRZED rotacją nadal blokuje po rotacji. Gdyby klucz
-    //    zawierał `sig` (funkcję sekretu), rotacja dałaby NOWY klucz i tabela
-    //    urosłaby o drugi wpis — czyli okno powtórzenia byłoby otwarte.
-    expect(shared.rows.size).toBe(1)
+    // 4. Sedno AC2: klucz bariery jest NIEZALEŻNY od sekretu, więc wpisy
+    //    postawione PRZED rotacją nadal blokują po rotacji. Gdyby klucz
+    //    zawierał `sig` (funkcję sekretu), rotacja dałaby NOWE klucze i tabela
+    //    urosłaby o kolejne wpisy — czyli okno powtórzenia byłoby otwarte.
+    //    Dwa wpisy = dwa klucze JEDNEGO żądania (z ciałem i bez, ADR-185 D8).
+    expect(shared.rows.size).toBe(2)
 
     // 5. Kontrola wprost: żądanie podpisane ZROTOWANYM sekretem, o tym samym
     //    `ts` i `nonce`, ma TEN SAM klucz bariery → nadal powtórzenie, mimo że
@@ -321,20 +352,58 @@ describe("Story 5.3 — replay-guard cross-instance na trasie /vendor/*", () => 
     const replayWithRotatedSig = await buildInstance(shared).callViaHof(rotatedHeader)
     expect(replayWithRotatedSig.status).toBe(401)
     expect(replayWithRotatedSig.body.code).toBe(VENDOR_AUTH_REPLAY_DETECTED) // …ten sam klucz
-    expect(shared.rows.size).toBe(1)
+    expect(shared.rows.size).toBe(2)
   })
 
-  it("AC2: różne CIAŁA pod tym samym nonce nie sklejają się w jeden klucz bariery", async () => {
+  it("HIGH-1: przechwycony nagłówek z INNYM ciałem jest ODRZUCANY (nonce jest jednorazowy)", async () => {
+    // REGRESJA, przed którą stoi ten test: dopóki jedynym kluczem bariery był
+    // klucz ZAWIERAJĄCY skrót ciała, jeden przechwycony nagłówek dawał się użyć
+    // dowolnie wiele razy — wystarczyło zmieniać ciało, żeby dostać inny klucz.
+    // Podpis 5.2 NIE obejmuje ciała, więc taki nagłówek zostaje ważny przez całe
+    // `±drift`. Realna trasa, na której to boli: `POST /vendor/training-cert/upload`
+    // niesie plik w ciele. Stara `NonceLru` (klucz `seller:nonce`) odbijała je wszystkie.
     const shared = new SharedGuardTable()
     const header = buildVendorSignatureHeader(SELLER_A, SECRET_A, nowSec())
 
     expect((await buildInstance(shared).callViaHof(header, { amount: 100 })).status).toBe(200)
-    // Inne ciało → inny skrót treści → inny klucz → przechodzi.
-    expect((await buildInstance(shared).callViaHof(header, { amount: 200 })).status).toBe(200)
-    // To samo ciało → ten sam klucz → powtórzenie.
+
+    // INNE ciało, TEN SAM nagłówek — i tak powtórzenie, bo `nonceKey` już żyje.
+    const otherBody = await buildInstance(shared).callViaHof(header, { amount: 200 })
+    expect(otherBody.status).toBe(401)
+    expect(otherBody.body.code).toBe(VENDOR_AUTH_REPLAY_DETECTED)
+
+    // Także na DRUGIEJ instancji — własność jest cross-instance, nie in-process.
+    const otherBodyOtherInstance = await buildInstance(shared).callViaHof(header, { x: 1 })
+    expect(otherBodyOtherInstance.status).toBe(401)
+    expect(otherBodyOtherInstance.body.code).toBe(VENDOR_AUTH_REPLAY_DETECTED)
+
+    // To samo ciało → oczywiście też powtórzenie.
     const repeat = await buildInstance(shared).callViaHof(header, { amount: 100 })
     expect(repeat.status).toBe(401)
     expect(repeat.body.code).toBe(VENDOR_AUTH_REPLAY_DETECTED)
+  })
+
+  it("AC2: klucz z AD-20 nadal RÓŻNICUJE ciała — świeży nonce z innym ciałem przechodzi", async () => {
+    // Kontrola kontroli dla testu wyżej: odmowa bierze się z JEDNORAZOWOŚCI
+    // NONCE, a nie z tego, że bariera odrzuca wszystko po pierwszym żądaniu.
+    const shared = new SharedGuardTable()
+
+    expect(
+      (
+        await buildInstance(shared).callViaHof(
+          buildVendorSignatureHeader(SELLER_A, SECRET_A, nowSec()),
+          { amount: 100 }
+        )
+      ).status
+    ).toBe(200)
+    expect(
+      (
+        await buildInstance(shared).callViaHof(
+          buildVendorSignatureHeader(SELLER_A, SECRET_A, nowSec()),
+          { amount: 200 }
+        )
+      ).status
+    ).toBe(200)
   })
 
   it("AC2: GET bez ciała ma zdefiniowany, STABILNY klucz (dwa GET-y to powtórzenie, nie sklejenie)", async () => {
@@ -345,7 +414,9 @@ describe("Story 5.3 — replay-guard cross-instance na trasie /vendor/*", () => 
     const repeat = await buildInstance(shared).callViaHof(header)
     expect(repeat.status).toBe(401)
     expect(repeat.body.code).toBe(VENDOR_AUTH_REPLAY_DETECTED)
-    expect(shared.rows.size).toBe(1)
+    // Dwa wpisy = dwa klucze JEDNEGO żądania (z ciałem i bez, ADR-185 D8),
+    // a nie dwa żądania.
+    expect(shared.rows.size).toBe(2)
   })
 
   // -------------------------------------------------------------------------

@@ -54,6 +54,11 @@
  *     timestamp, nonce and a server-side digest of the request body. Neither the
  *     secret nor `sig` enters it, so ROTATING A SELLER'S SECRET DOES NOT OPEN A
  *     REPLAY WINDOW.
+ *   - TWO keys are claimed in ONE statement (ADR-185 D8): the AD-20 key (with the
+ *     body digest) AND a narrower seller+ts+nonce key. The narrow one is what
+ *     keeps the NONCE one-shot; without it, a captured header could be replayed
+ *     with a different body forever inside `±drift`, because the 5.2 signature
+ *     does not cover the body.
  *   - The validity window is enforced INSIDE the statement's predicate, so a
  *     stalled cleanup job cannot change the barrier's verdict. Cleanup is
  *     hygiene only (`purgeExpiredReplayGuardRows`).
@@ -84,6 +89,7 @@ import {
   VENDOR_AUTH_SECRET_STORE_UNAVAILABLE,
 } from "./vendor-secret/crypto-core"
 import {
+  buildNonceScopeKey,
   buildReplayGuardKey,
   claimReplayGuardKey,
   computeBodyDigest,
@@ -292,17 +298,31 @@ async function resolveSellerFromRequest(
     }
   }
 
-  const guardKey = buildReplayGuardKey({
+  // TWO keys, claimed in ONE statement (ADR-185 D8):
+  //   - bodyKey  — AD-20's key: seller + ts + nonce + body digest.
+  //   - nonceKey — seller + ts + nonce, WITHOUT the body.
+  // The second one is load-bearing precisely because the 5.2 signature does NOT
+  // cover the body: with `bodyKey` alone, one captured header could be replayed
+  // unboundedly within `±drift` simply by varying the body (every variant would
+  // hash to a different key and be seen as fresh). `nonceKey` restores the
+  // one-shot nonce that `NonceLru` used to give, without dropping AD-20's key.
+  const guardKeyParams = {
     sellerId: result.sellerId,
     ts: result.ts,
     nonce: result.nonce,
-    bodyDigest: computeBodyDigest(req as { rawBody?: Buffer | string; body?: unknown }),
-  })
+  }
+  const guardKeys = [
+    buildReplayGuardKey({
+      ...guardKeyParams,
+      bodyDigest: computeBodyDigest(req as { rawBody?: Buffer | string; body?: unknown }),
+    }),
+    buildNonceScopeKey(guardKeyParams),
+  ]
 
   let fresh: boolean
   try {
     fresh = await claimReplayGuardKey(guardDb, {
-      guardKey,
+      guardKeys,
       sellerId: result.sellerId,
       nowSec,
       windowSec: deriveReplayGuardWindowSec(config.driftSeconds),

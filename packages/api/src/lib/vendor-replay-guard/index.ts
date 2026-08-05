@@ -41,6 +41,19 @@
  * ── Klucz jest NIEZALEŻNY OD SEKRETU (AD-20) ───────────────────────────────
  * Patrz `buildReplayGuardKey`.
  *
+ * ── DWA klucze w JEDNYM stwierdzeniu (ADR-185 D8) ──────────────────────────
+ * Bariera zajmuje NA RAZ dwa klucze: `bodyKey` (z AD-20: sprzedawca, ts, nonce,
+ * skrót treści) oraz `nonceKey` (sprzedawca, ts, nonce — BEZ treści). Powód jest
+ * konkretny: podpis 5.2 NIE obejmuje ciała, więc gdyby jedynym kluczem był
+ * `bodyKey`, jeden przechwycony nagłówek dałby się użyć DOWOLNIE WIELE RAZY —
+ * wystarczyłoby za każdym razem zmienić ciało, żeby dostać inny klucz. `nonceKey`
+ * przywraca to, co dawała stara `NonceLru` (nonce jednorazowy niezależnie od
+ * ciała), a `bodyKey` zostaje, bo wymaga go AD-20.
+ *
+ * Oba klucze idą jako DWA WIERSZE tego samego `INSERT … ON CONFLICT … RETURNING`,
+ * więc AD-23 („jedna operacja atomowa, nie sekwencja") jest nadal spełnione
+ * literalnie: jedna wysyłka, jedno stwierdzenie, jeden werdykt z liczby wierszy.
+ *
  * @module vendor-replay-guard
  */
 import { createHash } from "crypto"
@@ -190,8 +203,42 @@ export function buildReplayGuardKey(params: {
   bodyDigest: string
 }): string {
   const { sellerId, ts, nonce, bodyDigest } = params
-  const parts = [sellerId, ts, nonce, bodyDigest]
-  const material = `vrg1|${parts.map((p) => `${Buffer.byteLength(p, "utf8")}:${p}`).join("|")}`
+  return hashKeyMaterial("body", [sellerId, ts, nonce, bodyDigest])
+}
+
+/**
+ * Buduje WĘŻSZY klucz bariery: sprzedawca + `ts` + `nonce`, BEZ skrótu treści.
+ *
+ * ── Po co drugi klucz, skoro AD-20 wymienia skrót treści ───────────────────
+ * Bo w tej konfiguracji sam `bodyKey` NIE JEST barierą — jest jej rozluźnieniem.
+ * Złóż trzy fakty: (1) podpis 5.2 obejmuje `sellerId.ts.nonce`, ale NIE ciało;
+ * (2) nagłówek jest przyjmowany przez całe `±drift`; (3) `bodyKey` zależy od
+ * ciała. Napastnik z JEDNYM przechwyconym nagłówkiem wysyła N żądań o RÓŻNYCH
+ * ciałach — każde dostaje inny `bodyKey`, więc każde przechodzi. Realna trasa,
+ * na której to boli: `POST /vendor/training-cert/upload` niesie plik w ciele.
+ * Stara `NonceLru` (klucz `seller:nonce`) odbijała je wszystkie.
+ *
+ * `nonceKey` przywraca dokładnie tę własność: **nonce jest jednorazowy
+ * niezależnie od ciała**. `bodyKey` zostaje obok, bo wymaga go AD-20 i bo zawęża
+ * klucz tam, gdzie ciało faktycznie różnicuje żądania.
+ *
+ * Oba klucze są liczone tą samą konstrukcją (prefiks długości, wersja),
+ * ale z RÓŻNYM znacznikiem dziedziny (`body` vs `nonce`), więc nie mogą się
+ * zejść do jednej wartości nawet przy identycznych członach.
+ */
+export function buildNonceScopeKey(params: {
+  sellerId: string
+  ts: string
+  nonce: string
+}): string {
+  const { sellerId, ts, nonce } = params
+  return hashKeyMaterial("nonce", [sellerId, ts, nonce])
+}
+
+function hashKeyMaterial(scope: "body" | "nonce", parts: readonly string[]): string {
+  const material = `vrg1|${scope}|${parts
+    .map((p) => `${Buffer.byteLength(p, "utf8")}:${p}`)
+    .join("|")}`
   return sha256Hex(Buffer.from(material, "utf8"))
 }
 
@@ -222,10 +269,18 @@ function countReturnedRows(result: unknown): number {
 }
 
 /**
- * JEDNA operacja atomowa: zajmuje klucz albo stwierdza powtórzenie.
+ * JEDNA operacja atomowa: zajmuje WSZYSTKIE podane klucze albo stwierdza
+ * powtórzenie.
  *
- * @returns `true` gdy klucz był ŚWIEŻY (żądanie przechodzi),
- *          `false` gdy klucz jest już zajęty i wciąż w oknie (POWTÓRZENIE).
+ * @returns `true` gdy KAŻDY z kluczy był ŚWIEŻY (żądanie przechodzi),
+ *          `false` gdy CHOĆBY JEDEN jest już zajęty i wciąż w oknie
+ *          (POWTÓRZENIE).
+ *
+ * Werdykt „wszystkie albo nic" jest celowy i jest ZAOSTRZAJĄCY: klucze zajmowane
+ * są w jednym stwierdzeniu, więc żądanie odrzucone mogło mimochodem zająć ten
+ * drugi klucz. To nigdy nie przepuszcza powtórzenia — najwyżej spala nonce,
+ * który i tak już był spalony (ta sama klasa skutku, co „spalone żądanie" z
+ * ADR-185 D5).
  *
  * Wołający MUSI wywołać to DOPIERO PO udanej weryfikacji podpisu (AD-20) —
  * inaczej dowolny nadawca zatruwa tabelę cudzymi kluczami (DoS na sprzedawcę
@@ -234,34 +289,57 @@ function countReturnedRows(result: unknown): number {
 export async function claimReplayGuardKey(
   db: ReplayGuardDb,
   params: {
-    guardKey: string
+    guardKeys: readonly string[]
     sellerId: string
     nowSec: number
     windowSec: number
   }
 ): Promise<boolean> {
-  const { guardKey, sellerId, nowSec, windowSec } = params
+  const { sellerId, nowSec, windowSec } = params
+
+  // Deduplikacja jest OBRONNA, nie kosmetyczna: `ON CONFLICT DO UPDATE` w
+  // Postgresie rzuca „cannot affect row a second time", gdy jedno stwierdzenie
+  // dwa razy trafi w ten sam wiersz. Znaczniki dziedziny czynią to praktycznie
+  // niemożliwym, ale bariera nie ma prawa paść na kształcie wejścia.
+  const guardKeys = [...new Set(params.guardKeys)]
+  if (guardKeys.length === 0) {
+    throw new Error("claimReplayGuardKey: pusty zbiór kluczy — bariera nie ma czego zająć")
+  }
 
   const nowIso = new Date(nowSec * 1000).toISOString()
   const expiresIso = new Date((nowSec + windowSec) * 1000).toISOString()
+
+  // Każdy wiersz dostaje WŁASNE, kolejne placeholdery — bez powtarzania `$N`.
+  // Dzięki temu lista bindingów jest regularna (grupy po cztery w kolejności
+  // kolumn, na końcu próg predykatu) i czytelna dla każdego, kto ją ogląda
+  // w logu sterownika albo w teście.
+  const values = guardKeys
+    .map((_key, i) => `($${i * 4 + 1}, $${i * 4 + 2}, $${i * 4 + 3}, $${i * 4 + 4})`)
+    .join(", ")
+  const nowPlaceholder = `$${guardKeys.length * 4 + 1}`
+  const bindingValues = [
+    ...guardKeys.flatMap((key) => [key, sellerId, expiresIso, nowIso]),
+    nowIso,
+  ]
 
   // Jedno stwierdzenie. Werdykt = liczba wierszy z `RETURNING`.
   // `WHERE` na `DO UPDATE` to CAŁE egzekwowanie okna — wygasły wpis jest
   // odnawiany (i przepuszcza), żyjący nie jest ruszany (i blokuje).
   const { text, bindings } = toKnexPositionalSql(
     `INSERT INTO ${VENDOR_REPLAY_GUARD_TABLE} (guard_key, seller_id, expires_at, created_at)
-     VALUES ($1, $2, $3, $4)
+     VALUES ${values}
      ON CONFLICT (guard_key) DO UPDATE
        SET expires_at = EXCLUDED.expires_at,
            seller_id  = EXCLUDED.seller_id,
            created_at = EXCLUDED.created_at
-     WHERE ${VENDOR_REPLAY_GUARD_TABLE}.expires_at <= $5
+     WHERE ${VENDOR_REPLAY_GUARD_TABLE}.expires_at <= ${nowPlaceholder}
      RETURNING guard_key`,
-    [guardKey, sellerId, expiresIso, nowIso, nowIso]
+    bindingValues
   )
 
   const result = await db.raw(text, bindings)
-  return countReturnedRows(result) > 0
+  // „Wszystkie albo nic": brakujący wiersz = któryś klucz żyje = POWTÓRZENIE.
+  return countReturnedRows(result) === guardKeys.length
 }
 
 /**
@@ -274,15 +352,35 @@ export async function claimReplayGuardKey(
  *
  * Właściciel zobowiązania operacyjnego: Platform Ops (retencja tabel
  * technicznych backendu), tak jak dla pozostałych tabel-ledgerów `api`.
+ *
+ * NOŚNIK tego zobowiązania to `jobs/vendor-replay-guard-purge.ts` — sam
+ * komentarz nim NIE JEST. Bez odpalanego joba tabela w gorącej ścieżce
+ * uwierzytelnienia rośnie o `86400 × R` wierszy dziennie i nigdy nie maleje.
+ *
+ * @returns liczba skasowanych wierszy (do zalogowania przez job), albo `null`
+ *          gdy sterownik nie podał licznika — brak licznika NIE jest błędem,
+ *          bo sprzątanie nie decyduje o poprawności.
  */
 export async function purgeExpiredReplayGuardRows(
   db: ReplayGuardDb,
   nowSec: number
-): Promise<void> {
+): Promise<number | null> {
   const nowIso = new Date(nowSec * 1000).toISOString()
   const { text, bindings } = toKnexPositionalSql(
     `DELETE FROM ${VENDOR_REPLAY_GUARD_TABLE} WHERE expires_at <= $1`,
     [nowIso]
   )
-  await db.raw(text, bindings)
+  const result = await db.raw(text, bindings)
+  return countDeletedRows(result)
+}
+
+/** `DELETE` bez `RETURNING` niesie licznik w `rowCount`; Knex bywa oszczędny. */
+function countDeletedRows(result: unknown): number | null {
+  if (result && typeof result === "object") {
+    const rowCount = (result as { rowCount?: unknown }).rowCount
+    if (typeof rowCount === "number") {
+      return rowCount
+    }
+  }
+  return null
 }

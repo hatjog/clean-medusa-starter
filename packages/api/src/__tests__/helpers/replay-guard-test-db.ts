@@ -24,6 +24,10 @@ export type ReplayGuardTestDb = {
  * Buduje magazyn bariery odwzorowujący `INSERT … ON CONFLICT (guard_key)
  * DO UPDATE … WHERE expires_at <= $now RETURNING guard_key`:
  * brak klucza → wiersz, klucz wygasły → wiersz, klucz żywy → brak wiersza.
+ *
+ * Jedno stwierdzenie niesie WIELE kluczy (ADR-185 D8: klucz AD-20 z ciałem oraz
+ * węższy klucz `seller+ts+nonce`), a bindingi są ułożone w grupy po cztery —
+ * `guard_key, seller_id, expires_at, created_at` — z progiem predykatu na końcu.
  */
 export function createReplayGuardTestDb(): ReplayGuardTestDb {
   const rows = new Map<string, string>()
@@ -35,15 +39,23 @@ export function createReplayGuardTestDb(): ReplayGuardTestDb {
         return { rows: [] }
       }
 
-      const [guardKey, , expiresIso, , nowIso] = bindings as string[]
-      const existing = rows.get(guardKey)
+      const values = bindings.slice(0, -1) as string[]
+      const nowIso = bindings[bindings.length - 1] as string
 
-      if (existing !== undefined && !(existing <= nowIso)) {
-        return { rows: [] }
+      const returned: Array<{ guard_key: string }> = []
+      for (let i = 0; i < values.length; i += 4) {
+        const guardKey = values[i]
+        const expiresIso = values[i + 2]
+        const existing = rows.get(guardKey)
+
+        if (existing !== undefined && !(existing <= nowIso)) {
+          continue
+        }
+
+        rows.set(guardKey, expiresIso)
+        returned.push({ guard_key: guardKey })
       }
-
-      rows.set(guardKey, expiresIso)
-      return { rows: [{ guard_key: guardKey }] }
+      return { rows: returned }
     },
   }
 }
