@@ -17,6 +17,11 @@
  */
 import { describe, it, expect, beforeEach, afterEach, jest } from "@jest/globals"
 import { buildVendorSignatureHeader } from "../../../lib/vendor-hmac"
+import { createReplayGuardTestDb } from "../../helpers/replay-guard-test-db"
+import {
+  configureVendorSecretCryptoCore,
+  resetVendorSecretCryptoCore,
+} from "../../../lib/vendor-secret/crypto-core"
 import { GET as lookupGET } from "../../../api/vendor/vouchers/[code]/lookup/route"
 import { POST as redeemPOST } from "../../../api/vendor/vouchers/[code]/redeem/route"
 
@@ -32,9 +37,27 @@ beforeEach(() => {
   savedEnv.VENDOR_HMAC_ENFORCED = process.env.VENDOR_HMAC_ENFORCED
   process.env.VENDOR_HMAC_SECRET = HMAC_SECRET
   process.env.VENDOR_HMAC_ENFORCED = "true"
+  // v1.15.0 Story 5.2: the route resolves the HMAC secret PER SELLER, so this
+  // suite provisions `SELLER_ID` in the crypto-core. Only the way the secret is
+  // supplied changed — the signature shape and every assertion below are the same.
+  configureVendorSecretCryptoCore({
+    secretSetPath: "/test/vouchers-redeem.enc.json",
+    decryptor: () =>
+      JSON.stringify({
+        version: 1,
+        entries: [
+          {
+            seller_id: SELLER_ID,
+            config_ref: `sops://test#${SELLER_ID}`,
+            secret_b64: Buffer.from(HMAC_SECRET, "utf8").toString("base64"),
+          },
+        ],
+      }),
+  })
 })
 
 afterEach(() => {
+  resetVendorSecretCryptoCore()
   for (const [k, v] of Object.entries(savedEnv)) {
     if (v === undefined) delete process.env[k]
     else process.env[k] = v
@@ -58,6 +81,9 @@ function makeRequest(opts: {
     Buffer.from(HMAC_SECRET, "utf8"),
     Math.floor(Date.now() / 1000),
   )
+  // Fresh barrier per request builder: these cases are about the route, not
+  // about replay, so each built request must carry a nonce that is still free.
+  const replayGuardDb = createReplayGuardTestDb()
   return {
     params: opts.params ?? { code: VOUCHER_CODE },
     body: {},
@@ -74,12 +100,18 @@ function makeRequest(opts: {
           return { info: jest.fn(), warn: jest.fn(), error: jest.fn() }
         // PG_CONNECTION used by appendNotificationLog — return a knex-like
         // stub that fails so the route logs and continues (best-effort audit).
+        //
+        // v1.15.0 Story 5.3: the SAME connection now also carries the anti-replay
+        // barrier, which fails CLOSED (503) when it cannot be consulted. Hence
+        // `raw` is wired to the shared guard stub — without it every case here
+        // would measure 503 instead of the route behaviour it was written for.
         return {
           insert: () => ({
             returning: async () => {
               throw new Error("audit write skipped in unit test")
             },
           }),
+          raw: replayGuardDb.raw,
         }
       },
     },

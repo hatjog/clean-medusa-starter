@@ -589,9 +589,20 @@ async function persistConsent(args: {
   )
 }
 
-function requireMarketContext(res: MedusaResponse): MarketContext | null {
+/**
+ * Kontekst requestu `/store/*` NIESIE `sales_channel_id` — strażnik i tak go
+ * sprawdza, więc typ zwrotu zawęża pole do `string`. Bez tego zawężenia
+ * konsumenci musieliby podstawiać `?? ""`, czyli zapisywać do bazy pusty
+ * kanał sprzedaży zamiast odmówić (v1.15.0 Story 2.1: `sales_channel_id`
+ * stało się opcjonalne w `MarketContext`, bo wykonanie systemowe go nie ma).
+ */
+type RequestMarketContext = MarketContext & { sales_channel_id: string }
+
+function requireMarketContext(res: MedusaResponse): RequestMarketContext | null {
   const context = marketContextStorage.getStore()
-  if (context?.market_id && context.sales_channel_id) return context
+  if (context?.market_id && context.sales_channel_id) {
+    return context as RequestMarketContext
+  }
   res.status(403).json({
     code: "MARKET_CONTEXT_REQUIRED",
     message: "Market context required",

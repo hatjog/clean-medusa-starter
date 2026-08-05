@@ -52,6 +52,13 @@ if (process.env.TEST_TYPE === "integration:http") {
   module.exports.testMatch = [
     "**/packages/api/src/__tests__/integration/stripe-payment-intent-multi-order-pg.integration.test.[jt]s",
   ];
+} else if (process.env.TEST_TYPE === "replay-guard-pg") {
+  // v1.15.0 Story 5.3 — bariera anty-replay wykonana przez sam modul na realnym
+  // Postgresie (knex.raw). DATABASE_URL musi wskazywac IZOLOWANA DB testowa:
+  // suita zaklada i kasuje `vendor_replay_guard`.
+  module.exports.testMatch = [
+    "**/packages/api/src/__tests__/integration/vendor-replay-guard-pg.integration.test.[jt]s",
+  ];
 } else if (process.env.TEST_TYPE === "unit") {
   module.exports.testMatch = [
     "**/packages/api/src/**/__tests__/**/*.unit.spec.[jt]s",

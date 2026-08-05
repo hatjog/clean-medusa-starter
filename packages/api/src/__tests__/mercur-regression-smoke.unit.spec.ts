@@ -19,6 +19,11 @@ import { config as subscriberConfig } from "../subscribers/on-order-completed.js
 import { NotImplementedError } from "../modules/gp-core/service"
 import { withVendorAuth, vendorAuthMiddleware } from "../lib/vendor-auth"
 import { buildVendorSignatureHeader } from "../lib/vendor-hmac"
+import { createReplayGuardTestDb } from "./helpers/replay-guard-test-db"
+import {
+  configureVendorSecretCryptoCore,
+  resetVendorSecretCryptoCore,
+} from "../lib/vendor-secret/crypto-core"
 import type { VendorAuthContext } from "../lib/vendor-auth"
 
 // ---------------------------------------------------------------------------
@@ -35,9 +40,25 @@ beforeEach(() => {
   savedEnv.VENDOR_HMAC_ENFORCED = process.env.VENDOR_HMAC_ENFORCED
   process.env.VENDOR_HMAC_SECRET = SMOKE_SECRET
   process.env.VENDOR_HMAC_ENFORCED = "true"
+  // v1.15.0 Story 5.2: `withVendorAuth` resolves the secret per seller, so the
+  // smoke seller is provisioned in the crypto-core. Only the secret SOURCE moved;
+  // the HOF contract asserted below is unchanged.
+  configureVendorSecretCryptoCore({
+    secretSetPath: "/test/mercur-smoke.enc.json",
+    decryptor: () =>
+      JSON.stringify({
+        version: 1,
+        entries: [SMOKE_SELLER, "seller-xyz"].map((sellerId) => ({
+          seller_id: sellerId,
+          config_ref: `sops://test#${sellerId}`,
+          secret_b64: Buffer.from(SMOKE_SECRET, "utf8").toString("base64"),
+        })),
+      }),
+  })
 })
 
 afterEach(() => {
+  resetVendorSecretCryptoCore()
   for (const [key, val] of Object.entries(savedEnv)) {
     if (val === undefined) delete process.env[key]
     else process.env[key] = val
@@ -72,10 +93,18 @@ describe("Mercur event contract", () => {
 // --- withVendorAuth HOF Tests ---
 
 function buildMockReq(headers: Record<string, string | undefined> = {}) {
+  // v1.15.0 Story 5.3: `/vendor/*` auth now consults a shared anti-replay
+  // barrier and fails CLOSED (503) when it cannot reach it. A fresh barrier per
+  // request keeps these smoke cases about the route, not about replay.
+  const replayGuardDb = createReplayGuardTestDb()
   return {
     headers,
+    body: undefined,
     scope: {
       resolve: jest.fn((key: string) => {
+        if (key === "__pg_connection__") {
+          return replayGuardDb
+        }
         if (key === "logger") {
           return {
             info: jest.fn(),
@@ -152,6 +181,12 @@ describe("withVendorAuth HOF", () => {
 
     // Override gp_core to throw NotImplementedError
     req.scope.resolve = jest.fn((key: string) => {
+      // Story 5.3: this override replaces the whole resolver, so it must keep
+      // carrying the anti-replay barrier — otherwise the case measures a 503
+      // fail-closed instead of the 501/500 it was written for.
+      if (key === "__pg_connection__") {
+        return createReplayGuardTestDb()
+      }
       if (key === "logger") {
         return { info: jest.fn(), warn: jest.fn(), error: jest.fn() }
       }
@@ -183,6 +218,12 @@ describe("withVendorAuth HOF", () => {
     const req = buildMockReq({ "x-vendor-signature": makeSignedHeader() })
 
     req.scope.resolve = jest.fn((key: string) => {
+      // Story 5.3: this override replaces the whole resolver, so it must keep
+      // carrying the anti-replay barrier — otherwise the case measures a 503
+      // fail-closed instead of the 501/500 it was written for.
+      if (key === "__pg_connection__") {
+        return createReplayGuardTestDb()
+      }
       if (key === "logger") {
         return { info: jest.fn(), warn: jest.fn(), error: jest.fn() }
       }
@@ -204,6 +245,12 @@ describe("withVendorAuth HOF", () => {
     const req = buildMockReq({ "x-vendor-signature": makeSignedHeader() })
 
     req.scope.resolve = jest.fn((key: string) => {
+      // Story 5.3: this override replaces the whole resolver, so it must keep
+      // carrying the anti-replay barrier — otherwise the case measures a 503
+      // fail-closed instead of the 501/500 it was written for.
+      if (key === "__pg_connection__") {
+        return createReplayGuardTestDb()
+      }
       if (key === "logger") {
         return { info: jest.fn(), warn: jest.fn(), error: jest.fn() }
       }
@@ -254,6 +301,12 @@ describe("vendorAuthMiddleware", () => {
   it("returns 501 on NotImplementedError (stub-safe)", async () => {
     const req = buildMockReq({ "x-vendor-signature": makeSignedHeader("seller-xyz") })
     req.scope.resolve = jest.fn((key: string) => {
+      // Story 5.3: this override replaces the whole resolver, so it must keep
+      // carrying the anti-replay barrier — otherwise the case measures a 503
+      // fail-closed instead of the 501/500 it was written for.
+      if (key === "__pg_connection__") {
+        return createReplayGuardTestDb()
+      }
       if (key === "logger") {
         return { info: jest.fn(), warn: jest.fn(), error: jest.fn() }
       }
