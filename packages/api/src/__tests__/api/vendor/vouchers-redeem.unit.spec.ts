@@ -17,6 +17,7 @@
  */
 import { describe, it, expect, beforeEach, afterEach, jest } from "@jest/globals"
 import { buildVendorSignatureHeader } from "../../../lib/vendor-hmac"
+import { createReplayGuardTestDb } from "../../helpers/replay-guard-test-db"
 import {
   configureVendorSecretCryptoCore,
   resetVendorSecretCryptoCore,
@@ -80,6 +81,9 @@ function makeRequest(opts: {
     Buffer.from(HMAC_SECRET, "utf8"),
     Math.floor(Date.now() / 1000),
   )
+  // Fresh barrier per request builder: these cases are about the route, not
+  // about replay, so each built request must carry a nonce that is still free.
+  const replayGuardDb = createReplayGuardTestDb()
   return {
     params: opts.params ?? { code: VOUCHER_CODE },
     body: {},
@@ -96,12 +100,18 @@ function makeRequest(opts: {
           return { info: jest.fn(), warn: jest.fn(), error: jest.fn() }
         // PG_CONNECTION used by appendNotificationLog — return a knex-like
         // stub that fails so the route logs and continues (best-effort audit).
+        //
+        // v1.15.0 Story 5.3: the SAME connection now also carries the anti-replay
+        // barrier, which fails CLOSED (503) when it cannot be consulted. Hence
+        // `raw` is wired to the shared guard stub — without it every case here
+        // would measure 503 instead of the route behaviour it was written for.
         return {
           insert: () => ({
             returning: async () => {
               throw new Error("audit write skipped in unit test")
             },
           }),
+          raw: replayGuardDb.raw,
         }
       },
     },

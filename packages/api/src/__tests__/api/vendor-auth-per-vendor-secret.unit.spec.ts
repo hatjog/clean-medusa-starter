@@ -16,6 +16,7 @@ import { describe, it, expect, jest, beforeEach, afterEach } from "@jest/globals
 
 import { buildVendorSignatureHeader } from "../../lib/vendor-hmac"
 import { withVendorAuth } from "../../lib/vendor-auth"
+import { createReplayGuardTestDb } from "../helpers/replay-guard-test-db"
 import {
   configureVendorSecretCryptoCore,
   resetVendorSecretCryptoCore,
@@ -56,10 +57,18 @@ function nowSec(): number {
 type Logged = { level: string; message: string }
 
 function buildMockReq(headers: Record<string, string | undefined>, logged: Logged[]) {
+  // v1.15.0 Story 5.3: the route consults a shared anti-replay barrier and
+  // fails CLOSED without it. Fresh per request — 5.2 cases are about secret
+  // resolution, not about replay.
+  const replayGuardDb = createReplayGuardTestDb()
   return {
     headers,
+    body: undefined,
     scope: {
       resolve: (key: string) => {
+        if (key === "__pg_connection__") {
+          return replayGuardDb
+        }
         if (key === "logger") {
           return {
             info: (m: string) => logged.push({ level: "info", message: m }),

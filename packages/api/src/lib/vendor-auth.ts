@@ -9,14 +9,15 @@
  * - VENDOR_HMAC_ENFORCED=false: returns 503 (config error), never accepts
  *   `x-vendor-token` as a seller_id substitute.
  *
- * v1.6.0 HMAC design notes (story: cleanup-48):
- *   - Single shared secret (VENDOR_HMAC_SECRET env var) — simplest viable for
- *     v1.6.0 single-API-instance topology.
- *   - v1.7.0 ADR follow-up: per-vendor secret store (vendor-specific keys).
- *   - Replay protection via in-process LRU (size 10k).
- *   - v1.7.0 follow-up: Redis-backed distributed nonce cache.
- *   - VENDOR_HMAC_ENFORCED=false enables legacy x-vendor-token path (transition
- *     window only — this flag MUST be removed in v1.7.0 cleanup).
+ * v1.6.0 HMAC design notes (story: cleanup-48) — SUPERSEDED, kept for provenance:
+ *   - Single shared secret (VENDOR_HMAC_SECRET env var) — superseded by Story 5.2
+ *     (per-seller resolution, see the v1.15.0 note below).
+ *   - Replay protection via in-process LRU (size 10k) and the standing "v1.7.0
+ *     follow-up: Redis-backed distributed nonce cache" — superseded by Story 5.3.
+ *     That follow-up was deferred for four releases and is now CLOSED, on
+ *     Postgres rather than Redis (see the v1.15.0 Story 5.3 note below).
+ *   - VENDOR_HMAC_ENFORCED=false enables legacy x-vendor-token path — deleted in
+ *     v1.9.0 (cc-4 F-10, below); the flag now fails closed.
  *
  * References:
  * - ADR-025: Term "vendor" used in gp_core; "seller" only in Mercur auth context
@@ -44,9 +45,24 @@
  *     + drift), and still exists as `verify-all` comparison material inside the
  *     DATED dual-validity window declared in
  *     `specs/contracts/vendor-secret-dual-window.yaml`. Story 5.4 removes it.
+ * v1.15.0 Story 5.3 (FR-11 replay-guard member, AD-20, AD-23, ADR-185):
+ *   - The in-process `NonceLru` is GONE. The anti-replay barrier is ONE atomic
+ *     statement against a shared table (`lib/vendor-replay-guard/`), so a replay
+ *     aimed at a SECOND API instance is refused — the in-process map could not
+ *     see it at all.
+ *   - The anti-replay key is a function of PUBLIC MATERIAL ONLY: seller,
+ *     timestamp, nonce and a server-side digest of the request body. Neither the
+ *     secret nor `sig` enters it, so ROTATING A SELLER'S SECRET DOES NOT OPEN A
+ *     REPLAY WINDOW.
+ *   - The validity window is enforced INSIDE the statement's predicate, so a
+ *     stalled cleanup job cannot change the barrier's verdict. Cleanup is
+ *     hygiene only (`purgeExpiredReplayGuardRows`).
+ *   - Because the barrier is asynchronous, `resolveSellerFromRequest` is now
+ *     `async` and BOTH entry points below await it.
  *
  * @module vendor-auth
  */
+import { ContainerRegistrationKeys } from "@medusajs/framework/utils"
 import type {
   MedusaNextFunction,
   MedusaRequest,
@@ -56,7 +72,6 @@ import type {
 import { NotImplementedError } from "../modules/gp-core/service"
 import {
   verifyVendorSignature,
-  getSharedLru,
   VENDOR_AUTH_SIGNATURE_MISSING,
   VENDOR_AUTH_SIGNATURE_INVALID,
   VENDOR_AUTH_TIMESTAMP_EXPIRED,
@@ -68,8 +83,37 @@ import {
   getVendorSecretCryptoCore,
   VENDOR_AUTH_SECRET_STORE_UNAVAILABLE,
 } from "./vendor-secret/crypto-core"
+import {
+  buildReplayGuardKey,
+  claimReplayGuardKey,
+  computeBodyDigest,
+  deriveReplayGuardWindowSec,
+  type ReplayGuardDb,
+} from "./vendor-replay-guard"
 
 const VENDOR_SIGNATURE_HEADER = "x-vendor-signature"
+
+/**
+ * v1.15.0 Story 5.3 — the anti-replay barrier could not be consulted at all
+ * (no `PG_CONNECTION` in the scope, or the statement itself failed).
+ *
+ * Deliberately FAIL-CLOSED with 503: an unavailable barrier that let requests
+ * through would silently reinstate exactly the replay window this story closes,
+ * and it would do so invisibly. Operator fault → 503, never "allow and log".
+ */
+export const VENDOR_AUTH_REPLAY_GUARD_UNAVAILABLE =
+  "VENDOR_AUTH_REPLAY_GUARD_UNAVAILABLE" as const
+
+function resolveReplayGuardDb(scope: MedusaRequest["scope"] | undefined): ReplayGuardDb | null {
+  if (!scope) return null
+
+  try {
+    const db = scope.resolve(ContainerRegistrationKeys.PG_CONNECTION) as ReplayGuardDb | null
+    return db && typeof db.raw === "function" ? db : null
+  } catch {
+    return null
+  }
+}
 
 export type VendorAuthContext = {
   vendor_id: string
@@ -116,12 +160,13 @@ function resolveGpCore(scope: MedusaRequest["scope"] | undefined): GpCoreService
  *
  * Returns { ok: true, sellerId } or { ok: false, status, code, message }.
  */
-function resolveSellerFromRequest(
+async function resolveSellerFromRequest(
   req: MedusaRequest,
   logger: LoggerLike
-):
+): Promise<
   | { ok: true; sellerId: string }
-  | { ok: false; status: 401 | 503; code: string; message: string } {
+  | { ok: false; status: 401 | 503; code: string; message: string }
+> {
   let config: ReturnType<typeof resolveVendorHmacConfig>
   try {
     config = resolveVendorHmacConfig()
@@ -181,12 +226,12 @@ function resolveSellerFromRequest(
   // The shared value survives only as `verify-all` comparison material inside
   // the dated dual-validity window (specs/contracts/vendor-secret-dual-window.yaml);
   // Story 5.4 removes it.
+  const nowSec = Math.floor(Date.now() / 1000)
   const result = verifyVendorSignature(
     sigValue,
     (sellerId: string) => cryptoCore.core.resolveForSeller(sellerId),
-    Math.floor(Date.now() / 1000),
-    config.driftSeconds,
-    getSharedLru()
+    nowSec,
+    config.driftSeconds
   )
 
   if (!result.ok) {
@@ -221,6 +266,74 @@ function resolveSellerFromRequest(
     }
   }
 
+  // --- Anti-replay barrier (v1.15.0 Story 5.3 — FR-11, AD-20, AD-23, ADR-185) ---
+  //
+  // ORDER IS LOAD-BEARING: we are past `result.ok === true`, so the signature is
+  // already verified. Claiming the key any earlier would let any sender write
+  // rows for a seller they cannot sign for — a DoS on that seller plus a timing
+  // oracle. This is the same ordering v1.6.0 had inside `verifyVendorSignature`;
+  // only the barrier's carrier moved.
+  //
+  // The key is built from PUBLIC MATERIAL ONLY (seller, timestamp, nonce, body
+  // digest). `sig` is deliberately absent: it is a function of the secret, so a
+  // sig-derived key would change on rotation and reopen the replay window —
+  // which is the very defect this story exists to close.
+  const guardDb = resolveReplayGuardDb(req.scope)
+  if (!guardDb) {
+    logger.error?.(
+      `[vendor-auth] ${VENDOR_AUTH_REPLAY_GUARD_UNAVAILABLE} — no PG_CONNECTION in scope; ` +
+        "failing closed rather than serving /vendor/* without replay protection"
+    )
+    return {
+      ok: false,
+      status: 503,
+      code: VENDOR_AUTH_REPLAY_GUARD_UNAVAILABLE,
+      message: "Vendor replay protection unavailable",
+    }
+  }
+
+  const guardKey = buildReplayGuardKey({
+    sellerId: result.sellerId,
+    ts: result.ts,
+    nonce: result.nonce,
+    bodyDigest: computeBodyDigest(req as { rawBody?: Buffer | string; body?: unknown }),
+  })
+
+  let fresh: boolean
+  try {
+    fresh = await claimReplayGuardKey(guardDb, {
+      guardKey,
+      sellerId: result.sellerId,
+      nowSec,
+      windowSec: deriveReplayGuardWindowSec(config.driftSeconds),
+    })
+  } catch (err) {
+    // Fail-closed, loudly. A barrier that errors is NOT a barrier that allows.
+    logger.error?.(`[vendor-auth] ${VENDOR_AUTH_REPLAY_GUARD_UNAVAILABLE} ${String(err)}`)
+    return {
+      ok: false,
+      status: 503,
+      code: VENDOR_AUTH_REPLAY_GUARD_UNAVAILABLE,
+      message: "Vendor replay protection unavailable",
+    }
+  }
+
+  if (!fresh) {
+    // NFR-2: the refusal is LOUD server-side. The response body carries the
+    // same generic replay message it carried before — no new oracle about the
+    // seller's existence (the 5.2 AC5 non-disclosure contract still holds).
+    logger.warn?.(
+      `[vendor-auth] ${VENDOR_AUTH_REPLAY_DETECTED} seller=${result.sellerId} — ` +
+        "anti-replay key already claimed within the validity window"
+    )
+    return {
+      ok: false,
+      status: 401,
+      code: VENDOR_AUTH_REPLAY_DETECTED,
+      message: "Vendor signature replay detected",
+    }
+  }
+
   return { ok: true, sellerId: result.sellerId }
 }
 
@@ -246,7 +359,7 @@ export function withVendorAuth(
   ): Promise<void> => {
     const logger = resolveLogger(req.scope)
 
-    const sellerResult = resolveSellerFromRequest(req, logger)
+    const sellerResult = await resolveSellerFromRequest(req, logger)
     if (!sellerResult.ok) {
       res.status(sellerResult.status).json({
         code: sellerResult.code,
@@ -307,7 +420,7 @@ export async function vendorAuthMiddleware(
 ): Promise<void> {
   const logger = resolveLogger(req.scope)
 
-  const sellerResult = resolveSellerFromRequest(req, logger)
+  const sellerResult = await resolveSellerFromRequest(req, logger)
   if (!sellerResult.ok) {
     res.status(sellerResult.status).json({
       code: sellerResult.code,

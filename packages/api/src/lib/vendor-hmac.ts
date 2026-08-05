@@ -7,17 +7,26 @@
  *
  * Signed payload: `${seller_id}.${ts}.${nonce}` (dot-joined, UTF-8)
  *
- * Design decisions (v1.6.0):
- *   - Single shared secret (VENDOR_HMAC_SECRET) — simplest viable for single-instance topology.
- *   - v1.7.0 follow-up: per-vendor secret store (ADR to be filed).
- *   - Nonce dedup via in-process LRU bounded at 10k — sufficient for v1.6.0 single-API-instance.
- *   - v1.7.0 follow-up: Redis-backed distributed nonce cache.
+ * Design decisions (v1.6.0, superseded where noted):
+ *   - Single shared secret (VENDOR_HMAC_SECRET) — SUPERSEDED by v1.15.0 Story 5.2:
+ *     the secret is resolved PER SELLER by `lib/vendor-secret/crypto-core.ts`.
+ *   - Nonce dedup via in-process LRU bounded at 10k — SUPERSEDED by v1.15.0
+ *     Story 5.3 (FR-11, AD-20, AD-23, ADR-185). `NonceLru`/`getSharedLru` are
+ *     GONE, not merely unused: the in-process map could not see a replay aimed
+ *     at a second API instance, and its `get` → check → `set` sequence was the
+ *     exact shape AD-23 rejects. The barrier now lives in
+ *     `lib/vendor-replay-guard/` as ONE atomic statement on a shared table.
+ *     Consequently this function NO LONGER performs the replay check — it stays
+ *     synchronous and the (already async) callers in `vendor-auth.ts` own the
+ *     barrier. See `vendor-auth.ts` for the enforced ordering.
  *
  * Error codes (stable identifiers — referenced by storefront/vendor-panel in v1.7.0):
  *   VENDOR_AUTH_SIGNATURE_MISSING    — x-vendor-signature header absent
  *   VENDOR_AUTH_SIGNATURE_INVALID    — HMAC mismatch or malformed header
  *   VENDOR_AUTH_TIMESTAMP_EXPIRED    — |now - ts| > driftSeconds
- *   VENDOR_AUTH_REPLAY_DETECTED      — duplicate (seller_id, nonce) within 2*drift window
+ *   VENDOR_AUTH_REPLAY_DETECTED      — duplicate anti-replay key still inside the
+ *                                      validity window (raised by vendor-auth.ts
+ *                                      via lib/vendor-replay-guard, not here)
  *
  * @module vendor-hmac
  */
@@ -64,63 +73,22 @@ export type VendorSecretResolver = (sellerId: string) => Buffer | null
 const DECOY_SECRET = randomBytes(32)
 
 export type VendorHmacResult =
-  | { ok: true; sellerId: string }
+  // v1.15.0 Story 5.3: `ts` and `nonce` are surfaced ADDITIVELY so the caller
+  // can build the anti-replay key without re-parsing the header. This does not
+  // touch the frozen 5.2 shape (header layout, field count, `payload`,
+  // algorithm, encoding, comparison) — it only stops the barrier from having to
+  // parse the header a second time and drift from what was actually verified.
+  | { ok: true; sellerId: string; ts: string; nonce: string }
   | { ok: false; code: VendorAuthErrorCode }
 
 // ---------------------------------------------------------------------------
-// Minimal LRU for nonce dedup (no external deps)
+// (v1.15.0 Story 5.3) `NonceLru` and `getSharedLru` were DELETED here.
+//
+// They are not left as a dead export on purpose: "the mechanism exists but is
+// never called" is precisely the end state AC1 forbids, because the next reader
+// cannot tell a retired barrier from a live one. The replacement is
+// `lib/vendor-replay-guard/` — one atomic statement against a shared table.
 // ---------------------------------------------------------------------------
-export class NonceLru {
-  private readonly maxSize: number
-  /** Maps `${sellerId}:${nonce}` → expiry unix-seconds */
-  private readonly store = new Map<string, number>()
-
-  constructor(maxSize = 10_000) {
-    this.maxSize = maxSize
-  }
-
-  /**
-   * Returns true if the nonce+sellerId pair is already known (replay detected).
-   * Inserts and returns false if new.
-   */
-  check(sellerId: string, nonce: string, nowSec: number, ttlSec: number): boolean {
-    const key = `${sellerId}:${nonce}`
-    const expiry = this.store.get(key)
-
-    if (expiry !== undefined && nowSec < expiry) {
-      return true // replay
-    }
-
-    // Evict expired entries if over capacity (simple scan — acceptable for bounded map)
-    if (this.store.size >= this.maxSize) {
-      for (const [k, exp] of this.store) {
-        if (nowSec >= exp) {
-          this.store.delete(k)
-        }
-        if (this.store.size < this.maxSize) break
-      }
-    }
-
-    this.store.set(key, nowSec + ttlSec)
-    return false
-  }
-
-  /** Visible for testing. */
-  get size(): number {
-    return this.store.size
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Singleton LRU shared across requests
-// ---------------------------------------------------------------------------
-let _sharedLru: NonceLru | null = null
-export function getSharedLru(): NonceLru {
-  if (!_sharedLru) {
-    _sharedLru = new NonceLru(10_000)
-  }
-  return _sharedLru
-}
 
 // ---------------------------------------------------------------------------
 // Header parsing
@@ -174,22 +142,29 @@ export function parseSignatureHeader(header: string): ParsedSignatureHeader | nu
  * callers and the shape regression suite) or a per-seller resolver.
  *
  * Step order is also frozen: parse → timestamp → **secret resolution** → HMAC
- * reconstruction → replay. Resolution deliberately sits AFTER the timestamp check
+ * reconstruction. Resolution deliberately sits AFTER the timestamp check
  * and BEFORE the HMAC so an unknown seller is not distinguishable by ordering.
+ *
+ * v1.15.0 Story 5.3: the replay step is NO LONGER part of this function. The
+ * shared barrier is asynchronous by nature, and this function is deliberately
+ * kept synchronous so the frozen 5.2 shape suite keeps exercising it directly.
+ * The barrier therefore runs in `vendor-auth.ts`, STRICTLY AFTER a `ok: true`
+ * result from here — the "replay only after a verified signature" ordering that
+ * prevents an unauthenticated sender from poisoning the table is preserved by
+ * that call order, and is covered by a test asserting a bad signature writes
+ * no row.
  *
  * @param headerValue  Raw value of the `x-vendor-signature` header (or undefined).
  * @param secretSource HMAC secret (Buffer) or a per-seller {@link VendorSecretResolver}.
  * @param nowSec       Current unix time in seconds (injectable for tests).
  * @param driftSeconds Max allowed timestamp drift.
- * @param lru          Nonce dedup LRU cache.
  * @returns VendorHmacResult — ok:true with sellerId on success, ok:false with error code.
  */
 export function verifyVendorSignature(
   headerValue: string | undefined,
   secretSource: Buffer | VendorSecretResolver,
   nowSec: number,
-  driftSeconds: number,
-  lru: NonceLru
+  driftSeconds: number
 ): VendorHmacResult {
   if (!headerValue) {
     return { ok: false, code: VENDOR_AUTH_SIGNATURE_MISSING }
@@ -260,13 +235,11 @@ export function verifyVendorSignature(
     return { ok: false, code: VENDOR_AUTH_SIGNATURE_INVALID }
   }
 
-  // --- Replay check (after signature verification to avoid oracle timing) ---
-  const ttlSec = driftSeconds * 2
-  if (lru.check(sellerId, nonce, nowSec, ttlSec)) {
-    return { ok: false, code: VENDOR_AUTH_REPLAY_DETECTED }
-  }
-
-  return { ok: true, sellerId }
+  // The replay barrier used to sit HERE. It now runs in `vendor-auth.ts`, on
+  // this exact result — still after signature verification, for the same reason
+  // the comment gave in v1.6.0: an earlier check would be a timing oracle and
+  // would let an unauthenticated sender write rows.
+  return { ok: true, sellerId, ts, nonce }
 }
 
 /**
