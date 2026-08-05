@@ -56,7 +56,7 @@ function isNotFound(error: unknown): boolean {
 }
 
 /**
- * Wykonaj ZAPIS USTANAWIAJĄCY przynależność do rynku POZA kontekstem rynku.
+ * Wykonaj OPERACJĘ USTANAWIAJĄCĄ przynależność do rynku POZA kontekstem rynku.
  *
  * ── Dlaczego poza, skoro cała story wprowadza kontekst ──────────────────────
  * Polityka `market_isolation` na `customer` (infra/postgres/migrations/010,
@@ -73,6 +73,16 @@ function isNotFound(error: unknown): boolean {
  * rynek wyliczony ze scoped-emaila), a nie „no bo tak było wcześniej".
  * Kontrola dodatnia zaraz po nim sprawdza, że wiersz JEST już widoczny
  * w zadeklarowanym rynku — czyli że izolacja zaczęła obowiązywać.
+ *
+ * ── Dlaczego także ODCZYT ustalający ────────────────────────────────────────
+ * Klauzula `USING` obowiązuje również dla `SELECT`, więc nieotagowany wiersz
+ * jest niewidoczny nie tylko dla `UPDATE`, ale i dla `retrieveCustomer`.
+ * Do weryfikacji B5 (correctness 1.3) pierwszy odczyt w gałęzi z ALS leciał
+ * W KONTEKŚCIE: przy propagującym się ALS kończył się `not_found`, wyjątek
+ * wpadał w ogólny `catch` i degradował się do `logger.warn`, handler kończył
+ * się „sukcesem", a klient zostawał TRWALE nieotagowany. Cisza z HIGH-1 nie
+ * została wtedy usunięta, tylko przeniesiona na drugą gałąź — dlatego odczyt
+ * ustalający idzie tą samą drogą co zapis ustanawiający.
  */
 function runOutsideMarketContext<T>(work: () => Promise<T>): Promise<T> {
   return marketContextStorage.exit(work);
@@ -112,7 +122,9 @@ export default async function customerMarketTaggingHandler({
 
   try {
     if (!marketId) {
-      const customer = await customerService.retrieveCustomer(event.data.id);
+      const customer = await runOutsideMarketContext(async () =>
+        customerService.retrieveCustomer(event.data.id),
+      );
       marketId = parseScopedCustomerEmail(customer.email)?.marketId;
 
       if (!marketId) {
@@ -135,7 +147,12 @@ export default async function customerMarketTaggingHandler({
       return;
     }
 
-    const customer = await customerService.retrieveCustomer(event.data.id);
+    // Odczyt USTALAJĄCY — poza kontekstem z tego samego powodu, co zapis
+    // ustanawiający: `USING` polityki RLS ukrywa nieotagowany wiersz także
+    // przed `SELECT`-em (weryfikacja B5, correctness 1.3).
+    const customer = await runOutsideMarketContext(async () =>
+      customerService.retrieveCustomer(event.data.id),
+    );
 
     if (hasMarketMetadata(customer)) {
       // Metadata already set by create middleware — skip redundant write.
@@ -159,16 +176,32 @@ export default async function customerMarketTaggingHandler({
     // Nieudane tagowanie NIE jest kosmetyką: bez `metadata.gp.market_id` ten
     // klient jest niewidoczny dla KAŻDEGO zapytania pod RLS. Do review-fixu
     // HIGH-1 lądowało tu `warn` i handler kończył się „sukcesem".
-    if (error instanceof CustomerMarketTaggingError) {
+    // Niewidoczny wiersz na ŚCIEŻCE TAGOWANIA jest tą samą klasą co wyżej,
+    // niezależnie od tego, które ogniwo go zgłosiło: klient, którego nie widać,
+    // nie zostanie otagowany, a bez `metadata.gp.market_id` jest niewidoczny
+    // pod RLS dla KAŻDEGO zapytania. Do weryfikacji B5 `not_found` z pierwszego
+    // odczytu wpadało niżej, w `warn`, i handler kończył się „sukcesem".
+    const escalated =
+      error instanceof CustomerMarketTaggingError
+        ? error
+        : isNotFound(error)
+          ? new CustomerMarketTaggingError(
+              `klient ${event.data.id} jest NIEWIDOCZNY podczas tagowania ` +
+                "(wiersz odrzucony przez politykę RLS albo nie istnieje) — " +
+                "tagowanie NIE zostało wykonane",
+              event.data.id,
+            )
+          : null;
+    if (escalated) {
       resolveLogger(container)?.error?.(
         "customerMarketTaggingHandler failed to establish market membership",
         {
-          error_code: error.error_code,
-          customer_id: error.customerId,
-          error: error.message,
+          error_code: escalated.error_code,
+          customer_id: escalated.customerId,
+          error: escalated.message,
         },
       );
-      throw error;
+      throw escalated;
     }
     resolveLogger(container)?.warn?.(
       "customerMarketTaggingHandler failed",

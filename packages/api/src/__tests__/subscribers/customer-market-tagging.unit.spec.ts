@@ -211,3 +211,95 @@ describe("customer market tagging — granica kontekstu (HIGH-1)", () => {
     );
   });
 });
+
+/**
+ * weryfikacja B5 / correctness 1.3 — cisza NIE została usunięta, tylko
+ * przeniesiona na gałąź z ALS.
+ *
+ * Wszystkie testy z bloku HIGH-1 wchodzą wyłącznie w gałąź BEZ ALS. Gałąź
+ * z ALS miała pierwszy `retrieveCustomer` W KONTEKŚCIE, więc przy propagującym
+ * się ALS polityka `market_isolation` (klauzula `USING` obowiązuje także dla
+ * `SELECT`) ukrywała nieotagowany wiersz: `not_found` -> ogólny `catch` ->
+ * `logger.warn` -> handler kończył się „sukcesem", ZERO zapisu.
+ *
+ * Atrapa niżej odwzorowuje politykę: rzuca `not_found`, gdy odczyt leci
+ * W kontekście, i zwraca wiersz, gdy leci poza nim. Przeniesienie odczytu
+ * ustalającego z powrotem do kontekstu czerwieni oba testy.
+ */
+describe("customer market tagging — gałąź ALS pod RLS (weryfikacja B5)", () => {
+  function makeRlsAwareContainer() {
+    const logger = { warn: jest.fn(), error: jest.fn() };
+    const stored: { metadata: unknown } = { metadata: null };
+    const retrieveCustomer = jest.fn().mockImplementation(async () => {
+      const ctx = marketContextStorage.getStore();
+      if (ctx && !stored.metadata) {
+        // Wiersz bez `metadata.gp.market_id` jest w kontekście NIEWIDOCZNY.
+        const error: Error & { type?: string } = new Error("Customer not found");
+        error.type = "not_found";
+        throw error;
+      }
+      return { email: "bonbeauty::user@test.local", metadata: stored.metadata };
+    });
+    const updateCustomers = jest.fn().mockImplementation(async (_id, data) => {
+      stored.metadata = data.metadata;
+      return undefined;
+    });
+    const service = { retrieveCustomer, updateCustomers };
+    const container = {
+      resolve: jest.fn().mockImplementation((key: string) =>
+        key === "logger" ? logger : service
+      ),
+    };
+    return { container, logger, retrieveCustomer, updateCustomers };
+  }
+
+  it("tagowanie DZIAŁA, gdy ALS propaguje się na szynę zdarzeń", async () => {
+    const { container, logger, updateCustomers } = makeRlsAwareContainer();
+
+    await marketContextStorage.run(
+      { market_id: "bonbeauty", sales_channel_id: "sc_bb" },
+      async () => {
+        await customerMarketTaggingHandler({
+          event: { data: { id: "cus_123" } },
+          container,
+        } as any);
+      }
+    );
+
+    expect(updateCustomers).toHaveBeenCalledWith("cus_123", {
+      metadata: { gp: { market_id: "bonbeauty" } },
+    });
+    expect(logger.warn).not.toHaveBeenCalledWith(
+      "customerMarketTaggingHandler failed",
+      expect.anything()
+    );
+  });
+
+  it("niewidoczny klient na ścieżce tagowania = błąd z `error`, nie `warn` i sukces", async () => {
+    const { container, logger, updateCustomers } = makeRlsAwareContainer();
+    const service = container.resolve("customer") as {
+      retrieveCustomer: jest.Mock;
+    };
+    // Wiersz niewidoczny NIEZALEŻNIE od kontekstu (np. skasowany między
+    // zdarzeniem a obsługą): handler nie ma prawa zameldować sukcesu.
+    service.retrieveCustomer.mockImplementation(async () => {
+      const error: Error & { type?: string } = new Error("Customer not found");
+      error.type = "not_found";
+      throw error;
+    });
+
+    await expect(
+      marketContextStorage.run(
+        { market_id: "bonbeauty", sales_channel_id: "sc_bb" },
+        async () =>
+          customerMarketTaggingHandler({
+            event: { data: { id: "cus_123" } },
+            container,
+          } as any)
+      )
+    ).rejects.toMatchObject({ error_code: "GP_CUSTOMER_MARKET_TAGGING_FAILED" });
+
+    expect(logger.error).toHaveBeenCalled();
+    expect(updateCustomers).not.toHaveBeenCalled();
+  });
+});
