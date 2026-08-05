@@ -34,7 +34,16 @@
  *   - The shared secret resolver (`vendor-hmac-config.ts`) still throws
  *     on missing `VENDOR_HMAC_SECRET`, so a missing env var is still a
  *     readable fatal at request time.
- * TODO(v1.10.0+): Replace shared VENDOR_HMAC_SECRET with per-vendor secret store (ADR follow-up).
+ * v1.15.0 Story 5.2 (FR-11 resolver member, AD-20, ADR-181, ADR-156):
+ *   - The request path no longer verifies against the shared VENDOR_HMAC_SECRET.
+ *     The secret is resolved PER SELLER by the backend crypto-core
+ *     (`lib/vendor-secret/crypto-core.ts`) for the `seller_id` carried by the
+ *     signature header. No fallback to the shared value exists — not even
+ *     behind a flag (AD-20).
+ *   - `VENDOR_HMAC_SECRET` is still read by `vendor-hmac-config.ts` (enforcement
+ *     + drift), and still exists as `verify-all` comparison material inside the
+ *     DATED dual-validity window declared in
+ *     `specs/contracts/vendor-secret-dual-window.yaml`. Story 5.4 removes it.
  *
  * @module vendor-auth
  */
@@ -52,8 +61,13 @@ import {
   VENDOR_AUTH_SIGNATURE_INVALID,
   VENDOR_AUTH_TIMESTAMP_EXPIRED,
   VENDOR_AUTH_REPLAY_DETECTED,
+  VENDOR_AUTH_SECRET_NOT_PROVISIONED,
 } from "./vendor-hmac"
 import { resolveVendorHmacConfig } from "./vendor-hmac-config"
+import {
+  getVendorSecretCryptoCore,
+  VENDOR_AUTH_SECRET_STORE_UNAVAILABLE,
+} from "./vendor-secret/crypto-core"
 
 const VENDOR_SIGNATURE_HEADER = "x-vendor-signature"
 
@@ -138,13 +152,38 @@ function resolveSellerFromRequest(
     }
   }
 
+  // --- Per-vendor crypto-core (v1.15.0 Story 5.2 — AD-20, ADR-181, ADR-156 §4/§6a) ---
+  // Boot-time decrypt health is checked HERE and is distinguishable from a
+  // per-vendor resolve miss: a broken/absent age key or a failed decrypt is an
+  // operator fault → 503 on `/vendor/*` only (the rest of the API is untouched,
+  // P6-5b). "This seller has no secret" is an auth outcome → 401 below.
+  const cryptoCore = getVendorSecretCryptoCore()
+  if (!cryptoCore.ok) {
+    logger.error?.(
+      `[vendor-auth] ${VENDOR_AUTH_SECRET_STORE_UNAVAILABLE} reason=${cryptoCore.fault.reason}`
+    )
+    return {
+      ok: false,
+      status: 503,
+      code: VENDOR_AUTH_SECRET_STORE_UNAVAILABLE,
+      message: "Vendor secret store unavailable",
+    }
+  }
+
   // --- Enforced HMAC mode ---
   const sigHeader = req.headers[VENDOR_SIGNATURE_HEADER]
   const sigValue = Array.isArray(sigHeader) ? sigHeader[0] : sigHeader
 
+  // AD-20: the secret is resolved for the `sellerId` CARRIED BY THE HEADER, and
+  // `config.secret` (the shared VENDOR_HMAC_SECRET) is deliberately NOT passed
+  // here any more. There is no fallback branch — a seller without a per-vendor
+  // secret gets 401 even when a valid shared secret is present in the env.
+  // The shared value survives only as `verify-all` comparison material inside
+  // the dated dual-validity window (specs/contracts/vendor-secret-dual-window.yaml);
+  // Story 5.4 removes it.
   const result = verifyVendorSignature(
     sigValue,
-    config.secret,
+    (sellerId: string) => cryptoCore.core.resolveForSeller(sellerId),
     Math.floor(Date.now() / 1000),
     config.driftSeconds,
     getSharedLru()
@@ -157,6 +196,23 @@ function resolveSellerFromRequest(
       [VENDOR_AUTH_TIMESTAMP_EXPIRED]: "Vendor signature timestamp expired",
       [VENDOR_AUTH_REPLAY_DETECTED]: "Vendor signature replay detected",
     }
+
+    // AC5 non-disclosure: "this seller has no secret" and "wrong signature" are
+    // INDISTINGUISHABLE in the response body — otherwise the 401 becomes a
+    // seller-enumeration oracle. The discriminator AC1 asks for lives in the
+    // server-side log line below, not in the payload.
+    if (result.code === VENDOR_AUTH_SECRET_NOT_PROVISIONED) {
+      logger.warn?.(
+        `[vendor-auth] ${VENDOR_AUTH_SECRET_NOT_PROVISIONED} — no per-vendor secret for the seller named in the signature header`
+      )
+      return {
+        ok: false,
+        status: 401,
+        code: VENDOR_AUTH_SIGNATURE_INVALID,
+        message: messages[VENDOR_AUTH_SIGNATURE_INVALID],
+      }
+    }
+
     return {
       ok: false,
       status: 401,

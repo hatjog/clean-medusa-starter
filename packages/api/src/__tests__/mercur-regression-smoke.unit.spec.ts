@@ -19,6 +19,10 @@ import { config as subscriberConfig } from "../subscribers/on-order-completed.js
 import { NotImplementedError } from "../modules/gp-core/service"
 import { withVendorAuth, vendorAuthMiddleware } from "../lib/vendor-auth"
 import { buildVendorSignatureHeader } from "../lib/vendor-hmac"
+import {
+  configureVendorSecretCryptoCore,
+  resetVendorSecretCryptoCore,
+} from "../lib/vendor-secret/crypto-core"
 import type { VendorAuthContext } from "../lib/vendor-auth"
 
 // ---------------------------------------------------------------------------
@@ -35,9 +39,25 @@ beforeEach(() => {
   savedEnv.VENDOR_HMAC_ENFORCED = process.env.VENDOR_HMAC_ENFORCED
   process.env.VENDOR_HMAC_SECRET = SMOKE_SECRET
   process.env.VENDOR_HMAC_ENFORCED = "true"
+  // v1.15.0 Story 5.2: `withVendorAuth` resolves the secret per seller, so the
+  // smoke seller is provisioned in the crypto-core. Only the secret SOURCE moved;
+  // the HOF contract asserted below is unchanged.
+  configureVendorSecretCryptoCore({
+    secretSetPath: "/test/mercur-smoke.enc.json",
+    decryptor: () =>
+      JSON.stringify({
+        version: 1,
+        entries: [SMOKE_SELLER, "seller-xyz"].map((sellerId) => ({
+          seller_id: sellerId,
+          config_ref: `sops://test#${sellerId}`,
+          secret_b64: Buffer.from(SMOKE_SECRET, "utf8").toString("base64"),
+        })),
+      }),
+  })
 })
 
 afterEach(() => {
+  resetVendorSecretCryptoCore()
   for (const [key, val] of Object.entries(savedEnv)) {
     if (val === undefined) delete process.env[key]
     else process.env[key] = val

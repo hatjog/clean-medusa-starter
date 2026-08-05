@@ -21,7 +21,9 @@
  *
  * @module vendor-hmac
  */
-import { createHmac, timingSafeEqual } from "crypto"
+import { createHmac, randomBytes, timingSafeEqual } from "crypto"
+
+import { VENDOR_AUTH_SECRET_NOT_PROVISIONED } from "./vendor-secret/crypto-core"
 
 // ---------------------------------------------------------------------------
 // Error codes (exported constants — DO NOT rename without v1.7.0 migration note)
@@ -36,6 +38,30 @@ export type VendorAuthErrorCode =
   | typeof VENDOR_AUTH_SIGNATURE_INVALID
   | typeof VENDOR_AUTH_TIMESTAMP_EXPIRED
   | typeof VENDOR_AUTH_REPLAY_DETECTED
+  // v1.15.0 Story 5.2 (AD-20 / ADR-181): the crypto-core is healthy but the
+  // seller named in the header has no per-vendor secret. Server-side (log)
+  // discriminator only — the HTTP body stays indistinguishable from a plain
+  // signature mismatch (AC5 non-disclosure), see vendor-auth.ts.
+  | typeof VENDOR_AUTH_SECRET_NOT_PROVISIONED
+
+export { VENDOR_AUTH_SECRET_NOT_PROVISIONED }
+
+/**
+ * Resolves the HMAC secret for the seller named in the signature header.
+ * Returns `null` when that seller has no per-vendor secret.
+ *
+ * AD-20: an implementation MUST NOT fall back to a shared secret. `null` means
+ * `401`, never "try the shared value".
+ */
+export type VendorSecretResolver = (sellerId: string) => Buffer | null
+
+/**
+ * Per-process decoy secret used to keep the "seller not provisioned" branch
+ * doing the SAME work as the "bad signature" branch (AC2): without it, an
+ * unknown seller would answer measurably faster than a wrong signature, which
+ * is a seller-enumeration oracle.
+ */
+const DECOY_SECRET = randomBytes(32)
 
 export type VendorHmacResult =
   | { ok: true; sellerId: string }
@@ -112,7 +138,7 @@ type ParsedSignatureHeader = {
  * Accepted format (compact): `<seller_id>:<ts>:<nonce>:<base64-sig>`
  * Field count: exactly 4 parts (seller_id may not contain `:`)
  */
-function parseSignatureHeader(header: string): ParsedSignatureHeader | null {
+export function parseSignatureHeader(header: string): ParsedSignatureHeader | null {
   // Split into exactly 4 parts (seller_id, ts, nonce, sig)
   const firstColon = header.indexOf(":")
   if (firstColon === -1) return null
@@ -141,8 +167,18 @@ function parseSignatureHeader(header: string): ParsedSignatureHeader | null {
 /**
  * Verifies a vendor HMAC signature.
  *
+ * The signature SHAPE is frozen (v1.15.0 Story 5.2 / AC2): header format, field
+ * count, `payload` construction, algorithm, base64 encoding and the constant-time
+ * comparison are unchanged. The only thing Story 5.2 changed is WHERE the secret
+ * comes from — hence `secretSource` accepts either a Buffer (legacy/self-contained
+ * callers and the shape regression suite) or a per-seller resolver.
+ *
+ * Step order is also frozen: parse → timestamp → **secret resolution** → HMAC
+ * reconstruction → replay. Resolution deliberately sits AFTER the timestamp check
+ * and BEFORE the HMAC so an unknown seller is not distinguishable by ordering.
+ *
  * @param headerValue  Raw value of the `x-vendor-signature` header (or undefined).
- * @param secret       Shared HMAC secret (Buffer).
+ * @param secretSource HMAC secret (Buffer) or a per-seller {@link VendorSecretResolver}.
  * @param nowSec       Current unix time in seconds (injectable for tests).
  * @param driftSeconds Max allowed timestamp drift.
  * @param lru          Nonce dedup LRU cache.
@@ -150,7 +186,7 @@ function parseSignatureHeader(header: string): ParsedSignatureHeader | null {
  */
 export function verifyVendorSignature(
   headerValue: string | undefined,
-  secret: Buffer,
+  secretSource: Buffer | VendorSecretResolver,
   nowSec: number,
   driftSeconds: number,
   lru: NonceLru
@@ -172,6 +208,26 @@ export function verifyVendorSignature(
     return { ok: false, code: VENDOR_AUTH_TIMESTAMP_EXPIRED }
   }
 
+  // --- Per-seller secret resolution (v1.15.0 Story 5.2, AD-20/ADR-181) ---
+  // AFTER the timestamp check, BEFORE the HMAC. A `null` resolution is NEVER a
+  // reason to reach for a shared secret; there is no such branch here.
+  let secret: Buffer
+  let notProvisioned = false
+  if (Buffer.isBuffer(secretSource)) {
+    secret = secretSource
+  } else {
+    const resolved = secretSource(sellerId)
+    if (resolved === null) {
+      // Do NOT return yet: run the full HMAC + comparison against a decoy so
+      // "unknown seller" costs the same as "wrong signature" (AC2 — no
+      // enumeration oracle). The verdict is decided after the comparison.
+      notProvisioned = true
+      secret = DECOY_SECRET
+    } else {
+      secret = resolved
+    }
+  }
+
   // --- HMAC recomputation (timing-safe) ---
   const payload = `${sellerId}.${ts}.${nonce}`
   let expectedSig: Buffer
@@ -190,10 +246,17 @@ export function verifyVendorSignature(
     return { ok: false, code: VENDOR_AUTH_SIGNATURE_INVALID }
   }
 
-  if (
-    expectedSig.length !== providedSig.length ||
-    !timingSafeEqual(expectedSig, providedSig)
-  ) {
+  const sigMatches =
+    expectedSig.length === providedSig.length &&
+    timingSafeEqual(expectedSig, providedSig)
+
+  // The decoy comparison above is discarded here: a non-provisioned seller can
+  // never produce a match, and the outcome must not depend on it.
+  if (notProvisioned) {
+    return { ok: false, code: VENDOR_AUTH_SECRET_NOT_PROVISIONED }
+  }
+
+  if (!sigMatches) {
     return { ok: false, code: VENDOR_AUTH_SIGNATURE_INVALID }
   }
 

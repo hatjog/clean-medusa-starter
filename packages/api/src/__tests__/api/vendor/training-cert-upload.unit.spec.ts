@@ -32,6 +32,10 @@ import {
   resetMaxUploadBytesForTests,
 } from "../../../../src/lib/training-cert-upload-config"
 import { buildVendorSignatureHeader } from "../../../../src/lib/vendor-hmac"
+import {
+  configureVendorSecretCryptoCore,
+  resetVendorSecretCryptoCore,
+} from "../../../../src/lib/vendor-secret/crypto-core"
 
 // ---------------------------------------------------------------------------
 // HMAC env setup — cleanup-48: withVendorAuth now requires HMAC signature
@@ -46,9 +50,26 @@ beforeEach(() => {
   savedCertEnv.VENDOR_HMAC_ENFORCED = process.env.VENDOR_HMAC_ENFORCED
   process.env.VENDOR_HMAC_SECRET = CERT_TEST_SECRET
   process.env.VENDOR_HMAC_ENFORCED = "true"
+  // v1.15.0 Story 5.2: secret resolution is per seller — provision this suite's
+  // seller in the crypto-core. Case-6 ("wrong secret") stays 401 by construction.
+  configureVendorSecretCryptoCore({
+    secretSetPath: "/test/training-cert.enc.json",
+    decryptor: () =>
+      JSON.stringify({
+        version: 1,
+        entries: [
+          {
+            seller_id: CERT_TEST_SELLER,
+            config_ref: `sops://test#${CERT_TEST_SELLER}`,
+            secret_b64: Buffer.from(CERT_TEST_SECRET, "utf8").toString("base64"),
+          },
+        ],
+      }),
+  })
 })
 
 afterEach(() => {
+  resetVendorSecretCryptoCore()
   for (const [key, val] of Object.entries(savedCertEnv)) {
     if (val === undefined) delete process.env[key]
     else process.env[key] = val

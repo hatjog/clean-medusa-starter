@@ -17,6 +17,10 @@
  */
 import { describe, it, expect, beforeEach, afterEach, jest } from "@jest/globals"
 import { buildVendorSignatureHeader } from "../../../lib/vendor-hmac"
+import {
+  configureVendorSecretCryptoCore,
+  resetVendorSecretCryptoCore,
+} from "../../../lib/vendor-secret/crypto-core"
 import { GET as lookupGET } from "../../../api/vendor/vouchers/[code]/lookup/route"
 import { POST as redeemPOST } from "../../../api/vendor/vouchers/[code]/redeem/route"
 
@@ -32,9 +36,27 @@ beforeEach(() => {
   savedEnv.VENDOR_HMAC_ENFORCED = process.env.VENDOR_HMAC_ENFORCED
   process.env.VENDOR_HMAC_SECRET = HMAC_SECRET
   process.env.VENDOR_HMAC_ENFORCED = "true"
+  // v1.15.0 Story 5.2: the route resolves the HMAC secret PER SELLER, so this
+  // suite provisions `SELLER_ID` in the crypto-core. Only the way the secret is
+  // supplied changed — the signature shape and every assertion below are the same.
+  configureVendorSecretCryptoCore({
+    secretSetPath: "/test/vouchers-redeem.enc.json",
+    decryptor: () =>
+      JSON.stringify({
+        version: 1,
+        entries: [
+          {
+            seller_id: SELLER_ID,
+            config_ref: `sops://test#${SELLER_ID}`,
+            secret_b64: Buffer.from(HMAC_SECRET, "utf8").toString("base64"),
+          },
+        ],
+      }),
+  })
 })
 
 afterEach(() => {
+  resetVendorSecretCryptoCore()
   for (const [k, v] of Object.entries(savedEnv)) {
     if (v === undefined) delete process.env[k]
     else process.env[k] = v
