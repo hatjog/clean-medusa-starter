@@ -65,6 +65,8 @@ export type MarketRuntimeRecord = {
   locales: Record<string, unknown>
   support_email: string
   market_url: string
+  /** v1.15.0 Story 2.1 (AD-25 / ADR-177) — hamulec sciezki pieniadza per rynek. */
+  money_path_brakes: Record<string, string>
 }
 
 export type MarketRuntimeSyncPlan = {
@@ -206,6 +208,72 @@ export function normalizeLocalesBlock(raw: unknown): Record<string, unknown> {
   return block
 }
 
+/**
+ * Story 2.1 (v1.15.0, AC4) — normalizacja bloku `money_path_brakes`.
+ *
+ * Brak bloku NIE jest bledem konfiguracji: rynek, ktory nie zadeklarowal
+ * hamulcow, ma je wszystkie ZACIAGNIETE (`engaged`) — wartosc bezpieczna
+ * ustalona w ADR-177. Bledem jest natomiast wartosc SPOZA enumu: cicha
+ * podmiana literowki (`relesed`) na `engaged` ukrylaby fakt, ze operator
+ * probowal zwolnic hamulec i mu sie nie udalo, a on sam bylby przekonany, ze
+ * sie udalo. Dlatego niepoprawna wartosc zatrzymuje sync PRZED zapisem.
+ */
+export const MONEY_PATH_BRAKE_SWITCHES = [
+  "fr_6_7_multi_seller_purchase_return",
+  "fr_9_delivery_idempotency",
+  "fr_10_panel_redemption",
+  "fr_12_redemption_ledger",
+  "fr_14_market_isolation",
+] as const
+
+export const MONEY_PATH_BRAKE_STATES = ["engaged", "released"] as const
+
+/** Wartosc bezpieczna z ADR-177 — fail-closed dla sciezki pieniadza. */
+export const MONEY_PATH_BRAKE_SAFE_STATE = "engaged"
+
+export function normalizeMoneyPathBrakes(raw: unknown): Record<string, string> {
+  const declared =
+    raw && typeof raw === "object" && !Array.isArray(raw)
+      ? (raw as Record<string, unknown>)
+      : {}
+
+  if (raw !== undefined && raw !== null && Object.keys(declared).length === 0) {
+    throw new MarketRuntimeConfigInvalidError(
+      "money_path_brakes",
+      "blok obecny, ale pusty — zadeklaruj piec przelacznikow albo usun blok",
+    )
+  }
+
+  for (const key of Object.keys(declared)) {
+    if (!(MONEY_PATH_BRAKE_SWITCHES as readonly string[]).includes(key)) {
+      throw new MarketRuntimeConfigInvalidError(
+        `money_path_brakes.${key}`,
+        "przelacznik spoza piatki zamrozonej w ADR-177",
+      )
+    }
+  }
+
+  const normalized: Record<string, string> = {}
+  for (const name of MONEY_PATH_BRAKE_SWITCHES) {
+    const value = declared[name]
+    if (value === undefined) {
+      normalized[name] = MONEY_PATH_BRAKE_SAFE_STATE
+      continue
+    }
+    if (
+      typeof value !== "string" ||
+      !(MONEY_PATH_BRAKE_STATES as readonly string[]).includes(value)
+    ) {
+      throw new MarketRuntimeConfigInvalidError(
+        `money_path_brakes.${name}`,
+        `oczekiwano ${MONEY_PATH_BRAKE_STATES.join(" albo ")}, dostano '${String(value)}'`,
+      )
+    }
+    normalized[name] = value
+  }
+  return normalized
+}
+
 export function buildMarketRuntimeRecord(
   marketId: string,
   marketYaml: Record<string, unknown>,
@@ -230,6 +298,7 @@ export function buildMarketRuntimeRecord(
     locales: normalizeLocalesBlock(marketYaml.locales),
     support_email: normalizeSupportEmail(owners.email),
     market_url: normalizeMarketUrl(domains.primary),
+    money_path_brakes: normalizeMoneyPathBrakes(marketYaml.money_path_brakes),
   }
 }
 
@@ -237,6 +306,7 @@ type ExistingRow = {
   locales: unknown
   support_email: string | null
   market_url: string | null
+  money_path_brakes: unknown
 }
 
 function extractRows<T>(result: unknown): T[] {
@@ -276,7 +346,7 @@ export async function planMarketRuntimeSync(
   record: MarketRuntimeRecord,
 ): Promise<MarketRuntimeSyncPlan> {
   const result = await db.raw(
-    `SELECT locales, support_email, market_url
+    `SELECT locales, support_email, market_url, money_path_brakes
        FROM market_runtime_config
       WHERE market_id = ?
       LIMIT 1`,
@@ -292,7 +362,8 @@ export async function planMarketRuntimeSync(
   const unchanged =
     current.support_email === record.support_email &&
     current.market_url === record.market_url &&
-    sameLocales(current.locales, record.locales)
+    sameLocales(current.locales, record.locales) &&
+    sameLocales(current.money_path_brakes, record.money_path_brakes)
 
   return { record, action: unchanged ? "unchanged" : "update" }
 }
@@ -303,18 +374,21 @@ export async function applyMarketRuntimeSync(
 ): Promise<void> {
   await db.raw(
     `INSERT INTO market_runtime_config
-       (market_id, locales, support_email, market_url, created_at, updated_at)
-     VALUES (?, ?::jsonb, ?, ?, now(), now())
+       (market_id, locales, support_email, market_url, money_path_brakes,
+        created_at, updated_at)
+     VALUES (?, ?::jsonb, ?, ?, ?::jsonb, now(), now())
      ON CONFLICT (market_id) DO UPDATE
-        SET locales       = EXCLUDED.locales,
-            support_email = EXCLUDED.support_email,
-            market_url    = EXCLUDED.market_url,
-            updated_at    = now()`,
+        SET locales           = EXCLUDED.locales,
+            support_email     = EXCLUDED.support_email,
+            market_url        = EXCLUDED.market_url,
+            money_path_brakes = EXCLUDED.money_path_brakes,
+            updated_at        = now()`,
     [
       record.market_id,
       JSON.stringify(record.locales),
       record.support_email,
       record.market_url,
+      JSON.stringify(record.money_path_brakes),
     ],
   )
 }

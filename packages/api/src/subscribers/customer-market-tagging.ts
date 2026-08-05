@@ -9,6 +9,10 @@ import {
   parseScopedCustomerEmail,
 } from "../lib/customer-scoped-email";
 import { marketContextStorage } from "../lib/market-context";
+import {
+  runInSystemMarketContext,
+  SystemMarketContextError,
+} from "../lib/system-market-context";
 
 type CustomerRecord = {
   email?: string | null;
@@ -31,6 +35,19 @@ function resolveLogger(container: { resolve: (key: string) => unknown }): Logger
   }
 }
 
+/**
+ * v1.15.0 Story 2.1 (AC1, FR-14d / AD-21) — REALNY konsument nośnika kontekstu
+ * systemowego.
+ *
+ * Ten subscriber jest wzorcowym przypadkiem sprzeczności, którą nośnik
+ * likwiduje: leci POZA żądaniem HTTP (`customer.created` na szynie zdarzeń,
+ * gdzie ALS się nie propaguje), a mimo to ZAPISUJE wiersz klienta. Do tej pory
+ * zapis szedł bez jakiegokolwiek kontekstu rynku, czyli bez izolacji.
+ *
+ * Rynek jest tu WYLICZONY i JAWNY — pochodzi ze scoped-emaila konkretnego
+ * klienta, nie z globalnej konfiguracji („wszystkie rynki") i nie z wartości
+ * domyślnej. To jest dokładnie kształt deklaracji, którego wymaga AD-21.
+ */
 export default async function customerMarketTaggingHandler({
   event,
   container,
@@ -63,9 +80,19 @@ export default async function customerMarketTaggingHandler({
         return;
       }
 
-      await customerService.updateCustomers(event.data.id, {
-        metadata: mergeCustomerMarketMetadata(customer.metadata, marketId),
-      });
+      // Jawny kontekst systemowy dla ZAPISU: jeden wyliczony rynek,
+      // ten sam nośnik izolacji co łańcuch `/store/*`.
+      await runInSystemMarketContext(
+        {
+          markets: [marketId],
+          origin: { surface: "subscriber", name: "customer-market-tagging" },
+          logger: resolveLogger(container) as never,
+        },
+        async () =>
+          customerService.updateCustomers(event.data.id, {
+            metadata: mergeCustomerMarketMetadata(customer.metadata, marketId as string),
+          }),
+      );
       return;
     }
 
@@ -80,6 +107,12 @@ export default async function customerMarketTaggingHandler({
       metadata: mergeCustomerMarketMetadata(customer.metadata, marketId),
     });
   } catch (error) {
+    // Odmowa kontekstu MUSI zostać głośna. Zdegradowanie jej do `warn` byłoby
+    // dokładnie tą ciszą, którą NFR-2 odrzuca — nośnik zaliczyłby odmowę,
+    // a wywołujący dowiedziałby się, że „wszystko poszło dobrze".
+    if (error instanceof SystemMarketContextError) {
+      throw error;
+    }
     resolveLogger(container)?.warn?.(
       "customerMarketTaggingHandler failed",
       {
