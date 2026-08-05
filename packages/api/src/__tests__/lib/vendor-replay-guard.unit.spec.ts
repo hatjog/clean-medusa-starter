@@ -22,6 +22,7 @@
  */
 import { describe, it, expect } from "@jest/globals"
 
+import { marketContextStorage } from "../../lib/market-context"
 import {
   buildNonceScopeKey,
   buildReplayGuardKey,
@@ -412,6 +413,18 @@ describe("computeBodyDigest — skrót treści liczony PO STRONIE SERWERA (AC2)"
   })
 })
 
+/**
+ * Sprzątanie jest ZAPISEM POZA ŻĄDANIEM HTTP, więc od review cyklu 2 wymaga
+ * zadeklarowanego rynku (AD-21). Testy higieny muszą więc biec w kontekście —
+ * a to, że BEZ kontekstu jest odmowa (i zero wysyłek do bazy), jest mierzone
+ * w `__tests__/jobs/vendor-replay-guard-purge.unit.spec.ts`.
+ */
+const inMarket = <T>(work: () => Promise<T>): Promise<T> =>
+  marketContextStorage.run(
+    { market_id: "bonbeauty", system: { surface: "job", name: "vendor-replay-guard-purge" } },
+    work
+  )
+
 describe("purgeExpiredReplayGuardRows — HIGIENA, nie poprawność (AC3)", () => {
   it("kasuje WYŁĄCZNIE wygasłe wiersze — mierzone wykonaniem, nie kształtem SQL", async () => {
     const table = new FakeGuardTable()
@@ -430,7 +443,7 @@ describe("purgeExpiredReplayGuardRows — HIGIENA, nie poprawność (AC3)", () =
       windowSec: 660,
     })
 
-    await purgeExpiredReplayGuardRows(table, T0 + 700)
+    await inMarket(() => purgeExpiredReplayGuardRows(table, T0 + 700))
 
     expect([...table.rows.keys()]).toEqual(["k-fresh"])
   })
@@ -439,9 +452,11 @@ describe("purgeExpiredReplayGuardRows — HIGIENA, nie poprawność (AC3)", () =
     const withCount: ReplayGuardDb = { raw: async () => ({ rowCount: 7 }) }
     const withoutCount: ReplayGuardDb = { raw: async () => [] }
 
-    await expect(purgeExpiredReplayGuardRows(withCount, 1_800_000_000)).resolves.toBe(7)
+    await expect(inMarket(() => purgeExpiredReplayGuardRows(withCount, 1_800_000_000))).resolves.toBe(7)
     // Brak licznika NIE jest błędem — sprzątanie nie decyduje o poprawności.
-    await expect(purgeExpiredReplayGuardRows(withoutCount, 1_800_000_000)).resolves.toBeNull()
+    await expect(
+      inMarket(() => purgeExpiredReplayGuardRows(withoutCount, 1_800_000_000))
+    ).resolves.toBeNull()
   })
 
   it("jest osobną operacją: bariera nie woła jej i nie zależy od jej wykonania", async () => {
@@ -450,7 +465,7 @@ describe("purgeExpiredReplayGuardRows — HIGIENA, nie poprawność (AC3)", () =
     // przepuszcza, choć NIC go nie skasowało. Tutaj tylko potwierdzamy, że
     // sprzątanie jest oddzielnym stwierdzeniem DELETE, a nie częścią bariery.
     const db = countingDb(0)
-    await purgeExpiredReplayGuardRows(db, 1_800_000_000)
+    await inMarket(() => purgeExpiredReplayGuardRows(db, 1_800_000_000))
 
     expect(db.calls).toHaveLength(1)
     expect(db.calls[0].sql.trim().toUpperCase().startsWith("DELETE")).toBe(true)

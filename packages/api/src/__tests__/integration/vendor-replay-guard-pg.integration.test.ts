@@ -32,6 +32,7 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "@jest/globals"
 import knexFactory, { type Knex } from "knex"
 
+import { marketContextStorage } from "../../lib/market-context"
 import { Migration20260816090000VendorReplayGuardTable } from "../../migrations/Migration20260816090000VendorReplayGuardTable"
 import {
   buildNonceScopeKey,
@@ -49,6 +50,12 @@ const runOrSkip = DATABASE_URL ? describe : describe.skip
 const T0 = 1_800_000_000
 const WINDOW = deriveReplayGuardWindowSec(300) // 660 s, wartość produkcyjna
 const SELLER = "seller-A-uuid"
+/** Sprzedawca INNEGO rynku — kontrola negatywna zawężenia sprzątania (AD-21). */
+const SELLER_OTHER_MARKET = "seller-B-uuid"
+/** Sprzedawca BEZ `metadata.gp.market_id` — nie należy do żadnej deklaracji. */
+const SELLER_UNTAGGED = "seller-C-uuid"
+const MARKET = "bonbeauty"
+const OTHER_MARKET = "testmarketb"
 
 /** Zbiera SQL migracji bez uruchamiania silnika migracji MikroORM. */
 function migrationSql(direction: "up" | "down"): Promise<string[]> {
@@ -66,11 +73,35 @@ function migrationSql(direction: "up" | "down"): Promise<string[]> {
 
 runOrSkip("Story 5.3 — replay-guard na REALNYM Postgresie (knex.raw)", () => {
   let db: Knex
+  /** Czy `seller` powstał TUTAJ (izolowana baza) — tylko wtedy go kasujemy. */
+  let sellerFixtureCreated = false
 
   beforeAll(async () => {
     db = knexFactory({ client: "pg", connection: DATABASE_URL as string, pool: { min: 0, max: 2 } })
     for (const sql of await migrationSql("up")) {
       await db.raw(sql)
+    }
+
+    // Atrybucja rynkowa wiersza bariery idzie po SPRZEDAWCY
+    // (`seller.metadata->'gp'->>'market_id'`, AD-21). Na izolowanej bazie
+    // testowej `seller` nie istnieje — zakładamy MINIMALNĄ atrapę o tym samym
+    // kształcie kolumn, których używa wyrażenie. Na bazie z Mercurem tabela
+    // już jest i NIE jest ruszana strukturalnie.
+    const { rows: reg } = await db.raw(`SELECT to_regclass('public.seller') AS reg`)
+    if (!reg[0].reg) {
+      await db.raw(`CREATE TABLE seller (id TEXT PRIMARY KEY, metadata JSONB)`)
+      sellerFixtureCreated = true
+    }
+    for (const [id, metadata] of [
+      [SELLER, JSON.stringify({ gp: { market_id: MARKET } })],
+      [SELLER_OTHER_MARKET, JSON.stringify({ gp: { market_id: OTHER_MARKET } })],
+      [SELLER_UNTAGGED, JSON.stringify({})],
+    ] as const) {
+      await db.raw(
+        `INSERT INTO seller (id, metadata) VALUES (?, ?::jsonb)
+         ON CONFLICT (id) DO UPDATE SET metadata = EXCLUDED.metadata`,
+        [id, metadata]
+      )
     }
   })
 
@@ -80,6 +111,15 @@ runOrSkip("Story 5.3 — replay-guard na REALNYM Postgresie (knex.raw)", () => {
     }
     for (const sql of await migrationSql("down")) {
       await db.raw(sql)
+    }
+    if (sellerFixtureCreated) {
+      await db.raw(`DROP TABLE IF EXISTS seller`)
+    } else {
+      await db.raw(`DELETE FROM seller WHERE id IN (?, ?, ?)`, [
+        SELLER,
+        SELLER_OTHER_MARKET,
+        SELLER_UNTAGGED,
+      ])
     }
     await db.destroy()
   })
@@ -163,17 +203,67 @@ runOrSkip("Story 5.3 — replay-guard na REALNYM Postgresie (knex.raw)", () => {
     )
   })
 
+  const purgeInMarket = (marketId: string, nowSec: number) =>
+    marketContextStorage.run(
+      { market_id: marketId, system: { surface: "job", name: "vendor-replay-guard-purge" } },
+      () => purgeExpiredReplayGuardRows(db as unknown as { raw: Knex["raw"] }, nowSec)
+    )
+
   it("purge kasuje WYŁĄCZNIE wygasłe wiersze i zwraca ich liczbę", async () => {
     await claim(keysFor("nonce-old", {}), T0)
     await claim(keysFor("nonce-new", {}), T0 + WINDOW)
 
-    const deleted = await purgeExpiredReplayGuardRows(
-      db as unknown as { raw: Knex["raw"] },
-      T0 + WINDOW + 1
-    )
+    const deleted = await purgeInMarket(MARKET, T0 + WINDOW + 1)
     expect(deleted).toBe(2) // dwa klucze pierwszego żądania
 
     const { rows } = await db.raw(`SELECT count(*)::int AS n FROM ${VENDOR_REPLAY_GUARD_TABLE}`)
     expect(rows[0].n).toBe(2) // dwa klucze drugiego żądania zostają
+  })
+
+  it("AD-21: purge kasuje WYŁĄCZNIE wiersze ZADEKLAROWANEGO rynku", async () => {
+    // Trzej sprzedawcy, wszystkie wpisy wygasłe — różni je TYLKO rynek.
+    for (const sellerId of [SELLER, SELLER_OTHER_MARKET, SELLER_UNTAGGED]) {
+      await claimReplayGuardKey(db as unknown as { raw: Knex["raw"] }, {
+        guardKeys: [`k-${sellerId}`],
+        sellerId,
+        nowSec: T0,
+        windowSec: WINDOW,
+      })
+    }
+
+    const deleted = await purgeInMarket(MARKET, T0 + WINDOW + 1)
+
+    // Kontrola dodatnia: wiersz zadeklarowanego rynku ZNIKA.
+    expect(deleted).toBe(1)
+    // Kontrola negatywna: wiersz innego rynku i wiersz sprzedawcy BEZ
+    // przypisania rynkowego ZOSTAJĄ. To nie jest przeoczenie — deklaracja
+    // jednego rynku nie jest dostępem do wszystkich (AD-21). Ich retencja
+    // wymaga ZADEKLAROWANIA ich rynku, a skutek jest wyłącznie higieniczny.
+    const { rows } = await db.raw(
+      `SELECT seller_id FROM ${VENDOR_REPLAY_GUARD_TABLE} ORDER BY seller_id`
+    )
+    expect(rows.map((r: { seller_id: string }) => r.seller_id)).toEqual([
+      SELLER_OTHER_MARKET,
+      SELLER_UNTAGGED,
+    ])
+
+    // …i deklaracja drugiego rynku faktycznie go dosięga.
+    expect(await purgeInMarket(OTHER_MARKET, T0 + WINDOW + 1)).toBe(1)
+  })
+
+  it("AD-21: purge BEZ kontekstu rynku NIE kasuje niczego (odmowa, nie „wszystko”)", async () => {
+    await claim(keysFor("nonce-denied", {}), T0)
+
+    // Asercja na KODZIE i POWODZIE, nie na treści zdania: komunikat wolno
+    // przeredagować, kontrakt odmowy — nie.
+    await expect(
+      purgeExpiredReplayGuardRows(db as unknown as { raw: Knex["raw"] }, T0 + WINDOW + 1)
+    ).rejects.toMatchObject({
+      error_code: "GP_SYSTEM_MARKET_CONTEXT_DENIED",
+      reason: "context_missing",
+    })
+
+    const { rows } = await db.raw(`SELECT count(*)::int AS n FROM ${VENDOR_REPLAY_GUARD_TABLE}`)
+    expect(rows[0].n).toBe(2) // wiersze nietknięte
   })
 })

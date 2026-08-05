@@ -59,6 +59,10 @@
 import { createHash } from "crypto"
 
 import { toKnexPositionalSql } from "../knex-positional-sql"
+import {
+  requireMarketContext,
+  type SystemExecutionOrigin,
+} from "../system-market-context"
 
 /** Nazwa tabeli bariery. Zakładana przez `Migration20260816090000VendorReplayGuardTable`. */
 export const VENDOR_REPLAY_GUARD_TABLE = "vendor_replay_guard"
@@ -343,12 +347,60 @@ export async function claimReplayGuardKey(
 }
 
 /**
- * HIGIENA, NIE POPRAWNOŚĆ — odzyskuje miejsce po wygasłych wpisach.
+ * Wyrażenie przypisujące WIERSZ BARIERY do rynku (AD-21).
+ *
+ * Wiersz bariery nie niesie własnej kolumny rynku i to jest decyzja, nie
+ * przeoczenie: `/vendor/*` NIE ma kontekstu rynku (kontekst ustawia wyłącznie
+ * łańcuch `/store/*`, `api/middlewares.ts`), więc jedynym sposobem na kolumnę
+ * byłoby DOŁOŻENIE ODCZYTU sprzedawcy do gorącej ścieżki uwierzytelnienia —
+ * czyli drugiej wysyłki do bazy na żądanie, dokładnie tego, czego zabrania AC1
+ * (AD-23: bariera to JEDNA operacja). Atrybucja jest więc wyliczana DOPIERO
+ * przy sprzątaniu, gdzie kosztuje raz na 15 minut, a nie raz na żądanie.
+ *
+ * Wyrażenie jest tym samym, którym repo już posługuje się dla sprzedawców
+ * (`lib/review-market-scope.ts:66`): `seller.metadata->'gp'->>'market_id'`.
+ * Rozjazd tych dwóch miejsc oznaczałby dwie prawdy o tym, do jakiego rynku
+ * należy sprzedawca.
+ */
+export const REPLAY_GUARD_SELLER_MARKET_EXPR =
+  "seller.metadata->'gp'->>'market_id'"
+
+/** Opcje diagnostyczne sprzątania — trafiają do logu i metryki ODMOWY (NFR-2). */
+export type ReplayGuardPurgeOptions = {
+  origin?: SystemExecutionOrigin
+  logger?: {
+    warn?: (message: string, meta?: Record<string, unknown>) => void
+    error?: (message: string, meta?: Record<string, unknown>) => void
+  }
+}
+
+/**
+ * HIGIENA, NIE POPRAWNOŚĆ — odzyskuje miejsce po wygasłych wpisach
+ * ZADEKLAROWANEGO rynku.
  *
  * Świadomie NIE jest wołane ze ścieżki żądania i świadomie nie ma tu żadnego
  * harmonogramu. Werdykt bariery nie zależy od tego, czy ta funkcja kiedykolwiek
  * się wykona (okno siedzi w predykacie `claimReplayGuardKey`); zatrzymanie
  * sprzątania powoduje wyłącznie wzrost tabeli.
+ *
+ * ── Dlaczego to WOŁA NOŚNIK, a nie tylko przyjmuje `marketId` (AD-21) ──────
+ * To jest POWIERZCHNIA ZAPISU poza żądaniem HTTP: `DELETE` bez zadeklarowanego
+ * rynku skasowałby wiersze WSZYSTKICH rynków, a hook RLS przy braku kontekstu
+ * oddaje połączenie NIETKNIĘTE (rola aplikacyjna, dla której RLS nie
+ * obowiązuje) — czyli cichy zapis poza izolacją. Dlatego rynek pochodzi
+ * z `requireMarketContext`, a nie z argumentu: gdyby był argumentem, wołający,
+ * który go pominie (albo poda „wszystko"), obchodziłby kontrolę bez śladu.
+ * Brak kontekstu = ODMOWA GŁOŚNA (wyjątek + log + metryka), nie „skasuj wszystko".
+ * Wołający deklaruje rynki przez `runInSystemMarketContext` —
+ * `jobs/vendor-replay-guard-purge.ts`.
+ *
+ * ── Konsekwencja, która musi być nazwana ───────────────────────────────────
+ * Wiersze sprzedawców SPOZA zadeklarowanych rynków — oraz sprzedawców BEZ
+ * `metadata.gp.market_id` — NIE są kasowane. To jest wprost semantyka AD-21
+ * („kontekst bez rynku jest odmową, nie dostępem do wszystkiego"), a nie
+ * przeoczenie: ich retencja wymaga DEKLARACJI ich rynku, nie rozszerzenia
+ * uprawnień sprzątacza. Skutkiem jest wyłącznie wzrost tabeli (higiena),
+ * nigdy zmiana werdyktu bariery.
  *
  * Właściciel zobowiązania operacyjnego: Platform Ops (retencja tabel
  * technicznych backendu), tak jak dla pozostałych tabel-ledgerów `api`.
@@ -357,18 +409,32 @@ export async function claimReplayGuardKey(
  * komentarz nim NIE JEST. Bez odpalanego joba tabela w gorącej ścieżce
  * uwierzytelnienia rośnie o `86400 × R` wierszy dziennie i nigdy nie maleje.
  *
+ * @throws SystemMarketContextError gdy wywołanie leci poza kontekstem rynku —
+ *         PRZED jakąkolwiek wysyłką do bazy (zero wysyłek jest mierzalne).
  * @returns liczba skasowanych wierszy (do zalogowania przez job), albo `null`
  *          gdy sterownik nie podał licznika — brak licznika NIE jest błędem,
  *          bo sprzątanie nie decyduje o poprawności.
  */
 export async function purgeExpiredReplayGuardRows(
   db: ReplayGuardDb,
-  nowSec: number
+  nowSec: number,
+  options?: ReplayGuardPurgeOptions
 ): Promise<number | null> {
+  const { market_id: marketId } = requireMarketContext(
+    `${VENDOR_REPLAY_GUARD_TABLE}.purge`,
+    { origin: options?.origin, logger: options?.logger }
+  )
+
   const nowIso = new Date(nowSec * 1000).toISOString()
   const { text, bindings } = toKnexPositionalSql(
-    `DELETE FROM ${VENDOR_REPLAY_GUARD_TABLE} WHERE expires_at <= $1`,
-    [nowIso]
+    `DELETE FROM ${VENDOR_REPLAY_GUARD_TABLE}
+      WHERE expires_at <= $1
+        AND seller_id IN (
+          SELECT seller.id
+            FROM seller
+           WHERE ${REPLAY_GUARD_SELLER_MARKET_EXPR} = $2
+        )`,
+    [nowIso, marketId]
   )
   const result = await db.raw(text, bindings)
   return countDeletedRows(result)
