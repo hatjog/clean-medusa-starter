@@ -6,7 +6,8 @@
  * mocked Playwright route, the live verdict was BLOCKED_BY_RUNTIME.
  *
  * Behaviour:
- *   - withVendorAuth (HMAC) → vendorAuth.seller_id is the authenticated seller.
+ *   - The `/vendor/*` matcher (Story 5.4) authenticates the request and
+ *     populates vendorAuth.seller_id before this handler runs.
  *   - voucher.seller_id MUST match the authenticated seller (cross-vendor
  *     redeem returns 404 to avoid existence leak).
  *   - VoucherService.claim performs the atomic ACTIVE → claimed transition
@@ -23,7 +24,7 @@
  *
  * Validation:
  *   - 400 INVALID_INPUT — missing/short code
- *   - 401 UNAUTHORIZED — withVendorAuth fails (handled by HOF)
+ *   - 401 UNAUTHORIZED — refused by the /vendor/* gate, never reaches here
  *   - 404 VOUCHER_NOT_FOUND — code unknown OR cross-vendor lookup attempt
  *   - 410 VOUCHER_EXPIRED — voucher has expires_at < now
  *
@@ -40,7 +41,6 @@ import {
   resolveSellerMarketId,
   runInHttpMarketContext,
 } from "../../../../../lib/http-market-context"
-import { withVendorAuth } from "../../../../../lib/vendor-auth"
 import type { VendorAuthContext } from "../../../../../lib/vendor-auth"
 import { appendNotificationLog } from "../../../../../lib/vendor-notification-log"
 import {
@@ -70,7 +70,7 @@ type VendorRedeemResponse = {
   envelope: VendorRedeemAuditEnvelope
 }
 
-export const POST = withVendorAuth(async (
+export const POST = async (
   req: RequestWithVendorAuth,
   res: MedusaResponse,
 ): Promise<void> => {
@@ -113,7 +113,7 @@ export const POST = withVendorAuth(async (
       authenticatedSellerId,
     })
   })
-})
+}
 
 async function redeemInSellerMarket(
   req: RequestWithVendorAuth,

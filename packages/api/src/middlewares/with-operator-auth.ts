@@ -9,7 +9,8 @@
  * References:
  * - architecture-v1.2.0.md#auth-boundary — admin vs vendor separation
  * - architecture-v1.2.0.md#IP-6 — auth auto-discovery gate requirement
- * - Story 7.1 (withVendorAuth) — HOF pattern precedent
+ * - Story 7.1 (vendor auth) — HOF pattern precedent; note that the vendor side
+ *   left that pattern in v1.15.0 Story 5.4 (matcher `/vendor/*`, ADR-194)
  *
  * @module middlewares/with-operator-auth
  */

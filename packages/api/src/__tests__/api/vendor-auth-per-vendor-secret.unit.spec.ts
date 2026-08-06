@@ -1,7 +1,7 @@
 /**
  * v1.15.0 Story 5.2 — per-vendor HMAC secret resolution ON THE REQUEST ROUTE.
  *
- * Every case here runs through `withVendorAuth`, NOT through a direct call to
+ * Every case here runs through the REAL `/vendor/*` gate, NOT through a direct call to
  * `verifyVendorSignature`: a proof from a pure function is not a proof about the
  * route (NFR-1). AC1/AC2/AC3/AC5.
  *
@@ -15,7 +15,7 @@
 import { describe, it, expect, jest, beforeEach, afterEach } from "@jest/globals"
 
 import { buildVendorSignatureHeader } from "../../lib/vendor-hmac"
-import { withVendorAuth } from "../../lib/vendor-auth"
+import { withVendorGate } from "../helpers/vendor-auth-chain"
 import { createReplayGuardTestDb } from "../helpers/replay-guard-test-db"
 import {
   configureVendorSecretCryptoCore,
@@ -111,7 +111,7 @@ async function callRoute(header: string | undefined) {
     res.status(200).json({ ok: true })
   })
 
-  const wrapped = withVendorAuth(handler as any)
+  const wrapped = withVendorGate(handler as any)
   await wrapped(
     buildMockReq(header === undefined ? {} : { "x-vendor-signature": header }, logged),
     res,
@@ -121,7 +121,7 @@ async function callRoute(header: string | undefined) {
   return { status: captured.status, body: captured.body, logged, seen, handler }
 }
 
-describe("Story 5.2 — per-vendor secret resolution through withVendorAuth", () => {
+describe("Story 5.2 — per-vendor secret resolution through the /vendor/* gate", () => {
   const envBackup = { ...process.env }
 
   beforeEach(() => {

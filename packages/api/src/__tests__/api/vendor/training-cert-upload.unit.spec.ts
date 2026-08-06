@@ -38,7 +38,7 @@ import {
 } from "../../../../src/lib/vendor-secret/crypto-core"
 
 // ---------------------------------------------------------------------------
-// HMAC env setup — cleanup-48: withVendorAuth now requires HMAC signature
+// HMAC env setup — cleanup-48: the /vendor/* gate requires an HMAC signature
 // ---------------------------------------------------------------------------
 const CERT_TEST_SECRET = "cert-upload-test-hmac-secret-xxx"
 const CERT_TEST_SELLER = "cert-seller-test-uuid"
@@ -283,14 +283,14 @@ describe("training-cert upload route — real uploadHandler (review F5)", () => 
     expect(auditLog[0].input["status"]).toBe("rejected")
   })
 
-  // Case 5: Missing vendor signature → 401 (real withVendorAuth gate, cleanup-48 HMAC)
+  // Case 5: Missing vendor signature → 401 (real /vendor/* gate, cleanup-48 HMAC)
   // Verifies the inner handler is NEVER invoked when the signature header is
   // absent — therefore mockAppendLog cannot be reached.
-  it("case-5: missing vendor signature → 401, no audit row written (real withVendorAuth)", async () => {
-    const { withVendorAuth } = await import("../../../../src/lib/vendor-auth.js")
+  it("case-5: missing vendor signature → 401, no audit row written (real /vendor/* gate)", async () => {
+    const { withVendorGate } = await import("../../helpers/vendor-auth-chain.js")
 
     const innerCalled = jest.fn()
-    const wrapped = withVendorAuth(async (_req, _res, _next) => {
+    const wrapped = withVendorGate(async (_req, _res, _next) => {
       innerCalled()
     })
 
@@ -305,10 +305,10 @@ describe("training-cert upload route — real uploadHandler (review F5)", () => 
 
   // Case 6: Invalid vendor signature → 401 (wrong secret = HMAC mismatch)
   it("case-6: invalid vendor signature (wrong secret) → 401, no audit row written", async () => {
-    const { withVendorAuth } = await import("../../../../src/lib/vendor-auth.js")
+    const { withVendorGate } = await import("../../helpers/vendor-auth-chain.js")
 
     const innerCalled = jest.fn()
-    const wrapped = withVendorAuth(async (_req, _res, _next) => {
+    const wrapped = withVendorGate(async (_req, _res, _next) => {
       innerCalled()
     })
 

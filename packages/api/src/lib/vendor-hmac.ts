@@ -8,8 +8,10 @@
  * Signed payload: `${seller_id}.${ts}.${nonce}` (dot-joined, UTF-8)
  *
  * Design decisions (v1.6.0, superseded where noted):
- *   - Single shared secret (VENDOR_HMAC_SECRET) — SUPERSEDED by v1.15.0 Story 5.2:
- *     the secret is resolved PER SELLER by `lib/vendor-secret/crypto-core.ts`.
+ *   - Single shared secret in one env var — SUPERSEDED by v1.15.0 Story 5.2 (the
+ *     secret is resolved PER SELLER by `lib/vendor-secret/crypto-core.ts`) and
+ *     REMOVED FROM THE CODE by Story 5.4: no module in this package reads that
+ *     env var any more, which is what `vendor-secret-dual-window` measures.
  *   - Nonce dedup via in-process LRU bounded at 10k — SUPERSEDED by v1.15.0
  *     Story 5.3 (FR-11, AD-20, AD-23, ADR-185). `NonceLru`/`getSharedLru` are
  *     GONE, not merely unused: the in-process map could not see a replay aimed

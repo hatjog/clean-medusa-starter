@@ -29,6 +29,10 @@ import {
   scopeCustomerEmail,
 } from "../lib/customer-scoped-email";
 import { marketContextStorage } from "../lib/market-context";
+import {
+  VENDOR_HMAC_MATCHER,
+  vendorHmacGateMiddleware,
+} from "../lib/vendor-auth-matcher";
 import { recordRequest } from "../lib/request-log-aggregator";
 import { installRlsPoolHook, type HookLogger } from "../lib/rls-pool-hook";
 import { marketContextCache } from "../loaders/market-context-cache";
@@ -797,6 +801,18 @@ export default defineMiddlewares({
       method: ["POST"],
       matcher: "/store/account/magic-links/revoke-all",
       middlewares: [authenticate("customer", ["session", "bearer"])],
+    },
+    // v1.15.0 Story 5.4 (FR-11 domknięcie, AD-20, NFR-1, ADR-194):
+    // uwierzytelnienie `/vendor/*` wynika Z TEGO WPISU, nie z opakowania trasy.
+    // Przed 5.4 nowa trasa `/vendor/*` była domyślnie NIEUWIERZYTELNIONA aż do
+    // momentu, w którym ktoś pamiętał o `withVendorAuth` — ten HOF już nie
+    // istnieje, więc drugiej prawdy nie ma z czego zbudować.
+    // Zwolnienia (trasy browser-bearer / `seller_context`) są JAWNĄ, nazwaną
+    // listą w `lib/vendor-auth-matcher.ts`, a nie skutkiem kolejności wpisów:
+    // Medusa uruchamia KAŻDY pasujący wpis, więc kolejność niczego by nie zwalniała.
+    {
+      matcher: VENDOR_HMAC_MATCHER,
+      middlewares: [vendorHmacGateMiddleware],
     },
     {
       method: ["GET"],

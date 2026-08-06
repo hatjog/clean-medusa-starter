@@ -1,5 +1,20 @@
 /**
- * withVendorAuth — Higher-Order Function for vendor authentication (DD-25).
+ * vendor-auth — the ONE authentication point for `/vendor/*` (DD-25).
+ *
+ * v1.15.0 Story 5.4 (FR-11 closure, D-5, AD-20, SM-6, ADR-194):
+ *   - `withVendorAuth` (the per-route HOF) is DELETED. Authentication of
+ *     `/vendor/*` now follows from the MIDDLEWARE MATCHER
+ *     (`lib/vendor-auth-matcher.ts`, wired in `api/middlewares.ts`), so a NEW
+ *     `/vendor/*` route is authenticated by default instead of being
+ *     unauthenticated until someone remembers to wrap it.
+ *   - Keeping BOTH would not be "belt and braces", it would be an outage: since
+ *     Story 5.3 `resolveSellerFromRequest` CLAIMS the anti-replay key, so two
+ *     entry points on one request means two claims of the same key ⇒
+ *     `VENDOR_AUTH_REPLAY_DETECTED` on every LEGAL request. One point is not a
+ *     stylistic preference here; it is the only correct number.
+ *   - The shared `VENDOR_HMAC_SECRET` is gone from the codebase. Signing
+ *     material is per seller (Story 5.2) and nothing falls back to a shared
+ *     value — AD-20 forbids the fallback, it does not discourage it.
  *
  * Decision: Extend Mercur seller auth (token-based federation per ADR-034).
  * - Enforced mode (the only supported mode since cc-4 F-10): `x-vendor-signature`
@@ -10,8 +25,8 @@
  *   `x-vendor-token` as a seller_id substitute.
  *
  * v1.6.0 HMAC design notes (story: cleanup-48) — SUPERSEDED, kept for provenance:
- *   - Single shared secret (VENDOR_HMAC_SECRET env var) — superseded by Story 5.2
- *     (per-seller resolution, see the v1.15.0 note below).
+ *   - Single shared secret (one env var for every seller) — superseded by Story
+ *     5.2 (per-seller resolution) and REMOVED FROM THE CODE by Story 5.4.
  *   - Replay protection via in-process LRU (size 10k) and the standing "v1.7.0
  *     follow-up: Redis-backed distributed nonce cache" — superseded by Story 5.3.
  *     That follow-up was deferred for four releases and is now CLOSED, on
@@ -32,19 +47,20 @@
  *     for removal in v1.7.0 cleanup notes and is now overdue (v1.9.0+).
  *   - Setting `VENDOR_HMAC_ENFORCED=false` now FAILS CLOSED — the route
  *     returns a 503 telling operators the legacy path is gone.
- *   - The shared secret resolver (`vendor-hmac-config.ts`) still throws
- *     on missing `VENDOR_HMAC_SECRET`, so a missing env var is still a
- *     readable fatal at request time.
+ *   - (Story 5.4 note) `vendor-hmac-config.ts` used to ALSO throw on a missing
+ *     shared secret, which made an unset env var an outage of `/vendor/*`
+ *     even though the request path had stopped using that value. That coupling
+ *     is gone: the module now resolves policy only.
  * v1.15.0 Story 5.2 (FR-11 resolver member, AD-20, ADR-181, ADR-156):
- *   - The request path no longer verifies against the shared VENDOR_HMAC_SECRET.
+ *   - The request path does not verify against any shared secret.
  *     The secret is resolved PER SELLER by the backend crypto-core
  *     (`lib/vendor-secret/crypto-core.ts`) for the `seller_id` carried by the
  *     signature header. No fallback to the shared value exists — not even
  *     behind a flag (AD-20).
- *   - `VENDOR_HMAC_SECRET` is still read by `vendor-hmac-config.ts` (enforcement
- *     + drift), and still exists as `verify-all` comparison material inside the
- *     DATED dual-validity window declared in
- *     `specs/contracts/vendor-secret-dual-window.yaml`. Story 5.4 removes it.
+ *   - The dated dual-validity window opened here
+ *     (`specs/contracts/security/vendor-secret-dual-window.v1.yaml`) is CLOSED
+ *     by Story 5.4: the shared value is no longer read anywhere in production
+ *     code, and the gate measures that independently of today's date.
  * v1.15.0 Story 5.3 (FR-11 replay-guard member, AD-20, AD-23, ADR-185):
  *   - The in-process `NonceLru` is GONE. The anti-replay barrier is ONE atomic
  *     statement against a shared table (`lib/vendor-replay-guard/`), so a replay
@@ -63,7 +79,7 @@
  *     stalled cleanup job cannot change the barrier's verdict. Cleanup is
  *     hygiene only (`purgeExpiredReplayGuardRows`).
  *   - Because the barrier is asynchronous, `resolveSellerFromRequest` is now
- *     `async` and BOTH entry points below await it.
+ *     `async` and the (single, since 5.4) entry point below awaits it.
  *
  * @module vendor-auth
  */
@@ -136,7 +152,13 @@ type LoggerLike = {
   error?: (message: string) => void
 }
 
-type RequestWithVendorAuth = MedusaRequest & {
+/**
+ * A request that has already passed the `/vendor/*` matcher. `vendorAuth` is
+ * optional in the TYPE (Express hands the handler a plain `MedusaRequest`) but
+ * GUARANTEED at runtime for every non-exempt `/vendor/*` route: the gate either
+ * populates it or ends the response before the handler is reached.
+ */
+export type RequestWithVendorAuth = MedusaRequest & {
   vendorAuth?: VendorAuthContext
 }
 
@@ -193,7 +215,8 @@ async function resolveSellerFromRequest(
   if (!config.enforced) {
     logger.error?.(
       "[vendor-auth] VENDOR_HMAC_ENFORCED=false is no longer supported (cc-4 F-10). " +
-        "Remove the env var or set VENDOR_HMAC_ENFORCED=true and provide VENDOR_HMAC_SECRET."
+        "Remove the env var or set VENDOR_HMAC_ENFORCED=true; signing material is " +
+        "per seller and comes from the secret store, not from the environment."
     )
     return {
       ok: false,
@@ -225,13 +248,11 @@ async function resolveSellerFromRequest(
   const sigHeader = req.headers[VENDOR_SIGNATURE_HEADER]
   const sigValue = Array.isArray(sigHeader) ? sigHeader[0] : sigHeader
 
-  // AD-20: the secret is resolved for the `sellerId` CARRIED BY THE HEADER, and
-  // `config.secret` (the shared VENDOR_HMAC_SECRET) is deliberately NOT passed
-  // here any more. There is no fallback branch — a seller without a per-vendor
-  // secret gets 401 even when a valid shared secret is present in the env.
-  // The shared value survives only as `verify-all` comparison material inside
-  // the dated dual-validity window (specs/contracts/vendor-secret-dual-window.yaml);
-  // Story 5.4 removes it.
+  // AD-20: the secret is resolved for the `sellerId` CARRIED BY THE HEADER.
+  // There is no fallback branch and, since Story 5.4, no shared value to fall
+  // back TO: `VendorHmacConfig` carries policy only (enforcement + drift), so a
+  // fallback cannot be reintroduced by accident — there is nothing to reach for.
+  // A seller without a per-vendor secret gets 401, never a shared-secret pass.
   const nowSec = Math.floor(Date.now() / 1000)
   const result = verifyVendorSignature(
     sigValue,
@@ -358,80 +379,15 @@ async function resolveSellerFromRequest(
 }
 
 /**
- * withVendorAuth — HOF middleware factory for vendor-authenticated routes.
+ * vendorAuthMiddleware — the ONE authentication point for `/vendor/*`.
  *
- * Wraps a route handler to inject `req.vendorAuth` context.
- * When VENDOR_HMAC_ENFORCED=true (default): validates x-vendor-signature HMAC.
- * When VENDOR_HMAC_ENFORCED=false: accepts legacy x-vendor-token (transition window).
- * If resolveVendorId is still a stub (NotImplementedError), responds with 501.
- */
-export function withVendorAuth(
-  handler: (
-    req: RequestWithVendorAuth,
-    res: MedusaResponse,
-    next: MedusaNextFunction
-  ) => Promise<void> | void
-) {
-  return async (
-    req: MedusaRequest,
-    res: MedusaResponse,
-    next: MedusaNextFunction
-  ): Promise<void> => {
-    const logger = resolveLogger(req.scope)
-
-    const sellerResult = await resolveSellerFromRequest(req, logger)
-    if (!sellerResult.ok) {
-      res.status(sellerResult.status).json({
-        code: sellerResult.code,
-        message: sellerResult.message,
-      })
-      return
-    }
-
-    const { sellerId } = sellerResult
-
-    const gpCore = resolveGpCore(req.scope)
-    if (!gpCore) {
-      logger.warn?.("[vendor-auth] GpCoreService not available")
-      res.status(503).json({
-        message: "Vendor authentication service unavailable",
-      })
-      return
-    }
-
-    try {
-      const vendorId = await gpCore.resolveVendorId(sellerId)
-      const vendorReq = req as RequestWithVendorAuth
-      vendorReq.vendorAuth = {
-        vendor_id: vendorId,
-        seller_id: sellerId,
-      }
-
-      logger.info?.(`[vendor-auth] authenticated vendor=${vendorId} seller=${sellerId}`)
-      await handler(vendorReq, res, next)
-    } catch (error) {
-      if (error instanceof NotImplementedError) {
-        // Graceful 501 — resolveVendorId is still a stub (Story 1.3)
-        logger.warn?.(`[vendor-auth] resolveVendorId stub: ${error.message}`)
-        res.status(501).json({
-          message: "Vendor ID resolution not yet implemented",
-          stub: true,
-          story: "1.3",
-        })
-        return
-      }
-
-      logger.error?.(`[vendor-auth] error resolving vendor: ${String(error)}`)
-      res.status(500).json({
-        message: "Vendor authentication failed",
-      })
-    }
-  }
-}
-
-/**
- * vendorAuthMiddleware — Standalone middleware that injects vendorAuth context.
- * Use when you need vendorAuth on a route without wrapping the handler.
+ * Wired by the `/vendor/*` matcher (`lib/vendor-auth-matcher.ts` →
+ * `api/middlewares.ts`), never per route. Do NOT also wrap a route handler in
+ * an authentication HOF: `resolveSellerFromRequest` claims the anti-replay key
+ * (Story 5.3), so a second pass over the same request claims the same key twice
+ * and every legal request would answer `401 VENDOR_AUTH_REPLAY_DETECTED`.
+ * That is not a hypothetical — it is covered by an execution test
+ * (`__tests__/middlewares/vendor-auth-matcher.unit.spec.ts`).
  */
 export async function vendorAuthMiddleware(
   req: MedusaRequest,

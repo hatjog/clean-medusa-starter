@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto"
 
 import type { MedusaNextFunction, MedusaRequest, MedusaResponse } from "@medusajs/framework/http"
 
-import { withVendorAuth, type VendorAuthContext } from "../../../../lib/vendor-auth"
+import type { VendorAuthContext } from "../../../../lib/vendor-auth"
 import { sniffMagicBytes } from "../../../../lib/magic-byte-sniffer"
 import { getMaxUploadBytes } from "../../../../lib/training-cert-upload-config"
 import {
@@ -296,4 +296,6 @@ export async function uploadHandler(
   })
 }
 
-export const postTrainingCertUpload = withVendorAuth(uploadHandler)
+// Story 5.4: authentication comes from the `/vendor/*` matcher, so the handler
+// is exported bare. Wrapping it again would claim the anti-replay key twice.
+export const postTrainingCertUpload = uploadHandler

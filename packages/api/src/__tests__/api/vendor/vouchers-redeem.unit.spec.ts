@@ -10,10 +10,10 @@
  *   - L6  — POST /vendor/vouchers/:code/redeem → idempotent on second call
  *   - L7  — POST /vendor/vouchers/:code/redeem → 410 on expired voucher
  *
- * Strategy: bypass the withVendorAuth HMAC by stubbing process.env to a
- * known shared secret. The handler signs/verifies via the production
- * helpers; no Mercur DB is touched. VoucherService is mocked at the
- * container resolve seam.
+ * Strategy: run the route through the REAL `/vendor/*` gate (Story 5.4) with a
+ * signature made from the seller's own provisioned secret. The handler
+ * signs/verifies via the production helpers; no Mercur DB is touched.
+ * VoucherService is mocked at the container resolve seam.
  */
 import { describe, it, expect, beforeEach, afterEach, jest } from "@jest/globals"
 import { buildVendorSignatureHeader } from "../../../lib/vendor-hmac"
@@ -22,8 +22,15 @@ import {
   configureVendorSecretCryptoCore,
   resetVendorSecretCryptoCore,
 } from "../../../lib/vendor-secret/crypto-core"
-import { GET as lookupGET } from "../../../api/vendor/vouchers/[code]/lookup/route"
-import { POST as redeemPOST } from "../../../api/vendor/vouchers/[code]/redeem/route"
+import { GET as lookupHandler } from "../../../api/vendor/vouchers/[code]/lookup/route"
+import { POST as redeemHandler } from "../../../api/vendor/vouchers/[code]/redeem/route"
+import { withVendorGate } from "../../helpers/vendor-auth-chain"
+
+// Story 5.4: the route handlers are bare; authentication is the /vendor/*
+// matcher. Calling them directly would measure the route with NO auth at all,
+// so every case below goes through the production gate first.
+const lookupGET = withVendorGate(lookupHandler)
+const redeemPOST = withVendorGate(redeemHandler)
 
 const HMAC_SECRET = "vendor-redeem-test-secret"
 const SELLER_ID = "seller_test_001"
@@ -35,7 +42,11 @@ const savedEnv: Record<string, string | undefined> = {}
 beforeEach(() => {
   savedEnv.VENDOR_HMAC_SECRET = process.env.VENDOR_HMAC_SECRET
   savedEnv.VENDOR_HMAC_ENFORCED = process.env.VENDOR_HMAC_ENFORCED
-  process.env.VENDOR_HMAC_SECRET = HMAC_SECRET
+  // Story 5.4 (AC1): the shared secret is UNSET, not set-to-something. The
+  // suite passes because the signature is verified against the SELLER'S OWN
+  // secret from the crypto-core below — before 5.4 this same line produced
+  // 503 VENDOR_AUTH_CONFIG_ERROR on every case.
+  delete process.env.VENDOR_HMAC_SECRET
   process.env.VENDOR_HMAC_ENFORCED = "true"
   // v1.15.0 Story 5.2: the route resolves the HMAC secret PER SELLER, so this
   // suite provisions `SELLER_ID` in the crypto-core. Only the way the secret is
