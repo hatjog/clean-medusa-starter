@@ -20,6 +20,7 @@ import {
 } from "./middlewares/brevo-hmac-validator";
 import { paymentStatusRateLimitMiddleware } from "./middlewares/payment-status-rate-limit";
 import { upstreamOrderAccessGuardMiddleware } from "./middlewares/upstream-order-access-guard";
+import { cartCompletionAuthorizationGuardMiddleware } from "./middlewares/cart-completion-authorization-guard";
 import {
   CUSTOMER_MARKET_FORBIDDEN_MESSAGE,
   isScopedToMarket,
@@ -762,6 +763,18 @@ export default defineMiddlewares({
       method: ["POST"],
       matcher: "/webhooks/stripe/payment-intent",
       bodyParser: { preserveRawBody: true },
+    },
+    // Story 3.5 review-fix (FR-6c, AD-22; AC4 pozycja 4 — EC-43).
+    // Opakowanie po NASZEJ stronie wykrywajace nieodwrocone obciazenie:
+    // kompensacja `authorizePaymentSessionStep` w @medusajs/core-flows wychodzi
+    // wczesnie przy REQUIRES_MORE i polyka blad `cancelPayment` do loga, wiec
+    // nieudany completion koszyka zostawial obciazenie BEZ zamowienia i bez
+    // ani jednego trwalego sladu. Guard nie anuluje platnosci — sprawia, ze
+    // przestaje ona znikac w ciszy.
+    {
+      method: ["POST"],
+      matcher: "/store/carts/:id/complete",
+      middlewares: [cartCompletionAuthorizationGuardMiddleware],
     },
     {
       method: ["POST"],

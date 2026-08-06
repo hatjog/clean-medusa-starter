@@ -72,8 +72,10 @@ import {
 } from "../../../../lib/payment/stripe-payment-intent-transport"
 import {
   buildPurchaseCorrelationKey,
+  findOpenCompensationFailures,
   reportCompensationFailure,
   type CompensationFailureRecord,
+  type RecordedCompensationFailure,
 } from "../../../../lib/payment/money-path-compensation-registry"
 import {
   STRIPE_SIGNATURE_HEADER,
@@ -296,7 +298,90 @@ export async function POST(
     }
 
     if (!reserved) {
-      // Ta sama dostawa już przyjęta (np. `stripe events resend`). ACK bez emisji.
+      // ── Story 3.5 review-fix (AC2/AC3) ────────────────────────────────────
+      // `duplicate` NIE jest bezwarunkowo ciszą do zaACK-owania. Rezerwacja
+      // ŻYJE także wtedy, gdy jej zwolnienie (kompensacja) padło — i wtedy
+      // dokładnie TA gałąź łapie ponowienia Stripe'a. Odpowiedź `200
+      // { received: true }` kasowałaby tu ostatnią szansę na odzysk, a
+      // `attempt_count` w rejestrze na zawsze zostawałby na 1, choć Stripe
+      // pukał wielokrotnie.
+      //
+      // Rozstrzyga REJESTR, nie domysł: jeśli dla tej dostawy jest wiersz
+      // `resolution_state = 'open'`, ponowienie jest kolejną próbą TEJ SAMEJ
+      // nieudanej kompensacji.
+      let openFailures: RecordedCompensationFailure[]
+      try {
+        openFailures = await findOpenCompensationFailures(handle.client, {
+          delivery_path: STRIPE_PATH_Y_WEBHOOK_PROVIDER,
+          stripe_event_id: deliveryEventId,
+        })
+      } catch (err) {
+        // Nie wiemy, czy dostawa jest czysta, czy niesie otwartą porażkę.
+        // ACK przy nieznanym stanie byłby decyzją nieodwracalną podjętą
+        // w imieniu klientki — zachowujemy ponowienie.
+        logger.error?.(
+          `[stripe/payment-intent] odczyt rejestru kompensacji dla ` +
+            `${deliveryEventId} nieudany: ${(err as Error).message}`
+        )
+        res.status(500).json({
+          type: "db_unavailable",
+          reason: "compensation_registry_lookup_failed",
+        })
+        return
+      }
+
+      if (openFailures.length > 0) {
+        // Ponowienie tej samej nieudanej kompensacji: DOPISUJEMY próbę
+        // (`ON CONFLICT … attempt_count + 1`) i znów zachowujemy ponowienie.
+        // Wiersz zamyka operator (`resolution_state`), nie milczący ACK.
+        const records: CompensationFailureRecord[] = resolution.orders.map(
+          (order) => ({
+            market_id: order.market_id,
+            compensation_kind: "webhook_delivery_release",
+            delivery_path: STRIPE_PATH_Y_WEBHOOK_PROVIDER,
+            stripe_event_id: deliveryEventId,
+            payment_intent_id: paymentIntentId,
+            order_id: order.order_id,
+            purchase_correlation_key: buildPurchaseCorrelationKey(paymentIntentId),
+            // TEN SAM `failure_code` co przy pierwszej porażce — inaczej
+            // `failure_id` byłby inny i powstałby DRUGI wiersz zamiast próby.
+            failure_code: "delivery_release_failed",
+            failure_detail:
+              `ponowna dostawa ${deliveryEventId} przy nierozstrzygnietej ` +
+              "kompensacji rezerwacji (rezerwacja nadal zyje, emisji nie bylo)",
+          })
+        )
+        const reported = await reportCompensationFailure(
+          req.scope,
+          handle.client,
+          records
+        )
+
+        logger.error?.(
+          `[stripe/payment-intent] ponowna dostawa ${deliveryEventId} trafia ` +
+            `w NIEROZSTRZYGNIETA nieudana kompensacje ` +
+            `(${openFailures.map((row) => row.failure_id).join(",")}) — ` +
+            "ACK wstrzymany, ponowienie zachowane"
+        )
+
+        res.status(500).json({
+          type: "compensation_failed",
+          reason: "delivery_release_unresolved",
+          registry_persisted: reported.persisted,
+          registry_failure_ids: openFailures.map((row) => row.failure_id),
+          ...(reported.persisted
+            ? {
+                registry_attempt_counts: reported.rows.map(
+                  (row) => row.attempt_count
+                ),
+              }
+            : { registry_error: reported.registry_error }),
+        })
+        return
+      }
+
+      // Ta sama dostawa już przyjęta (np. `stripe events resend`) i rejestr
+      // NIE zna dla niej otwartej porażki. ACK bez emisji.
       // Druga warstwa (`event_processed` po payment_intent_id + order_id) i tak
       // nie dopuści drugiego kompletu voucherów, ale zatrzymanie tutaj oszczędza
       // cały przebieg.
@@ -364,7 +449,12 @@ export async function POST(
             "zdeduplikowana mimo braku emisji; wymaga ręcznego usunięcia wiersza" +
             (reported.persisted
               ? ` — rejestr: ${reported.rows.map((row) => row.failure_id).join(",")}`
-              : ` — ZAPIS DO REJESTRU RÓWNIEŻ PADŁ: ${reported.registry_error}`)
+              : reported.partial
+                ? ` — ZAPIS DO REJESTRU CZĘŚCIOWY (${reported.rows.length}/` +
+                  `${records.length}): ${reported.rows
+                    .map((row) => row.failure_id)
+                    .join(",")}; blad: ${reported.registry_error}`
+                : ` — ZAPIS DO REJESTRU RÓWNIEŻ PADŁ: ${reported.registry_error}`)
         )
 
         // Ogniwo 4: kod odpowiedzi ZACHOWUJĄCY ponowienie po stronie Stripe'a.
@@ -377,13 +467,19 @@ export async function POST(
           type: "compensation_failed",
           reason: reported.persisted
             ? "delivery_release_failed"
-            : "delivery_release_failed_registry_unavailable",
+            : reported.partial
+              ? "delivery_release_failed_registry_partial"
+              : "delivery_release_failed_registry_unavailable",
           emit_error: error.message,
           release_error: releaseError.message,
           registry_persisted: reported.persisted,
-          ...(reported.persisted
+          // Adresy wierszy, które SĄ w bazie, jadą ZAWSZE — także przy zapisie
+          // częściowym. Milczenie o nich kazałoby operatorowi szukać śladu tam,
+          // gdzie mu powiedziano, że go nie ma.
+          ...(reported.rows.length > 0
             ? { registry_failure_ids: reported.rows.map((row) => row.failure_id) }
-            : { registry_error: reported.registry_error }),
+            : {}),
+          ...(reported.persisted ? {} : { registry_error: reported.registry_error }),
         })
         return
       }

@@ -19,13 +19,15 @@ jest.mock("../../../../../lib/payment/stripe-payment-intent-metadata-stamp", () 
 
 import { POST } from "../route"
 import { STRIPE_SIGNATURE_HEADER } from "../helpers"
-import { Modules } from "@medusajs/framework/utils"
+import { ContainerRegistrationKeys, Modules } from "@medusajs/framework/utils"
 import { getRingBuffer, _resetRingBuffer } from "../../../../../lib/alert-emit"
 import {
   buildCompensationFailureId,
   buildPurchaseCorrelationKey,
   COMPENSATION_FAILURE_ALERT_CODE,
   COMPENSATION_FAILURE_STDERR_PREFIX,
+  reportCompensationFailure,
+  type CompensationFailureRecord,
 } from "../../../../../lib/payment/money-path-compensation-registry"
 import { STRIPE_PATH_Y_WEBHOOK_PROVIDER } from "../../../../../lib/payment/stripe-payment-intent-transport"
 
@@ -108,20 +110,64 @@ type RegistryRow = {
  * `registry` jest tabelą: `ON CONFLICT (failure_id) DO UPDATE` jest tu
  * ODWZOROWANE, żeby test idempotencji mierzył zachowanie, a nie mock.
  */
-function makeHarness(options: { failRelease: boolean; failRegistry: boolean }) {
+function makeHarness(options: {
+  failRelease: boolean
+  failRegistry: boolean
+  /**
+   * Którym nośnikiem dysponuje kontener — ROZSTRZYGA, czy `openRegistryWriter`
+   * ma skąd wziąć połączenie ROZŁĄCZNE z uchwytem route'u.
+   *
+   *  * `pool`        — `__pg_pool__` (dialekt `$N`). W tym repo NIE jest
+   *                    nigdzie rejestrowany; wariant trzymamy, bo kod go
+   *                    obsługuje, ale nie jest to ścieżka produkcyjna.
+   *  * `knex`        — `PG_CONNECTION` ze sterownikiem
+   *                    (`acquireConnection`/`releaseConnection`). To JEST
+   *                    ścieżka produkcyjna i do tego review-fixu nie wykonywał
+   *                    jej żaden test.
+   *  * `knex-no-acquire` — `PG_CONNECTION` BEZ sterownika: rozłącznego
+   *                    połączenia wziąć się nie da, więc `origin` MUSI zejść
+   *                    na `caller`. Kontrola dodatnia dla degradacji, która
+   *                    wcześniej była nieosiągalna.
+   */
+  transport?: "pool" | "knex" | "knex-no-acquire"
+  /** Dostawa uznana za już zarezerwowaną ⇒ route wchodzi w gałąź `duplicate`. */
+  deliveryAlreadyReserved?: boolean
+  /** Wiersze `resolution_state = 'open'` widziane przez `findOpenCompensationFailures`. */
+  openFailures?: Array<{ failure_id: string; attempt_count: number; order_id: string | null }>
+}) {
+  const transport = options.transport ?? "pool"
   const registry = new Map<string, RegistryRow>()
   const deliveries = new Set<string>()
   const sqlSeen: string[] = []
   const emitAttempts: number[] = []
   const connects: string[] = []
+  /** Etykiety klientów w kolejności ich WYDANIA (pula/sterownik). */
+  const connectedLabels: string[] = []
+  /** Identyfikatory obiektów-klientów, którymi FAKTYCZNIE pisano rejestr. */
+  const registryWrittenBy: string[] = []
 
-  const client = {
-    query: async (sql: string, values: ReadonlyArray<unknown> = []) => {
+  const runQuery = async (
+    label: string,
+    sql: string,
+    values: ReadonlyArray<unknown> = []
+  ) => {
       sqlSeen.push(sql)
 
       if (/INSERT INTO webhook_event_processed/i.test(sql)) {
-        deliveries.add(`${values[0]}|${values[1]}`)
+        const key = `${values[0]}|${values[1]}`
+        if (options.deliveryAlreadyReserved) {
+          // `ON CONFLICT … DO NOTHING` — rezerwacja JUŻ istnieje.
+          return { rows: [], rowCount: 0 }
+        }
+        deliveries.add(key)
         return { rows: [], rowCount: 1 }
+      }
+
+      if (/FROM money_path_compensation_failure/i.test(sql)) {
+        return {
+          rows: options.openFailures ?? [],
+          rowCount: (options.openFailures ?? []).length,
+        }
       }
 
       if (/DELETE FROM webhook_event_processed/i.test(sql)) {
@@ -133,6 +179,7 @@ function makeHarness(options: { failRelease: boolean; failRegistry: boolean }) {
       }
 
       if (/INSERT INTO money_path_compensation_failure/i.test(sql)) {
+        registryWrittenBy.push(label)
         if (options.failRegistry) {
           throw new Error("PG: relation money_path_compensation_failure unavailable")
         }
@@ -178,9 +225,54 @@ function makeHarness(options: { failRelease: boolean; failRegistry: boolean }) {
       }
 
       return { rows: [], rowCount: 0 }
-    },
-    release: () => {},
   }
+
+  /**
+   * Każde wywołanie daje ODRĘBNY obiekt klienta nad TYM SAMYM składem danych —
+   * dokładnie tak, jak zachowuje się pula połączeń. Poprzednia wersja atrapy
+   * zwracała z `connect()` TEN SAM obiekt, którym posługiwał się route, więc
+   * asercja „zapis idzie świeżym połączeniem" nie mierzyła rozłączności
+   * i świeciła zielono na kodzie, który rozłączności nie zapewniał.
+   */
+  let clientSeq = 0
+  function makeClient(kind: string) {
+    const label = `${kind}#${++clientSeq}`
+    return {
+      label,
+      query: async (sql: string, values: ReadonlyArray<unknown> = []) =>
+        runQuery(label, sql, values),
+      release: () => {},
+    }
+  }
+
+  /** Sterownik Knexa — `raw` dostaje SQL już przekonwertowany na `?`. */
+  function makeKnex() {
+    const rawClient = makeClient("knex-raw")
+    const acquired: Array<{ label: string }> = []
+    const released: string[] = []
+    const driver = {
+      acquireConnection: async () => {
+        const conn = makeClient("knex-acquired")
+        acquired.push(conn)
+        connects.push("acquireConnection")
+        connectedLabels.push(conn.label)
+        return conn
+      },
+      releaseConnection: async (conn: { label: string }) => {
+        released.push(conn.label)
+      },
+    }
+    return {
+      raw: async (sql: string, bindings: ReadonlyArray<unknown> = []) =>
+        rawClient.query(sql, bindings),
+      ...(transport === "knex" ? { client: driver } : {}),
+      _acquired: acquired,
+      _released: released,
+      _rawLabel: rawClient.label,
+    }
+  }
+
+  const knex = makeKnex()
 
   const req = {
     rawBody: Buffer.from(""),
@@ -189,12 +281,23 @@ function makeHarness(options: { failRelease: boolean; failRegistry: boolean }) {
       resolve: (key: string) => {
         if (key === "logger") return { info() {}, warn() {}, error() {} }
         if (key === "__pg_pool__") {
+          if (transport !== "pool") {
+            throw new Error("unresolved __pg_pool__")
+          }
           return {
             connect: async () => {
               connects.push("__pg_pool__")
-              return client
+              const conn = makeClient("pool")
+              connectedLabels.push(conn.label)
+              return conn
             },
           }
+        }
+        if (key === ContainerRegistrationKeys.PG_CONNECTION) {
+          if (transport === "pool") {
+            throw new Error("unresolved PG_CONNECTION")
+          }
+          return knex
         }
         if (key === Modules.EVENT_BUS) {
           return {
@@ -215,7 +318,17 @@ function makeHarness(options: { failRelease: boolean; failRegistry: boolean }) {
     return req
   }
 
-  return { withBody, registry, deliveries, sqlSeen, emitAttempts, connects }
+  return {
+    withBody,
+    registry,
+    deliveries,
+    sqlSeen,
+    emitAttempts,
+    connects,
+    connectedLabels,
+    registryWrittenBy,
+    knex,
+  }
 }
 
 function captureStderr(): { lines: string[]; restore: () => void } {
@@ -308,6 +421,70 @@ describe("Story 3.5 AC1 — nieudana kompensacja kończy się WPISEM W BAZIE i A
       (entry) => entry.code === COMPENSATION_FAILURE_ALERT_CODE
     )
     expect(alerts[0].context?.registry_writer_origin).toBe("fresh")
+
+    // Sedno: rejestr pisał INNY obiekt klienta niż ten, którym route wykonał
+    // `DELETE`. Bez tej asercji `origin: "fresh"` jest deklaracją, nie pomiarem
+    // — poprzednia wersja atrapy zwracała z `connect()` TEN SAM obiekt.
+    expect(h.registryWrittenBy).toHaveLength(1)
+    // Route dostał PIERWSZE wydane połączenie, rejestr — DRUGIE, rozłączne.
+    expect(h.connectedLabels.length).toBeGreaterThanOrEqual(2)
+    expect(h.registryWrittenBy[0]).not.toBe(h.connectedLabels[0])
+    expect(h.registryWrittenBy[0]).toBe(h.connectedLabels[1])
+  })
+
+  it("ŚCIEŻKA PRODUKCYJNA (Knex, bez `__pg_pool__`): rejestr bierze połączenie ROZŁĄCZNE przez `acquireConnection`", async () => {
+    // `__pg_pool__` nie jest w tym repo rejestrowany przez nic — ani przez kod,
+    // ani przez framework. Do tego review-fixu gałąź Knexa nie była wykonana
+    // przez ŻADEN test, a `resolveWebhookPgHandle` zwracał w niej opakowanie tej
+    // samej instancji Knexa, meldując mimo to `origin: "fresh"`.
+    const h = makeHarness({
+      failRelease: true,
+      failRegistry: false,
+      transport: "knex",
+    })
+    const raw = JSON.stringify(stripePiEvent())
+    const res = makeRes()
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await POST(h.withBody(raw) as any, res as any)
+
+    const alerts = getRingBuffer().filter(
+      (entry) => entry.code === COMPENSATION_FAILURE_ALERT_CODE
+    )
+    expect(alerts[0].context?.registry_writer_origin).toBe("fresh")
+
+    // Połączenie wzięte ze sterownika, nie z `knex.raw` wołającego…
+    expect(h.connects).toContain("acquireConnection")
+    expect(h.knex._acquired).toHaveLength(1)
+    // …i faktycznie NIM zapisany rejestr…
+    expect(h.registryWrittenBy).toEqual([h.knex._acquired[0].label])
+    expect(h.registryWrittenBy[0]).not.toBe(h.knex._rawLabel)
+    // …oraz oddany do puli, a nie wyciekły.
+    expect(h.knex._released).toEqual([h.knex._acquired[0].label])
+
+    // Wiersz naprawdę powstał — inaczej mierzylibyśmy samo `origin`.
+    expect(Array.from(h.registry.values())).toHaveLength(1)
+  })
+
+  it("KONTROLA DODATNIA degradacji: bez sterownika Knexa `origin` schodzi na `caller`, a wpis NADAL powstaje", async () => {
+    const h = makeHarness({
+      failRelease: true,
+      failRegistry: false,
+      transport: "knex-no-acquire",
+    })
+    const raw = JSON.stringify(stripePiEvent())
+    const res = makeRes()
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await POST(h.withBody(raw) as any, res as any)
+
+    const alerts = getRingBuffer().filter(
+      (entry) => entry.code === COMPENSATION_FAILURE_ALERT_CODE
+    )
+    // Degradacja jest JAWNA — wcześniej ta gałąź była w produkcji nieosiągalna,
+    // więc pole `registry_writer_origin` nie niosło żadnego rozróżnienia.
+    expect(alerts[0].context?.registry_writer_origin).toBe("caller")
+    expect(h.connects).not.toContain("acquireConnection")
+    // Degradacja NIE jest utratą nośnika: wiersz jest w bazie mimo `caller`.
+    expect(Array.from(h.registry.values())).toHaveLength(1)
   })
 
   it("ponowna dostawa TEGO SAMEGO `evt_…` NIE mnoży wierszy i NIE gubi kolejnej próby", async () => {
@@ -398,6 +575,188 @@ describe("Story 3.5 AC3 — cisza jest niemożliwa TAKŻE gdy padnie sam zapis d
     expect(res.statusCode).toBe(500)
     expect(res.body?.type).toBe("emit_failed")
     expect(Array.from(h.registry.values())).toHaveLength(0)
+    expect(
+      getRingBuffer().filter((e) => e.code === COMPENSATION_FAILURE_ALERT_CODE)
+    ).toHaveLength(0)
+  })
+})
+
+describe("Story 3.5 AC2/AC3 review-fix — ponowienie Stripe'a NIE ląduje w ciszy `duplicate`", () => {
+  it("ponowna dostawa przy OTWARTEJ nieudanej kompensacji ⇒ 500, nie `200 { received: true, duplicate: true }`", async () => {
+    // To jest gałąź, w którą ponowienia Stripe'a wchodzą NAPRAWDĘ: rezerwacja
+    // żyje, bo jej zwolnienie padło, więc `reserveWebhookDelivery` zwraca
+    // `false`. Przed tym fixem odpowiedzią było `200 { received: true }` —
+    // ta sama cisza, którą AC3 zakazuje o dwie linie wyżej, a `attempt_count`
+    // pozostawał na 1 mimo N ponowień.
+    const h = makeHarness({
+      failRelease: false,
+      failRegistry: false,
+      deliveryAlreadyReserved: true,
+      openFailures: [
+        { failure_id: "mpcf_otwarta_porazka", attempt_count: 1, order_id: "order_3_5_a" },
+      ],
+    })
+    const raw = JSON.stringify(stripePiEvent())
+    const res = makeRes()
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await POST(h.withBody(raw) as any, res as any)
+
+    expect(res.statusCode).toBe(500)
+    expect(res.body?.type).toBe("compensation_failed")
+    expect(res.body?.reason).toBe("delivery_release_unresolved")
+    expect(res.body?.received).toBeUndefined()
+    expect(res.body?.duplicate).toBeUndefined()
+    expect(res.body?.registry_failure_ids).toEqual(["mpcf_otwarta_porazka"])
+
+    // Ponowienie zostało DOPISANE jako kolejna próba, a nie zgubione.
+    const rows = Array.from(h.registry.values())
+    expect(rows).toHaveLength(1)
+    expect(rows[0].failure_detail).toContain("ponowna dostawa")
+
+    // Emisji NIE było — to nadal duplikat, tylko nie zaACK-owany.
+    expect(h.emitAttempts).toHaveLength(0)
+  })
+
+  it("`attempt_count` ROŚNIE przez realną gałąź ponowienia, nie tylko przez bezpośrednie wołanie modułu", async () => {
+    const failureId = buildCompensationFailureId({
+      delivery_path: STRIPE_PATH_Y_WEBHOOK_PROVIDER,
+      stripe_event_id: EVT_ID,
+      compensation_kind: "webhook_delivery_release",
+      failure_code: "delivery_release_failed",
+      order_id: "order_3_5_a",
+    })
+    const h = makeHarness({
+      failRelease: false,
+      failRegistry: false,
+      deliveryAlreadyReserved: true,
+      openFailures: [{ failure_id: failureId, attempt_count: 1, order_id: "order_3_5_a" }],
+    })
+    const raw = JSON.stringify(stripePiEvent())
+
+    for (const _ of [1, 2, 3]) {
+      const res = makeRes()
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await POST(h.withBody(raw) as any, res as any)
+      expect(res.statusCode).toBe(500)
+    }
+
+    const rows = Array.from(h.registry.values())
+    expect(rows).toHaveLength(1)
+    expect(rows[0].failure_id).toBe(failureId)
+    // Trzy ponowienia = trzy próby na JEDNYM wierszu.
+    expect(rows[0].attempt_count).toBe(3)
+  })
+
+  it("gdy rejestr NIE zna otwartej porażki, `duplicate` nadal jest zwykłym ACK", async () => {
+    // Kontrola dodatnia w drugą stronę: fix nie może zamienić każdego
+    // `stripe events resend` w wieczne 500.
+    const h = makeHarness({
+      failRelease: false,
+      failRegistry: false,
+      deliveryAlreadyReserved: true,
+      openFailures: [],
+    })
+    const raw = JSON.stringify(stripePiEvent())
+    const res = makeRes()
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await POST(h.withBody(raw) as any, res as any)
+
+    expect(res.statusCode).toBe(200)
+    expect(res.body?.duplicate).toBe(true)
+    expect(res.body?.reason).toBe("delivery_already_processed")
+    expect(Array.from(h.registry.values())).toHaveLength(0)
+  })
+})
+
+describe("Story 3.5 review-fix — zapis CZĘŚCIOWY nie jest raportowany jako brak zapisu", () => {
+  function record(orderId: string): CompensationFailureRecord {
+    return {
+      market_id: "bonbeauty",
+      compensation_kind: "webhook_delivery_release",
+      delivery_path: STRIPE_PATH_Y_WEBHOOK_PROVIDER,
+      stripe_event_id: EVT_ID,
+      payment_intent_id: PI_ID,
+      order_id: orderId,
+      purchase_correlation_key: buildPurchaseCorrelationKey(PI_ID),
+      failure_code: "delivery_release_failed",
+      failure_detail: "PG: connection terminated during DELETE",
+    }
+  }
+
+  /** Klient, który zapisuje pierwszy wiersz, a na drugim rzuca. */
+  function partialClient() {
+    const written: string[] = []
+    return {
+      written,
+      client: {
+        query: async (_sql: string, values: ReadonlyArray<unknown> = []) => {
+          if (written.length >= 1) {
+            throw new Error("PG: naruszenie CHECK market_id dla drugiego wiersza")
+          }
+          written.push(values[0] as string)
+          return {
+            rows: [
+              { failure_id: values[0], attempt_count: 1, order_id: values[6] },
+            ],
+            rowCount: 1,
+          }
+        },
+      },
+    }
+  }
+
+  const emptyScope = {
+    resolve: (key: string) => {
+      throw new Error(`unresolved ${key}`)
+    },
+  }
+
+  it("wiersz FAKTYCZNIE zapisany niesie swój `registry_failure_id`, mimo że partia padła", async () => {
+    const pc = partialClient()
+    const result = await reportCompensationFailure(
+      emptyScope,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      pc.client as any,
+      [record("order_a"), record("order_b")]
+    )
+
+    expect(result.persisted).toBe(false)
+    expect(result.partial).toBe(true)
+    expect(result.rows).toHaveLength(1)
+
+    const alerts = getRingBuffer().filter(
+      (entry) => entry.code === COMPENSATION_FAILURE_ALERT_CODE
+    )
+    expect(alerts).toHaveLength(2)
+
+    const forA = alerts.find((a) => a.context?.order_id === "order_a")
+    const forB = alerts.find((a) => a.context?.order_id === "order_b")
+
+    // Wiersz 1 JEST w bazie — jego alarm musi nieść adres, inaczej zdarzenie
+    // jest nieodnajdywalne inaczej niż skanem po `stripe_event_id`.
+    expect(forA?.context?.registry_persisted).toBe(true)
+    expect(forA?.context?.registry_failure_id).toBe(pc.written[0])
+    expect(forA?.severity).toBe("ERROR")
+    expect(forA?.context?.registry_error).toBeNull()
+
+    // Wiersz 2 NIE jest — i tylko on dostaje CRITICAL z błędem.
+    expect(forB?.context?.registry_persisted).toBe(false)
+    expect(forB?.context?.registry_failure_id).toBeNull()
+    expect(forB?.severity).toBe("CRITICAL")
+    expect(String(forB?.context?.registry_error)).toContain("CHECK market_id")
+  })
+
+  it("pusty zbiór rekordów RZUCA — „sukces bez ani jednego nośnika\" jest zakazany", async () => {
+    await expect(
+      reportCompensationFailure(
+        emptyScope,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        partialClient().client as any,
+        []
+      )
+    ).rejects.toThrow(/pusty zbior rekordow/)
+
+    // I nie powstał ani jeden alarm — bo nie powstał ani jeden „cichy sukces".
     expect(
       getRingBuffer().filter((e) => e.code === COMPENSATION_FAILURE_ALERT_CODE)
     ).toHaveLength(0)

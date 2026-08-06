@@ -16,15 +16,20 @@
  */
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "@jest/globals"
 import { Pool } from "pg"
+import knexFactory from "knex"
 
 import { Migration20260818090000MoneyPathCompensationFailureTable } from "../../migrations/Migration20260818090000MoneyPathCompensationFailureTable"
 import {
   buildCompensationFailureId,
   buildPurchaseCorrelationKey,
+  findOpenCompensationFailures,
   recordCompensationFailure,
   type CompensationFailureRecord,
 } from "../../lib/payment/money-path-compensation-registry"
-import { STRIPE_PATH_Y_WEBHOOK_PROVIDER } from "../../lib/payment/stripe-payment-intent-transport"
+import {
+  createKnexQueryClient,
+  STRIPE_PATH_Y_WEBHOOK_PROVIDER,
+} from "../../lib/payment/stripe-payment-intent-transport"
 
 const DATABASE_URL = process.env.DATABASE_URL
 const runOrSkip = DATABASE_URL ? describe : describe.skip
@@ -237,5 +242,103 @@ runOrSkip("Story 3.5 AC2 — rejestr na REALNYM PostgreSQL-u", () => {
     )
     expect(rows.rows[0].resolution_state).toBe("resolved_manually")
     expect(rows.rows[0].resolved_by).toBe("robert@bonbeauty")
+  })
+})
+
+/**
+ * Dialekt PRODUKCYJNY na realnym silniku — review-fix cyklu 1.
+ *
+ * `RECORD_COMPENSATION_FAILURE_SQL` jest pisany w składni `$1..$10`, ale na
+ * produkcji idzie ZAWSZE przez `createKnexQueryClient` → `toKnexPositionalSql`
+ * (`?`) → `knex.raw`. Do tego review-fixu żaden test nie wykonywał tej gałęzi:
+ * suita na realnym silniku używała `pg.Pool` (wariant `$N`), a test jednostkowy
+ * nie wykonywał SQL-a wcale. Kształt wyniku `knex.raw` z `RETURNING`
+ * (`result.rows` vs tablica) i normalizacja `attempt_count` przez `Number(...)`
+ * były więc niepotwierdzone wykonaniem w tym właśnie dialekcie.
+ */
+runOrSkip("Story 3.5 review-fix — dialekt Knex (`?` + knex.raw) na realnym silniku", () => {
+  let pool: Pool
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let knex: any
+
+  beforeAll(async () => {
+    pool = new Pool({ connectionString: DATABASE_URL })
+    for (const sql of await collectSql("down")) {
+      await pool.query(sql).catch(() => undefined)
+    }
+    for (const sql of await collectSql("up")) {
+      await pool.query(sql)
+    }
+    knex = knexFactory({ client: "pg", connection: DATABASE_URL })
+  })
+
+  afterAll(async () => {
+    await knex?.destroy()
+    for (const sql of await collectSql("down")) {
+      await pool.query(sql).catch(() => undefined)
+    }
+    await pool.end()
+  })
+
+  beforeEach(async () => {
+    await pool.query("DELETE FROM money_path_compensation_failure")
+  })
+
+  it("`INSERT … RETURNING` przez `knex.raw` zwraca wiersz, a `attempt_count` jest LICZBĄ", async () => {
+    const client = createKnexQueryClient(knex)
+
+    const first = await recordCompensationFailure(client, record())
+    expect(first.failure_id).toBe(
+      buildCompensationFailureId({
+        delivery_path: STRIPE_PATH_Y_WEBHOOK_PROVIDER,
+        stripe_event_id: EVT,
+        compensation_kind: "webhook_delivery_release",
+        failure_code: "delivery_release_failed",
+        order_id: record().order_id,
+      })
+    )
+    // Sedno: gdyby `createKnexQueryClient` nie rozwinął wyniku na `rows`,
+    // `recordCompensationFailure` rzuciłoby „INSERT nie zwrócił wiersza".
+    expect(typeof first.attempt_count).toBe("number")
+    expect(first.attempt_count).toBe(1)
+
+    // `ON CONFLICT … DO UPDATE` przez ten sam dialekt — druga próba, nie drugi wiersz.
+    const second = await recordCompensationFailure(client, record())
+    expect(second.failure_id).toBe(first.failure_id)
+    expect(second.attempt_count).toBe(2)
+    expect(typeof second.attempt_count).toBe("number")
+
+    const count = await pool.query<{ n: string }>(
+      "SELECT count(*)::text AS n FROM money_path_compensation_failure"
+    )
+    expect(count.rows[0].n).toBe("1")
+  })
+
+  it("`findOpenCompensationFailures` przez Knex widzi wiersz otwarty i NIE widzi zamkniętego", async () => {
+    const client = createKnexQueryClient(knex)
+    const written = await recordCompensationFailure(client, record())
+
+    const open = await findOpenCompensationFailures(client, {
+      delivery_path: STRIPE_PATH_Y_WEBHOOK_PROVIDER,
+      stripe_event_id: EVT,
+    })
+    expect(open.map((row) => row.failure_id)).toEqual([written.failure_id])
+    expect(typeof open[0].attempt_count).toBe("number")
+
+    // Po ręcznym zamknięciu gałąź `duplicate` wraca do zwykłego ACK — bez tego
+    // fix ponowień zamieniłby każdy `stripe events resend` w wieczne 500.
+    await pool.query(
+      `UPDATE money_path_compensation_failure
+          SET resolution_state = 'resolved_manually',
+              resolved_at = now(),
+              resolved_by = $2
+        WHERE failure_id = $1`,
+      [written.failure_id, "robert@bonbeauty"]
+    )
+    const afterClose = await findOpenCompensationFailures(client, {
+      delivery_path: STRIPE_PATH_Y_WEBHOOK_PROVIDER,
+      stripe_event_id: EVT,
+    })
+    expect(afterClose).toEqual([])
   })
 })

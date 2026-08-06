@@ -319,7 +319,19 @@ async function reserveRetryAttempt(
       failure,
     }
   } catch (err) {
-    await client.query("ROLLBACK").catch(() => undefined)
+    await client.query("ROLLBACK").catch((rollbackErr: Error) => {
+      // Story 3.5 (FR-6c, AD-22): porazka ROLLBACK-u na sciezce pieniadza NIE
+      // MOZE byc cichsza niz blad, ktory ja wywolal. Polkniecie zostawialo stan,
+      // w ktorym transakcja moze byc nadal otwarta, a skutek nieodwrocony — i nie
+      // mowilo o tym NIKOMU. Rzut laczy oba bledy w jeden, ktory i tak leci
+      // wyzej; zaden nie ginie.
+      const joined = new Error(
+        "ROLLBACK po bledzie transakcji NIE doszedl do skutku: " +
+          `${rollbackErr.message}; blad pierwotny: ${(err as Error).message}`
+      )
+      ;(joined as Error & { cause?: unknown }).cause = err
+      throw joined
+    })
     throw err
   }
 }
@@ -371,7 +383,19 @@ async function finalizeRetryAttempt(
 
     await client.query("COMMIT")
   } catch (err) {
-    await client.query("ROLLBACK").catch(() => undefined)
+    await client.query("ROLLBACK").catch((rollbackErr: Error) => {
+      // Story 3.5 (FR-6c, AD-22): porazka ROLLBACK-u na sciezce pieniadza NIE
+      // MOZE byc cichsza niz blad, ktory ja wywolal. Polkniecie zostawialo stan,
+      // w ktorym transakcja moze byc nadal otwarta, a skutek nieodwrocony — i nie
+      // mowilo o tym NIKOMU. Rzut laczy oba bledy w jeden, ktory i tak leci
+      // wyzej; zaden nie ginie.
+      const joined = new Error(
+        "ROLLBACK po bledzie transakcji NIE doszedl do skutku: " +
+          `${rollbackErr.message}; blad pierwotny: ${(err as Error).message}`
+      )
+      ;(joined as Error & { cause?: unknown }).cause = err
+      throw joined
+    })
     throw err
   }
 }
