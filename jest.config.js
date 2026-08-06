@@ -66,6 +66,15 @@ if (process.env.TEST_TYPE === "integration:http") {
   module.exports.testMatch = [
     "**/packages/api/src/__tests__/integration/completed-order-cardinality-pg.integration.test.[jt]s",
   ];
+} else if (process.env.TEST_TYPE === "voucher-rls-pg") {
+  // v1.15.0 Story 2.6 (FR-14e) — moduł voucher pod RLS na REALNYM Postgresie.
+  // Profil istnieje, bo `packages/api/src/__tests__/rls/**` NIE JEST objęte
+  // żadnym z pozostałych `testMatch` — suity RLS leżały tam jako mechanizm,
+  // którego nie odpalał żaden profil. DATABASE_URL musi wskazywać IZOLOWANĄ DB:
+  // suita DROP-uje i odtwarza tabele modułu voucher.
+  module.exports.testMatch = [
+    "**/packages/api/src/__tests__/rls/voucher-module-rls.integration.spec.[jt]s",
+  ];
 } else if (process.env.TEST_TYPE === "unit") {
   module.exports.testMatch = [
     "**/packages/api/src/**/__tests__/**/*.unit.spec.[jt]s",
