@@ -72,6 +72,7 @@ import { marketContextStorage } from "../../lib/market-context";
 import {
   _resetForTest,
   computeRangeStats,
+  recordRequest,
 } from "../../lib/request-log-aggregator";
 
 type FakeRes = {
@@ -367,9 +368,35 @@ describe("Story 2.3 — productListMarketScopeMiddleware fail-closed", () => {
       "export async function productListMarketScopeMiddleware"
     );
     expect(start).toBeGreaterThan(-1);
-    const end = withoutComments.indexOf("\nexport default defineMiddlewares", start);
-    expect(end).toBeGreaterThan(start);
+
+    // review-fix MEDIUM-6: region domkniety po CIELE FUNKCJI (licznik nawiasow
+    // klamrowych), nie na `export default defineMiddlewares`. Kotwica na
+    // `defineMiddlewares` wciagala do regionu KAZDE middleware zadeklarowane
+    // nizej — dawalo to falszywa zielen (wywolania `denyMarketScope` z cudzego
+    // middleware zaspokajaly wymog) i falszywa czerwien (poprawny
+    // `if (context?.sales_channel_id)` w innym middleware).
+    const bodyStart = withoutComments.indexOf("{", start);
+    expect(bodyStart).toBeGreaterThan(start);
+    let depth = 0;
+    let end = -1;
+    for (let i = bodyStart; i < withoutComments.length; i += 1) {
+      const ch = withoutComments[i];
+      if (ch === "{") depth += 1;
+      else if (ch === "}") {
+        depth -= 1;
+        if (depth === 0) {
+          end = i + 1;
+          break;
+        }
+      }
+    }
+    expect(end).toBeGreaterThan(bodyStart);
     const body = withoutComments.slice(start, end);
+    // Region NIE moze siegac do rejestracji middleware ani do sasiadow.
+    expect(body).not.toContain("defineMiddlewares");
+    // Region konczy sie na klamrze zamykajacej cialo funkcji, a nie na koncu pliku.
+    expect(body.trimEnd().endsWith("}")).toBe(true);
+    expect(end).toBeLessThan(withoutComments.length);
 
     // Powrot bramy wejsciowej: scoping warunkowany obecnoscia kontekstu.
     expect(body).not.toMatch(/if\s*\(\s*context\?\.\s*sales_channel_id\s*\)/);
@@ -377,5 +404,95 @@ describe("Story 2.3 — productListMarketScopeMiddleware fail-closed", () => {
     expect(body).not.toMatch(
       /!context\?\.\s*market_id[\s\S]{0,120}?return\s+originalJson/
     );
+
+    // review-fix HIGH-2: odmowa musi byc BEZWARUNKOWA. Sam skan na obecnosc
+    // `denyMarketScope(` przepuszczal wariant `if (requestDenial && false)` —
+    // czyli WYLACZENIE obu bram przy nietknietych nazwach.
+    expect(body).toMatch(/if\s*\(\s*requestDenial\s*\)\s*\{/);
+    expect(body).toMatch(/if\s*\(\s*responseDenial\s*\)\s*\{/);
+  });
+
+  /**
+   * review-fix HIGH-1 — probka odmowy NIE JEST wizyta.
+   *
+   * `computeCohortMetrics` czyta ring buffer BEZ filtra kohorty, wiec kazda
+   * probka syntetyczna wchodzila do wyliczen WSZYSTKICH KPI: odmowa liczona
+   * dwa razy (raz przez `requestLogMetricsMiddleware`, raz przez
+   * `denyMarketScope`) zawyzala mianownik `conversion`, a jej `duration_ms: 0`
+   * zanizalo `p95_latency_ms`.
+   *
+   * Ten test PEKA po usunieciu wykluczenia `NON_TRAFFIC_COHORTS`.
+   */
+  it("HIGH-1: probka odmowy nie wchodzi do odczytu RUCHU (bez jawnej kohorty)", async () => {
+    const before = Date.now() - 1;
+
+    // Realna probka ruchu: to, co dopisuje `requestLogMetricsMiddleware`.
+    recordRequest({
+      ts: Date.now(),
+      duration_ms: 480,
+      status_code: 403,
+      cohort: "/store/products",
+    });
+
+    await marketContextStorage.run(PARTIAL_CONTEXT, async () => {
+      await productListMarketScopeMiddleware(
+        makeReq(logger),
+        makeRes() as any,
+        jest.fn()
+      );
+    });
+
+    const traffic = computeRangeStats(before, Date.now() + 1);
+    // Jedna wizyta, nie dwie — brak podwojnego liczenia odmowy.
+    expect(traffic.sample_size).toBe(1);
+    // p95 z realnej probki, nie zalany zerem odmowy.
+    expect(traffic.p95_latency_ms).toBe(480);
+
+    // Kohorta odmowy jest nadal odczytywalna JAWNIE — po to istnieje.
+    const denied = computeRangeStats(
+      before,
+      Date.now() + 1,
+      MARKET_SCOPE_DENIED_COHORT
+    );
+    expect(denied.sample_size).toBe(1);
+  });
+
+  /**
+   * review-fix LOW-9 — odmowa nie milknie, gdy `LOGGER` nie rozwiaze sie
+   * z kontenera. Wczesniej `resolveLogger(req.scope)?.warn?.()` sprowadzalo
+   * kanal logu do ciszy bez zadnego sladu.
+   */
+  it("LOW-9: nierozwiazany logger ⇒ odmowa nadal ma linie logu (console.warn)", async () => {
+    const consoleWarn = jest
+      .spyOn(console, "warn")
+      .mockImplementation(() => undefined);
+    try {
+      const req = {
+        path: "/store/products",
+        method: "GET",
+        query: {},
+        scope: {
+          resolve: jest.fn(() => {
+            throw new Error("LOGGER not registered");
+          }),
+        },
+      } as any;
+      const res = makeRes();
+
+      await marketContextStorage.run(PARTIAL_CONTEXT, async () => {
+        await productListMarketScopeMiddleware(req, res as any, jest.fn());
+      });
+
+      expect(res.statusCode).toBe(403);
+      expect(consoleWarn).toHaveBeenCalledTimes(1);
+      expect(String(consoleWarn.mock.calls[0][0])).toContain(
+        "market-scope-denied"
+      );
+      expect(consoleWarn.mock.calls[0][1]).toEqual(
+        expect.objectContaining({ reason: "sales_channel_id_missing" })
+      );
+    } finally {
+      consoleWarn.mockRestore();
+    }
   });
 });

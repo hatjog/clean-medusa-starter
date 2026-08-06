@@ -32,7 +32,10 @@ import {
   marketContextStorage,
   type MarketContext,
 } from "../lib/market-context";
-import { recordRequest } from "../lib/request-log-aggregator";
+import {
+  MARKET_SCOPE_DENIED_COHORT,
+  recordRequest,
+} from "../lib/request-log-aggregator";
 import { installRlsPoolHook, type HookLogger } from "../lib/rls-pool-hook";
 import { marketContextCache } from "../loaders/market-context-cache";
 import { listProductIdsForSalesChannel } from "../lib/product-market-scope";
@@ -662,8 +665,14 @@ function productMarketId(product: Record<string, unknown>): string | null {
  */
 export const MARKET_SCOPE_UNRESOLVABLE_MESSAGE = "Market scope unresolvable";
 
-/** Kohorta metryki odmowy w `request-log-aggregator` (NFR-2). */
-export const MARKET_SCOPE_DENIED_COHORT = "market-scope-denied";
+/**
+ * Kohorta metryki odmowy w `request-log-aggregator` (NFR-2).
+ *
+ * Nazwa jest re-eksportem, nie drugą definicją: właścicielem jest
+ * `request-log-aggregator`, bo to on musi ją znać, żeby wykluczyć te próbki
+ * z odczytu ruchu (`NON_TRAFFIC_COHORTS`, review-fix HIGH-1).
+ */
+export { MARKET_SCOPE_DENIED_COHORT };
 
 export type MarketScopeDenialReason =
   | "context_missing"
@@ -720,18 +729,27 @@ function denyMarketScope(
 ): void {
   const context = marketContextStorage.getStore();
 
-  resolveLogger(req.scope)?.warn?.(
-    `[gp] market-scope-denied (${gate})`,
-    {
-      reason,
-      gate,
-      path: getRequestPath(req),
-      method: req.method,
-      market_id: context?.market_id ?? null,
-      sales_channel_id: context?.sales_channel_id ?? null,
-      system_origin: context?.system ?? null,
-    }
-  );
+  const payload = {
+    reason,
+    gate,
+    path: getRequestPath(req),
+    method: req.method,
+    market_id: context?.market_id ?? null,
+    sales_channel_id: context?.sales_channel_id ?? null,
+    system_origin: context?.system ?? null,
+  };
+  const message = `[gp] market-scope-denied (${gate})`;
+
+  // Story 2.3 review-fix LOW-9: `resolveLogger(...)?.warn?.()` sprowadzało
+  // „głośną odmowę” do CISZY, gdy `LOGGER` nie rozwiązał się z kontenera albo
+  // nie miał `warn` — a wtedy jedynym obserwowalnym kanałem zostawał kod HTTP.
+  // Kanał logu jest bezwarunkowy: rozwiązany logger albo `console.warn`.
+  const logger = resolveLogger(req.scope);
+  if (typeof logger?.warn === "function") {
+    logger.warn(message, payload);
+  } else {
+    console.warn(message, payload);
+  }
 
   recordRequest({
     ts: Date.now(),

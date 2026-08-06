@@ -30,6 +30,38 @@ export type RequestSample = {
   cohort?: string
 }
 
+/**
+ * Kohorta metryki odmowy scopingu katalogu (Story 2.3, NFR-2).
+ *
+ * Mieszka TUTAJ, a nie w `api/middlewares.ts`, bo to ten moduł musi wiedzieć,
+ * że ta kohorta NIE JEST ruchem katalogowym — inaczej wiedza o wykluczeniu
+ * leżałaby po stronie producenta próbki, a konsument (`computeCohortMetrics`)
+ * i tak by ją policzył.
+ */
+export const MARKET_SCOPE_DENIED_COHORT = "market-scope-denied"
+
+/**
+ * Kohorty SYNTETYCZNE — próbki dopisywane przez mechanizmy domenowe, a nie
+ * przez `requestLogMetricsMiddleware`, który mierzy realne żądanie HTTP
+ * (kohorta = ścieżka trasy).
+ *
+ * Story 2.3 review-fix HIGH-1: `computeCohortMetrics` woła `computeRangeStats`
+ * BEZ kohorty, więc do tej pory każda taka próbka wchodziła do wyliczeń
+ * WSZYSTKICH KPI. Skutki były zmierzalne i szkodliwe: odmowa `403` była
+ * liczona DWA razy (raz przez `requestLogMetricsMiddleware` na `res.finish`,
+ * raz przez `denyMarketScope`), co zawyżało mianownik `conversion`, a jej
+ * `duration_ms: 0` wstrzykiwało zera w ogon próbek i ZANIŻAŁO `p95_latency_ms`
+ * — czyli maskowało regresję latencji dokładnie wtedy, gdy katalog masowo
+ * odmawia.
+ *
+ * Wykluczenie zapada przy odczycie BEZ jawnej kohorty. Odczyt Z jawną kohortą
+ * (`computeRangeStats(since, now, MARKET_SCOPE_DENIED_COHORT)`) nadal zwraca
+ * te próbki — po to one są.
+ */
+export const NON_TRAFFIC_COHORTS: ReadonlySet<string> = new Set([
+  MARKET_SCOPE_DENIED_COHORT,
+])
+
 const DEFAULT_CAPACITY = 10_000
 
 class RingBuffer {
@@ -87,6 +119,13 @@ export function computeRangeStats(
   let samples = _aggregator.range(sinceMs, nowMs)
   if (cohort) {
     samples = samples.filter((s) => s.cohort === cohort)
+  } else {
+    // Story 2.3 review-fix HIGH-1: odczyt bez jawnej kohorty jest odczytem
+    // RUCHU. Kohorty syntetyczne muszą z niego wypaść, bo inaczej licznik
+    // zdarzenia domenowego udaje wizytę i psuje `conversion` oraz `p95`.
+    samples = samples.filter(
+      (s) => !(s.cohort !== undefined && NON_TRAFFIC_COHORTS.has(s.cohort)),
+    )
   }
   if (samples.length === 0) {
     return {
