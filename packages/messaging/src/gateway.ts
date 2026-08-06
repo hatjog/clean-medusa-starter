@@ -580,7 +580,13 @@ function mapDispatchStatus(
 }
 
 // H1: znormalizowane zdarzenie engagement (webhook) → KPI source event_type.
-// opened/bounced/spam nie mapują się na żaden z 5 KPI w v1.10.0.
+// opened/odbicia/spam nie mapują się na żaden z 5 KPI w v1.10.0.
+//
+// ADR-192: ten `switch` był dotąd domknięty `default: return null` — czyli
+// catch-allem. Po rozszerzeniu dziedziny klas (FR-9d) catch-all zostaje usunięty
+// i każda klasa jest rozstrzygnięta JAWNIE, a `assertNever` sprawia, że dodanie
+// nowej klasy bez decyzji tutaj NIE KOMPILUJE SIĘ. Klasy zwracające `null` są
+// świadomą decyzją "brak odpowiadającego KPI w v1.10.0", nie przeoczeniem.
 function mapDeliveryEventType(
   type: NotificationDeliveryEventType,
 ): CommunicationKpiSourceEventType | null {
@@ -591,9 +597,24 @@ function mapDeliveryEventType(
       return "clicked";
     case "unsubscribed":
       return "unsubscribed";
-    default:
+    case "opened":
+    case "bounced_permanent":
+    case "bounced_transient":
+    case "blocked":
+    case "invalid_address":
+    case "deferred":
+    case "complaint":
+    case "failed":
       return null;
+    default:
+      return assertNeverDeliveryEventType(type);
   }
+}
+
+function assertNeverDeliveryEventType(value: never): never {
+  throw new Error(
+    `mapDeliveryEventType: nieobsłużona klasa zdarzenia dostawy: ${String(value)}`,
+  );
 }
 
 function hashRecipient(intent: NotificationIntent): string {

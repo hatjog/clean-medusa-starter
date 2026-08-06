@@ -11,6 +11,17 @@ import type {
   NotificationDeliveryCorrelationState,
   NotificationDeliveryEventType,
 } from "@gp/messaging"
+import {
+  backoffDelayMs,
+  classifyDeliveryEventName,
+  errorCodeFor,
+  nextAttemptNumber,
+  reactionFor,
+  UnknownDeliveryEventError,
+  UNRECOGNIZED_DELIVERY_EVENT_METRIC,
+  type DeliveryEventReaction,
+} from "../lib/delivery-event-classification"
+import { runInSystemMarketContext } from "../lib/system-market-context"
 
 /**
  * Path Y Brevo delivery subscriber.
@@ -37,13 +48,24 @@ import type {
  *   operator alert distinction.
  */
 
+/**
+ * ADR-192: `notification.bounced` ZNIKA z listy subskrypcji. Nazwa `bounced` nie
+ * niesie rozroznienia trwale/chwilowe/zablokowane/niepoprawny-adres/opoznienie,
+ * ktorego wymaga FR-9d, wiec przyjmowanie jej oznaczaloby przywrocenie zwiniecia
+ * tylnymi drzwiami. Na jej miejsce wchodzi piec rozlacznych nazw kanalu.
+ */
 export const BREVO_NOTIFICATION_EVENTS = Object.freeze([
   "notification.delivered",
   "notification.opened",
   "notification.clicked",
-  "notification.bounced",
+  "notification.hard_bounce",
+  "notification.soft_bounce",
+  "notification.blocked",
+  "notification.invalid_email",
+  "notification.deferred",
   "notification.complaint",
   "notification.unsubscribed",
+  "notification.failed",
 ] as const)
 
 const NO_RECIPIENT_SENTINEL = "__no_recipient__"
@@ -73,7 +95,9 @@ type BrevoDeliveryEventPayload = {
   locale?: Locale
   consent_basis?: ConsentBasis
   idempotency_key?: string
-  bounce_type?: string
+  // `bounce_type` USUNIETY (ADR-192): sluzyl do rozroznienia hard/soft ZA
+  // zwinieciem. Rozroznienie niesie teraz sama nazwa zdarzenia, wiec pole bylo
+  // martwym nosnikiem, ktory wyglada na znaczacy.
   reason?: string
   error_code?: string
   error_message?: string
@@ -100,6 +124,8 @@ type DispatchRecord = {
   locale?: Locale
   consent_basis?: ConsentBasis
   idempotency_key?: string
+  /** Liczba prob zarejestrowanych po stronie SYSTEMU (AD-23), nie z ladunku. */
+  attempts?: number
 }
 
 type DispatchLookup = {
@@ -154,11 +180,39 @@ export default async function brevoDeliveryTracker({
 }: SubscriberArgs<BrevoDeliveryEventPayload>): Promise<void> {
   const runtimeContainer = container as unknown as ResolveContainer
   const logger = resolveLogger(runtimeContainer)
-  const normalized = normalizeDeliveryEvent(event.name, event.data)
+
+  let normalized: NormalizedBrevoDeliveryEvent | null
+  try {
+    normalized = normalizeDeliveryEvent(event.name, event.data)
+  } catch (error) {
+    if (error instanceof UnknownDeliveryEventError) {
+      // AD-19: wartosc spoza dziedziny jest BLEDEM, nie wartoscia domyslna.
+      // Do v1.15.0 ta sciezka konczyla sie `logger.warn` + cichym `return` —
+      // zdarzenie znikalo bez bledu, bez metryki i bez zmiany stanu, a Medusa
+      // uznawala je za obsluzone. Teraz odmowa jest GLOSNA: nazwany kod bledu,
+      // przyrost licznika i propagacja wyjatku, wiec zdarzenie NIE jest
+      // potwierdzone jako obsluzone i wraca w ponowieniu dostawcy.
+      logger.error?.(
+        `[brevo-delivery-tracker] error_code=${error.code} ` +
+          `metric=${UNRECOGNIZED_DELIVERY_EVENT_METRIC} ` +
+          `dictionary=${error.dictionary} raw_value=${JSON.stringify(error.rawValue)}`,
+      )
+    }
+    throw error
+  }
 
   if (!normalized) {
-    logger.warn?.("[brevo-delivery-tracker] dropped malformed delivery event")
-    return
+    // Ladunek bez identyfikatora zdarzenia dostawcy — nie da sie go ani
+    // skorelowac, ani zdeduplikowac. To jest brak NOSNIKA tozsamosci, nie
+    // nieznana klasa; ponowienie nie zmieni ladunku, wiec odmowa jest
+    // terminalna i jawna, a nie cicha.
+    logger.error?.(
+      "[brevo-delivery-tracker] error_code=DELIVERY_EVENT_MALFORMED " +
+        "brak provider_event_id — zdarzenie nieidentyfikowalne",
+    )
+    throw new Error(
+      "DELIVERY_EVENT_MALFORMED: zdarzenie dostawy bez provider_event_id",
+    )
   }
 
   pruneSeenProviderEventIds()
@@ -175,14 +229,48 @@ export default async function brevoDeliveryTracker({
   markProviderEventSeen(normalized.provider_event_id)
 
   try {
-    const correlated = await correlateDispatch(runtimeContainer, normalized, logger)
-    const auditEvent = buildAuditEnvelope(normalized, correlated)
+    // AD-21 / ADR-177: subscriber jest powierzchnia zapisu POZA HTTP, wiec
+    // wykonanie musi niesc jawny kontekst rynku. Rynek pochodzi z ladunku albo
+    // z wiersza dispatchu; jego BRAK jest ODMOWA (`SystemMarketContextError`),
+    // a nie zapisem dla wszystkich rynkow. Nosnik jest ten sam co dla `/store/*`.
+    const marketId = await resolveMarketIdForContext(runtimeContainer, normalized, logger)
 
-    await emitAuditEvent(runtimeContainer, auditEvent, logger)
+    await runInSystemMarketContext(
+      {
+        markets: marketId ? [marketId] : [],
+        origin: { surface: "subscriber", name: "brevo-delivery-tracker" },
+        logger: logger as never,
+      },
+      async () => {
+        const correlated = await correlateDispatch(runtimeContainer, normalized!, logger)
+        const auditEvent = buildAuditEnvelope(normalized!, correlated)
+
+        await emitAuditEvent(runtimeContainer, auditEvent, logger)
+      },
+    )
   } catch (error) {
     seenProviderEventIds.delete(normalized.provider_event_id)
     throw error
   }
+}
+
+/**
+ * Rynek dla kontekstu systemowego. Zwraca `undefined`, gdy nie da sie go ustalic —
+ * wywolujacy przekazuje wtedy PUSTA liste rynkow, co `runInSystemMarketContext`
+ * traktuje jako odmowe (`markets_empty`). Podstawienie tu wartosci zastepczej
+ * byloby zapisem poza izolacja pod pozorem „zadeklarowanego" rynku.
+ */
+async function resolveMarketIdForContext(
+  container: ResolveContainer,
+  normalized: NormalizedBrevoDeliveryEvent,
+  logger: LoggerLike,
+): Promise<string | undefined> {
+  if (normalized.market_id) {
+    return normalized.market_id
+  }
+
+  const lookup = await lookupDispatch(container, normalized.provider_event_id, logger)
+  return readString(lookup.dispatch?.market_id)
 }
 
 export const config: SubscriberConfig = {
@@ -213,15 +301,16 @@ function normalizeDeliveryEvent(
     return null
   }
 
-  const eventType = normalizeEventType(
+  // Klasyfikacja rzuca `UnknownDeliveryEventError` dla nazwy spoza dziedziny —
+  // wyjatek propaguje do handlera i konczy sie GLOSNA odmowa (AD-19). Nazwa
+  // pochodzi ze slownika PAYLOADU; slownik API rejestracji jest osobna dziedzina
+  // i nie jest tu akceptowany (ADR-192).
+  const eventType = classifyDeliveryEventName(
+    "event_payload",
     readString(payload.event_type) ??
       readString(payload.event) ??
       eventName?.replace(/^notification\./, ""),
   )
-
-  if (!eventType) {
-    return null
-  }
 
   return {
     provider_event_id: providerEventId,
@@ -235,8 +324,8 @@ function normalizeDeliveryEvent(
     locale: payload.locale,
     consent_basis: payload.consent_basis,
     idempotency_key: readString(payload.idempotency_key),
-    error_code: resolveErrorCode(eventType, payload),
-    error_message: readString(payload.error_message) ?? readString(payload.reason),
+    error_code: resolveErrorCode(eventType),
+    error_message: resolveErrorMessage(payload),
     source: payload,
   }
 }
@@ -382,7 +471,43 @@ function buildAuditEnvelope(
     occurred_at: normalized.occurred_at,
     error_code: normalized.error_code ?? correlated.lookup_error_code,
     error_message: normalized.error_message,
+    delivery_class: normalized.event_type,
+    delivery_reaction: buildReaction(normalized, correlated),
   }
+}
+
+/**
+ * Reakcja per klasa — czynnik, ktory czyni skutek KAZDEJ z klas obserwowalnie
+ * rozny na realnej sciezce (AC4).
+ *
+ * AD-23: numer proby i backoff nadaje POLITYKA. Zrodlem `recordedAttempts` jest
+ * wylacznie stan po stronie systemu (wiersz dispatchu); zadna wartosc z ladunku
+ * dostawcy (`attempt`, `retry_count`, …) nie jest czytana — dostawca nie ma
+ * wplywu na numeracje prob.
+ */
+function buildReaction(
+  normalized: NormalizedBrevoDeliveryEvent,
+  correlated: CorrelatedDispatch,
+): NotificationAuditEnvelope["delivery_reaction"] {
+  const reaction: DeliveryEventReaction = reactionFor(normalized.event_type)
+  const recordedAttempts = readAttempts(correlated.dispatch)
+
+  return {
+    terminal: reaction.terminal,
+    escalate: reaction.escalate,
+    retryable: reaction.retryable,
+    retry_policy: reaction.retry_policy,
+    consumes_recipient_attempt: reaction.consumes_recipient_attempt,
+    suppress_recipient: reaction.suppress_recipient,
+    bounce_family: reaction.bounce_family,
+    next_attempt_number: nextAttemptNumber(normalized.event_type, recordedAttempts),
+    backoff_delay_ms: backoffDelayMs(normalized.event_type, recordedAttempts),
+  }
+}
+
+function readAttempts(dispatch: DispatchRecord | undefined): number {
+  const value = dispatch?.attempts
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : 0
 }
 
 function deriveAuditId(providerEventId: string, eventType: NotificationDeliveryEventType): string {
@@ -437,6 +562,17 @@ async function emitAuditEvent(
   )
 }
 
+/**
+ * UWAGA na pulapke pozornego PASS: ten `switch` byl wyczerpujacy juz wczesniej,
+ * ale pracowal na typie, ktory ZGUBIL rozroznienie w `normalizeEventType`.
+ * Wyczerpalnosc ZA zwinieciem nie chronila przed niczym. Teraz dziedzina jest
+ * wielodzielna, wiec kazda klasa jest tu rozstrzygnieta osobno, a `assertNever`
+ * lamie kompilacje po dodaniu klasy bez decyzji.
+ *
+ * `outcome` i `status` to slownik KOPERTY AUDYTOWEJ (weszej niz dziedzina klas) —
+ * kilka klas mapuje sie na `failed` swiadomie. Rozroznienie klas nie ginie przy
+ * tym rzutowaniu: niesie je `delivery_class` i `delivery_reaction` w kopercie.
+ */
 function resolveOutcome(
   eventType: NotificationDeliveryEventType,
 ): NotificationDeliveryAuditOutcome {
@@ -447,13 +583,22 @@ function resolveOutcome(
       return "opened"
     case "clicked":
       return "engaged"
-    case "bounced":
+    case "bounced_permanent":
+    case "bounced_transient":
+    case "blocked":
     case "failed":
       return "failed"
+    case "invalid_address":
+      return "rejected"
+    case "deferred":
+      // Opoznienie NIE jest porazka dostawy — dostawa jest wciaz w toku.
+      return "delivered"
     case "complaint":
       return "flagged"
     case "unsubscribed":
       return "opted_out"
+    default:
+      return assertNeverEventType(eventType, "resolveOutcome")
   }
 }
 
@@ -467,72 +612,55 @@ function resolveDeliveryStatus(
       return "opened"
     case "clicked":
       return "clicked"
-    case "bounced":
+    case "bounced_permanent":
+    case "bounced_transient":
+    case "blocked":
+    case "invalid_address":
     case "failed":
       return "failed"
+    case "deferred":
+      // Opoznienie zostawia wiersz w stanie NIETERMINALNYM i wciaz ponawialnym.
+      return "sent"
     case "complaint":
       return "complaint"
     case "unsubscribed":
       return "unsubscribed"
+    default:
+      return assertNeverEventType(eventType, "resolveDeliveryStatus")
   }
 }
 
+function assertNeverEventType(value: never, where: string): never {
+  throw new Error(`${where}: nieobsluzona klasa zdarzenia dostawy: ${String(value)}`)
+}
+
+/**
+ * Szczegol diagnostyczny dostawcy. Kod podany przez dostawce trafia TUTAJ,
+ * a nie do `error_code` — `error_code` jest kanoniczna nazwa klasy i musi
+ * pozostac rozlaczny miedzy klasami (AC2).
+ */
+function resolveErrorMessage(payload: BrevoDeliveryEventPayload): string | undefined {
+  const providerCode = readString(payload.error_code)
+  const message = readString(payload.error_message) ?? readString(payload.reason)
+  if (providerCode && message) {
+    return `${providerCode}: ${message}`
+  }
+  return providerCode ?? message
+}
+
+/**
+ * Kod bledu pochodzi WYLACZNIE z klasy (tabela reakcji), nie z ladunku.
+ *
+ * Do v1.15.0 ta funkcja konczyla sie `return "BOUNCE"` — drugim catch-allem,
+ * w przebraniu: `invalid_email` i `blocked` dostawaly ten sam kod co nierozpoznane
+ * odbicie. Teraz kody sa rozlaczne per klasa. Kod podany przez dostawce NIE
+ * nadpisuje kodu klasy (to zniszczyloby rozlacznosc, ktorej pilnuje AC2) —
+ * trafia do `error_message` jako szczegol diagnostyczny.
+ */
 function resolveErrorCode(
   eventType: NotificationDeliveryEventType,
-  payload: BrevoDeliveryEventPayload,
 ): string | undefined {
-  const explicit = readString(payload.error_code)
-  if (explicit) {
-    return explicit
-  }
-
-  if (eventType === "bounced") {
-    const bounceType = readString(payload.bounce_type)?.toLowerCase()
-    if (bounceType === "hard" || readString(payload.event) === "hard_bounce") {
-      return "HARD_BOUNCE"
-    }
-    if (bounceType === "soft" || readString(payload.event) === "soft_bounce") {
-      return "SOFT_BOUNCE"
-    }
-    return "BOUNCE"
-  }
-
-  if (eventType === "complaint") {
-    return "SPAM_COMPLAINT"
-  }
-
-  if (eventType === "failed") {
-    return "BREVO_DELIVERY_FAILED"
-  }
-
-  return undefined
-}
-
-function normalizeEventType(value: string | undefined): NotificationDeliveryEventType | null {
-  switch (value) {
-    case "delivered":
-      return "delivered"
-    case "opened":
-      return "opened"
-    case "clicked":
-      return "clicked"
-    case "bounced":
-    case "soft_bounce":
-    case "hard_bounce":
-    case "invalid_email":
-    case "blocked":
-    case "deferred":
-      return "bounced"
-    case "complaint":
-    case "spam":
-      return "complaint"
-    case "unsubscribed":
-      return "unsubscribed"
-    case "failed":
-      return "failed"
-    default:
-      return null
-  }
+  return errorCodeFor(eventType) ?? undefined
 }
 
 function normalizeOccurredAt(payload: BrevoDeliveryEventPayload): string {
