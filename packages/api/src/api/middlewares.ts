@@ -28,7 +28,10 @@ import {
   sanitizeCustomerEmailInObject,
   scopeCustomerEmail,
 } from "../lib/customer-scoped-email";
-import { marketContextStorage } from "../lib/market-context";
+import {
+  marketContextStorage,
+  type MarketContext,
+} from "../lib/market-context";
 import { recordRequest } from "../lib/request-log-aggregator";
 import { installRlsPoolHook, type HookLogger } from "../lib/rls-pool-hook";
 import { marketContextCache } from "../loaders/market-context-cache";
@@ -640,6 +643,110 @@ function productMarketId(product: Record<string, unknown>): string | null {
   return typeof value === "string" && value.trim() ? value : null;
 }
 
+/**
+ * Story 2.3 (FR-14a, NFR-2, AD-19) — kontrakt odmowy scopingu katalogu.
+ *
+ * Rozstrzygnięcie kodu odmowy (AC2), świadomie ROZDZIELAJĄCE dwa przypadki
+ * zamiast je unifikować (RFC 7235):
+ *
+ *   - `401 { message: "Market context required" }` (`failWithMarketContext`)
+ *     ZOSTAJE dla brakującego / nieważnego klucza publishable — wołający nie
+ *     jest uwierzytelniony. Kontrakt Story 4.4 AC3 / F7 pozostaje nienaruszony.
+ *   - `403` ZAPADA TUTAJ: kontekst rynku JEST (klucz przeszedł), ale jest
+ *     niepełny / nierozstrzygalny, więc scoping po rynku nie może zostać
+ *     zastosowany. Wołający jest uwierzytelniony, ale nieuprawniony do
+ *     odpowiedzi, której nie da się zawęzić.
+ *
+ * Komunikat jest CELOWO rozróżnialny od `"Market context required"`, żeby
+ * diagnostyka odróżniła „nie ma klucza” od „klucz jest, kontekst niepełny”.
+ */
+export const MARKET_SCOPE_UNRESOLVABLE_MESSAGE = "Market scope unresolvable";
+
+/** Kohorta metryki odmowy w `request-log-aggregator` (NFR-2). */
+export const MARKET_SCOPE_DENIED_COHORT = "market-scope-denied";
+
+export type MarketScopeDenialReason =
+  | "context_missing"
+  | "market_id_missing"
+  | "sales_channel_id_missing";
+
+type CompleteMarketContext = { market_id: string; sales_channel_id: string };
+
+/**
+ * Powód, dla którego kontekst rynku nie nadaje się do scopingu — albo `null`,
+ * gdy kontekst jest pełny.
+ *
+ * To jest miejsce, w którym inwariant „kontekst rynku jest pełny albo go nie
+ * ma” przestaje być przypadkiem jednej implementacji rezolwera. Rezolwer HTTP
+ * (`resolveRequestMarketContext`) jest wszystko-albo-nic, ale `system-market-context.ts`
+ * ustawia `sales_channel_id` OPCJONALNIE (`:238`) — kontekst częściowy jest więc
+ * realnie produkowalny. Middleware traktuje go jako BRAK, a nie jako pozwolenie
+ * na pominięcie izolacji.
+ */
+function marketScopeDenialReason(
+  context: MarketContext | undefined
+): MarketScopeDenialReason | null {
+  if (!context?.market_id && !context?.sales_channel_id) {
+    return "context_missing";
+  }
+  if (!context.market_id) {
+    return "market_id_missing";
+  }
+  if (!context.sales_channel_id) {
+    return "sales_channel_id_missing";
+  }
+  return null;
+}
+
+/**
+ * Odmowa GŁOŚNA (NFR-2): log strukturalny z powodem w kategoriach domeny,
+ * metryka przez istniejący nośnik `recordRequest` i kod odpowiedzi.
+ *
+ * `gate` rozróżnia, KTÓRA z dwóch niezależnych bram odmówiła — bez tego
+ * naprawa jednej przy pozostawieniu drugiej jest nieodróżnialna w logach.
+ *
+ * `emit` MUSI być oryginalnym `res.json`, nigdy nadpisanym: brama wyjściowa
+ * żyje WEWNĄTRZ nadpisanego `res.json`, więc odmowa przez `res.json` wpadłaby
+ * w nieskończoną rekurencję (`RangeError: Maximum call stack size exceeded`)
+ * pożartą jako unhandled rejection — czyli w cichą awarię, przy której
+ * asercje na `res.statusCode` nadal świecą na zielono.
+ */
+function denyMarketScope(
+  req: MedusaRequest,
+  res: MedusaResponse,
+  reason: MarketScopeDenialReason,
+  gate: "request" | "response",
+  emit: (body: unknown) => unknown
+): void {
+  const context = marketContextStorage.getStore();
+
+  resolveLogger(req.scope)?.warn?.(
+    `[gp] market-scope-denied (${gate})`,
+    {
+      reason,
+      gate,
+      path: getRequestPath(req),
+      method: req.method,
+      market_id: context?.market_id ?? null,
+      sales_channel_id: context?.sales_channel_id ?? null,
+      system_origin: context?.system ?? null,
+    }
+  );
+
+  recordRequest({
+    ts: Date.now(),
+    duration_ms: 0,
+    status_code: 403,
+    cohort: MARKET_SCOPE_DENIED_COHORT,
+  });
+
+  res.status(403);
+  emit({
+    message: MARKET_SCOPE_UNRESOLVABLE_MESSAGE,
+    reason,
+  });
+}
+
 export async function productListMarketScopeMiddleware(
   req: MedusaRequest,
   res: MedusaResponse,
@@ -648,43 +755,60 @@ export async function productListMarketScopeMiddleware(
   const request = getRequestExtensions(req);
   const context = marketContextStorage.getStore();
 
-  if (context?.sales_channel_id) {
-    const db = req.scope.resolve(ContainerRegistrationKeys.PG_CONNECTION) as Knex;
-    let scopedProductIds = await listProductIdsForSalesChannel(
-      db,
-      context.sales_channel_id
-    );
-    const existingIdFilter = request.filterableFields?.id ?? request.query?.id;
-    const requestedIds = Array.isArray(existingIdFilter)
-      ? existingIdFilter.filter((id): id is string => typeof id === "string")
-      : typeof existingIdFilter === "string"
-        ? [existingIdFilter]
-        : [];
-
-    if (requestedIds.length) {
-      const requestedIdSet = new Set(requestedIds);
-      scopedProductIds = scopedProductIds.filter((id) => requestedIdSet.has(id));
-    }
-
-    const enforcedIds = scopedProductIds.length
-      ? scopedProductIds
-      : ["__gp_no_products_in_market__"];
-    request.query = { ...request.query, id: enforcedIds };
-    request.filterableFields = { ...request.filterableFields, id: enforcedIds };
+  // BRAMA WEJŚCIOWA (FR-14a). Wcześniej: `if (context?.sales_channel_id) {…}` —
+  // brak kanału POMIJAŁ scoping i core Medusy paginował po pełnym zbiorze.
+  // Brak kontekstu jest odmową, nie zwolnieniem z izolacji.
+  const requestDenial = marketScopeDenialReason(context);
+  if (requestDenial) {
+    // Brama wejściowa biegnie PRZED nadpisaniem `res.json`, więc oryginał
+    // i bieżący `res.json` to ten sam obiekt — wiążemy go jawnie mimo to.
+    denyMarketScope(req, res, requestDenial, "request", res.json.bind(res));
+    return;
   }
+
+  const scopedContext = context as CompleteMarketContext;
+  const db = req.scope.resolve(ContainerRegistrationKeys.PG_CONNECTION) as Knex;
+  let scopedProductIds = await listProductIdsForSalesChannel(
+    db,
+    scopedContext.sales_channel_id
+  );
+  const existingIdFilter = request.filterableFields?.id ?? request.query?.id;
+  const requestedIds = Array.isArray(existingIdFilter)
+    ? existingIdFilter.filter((id): id is string => typeof id === "string")
+    : typeof existingIdFilter === "string"
+      ? [existingIdFilter]
+      : [];
+
+  if (requestedIds.length) {
+    const requestedIdSet = new Set(requestedIds);
+    scopedProductIds = scopedProductIds.filter((id) => requestedIdSet.has(id));
+  }
+
+  const enforcedIds = scopedProductIds.length
+    ? scopedProductIds
+    : ["__gp_no_products_in_market__"];
+  request.query = { ...request.query, id: enforcedIds };
+  request.filterableFields = { ...request.filterableFields, id: enforcedIds };
 
   const originalJson = res.json.bind(res);
 
   (res as unknown as { json: (body: unknown) => Promise<void> }).json =
     async (body: unknown): Promise<void> => {
       const context = marketContextStorage.getStore();
-      if (
-        !context?.market_id ||
-        !context.sales_channel_id ||
-        !body ||
-        typeof body !== "object" ||
-        Array.isArray(body)
-      ) {
+
+      // BRAMA WYJŚCIOWA (FR-14a) — niezależna od wejściowej. Wcześniej brak
+      // kontekstu wyłączał tu filtr po `gp.market_id` i ciało szło przez
+      // `originalJson` niezawężone. Short-circuity NIEZWIĄZANE z kontekstem
+      // (kształt ciała, brak `products`) zostają — one nie pomijają izolacji.
+      const responseDenial = marketScopeDenialReason(context);
+      if (responseDenial) {
+        denyMarketScope(req, res, responseDenial, "response", originalJson);
+        return;
+      }
+
+      const responseContext = context as CompleteMarketContext;
+
+      if (!body || typeof body !== "object" || Array.isArray(body)) {
         return originalJson(body);
       }
 
@@ -694,7 +818,7 @@ export async function productListMarketScopeMiddleware(
           typedBody.product &&
           typeof typedBody.product === "object" &&
           !Array.isArray(typedBody.product) &&
-          productMarketId(typedBody.product) !== context.market_id
+          productMarketId(typedBody.product) !== responseContext.market_id
         ) {
           res.status(404);
           return originalJson({ message: "Product not found" });
@@ -703,7 +827,7 @@ export async function productListMarketScopeMiddleware(
       }
 
       const hasCrossMarketProducts = typedBody.products.some(
-        (product) => productMarketId(product) !== context.market_id
+        (product) => productMarketId(product) !== responseContext.market_id
       );
       if (!hasCrossMarketProducts) {
         return originalJson(body);
@@ -726,7 +850,7 @@ export async function productListMarketScopeMiddleware(
       // requested) are kept — the publishable-key sales-channel scope still applies.
       const inMarketProducts = typedBody.products.filter((product) => {
         const productMarket = productMarketId(product);
-        return productMarket === null || productMarket === context.market_id;
+        return productMarket === null || productMarket === responseContext.market_id;
       });
 
       const removedCount = typedBody.products.length - inMarketProducts.length;

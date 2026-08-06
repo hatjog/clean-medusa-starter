@@ -19,7 +19,7 @@ Aktualna deklaracja w [middlewares.ts](middlewares.ts) ustawia dla wszystkich tr
 | Kolejność | Middleware | Odpowiedzialność | Zachowanie fail-closed |
 |---|---|---|---|
 | 1 | `marketContextMiddleware` | Rozpoznaje `publishable key -> sales_channel_id -> market_id`, lazy-loaduje [MarketContextCache](../loaders/market-context-cache.ts) i instaluje [RLS pool hook](../lib/rls-pool-hook.ts). | Jeśli contextu nie da się ustalić, request przechodzi dalej bez ALS i zostaje zablokowany przez kolejny krok. |
-| 2 | `marketGuardMiddleware` | Wymaga `market_id` w `AsyncLocalStorage` dla każdego requestu `/store/*`. | Brak market contextu kończy się `403 { message: "Market context required" }`. |
+| 2 | `marketGuardMiddleware` | Wymaga `market_id` w `AsyncLocalStorage` dla każdego requestu `/store/*`. | Brak market contextu kończy się **`401 { message: "Market context required" }`** (`failWithMarketContext`). Wcześniejsze wydania tego dokumentu podawały tu `403` — było to nieaktualne wobec kodu od Story 4.4 AC3/F7. Rozdział kodów (Story 2.3, FR-14a): **`401`** = brak / nieważny klucz publishable, czyli wołający nieuwierzytelniony; **`403 { message: "Market scope unresolvable", reason }`** = kontekst rynku JEST, ale jest niepełny (brak `market_id` albo `sales_channel_id`), więc scoping nie może zostać zastosowany — patrz wiersz `productListMarketScopeMiddleware` niżej. |
 | 3 | `customerMarketGuardMiddleware` | Dla zalogowanego customera sprawdza zgodność `customer.metadata.gp.market_id` z aktywnym marketem requestu. Goście przechodzą dalej. | Cross-market access kończy się `403 { message: "Customer not found in this market" }`. |
 
 ## Route-specific overlays
@@ -35,6 +35,7 @@ Po globalnym chainie dokładane są middleware specyficzne dla wybranych ścież
 | `/store/customers/me*` `ALL` | `customerResponseSanitizerMiddleware` | Usuwa `{market_id}::` z pól email przed wysłaniem payloadu do klienta. |
 | `/store/orders*` `ALL` | `customerResponseSanitizerMiddleware` | Ten sam cel co wyżej dla odpowiedzi order/customer. |
 | `/store/carts*` `ALL` | `cartMarketGuardMiddleware` -> `customerResponseSanitizerMiddleware` | Domyka read-path cartów po `sales_channel_id` i dalej sanitizuje payload customer-related. |
+| `/store/products` `ALL` | `productListMarketScopeMiddleware` -> `vendorMetaMiddleware` | Zawęża listing do rynku **dwiema niezależnymi bramami**: wejściową (`request.query.id` / `filterableFields.id` zawężone do produktów kanału sprzedaży, zanim core Medusy spaginuje) i wyjściową (nadpisany `res.json` odrzuca pozycje o obcym `gp.market_id`). Fail-closed od Story 2.3 (FR-14a, AD-19): kontekst **niepełny** (brak `market_id` albo `sales_channel_id`) to **odmowa `403 { message: "Market scope unresolvable", reason }`** na **obu** bramach — nie „pominięty scoping”. `reason` ∈ `context_missing` / `market_id_missing` / `sales_channel_id_missing`. |
 
 ## Webhook security overlays
 
@@ -64,6 +65,15 @@ Po włączeniu backend loguje zdarzenia:
 - `[rls-debug] market-context-resolved`
 - `[rls-debug] market-context-missing`
 - `[rls-debug] market-guard-blocked`
+
+Niezależnie od `GP_RLS_DEBUG` (odmowa musi być widoczna — NFR-2) `productListMarketScopeMiddleware`
+loguje **zawsze** przez `logger.warn`:
+- `[gp] market-scope-denied (request)` — odmowa bramy wejściowej
+- `[gp] market-scope-denied (response)` — odmowa bramy wyjściowej
+
+Payload: `{ reason, gate, path, method, market_id, sales_channel_id, system_origin }`.
+Metryka odmowy trafia do [request-log-aggregator](../lib/request-log-aggregator.ts)
+w kohorcie `market-scope-denied` (`computeRangeStats(since, now, "market-scope-denied")`).
 
 Runbook użycia tych logów znajduje się w [../../../../specs/ops/rls-debugging-runbook.md](../../../../specs/ops/rls-debugging-runbook.md).
 
