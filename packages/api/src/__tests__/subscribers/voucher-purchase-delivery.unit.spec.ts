@@ -38,6 +38,7 @@ const ENTITLEMENT_ID = "entinst_2_3_001"
 const VOUCHER_CODE = "BB-ABCD-1234"
 const MARKET_ID = "bonbeauty"
 const TEMPLATE_KEY = NOTIFICATION_TEMPLATE_KEYS.VOUCHER_PURCHASE_CONFIRMATION
+const HANDOFF_TEMPLATE_KEY = NOTIFICATION_TEMPLATE_KEYS.VOUCHER_HANDOFF_LINK
 
 /**
  * Story 5.7 — projekcja źródłowa niesie KOMPLET danych treści maila. Do 5.7
@@ -345,6 +346,8 @@ describe("extractPurchaseDeliveryTrigger", () => {
       to_state: "ISSUED",
       from_state: "__genesis__",
       market_id: MARKET_ID,
+      // Story 4.4: ścieżka ZDARZENIOWA nie niesie celu — pełna matryca AD-7.
+      dispatch_target: null,
     })
   })
 
@@ -360,6 +363,7 @@ describe("extractPurchaseDeliveryTrigger", () => {
       to_state: "ACTIVE",
       from_state: "ISSUED",
       market_id: null,
+      dispatch_target: null,
     })
   })
 
@@ -369,7 +373,178 @@ describe("extractPurchaseDeliveryTrigger", () => {
       to_state: null,
       from_state: null,
       market_id: null,
+      dispatch_target: null,
     })
+  })
+
+  it("Story 4.4 — czyta cel dosyłki z payloadu (oba człony klucza tożsamości)", () => {
+    const trigger = extractPurchaseDeliveryTrigger({
+      entitlement_id: ENTITLEMENT_ID,
+      to_state: "ISSUED",
+      dispatch_target: {
+        template_key: HANDOFF_TEMPLATE_KEY,
+        recipient_hash: `sha256:${"a".repeat(64)}`,
+      },
+    })
+
+    expect(trigger.dispatch_target).toEqual({
+      template_key: HANDOFF_TEMPLATE_KEY,
+      recipient_hash: `sha256:${"a".repeat(64)}`,
+    })
+  })
+
+  it("Story 4.4 — cel bez `template_key` NIE degraduje się cicho do braku celu", () => {
+    // Sentynela z pustym kluczem: handler odrzuci ją enumem. Zwrócenie tu
+    // `null` znaczyłoby „wyślij całą matrycę" — czyli dokładnie tę wysyłkę
+    // spoza celu, przed którą broni AC2.
+    expect(
+      extractPurchaseDeliveryTrigger({
+        entitlement_id: ENTITLEMENT_ID,
+        to_state: "ISSUED",
+        dispatch_target: { recipient_hash: null },
+      }).dispatch_target,
+    ).toEqual({ template_key: "", recipient_hash: null })
+  })
+})
+
+// ── Story 4.4 / AC2: wejście dosyłki celowane w WIERSZ ─────────────────────
+
+describe("Story 4.4 / AC2 — wysyłka spoza celu NIE NASTĘPUJE", () => {
+  /** Koperta z celem dosyłki (kształt, który buduje sweep). */
+  function targetedEnvelope(
+    templateKey: string,
+    recipientHash: string | null = null,
+    toState = "ISSUED",
+  ) {
+    const base = envelope(toState)
+    return {
+      ...base,
+      payload: {
+        ...base.payload,
+        dispatch_target: {
+          template_key: templateKey,
+          recipient_hash: recipientHash,
+        },
+      },
+    }
+  }
+
+  it("cel „tylko handoff” ⇒ ZERO wywołań providera dla buyer-maila (dwa = RED)", async () => {
+    const { deps, sql, dispatchCalls } = makeDeps({
+      source: {
+        ...DEFAULT_SOURCE,
+        purchase_mode: "gift",
+        gift_recipient_email: "obdarowana@example.test",
+        gift_recipient_send_timing: "now",
+        gift_recipient_bound_to_voucher_issue: true,
+      },
+    })
+
+    const result = await handleVoucherPurchaseDelivery(
+      targetedEnvelope(HANDOFF_TEMPLATE_KEY),
+      deps,
+    )
+
+    // Sterownik zlicza wywołania providera — to jest bramka WYKONANIA.
+    expect(
+      dispatchCalls.filter((call) => call.template === TEMPLATE_KEY),
+    ).toHaveLength(0)
+    expect(
+      dispatchCalls.filter((call) => call.template === HANDOFF_TEMPLATE_KEY),
+    ).toHaveLength(1)
+
+    // Zero wierszy ledgera poza celem: bramka stoi PRZED `reserveDispatch`.
+    expect(sql.dispatch).toHaveLength(1)
+    expect(sql.dispatch[0].template_key).toBe(HANDOFF_TEMPLATE_KEY)
+
+    // Wynik CELU idzie na wierzch (inaczej sweep policzyłby to jako `skipped`).
+    expect(result.outcome).toBe("sent")
+    expect(result.handoff?.outcome).toBe("sent")
+  })
+
+  it("cel „tylko buyer” ⇒ handoff nie idzie, choć predykat prezentu przechodzi", async () => {
+    const { deps, sql, dispatchCalls } = makeDeps({
+      source: {
+        ...DEFAULT_SOURCE,
+        purchase_mode: "gift",
+        gift_recipient_email: "obdarowana@example.test",
+        gift_recipient_send_timing: "now",
+        gift_recipient_bound_to_voucher_issue: true,
+      },
+    })
+
+    const result = await handleVoucherPurchaseDelivery(
+      targetedEnvelope(TEMPLATE_KEY),
+      deps,
+    )
+
+    expect(
+      dispatchCalls.filter((call) => call.template === HANDOFF_TEMPLATE_KEY),
+    ).toHaveLength(0)
+    expect(sql.dispatch).toHaveLength(1)
+    expect(sql.dispatch[0].template_key).toBe(TEMPLATE_KEY)
+    expect(result.outcome).toBe("sent")
+    expect(result.handoff?.outcome).toBe("skipped_dispatch_target_mismatch")
+  })
+
+  it("cel z NIEPASUJĄCYM `recipient_hash` odmawia, choć szablon się zgadza", async () => {
+    const { deps, sql, dispatchCalls } = makeDeps({})
+
+    const result = await handleVoucherPurchaseDelivery(
+      targetedEnvelope(TEMPLATE_KEY, `sha256:${"c".repeat(64)}`),
+      deps,
+    )
+
+    expect(dispatchCalls).toHaveLength(0)
+    expect(sql.dispatch).toHaveLength(0)
+    expect(result.outcome).toBe("skipped_dispatch_target_mismatch")
+  })
+
+  it("cel SPOZA matrycy AD-7 ⇒ enum odmowy, zero wysyłek, zero wierszy ledgera", async () => {
+    const { deps, sql, dispatchCalls } = makeDeps({})
+
+    const result = await handleVoucherPurchaseDelivery(
+      targetedEnvelope("appointment_reminder"),
+      deps,
+    )
+
+    expect(result.outcome).toBe("skipped_dispatch_target_invalid")
+    expect(dispatchCalls).toHaveLength(0)
+    expect(sql.dispatch).toHaveLength(0)
+  })
+
+  it("cel bez `template_key` NIE degraduje się do wysyłki całej matrycy", async () => {
+    const { deps, sql, dispatchCalls } = makeDeps({})
+
+    const base = envelope("ISSUED")
+    const result = await handleVoucherPurchaseDelivery(
+      { ...base, payload: { ...base.payload, dispatch_target: {} } },
+      deps,
+    )
+
+    expect(result.outcome).toBe("skipped_dispatch_target_invalid")
+    expect(dispatchCalls).toHaveLength(0)
+    expect(sql.dispatch).toHaveLength(0)
+  })
+
+  it("BEZ celu zachowanie matrycy AD-7 jest nietknięte (ścieżka zdarzeniowa)", async () => {
+    const { deps, sql, dispatchCalls } = makeDeps({
+      source: {
+        ...DEFAULT_SOURCE,
+        purchase_mode: "gift",
+        gift_recipient_email: "obdarowana@example.test",
+        gift_recipient_send_timing: "now",
+        gift_recipient_bound_to_voucher_issue: true,
+      },
+    })
+
+    const result = await handleVoucherPurchaseDelivery(envelope("ISSUED"), deps)
+
+    // Zgubiony event dotyczy WSZYSTKICH szablonów — komplet matrycy idzie dalej.
+    expect(dispatchCalls).toHaveLength(2)
+    expect(sql.dispatch).toHaveLength(2)
+    expect(result.outcome).toBe("sent")
+    expect(result.handoff?.outcome).toBe("sent")
   })
 })
 

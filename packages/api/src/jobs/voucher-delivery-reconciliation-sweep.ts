@@ -102,6 +102,10 @@ import {
 } from "../modules/voucher-delivery/dispatch-ledger"
 import { DISPATCH_STATES_ALLOWING_RETRY } from "../modules/voucher-delivery/delivery-state"
 import {
+  VOUCHER_DELIVERY_MAX_ATTEMPT_COUNT,
+  VOUCHER_DELIVERY_MAX_CONFIGURATION_RECOVERIES,
+} from "../modules/voucher-delivery/attempt-policy"
+import {
   ENTITLEMENT_STATE_CHANGED_EVENT,
   handleVoucherPurchaseDelivery,
   MARKET_LOCALES_UNAVAILABLE_ERROR_CODE,
@@ -150,6 +154,12 @@ export const SWEEP_STALE_QUEUED_MS = STALE_QUEUED_THRESHOLD_MS
 export const SWEEP_BATCH_LIMIT = 200
 
 /**
+ * Re-eksport budżetu prób z POLITYKI dostawy (`voucher-delivery/attempt-policy`).
+ *
+ * AD-23 / Story 4.4: budżet nadaje polityka, nie wywołujący. Ta stała istnieje
+ * WYŁĄCZNIE dla czytelności wywołań w tym pliku i zgodności zastanych importów
+ * — nie jest drugim źródłem wartości i nie wolno jej przypisać literału.
+ *
  * Górna granica prób dosyłki dla JEDNEGO wiersza ledgera — budżet REALNYCH
  * odrzuceń wysyłki. Wiersz, który go wyczerpał, jest ZAPARKOWANY: nie wraca ze
  * skanu (żeby nie zjadał batcha, R-2.5-H3) i jest raportowany osobnym
@@ -159,7 +169,7 @@ export const SWEEP_BATCH_LIMIT = 200
  * zużywają — inaczej odwracalna awaria konfiguracji zamieniałaby się po 5
  * przebiegach (75 min) w trwałą utratę maili dla całego okna awarii.
  */
-export const SWEEP_MAX_ATTEMPT_COUNT = 5
+export const SWEEP_MAX_ATTEMPT_COUNT = VOUCHER_DELIVERY_MAX_ATTEMPT_COUNT
 
 /**
  * Najwyżej jedno automatyczne odzyskanie budżetu konfiguracji na wiersz.
@@ -169,7 +179,8 @@ export const SWEEP_MAX_ATTEMPT_COUNT = 5
  * tego samego dispatchu w nieskończoność. Kolejny przypadek pozostaje
  * zaparkowany i widoczny w metryce operatorskiej.
  */
-export const SWEEP_MAX_CONFIGURATION_RECOVERIES = 1
+export const SWEEP_MAX_CONFIGURATION_RECOVERIES =
+  VOUCHER_DELIVERY_MAX_CONFIGURATION_RECOVERIES
 
 /**
  * Okno skanu i licznika granicy H1 (7 dni) — JEDNA stała, bo obie liczby muszą
@@ -341,18 +352,28 @@ export type SweepRunStatus =
 /**
  * Liczniki per rynek (AC3 — wymiar `market_id`).
  *
- * R-2.5-M7/L10: jednostką jest ENTITLEMENT (nie para entitlement × szablon),
- * a zbiór kubełków jest DOMKNIĘTY:
+ * Zbiór kubełków jest DOMKNIĘTY:
  *   `found = recovered + still_failing + unresolvable + exhausted + skipped
  *            + state_mismatch + errored`
  * Bez tej domkniętości nie da się napisać reguły alertu „luka domknięta",
  * bo rynek z samymi `skipped`/`exhausted` raportowałby „nic się nie zepsuło".
- * Handoff (drugi szablon matrycy AD-7) ma WŁASNE pola — mieszanie go z
- * buyer-mailem łamało relację `found` ↔ wynik.
+ *
+ * ZMIANA JEDNOSTKI (Story 4.4, FR-9e) — jawnie, nie milcząco: do 4.4 jednostką
+ * `found` był ENTITLEMENT, od 4.4 jest WIERSZ dostawy (para entitlement ×
+ * szablon), bo to wiersz jest jednostką ponawiania. Konsekwencje, które trzeba
+ * znać przy czytaniu dashboardu:
+ *   - `found` rośnie dla entitlementów z dwoma szablonami (buyer + handoff);
+ *     porównania z okresem sprzed 4.4 są porównaniami różnych mianowników,
+ *   - wiersz handoffu wchodzi teraz DO kubełków (wcześniej był poza `found`),
+ *     więc `handoff_recovered`/`handoff_still_failing` przestały być rozłączne
+ *     z `recovered`/`still_failing` — są ich PRZEKROJEM, nie składnikiem,
+ *   - liczbę entitlementów niesie dalej `entitlements_scanned`.
+ * Domkniętość samego równania jest nietknięta: każdy wiersz daje dokładnie
+ * jeden `found` i dokładnie jeden kubełek.
  */
 export type SweepMarketCounters = {
   market_id: string
-  /** Luka WYKRYTA (rozmiar luki przed dosyłką), per entitlement. */
+  /** Luka WYKRYTA (rozmiar luki przed dosyłką), per WIERSZ dostawy (4.4). */
   found: number
   /** Luka DOMKNIĘTA (mail poszedł w tym przebiegu). */
   recovered: number
@@ -543,7 +564,13 @@ class MarketTally {
   }
 }
 
-/** Grupa wierszy skanu dla JEDNEGO entitlementu (dosyłka jest per entitlement). */
+/**
+ * Grupa wierszy skanu dla JEDNEGO entitlementu.
+ *
+ * Story 4.4 (FR-9e): grupa NIE jest już jednostką dosyłki — jest wyłącznie
+ * nośnikiem granicy batcha i licznika `entitlements_scanned`. Dosyłka i decyzja
+ * o wyczerpaniu budżetu zapadają per WIERSZ (`rows`).
+ */
 type SweepTarget = {
   entitlement_id: string
   candidate: DeliveryGapCandidate
@@ -713,7 +740,8 @@ export async function runVoucherDeliveryReconciliationSweep(
   report.scanned = pairs.size
 
   const tally = new MarketTally()
-  /** Dosyłka jest per ENTITLEMENT — handler obsługuje wszystkie szablony naraz. */
+  // Bounded batch liczy ENTITLEMENTY (jak przed 4.4), żeby zmiana jednostki
+  // ponawiania nie podniosła po cichu sufitu wysyłek na przebieg.
   const targets = new Map<string, SweepTarget>()
   for (const candidate of pairs.values()) {
     const target = targets.get(candidate.entitlement_id)
@@ -735,70 +763,64 @@ export async function runVoucherDeliveryReconciliationSweep(
   }
   report.entitlements_scanned = targets.size
 
-  // ── R-2.5-M6: wiersz zaparkowany blokuje CAŁY entitlement ─────────────────
-  // Próg prób żyje przy wierszu, ale handler wysyła wszystkie szablony naraz:
-  // bez tego guardu druga luka reaktywowałaby wiersz zaparkowany przez
-  // `reserveDispatch` i próg przestałby obowiązywać dokładnie tam, gdzie miał.
-  const parkedEntitlements = new Map<string, number>()
+  // ── FR-9e (Story 4.4): jednostką ponawiania jest WIERSZ, nie entitlement ──
+  // Zastane wykluczenie działało na CAŁYM entitlemencie i było POPRAWNE dopóty,
+  // dopóki handler nie przyjmował celu: dosyłka drugiego szablonu wskrzeszałaby
+  // wiersz zaparkowany przez `reserveDispatch` (`attempt_count + 1`) i próg
+  // przestałby obowiązywać dokładnie tam, gdzie miał. Kolejność jest
+  // NIEZAMIENNA — najpierw cel wysyłki (`dispatch_target`), potem ta zmiana.
+  //
+  // Klucz wykluczenia to (entitlement, szablon), bo kandydat skanu nie niesie
+  // `recipient_hash` (wiersza może jeszcze nie być). To granulacja WĘŻSZA niż
+  // zastana i nigdy szersza — czyli bezpieczna w stronę progu prób.
+  const parkedRowKeys = new Set<string>()
   try {
     const parkedRows = await scanner.listParkedDispatches({
       entitlement_ids: [...targets.keys()],
       max_attempt_count: SWEEP_MAX_ATTEMPT_COUNT,
     })
     for (const row of parkedRows) {
-      parkedEntitlements.set(
-        row.entitlement_id,
-        (parkedEntitlements.get(row.entitlement_id) ?? 0) + 1,
-      )
+      parkedRowKeys.add(dispatchRowKey(row.entitlement_id, row.template_key))
     }
   } catch (error) {
     // Fail-closed byłoby gorsze (zero dosyłek), fail-open bez śladu też —
     // logujemy i idziemy dalej z samym guardem `attempt_count` per wiersz.
     logger.warn(
       `[${SCHEDULE_NAME}] odczyt wierszy zaparkowanych nieudany — guard ` +
-        "per-entitlement niedostępny w tym przebiegu",
+        "per-wiersz niedostępny w tym przebiegu",
       { error_class: errorClass(error), error_code: errorCode(error) },
     )
   }
 
+  // Grupa per entitlement pozostaje WYŁĄCZNIE nośnikiem granicy batcha
+  // (`entitlements_scanned`); decyzja o dosyłce zapada per wiersz.
   for (const target of targets.values()) {
-    const candidate = target.candidate
-
-    if (parkedEntitlements.has(target.entitlement_id)) {
-      report.exhausted += 1
-      tally.resolve(candidate.market_id, "exhausted")
-      logger.warn(
-        `[${SCHEDULE_NAME}] entitlement ma wiersz z wyczerpanym budżetem prób ` +
-          "— dosyłka wstrzymana dla WSZYSTKICH jego szablonów",
-        {
-          entitlement_id: target.entitlement_id,
-          market_id: candidate.market_id,
-          parked_rows: parkedEntitlements.get(target.entitlement_id) ?? 0,
-          max_attempt_count: SWEEP_MAX_ATTEMPT_COUNT,
-        },
-      )
-      continue
-    }
-
-    let eligible = false
-    let blocker: SweepBucket | null = null
     for (const row of target.rows) {
-      try {
-        const decision = await prepareCandidate(
-          row,
-          staleQueuedBefore,
-          deps,
-          report,
+      if (parkedRowKeys.has(dispatchRowKey(row.entitlement_id, row.template_key))) {
+        report.exhausted += 1
+        tally.resolve(row.market_id, "exhausted")
+        logger.warn(
+          `[${SCHEDULE_NAME}] wiersz wyczerpał budżet prób — dosyłka ` +
+            "wstrzymana dla TEGO wiersza; pozostałe szablony tego entitlementu " +
+            "idą niezależnie (FR-9e)",
+          {
+            entitlement_id: row.entitlement_id,
+            market_id: row.market_id,
+            template_key: row.template_key,
+            max_attempt_count: SWEEP_MAX_ATTEMPT_COUNT,
+          },
         )
-        if (decision === "eligible") {
-          eligible = true
-        } else if (blocker === null || decision === "state_mismatch") {
-          blocker = decision
-        }
+        continue
+      }
+
+      let decision: PrepareDecision
+      try {
+        decision = await prepareCandidate(row, staleQueuedBefore, deps, report)
       } catch (error) {
-        // Awaria pojedynczego wiersza nie przerywa przebiegu (AC2).
-        eligible = false
-        blocker = "errored"
+        // Awaria pojedynczego wiersza nie przerywa przebiegu (AC2) i — od 4.4 —
+        // nie zabiera już próby SĄSIADOWI: pętla idzie do następnego wiersza.
+        report.errored += 1
+        tally.resolve(row.market_id, "errored")
         logger.warn(
           `[${SCHEDULE_NAME}] przygotowanie wiersza nieudane — wiersz pominięty`,
           {
@@ -809,71 +831,75 @@ export async function runVoucherDeliveryReconciliationSweep(
             error_code: errorCode(error),
           },
         )
-        break
+        continue
       }
-    }
 
-    if (!eligible) {
-      const bucket = blocker ?? "skipped"
-      applyBucket(report, bucket)
-      tally.resolve(candidate.market_id, bucket)
-      continue
-    }
+      if (decision !== "eligible") {
+        applyBucket(report, decision)
+        tally.resolve(row.market_id, decision)
+        continue
+      }
 
-    report.attempted += 1
-    try {
-      const result = await handleVoucherPurchaseDelivery(
-        buildSweepTrigger(candidate),
-        deps.delivery,
-      )
+      report.attempted += 1
+      try {
+        const result = await handleVoucherPurchaseDelivery(
+          buildSweepTrigger(row),
+          deps.delivery,
+        )
 
-      // R-2.5-I15: wymiar metryki to rynek ROZSTRZYGNIĘTY przez handler (ten
-      // sam, który trafia do wiersza ledgera), a nie surowa projekcja skanu.
-      const marketId = result.market_id ?? candidate.market_id
-      const bucket = classifyOutcome(result.outcome)
-      applyBucket(report, bucket)
-      tally.resolve(marketId, bucket)
+        // R-2.5-I15: wymiar metryki to rynek ROZSTRZYGNIĘTY przez handler (ten
+        // sam, który trafia do wiersza ledgera), a nie surowa projekcja skanu.
+        const marketId = result.market_id ?? row.market_id
+        // `result.outcome` JEST wynikiem celu: przy dosyłce celowanej handler
+        // zwraca na wierzchu wynik wiersza, o który sweep prosił (Story 4.4).
+        // Dzięki temu job nadal nie musi znać drugiego szablonu matrycy AD-7 —
+        // granica zależności z 2.4 zostaje nietknięta.
+        const bucket = classifyOutcome(result.outcome)
+        applyBucket(report, bucket)
+        tally.resolve(marketId, bucket)
 
-      await releaseBudgetOnGlobalFailure(
-        result.outcome,
-        result.dispatch_id,
-        result.error_code,
-        deps,
-        report,
-      )
-
-      // Handoff jest osobnym wierszem ledgera i osobnym licznikiem (R-2.5-M7)
-      // — WYŁĄCZNIE gdy realnie doszło do próby wysyłki. `skipped_not_eligible`
-      // (zakup dla siebie) to zdecydowana większość ruchu i zalałby liczniki.
-      const handoff = result.handoff
-      if (handoff && (handoff.outcome === "sent" || handoff.outcome === "failed")) {
-        tally.handoff(marketId, handoff.outcome)
-        if (handoff.outcome === "sent") report.handoff_recovered += 1
-        else report.handoff_still_failing += 1
         await releaseBudgetOnGlobalFailure(
-          handoff.outcome,
-          handoff.dispatch_id,
-          handoff.error_code,
+          result.outcome,
+          result.dispatch_id,
+          result.error_code,
           deps,
           report,
         )
-      }
 
-      logDispatchOutcome(logger, candidate, result, bucket)
-    } catch (error) {
-      // Handler z 2.3 nie rzuca, ale sweep nie może na tym STAĆ: awaria
-      // pojedynczego wiersza nie przerywa przebiegu i nie wywraca schedulera.
-      report.errored += 1
-      tally.resolve(candidate.market_id, "errored")
-      logger.warn(
-        `[${SCHEDULE_NAME}] dosyłka wiersza nieudana — przebieg kontynuowany`,
-        {
-          entitlement_id: candidate.entitlement_id,
-          market_id: candidate.market_id,
-          error_class: errorClass(error),
-          error_code: errorCode(error),
-        },
-      )
+        // Handoff jest osobnym wierszem ledgera i osobnym licznikiem (R-2.5-M7)
+        // — WYŁĄCZNIE gdy realnie doszło do próby wysyłki. `skipped_*` (zakup
+        // dla siebie, wysyłka poza celem) zalałoby liczniki.
+        const handoff = result.handoff
+        if (handoff && (handoff.outcome === "sent" || handoff.outcome === "failed")) {
+          tally.handoff(marketId, handoff.outcome)
+          if (handoff.outcome === "sent") report.handoff_recovered += 1
+          else report.handoff_still_failing += 1
+          await releaseBudgetOnGlobalFailure(
+            handoff.outcome,
+            handoff.dispatch_id,
+            handoff.error_code,
+            deps,
+            report,
+          )
+        }
+
+        logDispatchOutcome(logger, row, result, bucket)
+      } catch (error) {
+        // Handler z 2.3 nie rzuca, ale sweep nie może na tym STAĆ: awaria
+        // pojedynczego wiersza nie przerywa przebiegu i nie wywraca schedulera.
+        report.errored += 1
+        tally.resolve(row.market_id, "errored")
+        logger.warn(
+          `[${SCHEDULE_NAME}] dosyłka wiersza nieudana — przebieg kontynuowany`,
+          {
+            entitlement_id: row.entitlement_id,
+            market_id: row.market_id,
+            template_key: row.template_key,
+            error_class: errorClass(error),
+            error_code: errorCode(error),
+          },
+        )
+      }
     }
   }
 
@@ -969,6 +995,10 @@ export async function runVoucherDeliveryReconciliationSweep(
     metrics?.capture(METRIC_GAP, {
       schedule_name: SCHEDULE_NAME,
       market_id: row.market_id,
+        // Story 4.4: nazwa zachowana ŚWIADOMIE (reguła alertu „luka domknięta"
+      // czyta ją po nazwie), ale jednostką jest teraz WIERSZ dostawy. Zmiana
+      // nazwy zerwałaby ciągłość szeregu bez zysku; zmiana znaczenia jest
+      // udokumentowana przy `SweepMarketCounters`.
       entitlements_without_dispatch: row.found,
       recovered: row.recovered,
       still_failing: row.still_failing,
@@ -1125,6 +1155,14 @@ async function prepareCandidate(
   return "state_mismatch"
 }
 
+/**
+ * Klucz WIERSZA dostawy w obrębie przebiegu (Story 4.4). Świadomie bez
+ * `recipient_hash`: kandydat skanu go nie niesie, patrz doc `listParkedDispatches`.
+ */
+function dispatchRowKey(entitlementId: string, templateKey: string): string {
+  return `${entitlementId}::${templateKey}`
+}
+
 /** Wynik handlera → JEDEN rozłączny kubełek (domknięcie `found`). */
 function classifyOutcome(outcome: PurchaseDeliveryOutcome): SweepBucket {
   if (outcome === "sent") return "recovered"
@@ -1191,6 +1229,7 @@ function logDispatchOutcome(
     entitlement_id: candidate.entitlement_id,
     market_id: result.market_id ?? candidate.market_id,
     entitlement_state: candidate.entitlement_state,
+    template_key: candidate.template_key,
     outcome: result.outcome,
     handoff_outcome: result.handoff?.outcome ?? null,
     error_code: result.error_code,
@@ -1219,7 +1258,12 @@ function logDispatchOutcome(
 export function buildSweepTrigger(candidate: DeliveryGapCandidate): {
   event_type: string
   scope: { market_id: string | null }
-  payload: { entitlement_id: string; to_state: string; from_state: null }
+  payload: {
+    entitlement_id: string
+    to_state: string
+    from_state: null
+    dispatch_target: { template_key: string; recipient_hash: string | null }
+  }
 } {
   return {
     event_type: ENTITLEMENT_STATE_CHANGED_EVENT,
@@ -1228,6 +1272,14 @@ export function buildSweepTrigger(candidate: DeliveryGapCandidate): {
       entitlement_id: candidate.entitlement_id,
       to_state: candidate.entitlement_state,
       from_state: null,
+      // Story 4.4 (AC2) — jednostką ponawiania jest WIERSZ: handler wyśle
+      // dokładnie ten szablon i żadnego innego. `recipient_hash` jest `null`,
+      // bo kandydat skanu go nie zna (kanoniczna luka nie ma jeszcze wiersza);
+      // tożsamość odbiorcy rozstrzyga wtedy projekcja źródłowa w handlerze.
+      dispatch_target: {
+        template_key: candidate.template_key,
+        recipient_hash: null,
+      },
     },
   }
 }

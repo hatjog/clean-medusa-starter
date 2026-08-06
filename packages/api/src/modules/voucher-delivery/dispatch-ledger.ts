@@ -56,6 +56,7 @@ import {
   type DeliveryDispatchState,
 } from "./delivery-state"
 import { isRecipientHash, type RecipientHash } from "./recipient-hash"
+import { CALLER_FORBIDDEN_ATTEMPT_FIELDS } from "./attempt-policy"
 
 export const VOUCHER_DELIVERY_DISPATCH_TABLE = "voucher_delivery_dispatch"
 export const VOUCHER_DELIVERY_DISPATCH_AUDIT_TABLE =
@@ -368,11 +369,21 @@ export interface DeliveryGapScanPort {
     input: ScanStalledDispatchesInput,
   ): Promise<DeliveryGapCandidate[]>
   /**
-   * R-2.5-M6 — wiersze ZAPARKOWANE dla wskazanych entitlementów. Decyzja
-   * o wyczerpaniu budżetu żyje PRZY WIERSZU, ale dosyłka jest per entitlement
-   * (handler wysyła wszystkie szablony naraz), więc sweep musi wiedzieć, że dla
-   * tego entitlementu istnieje wiersz zaparkowany — inaczej dołożenie drugiego
-   * szablonu obchodziłoby próg przez `reserveDispatch`.
+   * R-2.5-M6 — wiersze ZAPARKOWANE dla wskazanych entitlementów.
+   *
+   * Story 4.4 (FR-9e): decyzja o wyczerpaniu budżetu żyje PRZY WIERSZU i od tej
+   * story sweep też wyklucza PER WIERSZ — zaparkowany wiersz nie wstrzymuje
+   * pozostałych szablonów tego samego entitlementu. Było to możliwe dopiero po
+   * scelowaniu wejścia dosyłki (`dispatch_target` w handlerze 2.3/2.4): dopóki
+   * handler wysyłał komplet szablonów naraz, jedynym sposobem na nieobejście
+   * progu przez `reserveDispatch` było wykluczenie CAŁEGO entitlementu.
+   *
+   * Zapytanie zwraca `template_key` wiersza, bo to on — obok `entitlement_id` —
+   * jest kluczem wykluczenia po stronie sweepa. `recipient_hash` NIE wchodzi do
+   * tego klucza świadomie: kandydat skanu go nie niesie (wiersza dostawy może
+   * jeszcze nie być), więc dopasowanie po nim byłoby niemożliwe. Skutkiem jest
+   * wykluczenie o granulacji (entitlement, szablon) — węższe niż zastane
+   * per-entitlement i nigdy szersze, czyli bezpieczne w stronę progu.
    */
   listParkedDispatches(input: {
     entitlement_ids: readonly string[]
@@ -461,6 +472,10 @@ export class PgDispatchLedger
     input: ReserveDispatchInput,
   ): Promise<ReserveDispatchResult> {
     assertRecipientHash(input.recipient_hash)
+    // AD-23 (Story 4.4): numer próby nadaje POLITYKA. Typ już go nie ma, ale
+    // wejście bywa budowane dynamicznie (payload webhooka 4.2/4.3, `as`) —
+    // ciche zignorowanie `attempt_no` wyglądałoby jak skuteczne nadanie numeru.
+    assertNoCallerAttemptNumber(input)
 
     const dispatchId = this.uuid()
     const nowIso = this.now().toISOString()
@@ -1445,6 +1460,28 @@ function assertConfigurationRecoveryLimit(value: number): void {
     throw new DispatchLedgerError(
       "max_configuration_recoveries musi być liczbą całkowitą >= 0",
       "VOUCHER_DELIVERY_CONFIGURATION_RECOVERY_LIMIT_INVALID",
+    )
+  }
+}
+
+/**
+ * AD-23 (Story 4.4) — wywołujący NIE nadaje numeru próby.
+ *
+ * Inkrement `attempt_count` dzieje się wyłącznie w warunkowym `UPDATE … WHERE
+ * status IN (…)` przejęcia retry. Wejście z polem `attempt_count`/`attempt_no`
+ * jest ODRZUCANE, nie ignorowane: cicha akceptacja wyglądałaby jak skuteczne
+ * nadanie numeru z zewnątrz, a gdyby `attempt_no` trafił kiedyś do klucza
+ * bariery idempotencji (rozstrzygnięcie P-3, Story 4.1), oznaczałaby, że
+ * dowolny wywołujący potrafi wyprodukować nowy klucz i obejść barierę.
+ */
+function assertNoCallerAttemptNumber(input: object): void {
+  const carried = CALLER_FORBIDDEN_ATTEMPT_FIELDS.filter((field) =>
+    Object.prototype.hasOwnProperty.call(input, field),
+  )
+  if (carried.length > 0) {
+    throw new DispatchLedgerError(
+      `numer próby nadaje polityka, nie wywołujący (AD-23) — wejście niesie: ${carried.join(", ")}`,
+      "VOUCHER_DELIVERY_ATTEMPT_NUMBER_NOT_CALLER_OWNED",
     )
   }
 }

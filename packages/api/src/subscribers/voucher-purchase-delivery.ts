@@ -18,6 +18,18 @@
  * Obie wysyłki są NIEZALEŻNE: osobne wiersze ledgera (różny `template_key`
  * i różny `recipient_hash`), osobny retry, `failed` jednej nie rusza drugiej.
  *
+ * ── Story 4.4 (FR-9e, AD-23): jednostką ponawiania jest WIERSZ ──────────────
+ * Do 4.4 niezależność wysyłek była prawdziwa w ścieżce ZDARZENIA i nieprawdziwa
+ * w ścieżce PONOWIENIA: handler przyjmował trigger entitlementu i próbował
+ * kompletu szablonów matrycy, więc sweep nie miał jak powiedzieć „ponów TEN
+ * jeden wiersz" i bronił progu prób, wykluczając cały entitlement.
+ *
+ * `payload.dispatch_target = { template_key, recipient_hash? }` domyka tę
+ * różnicę: wysyłka spoza celu nie następuje — ani do providera, ani do ledgera
+ * (bramka stoi przed `reserveDispatch`, także dla wiersza ograniczającego
+ * awarii konfiguracji). BEZ celu zachowanie matrycy AD-7 jest nietknięte, bo
+ * zgubiony event dotyczy wszystkich szablonów naraz.
+ *
  * ── Single-writer ledgera ───────────────────────────────────────────────────
  * Ten plik jest JEDYNYM pisarzem `voucher_delivery_dispatch`. Provider `brevo`
  * nie dotyka ledgera i nie importuje modułu voucher-delivery (kierunek
@@ -155,7 +167,32 @@ type TransitionEnvelopeLike = {
     to_state?: string
     transitioned_at?: string
     actor_hint?: string
+    /** Story 4.4 — cel dosyłki per WIERSZ; nieobecny w ścieżce zdarzeniowej. */
+    dispatch_target?: { template_key?: unknown; recipient_hash?: unknown }
   }
+}
+
+/**
+ * Story 4.4 (FR-9e) — CEL wysyłki: „ponów TEN JEDEN wiersz dostawy".
+ *
+ * Człony celu to dokładnie człony klucza tożsamości wiersza
+ * `voucher_delivery_dispatch_identity_uq (entitlement_id, template_key,
+ * recipient_hash)`; `entitlement_id` niesie już payload, więc zostają dwa.
+ *
+ * `recipient_hash` jest OPCJONALNY, bo sweep go nie zna: kandydat skanu bywa
+ * kanoniczną luką (wiersza nie ma w ogóle), a wtedy jedynym miejscem, w którym
+ * hash powstaje, jest ta ścieżka. `null` znaczy „dowolny odbiorca tego
+ * szablonu", nigdy „dowolny szablon".
+ *
+ * Dlaczego cel, a nie `dispatch_id`: handler nie czyta wierszy ledgera po id —
+ * wyprowadza tożsamość z projekcji źródłowej. Wejście po `dispatch_id`
+ * wymagałoby dodatkowego odczytu ledgera na ścieżce wysyłki i wprowadzało DRUGIE
+ * źródło tożsamości (snapshot wiersza vs bieżąca projekcja), które mogłoby się
+ * rozjechać. Cel jest porównaniem czysto lokalnym, bez I/O.
+ */
+export type DispatchTarget = {
+  template_key: string
+  recipient_hash: string | null
 }
 
 /** Znormalizowane wejście: koperta `envelope.v1` ALBO płaski payload. */
@@ -164,6 +201,11 @@ export type PurchaseDeliveryTrigger = {
   to_state: string | null
   from_state: string | null
   market_id: string | null
+  /**
+   * Story 4.4 — cel dosyłki. `null` w ścieżce ZDARZENIOWEJ: subscriber nadal
+   * realizuje pełną matrycę AD-7, bo zgubiony event dotyczy wszystkich szablonów.
+   */
+  dispatch_target: DispatchTarget | null
 }
 
 /** Projekcja źródła — wąski podzbiór `VoucherService.findBuyerClaimSource`. */
@@ -224,6 +266,16 @@ export type PurchaseDeliveryOutcome =
   | "skipped_in_flight"
   /** Story 2.4 — predykat gift/handoff nie przepuścił wysyłki (AC2). */
   | "skipped_not_eligible"
+  /**
+   * Story 4.4 (AC2) — ta wysyłka leży POZA celem dosyłki. Nie jest błędem:
+   * ponowienie celowane w jeden wiersz z definicji pomija pozostałe.
+   */
+  | "skipped_dispatch_target_mismatch"
+  /**
+   * Story 4.4 (AC2) — cel dosyłki jest niezdatny do użycia: pusty `template_key`
+   * albo klucz spoza matrycy AD-7. Odmowa, nie cicha wysyłka pełnej matrycy.
+   */
+  | "skipped_dispatch_target_invalid"
   | "sent"
   | "failed"
 
@@ -310,7 +362,49 @@ export function extractPurchaseDeliveryTrigger(
     // `scope.market_id` JEST w kopercie eventu (2.1) — to pierwszy, najtańszy
     // nośnik rynku z danych domenowych (R-2.2-M4 / AC6b).
     market_id: nonEmpty(scope?.market_id),
+    dispatch_target: extractDispatchTarget(payload?.dispatch_target),
   }
+}
+
+/**
+ * Story 4.4 — cel dosyłki z payloadu. Kształt niepełny (brak `template_key`)
+ * NIE jest cichym „brak celu": zwracamy sentynelę z pustym kluczem, którą
+ * handler odrzuca enumem `skipped_dispatch_target_invalid`. Milczące
+ * zdegradowanie zepsutego celu do „wyślij wszystko" byłoby dokładnie tą wysyłką
+ * spoza celu, przed którą broni AC2.
+ */
+function extractDispatchTarget(raw: unknown): DispatchTarget | null {
+  if (raw === undefined || raw === null) return null
+  if (typeof raw !== "object") return { template_key: "", recipient_hash: null }
+
+  const candidate = raw as { template_key?: unknown; recipient_hash?: unknown }
+  return {
+    template_key: nonEmpty(candidate.template_key) ?? "",
+    recipient_hash: nonEmpty(candidate.recipient_hash),
+  }
+}
+
+/** Szablony matrycy AD-7 — jedyne legalne wartości `dispatch_target.template_key`. */
+const TARGETABLE_TEMPLATE_KEYS: ReadonlySet<string> = new Set([
+  NOTIFICATION_TEMPLATE_KEYS.VOUCHER_PURCHASE_CONFIRMATION,
+  NOTIFICATION_TEMPLATE_KEYS.VOUCHER_HANDOFF_LINK,
+])
+
+/**
+ * Czy dana wysyłka mieści się w celu? Brak celu = ścieżka zdarzeniowa, w której
+ * mieści się wszystko (dzisiejsze zachowanie matrycy AD-7, co do joty).
+ */
+function isWithinDispatchTarget(
+  target: DispatchTarget | null,
+  templateKey: string,
+  recipientHash: string | null,
+): boolean {
+  if (!target) return true
+  if (target.template_key !== templateKey) return false
+  // Hash porównujemy WYŁĄCZNIE, gdy cel go niesie: sweep go nie zna, a wymaganie
+  // go zawsze zamieniłoby dosyłkę kanonicznej luki w odmowę.
+  if (target.recipient_hash && target.recipient_hash !== recipientHash) return false
+  return true
 }
 
 /**
@@ -338,6 +432,30 @@ export async function handleVoucherPurchaseDelivery(
   }
 
   const entitlementId = trigger.entitlement_id
+
+  // ── Story 4.4 (AC2): cel dosyłki musi być zdatny do użycia ────────────────
+  // Odmowa PRZED jakimkolwiek I/O — dzięki temu „zero wysyłek" znaczy też
+  // „zero wierszy ledgera", również na ścieżkach fail-loud konfiguracji.
+  const dispatchTarget = trigger.dispatch_target
+  if (dispatchTarget && !TARGETABLE_TEMPLATE_KEYS.has(dispatchTarget.template_key)) {
+    deps.logger?.warn?.(
+      "[voucher-purchase-delivery] odmowa: cel dosyłki spoza matrycy AD-7",
+      {
+        entitlement_id: entitlementId,
+        market_id: trigger.market_id,
+        to_state: trigger.to_state,
+        // Sam klucz szablonu, nigdy `recipient_hash` (nośnik tożsamości odbiorcy).
+        target_template_key: dispatchTarget.template_key || null,
+      },
+    )
+    return result(
+      "skipped_dispatch_target_invalid",
+      trigger,
+      null,
+      null,
+      null,
+    )
+  }
 
   let source: PurchaseDeliverySource | null = null
   try {
@@ -468,6 +586,7 @@ export async function handleVoucherPurchaseDelivery(
           locale: requestedLocale ?? locale,
           errorCode: MARKET_LOCALES_UNAVAILABLE_ERROR_CODE,
           recipientEmail,
+          dispatchTarget,
         },
         deps,
       ),
@@ -503,7 +622,7 @@ export async function handleVoucherPurchaseDelivery(
       outcome: "failed",
       entitlement_id: entitlementId,
       dispatch_id: await recordPreflightConfigurationFailure(
-        { entitlementId, marketId, locale, errorCode, recipientEmail },
+        { entitlementId, marketId, locale, errorCode, recipientEmail, dispatchTarget },
         deps,
       ),
       market_id: marketId,
@@ -546,7 +665,7 @@ export async function handleVoucherPurchaseDelivery(
       outcome: "failed",
       entitlement_id: entitlementId,
       dispatch_id: await recordPreflightConfigurationFailure(
-        { entitlementId, marketId, locale, errorCode, recipientEmail },
+        { entitlementId, marketId, locale, errorCode, recipientEmail, dispatchTarget },
         deps,
       ),
       market_id: marketId,
@@ -605,6 +724,26 @@ export async function handleVoucherPurchaseDelivery(
   // `template_key` i `recipient_hash`. Awaria buyer-maila nie może zabrać
   // handoffu ani odwrotnie, więc kolejność jest bez znaczenia dla wyniku.
   const handoff = await runGiftHandoff(handoffDecision, context, deps)
+
+  // ── Story 4.4 (AC1/AC2): wynik CELU idzie na wierzch ──────────────────────
+  // Wołający, który poprosił o KONKRETNY wiersz, musi dostać wynik TEGO wiersza
+  // jako `outcome`. Inaczej sweep klasyfikowałby udaną dosyłkę handoffu jako
+  // `skipped` (bo buyer-mail leżał poza celem) — i musiałby znać drugi szablon
+  // matrycy AD-7, żeby to naprawić, łamiąc granicę zależności z 2.4.
+  if (
+    dispatchTarget?.template_key ===
+    NOTIFICATION_TEMPLATE_KEYS.VOUCHER_HANDOFF_LINK
+  ) {
+    return {
+      outcome: handoff.outcome,
+      entitlement_id: entitlementId,
+      dispatch_id: handoff.dispatch_id,
+      market_id: marketId,
+      locale: handoff.locale,
+      error_code: handoff.error_code,
+      handoff,
+    }
+  }
 
   return { ...buyerResult, handoff }
 }
@@ -723,6 +862,28 @@ async function runDispatchAttempt(
       },
     )
     return result("skipped_missing_recipient", trigger, null, marketId, locale)
+  }
+
+  // ── Story 4.4 (AC2): wysyłka spoza celu NIE NASTĘPUJE ─────────────────────
+  // Bramka stoi PRZED `reserveDispatch`, więc pominięta wysyłka nie zostawia
+  // ani wiersza ledgera, ani wywołania providera. To jest miejsce, w którym
+  // „ponów TEN wiersz" przestaje być konwencją, a staje się wykonaniem.
+  if (
+    !isWithinDispatchTarget(trigger.dispatch_target, templateKey, recipientHash)
+  ) {
+    deps.logger?.info?.(`${tag} pominięto: wysyłka poza celem dosyłki (4.4)`, {
+      entitlement_id: entitlementId,
+      market_id: marketId,
+      template_key: templateKey,
+      target_template_key: trigger.dispatch_target?.template_key ?? null,
+    })
+    return result(
+      "skipped_dispatch_target_mismatch",
+      trigger,
+      null,
+      marketId,
+      locale,
+    )
   }
 
   let reservation
@@ -1040,6 +1201,8 @@ async function recordPreflightConfigurationFailure(
     locale: string
     errorCode: string
     recipientEmail: string | null
+    /** Story 4.4 — cel dosyłki; wiersz ograniczający też jest wysyłką co do celu. */
+    dispatchTarget: DispatchTarget | null
   },
   deps: PurchaseDeliveryDeps,
 ): Promise<string | null> {
@@ -1055,6 +1218,19 @@ async function recordPreflightConfigurationFailure(
   try {
     recipientHash = hashRecipientEmail(input.recipientEmail)
   } catch {
+    return null
+  }
+
+  // Story 4.4 (AC2): wiersz ograniczający dotyczy KONKRETNEGO szablonu
+  // (buyer-mail). Gdy cel dosyłki wskazuje inny wiersz, zapisanie go byłoby
+  // zapisem ledgera poza celem — czyli dokładnie tym, czego AC2 zabrania.
+  if (
+    !isWithinDispatchTarget(
+      input.dispatchTarget,
+      NOTIFICATION_TEMPLATE_KEYS.VOUCHER_PURCHASE_CONFIRMATION,
+      recipientHash,
+    )
+  ) {
     return null
   }
 
