@@ -1,6 +1,6 @@
 /**
  * rls-connection-source — źródło połączeń dla modułów używających surowego SQL
- * (v1.15.0 Story 2.6, AC1; FR-14e, AD-21 §4, AD-22, ADR-190).
+ * (v1.15.0 Story 2.6, AC1; FR-14e, AD-21 §4, AD-22, ADR-192).
  *
  * ── Problem, który ten moduł likwiduje ──────────────────────────────────────
  * `modules/voucher/service.ts` trzymał WŁASNĄ pulę `pg.Pool` ze
@@ -38,6 +38,11 @@ type RawConnection = {
 type KnexClientLike = {
   acquireConnection: () => Promise<RawConnection>
   releaseConnection: (connection: RawConnection) => Promise<void>
+  /**
+   * Knex wystawia to, gdy połączenie ma zostać ZNISZCZONE, a nie oddane do puli.
+   * Opcjonalne, bo `rls-pool-hook.ts` sam sobie z jego brakiem radzi.
+   */
+  destroyRawConnection?: (connection: RawConnection) => Promise<void>
 }
 
 /** Kształt `ContainerRegistrationKeys.PG_CONNECTION` (instancja Knexa). */
@@ -128,16 +133,28 @@ export function createRlsConnectionSource(
       ): Promise<QueryResult<R>> {
         return (await connection.query(sql, params)) as QueryResult<R>
       },
-      release(): void {
+      release(err?: unknown): void {
         if (released) return
         released = true
         // Knex zwalnia asynchronicznie, `pg.PoolClient.release()` jest
         // synchroniczne. Zwolnienie jest ODPALONE tutaj, a hook sam niszczy
         // połączenie, jeśli RESET się nie powiedzie — więc brak `await`
         // nie zostawia brudnego połączenia w puli.
-        void client.releaseConnection(connection).catch((error: unknown) => {
+        //
+        // v1.15.0 Story 2.6 cykl 1 (MEDIUM): argument `err` NIE jest ignorowany.
+        // W `pg` `release(err)` znaczy „zniszcz to połączenie, nie oddawaj go do
+        // puli" — serwis woła tak po nieudanym `ROLLBACK`. Zignorowanie argumentu
+        // oddawałoby do puli połączenie w OTWARTEJ transakcji, a następny
+        // wołający dostałby je z cudzym `BEGIN`.
+        const finish =
+          err !== undefined && typeof client.destroyRawConnection === "function"
+            ? client.destroyRawConnection(connection)
+            : client.releaseConnection(connection)
+
+        void Promise.resolve(finish).catch((error: unknown) => {
           logger?.error?.("rls connection source release failed", {
             error_code: RLS_CONNECTION_SOURCE_UNAVAILABLE,
+            destroyed: err !== undefined,
             error: describeError(error),
           })
         })

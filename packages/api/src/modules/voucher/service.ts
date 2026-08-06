@@ -299,7 +299,7 @@ export interface RefundAppliedEnvelope {
  * Moduł nie zna już `DATABASE_URL`, bo nie otwiera własnego połączenia:
  * connection string jest wejściem do WŁASNEJ puli, a własna pula to dokładnie
  * ten mechanizm, przez który ścieżka pieniądza omijała RLS. Źródłem połączeń
- * jest `lib/rls-connection-source.ts` nad pulą Knexa Medusy (ADR-190).
+ * jest `lib/rls-connection-source.ts` nad pulą Knexa Medusy (ADR-192).
  */
 
 /**

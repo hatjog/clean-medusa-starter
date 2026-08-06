@@ -1,7 +1,7 @@
 import { Migration } from "@medusajs/framework/mikro-orm/migrations"
 
 /**
- * v1.15.0 Story 2.6 (FR-14e, AD-22, NFR-5; ADR-190, wzorzec ADR-141) —
+ * v1.15.0 Story 2.6 (FR-14e, AD-22, NFR-5; ADR-192, wzorzec ADR-141) —
  * polityki RLS dla tabel modułu voucher PO usunięciu własnej puli połączeń
  * z `modules/voucher/service.ts`.
  *
@@ -87,24 +87,66 @@ export class Migration1779000000000 extends Migration {
     // Rola runtime bez BYPASSRLS. `infra/postgres/migrations/003` tworzy ją
     // dla dev/bootstrap, ale `infra/` jest jawnie NIE-SSOT (ADR-141 §1);
     // migracja modułu nie może zakładać, że tamten mirror się wykonał.
+    //
+    // WYMAGANIA UPRAWNIEŃ ROLI MIGRACYJNEJ (v1.15.0 Story 2.6 cykl 1, MEDIUM):
+    //   - `CREATEROLE` (albo superuser) — TYLKO gdy rola `medusa_store` jeszcze
+    //     nie istnieje; jeśli istnieje (np. z `infra/postgres/migrations/003`
+    //     albo z provisioningu środowiska), migracja jej nie tworzy i uprawnienie
+    //     nie jest potrzebne;
+    //   - własność tabel modułu albo `WITH GRANT OPTION` — dla `GRANT … ON <table>`.
+    // W suicie integracyjnej te instrukcje wykonuje superuser z kontenera, więc
+    // TEST NIE MOŻE wykryć braku uprawnień na środowisku docelowym. Dlatego brak
+    // uprawnienia kończy się komunikatem, który NAZYWA brakujące uprawnienie,
+    // a nie surowym `permission denied to create role` w połowie migracji.
     this.addSql(`
       DO $$
       BEGIN
         IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'medusa_store') THEN
-          CREATE ROLE medusa_store NOLOGIN;
+          BEGIN
+            CREATE ROLE medusa_store NOLOGIN;
+          EXCEPTION WHEN insufficient_privilege THEN
+            RAISE EXCEPTION
+              'GP_RLS_MIGRATION_REQUIRES_CREATEROLE: rola migracyjna "%" nie ma '
+              'uprawnienia CREATEROLE, a rola runtime "medusa_store" nie istnieje. '
+              'Utwórz ją poza migracją (CREATE ROLE medusa_store NOLOGIN) albo nadaj '
+              'roli migracyjnej CREATEROLE — patrz ADR-192 i runbook operatora.',
+              current_user;
+          END;
         END IF;
       END
       $$;
     `)
-    this.addSql(`GRANT USAGE ON SCHEMA public TO medusa_store`)
+    this.addSql(`
+      DO $$
+      BEGIN
+        GRANT USAGE ON SCHEMA public TO medusa_store;
+      EXCEPTION WHEN insufficient_privilege THEN
+        RAISE EXCEPTION
+          'GP_RLS_MIGRATION_REQUIRES_GRANT: rola migracyjna "%" nie może nadać '
+          'USAGE ON SCHEMA public roli medusa_store — wymagana jest własność '
+          'schematu albo WITH GRANT OPTION (ADR-192).',
+          current_user;
+      END
+      $$;
+    `)
 
     for (const table of RLS_TABLES) {
       // Bez GRANTU przepięcie puli zamieniłoby ciszę na `permission denied`
       // NA PRODUKCJI: `ALTER DEFAULT PRIVILEGES` z migracji 003 działa tylko
       // dla roli, która je zadeklarowała, a te tabele tworzy migracja modułu.
-      this.addSql(
-        `GRANT SELECT, INSERT, UPDATE, DELETE ON ${table} TO medusa_store`,
-      )
+      this.addSql(`
+        DO $$
+        BEGIN
+          GRANT SELECT, INSERT, UPDATE, DELETE ON ${table} TO medusa_store;
+        EXCEPTION WHEN insufficient_privilege THEN
+          RAISE EXCEPTION
+            'GP_RLS_MIGRATION_REQUIRES_GRANT: rola migracyjna "%" nie może nadać '
+            'uprawnień na tabeli ${table} roli medusa_store — wymagana jest '
+            'własność tabeli albo WITH GRANT OPTION (ADR-192).',
+            current_user;
+        END
+        $$;
+      `)
       this.addSql(`ALTER TABLE ${table} ENABLE ROW LEVEL SECURITY`)
       this.addSql(`ALTER TABLE ${table} FORCE ROW LEVEL SECURITY`)
       // Idempotencja: `CREATE POLICY` nie ma `IF NOT EXISTS` w PG 17.

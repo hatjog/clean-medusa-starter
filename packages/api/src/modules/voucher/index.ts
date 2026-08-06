@@ -12,6 +12,7 @@
 import { Module } from "@medusajs/framework/utils"
 import VoucherService from "./service"
 import voucherSeedFixturesLoader from "./loaders/seed-fixtures"
+import assertRlsConnectionSourceLoader from "./loaders/assert-rls-connection-source"
 
 export const VOUCHER_MODULE = "voucher"
 
@@ -650,5 +651,7 @@ export type {
 
 export default Module(VOUCHER_MODULE, {
   service: VoucherService,
-  loaders: [voucherSeedFixturesLoader],
+  // Kolejność jest ZNACZĄCA: najpierw werdykt o nośniku połączeń (fail-loud na
+  // boocie, v1.15.0 Story 2.6), potem seed, który i tak by się bez niego wywrócił.
+  loaders: [assertRlsConnectionSourceLoader, voucherSeedFixturesLoader],
 })

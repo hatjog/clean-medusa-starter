@@ -1,6 +1,6 @@
 /**
  * Moduł voucher pod RLS — dowód Z WYKONANIA na żywym Postgresie
- * (v1.15.0 Story 2.6, AC1/AC2/AC4; FR-14e, AD-22, NFR-1, NFR-5, ADR-190).
+ * (v1.15.0 Story 2.6, AC1/AC2/AC4; FR-14e, AD-22, NFR-1, NFR-5, ADR-192).
  *
  * ── Co tu jest prawdziwe ────────────────────────────────────────────────────
  *  - DDL tabel modułu jest WYKONANY Z PLIKÓW MIGRACJI (`up()` → `addSql`),
@@ -96,6 +96,39 @@ async function collectModuleMigrationSql(): Promise<string[]> {
     throw new Error("zero instrukcji z migracji — sonda nie może udawać migracji")
   }
   return statements
+}
+
+/**
+ * Instrukcje migracji dotyczące JEDNEJ tabeli — do PRZYWRACANIA stanu docelowego
+ * w test-the-teście.
+ *
+ * v1.15.0 Story 2.6 cykl 1 (finding LOW): blok `finally` odtwarzał politykę
+ * RĘCZNIE WPISANYM SQL-em, dokładnie tam, gdzie reszta suity świadomie tego
+ * unika (precedens ADR-166: własny DDL w teście zamaskował różnicę typu kolumny).
+ * Gdyby migracja zmieniła predykat, kolejne testy mierzyłyby POLITYKĘ Z TESTU —
+ * i robiłyby to na zielono. Przywracanie idzie więc TĄ SAMĄ DROGĄ co setup.
+ */
+async function migrationStatementsForTable(table: string): Promise<string[]> {
+  const statements = await collectModuleMigrationSql()
+  const onTable = new RegExp(
+    `(ALTER TABLE|CREATE POLICY market_isolation ON|DROP POLICY IF EXISTS market_isolation ON)\\s+${table}\\b`,
+    "i",
+  )
+  const matched = statements.filter(
+    (sql) =>
+      onTable.test(sql) &&
+      // TYLKO instrukcje RLS: `ALTER TABLE voucher ADD COLUMN …` z wcześniejszych
+      // migracji nie da się bezpiecznie odtworzyć na istniejącej tabeli.
+      /(ROW LEVEL SECURITY|POLICY)/i.test(sql) &&
+      !/NO FORCE|DISABLE ROW LEVEL SECURITY/i.test(sql),
+  )
+  if (matched.length === 0) {
+    throw new Error(
+      `zero instrukcji migracji dla tabeli ${table} — przywracanie stanu ` +
+        "docelowego udawałoby migrację zamiast jej używać",
+    )
+  }
+  return matched
 }
 
 /** Zapytanie wykonane DROGĄ MODUŁU (to samo wywołanie co `getPool()`). */
@@ -377,14 +410,11 @@ describe("AC2 — test-the-test: kontrola PĘKA po zdjęciu mechanizmu", () => {
       // przebieg 2b: mechanizm zdjęty — kontrola negatywna PĘKA.
       expect(await readOtherMarket()).toEqual(["V-A", "V-B"])
     } finally {
-      // przebieg 3: przywrócenie stanu docelowego.
-      await admin.raw(`ALTER TABLE voucher ENABLE ROW LEVEL SECURITY`)
-      await admin.raw(`ALTER TABLE voucher FORCE ROW LEVEL SECURITY`)
-      await admin.raw(`
-        CREATE POLICY market_isolation ON voucher
-          USING (market_id = current_setting('app.gp_market_id', true))
-          WITH CHECK (market_id = current_setting('app.gp_market_id', true))
-      `)
+      // przebieg 3: przywrócenie stanu docelowego — Z PLIKÓW MIGRACJI, nie
+      // z ręcznie przepisanego SQL-a (cykl 1, finding LOW).
+      for (const sql of await migrationStatementsForTable("voucher")) {
+        await admin.raw(sql)
+      }
     }
     expect(await readOtherMarket()).toEqual(["V-A"])
   })
