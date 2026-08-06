@@ -2199,6 +2199,58 @@ describe("FR-9e — zaparkowany wiersz nie wstrzymuje sąsiadów, ale sam nie ru
     expect(buyerAfter?.status).toBe("sent")
     expect(Number(buyerAfter?.attempt_count ?? 0)).toBe(buyerAttemptsBefore)
   })
+
+  /**
+   * Review 4.4, finding #6 — przy celu = handoff handler zwraca wynik handoffu
+   * RÓWNIEŻ „na wierzchu" (`result.dispatch_id === result.handoff.dispatch_id`),
+   * więc zwrot budżetu leciałby DWA RAZY z identycznymi argumentami.
+   *
+   * Dziś maskuje to guard SQL `configuration_recovery_count < max_...` przy
+   * progu 1 — czyli przypadek jest LATENTNY, nie działający. Mierzymy więc
+   * liczbę WYWOŁAŃ (`statements`), nie skutek: skutek jest dziś ten sam,
+   * a wywołanie jest tym, co się podwaja i co przestanie być nieszkodliwe,
+   * gdy 4.6/FR-9g podniesie próg odzysków do 2.
+   */
+  it("cel = handoff ⇒ zwrot budżetu wołany DOKŁADNIE RAZ, nie dwa", async () => {
+    const { deps, sql } = makeHarness({
+      templateKeys: [TEMPLATE_KEY, HANDOFF_KEY],
+      entitlements: [issuedEntitlement("ent_dedupe_budget")],
+      giftSource: true,
+      eligibleGift: true,
+      dispatchRows: [
+        {
+          dispatch_id: "dispatch-dedupe-handoff",
+          entitlement_id: "ent_dedupe_budget",
+          template_key: HANDOFF_KEY,
+          recipient_email: "obdarowana@example.test",
+          status: "failed",
+          error_code: "VOUCHER_DELIVERY_DISPATCH_FAILED",
+          first_error_code: "BREVO_SENDER_NOT_CONFIGURED",
+          attempt_count: SWEEP_MAX_ATTEMPT_COUNT,
+        },
+        {
+          dispatch_id: "dispatch-dedupe-buyer",
+          entitlement_id: "ent_dedupe_budget",
+          template_key: TEMPLATE_KEY,
+          status: "sent",
+        },
+      ],
+      dispatchImpl: async () => {
+        throw new Error(
+          "Failed to send notification [gp_error_code=BREVO_SENDER_NOT_CONFIGURED]",
+        )
+      },
+    })
+
+    await runVoucherDeliveryReconciliationSweep(deps)
+
+    // `releaseAttemptBudget` to jedyne zapytanie z `SET attempt_count = GREATEST`.
+    const releaseCalls = sql.statements.filter((statement) =>
+      statement.includes("SET attempt_count = GREATEST"),
+    )
+
+    expect(releaseCalls).toHaveLength(1)
+  })
 })
 
 describe("R-2.5-M8 — handoff w `failed` jest ponawiany, choć buyer-mail jest `sent`", () => {

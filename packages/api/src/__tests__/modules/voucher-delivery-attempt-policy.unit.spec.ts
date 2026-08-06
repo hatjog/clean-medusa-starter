@@ -12,7 +12,7 @@
  *      a wiersz nie powstaje.
  */
 
-import { readFileSync } from "node:fs"
+import { readdirSync, readFileSync } from "node:fs"
 import { join } from "node:path"
 
 import {
@@ -37,6 +37,53 @@ const SWEEP_SOURCE_PATH = join(
   "../../jobs/voucher-delivery-reconciliation-sweep.ts",
 )
 const sweepSource = readFileSync(SWEEP_SOURCE_PATH, "utf8")
+
+/**
+ * Review 4.4, finding #2 — zakres bramki to CAŁE drzewo produkcyjne, nie jeden
+ * plik. Zagrożenie, dla którego ta bramka istnieje, story nazywa wprost:
+ * „DRUGI wywołujący z innym progiem odparkowuje wiersze pierwszego i nikt tego
+ * nie zauważy". Skan wyłącznie źródła sweepa chronił pierwszego wywołującego,
+ * czyli był ślepy dokładnie na defekt, który miał łapać — a 4.2/4.3 dokładają
+ * w TEJ SAMEJ fali nowego producenta ponowień przez ten sam ledger.
+ */
+const API_SRC_ROOT = join(__dirname, "../..")
+
+function collectProductionSources(dir: string): string[] {
+  const out: string[] = []
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    // `__tests__` i `*.spec.ts` są POZA zakresem: test wolno napisać z literałem
+    // progu (to jest jego przedmiot). Bramka pilnuje ścieżki PRODUKCYJNEJ.
+    if (entry.name === "__tests__" || entry.name === "node_modules") continue
+    const full = join(dir, entry.name)
+    if (entry.isDirectory()) {
+      out.push(...collectProductionSources(full))
+    } else if (
+      entry.name.endsWith(".ts") &&
+      !entry.name.endsWith(".spec.ts") &&
+      !entry.name.endsWith(".test.ts")
+    ) {
+      out.push(full)
+    }
+  }
+  return out
+}
+
+/**
+ * JEDYNY plik, w którym literał progu jest legalny — bo to on JEST nośnikiem
+ * polityki. Wyjątek jest celowo pojedynczy i wypisany z nazwy: gdyby był
+ * wzorcem po sufiksie `attempt-policy.ts` w dowolnym katalogu, drugi
+ * wywołujący mógłby powołać własny „policy" i bramka znów przestałaby łapać
+ * defekt, dla którego powstała.
+ */
+const POLICY_CARRIER_PATH = join(
+  API_SRC_ROOT,
+  "modules/voucher-delivery/attempt-policy.ts",
+)
+
+const PRODUCTION_SOURCES = collectProductionSources(API_SRC_ROOT)
+const BUDGET_SCANNED_SOURCES = PRODUCTION_SOURCES.filter(
+  (file) => file !== POLICY_CARRIER_PATH,
+)
 
 const RECIPIENT_HASH = `sha256:${"b".repeat(64)}`
 
@@ -75,22 +122,84 @@ describe("AC4 — budżet prób ma JEDEN nośnik po stronie polityki", () => {
     )
   })
 
-  it("KAŻDE wstrzyknięcie progu w jobie konsumuje politykę — zero literałów", () => {
+  it("KAŻDE wstrzyknięcie progu w CAŁYM drzewie produkcyjnym konsumuje politykę", () => {
     // Zbiór NAZW wartości, nie ich licznik (NFR-9): dołożenie szóstego
     // wywołania z tą samą stałą jest w porządku, dołożenie JAKIEJKOLWIEK innej
-    // wartości świeci na czerwono.
-    const injectedBudgets = [
-      ...sweepSource.matchAll(/max_attempt_count:\s*([^,\n]+)/g),
-    ].map((match) => match[1].trim())
-    const injectedRecoveries = [
-      ...sweepSource.matchAll(/max_configuration_recoveries:\s*([^,\n]+)/g),
-    ].map((match) => match[1].trim())
+    // wartości — w JAKIMKOLWIEK pliku produkcyjnym — świeci na czerwono.
+    const injectedBudgets: { file: string; value: string }[] = []
+    const injectedRecoveries: { file: string; value: string }[] = []
+
+    for (const file of BUDGET_SCANNED_SOURCES) {
+      const source = readFileSync(file, "utf8")
+      for (const match of source.matchAll(/max_attempt_count:\s*([^,\n]+)/g)) {
+        injectedBudgets.push({ file, value: match[1].trim() })
+      }
+      for (const match of source.matchAll(
+        /max_configuration_recoveries:\s*([^,\n]+)/g,
+      )) {
+        injectedRecoveries.push({ file, value: match[1].trim() })
+      }
+    }
+
+    // Nazwy legalnych nośników: stała polityki albo jej re-eksport w sweepie.
+    // Typ pola w deklaracji (`max_attempt_count: number`) też tu wpada i jest
+    // legalny — to KSZTAŁT, nie wartość.
+    const ALLOWED_BUDGET_TOKENS = new Set([
+      "SWEEP_MAX_ATTEMPT_COUNT",
+      "VOUCHER_DELIVERY_MAX_ATTEMPT_COUNT",
+      "number",
+    ])
+    const ALLOWED_RECOVERY_TOKENS = new Set([
+      "SWEEP_MAX_CONFIGURATION_RECOVERIES",
+      "VOUCHER_DELIVERY_MAX_CONFIGURATION_RECOVERIES",
+      "number",
+    ])
 
     expect(injectedBudgets.length).toBeGreaterThan(0)
-    expect(new Set(injectedBudgets)).toEqual(new Set(["SWEEP_MAX_ATTEMPT_COUNT"]))
-    expect(new Set(injectedRecoveries)).toEqual(
-      new Set(["SWEEP_MAX_CONFIGURATION_RECOVERIES"]),
-    )
+
+    // Raportujemy PLIK przy naruszeniu — inaczej czerwień nie mówi, gdzie
+    // powstał drugi próg.
+    const budgetOffenders = injectedBudgets
+      .filter((entry) => !ALLOWED_BUDGET_TOKENS.has(entry.value))
+      .map((entry) => `${entry.file.replace(API_SRC_ROOT, "src")}: ${entry.value}`)
+    const recoveryOffenders = injectedRecoveries
+      .filter((entry) => !ALLOWED_RECOVERY_TOKENS.has(entry.value))
+      .map((entry) => `${entry.file.replace(API_SRC_ROOT, "src")}: ${entry.value}`)
+
+    expect(budgetOffenders).toEqual([])
+    expect(recoveryOffenders).toEqual([])
+  })
+
+  it("kontrola kontroli: literał progu w INNYM pliku produkcyjnym jest wykrywany", () => {
+    // Bramka bez tego testu byłaby „mechanizmem, który istnieje", a nie takim,
+    // który odpala. Symulujemy drugiego wywołującego z własnym progiem.
+    const foreignSource = [
+      "// hipotetyczny subscriber webhooka z 4.2/4.3",
+      "await ledger.listParkedDispatches({",
+      "  entitlement_ids: ids,",
+      "  max_attempt_count: 3,",
+      "})",
+    ].join("\n")
+
+    const injected = [
+      ...foreignSource.matchAll(/max_attempt_count:\s*([^,\n]+)/g),
+    ].map((match) => match[1].trim())
+
+    expect(injected).toEqual(["3"])
+    expect(
+      injected.every((value) =>
+        ["SWEEP_MAX_ATTEMPT_COUNT", "VOUCHER_DELIVERY_MAX_ATTEMPT_COUNT", "number"].includes(
+          value,
+        ),
+      ),
+    ).toBe(false)
+  })
+
+  it("skan obejmuje realne drzewo, nie pusty zbiór plików", () => {
+    // Bez tej asercji pomyłka w ścieżce zamieniłaby bramkę w zawsze-zieloną.
+    expect(PRODUCTION_SOURCES.length).toBeGreaterThan(50)
+    expect(PRODUCTION_SOURCES).toContain(SWEEP_SOURCE_PATH)
+    expect(PRODUCTION_SOURCES.every((file) => !file.includes("__tests__"))).toBe(true)
   })
 
   it("job nie definiuje progu — przypisanie literału do stałej progu jest RED", () => {

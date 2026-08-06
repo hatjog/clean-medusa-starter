@@ -169,6 +169,8 @@ type TransitionEnvelopeLike = {
     actor_hint?: string
     /** Story 4.4 — cel dosyłki per WIERSZ; nieobecny w ścieżce zdarzeniowej. */
     dispatch_target?: { template_key?: unknown; recipient_hash?: unknown }
+    /** Story 4.4 / review #5 — znacznik pochodzenia celu (tylko sweep). */
+    dispatch_origin?: unknown
   }
 }
 
@@ -347,6 +349,8 @@ export interface PurchaseDeliveryDeps {
 
 export function extractPurchaseDeliveryTrigger(
   data: unknown,
+  /** Opcjonalne — służy WYŁĄCZNIE do `warn` przy celu bez zaufanego pochodzenia. */
+  deps: Pick<PurchaseDeliveryDeps, "logger"> = {},
 ): PurchaseDeliveryTrigger {
   const envelope = (data ?? {}) as TransitionEnvelopeLike
   const payload =
@@ -362,8 +366,52 @@ export function extractPurchaseDeliveryTrigger(
     // `scope.market_id` JEST w kopercie eventu (2.1) — to pierwszy, najtańszy
     // nośnik rynku z danych domenowych (R-2.2-M4 / AC6b).
     market_id: nonEmpty(scope?.market_id),
-    dispatch_target: extractDispatchTarget(payload?.dispatch_target),
+    // Review 4.4, finding #5: cel jest honorowany WYŁĄCZNIE od zaufanego
+    // producenta. Ta sama ścieżka obsługuje sweep i szynę zdarzeń, a bez
+    // kontroli pochodzenia dowolny emiter mógłby cicho zawęzić dostawę.
+    dispatch_target: isTrustedDispatchOrigin(payload?.dispatch_origin)
+      ? extractDispatchTarget(payload?.dispatch_target)
+      : ignoreUntrustedDispatchTarget(payload?.dispatch_target, deps),
   }
+}
+
+/**
+ * Znacznik pochodzenia celu dosyłki. Allowlista, nie „cokolwiek niepustego":
+ * pole ma sens tylko dla producentów, którzy jednostkę ponawiania ROZUMIEJĄ.
+ */
+const TRUSTED_DISPATCH_ORIGINS: ReadonlySet<string> = new Set([
+  "voucher_delivery_reconciliation_sweep",
+])
+
+function isTrustedDispatchOrigin(raw: unknown): boolean {
+  return typeof raw === "string" && TRUSTED_DISPATCH_ORIGINS.has(raw)
+}
+
+/**
+ * Cel bez znacznika pochodzenia: IGNORUJEMY z `warn`, nie odmawiamy. Odmowa
+ * zamieniłaby zepsuty payload w brak dostawy; ignorowanie degraduje do pełnej
+ * matrycy AD-7, czyli do dzisiejszego, bezpiecznego zachowania ścieżki
+ * zdarzeniowej. Cichego ignorowania NIE ma — `warn` jest jedynym śladem, po
+ * którym da się wykryć producenta, który myśli, że celuje, a nie celuje.
+ */
+function ignoreUntrustedDispatchTarget(
+  raw: unknown,
+  deps: Pick<PurchaseDeliveryDeps, "logger">,
+): null {
+  if (raw !== undefined && raw !== null) {
+    deps.logger?.warn?.(
+      "[voucher-purchase-delivery] zignorowano `dispatch_target` bez zaufanego " +
+        "`dispatch_origin` — dostawa realizuje PEŁNĄ matrycę AD-7",
+      {
+        // Sam klucz szablonu, nigdy `recipient_hash` (nośnik tożsamości odbiorcy).
+        target_template_key:
+          typeof raw === "object" && raw !== null
+            ? (nonEmpty((raw as { template_key?: unknown }).template_key) ?? null)
+            : null,
+      },
+    )
+  }
+  return null
 }
 
 /**
@@ -415,7 +463,7 @@ export async function handleVoucherPurchaseDelivery(
   data: unknown,
   deps: PurchaseDeliveryDeps,
 ): Promise<PurchaseDeliveryResult> {
-  const trigger = extractPurchaseDeliveryTrigger(data)
+  const trigger = extractPurchaseDeliveryTrigger(data, deps)
 
   if (!trigger.to_state || !DELIVERABLE_TO_STATES.has(trigger.to_state)) {
     // No-op, NIE błąd: subscriber słucha wszystkich tranzycji L4, a matryca
@@ -492,6 +540,9 @@ export async function handleVoucherPurchaseDelivery(
   })
 
   const recipientEmail = nonEmpty(source.buyer_email)
+  // Review 4.4, finding #1: tożsamość wiersza handoffu na potrzeby wiersza
+  // ograniczającego. Ta sama projekcja źródłowa, z której korzysta `runGiftHandoff`.
+  const handoffRecipientEmail = nonEmpty(source.gift_recipient_email)
   if (!recipientEmail) {
     deps.logger?.warn?.(
       "[voucher-purchase-delivery] pominięto: brak adresu odbiorcy w danych domenowych",
@@ -586,6 +637,7 @@ export async function handleVoucherPurchaseDelivery(
           locale: requestedLocale ?? locale,
           errorCode: MARKET_LOCALES_UNAVAILABLE_ERROR_CODE,
           recipientEmail,
+          handoffRecipientEmail,
           dispatchTarget,
         },
         deps,
@@ -622,7 +674,15 @@ export async function handleVoucherPurchaseDelivery(
       outcome: "failed",
       entitlement_id: entitlementId,
       dispatch_id: await recordPreflightConfigurationFailure(
-        { entitlementId, marketId, locale, errorCode, recipientEmail, dispatchTarget },
+        {
+          entitlementId,
+          marketId,
+          locale,
+          errorCode,
+          recipientEmail,
+          handoffRecipientEmail,
+          dispatchTarget,
+        },
         deps,
       ),
       market_id: marketId,
@@ -665,7 +725,15 @@ export async function handleVoucherPurchaseDelivery(
       outcome: "failed",
       entitlement_id: entitlementId,
       dispatch_id: await recordPreflightConfigurationFailure(
-        { entitlementId, marketId, locale, errorCode, recipientEmail, dispatchTarget },
+        {
+          entitlementId,
+          marketId,
+          locale,
+          errorCode,
+          recipientEmail,
+          handoffRecipientEmail,
+          dispatchTarget,
+        },
         deps,
       ),
       market_id: marketId,
@@ -1185,11 +1253,23 @@ export const config: SubscriberConfig = {
  * „sierocego `queued` po błędzie konfiguracji" z 5.7 zostaje utrzymany: przez
  * `queued` przechodzimy wyłącznie tranzytem, w tej samej funkcji, bez wysyłki.
  *
- * Zapisujemy WYŁĄCZNIE wiersz `voucher_purchase_confirmation`: to jedyny klucz
- * w `SWEEP_EXPECTED_TEMPLATE_KEYS`, więc to on i tylko on decyduje, czy sweep
- * widzi „brak wiersza". Handoff ma własny wiersz zakładany dopiero przy realnej
- * próbie wysyłki i dokładanie mu tu wiersza `failed` nie zmieniłoby żadnej
- * granicy, a rozmnażałoby stany.
+ * ── Który wiersz (review 4.4, finding #1) ───────────────────────────────────
+ * W ścieżce ZDARZENIOWEJ (bez celu) zapisujemy wiersz
+ * `voucher_purchase_confirmation`: to jedyny klucz w
+ * `SWEEP_EXPECTED_TEMPLATE_KEYS`, więc to on decyduje, czy sweep widzi „brak
+ * wiersza", a handoff i tak jedzie na tym samym przebiegu.
+ *
+ * W ścieżce CELOWANEJ wiersz ograniczający dotyczy WIERSZA Z CELU. Pierwotna
+ * wersja 4.4 zwracała tu `null`, gdy cel wskazywał handoff — poprawnie co do
+ * litery AC2 („żadnego zapisu poza celem"), ale przywracało to dokładnie stan,
+ * przed którym broni ta funkcja: sweep celowany w handoff, który wpadł w gałąź
+ * fail-loud konfiguracji (`MARKET_LOCALES_UNAVAILABLE`,
+ * `VOUCHER_DELIVERY_STOREFRONT_URL_NOT_CONFIGURED`, `MARKET_RUNTIME_CONFIG_*`),
+ * wraca zanim `runGiftHandoff` cokolwiek zarezerwuje. Nie powstawał wtedy ŻADEN
+ * wiersz, `attempt_count` nie rósł, wiersz nigdy się nie parkował — czyli
+ * ponowienie bez licznika, w każdym cyklu crona, bez końca (scenariusz R-2.5-H3,
+ * np. brak locale dla `ua`/`de`). Zapis wiersza Z CELU jest zapisem W CELU,
+ * więc AC2 zostaje spełnione, a próg znów obowiązuje.
  *
  * NIGDY nie rzuca: awaria ledgera na tej ścieżce nie może zamienić błędu
  * konfiguracji w wyjątek wychodzący z subscribera (inwariant AD-6).
@@ -1200,15 +1280,31 @@ async function recordPreflightConfigurationFailure(
     marketId: string
     locale: string
     errorCode: string
+    /** Adres KUPUJĄCEJ — tożsamość wiersza `voucher_purchase_confirmation`. */
     recipientEmail: string | null
+    /** Adres OBDAROWANEJ — tożsamość wiersza `voucher_handoff_link` (jeśli jest). */
+    handoffRecipientEmail: string | null
     /** Story 4.4 — cel dosyłki; wiersz ograniczający też jest wysyłką co do celu. */
     dispatchTarget: DispatchTarget | null
   },
   deps: PurchaseDeliveryDeps,
 ): Promise<string | null> {
   const tag = "[voucher-purchase-delivery]"
-  if (!input.recipientEmail) {
-    // Bez adresu kupującej nie ma tożsamości wiersza (`recipient_hash` jest
+
+  // Wiersz ograniczający idzie na szablon Z CELU; bez celu — na buyer-mail.
+  const templateKey =
+    input.dispatchTarget?.template_key ===
+    NOTIFICATION_TEMPLATE_KEYS.VOUCHER_HANDOFF_LINK
+      ? NOTIFICATION_TEMPLATE_KEYS.VOUCHER_HANDOFF_LINK
+      : NOTIFICATION_TEMPLATE_KEYS.VOUCHER_PURCHASE_CONFIRMATION
+
+  const recipientEmailForRow =
+    templateKey === NOTIFICATION_TEMPLATE_KEYS.VOUCHER_HANDOFF_LINK
+      ? input.handoffRecipientEmail
+      : input.recipientEmail
+
+  if (!recipientEmailForRow) {
+    // Bez adresu odbiorcy nie ma tożsamości wiersza (`recipient_hash` jest
     // częścią klucza). Taki entitlement i tak nie jest domykalny przez automat
     // — sweep liczy go jako `unresolvable`, a nie ponawia w nieskończoność.
     return null
@@ -1216,20 +1312,17 @@ async function recordPreflightConfigurationFailure(
 
   let recipientHash
   try {
-    recipientHash = hashRecipientEmail(input.recipientEmail)
+    recipientHash = hashRecipientEmail(recipientEmailForRow)
   } catch {
     return null
   }
 
-  // Story 4.4 (AC2): wiersz ograniczający dotyczy KONKRETNEGO szablonu
-  // (buyer-mail). Gdy cel dosyłki wskazuje inny wiersz, zapisanie go byłoby
-  // zapisem ledgera poza celem — czyli dokładnie tym, czego AC2 zabrania.
+  // Story 4.4 (AC2): wiersz ograniczający dotyczy szablonu Z CELU — sprawdzamy
+  // więc cel przeciwko TEMU szablonowi, nie na sztywno buyer-mailowi. Gdy cel
+  // wskazuje wiersz, którego ta ścieżka nie potrafi zidentyfikować, zapis nie
+  // następuje: to nadal zapis poza celem, czyli to, czego AC2 zabrania.
   if (
-    !isWithinDispatchTarget(
-      input.dispatchTarget,
-      NOTIFICATION_TEMPLATE_KEYS.VOUCHER_PURCHASE_CONFIRMATION,
-      recipientHash,
-    )
+    !isWithinDispatchTarget(input.dispatchTarget, templateKey, recipientHash)
   ) {
     return null
   }
@@ -1237,7 +1330,7 @@ async function recordPreflightConfigurationFailure(
   try {
     const reservation = await deps.ledger.reserveDispatch({
       entitlement_id: input.entitlementId,
-      template_key: NOTIFICATION_TEMPLATE_KEYS.VOUCHER_PURCHASE_CONFIRMATION,
+      template_key: templateKey,
       recipient_hash: recipientHash,
       market_id: input.marketId,
       flow_id: VOUCHER_PURCHASE_DELIVERY_FLOW_ID,

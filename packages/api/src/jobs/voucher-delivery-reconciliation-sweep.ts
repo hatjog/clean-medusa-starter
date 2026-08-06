@@ -273,6 +273,14 @@ const UNRESOLVABLE_OUTCOMES: readonly PurchaseDeliveryOutcome[] = [
   "skipped_source_not_found",
   "skipped_missing_recipient",
   "skipped_missing_voucher_code",
+  // Story 4.4 / review finding #11: odmowa celu spoza matrycy AD-7 jest USTERKĄ
+  // WYWOŁUJĄCEGO (zepsuty payload, `template_key` spoza AD-7), a nie zwykłym
+  // pominięciem. AC2 żąda „odmowy z enumem, nie cichej wysyłki" — enum bez
+  // metryki jest cichy, bo `skipped` to kubełek, w którym tonie oczekiwany ruch
+  // (`skipped_dispatch_target_mismatch` to zdecydowana większość przebiegu).
+  // `unresolvable` jest kubełkiem ALARMOWYM i tam ta odmowa należy.
+  // Zbiór kubełków się NIE zmienia, więc domknięcie `found` jest nietknięte.
+  "skipped_dispatch_target_invalid",
 ]
 
 /**
@@ -367,7 +375,14 @@ export type SweepRunStatus =
  *   - wiersz handoffu wchodzi teraz DO kubełków (wcześniej był poza `found`),
  *     więc `handoff_recovered`/`handoff_still_failing` przestały być rozłączne
  *     z `recovered`/`still_failing` — są ich PRZEKROJEM, nie składnikiem,
- *   - liczbę entitlementów niesie dalej `entitlements_scanned`.
+ *   - liczbę entitlementów niesie dalej `entitlements_scanned`,
+ *   - `exhausted` jest na ścieżce produkcyjnej składnikiem TRWALE ZEROWYM
+ *     (review 4.4, finding #10): oba zapytania skanu filtrują już
+ *     `attempt_count < max_attempt_count`, więc wiersz zaparkowany nigdy nie
+ *     wraca ze skanu i guard nie ma czego wykluczyć. Guard i ten kubełek są
+ *     defense-in-depth — osiągalne z atrapy portu, nie z Postgresa. NIE buduj
+ *     alertu na `exhausted`: dostaniesz ciszę zamiast sygnału. Żywym nośnikiem
+ *     zaparkowania jest `parked_total` / `per_market.parked`.
  * Domkniętość samego równania jest nietknięta: każdy wiersz daje dokładnie
  * jeden `found` i dokładnie jeden kubełek.
  */
@@ -874,13 +889,24 @@ export async function runVoucherDeliveryReconciliationSweep(
           tally.handoff(marketId, handoff.outcome)
           if (handoff.outcome === "sent") report.handoff_recovered += 1
           else report.handoff_still_failing += 1
-          await releaseBudgetOnGlobalFailure(
-            handoff.outcome,
-            handoff.dispatch_id,
-            handoff.error_code,
-            deps,
-            report,
-          )
+          // Review 4.4, finding #6: przy dosyłce CELOWANEJ w handoff handler
+          // zwraca wynik handoffu również „na wierzchu" (`result.dispatch_id ===
+          // handoff.dispatch_id`), więc bez tego warunku zwrot budżetu leciałby
+          // DWA RAZY z identycznymi argumentami. Dziś maskuje to guard SQL
+          // `configuration_recovery_count < max_configuration_recoveries` przy
+          // progu 1 — ale próg jest wartością POLITYKI (`attempt-policy.ts`),
+          // którą konsumuje 4.6/FR-9g. Podniesienie go do 2 zamieniłoby jedną
+          // awarię w dwa odzyski, czyli podwoiłoby realny limit bez żadnej
+          // zmiany w polityce. Deduplikujemy po `dispatch_id` w obrębie iteracji.
+          if (handoff.dispatch_id !== result.dispatch_id) {
+            await releaseBudgetOnGlobalFailure(
+              handoff.outcome,
+              handoff.dispatch_id,
+              handoff.error_code,
+              deps,
+              report,
+            )
+          }
         }
 
         logDispatchOutcome(logger, row, result, bucket)
@@ -995,7 +1021,7 @@ export async function runVoucherDeliveryReconciliationSweep(
     metrics?.capture(METRIC_GAP, {
       schedule_name: SCHEDULE_NAME,
       market_id: row.market_id,
-        // Story 4.4: nazwa zachowana ŚWIADOMIE (reguła alertu „luka domknięta"
+      // Story 4.4: nazwa zachowana ŚWIADOMIE (reguła alertu „luka domknięta"
       // czyta ją po nazwie), ale jednostką jest teraz WIERSZ dostawy. Zmiana
       // nazwy zerwałaby ciągłość szeregu bez zysku; zmiana znaczenia jest
       // udokumentowana przy `SweepMarketCounters`.
@@ -1254,7 +1280,17 @@ function logDispatchOutcome(
  *
  * `from_state` jest `null`: sweep nie zna tranzycji, która zginęła, i nie udaje,
  * że zna. Handler i tak rozstrzyga po `to_state`.
+ *
+ * `dispatch_origin` (review 4.4, finding #5) jest ZNACZNIKIEM POCHODZENIA celu:
+ * handler honoruje `dispatch_target` WYŁĄCZNIE, gdy niesie go trigger z tym
+ * znacznikiem. Bez niego dowolny emiter `gp.voucher.entitlement_state_changed`
+ * — pomyłka, przepisanie payloadu w 4.2/4.3, replay starego eventu — mógłby
+ * cicho zawęzić dostawę do jednego szablonu i Marta dostałaby jeden mail
+ * zamiast dwóch, z wynikiem `sent`. To jest duch AD-23 („nie wywołujący")
+ * zastosowany do JEDNOSTKI DOSTAWY, nie tylko do numeru próby.
  */
+export const SWEEP_DISPATCH_ORIGIN = "voucher_delivery_reconciliation_sweep"
+
 export function buildSweepTrigger(candidate: DeliveryGapCandidate): {
   event_type: string
   scope: { market_id: string | null }
@@ -1262,6 +1298,7 @@ export function buildSweepTrigger(candidate: DeliveryGapCandidate): {
     entitlement_id: string
     to_state: string
     from_state: null
+    dispatch_origin: string
     dispatch_target: { template_key: string; recipient_hash: string | null }
   }
 } {
@@ -1272,6 +1309,7 @@ export function buildSweepTrigger(candidate: DeliveryGapCandidate): {
       entitlement_id: candidate.entitlement_id,
       to_state: candidate.entitlement_state,
       from_state: null,
+      dispatch_origin: SWEEP_DISPATCH_ORIGIN,
       // Story 4.4 (AC2) — jednostką ponawiania jest WIERSZ: handler wyśle
       // dokładnie ten szablon i żadnego innego. `recipient_hash` jest `null`,
       // bo kandydat skanu go nie zna (kanoniczna luka nie ma jeszcze wiersza);

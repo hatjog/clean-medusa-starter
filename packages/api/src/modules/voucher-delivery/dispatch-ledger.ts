@@ -374,9 +374,10 @@ export interface DeliveryGapScanPort {
    * Story 4.4 (FR-9e): decyzja o wyczerpaniu budżetu żyje PRZY WIERSZU i od tej
    * story sweep też wyklucza PER WIERSZ — zaparkowany wiersz nie wstrzymuje
    * pozostałych szablonów tego samego entitlementu. Było to możliwe dopiero po
-   * scelowaniu wejścia dosyłki (`dispatch_target` w handlerze 2.3/2.4): dopóki
-   * handler wysyłał komplet szablonów naraz, jedynym sposobem na nieobejście
-   * progu przez `reserveDispatch` było wykluczenie CAŁEGO entitlementu.
+   * scelowaniu wejścia dosyłki (`dispatch_target`, wprowadzony przez TĘ story
+   * 4.4 w handlerze zbudowanym w 2.3/2.4): dopóki handler wysyłał komplet
+   * szablonów naraz, jedynym sposobem na nieobejście progu przez
+   * `reserveDispatch` było wykluczenie CAŁEGO entitlementu.
    *
    * Zapytanie zwraca `template_key` wiersza, bo to on — obok `entitlement_id` —
    * jest kluczem wykluczenia po stronie sweepa. `recipient_hash` NIE wchodzi do
@@ -384,6 +385,20 @@ export interface DeliveryGapScanPort {
    * jeszcze nie być), więc dopasowanie po nim byłoby niemożliwe. Skutkiem jest
    * wykluczenie o granulacji (entitlement, szablon) — węższe niż zastane
    * per-entitlement i nigdy szersze, czyli bezpieczne w stronę progu.
+   *
+   * GRANICA ŚWIADOMA (review 4.4, finding #7): para `(entitlement, szablon)` NIE
+   * jest tożsamością wiersza — tą jest trójka z `recipient_hash`
+   * (`voucher_delivery_dispatch_identity_uq`). Gdyby jedna para miała DWA różne
+   * `recipient_hash` (zmiana adresu obdarowanej, ponowne wydanie handoffu),
+   * zaparkowany wiersz adresu A wykluczałby ze skanu zdrowy wiersz adresu B —
+   * czyli literę AC1 („wykluczenie działa na wierszach") ta granulacja oblewa.
+   * Dziś jest to nieosiągalne, bo `recipient_hash` obu szablonów jest FUNKCJĄ
+   * projekcji źródłowej entitlementu (buyer → `buyer_email`, handoff →
+   * `gift_recipient_email`), a nie parametrem wywołania: przy danym
+   * entitlemencie para wyznacza hash jednoznacznie. Ta niezmienniczość jest
+   * mierzona testem `wykluczenie po parze == wykluczenie po wierszu, dopóki
+   * para wyznacza hash` — jeśli kiedyś powstanie ścieżka nadająca drugi hash
+   * tej samej parze, ten test pęknie i klucz trzeba będzie poszerzyć.
    */
   listParkedDispatches(input: {
     entitlement_ids: readonly string[]
