@@ -35,6 +35,17 @@ export const UNRECOGNIZED_DELIVERY_EVENT_CODE = "DELIVERY_EVENT_UNRECOGNIZED"
 export const UNRECOGNIZED_DELIVERY_EVENT_METRIC =
   "notification_delivery_event_unrecognized_total"
 
+/**
+ * Ograniczenia licznika odmow. Klucz niesie SUROWA nazwe podana przez dostawce,
+ * wiec bez sufitu strumien nazw nieznanych rosnie w pamieci procesu bez konca
+ * (kazda nowa nazwa = nowy wpis, proces zyje tygodniami). Nadmiar nie jest
+ * gubiony: wpada do jawnego kubla `UNRECOGNIZED_OVERFLOW_KEY`, wiec suma
+ * pozostaje prawdziwa, a operator widzi, ze kardynalnosc zostala obcieta.
+ */
+const UNRECOGNIZED_RAW_VALUE_MAX_LENGTH = 64
+const UNRECOGNIZED_DISTINCT_MAX = 256
+export const UNRECOGNIZED_OVERFLOW_RAW_VALUE = "__overflow__"
+
 const unrecognizedCounters = new Map<string, number>()
 
 export class UnknownDeliveryEventError extends Error {
@@ -164,7 +175,26 @@ export function recordUnrecognizedDeliveryEvent(
   dictionary: DeliveryEventDictionary,
   rawValue: string,
 ): void {
-  const key = `${dictionary}:${rawValue}`
+  const truncated =
+    rawValue.length > UNRECOGNIZED_RAW_VALUE_MAX_LENGTH
+      ? rawValue.slice(0, UNRECOGNIZED_RAW_VALUE_MAX_LENGTH)
+      : rawValue
+  const key = `${dictionary}:${truncated}`
+
+  if (
+    !unrecognizedCounters.has(key) &&
+    unrecognizedCounters.size >= UNRECOGNIZED_DISTINCT_MAX
+  ) {
+    // Sufit kardynalnosci osiagniety — liczymy dalej, ale w jednym kuble.
+    // Suma zostaje prawdziwa; gubienie zdarzen byloby cichym odrzuceniem.
+    const overflowKey = `${dictionary}:${UNRECOGNIZED_OVERFLOW_RAW_VALUE}`
+    unrecognizedCounters.set(
+      overflowKey,
+      (unrecognizedCounters.get(overflowKey) ?? 0) + 1,
+    )
+    return
+  }
+
   unrecognizedCounters.set(key, (unrecognizedCounters.get(key) ?? 0) + 1)
 }
 
@@ -394,6 +424,17 @@ export function nextAttemptNumber(
   return base + 1
 }
 
+/**
+ * Sufit backoffu — 24 h.
+ *
+ * Bez niego `2 ** (attempt - 1)` rosnie bez ograniczen: przy kilkudziesieciu
+ * probach `blocked_backoff` przekracza czas zycia systemu, a dalej traci
+ * precyzje liczby zmiennoprzecinkowej. „Ponowienie za 10^9 lat" jest w praktyce
+ * stanem terminalnym udajacym ponawialny — czyli tym samym zwinieciem, ktore
+ * FR-9d kaze usunac, tylko w wymiarze czasu.
+ */
+export const MAX_BACKOFF_DELAY_MS = 24 * 60 * 60 * 1000
+
 /** Opoznienie backoffu w ms — wylacznie z polityki klasy i numeru proby. */
 export function backoffDelayMs(
   eventType: NotificationDeliveryEventType,
@@ -405,15 +446,25 @@ export function backoffDelayMs(
     return null
   }
 
-  switch (reaction.retry_policy) {
+  const base = baseBackoffMs(reaction.retry_policy)
+  // Wykladnik obciety osobno: bez tego `2 ** 1024` daje `Infinity`, a `Infinity`
+  // przycieta sufitem nadal ukrywa fakt, ze mnozenie sie przepelnilo.
+  const exponent = Math.min(attempt - 1, 32)
+  return Math.min(base * 2 ** exponent, MAX_BACKOFF_DELAY_MS)
+}
+
+function baseBackoffMs(
+  policy: NonNullable<DeliveryEventReaction["retry_policy"]>,
+): number {
+  switch (policy) {
     case "transient_backoff":
-      return 60_000 * 2 ** (attempt - 1)
+      return 60_000
     case "blocked_backoff":
-      return 900_000 * 2 ** (attempt - 1)
+      return 900_000
     case "provider_backoff":
-      return 30_000 * 2 ** (attempt - 1)
+      return 30_000
     default:
-      return assertNever(reaction.retry_policy, "backoffDelayMs")
+      return assertNever(policy, "baseBackoffMs")
   }
 }
 

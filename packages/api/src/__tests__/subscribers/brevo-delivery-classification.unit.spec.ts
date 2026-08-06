@@ -13,12 +13,16 @@ import brevoDeliveryTracker, {
 } from "../../subscribers/brevo-delivery-tracker"
 import {
   _resetUnrecognizedDeliveryEventMetrics,
+  backoffDelayMs,
   CLASSIFICATION_DOMAIN,
   EVENT_PAYLOAD_NAMES,
   getUnrecognizedDeliveryEventMetrics,
   getUnrecognizedDeliveryEventTotal,
+  MAX_BACKOFF_DELAY_MS,
+  recordUnrecognizedDeliveryEvent,
   REGISTRATION_API_NAMES,
   UNRECOGNIZED_DELIVERY_EVENT_METRIC,
+  UNRECOGNIZED_OVERFLOW_RAW_VALUE,
 } from "../../lib/delivery-event-classification"
 import {
   _resetSystemMarketContextMetrics,
@@ -536,5 +540,142 @@ describe("SM-3 — kazde odebrane odbicie zmienia stan; sierota liczona OSOBNO",
     // bo dzis KAZDE zdarzenie bez wiersza dostawy konczy jako sierota.
     expect(orphans).toBe(1)
     expect(stateChanged).toBe(0)
+  })
+})
+
+/**
+ * Cykl 1 review — kontrole, ktorych brak pozwalal defektom przechodzic na
+ * zielono. Kazda z nich PEKA po cofnieciu odpowiadajacej poprawki.
+ */
+describe("cykl 1 review — granica zaufania do ladunku dostawcy i sufity", () => {
+  /** Kontener z JEDNYM, policzalnym odczytem wiersza dispatchu. */
+  function makeCountingContainer(dispatch: Record<string, unknown> | null) {
+    const auditEvents: AuditEvent[] = []
+    const logger = { info: jest.fn(), warn: jest.fn(), error: jest.fn() }
+    const findByProviderMessageId = jest.fn(async () => dispatch)
+    const resolve = jest.fn((key: string) => {
+      if (key === "logger") return logger
+      if (key === "notification_dispatches") return { findByProviderMessageId }
+      if (key === "notification_delivery_audit_sink") {
+        return {
+          record: jest.fn(async (auditEvent: AuditEvent) => {
+            auditEvents.push(auditEvent)
+          }),
+        }
+      }
+      throw new Error(`Unknown container key: ${key}`)
+    })
+    return { auditEvents, logger, findByProviderMessageId, container: { resolve } }
+  }
+
+  it("AD-23 — `dispatch_id` z ladunku NIE zastepuje odczytu liczby prob z systemu", async () => {
+    const ctx = makeCountingContainer({
+      dispatch_id: "d-attempts",
+      market_id: "pl",
+      attempts: 3,
+    })
+
+    await run(
+      {
+        provider_id: "brevo",
+        provider_event_id: "pe-attempts-with-dispatch-id",
+        market_id: "pl",
+        // Do cyklu 1 review OBECNOSC tego pola konczyla korelacje natychmiast,
+        // wiersz nie byl czytany, `attempts` bylo 0 i numer proby wracal do 1.
+        // Dostawca zerowal w ten sposob drabine ponowien.
+        dispatch_id: "d-attempts",
+        event_type: "soft_bounce",
+      },
+      ctx.container,
+      "notification.soft_bounce",
+    )
+
+    expect(ctx.auditEvents[0].delivery_reaction.next_attempt_number).toBe(4)
+    // Backoff idzie za numerem proby, wiec on tez nie moze byc bazowy.
+    expect(ctx.auditEvents[0].delivery_reaction.backoff_delay_ms).toBe(60_000 * 2 ** 3)
+  })
+
+  it("wiersz dispatchu jest czytany DOKLADNIE RAZ na zdarzenie", async () => {
+    const ctx = makeCountingContainer({ dispatch_id: "d-once", market_id: "pl" })
+
+    await run(
+      {
+        provider_id: "brevo",
+        provider_event_id: "pe-single-lookup",
+        event_type: "hard_bounce",
+      },
+      ctx.container,
+      "notification.hard_bounce",
+    )
+
+    // Dwa odczyty to nie tylko drugi round-trip do bazy: to takze drugi alert
+    // `DISPATCH_LOOKUP_FAILED` z jednego zdarzenia.
+    expect(ctx.findByProviderMessageId).toHaveBeenCalledTimes(1)
+  })
+
+  it("AD-21 — rynek z wiersza dostawy jest nadrzedny; rozjazd z ladunkiem to ODMOWA", async () => {
+    const ctx = makeCountingContainer({ dispatch_id: "d-market", market_id: "ua" })
+
+    await expect(
+      run(
+        {
+          provider_id: "brevo",
+          provider_event_id: "pe-market-conflict",
+          // Rynek podany przez DOSTAWCE, inny niz w stanie systemu.
+          market_id: "pl",
+          event_type: "hard_bounce",
+        },
+        ctx.container,
+        "notification.hard_bounce",
+      ),
+    ).rejects.toThrow("DELIVERY_EVENT_MARKET_CONFLICT")
+
+    // Zapis nie wykonal sie ANI pod rynkiem z ladunku, ANI pod rynkiem systemu.
+    expect(ctx.auditEvents).toHaveLength(0)
+  })
+
+  it("AD-21 kontrola DODATNIA — zgodny rynek ladunku i wiersza -> zapis", async () => {
+    const ctx = makeCountingContainer({ dispatch_id: "d-agree", market_id: "pl" })
+
+    await run(
+      {
+        provider_id: "brevo",
+        provider_event_id: "pe-market-agree",
+        market_id: "pl",
+        event_type: "hard_bounce",
+      },
+      ctx.container,
+      "notification.hard_bounce",
+    )
+
+    expect(ctx.auditEvents).toHaveLength(1)
+    expect(ctx.auditEvents[0].market_id).toBe("pl")
+  })
+
+  it("licznik odmow ma SUFIT kardynalnosci, a suma zostaje prawdziwa", () => {
+    for (let i = 0; i < 400; i += 1) {
+      recordUnrecognizedDeliveryEvent("event_payload", `nazwa-nieznana-${i}`)
+    }
+
+    const metrics = getUnrecognizedDeliveryEventMetrics()
+    // Bez sufitu byloby 400 wpisow rosnacych z kazda nowa nazwa dostawcy.
+    expect(metrics.length).toBeLessThanOrEqual(300)
+    // Nadmiar nie jest gubiony — jest w jawnym kuble.
+    expect(metrics.map((m) => m.raw_value)).toContain(UNRECOGNIZED_OVERFLOW_RAW_VALUE)
+    expect(getUnrecognizedDeliveryEventTotal()).toBe(400)
+  })
+
+  it("surowa nazwa w kluczu licznika jest obcinana", () => {
+    recordUnrecognizedDeliveryEvent("event_payload", "x".repeat(5000))
+    const [entry] = getUnrecognizedDeliveryEventMetrics()
+    expect(entry.raw_value.length).toBeLessThanOrEqual(64)
+  })
+
+  it("backoff ma SUFIT — „ponowienie za rok\" to stan terminalny w przebraniu", () => {
+    // Bez sufitu 2 ** (attempt - 1) rosnie bez konca i konczy sie `Infinity`.
+    expect(backoffDelayMs("bounced_transient", 5_000)).toBe(MAX_BACKOFF_DELAY_MS)
+    expect(Number.isFinite(backoffDelayMs("blocked", 5_000)!)).toBe(true)
+    // Ponizej sufitu polityka nadal rzadzi wartoscia.
+    expect(backoffDelayMs("bounced_transient", 1)).toBe(120_000)
   })
 })

@@ -71,6 +71,8 @@ export const BREVO_NOTIFICATION_EVENTS = Object.freeze([
 const NO_RECIPIENT_SENTINEL = "__no_recipient__"
 const UNKNOWN_FIELD_SENTINEL = "unknown"
 const DISPATCH_LOOKUP_FAILED_CODE = "DISPATCH_LOOKUP_FAILED"
+/** Rozjazd rynku ladunek<->wiersz dostawy (AD-21) — odmowa, nie wybor jednej z wartosci. */
+const MARKET_CONFLICT_CODE = "DELIVERY_EVENT_MARKET_CONFLICT"
 const POSTGRES_UNDEFINED_TABLE = "42P01"
 
 type BrevoDeliveryEventPayload = {
@@ -204,8 +206,9 @@ export default async function brevoDeliveryTracker({
   if (!normalized) {
     // Ladunek bez identyfikatora zdarzenia dostawcy — nie da sie go ani
     // skorelowac, ani zdeduplikowac. To jest brak NOSNIKA tozsamosci, nie
-    // nieznana klasa; ponowienie nie zmieni ladunku, wiec odmowa jest
-    // terminalna i jawna, a nie cicha.
+    // nieznana klasa. Odmowa jest GLOSNA (nazwany kod + rzucenie), a nie cicha;
+    // ponowienie dostawcy przyniesie ten sam ladunek i odbije sie tak samo,
+    // wiec odrzucenie jest stabilne, ale NIE jest potwierdzeniem obslugi.
     logger.error?.(
       "[brevo-delivery-tracker] error_code=DELIVERY_EVENT_MALFORMED " +
         "brak provider_event_id — zdarzenie nieidentyfikowalne",
@@ -229,11 +232,20 @@ export default async function brevoDeliveryTracker({
   markProviderEventSeen(normalized.provider_event_id)
 
   try {
+    // JEDEN odczyt wiersza dispatchu na zdarzenie. Do cyklu 1 review byly DWA
+    // (raz dla rynku, raz dla korelacji) — podwojny round-trip do bazy i podwojny
+    // alert `DISPATCH_LOOKUP_FAILED` z jednego zdarzenia. Wynik jest tu odczytany
+    // raz i podany obu konsumentom.
+    const lookup = await lookupDispatch(
+      runtimeContainer,
+      normalized.provider_event_id,
+      logger,
+    )
+
     // AD-21 / ADR-177: subscriber jest powierzchnia zapisu POZA HTTP, wiec
-    // wykonanie musi niesc jawny kontekst rynku. Rynek pochodzi z ladunku albo
-    // z wiersza dispatchu; jego BRAK jest ODMOWA (`SystemMarketContextError`),
-    // a nie zapisem dla wszystkich rynkow. Nosnik jest ten sam co dla `/store/*`.
-    const marketId = await resolveMarketIdForContext(runtimeContainer, normalized, logger)
+    // wykonanie musi niesc jawny kontekst rynku. Jego BRAK jest ODMOWA
+    // (`SystemMarketContextError`), a nie zapisem dla wszystkich rynkow.
+    const marketId = resolveMarketIdForContext(normalized, lookup, logger)
 
     await runInSystemMarketContext(
       {
@@ -242,7 +254,7 @@ export default async function brevoDeliveryTracker({
         logger: logger as never,
       },
       async () => {
-        const correlated = await correlateDispatch(runtimeContainer, normalized!, logger)
+        const correlated = correlateDispatch(normalized!, lookup, logger)
         const auditEvent = buildAuditEnvelope(normalized!, correlated)
 
         await emitAuditEvent(runtimeContainer, auditEvent, logger)
@@ -259,18 +271,35 @@ export default async function brevoDeliveryTracker({
  * wywolujacy przekazuje wtedy PUSTA liste rynkow, co `runInSystemMarketContext`
  * traktuje jako odmowe (`markets_empty`). Podstawienie tu wartosci zastepczej
  * byloby zapisem poza izolacja pod pozorem „zadeklarowanego" rynku.
+ *
+ * PIERWSZENSTWO MA STAN SYSTEMU. `market_id` z ladunku pochodzi od DOSTAWCY, wiec
+ * przyjmowanie go bez konfrontacji ze stanem systemu pozwalaloby dostawcy wskazac
+ * rynek, pod ktorym wykona sie zapis — nosnik AD-21 bylby obecny, ale karmiony
+ * wartoscia spoza granicy zaufania. Gdy istnieje wiersz dispatchu z rynkiem, to
+ * ON jest zrodlem; rozjazd z ladunkiem jest ODMOWA, nie cichym wyborem jednej
+ * z dwoch wartosci. Ladunek rzadzi wylacznie tam, gdzie wiersza nie ma (sierota).
  */
-async function resolveMarketIdForContext(
-  container: ResolveContainer,
+function resolveMarketIdForContext(
   normalized: NormalizedBrevoDeliveryEvent,
+  lookup: DispatchLookupResult,
   logger: LoggerLike,
-): Promise<string | undefined> {
-  if (normalized.market_id) {
-    return normalized.market_id
+): string | undefined {
+  const systemMarketId = readString(lookup.dispatch?.market_id)
+  const payloadMarketId = normalized.market_id
+
+  if (systemMarketId && payloadMarketId && systemMarketId !== payloadMarketId) {
+    logger.error?.(
+      `[brevo-delivery-tracker] error_code=${MARKET_CONFLICT_CODE} ` +
+        `provider_event_id=${normalized.provider_event_id} ` +
+        `system=${systemMarketId} payload=${payloadMarketId}`,
+    )
+    throw new Error(
+      `${MARKET_CONFLICT_CODE}: rynek z ladunku dostawcy (${payloadMarketId}) ` +
+        `nie zgadza sie z rynkiem wiersza dostawy (${systemMarketId})`,
+    )
   }
 
-  const lookup = await lookupDispatch(container, normalized.provider_event_id, logger)
-  return readString(lookup.dispatch?.market_id)
+  return systemMarketId ?? payloadMarketId
 }
 
 export const config: SubscriberConfig = {
@@ -330,20 +359,31 @@ function normalizeDeliveryEvent(
   }
 }
 
-async function correlateDispatch(
-  container: ResolveContainer,
+/**
+ * Korelacja z wierszem dostawy.
+ *
+ * `dispatch_id` z ladunku moze nazwac wiersz, ale NIE ZASTEPUJE jego odczytu.
+ * Do cyklu 1 review ta funkcja zwracala sie tu natychmiast, przez co wiersz nie
+ * byl czytany wcale — a wraz z nim nie byla czytana liczba prob (`attempts`).
+ * Skutek: `next_attempt_number` bylo trwale rowne 1, a backoff trwale rowny
+ * wartosci bazowej dla KAZDEGO zdarzenia, ktorego ladunek niosl `dispatch_id`.
+ * Poniewaz to pole podaje dostawca, dostawca mogl w ten sposob zerowac drabine
+ * ponowien — dokladnie to, czego zabrania AD-23.
+ */
+function correlateDispatch(
   normalized: NormalizedBrevoDeliveryEvent,
+  lookup: DispatchLookupResult,
   logger: LoggerLike,
-): Promise<CorrelatedDispatch> {
+): CorrelatedDispatch {
   if (normalized.dispatch_id) {
     return {
       correlation_id: normalized.dispatch_id,
       correlation_state: "matched",
       dispatch_id: normalized.dispatch_id,
+      dispatch: lookup.dispatch ?? undefined,
     }
   }
 
-  const lookup = await lookupDispatch(container, normalized.provider_event_id, logger)
   const dispatchId = lookup.dispatch?.dispatch_id ?? lookup.dispatch?.id
   if (dispatchId) {
     return {
@@ -411,7 +451,11 @@ async function lookupDispatch(
           template_key,
           locale,
           consent_basis,
-          idempotency_key
+          idempotency_key,
+          -- AD-23: numer proby pochodzi WYLACZNIE ze stanu systemu. Bez tej
+          -- kolumny w projekcji attempts bylo zawsze undefined, wiec drabina
+          -- ponowien startowala od nowa przy kazdym zdarzeniu.
+          attempts
         FROM notification_dispatches
         WHERE provider_message_id = ?
         LIMIT 1
