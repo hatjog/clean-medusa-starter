@@ -59,6 +59,13 @@ if (process.env.TEST_TYPE === "integration:http") {
   module.exports.testMatch = [
     "**/packages/api/src/__tests__/integration/vendor-replay-guard-pg.integration.test.[jt]s",
   ];
+} else if (process.env.TEST_TYPE === "completed-order-pg") {
+  // v1.15.0 Story 3.6 — ogniwo 2 kontraktu powrotu 3DS (kardynalnosc N zamowien)
+  // wykonane na realnym Postgresie przez realny handler trasy. DATABASE_URL musi
+  // wskazywac IZOLOWANA DB testowa: suita zaklada i kasuje tabele fixture.
+  module.exports.testMatch = [
+    "**/packages/api/src/__tests__/integration/completed-order-cardinality-pg.integration.test.[jt]s",
+  ];
 } else if (process.env.TEST_TYPE === "unit") {
   module.exports.testMatch = [
     "**/packages/api/src/**/__tests__/**/*.unit.spec.[jt]s",
