@@ -201,6 +201,10 @@ export async function liveIssueEntitlementsWithinTx(
     ),
     event_type,
     processed_at: now.getTime(),
+    // Klucz zakupu (AD-16 / ADR-190): `payment_intent_id` na KAŻDYM wierszu
+    // pętli, więc N wystawień jednego zakupu koreluje się po kolumnie zamiast
+    // przez parsowanie `external_id` po separatorze.
+    purchase_key: payload.payment_intent_id,
   })
   const dedupe = await client.query(dedupeInsert.sql, dedupeInsert.params)
   if ((dedupe.rowCount ?? 0) === 0) {

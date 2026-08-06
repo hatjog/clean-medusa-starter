@@ -61,16 +61,18 @@ describe("Story 3.2 AC1 — migracja event_processed (ADR-137 DEC-5 pkt 3.i)", (
 describe("Story 3.2 AC1 — prymityw dedupe-insert (ON CONFLICT DO NOTHING)", () => {
   it("buduje parametryzowany INSERT z ON CONFLICT (external_id, event_type) DO NOTHING", () => {
     const { sql, params } = buildEventProcessedDedupeInsert({
-      external_id: "pi_123",
+      external_id: "pi_123:order_9",
       event_type: "gp.stripe.payment_intent_succeeded.v1",
       processed_at: 1_780_000_000_000,
+      purchase_key: "pi_123",
     })
     expect(sql).toContain(`INSERT INTO ${EVENT_PROCESSED_TABLE}`)
     expect(sql).toContain("ON CONFLICT (external_id, event_type) DO NOTHING")
     expect(params).toEqual([
-      "pi_123",
+      "pi_123:order_9",
       "gp.stripe.payment_intent_succeeded.v1",
       1_780_000_000_000,
+      "pi_123",
     ])
   })
 })
@@ -80,6 +82,7 @@ describe("Story 3.2 — idempotencja konsumenta: replay tego samego eventu ⇒ N
     external_id: "pi_replay_1",
     event_type: "gp.stripe.payment_intent_succeeded.v1",
     processed_at: 1_780_000_000_000,
+    purchase_key: "pi_replay",
   }
 
   it("pierwsza dostawa: processed=true (nowy wiersz)", () => {
