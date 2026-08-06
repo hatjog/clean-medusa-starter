@@ -150,8 +150,19 @@ export function readPaymentIntentIdentifiers(
  * `order_id`/`market_id` wyliczone z powiązania płatność→zamówienie.
  *
  * Kontrakt `gp.stripe.payment_intent_succeeded.v1` wymaga, żeby payload je
- * ZAWIERAŁ — nie narzuca, skąd pochodzą. Metadata pozostaje pierwszeństwem;
- * to jest uzupełnienie, nie nadpisanie.
+ * ZAWIERAŁ — nie narzuca, skąd pochodzą.
+ *
+ * PIERWSZEŃSTWO (Story 3.3 / ADR-190, amendment ADR-166): gdy wołający poda
+ * `resolved.order_id` / `resolved.market_id`, WYGRYWA ON, a metadata są
+ * fallbackiem. Powód jest kardynalny, nie kosmetyczny: jedno
+ * `payment_intent.succeeded` Mercur obejmuje N zamówień (po jednym na sellera),
+ * a `metadata` niesie CO NAJWYŻEJ JEDNO `order_id`. Wołający (route Path Y)
+ * iteruje po wyniku rezolucji linku i buduje N kopert; przy pierwszeństwie
+ * metadanych każda iteracja dostawała TO SAMO `order_id`, więc N kopert miało
+ * IDENTYCZNY `idempotency_key` — dedupe `event_processed` zjadał wszystkie poza
+ * pierwszą i drugi sprzedawca nie dostawał wystawienia. Dodatkowo `metadata` są
+ * mutowalne z zewnątrz (Stripe API), więc nie mogą przebijać faktu wyliczonego
+ * z powiązania payment_session→order.
  */
 export type ResolvedPaymentIntentFacts = {
   order_id?: string | null
@@ -161,10 +172,11 @@ export type ResolvedPaymentIntentFacts = {
 /**
  * Buduje i WALIDUJE envelope `gp.stripe.payment_intent_succeeded.v1` z faktu
  * Stripe (kontrakt Story 3.1, envelope.v1). Mapowanie minimalne, audytowalne —
- * BEZ raw provider error / sekretów (zgodnie z payload-schema). `order_id`,
- * `market_id`, `instance_id` czytane z `payment_intent.metadata`, a gdy metadata
- * ich NIE niesie — z `resolved` (fakty wyliczone przez wołającego z powiązania
- * płatność→zamówienie; Story 5.1 AC4). Rzuca `StripeEventMappingError` przy
+ * BEZ raw provider error / sekretów (zgodnie z payload-schema). `order_id` i
+ * `market_id` pochodzą z `resolved` (fakty wyliczone przez wołającego z
+ * powiązania płatność→zamówienie; Story 5.1 AC4, ADR-190), a `payment_intent.metadata`
+ * są FALLBACKIEM na wypadek, gdy wołający nic nie przekazał. `instance_id` nadal
+ * z metadata (nie jest faktem rezolucji). Rzuca `StripeEventMappingError` przy
  * brakach / złym typie.
  *
  * Dlaczego `resolved` w ogóle istnieje: sesja płatności powstaje ZANIM zamówienie
@@ -192,10 +204,14 @@ export function buildPaymentIntentSucceededEnvelope(
     throw new StripeEventMappingError("payment_intent.id wymagany")
   }
   const metadata = (pi.metadata ?? {}) as Record<string, unknown>
+  // ADR-190: wynik rezolucji PRZED metadata (metadata = fallback). Kolejność
+  // `??` jest tu semantyką kardynalności, nie stylem — patrz docstring typu
+  // `ResolvedPaymentIntentFacts`. Bramka:
+  // _grow/tools/validate_stripe_purchase_correlation.py (kontrola A).
   const orderId =
+    readString(resolved.order_id) ??
     readString(metadata.order_id) ??
-    readString(metadata.gp_order_id) ??
-    readString(resolved.order_id)
+    readString(metadata.gp_order_id)
   if (!orderId) {
     throw new StripeEventMappingError(
       `payment_intent ${paymentIntentId} bez order_id — ani w metadata, ani z ` +
@@ -213,10 +229,11 @@ export function buildPaymentIntentSucceededEnvelope(
     )
   }
   const instanceId = readString(metadata.instance_id) ?? "gp"
+  // ADR-190: jak wyżej — `resolved` przed metadata (kontrola A bramki).
   const marketId =
+    readString(resolved.market_id) ??
     readString(metadata.market_id) ??
-    readString(metadata.gp_market_id) ??
-    readString(resolved.market_id)
+    readString(metadata.gp_market_id)
   if (!marketId) {
     throw new StripeEventMappingError(
       `payment_intent ${paymentIntentId} bez market_id — ani w metadata, ani ` +
@@ -251,7 +268,13 @@ export function buildPaymentIntentSucceededEnvelope(
     // więc jednostką issuance jest para PI + order, nie sam PaymentIntent.
     idempotency_key:
       `${marketId}:${paymentIntentId}:${orderId}:payment_intent_succeeded`,
-    correlation_id: orderId,
+    // ADR-190 (AD-16): `correlation_id` niesie `payment_intent_id` — to JEDYNE
+    // pole koperty, które wiąże N kopert jednego zakupu. `order_id` jest już w
+    // `payload.order_id` i różni się między kopertami, więc jako correlation nie
+    // korelował niczego. `envelope.v1` ma `additionalProperties: false`, więc
+    // osobne pole klucza zakupu nie jest dostępne (nośnikiem jest kolumna
+    // `event_processed.purchase_key`). Bramka: kontrola B.
+    correlation_id: paymentIntentId,
     payload,
   }
   if (event.id) {

@@ -71,6 +71,38 @@ export interface EventProcessedRow {
   event_type: string
   /** epoch-ms pierwszego przetworzenia (konflikt PK zachowuje pierwotny). */
   processed_at: number
+  /**
+   * KLUCZ ZAKUPU (Story 3.3 / AD-16 / ADR-190) = `payment_intent_id`. Wiąże N
+   * wierszy pętli (jeden na zamówienie zakupu) bez rozszerzania `envelope.v1`
+   * (`additionalProperties: false` — pole koperty jest niedostępne) i BEZ
+   * parsowania `external_id` po separatorze `:`. Zapytanie „pokaż wszystkie
+   * wystawienia tego zakupu" = `WHERE purchase_key = $1`
+   * (`buildEventProcessedPurchaseQuery()`). Migracja: `1779006000000`.
+   */
+  purchase_key: string
+}
+
+/** Nazwa kolumny klucza zakupu — SSOT dla zapytań korelujących (AD-16). */
+export const EVENT_PROCESSED_PURCHASE_KEY_COLUMN = "purchase_key" as const
+
+/**
+ * Zapytanie korelujące N wystawień jednego zakupu — PO KOLUMNIE, nie po
+ * podciągu `external_id`. Istnienie kolumny bez ani jednego call-site'u nie
+ * spełniałoby AC2, więc to jest kanoniczny odczyt (używany w teście
+ * integracyjnym na realnym Postgresie).
+ */
+export function buildEventProcessedPurchaseQuery(purchaseKey: string): {
+  sql: string
+  params: [string]
+} {
+  return {
+    sql:
+      `SELECT external_id, event_type, processed_at, ${EVENT_PROCESSED_PURCHASE_KEY_COLUMN} ` +
+      `FROM ${EVENT_PROCESSED_TABLE} ` +
+      `WHERE ${EVENT_PROCESSED_PURCHASE_KEY_COLUMN} = $1 ` +
+      `ORDER BY external_id`,
+    params: [purchaseKey],
+  }
 }
 
 /**
@@ -81,19 +113,25 @@ export interface EventProcessedRow {
  * transakcji; gdy nic nie wstawiono (0 affected rows), event był już przetworzony
  * i tworzenie entitlementów jest pomijane (nie podwaja issue).
  *
- * Zwraca SQL + params (kolejność: external_id, event_type, processed_at). Czysta
- * funkcja — nie wykonuje zapytania (wykonanie należy do warstwy persystencji 3.3).
+ * Zwraca SQL + params (kolejność: external_id, event_type, processed_at,
+ * purchase_key). Czysta funkcja — nie wykonuje zapytania (wykonanie należy do
+ * warstwy persystencji 3.3).
+ *
+ * `purchase_key` (Story 3.3, AD-16) jest w typie WYMAGANY: pominięcie klucza
+ * zakupu ma pękać przy kompilacji, a nie cicho wstawiać NULL na ścieżce, która
+ * ma korelować N wystawień jednego zakupu.
  */
 export function buildEventProcessedDedupeInsert(row: EventProcessedRow): {
   sql: string
-  params: [string, string, number]
+  params: [string, string, number, string]
 } {
   return {
     sql:
-      `INSERT INTO ${EVENT_PROCESSED_TABLE} (external_id, event_type, processed_at) ` +
-      `VALUES ($1, $2, $3) ` +
+      `INSERT INTO ${EVENT_PROCESSED_TABLE} ` +
+      `(external_id, event_type, processed_at, ${EVENT_PROCESSED_PURCHASE_KEY_COLUMN}) ` +
+      `VALUES ($1, $2, $3, $4) ` +
       `ON CONFLICT (external_id, event_type) DO NOTHING`,
-    params: [row.external_id, row.event_type, row.processed_at],
+    params: [row.external_id, row.event_type, row.processed_at, row.purchase_key],
   }
 }
 
