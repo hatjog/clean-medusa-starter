@@ -85,11 +85,29 @@ type RawBodyRequest = MedusaRequest & {
   headers: Record<string, string | string[] | undefined>
 }
 
-function resolveLogger(req: MedusaRequest): LoggerLike {
+/**
+ * Logger z GWARANTOWANYMI `warn`/`error`/`info` (ADR-190).
+ *
+ * Wstrzyknięty logger bywa zawężonym obiektem (testy, część ścieżek Medusy), a
+ * wszystkie sygnały tej trasy idą przez `logger.warn?.()` — optional call, który
+ * przy braku metody po cichu ewaluuje się do `undefined`. Dla alarmu rozjazdu
+ * metadata↔rezolucja (krok 2b) znaczyłoby to, że JEDYNY sygnał znika bez śladu,
+ * a AC1 żąda wprost, żeby rozjazd „nie był cichy". Świadomy sygnał alarmowy nie
+ * może być opcjonalny, więc brakujące metody dostają jawny fallback na `console`
+ * — kontrakt jest tu, a nie w każdym call-sitcie z osobna.
+ */
+function resolveLogger(req: MedusaRequest): Required<LoggerLike> {
+  let resolved: LoggerLike | undefined
   try {
-    return (req.scope.resolve("logger") as LoggerLike) ?? console
+    resolved = req.scope.resolve("logger") as LoggerLike | undefined
   } catch {
-    return console
+    resolved = undefined
+  }
+  const base = resolved ?? console
+  return {
+    info: base.info?.bind(base) ?? console.info.bind(console),
+    warn: base.warn?.bind(base) ?? console.warn.bind(console),
+    error: base.error?.bind(base) ?? console.error.bind(console),
   }
 }
 
@@ -243,7 +261,10 @@ export async function POST(
       identifiers.order_id &&
       !resolvedOrderIds.includes(identifiers.order_id)
     ) {
-      logger.warn?.(
+      // NIE `warn?.()` — to jest alarm, nie log pomocniczy. `resolveLogger`
+      // gwarantuje `warn`, więc wywołanie jest bezwarunkowe i jego usunięcie
+      // widać w diffie zamiast cicho ewaluować się do `undefined`.
+      logger.warn(
         `[stripe/payment-intent] metadata_order_mismatch: ` +
           `payment_intent_id=${paymentIntentId}; ` +
           `metadata.order_id=${identifiers.order_id}; ` +
