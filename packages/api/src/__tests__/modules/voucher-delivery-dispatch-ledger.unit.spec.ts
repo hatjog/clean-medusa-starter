@@ -419,6 +419,100 @@ describe("PgDispatchLedger — INSERT-first ON CONFLICT DO NOTHING (AC5)", () =>
   })
 })
 
+// ── Story 4.4 / AC5 (AD-23): ponowienie ≠ duplikat ─────────────────────────
+
+describe("AC5 — ponowienie legalne jest ODRÓŻNIALNE od duplikatu (z DANYCH)", () => {
+  it("legalne ponowienie zostawia tranzycję `failed → queued` z podniesionym numerem", async () => {
+    const sql = new FakeDispatchSql()
+    const ledger = makeLedger(sql)
+
+    const first = await ledger.reserveDispatch(identity())
+    await ledger.markFailed({
+      dispatch_id: first.dispatch_id!,
+      error_code: "BREVO_TRANSPORT_ERROR",
+    })
+
+    const retry = await ledger.reserveDispatch(identity())
+
+    expect(retry.outcome).toBe("retry_reserved")
+    // Numer nadał LEDGER — wywołujący podał to samo wejście co za pierwszym razem.
+    expect(retry.attempt_count).toBe(first.attempt_count + 1)
+
+    // Rozróżnienie czytelne z DANYCH, nie z logu: append-only audyt niesie
+    // tranzycję z kopią numeru próby w momencie jej wykonania.
+    const transitions = sql.audit.map(
+      (row) => `${String(row.from_status)}→${String(row.to_status)}`,
+    )
+    expect(transitions).toEqual(["null→queued", "queued→failed", "failed→queued"])
+  })
+
+  it("duplikat kończy się `blocked`/`in_flight` — ZERO nowych tranzycji i zero prób", async () => {
+    const sql = new FakeDispatchSql()
+    const ledger = makeLedger(sql)
+
+    const first = await ledger.reserveDispatch(identity())
+    await ledger.markSent({
+      dispatch_id: first.dispatch_id!,
+      provider: "brevo",
+      provider_message_id: "brevo-1",
+    })
+
+    const auditBefore = sql.audit.length
+    const attemptsBefore = Number(sql.dispatch[0].attempt_count)
+
+    const duplicate = await ledger.reserveDispatch(identity())
+
+    expect(duplicate.outcome).toBe("blocked")
+    expect(sql.audit).toHaveLength(auditBefore)
+    expect(Number(sql.dispatch[0].attempt_count)).toBe(attemptsBefore)
+  })
+
+  it("dwa równoległe wejścia na TEN SAM wiersz dają dokładnie jedno `retry_reserved`", async () => {
+    const sql = new FakeDispatchSql()
+    const ledger = makeLedger(sql)
+
+    const first = await ledger.reserveDispatch(identity())
+    await ledger.markFailed({
+      dispatch_id: first.dispatch_id!,
+      error_code: "BREVO_TRANSPORT_ERROR",
+    })
+
+    const results = await Promise.all([
+      ledger.reserveDispatch(identity()),
+      ledger.reserveDispatch(identity()),
+    ])
+
+    // Guard `status IN (...)` w `WHERE` czyni przejęcie retry ATOMOWYM — drugi
+    // wołający widzi `in_flight`, a nie drugą próbę.
+    expect(results.filter((r) => r.outcome === "retry_reserved")).toHaveLength(1)
+    expect(results.filter((r) => r.outcome === "in_flight")).toHaveLength(1)
+    // Jeden inkrement, nie dwa: budżet prób zużyty raz na jedno ponowienie.
+    expect(Number(sql.dispatch[0].attempt_count)).toBe(2)
+  })
+
+  it("ponowienie SĄSIADA nie rusza wiersza zaparkowanego (jednostką jest wiersz)", async () => {
+    const sql = new FakeDispatchSql()
+    const ledger = makeLedger(sql)
+
+    const buyer = await ledger.reserveDispatch(identity())
+    await ledger.markFailed({
+      dispatch_id: buyer.dispatch_id!,
+      error_code: "BREVO_TRANSPORT_ERROR",
+    })
+    const buyerAttempts = Number(sql.dispatch[0].attempt_count)
+
+    const handoff = await ledger.reserveDispatch({
+      ...identity(),
+      template_key: "voucher_handoff_link",
+    })
+
+    expect(handoff.outcome).toBe("reserved")
+    expect(sql.dispatch).toHaveLength(2)
+    expect(Number(sql.dispatch[0].attempt_count)).toBe(buyerAttempts)
+    expect(sql.dispatch[0].status).toBe("failed")
+  })
+})
+
 describe("PgDispatchLedger — token korelacji dostarczonej wiadomości", () => {
   it("markSent ZAPISUJE token, żeby fallback pełnotekstowy smoke'a miał czego szukać", async () => {
     const sql = new FakeDispatchSql()
