@@ -75,6 +75,15 @@ if (process.env.TEST_TYPE === "integration:http") {
   module.exports.testMatch = [
     "**/packages/api/src/__tests__/rls/voucher-module-rls.integration.spec.[jt]s",
   ];
+} else if (process.env.TEST_TYPE === "compensation-failure-pg") {
+  // v1.15.0 Story 3.5 (FR-6c, NFR-3, AD-22) — rejestr nieudanych kompensacji
+  // sciezki pieniadza wykonany przez sam modul na realnym Postgresie
+  // (`up`/`down` migracji + CHECK-i + ON CONFLICT). DATABASE_URL musi wskazywac
+  // IZOLOWANA DB testowa: suita zaklada i kasuje
+  // `money_path_compensation_failure`.
+  module.exports.testMatch = [
+    "**/packages/api/src/__tests__/integration/money-path-compensation-failure-pg.integration.test.[jt]s",
+  ];
 } else if (process.env.TEST_TYPE === "unit") {
   module.exports.testMatch = [
     "**/packages/api/src/**/__tests__/**/*.unit.spec.[jt]s",

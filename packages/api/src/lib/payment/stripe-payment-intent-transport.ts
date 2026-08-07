@@ -81,11 +81,17 @@ export async function releaseWebhookDelivery(
 
 type PgPoolLike = { connect: () => Promise<PgClientLike> }
 type PgClientLike = PaymentLinkQueryClient & { release?: () => void }
+type KnexDriverLike = {
+  acquireConnection?: () => Promise<PgClientLike>
+  releaseConnection?: (connection: PgClientLike) => Promise<void> | void
+}
 type KnexLike = {
   raw: (
     sql: string,
     bindings?: ReadonlyArray<unknown>
   ) => Promise<{ rows?: unknown[]; rowCount?: number | null } | unknown[]>
+  /** Sterownik Knexa — jedyna droga do połączenia ROZŁĄCZNEGO z uchwytem wołającego. */
+  client?: KnexDriverLike
 }
 
 export type WebhookPgHandle = {
@@ -120,6 +126,57 @@ export async function resolveWebhookPgHandle(scope: {
   const knex = tryResolve<KnexLike>(scope, ContainerRegistrationKeys.PG_CONNECTION)
   if (knex && typeof knex.raw === "function") {
     return { client: createKnexQueryClient(knex), release: () => {} }
+  }
+
+  return null
+}
+
+/**
+ * Połączenie ROZŁĄCZNE z uchwytem wołającego — nośnik zapisu rejestru nieudanych
+ * kompensacji (Story 3.5, ogniwo 1 łańcucha degradacji).
+ *
+ * Różnica wobec `resolveWebhookPgHandle` jest tu CAŁYM SENSEM funkcji i została
+ * zmierzona, nie założona: `resolveWebhookPgHandle` przy braku `__pg_pool__`
+ * schodzi na `createKnexQueryClient(knex)` — opakowanie TEJ SAMEJ instancji
+ * Knexa, którą posługuje się wołający. Rejestr pisany takim „świeżym" klientem
+ * padłby dokładnie razem z kompensacją, którą ma odnotować, a `origin: "fresh"`
+ * raportowałby operatorowi rozróżnienie, którego nie dokonano.
+ *
+ * `__pg_pool__` NIE jest w tym repo nigdzie rejestrowany (ani przez kod, ani
+ * przez framework — sprawdzone `git grep` po rejestracjach i po `node_modules`),
+ * więc gałąź Knexa jest gałęzią PRODUKCYJNĄ, a nie awaryjną. Dlatego bierzemy
+ * z niej połączenie tak, jak robi to `api/store/payment-collections/[id]/
+ * payment-sessions/route.ts`: przez `knex.client.acquireConnection()`, które
+ * zwraca surowe połączenie `pg` (dialekt `$N`, ten sam co
+ * `RECORD_COMPENSATION_FAILURE_SQL`) — a nie przez `knex.raw` na wspólnej puli.
+ *
+ * `null` = rozłącznego połączenia NIE DA SIĘ wziąć. Wołający MUSI wtedy zejść
+ * na uchwyt wołającego i nazwać to `origin: "caller"`; udawanie `fresh` byłoby
+ * tą samą klasą ciszy, którą Story 3.5 zamyka.
+ */
+export async function acquireFreshPgConnection(scope: {
+  resolve: (key: string) => unknown
+}): Promise<WebhookPgHandle | null> {
+  const pool = tryResolve<PgPoolLike>(scope, "__pg_pool__")
+  if (pool && typeof pool.connect === "function") {
+    const client = await pool.connect()
+    return { client, release: () => client.release?.() }
+  }
+
+  const knex = tryResolve<KnexLike>(scope, ContainerRegistrationKeys.PG_CONNECTION)
+  const driver = knex?.client
+  if (
+    driver &&
+    typeof driver.acquireConnection === "function" &&
+    typeof driver.releaseConnection === "function"
+  ) {
+    const connection = await driver.acquireConnection()
+    return {
+      client: connection,
+      release: () => {
+        void driver.releaseConnection?.(connection)
+      },
+    }
   }
 
   return null
