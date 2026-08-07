@@ -68,14 +68,22 @@ describe("brevoDeliveryTracker", () => {
 
   it("subskrybuje natywne eventy notification.* bez custom route", () => {
     expect(config.event).toEqual([...BREVO_NOTIFICATION_EVENTS])
+    // ADR-192: `notification.bounced` zniknelo — nie niesie rozroznienia
+    // wymaganego przez FR-9d. Na jego miejscu piec rozlacznych nazw kanalu.
     expect(BREVO_NOTIFICATION_EVENTS).toEqual([
       "notification.delivered",
       "notification.opened",
       "notification.clicked",
-      "notification.bounced",
+      "notification.hard_bounce",
+      "notification.soft_bounce",
+      "notification.blocked",
+      "notification.invalid_email",
+      "notification.deferred",
       "notification.complaint",
       "notification.unsubscribed",
+      "notification.failed",
     ])
+    expect(BREVO_NOTIFICATION_EVENTS).not.toContain("notification.bounced")
   })
 
   it("notification.delivered generuje audit envelope z matched correlation", async () => {
@@ -110,21 +118,21 @@ describe("brevoDeliveryTracker", () => {
     })
   })
 
-  it("notification.bounced hard bounce mapuje outcome failed i HARD_BOUNCE", async () => {
+  it("hard_bounce mapuje outcome failed i HARD_BOUNCE", async () => {
     const ctx = makeContainer()
 
     await handleDelivery(
       {
         provider_id: "brevo",
         provider_event_id: "brevo-message-2",
+        market_id: "pl",
         dispatch_id: "dispatch-2",
-        event_type: "bounced",
-        bounce_type: "hard",
+        event_type: "hard_bounce",
         occurred_at: "2026-05-27T08:01:00.000Z",
         recipient_hash: "recipient-hash-2",
       },
       ctx.container,
-      "notification.bounced",
+      "notification.hard_bounce",
     )
 
     expect(ctx.auditEvents).toHaveLength(1)
@@ -143,6 +151,7 @@ describe("brevoDeliveryTracker", () => {
       {
         provider_id: "brevo",
         provider_event_id: "brevo-message-3",
+        market_id: "pl",
         dispatch_id: "dispatch-3",
         event_type: "complaint",
         occurred_at: "2026-05-27T08:02:00.000Z",
@@ -208,6 +217,7 @@ describe("brevoDeliveryTracker", () => {
       {
         provider_id: "brevo",
         provider_event_id: "orphan-message",
+        market_id: "pl",
         event_type: "opened",
         occurred_at: "2026-05-27T08:03:00.000Z",
         recipient_hash: "recipient-hash-4",
@@ -234,6 +244,7 @@ describe("brevoDeliveryTracker", () => {
     const payload = {
       provider_id: "brevo",
       provider_event_id: "duplicate-message",
+        market_id: "pl",
       dispatch_id: "dispatch-duplicate",
       event_type: "delivered",
       occurred_at: "2026-05-27T08:04:00.000Z",
@@ -257,6 +268,7 @@ describe("brevoDeliveryTracker", () => {
       {
         provider_id: "brevo",
         provider_event_id: "brevo-message-pii",
+        market_id: "pl",
         dispatch_id: "dispatch-pii",
         event_type: "clicked",
         occurred_at: "2026-05-27T08:05:00.000Z",
@@ -300,12 +312,13 @@ describe("brevoDeliveryTracker", () => {
       {
         provider_id: "brevo",
         "message-id": "legacy-soft-bounce",
+        market_id: "pl",
         event: "soft_bounce",
         date: "2026-05-27T08:06:00.000Z",
         email: "bounce@example.com",
       },
       { resolve },
-      "notification.bounced",
+      "notification.soft_bounce",
     )
 
     expect(auditEvents).toHaveLength(1)
@@ -335,6 +348,7 @@ describe("brevoDeliveryTracker", () => {
       {
         provider_id: "brevo",
         provider_event_id: "failed-message",
+        market_id: "pl",
         dispatch_id: "dispatch-failed",
         event_type: "failed",
         error_code: "BREVO_TIMEOUT",
@@ -350,8 +364,11 @@ describe("brevoDeliveryTracker", () => {
         provider_event_id: "failed-message",
         outcome: "failed",
         status: "failed",
-        error_code: "BREVO_TIMEOUT",
-        error_message: "timeout",
+        // ADR-192: kod błędu jest KANONICZNY dla klasy i rozłączny między
+        // klasami; kod podany przez dostawcę nie nadpisuje go, tylko trafia
+        // do `error_message` jako szczegół diagnostyczny.
+        error_code: "PROVIDER_ERROR",
+        error_message: "BREVO_TIMEOUT: timeout",
       }),
     )
   })
@@ -367,6 +384,7 @@ describe("brevoDeliveryTracker", () => {
       {
         provider_id: "brevo",
         provider_event_id: "unsubscribe-message",
+        market_id: "pl",
         event_type: "unsubscribed",
         ts: "1780000000000",
       },
@@ -405,6 +423,7 @@ describe("brevoDeliveryTracker", () => {
         {
           provider_id: "brevo",
           provider_event_id: "sink-failure-message",
+        market_id: "pl",
           dispatch_id: "dispatch-sink-failure",
           event_type: "delivered",
         },
@@ -414,19 +433,26 @@ describe("brevoDeliveryTracker", () => {
     expect(logger.error).toHaveBeenCalledWith(expect.stringContaining("audit sink failed"))
   })
 
-  it("zrzuca malformed event bez audit entry", async () => {
+  it("ODMAWIA na malformed event zamiast zrzucać go po cichu (AD-19)", async () => {
     const ctx = makeContainer()
 
-    await handleDelivery(
-      {
-        provider_id: "brevo",
-        event_type: "unknown",
-      },
-      ctx.container,
-    )
+    // Do v1.15.0 ta ścieżka kończyła się `logger.warn` + cichym `return`:
+    // zdarzenie znikało bez błędu i bez zmiany stanu, a Medusa uznawała je za
+    // obsłużone. Teraz odmowa jest głośna i propaguje.
+    await expect(
+      handleDelivery(
+        {
+          provider_id: "brevo",
+          provider_event_id: "unrecognized-name-message",
+          market_id: "pl",
+          event_type: "unknown",
+        },
+        ctx.container,
+      ),
+    ).rejects.toThrow("DELIVERY_EVENT_UNRECOGNIZED")
 
     expect(ctx.auditEvents).toHaveLength(0)
-    expect(ctx.logger.warn).toHaveBeenCalledWith(
+    expect(ctx.logger.warn).not.toHaveBeenCalledWith(
       "[brevo-delivery-tracker] dropped malformed delivery event",
     )
   })
@@ -436,6 +462,7 @@ describe("brevoDeliveryTracker", () => {
     const payload = {
       provider_id: "brevo",
       provider_event_id: "race-message",
+        market_id: "pl",
       dispatch_id: "dispatch-race",
       event_type: "delivered",
       occurred_at: "2026-05-27T08:10:00.000Z",
@@ -476,6 +503,7 @@ describe("brevoDeliveryTracker", () => {
     const payload = {
       provider_id: "brevo",
       provider_event_id: "retry-message",
+        market_id: "pl",
       dispatch_id: "dispatch-retry",
       event_type: "delivered",
     }
@@ -493,6 +521,7 @@ describe("brevoDeliveryTracker", () => {
     const payload = {
       provider_id: "brevo",
       provider_event_id: "deterministic-id-message",
+        market_id: "pl",
       dispatch_id: "dispatch-det",
       event_type: "delivered",
       occurred_at: "2026-05-27T08:11:00.000Z",
@@ -539,6 +568,7 @@ describe("brevoDeliveryTracker", () => {
       {
         provider_id: "brevo",
         provider_event_id: "db-outage-message",
+        market_id: "pl",
         event_type: "clicked",
       },
       { resolve },
@@ -588,6 +618,7 @@ describe("brevoDeliveryTracker", () => {
       {
         provider_id: "brevo",
         provider_event_id: "missing-relation-message",
+        market_id: "pl",
         event_type: "clicked",
       },
       { resolve },
@@ -634,6 +665,7 @@ describe("brevoDeliveryTracker", () => {
       {
         provider_id: "brevo",
         provider_event_id: "pg-orphan-message",
+        market_id: "pl",
         event_type: "clicked",
       },
       { resolve },
