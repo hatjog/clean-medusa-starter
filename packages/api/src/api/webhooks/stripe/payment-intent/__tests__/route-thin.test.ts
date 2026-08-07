@@ -124,7 +124,16 @@ function makeRes(): FakeRes {
   return res
 }
 
-function makeReq(rawBody: string, sigHeader: string | undefined) {
+function makeReq(
+  rawBody: string,
+  sigHeader: string | undefined,
+  options: {
+    /** Podmienia obiekt loggera (np. na zawężony, BEZ `warn`). */
+    logger?: unknown
+    /** `order_id` zwracane przez link płatność→zamówienie (rezolucja linku). */
+    linkOrderIds?: string[]
+  } = {}
+) {
   const emitted: { name: string; data: unknown }[] = []
   const resolved: string[] = []
   const sqlSeen: string[] = []
@@ -144,16 +153,21 @@ function makeReq(rawBody: string, sigHeader: string | undefined) {
       // Bez tego wiersza rezolucja kończy się `order_not_found`, czyli test
       // mierzyłby brak fixture'a, a nie kontrakt route'u.
       if (/AS order_id/i.test(sql) && /sales_channel/i.test(sql)) {
+        const ids = options.linkOrderIds ?? ["order_4421"]
         return {
-          rows: [
-            {
-              order_id: "order_4421",
-              order_metadata: { gp: { market_id: "bonbeauty" } },
-              sales_channel_id: "sc_bonbeauty",
-              sales_channel_market_id: "bonbeauty",
-            },
-          ],
-          rowCount: 1,
+          rows: ids.map((id) => ({
+            order_id: id,
+            order_metadata: { gp: { market_id: "bonbeauty" } },
+            sales_channel_id: "sc_bonbeauty",
+            sales_channel_market_id: "bonbeauty",
+          })),
+          rowCount: ids.length,
+        }
+      }
+      if (options.linkOrderIds && /FROM payment_session/i.test(sql)) {
+        return {
+          rows: options.linkOrderIds.map((id) => ({ order_id: id })),
+          rowCount: options.linkOrderIds.length,
         }
       }
       // Link płatność→zamówienie: pusto, żeby ten przypadek testował ścieżkę
@@ -168,7 +182,11 @@ function makeReq(rawBody: string, sigHeader: string | undefined) {
     scope: {
       resolve: (key: string) => {
         resolved.push(key)
-        if (key === "logger") return { info() {}, warn() {}, error() {} }
+        if (key === "logger") {
+          return options.logger !== undefined
+            ? options.logger
+            : { info() {}, warn() {}, error() {} }
+        }
         if (key === "__pg_pool__") return { connect: async () => client }
         if (key === Modules.EVENT_BUS) {
           return { emit: async (e: { name: string; data: unknown }) => emitted.push(e) }
@@ -255,5 +273,51 @@ describe("Story 3.3 AC1 — POST route cienki (verify + emit, ZERO biznes-logiki
     await POST(req as any, res as any)
     expect(res.statusCode).toBe(400)
     expect(emitted).toHaveLength(0)
+  })
+})
+
+describe("Story 3.3 AC1 — alarm rozjazdu metadata↔rezolucja NIE jest cichy (ADR-190)", () => {
+  /**
+   * AC1 żąda, żeby rozjazd „nie był cichy". Sygnał szedł przez `logger.warn?.()`
+   * — optional call, który przy loggerze BEZ metody `warn` (a takie bywają
+   * wstrzykiwane w testach i na części ścieżek Medusy) po cichu ewaluuje się do
+   * `undefined`, więc JEDYNY sygnał znikał bez śladu. Ten test mierzy wykonanie
+   * alarmu, nie jego obecność w kodzie: pęka, gdy alarm wróci do formy opcjonalnej.
+   */
+  it("logger BEZ `warn` ⇒ alarm nadal emitowany (fallback na console.warn)", async () => {
+    process.env.STRIPE_WEBHOOK_SECRET = SECRET
+    const raw = JSON.stringify(stripePiEvent())
+    // logger ZAWĘŻONY — ma `info`/`error`, nie ma `warn`.
+    const narrowedLogger = { info() {}, error() {} }
+    // rezolucja linku wskazuje INNE zamówienie niż `metadata.order_id`
+    // (`order_4421`) — to jest właśnie rozjazd, który ma być zgłoszony.
+    const { req, emitted } = makeReq(raw, signedHeader(raw), {
+      logger: narrowedLogger,
+      linkOrderIds: ["order_9001"],
+    })
+    // Zapis do WŁASNEJ tablicy, nie do `spy.mock.calls`: `mockRestore()` czyści
+    // zapamiętane wywołania, więc odczyt po restore dałby pustą listę i test
+    // „przechodziłby" na milczącym alarmie — czyli mierzyłby własne sprzątanie.
+    const warned: string[] = []
+    const spy = jest
+      .spyOn(console, "warn")
+      .mockImplementation((...args: unknown[]) => {
+        warned.push(String(args[0]))
+      })
+    const res = makeRes()
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await POST(req as any, res as any)
+    } finally {
+      spy.mockRestore()
+    }
+    expect(res.statusCode).toBe(200)
+    expect(emitted).toHaveLength(1)
+    const alarms = warned.filter((message) =>
+      message.includes("metadata_order_mismatch")
+    )
+    expect(alarms).toHaveLength(1)
+    expect(alarms[0]).toContain("order_4421")
+    expect(alarms[0]).toContain("order_9001")
   })
 })
