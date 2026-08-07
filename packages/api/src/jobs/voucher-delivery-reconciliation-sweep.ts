@@ -117,7 +117,10 @@ import {
   type PurchaseDeliveryResult,
   type PurchaseDeliverySourceReader,
 } from "../subscribers/voucher-purchase-delivery"
-import { NOTIFICATION_TEMPLATE_KEYS } from "@gp/messaging"
+import {
+  MESSAGING_BARRIER_TRANSIENT_ERROR_CODES,
+  NOTIFICATION_TEMPLATE_KEYS,
+} from "@gp/messaging"
 
 export const SCHEDULE_NAME = "voucher-delivery-reconciliation-sweep" as const
 
@@ -249,6 +252,14 @@ export const SWEEP_GLOBAL_FAILURE_ERROR_CODES: readonly string[] = [
   // sam — nie może odparkowywać wierszy w nieskończoność. Ochroną drugiego
   // rzędu pozostaje `SWEEP_MAX_CONFIGURATION_RECOVERIES`.
   "BREVO_UNAUTHORIZED",
+  // Story 4.1 fix-round (R-4.1-H2) — KOMPLET kodów bariery idempotencji
+  // dostawy, spreadowany z JEDNEGO źródła w `@gp/messaging` zamiast
+  // przepisywany. Bez tego wpisu przejściowa awaria nośnika bariery
+  // (`MESSAGING_BARRIER_UNAVAILABLE`) albo cudze zajęcie klucza
+  // (`MESSAGING_DISPATCH_IN_FLIGHT`) zużywały budżet 5 prób i po 75 min
+  // TRWALE parkowały wiersz — naprawa połączenia z bazą przestawała pomagać.
+  // Uzasadnienie per kod: `MESSAGING_BARRIER_TRANSIENT_ERROR_CODES`.
+  ...MESSAGING_BARRIER_TRANSIENT_ERROR_CODES,
 ]
 
 /** Sufiks kodów konfiguracyjnych (`BREVO_TEMPLATE_NOT_CONFIGURED` itp.). */

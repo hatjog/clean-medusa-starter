@@ -37,6 +37,7 @@ import {
   resolveCommunicationWiring,
   __resetCommunicationWiringForTests,
 } from "../../modules/notification-brevo/communication-wiring"
+import { SharedDispatchBarrier } from "../support/shared-dispatch-barrier"
 
 const FLOW_ID = "voucher_purchase_delivery"
 const MARKET_ID = "bonbeauty"
@@ -107,6 +108,7 @@ describe("AC6a — kill-switch per rynek/flow realnie BLOKUJE wysyłkę", () => 
   it("flow `enabled: true` przepuszcza wysyłkę", async () => {
     const provider = fakeProvider()
     const gateway = new DefaultMessagingGateway({ brevo: provider }, "brevo", {
+      barrier: new SharedDispatchBarrier(),
       flagResolver: makeResolver(DEFAULTS_YAML),
     })
 
@@ -119,6 +121,7 @@ describe("AC6a — kill-switch per rynek/flow realnie BLOKUJE wysyłkę", () => 
   it("flow `enabled: false` w defaults → dispatch `failed` z FLOW_DISABLED, provider NIE wołany", async () => {
     const provider = fakeProvider()
     const gateway = new DefaultMessagingGateway({ brevo: provider }, "brevo", {
+      barrier: new SharedDispatchBarrier(),
       flagResolver: makeResolver(
         DEFAULTS_YAML.replace(
           `  ${FLOW_ID}:\n    enabled: true`,
@@ -138,6 +141,7 @@ describe("AC6a — kill-switch per rynek/flow realnie BLOKUJE wysyłkę", () => 
   it("override rynku `enabled: false` wygrywa nad defaultem `true` (kill-switch per rynek)", async () => {
     const provider = fakeProvider()
     const gateway = new DefaultMessagingGateway({ brevo: provider }, "brevo", {
+      barrier: new SharedDispatchBarrier(),
       flagResolver: makeResolver(
         DEFAULTS_YAML,
         `version: 1\nmarket_id: ${MARKET_ID}\noverrides:\n  ${FLOW_ID}:\n    enabled: false\n`,
@@ -154,6 +158,7 @@ describe("AC6a — kill-switch per rynek/flow realnie BLOKUJE wysyłkę", () => 
   it("blokada dotyczy TYLKO rynku z override (inny rynek nadal wysyła)", async () => {
     const provider = fakeProvider()
     const gateway = new DefaultMessagingGateway({ brevo: provider }, "brevo", {
+      barrier: new SharedDispatchBarrier(),
       flagResolver: makeResolver(
         DEFAULTS_YAML,
         `version: 1\nmarket_id: ${MARKET_ID}\noverrides:\n  ${FLOW_ID}:\n    enabled: false\n`,
@@ -276,6 +281,7 @@ describe("AC6a — telemetria KPI `sent` jest realnie emitowana", () => {
     }
 
     const gateway = new DefaultMessagingGateway({ brevo: fakeProvider() }, "brevo", {
+      barrier: new SharedDispatchBarrier(),
       flagResolver: makeResolver(DEFAULTS_YAML),
       flowKpiTelemetry: createFlowKpiTelemetryHook({
         client,
@@ -303,6 +309,7 @@ describe("AC6a — telemetria KPI `sent` jest realnie emitowana", () => {
     }
 
     const gateway = new DefaultMessagingGateway({ brevo: fakeProvider() }, "brevo", {
+      barrier: new SharedDispatchBarrier(),
       flagResolver: makeResolver(DEFAULTS_YAML),
       flowKpiTelemetry: createFlowKpiTelemetryHook({
         client,
@@ -324,6 +331,7 @@ describe("AC6a — telemetria KPI `sent` jest realnie emitowana", () => {
     }
 
     const gateway = new DefaultMessagingGateway({ brevo: fakeProvider() }, "brevo", {
+      barrier: new SharedDispatchBarrier(),
       flagResolver: makeResolver(DEFAULTS_YAML),
       flowKpiTelemetry: createFlowKpiTelemetryHook({
         client,
@@ -343,6 +351,7 @@ describe("AC6a — telemetria KPI `sent` jest realnie emitowana", () => {
   it("gated dispatch NIE blokuje wysyłki — telemetria jest obserwacją, nie bramką", async () => {
     const provider = fakeProvider()
     const gateway = new DefaultMessagingGateway({ brevo: provider }, "brevo", {
+      barrier: new SharedDispatchBarrier(),
       flagResolver: makeResolver(DEFAULTS_YAML),
       flowKpiTelemetry: createFlowKpiTelemetryHook({
         client: { capture: () => undefined },

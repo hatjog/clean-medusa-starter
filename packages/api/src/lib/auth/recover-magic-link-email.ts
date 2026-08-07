@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto"
+
 import { Modules } from "@medusajs/framework/utils"
 
 // Story 2.2 (AC5 poz.5): klucz szablonu WYŁĄCZNIE ze stałej rejestru (AD-6).
@@ -156,6 +158,23 @@ function renderHtml(url: string, copy: RecoverEmailCopy, locale: RecoverEmailLoc
   ].join("")
 }
 
+/**
+ * Klucz bariery idempotencji wysyłki (v1.15.0 Story 4.1, AC2 — wariant (b):
+ * call-site BEZ wiersza skutku dostaje barierę z oknem ważności).
+ *
+ * Tożsamość skutku to KONKRETNY link odzyskiwania: każde nowe żądanie
+ * odzyskania konta dostaje nowy `token`, więc dostaje też nowy klucz i legalnie
+ * wysyła kolejny mail. Powtórzone dostarczenie TEGO SAMEGO żądania (retry
+ * modułu, druga instancja) trafia w ten sam klucz i nie wysyła drugiego maila.
+ *
+ * Do klucza wchodzi SKRÓT tokenu, nigdy sam token: token jest sekretem
+ * bearer, a `barrier_key` trafia do tabeli, do logów sterownika i do metryk.
+ */
+export function buildRecoverMagicLinkIdempotencyKey(token: string): string {
+  const digest = createHash("sha256").update(token, "utf8").digest("hex")
+  return `customer-recover-magic-link:${digest}`
+}
+
 export async function dispatchRecoverMagicLinkEmail({
   scope,
   to,
@@ -174,14 +193,19 @@ export async function dispatchRecoverMagicLinkEmail({
   const subject = copy.subject
   const text = renderText(url, copy)
   const html = renderHtml(url, copy, resolvedLocale)
+  const idempotencyKey = buildRecoverMagicLinkIdempotencyKey(token)
   const payload = {
     to,
     channel: "email",
     // `template` = pole kontraktu Medusy; `data.template_key` = kanoniczne GP
     // (ADR-158). Obie wartości pochodzą z tej samej stałej rejestru.
     template: NOTIFICATION_TEMPLATE_KEYS.CUSTOMER_RECOVER_MAGIC_LINK,
+    // Top-level włącza trwały dedupe modułu Notification Medusy; kopia w `data`
+    // zasila barierę gatewaya (Story 4.1, AC2). Jedna wartość, dwa pola.
+    idempotency_key: idempotencyKey,
     data: {
       template_key: NOTIFICATION_TEMPLATE_KEYS.CUSTOMER_RECOVER_MAGIC_LINK,
+      idempotency_key: idempotencyKey,
       market_id: marketId ?? resolveNotificationMarketId(),
       flow_id: "customer_recover",
       subject,

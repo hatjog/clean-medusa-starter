@@ -234,6 +234,12 @@ export async function handleVoucherAppointmentConfirmedDelivery(
     locale,
     email,
     marketId,
+    idempotencyKey: buildAppointmentDispatchIdempotencyKey({
+      entitlementId,
+      appointmentId: payload.appointment_id,
+      startsAt: payload.starts_at,
+      sequence: payload.sequence,
+    }),
   })
   const result = await deps.dispatcher.dispatch(notificationPayload)
   const notificationId = extractNotificationId(result)
@@ -322,12 +328,40 @@ function extractAppointmentScopeMarketId(
   return trimmed.length > 0 ? trimmed : null
 }
 
+/**
+ * Klucz bariery idempotencji wysyłki (v1.15.0 Story 4.1, AC2 — wariant (b):
+ * call-site BEZ wiersza skutku dostaje barierę z oknem ważności).
+ *
+ * Tożsamość skutku to KONKRETNE potwierdzone spotkanie, nie „entitlement":
+ * legalne przełożenie wizyty MUSI wysłać drugi mail, więc do klucza wchodzą
+ * `appointment_id` i `starts_at`. Klucz oparty na samym `entitlement_instance_id`
+ * skleiłby dwie legalne wysyłki w jedną — to defekt tej samej wagi co duplikat.
+ *
+ * `sequence` wchodzi, bo emiter używa go do numerowania kolejnych potwierdzeń
+ * tego samego spotkania; jego brak jest odróżnialny od wartości (`-`).
+ */
+export function buildAppointmentDispatchIdempotencyKey(input: {
+  entitlementId: string
+  appointmentId?: string | null
+  startsAt?: string | null
+  sequence?: number | null
+}): string {
+  return [
+    "voucher-appointment-confirmation",
+    input.entitlementId,
+    input.appointmentId ?? "-",
+    input.startsAt ?? "-",
+    input.sequence ?? "-",
+  ].join(":")
+}
+
 function buildNotificationPayload(input: {
   to: string
   entitlementId: string
   locale: string
   email: VoucherAppointmentDeliveryEmail
   marketId: string
+  idempotencyKey: string
 }): Record<string, unknown> {
   const marketId = input.marketId
 
@@ -337,10 +371,14 @@ function buildNotificationPayload(input: {
     // `template` = pole kontraktu Medusy; `data.template_key` = kanoniczne GP
     // (ADR-158). Obie wartości z tej samej stałej rejestru.
     template: NOTIFICATION_TEMPLATE_KEYS.VOUCHER_APPOINTMENT_CONFIRMATION,
+    // Top-level włącza trwały dedupe modułu Notification Medusy; kopia w `data`
+    // zasila barierę gatewaya (Story 4.1). Obie wartości z tej samej funkcji.
+    idempotency_key: input.idempotencyKey,
     data: {
       template_key: NOTIFICATION_TEMPLATE_KEYS.VOUCHER_APPOINTMENT_CONFIRMATION,
       market_id: marketId,
       flow_id: "voucher_appointment",
+      idempotency_key: input.idempotencyKey,
       entitlement_instance_id: input.entitlementId,
       locale: input.locale,
       subject: input.email.subject,
