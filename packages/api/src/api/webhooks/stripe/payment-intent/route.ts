@@ -233,6 +233,25 @@ export async function POST(
       return
     }
 
+    // ── krok 2b: rozjazd metadata ↔ rezolucja NIE jest cichy (ADR-190) ───────
+    // `metadata` są mutowalne z zewnątrz przez Stripe API, a od 3.3 przegrywają
+    // z wynikiem rezolucji przy budowie koperty. Gdy wskazują zamówienie SPOZA
+    // zbioru rozwiązanego z linku, to sygnał (obcy/nieaktualny stempel), nie szum
+    // — logujemy go zamiast po cichu odrzucić.
+    const resolvedOrderIds = resolution.orders.map((order) => order.order_id)
+    if (
+      identifiers.order_id &&
+      !resolvedOrderIds.includes(identifiers.order_id)
+    ) {
+      logger.warn?.(
+        `[stripe/payment-intent] metadata_order_mismatch: ` +
+          `payment_intent_id=${paymentIntentId}; ` +
+          `metadata.order_id=${identifiers.order_id}; ` +
+          `resolved_order_ids=[${resolvedOrderIds.join(",")}] ` +
+          `(pierwszeństwo ma rezolucja linku — ADR-190)`
+      )
+    }
+
     // ── krok 3: N kopert po jednej na zamówienie (ADR-166, NFR4) ──────────────
     let envelopes
     try {
