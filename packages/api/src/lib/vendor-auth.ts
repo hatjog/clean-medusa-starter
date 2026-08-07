@@ -51,7 +51,7 @@
  *     shared secret, which made an unset env var an outage of `/vendor/*`
  *     even though the request path had stopped using that value. That coupling
  *     is gone: the module now resolves policy only.
- * v1.15.0 Story 5.2 (FR-11 resolver member, AD-20, ADR-181, ADR-156):
+ * v1.15.0 Story 5.2 (FR-11 resolver member, AD-20, ADR-182, ADR-156):
  *   - The request path does not verify against any shared secret.
  *     The secret is resolved PER SELLER by the backend crypto-core
  *     (`lib/vendor-secret/crypto-core.ts`) for the `seller_id` carried by the
@@ -226,11 +226,32 @@ async function resolveSellerFromRequest(
     }
   }
 
-  // --- Per-vendor crypto-core (v1.15.0 Story 5.2 — AD-20, ADR-181, ADR-156 §4/§6a) ---
-  // Boot-time decrypt health is checked HERE and is distinguishable from a
-  // per-vendor resolve miss: a broken/absent age key or a failed decrypt is an
-  // operator fault → 503 on `/vendor/*` only (the rest of the API is untouched,
-  // P6-5b). "This seller has no secret" is an auth outcome → 401 below.
+  // --- Enforced HMAC mode ---
+  const sigHeader = req.headers[VENDOR_SIGNATURE_HEADER]
+  const sigValue = Array.isArray(sigHeader) ? sigHeader[0] : sigHeader
+
+  // review-fix L-3: an UNAUTHENTICATED caller must not be able to read the state
+  // of the secret store. A request with no signature header at all is answered
+  // with 401 BEFORE the crypto-core health check runs, so `503
+  // VENDOR_AUTH_SECRET_STORE_UNAVAILABLE` is only ever visible to a caller that
+  // at least presented a signature. AC3's 503-vs-401 distinguishability is
+  // untouched: it concerns signed requests.
+  if (!sigValue) {
+    return {
+      ok: false,
+      status: 401,
+      code: VENDOR_AUTH_SIGNATURE_MISSING,
+      message: "Missing vendor signature header (x-vendor-signature)",
+    }
+  }
+
+  // --- Per-vendor crypto-core (v1.15.0 Story 5.2 — AD-20, ADR-182, ADR-156 §4/§6a) ---
+  // Decrypt health is checked HERE and is distinguishable from a per-vendor
+  // resolve miss: a broken/absent age key or a failed decrypt is an operator
+  // fault → 503 on `/vendor/*` only (the rest of the API is untouched, P6-5b).
+  // "This seller has no secret" is an auth outcome → 401 below. The boot loader
+  // (`loaders/vendor-secret-crypto-core.ts`) already ran this check at startup;
+  // the call here is an idempotent read of the memoised verdict.
   const cryptoCore = getVendorSecretCryptoCore()
   if (!cryptoCore.ok) {
     logger.error?.(
@@ -243,10 +264,6 @@ async function resolveSellerFromRequest(
       message: "Vendor secret store unavailable",
     }
   }
-
-  // --- Enforced HMAC mode ---
-  const sigHeader = req.headers[VENDOR_SIGNATURE_HEADER]
-  const sigValue = Array.isArray(sigHeader) ? sigHeader[0] : sigHeader
 
   // AD-20: the secret is resolved for the `sellerId` CARRIED BY THE HEADER.
   // There is no fallback branch and, since Story 5.4, no shared value to fall

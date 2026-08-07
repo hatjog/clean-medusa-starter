@@ -243,6 +243,31 @@ describe("Story 5.2 — per-vendor secret resolution through the /vendor/* gate"
     expect(five.body.code).toBe("VENDOR_AUTH_SIGNATURE_INVALID")
   })
 
+  it("review-fix L-3: an unsigned request gets 401 (not 503) even when the secret store is broken", async () => {
+    // The state of the secret store must not be readable by an unauthenticated
+    // caller: no signature header ⇒ VENDOR_AUTH_SIGNATURE_MISSING, decided
+    // BEFORE the crypto-core health check.
+    resetVendorSecretCryptoCore()
+    configureVendorSecretCryptoCore({
+      secretSetPath: "/test/vendor-secret-set.enc.json",
+      decryptor: () => {
+        throw new CryptoCoreFault("decrypt-failed")
+      },
+    })
+
+    const r = await callRoute(undefined)
+
+    expect(r.status).toBe(401)
+    expect(r.body.code).toBe("VENDOR_AUTH_SIGNATURE_MISSING")
+    expect(JSON.stringify(r.body)).not.toContain(VENDOR_AUTH_SECRET_STORE_UNAVAILABLE)
+
+    // ...and a SIGNED request in the same state still gets the distinguishable
+    // 503 (AC3 is untouched by the reordering).
+    const signed = await callRoute(buildVendorSignatureHeader(SELLER_A, SECRET_A, nowSec()))
+    expect(signed.status).toBe(503)
+    expect(signed.body.code).toBe(VENDOR_AUTH_SECRET_STORE_UNAVAILABLE)
+  })
+
   it("AC2 step order: an expired timestamp is rejected BEFORE secret resolution, for a seller that has no secret", async () => {
     const header = buildVendorSignatureHeader(
       SELLER_UNPROVISIONED,

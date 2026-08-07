@@ -1,7 +1,7 @@
 /**
- * vendor-secret/crypto-core — per-vendor HMAC secret resolver (ADR-181, ADR-156 §1/§4/§6a).
+ * vendor-secret/crypto-core — per-vendor HMAC secret resolver (ADR-182, ADR-156 §1/§4/§6a).
  *
- * WHY THIS LIVES HERE (ADR-181 decision, AC3):
+ * WHY THIS LIVES HERE (ADR-182 decision, AC3):
  *   `GP/backend` is a separate git submodule with its OWN pnpm workspace
  *   (`packages/*`). `gp-ops/cli` (`@gp-ops/cli`, `private: true`) belongs to the
  *   SUPERPROJECT workspace and is never published to a registry. There is no
@@ -18,7 +18,7 @@
  *   - `config_ref` → secret value: the secret-set maps `seller_id → config_ref`
  *     and `config_ref → secret material`. Resolution for a request is
  *     `sellerId → config_ref → Buffer`.
- *   - failure taxonomy (ADR-156 §6a, ADR-181): a broken/absent age key or a
+ *   - failure taxonomy (ADR-156 §6a, ADR-182): a broken/absent age key or a
  *     failed decrypt is a STORE-level fault (operator problem → HTTP 503 on
  *     `/vendor/*`, rest of the API stays alive); a healthy store that simply has
  *     no entry for this seller is an AUTHENTICATION outcome (HTTP 401).
@@ -234,10 +234,32 @@ export class VendorSecretCryptoCore {
 type CoreState =
   | { kind: "unloaded" }
   | { kind: "ready"; core: VendorSecretCryptoCore }
-  | { kind: "faulted"; fault: CryptoCoreFault }
+  | { kind: "faulted"; fault: CryptoCoreFault; retryAt: number | null }
+
+/**
+ * Fault reasons whose cause CANNOT change without an operator edit + redeploy:
+ * caching them forever is correct (no shell-out storm on a misconfigured env).
+ * Everything else — `sops` briefly missing from PATH during a rolling deploy, a
+ * secret-set volume not yet mounted when the first request lands — is TRANSIENT
+ * and MUST NOT escalate to a permanent `503` on all of `/vendor/*` until the
+ * process is restarted (review-fix M-4).
+ */
+const DETERMINISTIC_FAULTS: ReadonlySet<CryptoCoreFaultReason> = new Set<CryptoCoreFaultReason>([
+  "secret-set-path-unset",
+  "secret-set-malformed",
+])
+
+/** Backoff before a transient fault is re-attempted. */
+export const CRYPTO_CORE_FAULT_RETRY_MS = 5_000
 
 let _state: CoreState = { kind: "unloaded" }
 let _defaults: { secretSetPath?: string; decryptor?: SecretSetDecryptor } = {}
+let _clock: () => number = () => Date.now()
+
+/** Visible for testing: makes the transient-fault backoff measurable. */
+export function setVendorSecretCryptoCoreClockForTests(clock: (() => number) | null): void {
+  _clock = clock ?? (() => Date.now())
+}
 
 /**
  * Sets the boot options used when the core is booted without explicit options
@@ -253,21 +275,41 @@ export function configureVendorSecretCryptoCore(opts: {
 }
 
 /**
- * Returns the booted crypto-core, or a store-level fault. The fault is CACHED:
- * a broken store does not cause a decrypt attempt on every request. Call
- * {@link resetVendorSecretCryptoCore} after fixing custody (or in tests).
+ * Returns the booted crypto-core, or a store-level fault.
+ *
+ * Fault caching is DELIBERATELY asymmetric (review-fix M-4):
+ *   - a DETERMINISTIC fault (`secret-set-path-unset`, `secret-set-malformed`)
+ *     is cached until {@link resetVendorSecretCryptoCore} — retrying a
+ *     misconfigured env on every request buys nothing;
+ *   - a TRANSIENT fault (`decryptor-unavailable`, `decrypt-failed`) is cached
+ *     only for {@link CRYPTO_CORE_FAULT_RETRY_MS}, after which the next call
+ *     re-attempts the decrypt. Without this, one blip (sops missing from PATH
+ *     mid-deploy, volume not yet mounted) turned a momentary outage into a
+ *     permanent `503` on all of `/vendor/*` until the process restarted.
+ *
+ * The retry is bounded by the backoff, so this is still not a shell-out per
+ * request.
  */
 export function getVendorSecretCryptoCore(opts?: {
   secretSetPath?: string
   decryptor?: SecretSetDecryptor
 }): { ok: true; core: VendorSecretCryptoCore } | { ok: false; fault: CryptoCoreFault } {
-  if (_state.kind === "unloaded") {
+  const now = _clock()
+  const retryDue =
+    _state.kind === "faulted" && _state.retryAt !== null && now >= _state.retryAt
+
+  if (_state.kind === "unloaded" || retryDue) {
     try {
       _state = { kind: "ready", core: VendorSecretCryptoCore.load(opts ?? _defaults) }
     } catch (err) {
+      const fault =
+        err instanceof CryptoCoreFault ? err : new CryptoCoreFault("decrypt-failed")
       _state = {
         kind: "faulted",
-        fault: err instanceof CryptoCoreFault ? err : new CryptoCoreFault("decrypt-failed"),
+        fault,
+        retryAt: DETERMINISTIC_FAULTS.has(fault.reason)
+          ? null
+          : now + CRYPTO_CORE_FAULT_RETRY_MS,
       }
     }
   }
@@ -289,4 +331,5 @@ export function vendorSecretCryptoCoreHealth(opts?: {
 export function resetVendorSecretCryptoCore(): void {
   _state = { kind: "unloaded" }
   _defaults = {}
+  _clock = () => Date.now()
 }

@@ -49,7 +49,7 @@ export type VendorAuthErrorCode =
   | typeof VENDOR_AUTH_SIGNATURE_INVALID
   | typeof VENDOR_AUTH_TIMESTAMP_EXPIRED
   | typeof VENDOR_AUTH_REPLAY_DETECTED
-  // v1.15.0 Story 5.2 (AD-20 / ADR-181): the crypto-core is healthy but the
+  // v1.15.0 Story 5.2 (AD-20 / ADR-182): the crypto-core is healthy but the
   // seller named in the header has no per-vendor secret. Server-side (log)
   // discriminator only — the HTTP body stays indistinguishable from a plain
   // signature mismatch (AC5 non-disclosure), see vendor-auth.ts.
@@ -185,7 +185,7 @@ export function verifyVendorSignature(
     return { ok: false, code: VENDOR_AUTH_TIMESTAMP_EXPIRED }
   }
 
-  // --- Per-seller secret resolution (v1.15.0 Story 5.2, AD-20/ADR-181) ---
+  // --- Per-seller secret resolution (v1.15.0 Story 5.2, AD-20/ADR-182) ---
   // AFTER the timestamp check, BEFORE the HMAC. A `null` resolution is NEVER a
   // reason to reach for a shared secret; there is no such branch here.
   let secret: Buffer
