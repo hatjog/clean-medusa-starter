@@ -171,6 +171,33 @@ runOrSkip("Story 3.6 — endpoint mostkowy niesie KOLEKCJĘ zamówień (realny P
     expect(first.orders[0].order_id).toBe(ORDER_A)
   })
 
+  /**
+   * review-fix (LOW): zgodność wsteczna skalara jest SEMANTYCZNA, nie kształtowa.
+   *
+   * Przed Story 3.6 zapytanie kończyło się `.orderBy("o.created_at","desc").first()`
+   * — `order_id` był NAJNOWSZYM zamówieniem koszyka. Posortowanie kolekcji rosnąco
+   * i wzięcie `orders[0]` przerzuciło skalar na NAJSTARSZE zamówienie: dla N=1 bez
+   * różnicy, dla N≥2 storefront sprzed v1.15.0 (jedyny konsument tego pola) dostaje
+   * INNE zamówienie niż dotąd.
+   *
+   * Ten test PĘKA po powrocie do `orders[0]`.
+   */
+  it("skalar zgodności wstecznej zachowuje znaczenie sprzed 3.6: NAJNOWSZE zamówienie", async () => {
+    const body = (await callRoute(db, CART_TWO_SELLERS)).body as {
+      orders: Array<{ order_id: string }>
+      order_id: string
+      order_group_id: string | null
+    }
+
+    // Kolekcja pozostaje rosnąca (stabilny, odtwarzalny odczyt)…
+    expect(body.orders.map((e) => e.order_id)).toEqual([ORDER_A, ORDER_B])
+    // …a skalar wskazuje na NAJNOWSZE, czyli ORDER_B (created_at 10:00:02),
+    // dokładnie tak jak `.orderBy("desc").first()` przed tą story.
+    expect(body.order_id).toBe(ORDER_B)
+    expect(body.order_id).not.toBe(body.orders[0].order_id)
+    expect(body.order_group_id).toBe(GROUP_ID)
+  })
+
   it("N=1: koszyk jednosprzedawcowy nadal działa i zwraca kolekcję jednoelementową", async () => {
     const captured = await callRoute(db, CART_ONE_SELLER)
 

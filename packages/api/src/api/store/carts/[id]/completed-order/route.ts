@@ -24,6 +24,11 @@
  * are separate submodules and can be deployed out of step). Per AD-16 this is a
  * legitimate reduction only because the surface it sits on (`orders`) shows the
  * WHOLE set — it is a drill-down, not a truncation, and it is named as such.
+ *
+ * The scalar also keeps its PRE-3.6 SEMANTICS (newest order of the cart), not
+ * just its shape — see the comment at the response site. Backward compatibility
+ * that preserves the field name while changing which row it points at is not
+ * backward compatibility.
  */
 
 import type { MedusaRequest, MedusaResponse } from "@medusajs/framework/http"
@@ -78,12 +83,25 @@ export async function GET(
     return
   }
 
+  // Backward-compat drill-down (see file header). NOT a reduction of the
+  // contract: `orders` above carries the whole set.
+  //
+  // v1.15.0 Story 3.6 review-fix (LOW): the scalar keeps its PRE-3.6 MEANING.
+  // Before this story the handler ended with `.orderBy("o.created_at","desc").first()`,
+  // so `order_id` was the NEWEST order of the cart. Sorting the collection
+  // ascending (for a stable, reproducible `orders`) and then taking `orders[0]`
+  // silently flipped the scalar to the OLDEST order — a semantic change for
+  // every pre-v1.15.0 storefront build, which is precisely the consumer this
+  // scalar exists for. The two repos are separate submodules and deploy out of
+  // step, so that consumer is real, not hypothetical.
+  //
+  // Collection order stays ascending; the scalar is taken from the END.
+  const backwardCompatNewest = orders[orders.length - 1]
+
   res.json({
     orders,
     order_count: orders.length,
-    // Backward-compat drill-down (see file header). NOT a reduction of the
-    // contract: `orders` above carries the whole set.
-    order_id: orders[0].order_id,
-    order_group_id: orders[0].order_group_id,
+    order_id: backwardCompatNewest.order_id,
+    order_group_id: backwardCompatNewest.order_group_id,
   })
 }
