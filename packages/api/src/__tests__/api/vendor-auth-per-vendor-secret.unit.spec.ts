@@ -1,7 +1,7 @@
 /**
  * v1.15.0 Story 5.2 — per-vendor HMAC secret resolution ON THE REQUEST ROUTE.
  *
- * Every case here runs through `withVendorAuth`, NOT through a direct call to
+ * Every case here runs through the REAL `/vendor/*` gate, NOT through a direct call to
  * `verifyVendorSignature`: a proof from a pure function is not a proof about the
  * route (NFR-1). AC1/AC2/AC3/AC5.
  *
@@ -15,7 +15,7 @@
 import { describe, it, expect, jest, beforeEach, afterEach } from "@jest/globals"
 
 import { buildVendorSignatureHeader } from "../../lib/vendor-hmac"
-import { withVendorAuth } from "../../lib/vendor-auth"
+import { withVendorGate } from "../helpers/vendor-auth-chain"
 import { createReplayGuardTestDb } from "../helpers/replay-guard-test-db"
 import {
   configureVendorSecretCryptoCore,
@@ -111,7 +111,7 @@ async function callRoute(header: string | undefined) {
     res.status(200).json({ ok: true })
   })
 
-  const wrapped = withVendorAuth(handler as any)
+  const wrapped = withVendorGate(handler as any)
   await wrapped(
     buildMockReq(header === undefined ? {} : { "x-vendor-signature": header }, logged),
     res,
@@ -121,7 +121,7 @@ async function callRoute(header: string | undefined) {
   return { status: captured.status, body: captured.body, logged, seen, handler }
 }
 
-describe("Story 5.2 — per-vendor secret resolution through withVendorAuth", () => {
+describe("Story 5.2 — per-vendor secret resolution through the /vendor/* gate", () => {
   const envBackup = { ...process.env }
 
   beforeEach(() => {
@@ -241,6 +241,31 @@ describe("Story 5.2 — per-vendor secret resolution through withVendorAuth", ()
     const five = await callRoute(`${SELLER_A}:${nowSec()}:nonce:sig:extra`)
     expect(five.status).toBe(401)
     expect(five.body.code).toBe("VENDOR_AUTH_SIGNATURE_INVALID")
+  })
+
+  it("review-fix L-3: an unsigned request gets 401 (not 503) even when the secret store is broken", async () => {
+    // The state of the secret store must not be readable by an unauthenticated
+    // caller: no signature header ⇒ VENDOR_AUTH_SIGNATURE_MISSING, decided
+    // BEFORE the crypto-core health check.
+    resetVendorSecretCryptoCore()
+    configureVendorSecretCryptoCore({
+      secretSetPath: "/test/vendor-secret-set.enc.json",
+      decryptor: () => {
+        throw new CryptoCoreFault("decrypt-failed")
+      },
+    })
+
+    const r = await callRoute(undefined)
+
+    expect(r.status).toBe(401)
+    expect(r.body.code).toBe("VENDOR_AUTH_SIGNATURE_MISSING")
+    expect(JSON.stringify(r.body)).not.toContain(VENDOR_AUTH_SECRET_STORE_UNAVAILABLE)
+
+    // ...and a SIGNED request in the same state still gets the distinguishable
+    // 503 (AC3 is untouched by the reordering).
+    const signed = await callRoute(buildVendorSignatureHeader(SELLER_A, SECRET_A, nowSec()))
+    expect(signed.status).toBe(503)
+    expect(signed.body.code).toBe(VENDOR_AUTH_SECRET_STORE_UNAVAILABLE)
   })
 
   it("AC2 step order: an expired timestamp is rejected BEFORE secret resolution, for a seller that has no secret", async () => {

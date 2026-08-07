@@ -12,13 +12,33 @@
  *   3. Backend boots → this loader fires → fixtures seeded automatically.
  *   To invalidate: psql -c "TRUNCATE voucher CASCADE" then restart backend
  *   (loader will re-seed with fresh rows).
+ *
+ * v1.15.0 Story 2.6 (FR-14e, AC2) — fixture'y DEKLARUJĄ RYNEK PER WIERSZ.
+ * Do v1.14.0 obie fixture'y miały `market_id: null` („global voucher, E2E only",
+ * migracja 1778112000000). Po włączeniu `FORCE ROW LEVEL SECURITY` na tabelach
+ * modułu polityka `market_isolation` obejmuje TAKŻE właściciela tabel, czyli rolę
+ * z `DATABASE_URL`, którą działa ten loader: `INSERT` z `market_id = NULL` jest
+ * odrzucany przez `WITH CHECK`, a odczyty widziałyby zero wierszy. AC2 nie dawało
+ * tu wyboru między naprawą fixture'ów a furtką `OR market_id IS NULL` w polityce:
+ * furtka jest ZAKAZANA, więc naprawa idzie w fixture'ach.
+ *
+ * Loader ustawia `app.gp_market_id` NA SWOIM połączeniu (własna pula jest tu
+ * wpisem allowlisty `_grow/db-connection-pool-allowlist.yaml`, nie wyjątkiem od
+ * reguły) — inaczej sam by się nie przepuścił przez własną politykę. Rynek jest
+ * JAWNY: `GP_VOUCHER_SEED_MARKET_ID` albo domyślnie `bonbeauty` (rynek, do którego
+ * należą obaj fixture'owi sprzedawcy). Brak rynku = odmowa, nie `NULL`.
  */
 
 import { Pool } from "pg"
 
+/** Domyślny rynek fixture'ów — jawny, nie `NULL` (Story 2.6 AC2). */
+const DEFAULT_FIXTURE_MARKET_ID = "bonbeauty"
+
+/** Ten sam kształt identyfikatora, który przyjmuje hook RLS. */
+const SAFE_MARKET_ID_RE = /^[a-zA-Z0-9_-]+$/
+
 interface FixtureSeed {
   code: string
-  market_id: string | null
   seller_id: string
   seller_name: string
   seller_handle: string
@@ -33,7 +53,6 @@ interface FixtureSeed {
 const E2E_FIXTURES: FixtureSeed[] = [
   {
     code: "E2E-IDLE-VOUCHER-001",
-    market_id: null,
     seller_id: "sel_01CITYBEAUTY00000000000",
     seller_name: "City Beauty",
     seller_handle: "city-beauty",
@@ -49,7 +68,6 @@ const E2E_FIXTURES: FixtureSeed[] = [
   },
   {
     code: "E2E-CLAIMED-VOUCHER-002",
-    market_id: null,
     seller_id: "sel_01KREMIDOTYK0000000000",
     seller_name: "Kremidotyk",
     seller_handle: "kremidotyk",
@@ -102,16 +120,37 @@ export default async function voucherSeedFixturesLoader(
     return
   }
 
+  // Story 2.6 AC2 — rynek fixture'ów jest JAWNY i walidowany kształtem, który
+  // przyjmuje hook RLS. Wartość spoza tego kształtu zostałaby po cichu odrzucona
+  // przez `set_config` + politykę, czyli wyglądałaby jak „seed nic nie zrobił".
+  const marketId = process.env.GP_VOUCHER_SEED_MARKET_ID?.trim() || DEFAULT_FIXTURE_MARKET_ID
+  if (!SAFE_MARKET_ID_RE.test(marketId)) {
+    const msg =
+      `[voucher/seed-fixtures] GP_VOUCHER_SEED_MARKET_ID='${marketId}' nie ma ` +
+      "kształtu przyjmowanego przez politykę RLS — seed odmawia zamiast wstawiać " +
+      "wiersze, których nikt potem nie zobaczy"
+    if (strict) throw new Error(msg)
+    console.warn(msg)
+    return
+  }
+
   const pool = new Pool({ connectionString: databaseUrl })
+  const client = await pool.connect()
   try {
+    // Bez tego loader nie przepuści SAM SIEBIE przez politykę `market_isolation`:
+    // pod FORCE RLS właściciel tabel też jej podlega (Story 2.6, migracja
+    // 1779000000000). Kontekst jest ustawiany na TYM połączeniu, na którym idą
+    // INSERT-y — nie na puli, bo pula wydaje wiele połączeń.
+    await client.query("SELECT set_config('app.gp_market_id', $1, false)", [marketId])
+
     for (const fx of E2E_FIXTURES) {
-      await pool.query(
+      await client.query(
         `INSERT INTO voucher (code, market_id, seller_id, seller_name, seller_handle, product_title, value_minor, currency_code, status, expires_at, created_at, updated_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW(), NOW())
          ON CONFLICT (code) DO NOTHING`,
         [
           fx.code,
-          fx.market_id,
+          marketId,
           fx.seller_id,
           fx.seller_name,
           fx.seller_handle,
@@ -123,7 +162,7 @@ export default async function voucherSeedFixturesLoader(
         ]
       )
       for (const evt of fx.events) {
-        await pool.query(
+        await client.query(
           `INSERT INTO voucher_event (id, voucher_code, event_type, occurred_at, created_at)
            VALUES ($1, $2, $3, $4, NOW())
            ON CONFLICT (id) DO NOTHING`,
@@ -131,14 +170,16 @@ export default async function voucherSeedFixturesLoader(
         )
       }
     }
-    console.log("[voucher/seed-fixtures] E2E fixtures seeded (idempotent)")
+    console.log(
+      `[voucher/seed-fixtures] E2E fixtures seeded (idempotent, market_id=${marketId})`
+    )
   } catch (err) {
     console.error("[voucher/seed-fixtures] Seed error:", err)
-    if (strict) {
-      await pool.end().catch(() => {})
-      throw err
-    }
+    // Sprzątanie jest WYŁĄCZNIE w `finally` — `client.release()` wołany dwa razy
+    // jest błędem `pg` ("Release called on client which has already been released").
+    if (strict) throw err
   } finally {
+    client.release()
     await pool.end().catch(() => {})
   }
 }

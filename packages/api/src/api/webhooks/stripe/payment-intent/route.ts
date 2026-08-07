@@ -36,7 +36,16 @@
  *   400 `invalid_contract`   — koperta niezgodna z kontraktem      → KOD
  *   500 `db_unavailable`     — brak dostępu do bazy                → INFRA (retry)
  *   500 `emit_failed`        — event bus odmówił                   → INFRA (retry)
+ *   500 `compensation_failed`— emisja padła I jej cofnięcie padło  → ODZYSK (retry)
  *   200 `duplicate`          — dostawa już przyjęta                → OK, no-op
+ *
+ * ── `compensation_failed` (Story 3.5, FR-6c/NFR-3/AD-22) ───────────────────
+ * Klasa dopisana w v1.15.0 i ROZŁĄCZNA z `emit_failed`. `emit_failed` znaczy
+ * „emisja padła, ale rezerwację cofnięto — Stripe ponowi i będzie dobrze".
+ * `compensation_failed` znaczy „padła też KOMPENSACJA": rezerwacja żyje bez
+ * emisji, więc ponowna dostawa zostanie zdeduplikowana. To jedyny stan, którego
+ * nikt nie zaplanował, i od v1.15.0 ma TRWAŁY wiersz w
+ * `money_path_compensation_failure` oraz alarm — nie linię w logu.
  */
 import type { MedusaRequest, MedusaResponse } from "@medusajs/framework/http"
 import { Modules } from "@medusajs/framework/utils"
@@ -58,8 +67,16 @@ import {
   releaseWebhookDelivery,
   reserveWebhookDelivery,
   resolveWebhookPgHandle,
+  STRIPE_PATH_Y_WEBHOOK_PROVIDER,
   type WebhookPgHandle,
 } from "../../../../lib/payment/stripe-payment-intent-transport"
+import {
+  buildPurchaseCorrelationKey,
+  findOpenCompensationFailures,
+  reportCompensationFailure,
+  type CompensationFailureRecord,
+  type RecordedCompensationFailure,
+} from "../../../../lib/payment/money-path-compensation-registry"
 import {
   STRIPE_SIGNATURE_HEADER,
   STRIPE_WEBHOOK_SECRET_ENV,
@@ -85,11 +102,29 @@ type RawBodyRequest = MedusaRequest & {
   headers: Record<string, string | string[] | undefined>
 }
 
-function resolveLogger(req: MedusaRequest): LoggerLike {
+/**
+ * Logger z GWARANTOWANYMI `warn`/`error`/`info` (ADR-190).
+ *
+ * Wstrzyknięty logger bywa zawężonym obiektem (testy, część ścieżek Medusy), a
+ * wszystkie sygnały tej trasy idą przez `logger.warn?.()` — optional call, który
+ * przy braku metody po cichu ewaluuje się do `undefined`. Dla alarmu rozjazdu
+ * metadata↔rezolucja (krok 2b) znaczyłoby to, że JEDYNY sygnał znika bez śladu,
+ * a AC1 żąda wprost, żeby rozjazd „nie był cichy". Świadomy sygnał alarmowy nie
+ * może być opcjonalny, więc brakujące metody dostają jawny fallback na `console`
+ * — kontrakt jest tu, a nie w każdym call-sitcie z osobna.
+ */
+function resolveLogger(req: MedusaRequest): Required<LoggerLike> {
+  let resolved: LoggerLike | undefined
   try {
-    return (req.scope.resolve("logger") as LoggerLike) ?? console
+    resolved = req.scope.resolve("logger") as LoggerLike | undefined
   } catch {
-    return console
+    resolved = undefined
+  }
+  const base = resolved ?? console
+  return {
+    info: base.info?.bind(base) ?? console.info.bind(console),
+    warn: base.warn?.bind(base) ?? console.warn.bind(console),
+    error: base.error?.bind(base) ?? console.error.bind(console),
   }
 }
 
@@ -233,6 +268,28 @@ export async function POST(
       return
     }
 
+    // ── krok 2b: rozjazd metadata ↔ rezolucja NIE jest cichy (ADR-190) ───────
+    // `metadata` są mutowalne z zewnątrz przez Stripe API, a od 3.3 przegrywają
+    // z wynikiem rezolucji przy budowie koperty. Gdy wskazują zamówienie SPOZA
+    // zbioru rozwiązanego z linku, to sygnał (obcy/nieaktualny stempel), nie szum
+    // — logujemy go zamiast po cichu odrzucić.
+    const resolvedOrderIds = resolution.orders.map((order) => order.order_id)
+    if (
+      identifiers.order_id &&
+      !resolvedOrderIds.includes(identifiers.order_id)
+    ) {
+      // NIE `warn?.()` — to jest alarm, nie log pomocniczy. `resolveLogger`
+      // gwarantuje `warn`, więc wywołanie jest bezwarunkowe i jego usunięcie
+      // widać w diffie zamiast cicho ewaluować się do `undefined`.
+      logger.warn(
+        `[stripe/payment-intent] metadata_order_mismatch: ` +
+          `payment_intent_id=${paymentIntentId}; ` +
+          `metadata.order_id=${identifiers.order_id}; ` +
+          `resolved_order_ids=[${resolvedOrderIds.join(",")}] ` +
+          `(pierwszeństwo ma rezolucja linku — ADR-190)`
+      )
+    }
+
     // ── krok 3: N kopert po jednej na zamówienie (ADR-166, NFR4) ──────────────
     let envelopes
     try {
@@ -281,7 +338,90 @@ export async function POST(
     }
 
     if (!reserved) {
-      // Ta sama dostawa już przyjęta (np. `stripe events resend`). ACK bez emisji.
+      // ── Story 3.5 review-fix (AC2/AC3) ────────────────────────────────────
+      // `duplicate` NIE jest bezwarunkowo ciszą do zaACK-owania. Rezerwacja
+      // ŻYJE także wtedy, gdy jej zwolnienie (kompensacja) padło — i wtedy
+      // dokładnie TA gałąź łapie ponowienia Stripe'a. Odpowiedź `200
+      // { received: true }` kasowałaby tu ostatnią szansę na odzysk, a
+      // `attempt_count` w rejestrze na zawsze zostawałby na 1, choć Stripe
+      // pukał wielokrotnie.
+      //
+      // Rozstrzyga REJESTR, nie domysł: jeśli dla tej dostawy jest wiersz
+      // `resolution_state = 'open'`, ponowienie jest kolejną próbą TEJ SAMEJ
+      // nieudanej kompensacji.
+      let openFailures: RecordedCompensationFailure[]
+      try {
+        openFailures = await findOpenCompensationFailures(handle.client, {
+          delivery_path: STRIPE_PATH_Y_WEBHOOK_PROVIDER,
+          stripe_event_id: deliveryEventId,
+        })
+      } catch (err) {
+        // Nie wiemy, czy dostawa jest czysta, czy niesie otwartą porażkę.
+        // ACK przy nieznanym stanie byłby decyzją nieodwracalną podjętą
+        // w imieniu klientki — zachowujemy ponowienie.
+        logger.error?.(
+          `[stripe/payment-intent] odczyt rejestru kompensacji dla ` +
+            `${deliveryEventId} nieudany: ${(err as Error).message}`
+        )
+        res.status(500).json({
+          type: "db_unavailable",
+          reason: "compensation_registry_lookup_failed",
+        })
+        return
+      }
+
+      if (openFailures.length > 0) {
+        // Ponowienie tej samej nieudanej kompensacji: DOPISUJEMY próbę
+        // (`ON CONFLICT … attempt_count + 1`) i znów zachowujemy ponowienie.
+        // Wiersz zamyka operator (`resolution_state`), nie milczący ACK.
+        const records: CompensationFailureRecord[] = resolution.orders.map(
+          (order) => ({
+            market_id: order.market_id,
+            compensation_kind: "webhook_delivery_release",
+            delivery_path: STRIPE_PATH_Y_WEBHOOK_PROVIDER,
+            stripe_event_id: deliveryEventId,
+            payment_intent_id: paymentIntentId,
+            order_id: order.order_id,
+            purchase_correlation_key: buildPurchaseCorrelationKey(paymentIntentId),
+            // TEN SAM `failure_code` co przy pierwszej porażce — inaczej
+            // `failure_id` byłby inny i powstałby DRUGI wiersz zamiast próby.
+            failure_code: "delivery_release_failed",
+            failure_detail:
+              `ponowna dostawa ${deliveryEventId} przy nierozstrzygnietej ` +
+              "kompensacji rezerwacji (rezerwacja nadal zyje, emisji nie bylo)",
+          })
+        )
+        const reported = await reportCompensationFailure(
+          req.scope,
+          handle.client,
+          records
+        )
+
+        logger.error?.(
+          `[stripe/payment-intent] ponowna dostawa ${deliveryEventId} trafia ` +
+            `w NIEROZSTRZYGNIETA nieudana kompensacje ` +
+            `(${openFailures.map((row) => row.failure_id).join(",")}) — ` +
+            "ACK wstrzymany, ponowienie zachowane"
+        )
+
+        res.status(500).json({
+          type: "compensation_failed",
+          reason: "delivery_release_unresolved",
+          registry_persisted: reported.persisted,
+          registry_failure_ids: openFailures.map((row) => row.failure_id),
+          ...(reported.persisted
+            ? {
+                registry_attempt_counts: reported.rows.map(
+                  (row) => row.attempt_count
+                ),
+              }
+            : { registry_error: reported.registry_error }),
+        })
+        return
+      }
+
+      // Ta sama dostawa już przyjęta (np. `stripe events resend`) i rejestr
+      // NIE zna dla niej otwartej porażki. ACK bez emisji.
       // Druga warstwa (`event_processed` po payment_intent_id + order_id) i tak
       // nie dopuści drugiego kompletu voucherów, ale zatrzymanie tutaj oszczędza
       // cały przebieg.
@@ -310,11 +450,78 @@ export async function POST(
       try {
         await releaseWebhookDelivery(handle.client, deliveryEventId)
       } catch (releaseErr) {
+        // ── Story 3.5 (FR-6c, NFR-3, AD-22) ────────────────────────────────
+        // Do v1.15.0 CAŁA obsługa tej gałęzi to była jedna linia `logger.error`
+        // z treścią „wymaga ręcznego usunięcia wiersza". System WIEDZIAŁ, że
+        // został w stanie niespójnym (rezerwacja żyje, emisji nie było, Stripe
+        // uzna zdarzenie za przyjęte i NIGDY go nie ponowi) i nie mówił tego
+        // NIKOMU poza logiem kontenera. Log ZOSTAJE — przestaje być JEDYNYM
+        // nośnikiem.
+        //
+        // Wiersz per zamówienie (skalarnie, ADR-166): rynek każdego wiersza
+        // pochodzi z JEGO zamówienia, nie z `resolution.orders[0].market_id`.
+        const releaseError = releaseErr as Error
+        const records: CompensationFailureRecord[] = resolution.orders.map(
+          (order) => ({
+            market_id: order.market_id,
+            compensation_kind: "webhook_delivery_release",
+            delivery_path: STRIPE_PATH_Y_WEBHOOK_PROVIDER,
+            stripe_event_id: deliveryEventId,
+            payment_intent_id: paymentIntentId,
+            order_id: order.order_id,
+            purchase_correlation_key: buildPurchaseCorrelationKey(paymentIntentId),
+            failure_code: "delivery_release_failed",
+            failure_detail: releaseError.message,
+          })
+        )
+
+        // Ogniwa 1–3 łańcucha degradacji: wpis (świeże połączenie, nie ten
+        // właśnie padnięty uchwyt) → alarm strukturalny → linia out-of-band.
+        const reported = await reportCompensationFailure(
+          req.scope,
+          handle.client,
+          records
+        )
+
         logger.error?.(
           `[stripe/payment-intent] KOMPENSACJA rezerwacji ${deliveryEventId} ` +
-            `nieudana: ${(releaseErr as Error).message} — ponowna dostawa zostanie ` +
-            "zdeduplikowana mimo braku emisji; wymaga ręcznego usunięcia wiersza"
+            `nieudana: ${releaseError.message} — ponowna dostawa zostanie ` +
+            "zdeduplikowana mimo braku emisji; wymaga ręcznego usunięcia wiersza" +
+            (reported.persisted
+              ? ` — rejestr: ${reported.rows.map((row) => row.failure_id).join(",")}`
+              : reported.partial
+                ? ` — ZAPIS DO REJESTRU CZĘŚCIOWY (${reported.rows.length}/` +
+                  `${records.length}): ${reported.rows
+                    .map((row) => row.failure_id)
+                    .join(",")}; blad: ${reported.registry_error}`
+                : ` — ZAPIS DO REJESTRU RÓWNIEŻ PADŁ: ${reported.registry_error}`)
         )
+
+        // Ogniwo 4: kod odpowiedzi ZACHOWUJĄCY ponowienie po stronie Stripe'a.
+        // `200 { received: true }` jest w tej gałęzi ZAKAZANY (AC3): dopóki
+        // Stripe ponawia, sytuacja jest odwracalna; potwierdzenie odbioru przy
+        // nieodwróconym skutku jest decyzją nieodwracalną podjętą w imieniu
+        // klientki. Klasa jest ROZŁĄCZNA z `emit_failed`, bo operator ma
+        // odczytać, że padła nie tylko emisja, ale i jej cofnięcie.
+        res.status(500).json({
+          type: "compensation_failed",
+          reason: reported.persisted
+            ? "delivery_release_failed"
+            : reported.partial
+              ? "delivery_release_failed_registry_partial"
+              : "delivery_release_failed_registry_unavailable",
+          emit_error: error.message,
+          release_error: releaseError.message,
+          registry_persisted: reported.persisted,
+          // Adresy wierszy, które SĄ w bazie, jadą ZAWSZE — także przy zapisie
+          // częściowym. Milczenie o nich kazałoby operatorowi szukać śladu tam,
+          // gdzie mu powiedziano, że go nie ma.
+          ...(reported.rows.length > 0
+            ? { registry_failure_ids: reported.rows.map((row) => row.failure_id) }
+            : {}),
+          ...(reported.persisted ? {} : { registry_error: reported.registry_error }),
+        })
+        return
       }
       logger.error?.(`[stripe/payment-intent] emit failed: ${error.message}`)
       res.status(500).json({ type: "emit_failed", reason: error.message })

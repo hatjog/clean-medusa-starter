@@ -20,6 +20,7 @@ import {
 } from "./middlewares/brevo-hmac-validator";
 import { paymentStatusRateLimitMiddleware } from "./middlewares/payment-status-rate-limit";
 import { upstreamOrderAccessGuardMiddleware } from "./middlewares/upstream-order-access-guard";
+import { cartCompletionAuthorizationGuardMiddleware } from "./middlewares/cart-completion-authorization-guard";
 import {
   CUSTOMER_MARKET_FORBIDDEN_MESSAGE,
   isScopedToMarket,
@@ -28,8 +29,18 @@ import {
   sanitizeCustomerEmailInObject,
   scopeCustomerEmail,
 } from "../lib/customer-scoped-email";
-import { marketContextStorage } from "../lib/market-context";
-import { recordRequest } from "../lib/request-log-aggregator";
+import {
+  marketContextStorage,
+  type MarketContext,
+} from "../lib/market-context";
+import {
+  VENDOR_HMAC_MATCHER,
+  vendorHmacGateMiddleware,
+} from "../lib/vendor-auth-matcher";
+import {
+  MARKET_SCOPE_DENIED_COHORT,
+  recordRequest,
+} from "../lib/request-log-aggregator";
 import { installRlsPoolHook, type HookLogger } from "../lib/rls-pool-hook";
 import { marketContextCache } from "../loaders/market-context-cache";
 import { listProductIdsForSalesChannel } from "../lib/product-market-scope";
@@ -640,6 +651,168 @@ function productMarketId(product: Record<string, unknown>): string | null {
   return typeof value === "string" && value.trim() ? value : null;
 }
 
+/**
+ * Story 2.3 (FR-14a, NFR-2, AD-19) — kontrakt odmowy scopingu katalogu.
+ *
+ * Rozstrzygnięcie kodu odmowy (AC2), świadomie ROZDZIELAJĄCE dwa przypadki
+ * zamiast je unifikować (RFC 7235):
+ *
+ *   - `401 { message: "Market context required" }` (`failWithMarketContext`)
+ *     ZOSTAJE dla brakującego / nieważnego klucza publishable — wołający nie
+ *     jest uwierzytelniony. Kontrakt Story 4.4 AC3 / F7 pozostaje nienaruszony.
+ *   - `403` ZAPADA TUTAJ: kontekst rynku JEST (klucz przeszedł), ale jest
+ *     niepełny / nierozstrzygalny, więc scoping po rynku nie może zostać
+ *     zastosowany. Wołający jest uwierzytelniony, ale nieuprawniony do
+ *     odpowiedzi, której nie da się zawęzić.
+ *
+ * Komunikat jest CELOWO rozróżnialny od `"Market context required"`, żeby
+ * diagnostyka odróżniła „nie ma klucza” od „klucz jest, kontekst niepełny”.
+ */
+export const MARKET_SCOPE_UNRESOLVABLE_MESSAGE = "Market scope unresolvable";
+
+/**
+ * Kohorta metryki odmowy w `request-log-aggregator` (NFR-2).
+ *
+ * Nazwa jest re-eksportem, nie drugą definicją: właścicielem jest
+ * `request-log-aggregator`, bo to on musi ją znać, żeby wykluczyć te próbki
+ * z odczytu ruchu (`NON_TRAFFIC_COHORTS`, review-fix HIGH-1).
+ */
+export { MARKET_SCOPE_DENIED_COHORT };
+
+export type MarketScopeDenialReason =
+  | "context_missing"
+  | "market_id_missing"
+  | "sales_channel_id_missing";
+
+type CompleteMarketContext = { market_id: string; sales_channel_id: string };
+
+/**
+ * Powód, dla którego kontekst rynku nie nadaje się do scopingu — albo `null`,
+ * gdy kontekst jest pełny.
+ *
+ * To jest miejsce, w którym inwariant „kontekst rynku jest pełny albo go nie
+ * ma” przestaje być przypadkiem jednej implementacji rezolwera. Rezolwer HTTP
+ * (`resolveRequestMarketContext`) jest wszystko-albo-nic, ale `system-market-context.ts`
+ * ustawia `sales_channel_id` OPCJONALNIE (`:238`) — kontekst częściowy jest więc
+ * realnie produkowalny. Middleware traktuje go jako BRAK, a nie jako pozwolenie
+ * na pominięcie izolacji.
+ */
+function marketScopeDenialReason(
+  context: MarketContext | undefined
+): MarketScopeDenialReason | null {
+  if (!context?.market_id && !context?.sales_channel_id) {
+    return "context_missing";
+  }
+  if (!context.market_id) {
+    return "market_id_missing";
+  }
+  if (!context.sales_channel_id) {
+    return "sales_channel_id_missing";
+  }
+  return null;
+}
+
+/**
+ * Odmowa GŁOŚNA (NFR-2): log strukturalny z powodem w kategoriach domeny,
+ * metryka przez istniejący nośnik `recordRequest` i kod odpowiedzi.
+ *
+ * `gate` rozróżnia, KTÓRA z dwóch niezależnych bram odmówiła — bez tego
+ * naprawa jednej przy pozostawieniu drugiej jest nieodróżnialna w logach.
+ *
+ * `emit` MUSI być oryginalnym `res.json`, nigdy nadpisanym: brama wyjściowa
+ * żyje WEWNĄTRZ nadpisanego `res.json`, więc odmowa przez `res.json` wpadłaby
+ * w nieskończoną rekurencję (`RangeError: Maximum call stack size exceeded`)
+ * pożartą jako unhandled rejection — czyli w cichą awarię, przy której
+ * asercje na `res.statusCode` nadal świecą na zielono.
+ */
+function denyMarketScope(
+  req: MedusaRequest,
+  res: MedusaResponse,
+  reason: MarketScopeDenialReason,
+  gate: "request" | "response",
+  emit: (body: unknown) => unknown
+): void {
+  const context = marketContextStorage.getStore();
+
+  const payload = {
+    reason,
+    gate,
+    path: getRequestPath(req),
+    method: req.method,
+    market_id: context?.market_id ?? null,
+    sales_channel_id: context?.sales_channel_id ?? null,
+    system_origin: context?.system ?? null,
+  };
+  const message = `[gp] market-scope-denied (${gate})`;
+
+  // Story 2.3 review-fix LOW-9: `resolveLogger(...)?.warn?.()` sprowadzało
+  // „głośną odmowę” do CISZY, gdy `LOGGER` nie rozwiązał się z kontenera albo
+  // nie miał `warn` — a wtedy jedynym obserwowalnym kanałem zostawał kod HTTP.
+  // Kanał logu jest bezwarunkowy: rozwiązany logger albo `console.warn`.
+  const logger = resolveLogger(req.scope);
+  if (typeof logger?.warn === "function") {
+    logger.warn(message, payload);
+  } else {
+    console.warn(message, payload);
+  }
+
+  recordRequest({
+    ts: Date.now(),
+    duration_ms: 0,
+    status_code: 403,
+    cohort: MARKET_SCOPE_DENIED_COHORT,
+  });
+
+  res.status(403);
+  emit({
+    message: MARKET_SCOPE_UNRESOLVABLE_MESSAGE,
+    reason,
+  });
+}
+
+/**
+ * v1.15.0 Story 2.4 (FR-14b, NFR-5) — kontrakt statusu dla dostepu cross-market.
+ *
+ * ADR-109 (`specs/adr/2026-05-14-adr-109-market-guard-middleware-3-state.md:44`):
+ * "Jesli zasob ... jest requestowany przez user z innego marketu -> 403
+ * (nie 404, bo zasob istnieje — cross-market access deny)".
+ *
+ * SWIADOMA KOREKTA ROZJAZDU: galaz detalu zwracala tu wczesniej 404. Byla to
+ * galaz MARTWA (middleware nie byl zarejestrowany na `/store/products/:id`),
+ * wiec rozjazd z ADR-109 nie mial jak sie ujawnic. Ozywienie trasy go ujawnia
+ * i ta story go zamyka.
+ *
+ * NIE mylic ze scenariuszem "brak kontekstu rynku" — ten rozstrzyga
+ * `failWithMarketContext()` (401, mandat Story 4.4 AC3/F7) i story 2.3.
+ * Brak kontekstu != kontekst obcego rynku.
+ */
+export const CROSS_MARKET_PRODUCT_STATUS = 403;
+export const CROSS_MARKET_PRODUCT_MESSAGE = "Product not available in this market";
+
+/**
+ * Czy zadanie celuje w JEDEN konkretny produkt?
+ *
+ * "Trasa szczegolu produktu" to dzis DWIE sciezki sieciowe: `/store/products/:id`
+ * oraz `/store/products?handle=...` (storefrontowy PDP idzie przez liste).
+ * Parytet statusu z AC2 dotyczy wlasnie zadan celowanych — dla przegladania
+ * katalogu odfiltrowanie obcorynkowych pozycji pozostaje poprawne (200).
+ */
+function targetsSingleProduct(request: RequestExtensions): boolean {
+  const handle = request.filterableFields?.handle ?? request.query?.handle;
+  if (typeof handle === "string" && handle.trim()) {
+    return true;
+  }
+  if (Array.isArray(handle) && handle.length === 1) {
+    return true;
+  }
+
+  const id = request.filterableFields?.id ?? request.query?.id;
+  if (typeof id === "string" && id.trim()) {
+    return true;
+  }
+  return Array.isArray(id) && id.length === 1;
+}
+
 export async function productListMarketScopeMiddleware(
   req: MedusaRequest,
   res: MedusaResponse,
@@ -648,11 +821,34 @@ export async function productListMarketScopeMiddleware(
   const request = getRequestExtensions(req);
   const context = marketContextStorage.getStore();
 
-  if (context?.sales_channel_id) {
+  // BRAMA WEJŚCIOWA (FR-14a). Wcześniej: `if (context?.sales_channel_id) {…}` —
+  // brak kanału POMIJAŁ scoping i core Medusy paginował po pełnym zbiorze.
+  // Brak kontekstu jest odmową, nie zwolnieniem z izolacji.
+  const requestDenial = marketScopeDenialReason(context);
+  if (requestDenial) {
+    // Brama wejściowa biegnie PRZED nadpisaniem `res.json`, więc oryginał
+    // i bieżący `res.json` to ten sam obiekt — wiążemy go jawnie mimo to.
+    denyMarketScope(req, res, requestDenial, "request", res.json.bind(res));
+    return;
+  }
+
+  // Story 2.4: na trasie detalu (`/store/products/:id`) rdzen Medusy czyta
+  // `req.params.id`, a nie `filterableFields.id`. Wstrzykniecie tam pelnej listy
+  // ID kanalu nic nie zaweza, za to rozjezdza sie z kontraktem handlera detalu.
+  // Zawezanie wejsciowe zostaje wiec przy powierzchni listingowej; ochrona
+  // detalu dziala na odpowiedzi (ponizej), na juz policzonym produkcie.
+  //
+  // Story 2.3 (integracja): BRAMA WEJŚCIOWA wyżej biegnie BEZWARUNKOWO, także
+  // na trasie detalu — brak kontekstu rynku jest odmową 403 na obu
+  // powierzchniach. Pomijane jest wyłącznie zawężanie filtrów, nie odmowa.
+  const isDetailRoute = typeof request.params?.id === "string";
+
+  if (!isDetailRoute) {
+    const scopedContext = context as CompleteMarketContext;
     const db = req.scope.resolve(ContainerRegistrationKeys.PG_CONNECTION) as Knex;
     let scopedProductIds = await listProductIdsForSalesChannel(
       db,
-      context.sales_channel_id
+      scopedContext.sales_channel_id
     );
     const existingIdFilter = request.filterableFields?.id ?? request.query?.id;
     const requestedIds = Array.isArray(existingIdFilter)
@@ -678,13 +874,20 @@ export async function productListMarketScopeMiddleware(
   (res as unknown as { json: (body: unknown) => Promise<void> }).json =
     async (body: unknown): Promise<void> => {
       const context = marketContextStorage.getStore();
-      if (
-        !context?.market_id ||
-        !context.sales_channel_id ||
-        !body ||
-        typeof body !== "object" ||
-        Array.isArray(body)
-      ) {
+
+      // BRAMA WYJŚCIOWA (FR-14a) — niezależna od wejściowej. Wcześniej brak
+      // kontekstu wyłączał tu filtr po `gp.market_id` i ciało szło przez
+      // `originalJson` niezawężone. Short-circuity NIEZWIĄZANE z kontekstem
+      // (kształt ciała, brak `products`) zostają — one nie pomijają izolacji.
+      const responseDenial = marketScopeDenialReason(context);
+      if (responseDenial) {
+        denyMarketScope(req, res, responseDenial, "response", originalJson);
+        return;
+      }
+
+      const responseContext = context as CompleteMarketContext;
+
+      if (!body || typeof body !== "object" || Array.isArray(body)) {
         return originalJson(body);
       }
 
@@ -694,16 +897,17 @@ export async function productListMarketScopeMiddleware(
           typedBody.product &&
           typeof typedBody.product === "object" &&
           !Array.isArray(typedBody.product) &&
-          productMarketId(typedBody.product) !== context.market_id
+          productMarketId(typedBody.product) !== responseContext.market_id
         ) {
-          res.status(404);
-          return originalJson({ message: "Product not found" });
+          // ADR-109 :44 — zasob istnieje, ale nalezy do innego rynku => 403.
+          res.status(CROSS_MARKET_PRODUCT_STATUS);
+          return originalJson({ message: CROSS_MARKET_PRODUCT_MESSAGE });
         }
         return originalJson(body);
       }
 
       const hasCrossMarketProducts = typedBody.products.some(
-        (product) => productMarketId(product) !== context.market_id
+        (product) => productMarketId(product) !== responseContext.market_id
       );
       if (!hasCrossMarketProducts) {
         return originalJson(body);
@@ -726,10 +930,21 @@ export async function productListMarketScopeMiddleware(
       // requested) are kept — the publishable-key sales-channel scope still applies.
       const inMarketProducts = typedBody.products.filter((product) => {
         const productMarket = productMarketId(product);
-        return productMarket === null || productMarket === context.market_id;
+        return productMarket === null || productMarket === responseContext.market_id;
       });
 
       const removedCount = typedBody.products.length - inMarketProducts.length;
+
+      // Story 2.4 / AC2 — PARYTET POWIERZCHNI. `/store/products?handle=...` to
+      // druga siec­owa sciezka PDP. Gdy zadanie celowalo w jeden konkretny
+      // produkt i jedyne dopasowanie odpadlo jako obcorynkowe, odpowiedzia jest
+      // ten sam status co na `/store/products/:id` (ADR-109 :44), a nie puste 200.
+      // Przegladanie katalogu (brak filtra celowanego) nadal filtruje po cichu.
+      if (removedCount > 0 && !inMarketProducts.length && targetsSingleProduct(request)) {
+        res.status(CROSS_MARKET_PRODUCT_STATUS);
+        return originalJson({ message: CROSS_MARKET_PRODUCT_MESSAGE });
+      }
+
       const scopedCount =
         typeof typedBody.count === "number"
           ? Math.max(typedBody.count - removedCount, inMarketProducts.length)
@@ -762,6 +977,18 @@ export default defineMiddlewares({
       method: ["POST"],
       matcher: "/webhooks/stripe/payment-intent",
       bodyParser: { preserveRawBody: true },
+    },
+    // Story 3.5 review-fix (FR-6c, AD-22; AC4 pozycja 4 — EC-43).
+    // Opakowanie po NASZEJ stronie wykrywajace nieodwrocone obciazenie:
+    // kompensacja `authorizePaymentSessionStep` w @medusajs/core-flows wychodzi
+    // wczesnie przy REQUIRES_MORE i polyka blad `cancelPayment` do loga, wiec
+    // nieudany completion koszyka zostawial obciazenie BEZ zamowienia i bez
+    // ani jednego trwalego sladu. Guard nie anuluje platnosci — sprawia, ze
+    // przestaje ona znikac w ciszy.
+    {
+      method: ["POST"],
+      matcher: "/store/carts/:id/complete",
+      middlewares: [cartCompletionAuthorizationGuardMiddleware],
     },
     {
       method: ["POST"],
@@ -797,6 +1024,18 @@ export default defineMiddlewares({
       method: ["POST"],
       matcher: "/store/account/magic-links/revoke-all",
       middlewares: [authenticate("customer", ["session", "bearer"])],
+    },
+    // v1.15.0 Story 5.4 (FR-11 domknięcie, AD-20, NFR-1, ADR-194):
+    // uwierzytelnienie `/vendor/*` wynika Z TEGO WPISU, nie z opakowania trasy.
+    // Przed 5.4 nowa trasa `/vendor/*` była domyślnie NIEUWIERZYTELNIONA aż do
+    // momentu, w którym ktoś pamiętał o `withVendorAuth` — ten HOF już nie
+    // istnieje, więc drugiej prawdy nie ma z czego zbudować.
+    // Zwolnienia (trasy browser-bearer / `seller_context`) są JAWNĄ, nazwaną
+    // listą w `lib/vendor-auth-matcher.ts`, a nie skutkiem kolejności wpisów:
+    // Medusa uruchamia KAŻDY pasujący wpis, więc kolejność niczego by nie zwalniała.
+    {
+      matcher: VENDOR_HMAC_MATCHER,
+      middlewares: [vendorHmacGateMiddleware],
     },
     {
       method: ["GET"],
@@ -940,7 +1179,13 @@ export default defineMiddlewares({
     {
       method: ["GET"],
       matcher: "/store/products/:id",
-      middlewares: [vendorMetaMiddleware],
+      // Story 2.4 (FR-14b, NFR-5): ochrona rynkowa MUSI poprzedzac
+      // `vendorMetaMiddleware` — kolejnosc jest identyczna jak na liscie, bo oba
+      // podmieniaja `res.json` i ostatni podmieniajacy owija poprzedniego.
+      // Ochrona NIE moze wisiec na interceptorze `vendorMetaMiddleware`: przy
+      // fladze `multi_vendor_pdp` != "on" robi on `return next()` PRZED jego
+      // podpieciem i ochrona zniknelaby razem z flaga.
+      middlewares: [productListMarketScopeMiddleware, vendorMetaMiddleware],
     },
   ],
 });

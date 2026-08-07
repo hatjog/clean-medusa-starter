@@ -59,6 +59,31 @@ if (process.env.TEST_TYPE === "integration:http") {
   module.exports.testMatch = [
     "**/packages/api/src/__tests__/integration/vendor-replay-guard-pg.integration.test.[jt]s",
   ];
+} else if (process.env.TEST_TYPE === "completed-order-pg") {
+  // v1.15.0 Story 3.6 — ogniwo 2 kontraktu powrotu 3DS (kardynalnosc N zamowien)
+  // wykonane na realnym Postgresie przez realny handler trasy. DATABASE_URL musi
+  // wskazywac IZOLOWANA DB testowa: suita zaklada i kasuje tabele fixture.
+  module.exports.testMatch = [
+    "**/packages/api/src/__tests__/integration/completed-order-cardinality-pg.integration.test.[jt]s",
+  ];
+} else if (process.env.TEST_TYPE === "voucher-rls-pg") {
+  // v1.15.0 Story 2.6 (FR-14e) — moduł voucher pod RLS na REALNYM Postgresie.
+  // Profil istnieje, bo `packages/api/src/__tests__/rls/**` NIE JEST objęte
+  // żadnym z pozostałych `testMatch` — suity RLS leżały tam jako mechanizm,
+  // którego nie odpalał żaden profil. DATABASE_URL musi wskazywać IZOLOWANĄ DB:
+  // suita DROP-uje i odtwarza tabele modułu voucher.
+  module.exports.testMatch = [
+    "**/packages/api/src/__tests__/rls/voucher-module-rls.integration.spec.[jt]s",
+  ];
+} else if (process.env.TEST_TYPE === "compensation-failure-pg") {
+  // v1.15.0 Story 3.5 (FR-6c, NFR-3, AD-22) — rejestr nieudanych kompensacji
+  // sciezki pieniadza wykonany przez sam modul na realnym Postgresie
+  // (`up`/`down` migracji + CHECK-i + ON CONFLICT). DATABASE_URL musi wskazywac
+  // IZOLOWANA DB testowa: suita zaklada i kasuje
+  // `money_path_compensation_failure`.
+  module.exports.testMatch = [
+    "**/packages/api/src/__tests__/integration/money-path-compensation-failure-pg.integration.test.[jt]s",
+  ];
 } else if (process.env.TEST_TYPE === "unit") {
   module.exports.testMatch = [
     "**/packages/api/src/**/__tests__/**/*.unit.spec.[jt]s",

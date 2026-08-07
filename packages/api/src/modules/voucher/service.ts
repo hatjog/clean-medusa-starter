@@ -8,9 +8,12 @@
  */
 
 import { randomUUID } from "node:crypto"
-import { Modules } from "@medusajs/framework/utils"
-import { Pool } from "pg"
-import type { PoolClient } from "pg"
+import { ContainerRegistrationKeys, Modules } from "@medusajs/framework/utils"
+import {
+  resolveRlsConnectionSource,
+  type RlsConnectionSource,
+  type RlsPoolClient,
+} from "../../lib/rls-connection-source"
 import type {
   VoucherRow,
   VoucherEventRow,
@@ -291,11 +294,13 @@ export interface RefundAppliedEnvelope {
   payload: RefundAppliedPayload
 }
 
-function resolveDatabaseUrl(override?: string): string {
-  const url = override ?? process.env.DATABASE_URL
-  if (!url) throw new Error("VoucherService: DATABASE_URL not set")
-  return url
-}
+/**
+ * v1.15.0 Story 2.6 (FR-14e) — `resolveDatabaseUrl()` USUNIĘTE świadomie.
+ * Moduł nie zna już `DATABASE_URL`, bo nie otwiera własnego połączenia:
+ * connection string jest wejściem do WŁASNEJ puli, a własna pula to dokładnie
+ * ten mechanizm, przez który ścieżka pieniądza omijała RLS. Źródłem połączeń
+ * jest `lib/rls-connection-source.ts` nad pulą Knexa Medusy (ADR-192).
+ */
 
 /**
  * Story 2.3 — normalizacja pola projekcji do `string | null`. Pusty string i
@@ -415,9 +420,17 @@ function readGiftContract(value: unknown): {
 export class VoucherService {
   private readonly container_: Record<string, any>
   private readonly moduleOptions_: VoucherModuleOptions
-  private pool_: Pool | null = null
-  /** @internal — for testing only: inject a mock Pool */
-  _testPool?: Pool
+  private connectionSource_: RlsConnectionSource | null = null
+  /**
+   * @internal — for testing only: inject a mock connection source.
+   *
+   * v1.15.0 Story 2.6 (AC1): to wstrzyknięcie OMIJA hook RLS z definicji,
+   * więc zielony test z podstawionym `_testPool` NIE JEST dowodem izolacji.
+   * Dowód dla AC1/AC2 leży w `__tests__/rls/voucher-module-rls.integration.spec.ts`,
+   * na żywym Postgresie. Wstrzyknięcie zostaje, bo pozwala testom jednostkowym
+   * asertować SQL bez bazy — ale jego rola jest tu nazwana, nie dorozumiana.
+   */
+  _testPool?: RlsConnectionSource
 
   constructor(
     container: Record<string, any> = {},
@@ -431,14 +444,29 @@ export class VoucherService {
     }
   }
 
-  private getPool(): Pool {
+  /**
+   * v1.15.0 Story 2.6 (FR-14e, AC1) — źródłem połączeń jest pula Knexa Medusy
+   * (`ContainerRegistrationKeys.PG_CONNECTION`), czyli DOKŁADNIE ta, którą łata
+   * `installRlsPoolHook` w `api/middlewares.ts`. Wcześniej stała tu własna
+   * `pg.Pool`, przez którą żadne zapytanie modułu nigdy nie przeszło przez
+   * `SET ROLE medusa_store` ani `set_config('app.gp_market_id', …)`.
+   *
+   * Nazwa `getPool` zostaje, żeby powierzchnia zmiany w tym pliku (2350 linii,
+   * współdzielonym z FR-10/FR-11/FR-12 — PRD §9) ograniczyła się do jednej
+   * metody zamiast trzynastu wywołań.
+   */
+  private getPool(): RlsConnectionSource {
     if (this._testPool) return this._testPool
-    if (!this.pool_) {
-      this.pool_ = new Pool({
-        connectionString: resolveDatabaseUrl(this.moduleOptions_.databaseUrl),
-      })
+    if (!this.connectionSource_) {
+      this.connectionSource_ = resolveRlsConnectionSource(
+        this.container_,
+        ContainerRegistrationKeys.PG_CONNECTION,
+        this.resolveContainerDependency<{
+          error?: (message: string, meta?: Record<string, unknown>) => void
+        }>(ContainerRegistrationKeys.LOGGER) ?? undefined
+      )
     }
-    return this.pool_
+    return this.connectionSource_
   }
 
   private resolveContainerDependency<T = unknown>(key: string): T | null {
@@ -676,7 +704,7 @@ export class VoucherService {
   }
 
   private async emitEntitlementBookingCancelled(
-    client: PoolClient,
+    client: RlsPoolClient,
     payload: EntitlementBookingCancelledPayload
   ): Promise<void> {
     await client.query(
@@ -692,7 +720,7 @@ export class VoucherService {
   }
 
   private async emitEntitlementCancellationFeeApplied(
-    client: PoolClient,
+    client: RlsPoolClient,
     payload: CancellationFeeAppliedPayload
   ): Promise<void> {
     await client.query(
@@ -1530,7 +1558,7 @@ export class VoucherService {
   }
 
   private async emitEntitlementNoShow(
-    client: PoolClient,
+    client: RlsPoolClient,
     payload: Record<string, unknown>
   ): Promise<void> {
     await client.query(
@@ -1870,7 +1898,7 @@ export class VoucherService {
       if (!txClient) await client.query("ROLLBACK")
       throw err
     } finally {
-      if (!txClient) (client as PoolClient).release()
+      if (!txClient) (client as RlsPoolClient).release()
     }
 
     const updated = txClient

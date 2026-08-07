@@ -4,7 +4,8 @@
  * Closes TF-93 (magic-byte sniffing) + TF-109 (JWT-derived vendor scope).
  *
  * Guard chain (return-on-first-fail per AC4):
- *   1. withVendorAuth  — resolves vendor_id from x-vendor-token (401 on fail)
+ *   1. /vendor/* gate  — HMAC signature → seller_id → vendor_id (401 on fail).
+ *                        Mounted in middlewares.ts (Story 5.4), not wrapped here.
  *   2. Cross-vendor    — any client vendor identifier (body OR query) must
  *                        match JWT vendor_id (403)
  *   3. Size guard      — buffer.byteLength > maxBytes → 413 (cheap check first, AC3)
@@ -33,6 +34,7 @@
 
 import { postTrainingCertUpload } from "./helpers"
 
-// Export the POST handler wrapped in withVendorAuth.
-// withVendorAuth handles 401 for missing / invalid tokens.
+// Story 5.4: the handler is exported BARE. Authentication is the /vendor/*
+// matcher's job; wrapping it again would claim the anti-replay key twice and
+// answer 401 VENDOR_AUTH_REPLAY_DETECTED on every legal request.
 export const POST = postTrainingCertUpload

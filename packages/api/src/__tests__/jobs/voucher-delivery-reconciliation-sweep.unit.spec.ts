@@ -1967,13 +1967,25 @@ describe("R-2.5-H3/H4 — batch nie jest zagłodzony przez wiersze niedosyłalne
   })
 })
 
-describe("R-2.5-M6 — próg prób nie jest obchodzony przez drugi szablon", () => {
+// ── Story 4.4 (FR-9e, AD-23): jednostką ponawiania jest WIERSZ dostawy ─────
+
+describe("FR-9e — zaparkowany wiersz nie wstrzymuje sąsiadów, ale sam nie rusza", () => {
   const HANDOFF_KEY = NOTIFICATION_TEMPLATE_KEYS.VOUCHER_HANDOFF_LINK
 
-  it("zaparkowany wiersz szablonu A blokuje dosyłkę CAŁEGO entitlementu", async () => {
-    const { deps, dispatchCalls, logger } = makeHarness({
+  /**
+   * AC3, kontrola negatywna nr 2 — WĘŻSZA i celująca w defekt.
+   *
+   * Kontrola z epics.md („drugi voucher z tego samego zakupu") jest słabsza:
+   * dwa vouchery to dwa ENTITLEMENTY, a zastany guard działał per entitlement,
+   * więc tamten test przechodził już przed tą story. Defekt widać dopiero na
+   * DWÓCH SZABLONACH JEDNEGO entitlementu — i dzisiejszy kod ten test oblewał.
+   */
+  it("zaparkowany buyer-mail NIE wstrzymuje handoffu tego samego entitlementu", async () => {
+    const { deps, sql, dispatchCalls, logger } = makeHarness({
       templateKeys: [TEMPLATE_KEY, HANDOFF_KEY],
       entitlements: [issuedEntitlement("ent_two_templates")],
+      giftSource: true,
+      eligibleGift: true,
       dispatchRows: [
         {
           dispatch_id: "dispatch-parked-buyer",
@@ -1988,18 +2000,256 @@ describe("R-2.5-M6 — próg prób nie jest obchodzony przez drugi szablon", () 
 
     const report = await runVoucherDeliveryReconciliationSweep(deps)
 
-    // Szablon B jest luką, ale handler wysyła OBA — bez guardu wiersz A
-    // wróciłby do `queued` przez `reserveDispatch` i próg by nie obowiązywał.
-    expect(dispatchCalls).toHaveLength(0)
+    // Dokładnie JEDNA wysyłka i to ta niezaparkowana.
+    expect(dispatchCalls).toHaveLength(1)
+    expect(dispatchCalls[0].template).toBe(HANDOFF_KEY)
+    expect(report.recovered).toBe(1)
+
+    // AC3, kontrola DODATNIA budżetu: zdjęcie blokady sąsiadowi NIE odparkowuje
+    // wiersza zaparkowanego. Bez tej asercji naprawa byłaby nieodróżnialna od
+    // usunięcia progu. Mierzymy stan WIERSZA, nie tylko licznik przebiegu.
+    expect(
+      dispatchCalls.some((call) => call.template === TEMPLATE_KEY),
+    ).toBe(false)
+    expect(report.parked_total).toBe(1)
+    const parked = sql.dispatch.find(
+      (row) => row.dispatch_id === "dispatch-parked-buyer",
+    )
+    expect(parked?.status).toBe("failed")
+    expect(Number(parked?.attempt_count ?? 0)).toBe(SWEEP_MAX_ATTEMPT_COUNT)
+    expect(logger.entries.length).toBeGreaterThan(0)
+  })
+
+  /** AC3, kontrola negatywna nr 1 — dosłownie ta z epics.md (NFR-1). */
+  it("zaparkowany wiersz jednego vouchera nie wstrzymuje DRUGIEGO z tego samego zakupu", async () => {
+    const { deps, dispatchCalls } = makeHarness({
+      entitlements: [
+        issuedEntitlement("ent_voucher_a"),
+        issuedEntitlement("ent_voucher_b"),
+      ],
+      dispatchRows: [
+        {
+          dispatch_id: "dispatch-parked-a",
+          entitlement_id: "ent_voucher_a",
+          template_key: TEMPLATE_KEY,
+          status: "failed",
+          error_code: "BREVO_TRANSPORT_ERROR",
+          attempt_count: SWEEP_MAX_ATTEMPT_COUNT,
+        },
+      ],
+    })
+
+    const report = await runVoucherDeliveryReconciliationSweep(deps)
+
+    expect(dispatchCalls).toHaveLength(1)
+    expect(
+      String(
+        (dispatchCalls[0].data as Record<string, unknown> | undefined)
+          ?.entitlement_id ?? "",
+      ),
+    ).toBe("ent_voucher_b")
+    expect(report.recovered).toBe(1)
+    expect(report.parked_total).toBe(1)
+  })
+
+  /**
+   * AC1 — domkniętość kubełków po zmianie jednostki. Rozjazd o JEDEN świeci na
+   * czerwono; asercja `>= 0` nie mierzyłaby niczego.
+   */
+  it("zbiór kubełków pozostaje DOMKNIĘTY, gdy jednostką jest wiersz", async () => {
+    const { deps } = makeHarness({
+      templateKeys: [TEMPLATE_KEY, HANDOFF_KEY],
+      entitlements: [
+        issuedEntitlement("ent_closure_parked"),
+        issuedEntitlement("ent_closure_plain"),
+      ],
+      giftSource: true,
+      eligibleGift: true,
+      dispatchRows: [
+        {
+          dispatch_id: "dispatch-closure-parked",
+          entitlement_id: "ent_closure_parked",
+          template_key: TEMPLATE_KEY,
+          status: "failed",
+          error_code: "BREVO_TRANSPORT_ERROR",
+          attempt_count: SWEEP_MAX_ATTEMPT_COUNT,
+        },
+      ],
+    })
+
+    const report = await runVoucherDeliveryReconciliationSweep(deps)
+
+    for (const row of report.per_market) {
+      expect(row.found).toBe(
+        row.recovered +
+          row.still_failing +
+          row.unresolvable +
+          row.exhausted +
+          row.skipped +
+          row.state_mismatch +
+          row.errored,
+      )
+    }
+
+    // Jednostką `found` jest WIERSZ (4.4), a nie entitlement — inaczej ta suma
+    // nie miałaby jak się zbilansować przy wykluczeniu per wiersz.
+    const found = report.per_market.reduce((sum, row) => sum + row.found, 0)
+    expect(found).toBe(report.scanned)
+    expect(report.entitlements_scanned).toBe(2)
+    expect(found).toBeGreaterThan(report.entitlements_scanned)
+  })
+
+  /**
+   * Guard `parkedRowKeys` jest defense-in-depth: produkcyjny SQL skanu wyklucza
+   * wiersze zaparkowane, więc normalnie nie ma czego wykluczać. Ten test
+   * podstawia port, który je zwraca (inna implementacja / rozjazd predykatu),
+   * i sprawdza, że guard ODPALA — i że odpala PER WIERSZ.
+   */
+  it("guard wierszy zaparkowanych odpala, gdy skan je jednak zwróci — i tylko dla nich", async () => {
+    const { deps, dispatchCalls, logger } = makeHarness({
+      templateKeys: [TEMPLATE_KEY, HANDOFF_KEY],
+      entitlements: [issuedEntitlement("ent_guard")],
+      giftSource: true,
+      eligibleGift: true,
+    })
+
+    // Skan „przepuszcza" wiersz zaparkowany buyer-maila, a lista zaparkowanych
+    // mówi prawdę. Bez guardu poszłyby DWIE wysyłki.
+    deps.scanner = scannerWith(deps.scanner, {
+      async listParkedDispatches() {
+        return [
+          {
+            dispatch_id: "dispatch-guard-parked",
+            entitlement_id: "ent_guard",
+            market_id: MARKET_ID,
+            template_key: TEMPLATE_KEY,
+            attempt_count: SWEEP_MAX_ATTEMPT_COUNT,
+            first_error_code: "BREVO_TRANSPORT_ERROR",
+          },
+        ]
+      },
+    })
+
+    const report = await runVoucherDeliveryReconciliationSweep(deps)
+
     expect(report.exhausted).toBe(1)
-    expect(report.attempted).toBe(0)
+    expect(
+      dispatchCalls.filter((call) => call.template === TEMPLATE_KEY),
+    ).toHaveLength(0)
+    // Sąsiad idzie — to jest dokładnie różnica między 4.4 a stanem sprzed niej.
+    expect(
+      dispatchCalls.filter((call) => call.template === HANDOFF_KEY),
+    ).toHaveLength(1)
     expect(
       logger.entries.some(
         (entry) =>
           entry.level === "warn" &&
-          entry.message.includes("wyczerpanym budżetem prób"),
+          entry.message.includes("dosyłka wstrzymana dla TEGO wiersza"),
       ),
     ).toBe(true)
+  })
+
+  /**
+   * AC2 — celowanie jest WYMUSZONE PRZEZ WYKONANIE, nie przez konwencję.
+   * Sterownik zlicza wywołania providera: cel „tylko handoff" ⇒ ZERO wywołań
+   * dla `voucher_purchase_confirmation`. Dwa wywołania = RED.
+   */
+  it("dosyłka celowana w handoff nie dotyka wiersza buyer-maila (ani providera, ani ledgera)", async () => {
+    const { deps, sql, dispatchCalls } = makeHarness({
+      templateKeys: [TEMPLATE_KEY, HANDOFF_KEY],
+      entitlements: [issuedEntitlement("ent_targeted")],
+      giftSource: true,
+      eligibleGift: true,
+      dispatchRows: [
+        {
+          dispatch_id: "dispatch-targeted-handoff",
+          entitlement_id: "ent_targeted",
+          template_key: HANDOFF_KEY,
+          recipient_email: "obdarowana@example.test",
+          status: "failed",
+          error_code: "BREVO_TRANSPORT_ERROR",
+          attempt_count: 1,
+        },
+        {
+          dispatch_id: "dispatch-targeted-buyer",
+          entitlement_id: "ent_targeted",
+          template_key: TEMPLATE_KEY,
+          status: "sent",
+        },
+      ],
+    })
+
+    const buyerBefore = sql.dispatch.find(
+      (row) => row.dispatch_id === "dispatch-targeted-buyer",
+    )
+    const buyerAttemptsBefore = Number(buyerBefore?.attempt_count ?? 0)
+
+    await runVoucherDeliveryReconciliationSweep(deps)
+
+    expect(
+      dispatchCalls.filter((call) => call.template === TEMPLATE_KEY),
+    ).toHaveLength(0)
+    expect(
+      dispatchCalls.filter((call) => call.template === HANDOFF_KEY),
+    ).toHaveLength(1)
+
+    const buyerAfter = sql.dispatch.find(
+      (row) => row.dispatch_id === "dispatch-targeted-buyer",
+    )
+    expect(buyerAfter?.status).toBe("sent")
+    expect(Number(buyerAfter?.attempt_count ?? 0)).toBe(buyerAttemptsBefore)
+  })
+
+  /**
+   * Review 4.4, finding #6 — przy celu = handoff handler zwraca wynik handoffu
+   * RÓWNIEŻ „na wierzchu" (`result.dispatch_id === result.handoff.dispatch_id`),
+   * więc zwrot budżetu leciałby DWA RAZY z identycznymi argumentami.
+   *
+   * Dziś maskuje to guard SQL `configuration_recovery_count < max_...` przy
+   * progu 1 — czyli przypadek jest LATENTNY, nie działający. Mierzymy więc
+   * liczbę WYWOŁAŃ (`statements`), nie skutek: skutek jest dziś ten sam,
+   * a wywołanie jest tym, co się podwaja i co przestanie być nieszkodliwe,
+   * gdy 4.6/FR-9g podniesie próg odzysków do 2.
+   */
+  it("cel = handoff ⇒ zwrot budżetu wołany DOKŁADNIE RAZ, nie dwa", async () => {
+    const { deps, sql } = makeHarness({
+      templateKeys: [TEMPLATE_KEY, HANDOFF_KEY],
+      entitlements: [issuedEntitlement("ent_dedupe_budget")],
+      giftSource: true,
+      eligibleGift: true,
+      dispatchRows: [
+        {
+          dispatch_id: "dispatch-dedupe-handoff",
+          entitlement_id: "ent_dedupe_budget",
+          template_key: HANDOFF_KEY,
+          recipient_email: "obdarowana@example.test",
+          status: "failed",
+          error_code: "VOUCHER_DELIVERY_DISPATCH_FAILED",
+          first_error_code: "BREVO_SENDER_NOT_CONFIGURED",
+          attempt_count: SWEEP_MAX_ATTEMPT_COUNT,
+        },
+        {
+          dispatch_id: "dispatch-dedupe-buyer",
+          entitlement_id: "ent_dedupe_budget",
+          template_key: TEMPLATE_KEY,
+          status: "sent",
+        },
+      ],
+      dispatchImpl: async () => {
+        throw new Error(
+          "Failed to send notification [gp_error_code=BREVO_SENDER_NOT_CONFIGURED]",
+        )
+      },
+    })
+
+    await runVoucherDeliveryReconciliationSweep(deps)
+
+    // `releaseAttemptBudget` to jedyne zapytanie z `SET attempt_count = GREATEST`.
+    const releaseCalls = sql.statements.filter((statement) =>
+      statement.includes("SET attempt_count = GREATEST"),
+    )
+
+    expect(releaseCalls).toHaveLength(1)
   })
 })
 

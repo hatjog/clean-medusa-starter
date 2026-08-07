@@ -31,8 +31,15 @@
  * - new ADR (`specs/adr/2026-05-24-entitlement-system-1-elimination.md`)
  */
 import type { MedusaRequest, MedusaResponse } from "@medusajs/framework/http"
+import { ContainerRegistrationKeys } from "@medusajs/framework/utils"
+import type { Knex } from "knex"
 
 import { AdminEntitlementsQuerySchema } from "../../../../lib/contracts/admin"
+import {
+  HttpMarketContextError,
+  listConfiguredMarketIds,
+  runInHttpMarketContext,
+} from "../../../../lib/http-market-context"
 import { apiError, apiSuccess } from "../../../../lib/api/response"
 import { ErrorCode } from "../../../../lib/contracts/errors"
 import { resolveAdminMarketContext } from "../../../../lib/admin-market-context"
@@ -54,6 +61,14 @@ function resolveVoucherService(req: MedusaRequest): VoucherSearchLike | null {
       VoucherSearchLike
     if (typeof svc?.adminSearchEntitlements === "function") return svc
     return null
+  } catch {
+    return null
+  }
+}
+
+function resolveKnexForRoute(req: MedusaRequest): Knex | null {
+  try {
+    return req.scope.resolve(ContainerRegistrationKeys.PG_CONNECTION) as Knex
   } catch {
     return null
   }
@@ -101,9 +116,63 @@ export async function GET(req: MedusaRequest, res: MedusaResponse): Promise<void
     return
   }
 
-  const entitlements = await voucher.adminSearchEntitlements(q, {
-    market_id: marketResult.market_id,
-    allow_cross_market: !marketResult.market_id && marketResult.is_super_admin,
-  })
-  apiSuccess(res, { entitlements })
+  // v1.15.0 Story 2.6 (FR-14e, AD-21 §4) — `/v1/admin/*` jest HTTP, ale NIE
+  // `/store/*`, więc nie przechodzi przez `marketContextMiddleware`. Po włączeniu
+  // FORCE RLS na `entitlement_instance` filtrowanie ARGUMENTEM (`market_id` w SQL-u
+  // serwisu) już nie wystarcza: bez `app.gp_market_id` na połączeniu polityka
+  // zwraca ZERO wierszy niezależnie od uprawnień. Kontekst zakłada więc trasa,
+  // TYM SAMYM nośnikiem co `/store/*`.
+  const db = resolveKnexForRoute(req)
+
+  try {
+    if (marketResult.market_id) {
+      const entitlements = await runInHttpMarketContext(
+        marketResult.market_id,
+        () =>
+          voucher.adminSearchEntitlements(q, {
+            market_id: marketResult.market_id,
+            allow_cross_market: false,
+          })
+      )
+      apiSuccess(res, { entitlements, markets_searched: [marketResult.market_id] })
+      return
+    }
+
+    // Cross-market global search super-admina (funkcja produktowa z v1.11.0).
+    // Zmienna sesji niesie DOKŁADNIE JEDEN rynek, a polityka nie ma trybu
+    // „wszystkie rynki" — więc wyszukiwanie jest ROZWIJANE po WYLICZONYM
+    // rosterze rynków, raz na rynek. Roster wraca w odpowiedzi, żeby dało się
+    // po fakcie orzec, co wyszukiwanie objęło (a nie zgadywać).
+    if (!db) {
+      apiError(res, ErrorCode.SERVICE_UNAVAILABLE, 503, {
+        message: "market roster unavailable",
+      })
+      return
+    }
+    const marketIds = await listConfiguredMarketIds(db)
+    const perMarket: unknown[][] = []
+    for (const marketId of marketIds) {
+      perMarket.push(
+        await runInHttpMarketContext(marketId, () =>
+          voucher.adminSearchEntitlements(q, {
+            market_id: marketId,
+            allow_cross_market: false,
+          })
+        )
+      )
+    }
+    apiSuccess(res, {
+      entitlements: perMarket.flat(),
+      markets_searched: marketIds,
+    })
+  } catch (error) {
+    if (error instanceof HttpMarketContextError) {
+      res.status(409).json({
+        code: "MARKET_CONTEXT_REQUIRED",
+        message: error.message,
+      })
+      return
+    }
+    throw error
+  }
 }

@@ -10,10 +10,10 @@
  *   - L6  — POST /vendor/vouchers/:code/redeem → idempotent on second call
  *   - L7  — POST /vendor/vouchers/:code/redeem → 410 on expired voucher
  *
- * Strategy: bypass the withVendorAuth HMAC by stubbing process.env to a
- * known shared secret. The handler signs/verifies via the production
- * helpers; no Mercur DB is touched. VoucherService is mocked at the
- * container resolve seam.
+ * Strategy: run the route through the REAL `/vendor/*` gate (Story 5.4) with a
+ * signature made from the seller's own provisioned secret. The handler
+ * signs/verifies via the production helpers; no Mercur DB is touched.
+ * VoucherService is mocked at the container resolve seam.
  */
 import { describe, it, expect, beforeEach, afterEach, jest } from "@jest/globals"
 import { buildVendorSignatureHeader } from "../../../lib/vendor-hmac"
@@ -22,8 +22,15 @@ import {
   configureVendorSecretCryptoCore,
   resetVendorSecretCryptoCore,
 } from "../../../lib/vendor-secret/crypto-core"
-import { GET as lookupGET } from "../../../api/vendor/vouchers/[code]/lookup/route"
-import { POST as redeemPOST } from "../../../api/vendor/vouchers/[code]/redeem/route"
+import { GET as lookupHandler } from "../../../api/vendor/vouchers/[code]/lookup/route"
+import { POST as redeemHandler } from "../../../api/vendor/vouchers/[code]/redeem/route"
+import { withVendorGate } from "../../helpers/vendor-auth-chain"
+
+// Story 5.4: the route handlers are bare; authentication is the /vendor/*
+// matcher. Calling them directly would measure the route with NO auth at all,
+// so every case below goes through the production gate first.
+const lookupGET = withVendorGate(lookupHandler)
+const redeemPOST = withVendorGate(redeemHandler)
 
 const HMAC_SECRET = "vendor-redeem-test-secret"
 const SELLER_ID = "seller_test_001"
@@ -35,7 +42,11 @@ const savedEnv: Record<string, string | undefined> = {}
 beforeEach(() => {
   savedEnv.VENDOR_HMAC_SECRET = process.env.VENDOR_HMAC_SECRET
   savedEnv.VENDOR_HMAC_ENFORCED = process.env.VENDOR_HMAC_ENFORCED
-  process.env.VENDOR_HMAC_SECRET = HMAC_SECRET
+  // Story 5.4 (AC1): the shared secret is UNSET, not set-to-something. The
+  // suite passes because the signature is verified against the SELLER'S OWN
+  // secret from the crypto-core below — before 5.4 this same line produced
+  // 503 VENDOR_AUTH_CONFIG_ERROR on every case.
+  delete process.env.VENDOR_HMAC_SECRET
   process.env.VENDOR_HMAC_ENFORCED = "true"
   // v1.15.0 Story 5.2: the route resolves the HMAC secret PER SELLER, so this
   // suite provisions `SELLER_ID` in the crypto-core. Only the way the secret is
@@ -75,6 +86,8 @@ function makeRequest(opts: {
   appendCalls?: AppendCall[]
   resolveVendor?: (sellerId: string) => Promise<string>
   params?: Record<string, string>
+  /** `null` = sprzedawca BEZ zadeklarowanego rynku (kontrola negatywna 2.6). */
+  sellerMarketId?: string | null
 }) {
   const sigHeader = buildVendorSignatureHeader(
     SELLER_ID,
@@ -105,14 +118,34 @@ function makeRequest(opts: {
         // barrier, which fails CLOSED (503) when it cannot be consulted. Hence
         // `raw` is wired to the shared guard stub — without it every case here
         // would measure 503 instead of the route behaviour it was written for.
-        return {
-          insert: () => ({
-            returning: async () => {
-              throw new Error("audit write skipped in unit test")
-            },
-          }),
-          raw: replayGuardDb.raw,
-        }
+        //
+        // v1.15.0 Story 2.6 cykl 1: trasa vendora zakłada teraz KONTEKST RYNKU
+        // (pod FORCE RLS połączenie bez `app.gp_market_id` widzi zero wierszy),
+        // a rynek bierze z uwierzytelnionego SPRZEDAWCY. Stub musi więc być
+        // WYWOŁYWALNY jak knex (`db("seller")`) — bez tego trasa nie ma skąd
+        // wziąć rynku i odmawia.
+        const knexStub = ((table: string) => {
+          if (table !== "seller") {
+            throw new Error(`unexpected table in unit stub: ${table}`)
+          }
+          return {
+            select: () => ({
+              where: () => ({
+                first: async () => ({
+                  market_id:
+                    "sellerMarketId" in opts ? opts.sellerMarketId : "bonbeauty",
+                }),
+              }),
+            }),
+          }
+        }) as unknown as Record<string, unknown> & ((t: string) => unknown)
+        ;(knexStub as any).raw = replayGuardDb.raw
+        ;(knexStub as any).insert = () => ({
+          returning: async () => {
+            throw new Error("audit write skipped in unit test")
+          },
+        })
+        return knexStub
       },
     },
   } as unknown as import("@medusajs/framework/http").MedusaRequest
@@ -289,5 +322,26 @@ describe("cc-4 F-05 — POST /vendor/vouchers/:code/redeem", () => {
     const res = makeRes()
     await redeemPOST(req as never, res as never, jest.fn() as never)
     expect(res.statusCode).toBe(410)
+  })
+
+  // v1.15.0 Story 2.6 cykl 1 (finding HIGH #1) — kontrola, która PĘKA po zepsuciu
+  // nowego mechanizmu: bez rynku sprzedawcy trasa MUSI odmówić głośno. Cichy
+  // przebieg dałby pod FORCE RLS `getByCode → null`, czyli komunikat „voucher nie
+  // istnieje" przy voucherze, który istnieje — najgorszy możliwy wariant na
+  // ścieżce realizacji.
+  it("L8 — sprzedawca BEZ zadeklarowanego rynku dostaje 409, nie ciche 404", async () => {
+    const voucher = makeVoucher()
+    const mock: VoucherMock = {
+      getByCode: jest.fn(async () => voucher),
+      claim: jest.fn(async () => ({ status: "claimed", voucher })),
+    }
+    const req = makeRequest({ voucherService: mock, sellerMarketId: null })
+    const res = makeRes()
+    await redeemPOST(req as never, res as never, jest.fn() as never)
+    expect(res.statusCode).toBe(409)
+    expect((res.body as { code: string }).code).toBe("MARKET_CONTEXT_REQUIRED")
+    // Odmowa jest PRZED dotknięciem vouchera — żadnego odczytu ani mutacji.
+    expect(mock.getByCode).not.toHaveBeenCalled()
+    expect(mock.claim).not.toHaveBeenCalled()
   })
 })

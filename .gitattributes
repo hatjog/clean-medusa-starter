@@ -1,0 +1,14 @@
+# v1.15.0 Story 3.6 review-fix (LOW) — końce linii kontraktu powrotu 3DS.
+#
+# Ten submoduł NIE miał `.gitattributes`, więc końce linii zależały wyłącznie
+# od `core.autocrlf` maszyny, która edytowała plik. Trasa mostkowa
+# `store/carts/[id]/completed-order/route.ts` była w indeksie jako CRLF i po
+# edycji z Linuksa weszła jako LF — diff pokazał 89 usuniętych / 89 dodanych
+# linii zamiast realnych ~40, a `git blame` stracił historię całego pliku.
+#
+# Zakres jest CELOWO wąski: `* text=auto eol=lf` na cały submoduł wymagałoby
+# `git add --renormalize .` na tysiącach plików (inaczej zostają trwale
+# „modified"), co jest zmianą spoza tej story. Pinujemy ścieżkę, którą ta
+# story realnie posiada — tu przewrót końców linii jest już zmierzonym
+# zdarzeniem, nie hipotezą.
+packages/api/src/api/store/carts/** text eol=lf

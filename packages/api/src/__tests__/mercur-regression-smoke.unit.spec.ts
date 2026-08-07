@@ -5,10 +5,10 @@
  * - Event name contract (order.placed)
  * - Mercur payload format ({ order_ids: string[] })
  * - Retry-safe subscriber behavior
- * - withVendorAuth HOF contract (HMAC-enforced, cleanup-48)
+ * - /vendor/* gate contract (HMAC-enforced; Story 5.4 replaced the HOF)
  *
  * Does NOT duplicate tests in on-order-completed.unit.spec.ts.
- * Focus: contracts + withVendorAuth HOF shape.
+ * Focus: contracts + the shape of the /vendor/* authentication gate.
  *
  * Updated in cleanup-48: tests now use HMAC-signed x-vendor-signature headers
  * (VENDOR_HMAC_ENFORCED=true) to verify the new enforcement path.
@@ -17,7 +17,8 @@ import { describe, it, expect, jest, beforeEach, afterEach } from "@jest/globals
 
 import { config as subscriberConfig } from "../subscribers/on-order-completed.js"
 import { NotImplementedError } from "../modules/gp-core/service"
-import { withVendorAuth, vendorAuthMiddleware } from "../lib/vendor-auth"
+import { vendorAuthMiddleware } from "../lib/vendor-auth"
+import { withVendorGate } from "./helpers/vendor-auth-chain"
 import { buildVendorSignatureHeader } from "../lib/vendor-hmac"
 import { createReplayGuardTestDb } from "./helpers/replay-guard-test-db"
 import {
@@ -40,7 +41,7 @@ beforeEach(() => {
   savedEnv.VENDOR_HMAC_ENFORCED = process.env.VENDOR_HMAC_ENFORCED
   process.env.VENDOR_HMAC_SECRET = SMOKE_SECRET
   process.env.VENDOR_HMAC_ENFORCED = "true"
-  // v1.15.0 Story 5.2: `withVendorAuth` resolves the secret per seller, so the
+  // v1.15.0 Story 5.2: the gate resolves the secret per seller, so the
   // smoke seller is provisioned in the crypto-core. Only the secret SOURCE moved;
   // the HOF contract asserted below is unchanged.
   configureVendorSecretCryptoCore({
@@ -90,7 +91,7 @@ describe("Mercur event contract", () => {
   })
 })
 
-// --- withVendorAuth HOF Tests ---
+// --- /vendor/* gate tests ---
 
 function buildMockReq(headers: Record<string, string | undefined> = {}) {
   // v1.15.0 Story 5.3: `/vendor/*` auth now consults a shared anti-replay
@@ -139,10 +140,10 @@ function buildMockRes() {
   return res
 }
 
-describe("withVendorAuth HOF", () => {
+describe("/vendor/* gate", () => {
   it("returns 401 when x-vendor-signature header is missing (enforced mode)", async () => {
     const handler = jest.fn()
-    const wrapped = withVendorAuth(handler as any)
+    const wrapped = withVendorGate(handler as any)
     const req = buildMockReq({})
     const res = buildMockRes()
     const next = jest.fn()
@@ -161,7 +162,7 @@ describe("withVendorAuth HOF", () => {
     const handler = jest.fn(async (req: any) => {
       capturedAuth = req.vendorAuth
     })
-    const wrapped = withVendorAuth(handler as any)
+    const wrapped = withVendorGate(handler as any)
     const req = buildMockReq({ "x-vendor-signature": makeSignedHeader() })
     const res = buildMockRes()
     const next = jest.fn()
@@ -176,7 +177,7 @@ describe("withVendorAuth HOF", () => {
 
   it("returns 501 when resolveVendorId is stub (NotImplementedError)", async () => {
     const handler = jest.fn()
-    const wrapped = withVendorAuth(handler as any)
+    const wrapped = withVendorGate(handler as any)
     const req = buildMockReq({ "x-vendor-signature": makeSignedHeader() })
 
     // Override gp_core to throw NotImplementedError
@@ -214,7 +215,7 @@ describe("withVendorAuth HOF", () => {
 
   it("returns 503 when GpCoreService is not available", async () => {
     const handler = jest.fn()
-    const wrapped = withVendorAuth(handler as any)
+    const wrapped = withVendorGate(handler as any)
     const req = buildMockReq({ "x-vendor-signature": makeSignedHeader() })
 
     req.scope.resolve = jest.fn((key: string) => {
@@ -241,7 +242,7 @@ describe("withVendorAuth HOF", () => {
 
   it("returns 500 on unexpected error from resolveVendorId", async () => {
     const handler = jest.fn()
-    const wrapped = withVendorAuth(handler as any)
+    const wrapped = withVendorGate(handler as any)
     const req = buildMockReq({ "x-vendor-signature": makeSignedHeader() })
 
     req.scope.resolve = jest.fn((key: string) => {

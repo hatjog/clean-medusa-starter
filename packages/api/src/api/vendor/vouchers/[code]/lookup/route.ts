@@ -8,8 +8,9 @@
  * unreachable; the harness ran against a mocked Playwright route only.
  *
  * Auth model:
- *   - withVendorAuth (HMAC x-vendor-signature only — legacy x-vendor-token
- *     path removed in cc-4 F-10). Returns 401 on missing/invalid.
+ *   - The /vendor/* matcher (Story 5.4) — HMAC x-vendor-signature only; the
+ *     legacy x-vendor-token path was removed in cc-4 F-10. Returns 401 on
+ *     missing/invalid BEFORE this handler is reached.
  *   - Market binding: the voucher.seller_id must match the authenticated
  *     seller_id (cross-vendor lookup attempts return 403). voucher.market_id
  *     is propagated into the response so the vendor-panel UI can surface
@@ -25,7 +26,6 @@
  */
 
 import type { MedusaRequest, MedusaResponse } from "@medusajs/framework/http"
-import { withVendorAuth } from "../../../../../lib/vendor-auth"
 import type { VendorAuthContext } from "../../../../../lib/vendor-auth"
 import {
   VOUCHER_MODULE,
@@ -73,7 +73,7 @@ function projectVendorView(
   }
 }
 
-export const GET = withVendorAuth(async (
+export const GET = async (
   req: RequestWithVendorAuth,
   res: MedusaResponse,
 ): Promise<void> => {
@@ -96,7 +96,8 @@ export const GET = withVendorAuth(async (
   }
 
   // Cross-vendor isolation: only the issuing seller can lookup the voucher.
-  // withVendorAuth populates vendorAuth.seller_id from the HMAC signature.
+  // The /vendor/* gate (Story 5.4) populated vendorAuth.seller_id from the
+  // HMAC signature before this handler was reached.
   const { seller_id: authenticatedSellerId } = req.vendorAuth!
   if (voucher.seller_id !== authenticatedSellerId) {
     res.status(404).json({ code: "VOUCHER_NOT_FOUND", message: "Voucher not found" })
@@ -105,4 +106,4 @@ export const GET = withVendorAuth(async (
 
   const view = projectVendorView(voucher)
   res.status(200).json({ voucher: view })
-})
+}

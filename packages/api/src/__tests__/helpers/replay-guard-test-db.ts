@@ -1,6 +1,6 @@
 /**
  * Atrapa nośnika bariery anty-replay dla suit, które przechodzą przez
- * `withVendorAuth` / `vendorAuthMiddleware`, ale NIE mierzą samej bariery.
+ * bramkę `/vendor/*` (`vendorAuthMiddleware`), ale NIE mierzą samej bariery.
  *
  * v1.15.0 Story 5.3: od tej story uwierzytelnienie `/vendor/*` konsultuje
  * współdzieloną barierę i FAIL-CLOSED-uje 503, gdy nie może jej dosięgnąć.

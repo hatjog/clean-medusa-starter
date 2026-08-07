@@ -8,8 +8,10 @@
  * Signed payload: `${seller_id}.${ts}.${nonce}` (dot-joined, UTF-8)
  *
  * Design decisions (v1.6.0, superseded where noted):
- *   - Single shared secret (VENDOR_HMAC_SECRET) — SUPERSEDED by v1.15.0 Story 5.2:
- *     the secret is resolved PER SELLER by `lib/vendor-secret/crypto-core.ts`.
+ *   - Single shared secret in one env var — SUPERSEDED by v1.15.0 Story 5.2 (the
+ *     secret is resolved PER SELLER by `lib/vendor-secret/crypto-core.ts`) and
+ *     REMOVED FROM THE CODE by Story 5.4: no module in this package reads that
+ *     env var any more, which is what `vendor-secret-dual-window` measures.
  *   - Nonce dedup via in-process LRU bounded at 10k — SUPERSEDED by v1.15.0
  *     Story 5.3 (FR-11, AD-20, AD-23, ADR-185). `NonceLru`/`getSharedLru` are
  *     GONE, not merely unused: the in-process map could not see a replay aimed
@@ -47,7 +49,7 @@ export type VendorAuthErrorCode =
   | typeof VENDOR_AUTH_SIGNATURE_INVALID
   | typeof VENDOR_AUTH_TIMESTAMP_EXPIRED
   | typeof VENDOR_AUTH_REPLAY_DETECTED
-  // v1.15.0 Story 5.2 (AD-20 / ADR-181): the crypto-core is healthy but the
+  // v1.15.0 Story 5.2 (AD-20 / ADR-182): the crypto-core is healthy but the
   // seller named in the header has no per-vendor secret. Server-side (log)
   // discriminator only — the HTTP body stays indistinguishable from a plain
   // signature mismatch (AC5 non-disclosure), see vendor-auth.ts.
@@ -183,7 +185,7 @@ export function verifyVendorSignature(
     return { ok: false, code: VENDOR_AUTH_TIMESTAMP_EXPIRED }
   }
 
-  // --- Per-seller secret resolution (v1.15.0 Story 5.2, AD-20/ADR-181) ---
+  // --- Per-seller secret resolution (v1.15.0 Story 5.2, AD-20/ADR-182) ---
   // AFTER the timestamp check, BEFORE the HMAC. A `null` resolution is NEVER a
   // reason to reach for a shared secret; there is no such branch here.
   let secret: Buffer

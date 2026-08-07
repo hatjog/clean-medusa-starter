@@ -116,6 +116,28 @@ export type NotificationAuditEnvelopeFields = {
   signature_hash?: string;
   source_ip_hash?: string;
   gate_source?: "feature_flag";
+  /**
+   * Klasa zdarzenia dostawy po klasyfikacji wielodzielnej (FR-9d, ADR-192).
+   * Bez niej koperta niosla tylko `status`/`outcome`, ktore zwijaja piec roznych
+   * odpowiedzi dostawcy do jednego `failed` — czyli rozroznienie wymagane przez
+   * FR-9d bylo obserwowalne wylacznie wewnatrz procesu.
+   */
+  delivery_class?: NotificationDeliveryEventType;
+  /**
+   * Rozstrzygnieta reakcja na klase — czynnik, ktory czyni skutek KAZDEJ z klas
+   * obserwowalnie rozny. Ksztalt odpowiada `DeliveryEventReaction`.
+   */
+  delivery_reaction?: {
+    terminal: boolean;
+    escalate: boolean;
+    retryable: boolean;
+    retry_policy: string | null;
+    consumes_recipient_attempt: boolean;
+    suppress_recipient: boolean;
+    bounce_family: boolean;
+    next_attempt_number: number | null;
+    backoff_delay_ms: number | null;
+  };
 }
 
 /**
@@ -136,14 +158,49 @@ export interface NotificationDispatch {
   audit_event: NotificationAuditEnvelope;
 }
 
+/**
+ * Dziedzina klas zdarzenia dostawy (FR-9d, ADR-192).
+ *
+ * Wartosc `"bounced"` ZOSTALA USUNIETA celowo. Do v1.15.0 zwijala piec roznych
+ * odpowiedzi dostawcy (`hard_bounce`, `soft_bounce`, `invalid_email`, `blocked`,
+ * `deferred`) w jedna wartosc, przez co rozroznienie wymagane przez FR-9d bylo
+ * kasowane w pierwszym kroku normalizacji — zanim jakakolwiek reakcja mogla je
+ * zobaczyc. Kazda z tych piec odpowiedzi ma teraz WLASNA, rozlaczna klase.
+ *
+ * `"deferred"` (opoznienie) NIE JEST odbiciem: nie nalezy do rodziny
+ * `isBounceFamily`, nie dostaje kodu z rodziny `*BOUNCE*` i nie konsumuje budzetu
+ * prob. Do v1.15.0 bylo klasyfikowane jako odbicie — to bylo bledne, nie brakujace.
+ *
+ * Dziedzina jest wyliczona i domkniety jest kazdy jej konsument (`assertNever`),
+ * wiec dodanie klasy bez obslugi NIE KOMPILUJE SIE (AD-19).
+ */
 export type NotificationDeliveryEventType =
   | "delivered"
   | "opened"
   | "clicked"
-  | "bounced"
+  | "bounced_permanent"
+  | "bounced_transient"
+  | "blocked"
+  | "invalid_address"
+  | "deferred"
   | "complaint"
   | "unsubscribed"
   | "failed";
+
+/** Pelna, wyliczona dziedzina klas — nosnik wyczerpalnosci dla testow i bramek. */
+export const NOTIFICATION_DELIVERY_EVENT_TYPES = Object.freeze([
+  "delivered",
+  "opened",
+  "clicked",
+  "bounced_permanent",
+  "bounced_transient",
+  "blocked",
+  "invalid_address",
+  "deferred",
+  "complaint",
+  "unsubscribed",
+  "failed",
+] as const satisfies readonly NotificationDeliveryEventType[]);
 
 export interface NotificationDeliveryEvent {
   dispatch_id: string;

@@ -1,5 +1,5 @@
 /**
- * v1.15.0 Story 5.2 — backend crypto-core (ADR-181, ADR-156 §1/§4/§6a).
+ * v1.15.0 Story 5.2 — backend crypto-core (ADR-182, ADR-156 §1/§4/§6a).
  *
  * Covers the resolver itself: `config_ref` → value, decrypt-on-boot (exactly one
  * decrypt per process), the fault taxonomy that separates 503 from 401, and the
@@ -15,6 +15,8 @@ import {
   getVendorSecretCryptoCore,
   vendorSecretCryptoCoreHealth,
   VENDOR_SECRET_SET_PATH_ENV,
+  CRYPTO_CORE_FAULT_RETRY_MS,
+  setVendorSecretCryptoCoreClockForTests,
 } from "../../lib/vendor-secret/crypto-core"
 
 const REF_A = "sops://infra/gp-dev/secrets/vendor-hmac.enc.yaml#seller-A"
@@ -165,6 +167,57 @@ describe("VendorSecretCryptoCore", () => {
       healthy: false,
       reason: "decrypt-failed",
     })
+  })
+
+  it("review-fix M-4: a TRANSIENT fault is retried after the backoff, not cached until restart", () => {
+    let clock = 1_000_000
+    let attempts = 0
+    setVendorSecretCryptoCoreClockForTests(() => clock)
+    configureVendorSecretCryptoCore({
+      secretSetPath: "/test/set.enc.json",
+      decryptor: () => {
+        attempts += 1
+        // First attempt: `sops` missing from PATH mid-deploy. Then it recovers.
+        if (attempts === 1) {
+          throw new CryptoCoreFault("decryptor-unavailable")
+        }
+        return SECRET_SET
+      },
+    })
+    setVendorSecretCryptoCoreClockForTests(() => clock)
+
+    expect(getVendorSecretCryptoCore().ok).toBe(false)
+    // Within the backoff window: still faulted, and NOT re-attempted.
+    clock += CRYPTO_CORE_FAULT_RETRY_MS - 1
+    expect(getVendorSecretCryptoCore().ok).toBe(false)
+    expect(attempts).toBe(1)
+
+    // After the backoff: re-attempted, and the transient outage is over.
+    clock += 1
+    const r = getVendorSecretCryptoCore()
+    expect(r.ok).toBe(true)
+    expect(attempts).toBe(2)
+  })
+
+  it("review-fix M-4: a DETERMINISTIC fault stays cached — no decrypt storm on a misconfigured env", () => {
+    let clock = 1_000_000
+    let attempts = 0
+    setVendorSecretCryptoCoreClockForTests(() => clock)
+    configureVendorSecretCryptoCore({
+      secretSetPath: "/test/set.enc.json",
+      decryptor: () => {
+        attempts += 1
+        return "{not json"
+      },
+    })
+    setVendorSecretCryptoCoreClockForTests(() => clock)
+
+    expect(getVendorSecretCryptoCore().ok).toBe(false)
+    clock += CRYPTO_CORE_FAULT_RETRY_MS * 100
+    const r = getVendorSecretCryptoCore()
+    expect(r.ok).toBe(false)
+    expect(r.ok === false && r.fault.reason).toBe("secret-set-malformed")
+    expect(attempts).toBe(1)
   })
 
   it("contains no reference to the shared VENDOR_HMAC_SECRET (AD-20, checked in-source)", () => {

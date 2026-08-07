@@ -3,7 +3,32 @@
  *
  * Read-only bridge for guest checkout completion. Mercur's cart completion can
  * return an order_group without embedding child order ids, while the storefront
- * handoff needs the concrete order id for confirmation/payment-status routes.
+ * handoff needs the concrete order ids for confirmation/payment-status routes.
+ *
+ * ── v1.15.0 Story 3.6 (FR-7, AD-16) — this bridge carries CARDINALITY ────────
+ * A multi-seller cart produces ONE order PER SELLER. Until v1.15.0 this handler
+ * ended its query with `.orderBy("o.created_at","desc").first()`, so a two-seller
+ * purchase was reported to the storefront as a single order and the buyer was
+ * shown one of her two orders with nothing indicating the other existed.
+ *
+ * The upstream boundary is measured, not assumed: `OrderGroupDTO`
+ * (`@mercurjs/types/dist/order-group/common.d.ts:1-11`) has NO `orders` field —
+ * only `seller_count` — and Medusa's `StoreCompleteCartResponse`
+ * (`@medusajs/types/dist/http/cart/store/responses.d.ts:36-47`) carries a single
+ * `order`. Child order ids are therefore NOT reachable from the completion
+ * response, which is exactly why the collection has to be built HERE.
+ *
+ * Response shape: `orders: [{ order_id, order_group_id }, ...]` — the whole set.
+ * `order_id` / `order_group_id` remain at the top level as a BACKWARD-COMPAT
+ * drill-down for storefront builds deployed before this change (the two repos
+ * are separate submodules and can be deployed out of step). Per AD-16 this is a
+ * legitimate reduction only because the surface it sits on (`orders`) shows the
+ * WHOLE set — it is a drill-down, not a truncation, and it is named as such.
+ *
+ * The scalar also keeps its PRE-3.6 SEMANTICS (newest order of the cart), not
+ * just its shape — see the comment at the response site. Backward compatibility
+ * that preserves the field name while changing which row it points at is not
+ * backward compatibility.
  */
 
 import type { MedusaRequest, MedusaResponse } from "@medusajs/framework/http"
@@ -29,7 +54,10 @@ export async function GET(
   }
 
   const db = req.scope.resolve(ContainerRegistrationKeys.PG_CONNECTION) as Knex
-  const row = await db<CompletedOrderRow>("order_cart as oc")
+  // AD-16: `orderBy` here orders the COLLECTION for a stable, reproducible
+  // response — it does not select an element. Ascending by creation time so the
+  // first seller's order stays first across repeated reads.
+  const rows = await db<CompletedOrderRow>("order_cart as oc")
     .select({
       order_id: "o.id",
       order_group_id: "og.id",
@@ -40,16 +68,40 @@ export async function GET(
     .where("oc.cart_id", cartId)
     .whereNull("oc.deleted_at")
     .whereNull("o.deleted_at")
-    .orderBy("o.created_at", "desc")
-    .first()
+    .orderBy("o.created_at", "asc")
+    .orderBy("o.id", "asc")
 
-  if (!row?.order_id) {
+  const orders = rows
+    .filter((row) => typeof row.order_id === "string" && row.order_id.length > 0)
+    .map((row) => ({
+      order_id: row.order_id,
+      order_group_id: row.order_group_id ?? null,
+    }))
+
+  if (orders.length === 0) {
     res.status(404).json({ type: "not_found", message: "Completed order not found" })
     return
   }
 
+  // Backward-compat drill-down (see file header). NOT a reduction of the
+  // contract: `orders` above carries the whole set.
+  //
+  // v1.15.0 Story 3.6 review-fix (LOW): the scalar keeps its PRE-3.6 MEANING.
+  // Before this story the handler ended with `.orderBy("o.created_at","desc").first()`,
+  // so `order_id` was the NEWEST order of the cart. Sorting the collection
+  // ascending (for a stable, reproducible `orders`) and then taking `orders[0]`
+  // silently flipped the scalar to the OLDEST order — a semantic change for
+  // every pre-v1.15.0 storefront build, which is precisely the consumer this
+  // scalar exists for. The two repos are separate submodules and deploy out of
+  // step, so that consumer is real, not hypothetical.
+  //
+  // Collection order stays ascending; the scalar is taken from the END.
+  const backwardCompatNewest = orders[orders.length - 1]
+
   res.json({
-    order_id: row.order_id,
-    order_group_id: row.order_group_id ?? null,
+    orders,
+    order_count: orders.length,
+    order_id: backwardCompatNewest.order_id,
+    order_group_id: backwardCompatNewest.order_group_id,
   })
 }

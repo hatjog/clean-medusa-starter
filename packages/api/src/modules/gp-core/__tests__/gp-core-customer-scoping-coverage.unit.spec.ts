@@ -213,9 +213,9 @@ const COVERED_PATHS: ReadonlyArray<CoveragePath> = [
     file: "api/vendor/vouchers/[code]/lookup/route.ts",
     result: "out-of-scope",
     scope: ["vendor-seller"],
-    guardLiterals: ["withVendorAuth", "voucher.seller_id !== authenticatedSellerId"],
+    guardLiterals: ["req.vendorAuth!", "voucher.seller_id !== authenticatedSellerId"],
     rationale:
-      "Vendor surface: HMAC withVendorAuth binds the authenticated seller_id; cross-vendor lookups return 403. A vendor is not a customer, so customer-scoping does not apply — listed explicitly per AC1 (no silent exclusion).",
+      "Vendor surface: the /vendor/* HMAC gate (Story 5.4; `withVendorAuth` was deleted) binds the authenticated seller_id into `req.vendorAuth`, and the route compares it; cross-vendor lookups return 403. A vendor is not a customer, so customer-scoping does not apply — listed explicitly per AC1 (no silent exclusion).",
   },
   {
     id: "vendor.voucher.redeem",
@@ -224,7 +224,7 @@ const COVERED_PATHS: ReadonlyArray<CoveragePath> = [
     file: "api/vendor/vouchers/[code]/redeem/route.ts",
     result: "out-of-scope",
     scope: ["vendor-seller"],
-    guardLiterals: ["withVendorAuth", "existing.seller_id !== authenticatedSellerId"],
+    guardLiterals: ["req.vendorAuth!", "existing.seller_id !== authenticatedSellerId"],
     rationale:
       "Vendor redeem (create + read entitlement_instance state) bound to authenticated seller_id via HMAC; cross-vendor attempts 403. Vendor ≠ customer — out-of-scope for customer-scoping, listed explicitly.",
   },
@@ -361,8 +361,20 @@ describe("Story 1.5 customer-scoping coverage — structural (CI-runnable)", () 
     expect(route).toContain("resolveAdminMarketContext(req)")
     expect(route).toContain("MARKET_REQUIRED")
     expect(route).toContain("market_id: marketResult.market_id")
-    // L2 — super-admin keeps cross-market global search via explicit opt-in.
-    expect(route).toContain("allow_cross_market: !marketResult.market_id && marketResult.is_super_admin")
+    // L2 — super-admin keeps cross-market global search, ale od v1.15.0 Story 2.6
+    // (FR-14e) NIE przez „jeden przebieg bez rynku": pod FORCE RLS zmienna sesji
+    // niesie DOKŁADNIE JEDEN rynek, a polityka nie ma trybu „wszystkie rynki",
+    // więc taki przebieg zwracałby ZERO wierszy niezależnie od uprawnień.
+    // Wyszukiwanie jest rozwijane po WYLICZONYM rosterze, raz na rynek, a każdy
+    // przebieg idzie w kontekście rynku — tym samym nośnikiem co `/store/*`.
+    expect(route).toContain("runInHttpMarketContext")
+    expect(route).toContain("listConfiguredMarketIds")
+    // Serwis NIGDY nie dostaje `allow_cross_market: true` — cross-market jest
+    // realizowany kontekstem, nie rozluźnieniem filtra w SQL-u.
+    expect(route).toContain("allow_cross_market: false")
+    expect(route).not.toContain(
+      "allow_cross_market: !marketResult.market_id && marketResult.is_super_admin"
+    )
     // L1 — service is fail-closed by default (no opts ⇒ empty, not unscoped read).
     expect(service).toContain("if (!marketId && !allowCrossMarket) return []")
     expect(service).toContain("AND ($2::text IS NULL OR ei.market_id = $2)")

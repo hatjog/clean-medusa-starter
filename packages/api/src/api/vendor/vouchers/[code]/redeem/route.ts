@@ -6,7 +6,8 @@
  * mocked Playwright route, the live verdict was BLOCKED_BY_RUNTIME.
  *
  * Behaviour:
- *   - withVendorAuth (HMAC) → vendorAuth.seller_id is the authenticated seller.
+ *   - The `/vendor/*` matcher (Story 5.4) authenticates the request and
+ *     populates vendorAuth.seller_id before this handler runs.
  *   - voucher.seller_id MUST match the authenticated seller (cross-vendor
  *     redeem returns 404 to avoid existence leak).
  *   - VoucherService.claim performs the atomic ACTIVE → claimed transition
@@ -23,7 +24,7 @@
  *
  * Validation:
  *   - 400 INVALID_INPUT — missing/short code
- *   - 401 UNAUTHORIZED — withVendorAuth fails (handled by HOF)
+ *   - 401 UNAUTHORIZED — refused by the /vendor/* gate, never reaches here
  *   - 404 VOUCHER_NOT_FOUND — code unknown OR cross-vendor lookup attempt
  *   - 410 VOUCHER_EXPIRED — voucher has expires_at < now
  *
@@ -32,8 +33,14 @@
  */
 
 import type { MedusaRequest, MedusaResponse } from "@medusajs/framework/http"
+import { ContainerRegistrationKeys } from "@medusajs/framework/utils"
+import type { Knex } from "knex"
 import { randomUUID } from "node:crypto"
-import { withVendorAuth } from "../../../../../lib/vendor-auth"
+import {
+  HttpMarketContextError,
+  resolveSellerMarketId,
+  runInHttpMarketContext,
+} from "../../../../../lib/http-market-context"
 import type { VendorAuthContext } from "../../../../../lib/vendor-auth"
 import { appendNotificationLog } from "../../../../../lib/vendor-notification-log"
 import {
@@ -63,7 +70,7 @@ type VendorRedeemResponse = {
   envelope: VendorRedeemAuditEnvelope
 }
 
-export const POST = withVendorAuth(async (
+export const POST = async (
   req: RequestWithVendorAuth,
   res: MedusaResponse,
 ): Promise<void> => {
@@ -77,6 +84,46 @@ export const POST = withVendorAuth(async (
   }
 
   const { vendor_id: vendorId, seller_id: authenticatedSellerId } = req.vendorAuth!
+
+  // v1.15.0 Story 2.6 (FR-14e, AD-21 §4) — ta trasa jest HTTP, ale NIE `/store/*`,
+  // więc nie przechodzi przez `marketContextMiddleware`. Po włączeniu FORCE RLS
+  // na tabelach modułu voucher połączenie bez `app.gp_market_id` widzi ZERO
+  // wierszy: `getByCode` zwróciłby `null` („voucher nie istnieje"), a `claim`
+  // zostałby odrzucony przez `WITH CHECK`. Rynek pochodzi z uwierzytelnionego
+  // sprzedawcy — vendor nie może go podać nagłówkiem, więc nie da się go podmienić.
+  const db = req.scope.resolve(ContainerRegistrationKeys.PG_CONNECTION) as Knex
+  let sellerMarketId: string
+  try {
+    sellerMarketId = await resolveSellerMarketId(db, authenticatedSellerId)
+  } catch (error) {
+    if (error instanceof HttpMarketContextError) {
+      res.status(409).json({
+        code: "MARKET_CONTEXT_REQUIRED",
+        message: error.message,
+      })
+      return
+    }
+    throw error
+  }
+
+  await runInHttpMarketContext(sellerMarketId, async () => {
+    await redeemInSellerMarket(req, res, {
+      code,
+      vendorId,
+      authenticatedSellerId,
+    })
+  })
+}
+
+async function redeemInSellerMarket(
+  req: RequestWithVendorAuth,
+  res: MedusaResponse,
+  {
+    code,
+    vendorId,
+    authenticatedSellerId,
+  }: { code: string; vendorId: string; authenticatedSellerId: string },
+): Promise<void> {
   const voucherService = req.scope.resolve(VOUCHER_MODULE) as VoucherService
 
   // Pre-check: cross-vendor lookup attempts return 404 BEFORE claim() runs
@@ -170,4 +217,4 @@ export const POST = withVendorAuth(async (
     envelope,
   }
   res.status(200).json(response)
-})
+}

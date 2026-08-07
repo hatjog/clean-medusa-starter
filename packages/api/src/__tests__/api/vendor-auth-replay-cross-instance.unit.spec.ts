@@ -4,18 +4,14 @@
  *
  * ── Dlaczego przez trasę, a nie przez `verifyVendorSignature` ──────────────
  * Dowód z funkcji czystej nie jest dowodem o trasie (NFR-1). Każdy przypadek
- * niżej biegnie przez `withVendorAuth` ALBO `vendorAuthMiddleware` — dwa
- * EKSPORTOWANE wejścia biblioteki.
+ * niżej biegnie przez JEDYNE produkcyjne wejście — bramkę `/vendor/*`.
  *
- * ATRYBUCJA, ŻEBY NIE MYLIĆ POKRYCIA Z ZASIĘGIEM: produkcyjnym wejściem jest
- * dziś WYŁĄCZNIE `withVendorAuth` (`vouchers/[code]/{redeem,lookup}`,
- * `training-cert/upload`). `vendorAuthMiddleware` NIE jest zarejestrowany na
- * żadnej trasie — `api/middlewares.ts` rejestruje `operatorAuthMiddleware`, a
- * `middlewares/with-operator-auth.ts` wspomina `withVendorAuth` tylko w
- * komentarzu. Pokrywamy go mimo to, bo jest eksportem publicznym i wejście
- * przez niego musi mieć tę samą barierę — ale to jest pokrycie MARTWEGO
- * eksportu, nie drugiej realnej trasy. Rozstrzygnięcie „zostaje czy podziela
- * los `NonceLru`" należy do 5.4 (patrz ADR-185, Konsekwencje).
+ * ATRYBUCJA (v1.15.0 Story 5.4, ADR-194): rozstrzygnięcie „HOF zostaje czy
+ * podziela los `NonceLru`", zostawione tu przez 5.3, zapadło — `withVendorAuth`
+ * NIE ISTNIEJE. `vendorAuthMiddleware` jest zarejestrowany raz, matcherem
+ * `/vendor/*` w `api/middlewares.ts`, i to jest cała powierzchnia. Znika przez
+ * to poprzednia dwuznaczność „pokrywamy martwy eksport": poniższe przypadki
+ * mierzą trasę, którą realnie jedzie ruch produkcyjny.
  *
  * ── Co znaczy tutaj „druga instancja" ──────────────────────────────────────
  * DWA ODRĘBNE KONTENERY ZALEŻNOŚCI (dwa niezależnie zbudowane `req.scope`),
@@ -37,10 +33,10 @@ import { ContainerRegistrationKeys } from "@medusajs/framework/utils"
 
 import { buildVendorSignatureHeader } from "../../lib/vendor-hmac"
 import {
-  withVendorAuth,
   vendorAuthMiddleware,
   VENDOR_AUTH_REPLAY_GUARD_UNAVAILABLE,
 } from "../../lib/vendor-auth"
+import { withVendorGate } from "../helpers/vendor-auth-chain"
 import {
   VENDOR_AUTH_REPLAY_DETECTED,
   VENDOR_AUTH_SIGNATURE_INVALID,
@@ -166,7 +162,7 @@ function buildInstance(db: { raw: SharedGuardTable["raw"] }) {
     return { res, captured }
   }
 
-  /** Wejście 1 na trasę: HOF `withVendorAuth`. */
+  /** Wejście na trasę: bramka `/vendor/*` (od 5.4 jedyne). */
   async function callViaHof(header: string | undefined, body?: unknown) {
     const { res, captured } = buildRes()
     const seen: { sellerId?: string } = {}
@@ -174,7 +170,7 @@ function buildInstance(db: { raw: SharedGuardTable["raw"] }) {
       seen.sellerId = req.vendorAuth?.seller_id
       res.status(200).json({ ok: true })
     })
-    await withVendorAuth(handler as any)(buildReq(header, body), res, (() => {}) as any)
+    await withVendorGate(handler as any)(buildReq(header, body), res, (() => {}) as any)
     return { status: captured.status, body: captured.body, logged, seen, handler }
   }
 
@@ -217,7 +213,7 @@ describe("Story 5.3 — replay-guard cross-instance na trasie /vendor/*", () => 
   // AC4 — kontrola NEGATYWNA i DODATNIA, cross-instance, przez OBA wejścia
   // -------------------------------------------------------------------------
 
-  it("KONTROLA NEGATYWNA: powtórzenie skierowane do DRUGIEJ instancji jest odrzucane (withVendorAuth)", async () => {
+  it("KONTROLA NEGATYWNA: powtórzenie skierowane do DRUGIEJ instancji jest odrzucane (bramka /vendor/*)", async () => {
     const shared = new SharedGuardTable()
     const instance1 = buildInstance(shared)
     const instance2 = buildInstance(shared)

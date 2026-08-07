@@ -26,6 +26,7 @@ import { Pool, type PoolClient } from "pg"
 
 import { Migration1778928000000 } from "../../modules/voucher/migrations/1778928000000_create_event_processed_table"
 import { Migration1778928100000 } from "../../modules/voucher/migrations/1778928100000_add_vat_classification_and_ontology_fk"
+import { Migration1779006000000 } from "../../modules/voucher/migrations/1779006000000_add_purchase_key_to_event_processed"
 import { buildEventProcessedDedupeInsert } from "../../modules/voucher/models/event-processed"
 
 /** Zbiera surowe stringi SQL z `up()` danej migracji (jak `addSql` w Mikro-ORM). */
@@ -92,6 +93,9 @@ maybe("Story 3.2 — migracja na realnym PG (review AI-01 / AI-04)", () => {
       for (const sql of [
         ...collectUpSql(Migration1778928000000),
         ...collectUpSql(Migration1778928100000),
+        // Story 3.3: kolumna klucza zakupu `event_processed.purchase_key`
+        // (AD-16 / ADR-190) — dedupe-insert wstawia ją od tej migracji.
+        ...collectUpSql(Migration1779006000000),
       ]) {
         await client.query(sql)
       }
@@ -198,6 +202,7 @@ maybe("Story 3.2 — migracja na realnym PG (review AI-01 / AI-04)", () => {
         external_id: "pi_pg_replay",
         event_type: "gp.stripe.payment_intent_succeeded.v1",
         processed_at: 1_780_000_000_000,
+        purchase_key: "pi_pg_replay",
       })
       const r1 = await c.query(first.sql, first.params)
       expect(r1.rowCount).toBe(1)
@@ -207,6 +212,7 @@ maybe("Story 3.2 — migracja na realnym PG (review AI-01 / AI-04)", () => {
         external_id: "pi_pg_replay",
         event_type: "gp.stripe.payment_intent_succeeded.v1",
         processed_at: 1_780_000_999_999,
+        purchase_key: "pi_pg_replay",
       })
       const r2 = await c.query(replay.sql, replay.params)
       expect(r2.rowCount).toBe(0) // NO-OP

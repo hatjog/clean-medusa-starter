@@ -14,7 +14,7 @@ Related files:
 | **public** | `/v1/health`, `/status`, `/api/v1/entitlements/claim` | None | (future: rate-limit) | Yes (future) | Existing endpoints, no auth required |
 | **storefront** | `/store/*` | Publishable API key | `marketContextMiddleware` → `marketGuardMiddleware` → `customerMarketGuardMiddleware` + route-specific overlays | Yes (future) | Fully implemented — see [MIDDLEWARE_STACK.md](MIDDLEWARE_STACK.md) |
 | **vendor (GP browser JWT)** | `/vendor/auth/sessions`, `/vendor/magic-links/:jti/revoke`, `/vendor/competitive-insights` | `authenticate("seller", ["bearer"])` + handler seller-context guard | Wired in `middlewares.ts` / Mercur seller context | No | Browser-initiated vendor routes; session list, JTI-scoped revoke, and seller-context competitive insights |
-| **vendor (GP-S2S-HMAC)** | `/vendor/training-cert/upload`, `/vendor/vouchers/:code/lookup`, `/vendor/vouchers/:code/redeem` | `withVendorAuth` (HMAC `x-vendor-signature` only; cc-4 F-10 removed the legacy `x-vendor-token` path) | Inline HOF in route handler | No | GP-owned S2S surface — machine-to-machine only; cross-vendor lookups return 404 |
+| **vendor (GP-S2S-HMAC)** | `/vendor/training-cert/upload`, `/vendor/vouchers/:code/lookup`, `/vendor/vouchers/:code/redeem` | `/vendor/*` matcher → `vendorHmacGateMiddleware` (HMAC `x-vendor-signature` only; cc-4 F-10 removed the legacy `x-vendor-token` path) | `middlewares.ts` matcher (Story 5.4; the per-route HOF is gone) | No | GP-owned S2S surface — machine-to-machine only; cross-vendor lookups return 404 |
 | **vendor (Mercur-native)** | other `/vendor/*` routes shipped by upstream Mercur | Mercur seller cookie/session | Native Mercur middleware | No | Untouched — upstream contract preserved |
 | **admin (Medusa-native)** | `/admin/*` non-GP routes | Medusa admin auth | Native Medusa middleware | No | Native Medusa — no explicit GP middleware needed |
 | **admin (GP-custom UI)** | `/admin/operator/*`, `/admin/vendors/*` (POST/PATCH/PUT/DELETE), `/admin/entitlements/*` (POST), `/admin/magic-links/*` (POST), `/admin/sellers/:id/pause` | `authenticate("user", ["session","bearer"])` + `operatorAuthMiddleware` | Wired in `middlewares.ts` | No | GP custom operator surface — `actor_type="user"` enforced; cc-4 F-01 wired `operator/*` matcher |
@@ -43,7 +43,8 @@ Related files:
   - `GET  /vendor/competitive-insights` (seller-context JWT, cc-4)
 
 ### Vendor Group (GP S2S HMAC)
-- `withVendorAuth` HOF (HMAC `x-vendor-signature` only — cc-4 F-10 removed `x-vendor-token` legacy path).
+- `/vendor/*` matcher → `vendorHmacGateMiddleware` (HMAC `x-vendor-signature` only — cc-4 F-10 removed the `x-vendor-token` legacy path).
+- v1.15.0 Story 5.4: authentication follows from the MATCHER, so any NEW `/vendor/*` route is authenticated by default. Exemptions are the named list in `lib/vendor-auth-matcher.ts` (`VENDOR_HMAC_EXEMPT_ROUTES`), each naming the transport that replaces the signature.
 - Machine-to-machine only; no browser-originated callers.
 - GP routes under `/vendor/*`:
   - `POST /vendor/training-cert/upload`

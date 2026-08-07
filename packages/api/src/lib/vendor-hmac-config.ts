@@ -3,11 +3,24 @@
  *
  * Keeps vendor-auth.ts testable by separating env resolution from logic.
  *
+ * v1.15.0 Story 5.4 (FR-11 closure, D-5, AD-20, SM-6):
+ *   The shared `VENDOR_HMAC_SECRET` is GONE from this module — not deprecated,
+ *   not behind a flag, not a fallback. Signing material is resolved PER SELLER
+ *   by `lib/vendor-secret/crypto-core.ts` (Story 5.2). What remains here is
+ *   POLICY, not secret material:
+ *     * enforcement (is a signature required at all),
+ *     * drift tolerance (how far a timestamp may be off).
+ *   Keeping those two is not a partial payment of the debt: neither is key
+ *   material, and neither can be used to authenticate a request.
+ *
+ *   Consequence that is the point of the story: `/vendor/*` now serves a
+ *   correctly signed request with `VENDOR_HMAC_SECRET` COMPLETELY UNSET. Before
+ *   5.4 the same environment produced `503 VENDOR_AUTH_CONFIG_ERROR`, so the
+ *   route was a hostage of a secret it no longer used.
+ *
  * Environment variables:
- *   VENDOR_HMAC_SECRET       — Required when VENDOR_HMAC_ENFORCED=true.
- *                               Single shared secret for v1.6.0 topology.
- *                               (v1.7.0 ADR follow-up: per-vendor secret store)
- *   VENDOR_HMAC_ENFORCED     — "false" to enable legacy transition window.
+ *   VENDOR_HMAC_ENFORCED     — "false" fails closed (503); the legacy
+ *                               `x-vendor-token` path was deleted in v1.9.0.
  *                               Default: true (fail-closed).
  *   VENDOR_HMAC_DRIFT_SECONDS — Replay window in seconds. Default: 300.
  *
@@ -15,8 +28,6 @@
  */
 
 export type VendorHmacConfig = {
-  /** Raw secret bytes (Buffer) for HMAC-SHA256. */
-  secret: Buffer
   /** When true, HMAC is required on all vendor-auth requests. */
   enforced: boolean
   /** Timestamp drift tolerance in seconds (default 300 = 5 min). */
@@ -24,29 +35,21 @@ export type VendorHmacConfig = {
 }
 
 /**
- * Resolves HMAC config from environment.
+ * Resolves HMAC POLICY from environment.
  *
- * Throws if `VENDOR_HMAC_ENFORCED` is not `false` and `VENDOR_HMAC_SECRET` is unset.
- * Called lazily on first request to surface the fatal condition at runtime.
+ * Does not throw: there is no longer any secret material whose absence could be
+ * fatal here. A misconfigured `VENDOR_HMAC_ENFORCED=false` is surfaced by
+ * `vendor-auth.ts` as a readable 503, which keeps that failure distinguishable
+ * from "secret store unavailable" and from "this seller has no secret".
  */
 export function resolveVendorHmacConfig(): VendorHmacConfig {
   const enforcedRaw = process.env.VENDOR_HMAC_ENFORCED
   const enforced = enforcedRaw !== "false"
 
-  const secretRaw = process.env.VENDOR_HMAC_SECRET ?? ""
-  if (enforced && !secretRaw) {
-    throw new Error(
-      "[vendor-hmac-config] FATAL: VENDOR_HMAC_SECRET is unset but VENDOR_HMAC_ENFORCED is true. " +
-        "Set VENDOR_HMAC_SECRET or set VENDOR_HMAC_ENFORCED=false for transition window. " +
-        "See v1.6.0 cleanup-48 implementation notes."
-    )
-  }
-
   const driftRaw = process.env.VENDOR_HMAC_DRIFT_SECONDS
   const driftSeconds = driftRaw ? parseInt(driftRaw, 10) : 300
 
   return {
-    secret: Buffer.from(secretRaw, "utf8"),
     enforced,
     driftSeconds,
   }
