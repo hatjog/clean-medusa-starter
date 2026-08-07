@@ -769,6 +769,49 @@ function denyMarketScope(
   });
 }
 
+/**
+ * v1.15.0 Story 2.4 (FR-14b, NFR-5) — kontrakt statusu dla dostepu cross-market.
+ *
+ * ADR-109 (`specs/adr/2026-05-14-adr-109-market-guard-middleware-3-state.md:44`):
+ * "Jesli zasob ... jest requestowany przez user z innego marketu -> 403
+ * (nie 404, bo zasob istnieje — cross-market access deny)".
+ *
+ * SWIADOMA KOREKTA ROZJAZDU: galaz detalu zwracala tu wczesniej 404. Byla to
+ * galaz MARTWA (middleware nie byl zarejestrowany na `/store/products/:id`),
+ * wiec rozjazd z ADR-109 nie mial jak sie ujawnic. Ozywienie trasy go ujawnia
+ * i ta story go zamyka.
+ *
+ * NIE mylic ze scenariuszem "brak kontekstu rynku" — ten rozstrzyga
+ * `failWithMarketContext()` (401, mandat Story 4.4 AC3/F7) i story 2.3.
+ * Brak kontekstu != kontekst obcego rynku.
+ */
+export const CROSS_MARKET_PRODUCT_STATUS = 403;
+export const CROSS_MARKET_PRODUCT_MESSAGE = "Product not available in this market";
+
+/**
+ * Czy zadanie celuje w JEDEN konkretny produkt?
+ *
+ * "Trasa szczegolu produktu" to dzis DWIE sciezki sieciowe: `/store/products/:id`
+ * oraz `/store/products?handle=...` (storefrontowy PDP idzie przez liste).
+ * Parytet statusu z AC2 dotyczy wlasnie zadan celowanych — dla przegladania
+ * katalogu odfiltrowanie obcorynkowych pozycji pozostaje poprawne (200).
+ */
+function targetsSingleProduct(request: RequestExtensions): boolean {
+  const handle = request.filterableFields?.handle ?? request.query?.handle;
+  if (typeof handle === "string" && handle.trim()) {
+    return true;
+  }
+  if (Array.isArray(handle) && handle.length === 1) {
+    return true;
+  }
+
+  const id = request.filterableFields?.id ?? request.query?.id;
+  if (typeof id === "string" && id.trim()) {
+    return true;
+  }
+  return Array.isArray(id) && id.length === 1;
+}
+
 export async function productListMarketScopeMiddleware(
   req: MedusaRequest,
   res: MedusaResponse,
@@ -788,29 +831,42 @@ export async function productListMarketScopeMiddleware(
     return;
   }
 
-  const scopedContext = context as CompleteMarketContext;
-  const db = req.scope.resolve(ContainerRegistrationKeys.PG_CONNECTION) as Knex;
-  let scopedProductIds = await listProductIdsForSalesChannel(
-    db,
-    scopedContext.sales_channel_id
-  );
-  const existingIdFilter = request.filterableFields?.id ?? request.query?.id;
-  const requestedIds = Array.isArray(existingIdFilter)
-    ? existingIdFilter.filter((id): id is string => typeof id === "string")
-    : typeof existingIdFilter === "string"
-      ? [existingIdFilter]
-      : [];
+  // Story 2.4: na trasie detalu (`/store/products/:id`) rdzen Medusy czyta
+  // `req.params.id`, a nie `filterableFields.id`. Wstrzykniecie tam pelnej listy
+  // ID kanalu nic nie zaweza, za to rozjezdza sie z kontraktem handlera detalu.
+  // Zawezanie wejsciowe zostaje wiec przy powierzchni listingowej; ochrona
+  // detalu dziala na odpowiedzi (ponizej), na juz policzonym produkcie.
+  //
+  // Story 2.3 (integracja): BRAMA WEJŚCIOWA wyżej biegnie BEZWARUNKOWO, także
+  // na trasie detalu — brak kontekstu rynku jest odmową 403 na obu
+  // powierzchniach. Pomijane jest wyłącznie zawężanie filtrów, nie odmowa.
+  const isDetailRoute = typeof request.params?.id === "string";
 
-  if (requestedIds.length) {
-    const requestedIdSet = new Set(requestedIds);
-    scopedProductIds = scopedProductIds.filter((id) => requestedIdSet.has(id));
+  if (!isDetailRoute) {
+    const scopedContext = context as CompleteMarketContext;
+    const db = req.scope.resolve(ContainerRegistrationKeys.PG_CONNECTION) as Knex;
+    let scopedProductIds = await listProductIdsForSalesChannel(
+      db,
+      scopedContext.sales_channel_id
+    );
+    const existingIdFilter = request.filterableFields?.id ?? request.query?.id;
+    const requestedIds = Array.isArray(existingIdFilter)
+      ? existingIdFilter.filter((id): id is string => typeof id === "string")
+      : typeof existingIdFilter === "string"
+        ? [existingIdFilter]
+        : [];
+
+    if (requestedIds.length) {
+      const requestedIdSet = new Set(requestedIds);
+      scopedProductIds = scopedProductIds.filter((id) => requestedIdSet.has(id));
+    }
+
+    const enforcedIds = scopedProductIds.length
+      ? scopedProductIds
+      : ["__gp_no_products_in_market__"];
+    request.query = { ...request.query, id: enforcedIds };
+    request.filterableFields = { ...request.filterableFields, id: enforcedIds };
   }
-
-  const enforcedIds = scopedProductIds.length
-    ? scopedProductIds
-    : ["__gp_no_products_in_market__"];
-  request.query = { ...request.query, id: enforcedIds };
-  request.filterableFields = { ...request.filterableFields, id: enforcedIds };
 
   const originalJson = res.json.bind(res);
 
@@ -842,8 +898,9 @@ export async function productListMarketScopeMiddleware(
           !Array.isArray(typedBody.product) &&
           productMarketId(typedBody.product) !== responseContext.market_id
         ) {
-          res.status(404);
-          return originalJson({ message: "Product not found" });
+          // ADR-109 :44 — zasob istnieje, ale nalezy do innego rynku => 403.
+          res.status(CROSS_MARKET_PRODUCT_STATUS);
+          return originalJson({ message: CROSS_MARKET_PRODUCT_MESSAGE });
         }
         return originalJson(body);
       }
@@ -876,6 +933,17 @@ export async function productListMarketScopeMiddleware(
       });
 
       const removedCount = typedBody.products.length - inMarketProducts.length;
+
+      // Story 2.4 / AC2 — PARYTET POWIERZCHNI. `/store/products?handle=...` to
+      // druga siec­owa sciezka PDP. Gdy zadanie celowalo w jeden konkretny
+      // produkt i jedyne dopasowanie odpadlo jako obcorynkowe, odpowiedzia jest
+      // ten sam status co na `/store/products/:id` (ADR-109 :44), a nie puste 200.
+      // Przegladanie katalogu (brak filtra celowanego) nadal filtruje po cichu.
+      if (removedCount > 0 && !inMarketProducts.length && targetsSingleProduct(request)) {
+        res.status(CROSS_MARKET_PRODUCT_STATUS);
+        return originalJson({ message: CROSS_MARKET_PRODUCT_MESSAGE });
+      }
+
       const scopedCount =
         typeof typedBody.count === "number"
           ? Math.max(typedBody.count - removedCount, inMarketProducts.length)
@@ -1098,7 +1166,13 @@ export default defineMiddlewares({
     {
       method: ["GET"],
       matcher: "/store/products/:id",
-      middlewares: [vendorMetaMiddleware],
+      // Story 2.4 (FR-14b, NFR-5): ochrona rynkowa MUSI poprzedzac
+      // `vendorMetaMiddleware` — kolejnosc jest identyczna jak na liscie, bo oba
+      // podmieniaja `res.json` i ostatni podmieniajacy owija poprzedniego.
+      // Ochrona NIE moze wisiec na interceptorze `vendorMetaMiddleware`: przy
+      // fladze `multi_vendor_pdp` != "on" robi on `return next()` PRZED jego
+      // podpieciem i ochrona zniknelaby razem z flaga.
+      middlewares: [productListMarketScopeMiddleware, vendorMetaMiddleware],
     },
   ],
 });
