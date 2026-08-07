@@ -22,8 +22,11 @@
  *     structured log przez `logger`). Envelope jest PII-free z konstrukcji
  *     (`hashed_recipient`), więc log nie łamie D-70. Bez tego envelope powstawał
  *     i przepadał — invariant był deklarowany, nie realizowany.
- *   - `idempotency-cache` — ZACHOWANY (to natywna własność gatewaya; pre-flight
- *     faile nie są cache'owane, patrz R-2.2-M2 w `gateway.ts`).
+ *   - bariera idempotencji — od Story 4.1 (v1.15.0) TRWAŁA i WSTRZYKIWANA stąd.
+ *     Gateway nie ma już mapy w pamięci procesu; ten plik składa
+ *     `PgDispatchIdempotencyBarrier` nad `PG_CONNECTION` kontenera modułu.
+ *     Rozróżnienie porażek przeżyło przeniesienie bez zmian (pre-flight zwalnia
+ *     barierę, niejednoznaczny ją zamyka — patrz `gateway.ts`, AC3).
  *   - `flagResolver` (per-market kill-switch flow) i `flowKpiTelemetry` (KPI
  *     `sent` → denominator `delivered_rate`) — **PODPIĘTE PRODUKCYJNIE w Story
  *     2.3** (ADR-161, domknięcie deferralu R-2.2-H1). Wiring żyje w
@@ -48,7 +51,7 @@
  * (fail-loud przy wysyłce), NIGDY crash startu backendu.
  */
 
-import { MedusaError } from "@medusajs/framework/utils"
+import { ContainerRegistrationKeys, MedusaError } from "@medusajs/framework/utils"
 import type { Logger } from "@medusajs/framework/types"
 import type { NotificationTypes } from "@medusajs/types"
 import { AbstractNotificationProviderService } from "@medusajs/framework/utils"
@@ -60,6 +63,7 @@ import {
   MessagingError,
   NotConfiguredBrevoClient,
   RegistryBackedBrevoProvider,
+  type DispatchIdempotencyBarrier,
   type FlowKpiTelemetryHook,
   type IBrevoClient,
   type ICommunicationFlowFlagResolver,
@@ -67,6 +71,13 @@ import {
   type NotificationAuditEnvelope,
 } from "@gp/messaging"
 
+import {
+  BARRIER_AMBIGUOUS_WINDOW_MS,
+  BARRIER_IN_FLIGHT_WINDOW_MS,
+  PgDispatchIdempotencyBarrier,
+  unavailableDispatchBarrier,
+  type DispatchBarrierDb,
+} from "../../lib/messaging-dispatch-barrier"
 import {
   createHotReloadingFlagResolver,
   resolveCommunicationWiring,
@@ -86,6 +97,17 @@ export interface BrevoNotificationProviderOptions {
 
 type InjectedDependencies = {
   logger?: Logger
+  /**
+   * Story 4.1: połączenie z bazą dla TRWAŁEJ bariery idempotencji wysyłki.
+   *
+   * Kontener modułu Notification rejestruje ten klucz przekierowaniem do
+   * kontenera głównego (`modules-sdk/loaders/utils/load-internal.js` dopisuje
+   * `ContainerRegistrationKeys.PG_CONNECTION` do zależności każdego modułu),
+   * a provider jest budowany z cradle tego kontenera
+   * (`@medusajs/notification/loaders/providers.js`). Jeśli mimo to nie
+   * przyjdzie, wysyłka ODMAWIA GŁOŚNO — patrz `unavailableDispatchBarrier`.
+   */
+  [ContainerRegistrationKeys.PG_CONNECTION]?: DispatchBarrierDb
 }
 
 /**
@@ -110,6 +132,11 @@ export interface BrevoNotificationProviderSeams {
    */
   flagResolver?: ICommunicationFlowFlagResolver
   flowKpiTelemetry?: FlowKpiTelemetryHook
+  /**
+   * Story 4.1: seam bariery idempotencji. Test podstawia atrapę o semantyce
+   * `INSERT … ON CONFLICT`; produkcja dostaje `PgDispatchIdempotencyBarrier`.
+   */
+  barrier?: DispatchIdempotencyBarrier
 }
 
 export class BrevoNotificationProviderService extends AbstractNotificationProviderService {
@@ -118,15 +145,21 @@ export class BrevoNotificationProviderService extends AbstractNotificationProvid
   protected readonly logger_?: Logger
   protected readonly options_: BrevoNotificationProviderOptions
   private readonly seams_: BrevoNotificationProviderSeams
+  private readonly db_?: DispatchBarrierDb
   private gateway_?: MessagingGateway
 
   constructor(
-    { logger }: InjectedDependencies,
+    deps: InjectedDependencies,
     options: BrevoNotificationProviderOptions = {},
     seams: BrevoNotificationProviderSeams = {},
   ) {
     super()
-    this.logger_ = logger
+    this.logger_ = deps?.logger
+    // Cradle awilixa jest proxy — odczyt klucza wykonuje resolve. Robimy go
+    // RAZ, w konstruktorze, i tolerujemy brak (rejestracja jest
+    // `allowUnregistered`), bo brak połączenia nie może wywrócić startu
+    // backendu (AC1 Story 2.2). Odmowa następuje dopiero przy wysyłce.
+    this.db_ = readPgConnection(deps)
     this.options_ = options
     this.seams_ = seams
   }
@@ -148,7 +181,18 @@ export class BrevoNotificationProviderService extends AbstractNotificationProvid
   async send(
     notification: NotificationTypes.ProviderSendNotificationDTO,
   ): Promise<NotificationTypes.ProviderSendNotificationResultsDTO> {
-    const intent = toNotificationIntent(notification)
+    const intent = toNotificationIntent(notification, {
+      // AC2: call-site bez klucza jest WIDOCZNY. Bez tego jego wysyłka jechała
+      // na losowym kluczu, czyli bez jakiejkolwiek bariery, i nic tego nie
+      // odnotowywało.
+      onMissingIdempotencyKey: ({ template_key, market_id }) =>
+        this.logger_?.error?.(
+          "[notification-brevo] NOTIFICATION_MISSING_IDEMPOTENCY_KEY — wysyłka BEZ " +
+            `bariery idempotencji (klucz wygenerowany losowo): template_key=${template_key} ` +
+            `market_id=${market_id}. Call-site MUSI podać deterministyczny ` +
+            "`data.idempotency_key` wyprowadzony z tożsamości skutku (Story 4.1, AC2)",
+        ),
+    })
     const dispatch = await this.gateway().send(intent)
 
     // R-2.2-H1: envelope audytowy MUSI zostać skonsumowany — na obu ścieżkach,
@@ -228,6 +272,19 @@ export class BrevoNotificationProviderService extends AbstractNotificationProvid
     // dopiero po restarcie, wbrew obietnicy ADR-161 „bez deployu". Hook KPI
     // celowo pozostaje instancją z bootu (per-procesowy `dedupeStore`).
     this.gateway_ = new DefaultMessagingGateway({ brevo: provider }, "brevo", {
+      // Story 4.1 (AD-23): bariera jest WYMAGANA. Gdy kontener nie oddał
+      // połączenia, wstrzykujemy barierę ODMAWIAJĄCĄ — nigdy `undefined`,
+      // bo gateway bez bariery wysyłałby maile bez ochrony i wyglądałby przy
+      // tym na działający.
+      barrier: this.resolveBarrier(),
+      barrierInFlightWindowMs: BARRIER_IN_FLIGHT_WINDOW_MS,
+      barrierAmbiguousWindowMs: BARRIER_AMBIGUOUS_WINDOW_MS,
+      logger: {
+        warn: (message, meta) =>
+          this.logger_?.warn?.(`${message} ${JSON.stringify(meta ?? {})}`),
+        error: (message, meta) =>
+          this.logger_?.error?.(`${message} ${JSON.stringify(meta ?? {})}`),
+      },
       flagResolver:
         this.seams_.flagResolver ??
         (wiring.flagResolver
@@ -237,6 +294,30 @@ export class BrevoNotificationProviderService extends AbstractNotificationProvid
     })
 
     return this.gateway_
+  }
+
+  /**
+   * Wybiera nośnik bariery. Seam testowy ma pierwszeństwo; potem realne
+   * połączenie; a gdy go nie ma — bariera ODMAWIAJĄCA z głośnym logiem.
+   */
+  private resolveBarrier(): DispatchIdempotencyBarrier {
+    if (this.seams_.barrier) {
+      return this.seams_.barrier
+    }
+    if (this.db_) {
+      return new PgDispatchIdempotencyBarrier(this.db_)
+    }
+    this.logger_?.error?.(
+      "[notification-brevo] MESSAGING_BARRIER_UNAVAILABLE — kontener nie oddał " +
+        "połączenia z bazą; wysyłki będą ODRZUCANE zamiast iść bez bariery " +
+        "idempotencji (Story 4.1, AD-23)",
+    )
+    return unavailableDispatchBarrier((barrierKey) =>
+      this.logger_?.error?.(
+        "[notification-brevo] MESSAGING_BARRIER_UNAVAILABLE — odmowa wysyłki " +
+          `dla klucza bariery '${barrierKey}'`,
+      ),
+    )
   }
 
   private resolveClient(env: NodeJS.ProcessEnv): IBrevoClient {
@@ -270,3 +351,22 @@ export class BrevoNotificationProviderService extends AbstractNotificationProvid
 }
 
 export default BrevoNotificationProviderService
+
+/**
+ * Odczytuje `PG_CONNECTION` z cradle'a kontenera modułu.
+ *
+ * Cradle awilixa rzuca `AwilixResolutionError`, gdy klucz nie jest
+ * zarejestrowany — a w testach jednostkowych provider dostaje zwykły obiekt,
+ * gdzie odczyt po prostu daje `undefined`. Oba przypadki znaczą tu to samo:
+ * „brak połączenia", i oba są obsłużone bez wywracania konstruktora.
+ */
+function readPgConnection(
+  deps: InjectedDependencies | undefined,
+): DispatchBarrierDb | undefined {
+  try {
+    const db = deps?.[ContainerRegistrationKeys.PG_CONNECTION]
+    return typeof db?.raw === "function" ? db : undefined
+  } catch {
+    return undefined
+  }
+}

@@ -8,6 +8,7 @@ import type {
   CommunicationDefaultsConfig,
   MarketFlowsConfig,
 } from "../index";
+import { SharedDispatchBarrier } from "./support/shared-barrier";
 
 const fixedNow = new Date("2026-05-27T10:00:00.000Z");
 
@@ -83,6 +84,7 @@ describe("DefaultMessagingGateway feature flag gate", () => {
     const provider = makeProvider();
     const resolver = new StaticCommunicationFlowFlagResolver(defaults, new Map());
     const gateway = new DefaultMessagingGateway({ brevo: provider }, "brevo", {
+      barrier: new SharedDispatchBarrier(),
       flagResolver: resolver,
       clock: () => fixedNow,
       uuid: makeUuid(["audit-1"]),
@@ -105,6 +107,7 @@ describe("DefaultMessagingGateway feature flag gate", () => {
     const provider = makeProvider();
     const resolver = new StaticCommunicationFlowFlagResolver(defaults, new Map());
     const gateway = new DefaultMessagingGateway({ brevo: provider }, "brevo", {
+      barrier: new SharedDispatchBarrier(),
       flagResolver: resolver,
       clock: () => fixedNow,
       uuid: makeUuid(["gated-dispatch-1", "audit-gated-1"]),
@@ -141,6 +144,7 @@ describe("DefaultMessagingGateway feature flag gate", () => {
       new Map([["bonbeauty", bonbeauty]]),
     );
     const gateway = new DefaultMessagingGateway({ brevo: provider }, "brevo", {
+      barrier: new SharedDispatchBarrier(),
       flagResolver: resolver,
       clock: () => fixedNow,
       uuid: makeUuid(["gated-dispatch", "audit-gated", "audit-provider"]),
@@ -171,6 +175,7 @@ describe("DefaultMessagingGateway feature flag gate", () => {
   it("zachowuje kompatybilność gdy resolver nie jest injected", async () => {
     const provider = makeProvider();
     const gateway = new DefaultMessagingGateway({ brevo: provider }, "brevo", {
+      barrier: new SharedDispatchBarrier(),
       clock: () => fixedNow,
       uuid: makeUuid(["audit-1"]),
     });
@@ -198,6 +203,7 @@ describe("DefaultMessagingGateway feature flag gate", () => {
       }),
     };
     const gateway = new DefaultMessagingGateway({ brevo: provider }, "brevo", {
+      barrier: new SharedDispatchBarrier(),
       flagResolver: resolver,
       clock: () => fixedNow,
       uuid: makeUuid([
@@ -241,6 +247,7 @@ describe("DefaultMessagingGateway feature flag gate", () => {
         market_id: "bonevent",
       });
     const gateway = new DefaultMessagingGateway({ brevo: provider }, "brevo", {
+      barrier: new SharedDispatchBarrier(),
       flagResolver: { resolve: resolveMock },
       clock: () => fixedNow,
       uuid: makeUuid(["gated-dispatch", "audit-gated", "audit-provider"]),

@@ -84,6 +84,14 @@ if (process.env.TEST_TYPE === "integration:http") {
   module.exports.testMatch = [
     "**/packages/api/src/__tests__/integration/money-path-compensation-failure-pg.integration.test.[jt]s",
   ];
+} else if (process.env.TEST_TYPE === "dispatch-barrier-pg") {
+  // v1.15.0 Story 4.1 — bariera idempotencji wysylki wykonana przez sam modul
+  // na realnym Postgresie (knex.raw). DATABASE_URL musi wskazywac IZOLOWANA DB
+  // testowa: suita zaklada i kasuje `messaging_dispatch_barrier` oraz
+  // `voucher_delivery_dispatch`.
+  module.exports.testMatch = [
+    "**/packages/api/src/__tests__/integration/messaging-dispatch-barrier-pg.integration.test.[jt]s",
+  ];
 } else if (process.env.TEST_TYPE === "unit") {
   module.exports.testMatch = [
     "**/packages/api/src/**/__tests__/**/*.unit.spec.[jt]s",

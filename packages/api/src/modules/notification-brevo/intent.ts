@@ -152,14 +152,33 @@ function toNotificationAttachments(
  *   - brak/nieznane `locale` → `GP_NOTIFICATION_LOCALE_UNSUPPORTED`
  *   - brak `template`/`template_key` → `GP_NOTIFICATION_TEMPLATE_KEY_REQUIRED`
  *
- * `idempotency_key` jest wymagany przez gateway; gdy call-site go nie poda,
- * generujemy losowy (brak dedupe dla tego call-site'u — świadomy dług
- * odnotowany w Dev Agent Record, NIE deterministyczny klucz, który sklejałby
- * dwie legalne wysyłki w jedną).
+ * ── `idempotency_key` — od Story 4.1 GŁOŚNY, gdy go brakuje (AC2) ───────────
+ * Do v1.14.0 brakujący klucz był po cichu zastępowany losowym `uuid()`. Skutek
+ * był mierzalny i zły: dla KAŻDEGO call-site'u, który klucza nie podał, bariera
+ * idempotencji NIGDY nie trafiała — dwa przebiegi tego samego zdarzenia dawały
+ * dwa różne klucze, więc dwie wysyłki. Przeniesienie takiej bariery do
+ * Postgresa utrwaliłoby zero ochrony i tabelę rosnącą o wiersz na wysyłkę.
+ *
+ * Losowy klucz ZOSTAJE jako zachowanie awaryjne (deterministyczny klucz
+ * wymyślony tutaj sklejałby dwie LEGALNE wysyłki w jedną — gorzej niż brak
+ * dedupe), ale przestaje być CICHY: każde takie wejście podnosi licznik
+ * `NOTIFICATION_MISSING_IDEMPOTENCY_KEY_METRIC` (odpytywalny) i woła
+ * `deps.onMissingIdempotencyKey`. Nowy call-site bez klucza jest więc WIDOCZNY,
+ * a nie cicho niechroniony.
+ *
+ * Kolejność źródeł klucza: `data.idempotency_key` (kanoniczne GP) → TOP-LEVEL
+ * `notification.idempotency_key` (pole kontraktu Medusy, którym call-site
+ * włącza jej własny dedupe) → losowy z licznikiem. Człon top-level dołożyła
+ * Story 4.1: call-site, który podał klucz Medusie, oczywiście chce tej samej
+ * tożsamości wysyłki także tutaj.
  */
 export function toNotificationIntent(
   notification: ProviderSendNotificationLike,
-  deps: { uuid?: () => string } = {},
+  deps: {
+    uuid?: () => string
+    /** Wołane, gdy klucz trzeba było wygenerować — patrz nagłówek. */
+    onMissingIdempotencyKey?: (info: { template_key: string; market_id: string }) => void
+  } = {},
 ): NotificationIntent {
   const data = (notification.data ?? {}) as Record<string, unknown>
   const uuid = deps.uuid ?? (() => randomUUID())
@@ -212,6 +231,18 @@ export function toNotificationIntent(
     notification.attachments ?? (data.attachments as ProviderAttachmentLike[] | undefined),
   )
 
+  // AC2: brak klucza jest GŁOŚNY. Zero to nie „bez zdarzenia" — to „żaden
+  // call-site nie przeszedł tędy bez bariery".
+  const declaredKey =
+    readString(data, "idempotency_key") ??
+    readTopLevelIdempotencyKey(notification)
+  let idempotencyKey = declaredKey
+  if (!idempotencyKey) {
+    recordMissingIdempotencyKey(templateKey)
+    deps.onMissingIdempotencyKey?.({ template_key: templateKey, market_id: marketId })
+    idempotencyKey = uuid()
+  }
+
   return {
     flow_id: readString(data, "flow_id") ?? templateKey,
     channel: "email",
@@ -220,7 +251,45 @@ export function toNotificationIntent(
     variables,
     locale,
     consent_basis: consentBasis,
-    idempotency_key: readString(data, "idempotency_key") ?? uuid(),
+    idempotency_key: idempotencyKey,
     ...(attachments ? { attachments } : {}),
   }
+}
+
+/**
+ * Nazwa metryki „wysyłka bez bariery". Zapisana W KODZIE, nie tylko w prozie:
+ * metryka bez nazwy jest metryką, której nikt nie odpyta (NFR-2).
+ */
+export const NOTIFICATION_MISSING_IDEMPOTENCY_KEY_METRIC =
+  "gp_notification_missing_idempotency_key_total"
+
+/** Licznik per `template_key` — proces-lokalny i ODPYTYWALNY, jak w `system-market-context`. */
+const missingIdempotencyKeyCounters = new Map<string, number>()
+
+function recordMissingIdempotencyKey(templateKey: string): void {
+  missingIdempotencyKeyCounters.set(
+    templateKey,
+    (missingIdempotencyKeyCounters.get(templateKey) ?? 0) + 1,
+  )
+}
+
+/** Odczyt metryki — test asertuje NA METRYCE, a nie na treści linii logu. */
+export function getMissingIdempotencyKeyCounts(): Record<string, number> {
+  return Object.fromEntries(missingIdempotencyKeyCounters)
+}
+
+/** Wyłącznie do izolacji przypadków testowych. */
+export function resetMissingIdempotencyKeyCounts(): void {
+  missingIdempotencyKeyCounters.clear()
+}
+
+function readTopLevelIdempotencyKey(
+  notification: ProviderSendNotificationLike,
+): string | undefined {
+  const raw = (notification as { idempotency_key?: unknown }).idempotency_key
+  if (typeof raw !== "string") {
+    return undefined
+  }
+  const trimmed = raw.trim()
+  return trimmed.length > 0 ? trimmed : undefined
 }

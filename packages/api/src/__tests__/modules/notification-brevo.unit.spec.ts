@@ -11,6 +11,7 @@ import { existsSync, readFileSync } from "node:fs"
 import path from "node:path"
 
 import { extractErrorCodeMarker, NOTIFICATION_TEMPLATE_KEYS } from "@gp/messaging"
+import { SharedDispatchBarrier } from "../support/shared-dispatch-barrier"
 
 import notificationBrevoProvider, {
   BREVO_API_KEY_ENV,
@@ -50,6 +51,9 @@ function makeService(env: Record<string, string | undefined> = {}) {
     {
       client: { sendTransacEmail },
       env: { [BREVO_SENDERS_ENV]: SENDERS_JSON, ...env } as NodeJS.ProcessEnv,
+      // Story 4.1: bariera jest WYMAGANA przez gateway. Bez seamu wrapper
+      // wstrzyknąłby barierę odmawiającą (brak PG_CONNECTION w tym teście).
+      barrier: new SharedDispatchBarrier(),
     },
   )
   return { service, sendTransacEmail, logger }
@@ -129,7 +133,10 @@ describe("AC1 — rejestracja modułu Notification z providerem brevo", () => {
     const service = new BrevoNotificationProviderService(
       { logger: logger as never },
       {},
-      { env: { [BREVO_SENDERS_ENV]: SENDERS_JSON } as NodeJS.ProcessEnv },
+      {
+        env: { [BREVO_SENDERS_ENV]: SENDERS_JSON } as NodeJS.ProcessEnv,
+        barrier: new SharedDispatchBarrier(),
+      },
     )
 
     // Klucz spoza rejestru — allowlist zatrzymuje wysyłkę zanim klient w ogóle
@@ -152,7 +159,10 @@ describe("AC1 — rejestracja modułu Notification z providerem brevo", () => {
     const service = new BrevoNotificationProviderService(
       { logger: { warn: jest.fn() } as never },
       {},
-      { env: { [BREVO_SENDERS_ENV]: SENDERS_JSON } as NodeJS.ProcessEnv },
+      {
+        env: { [BREVO_SENDERS_ENV]: SENDERS_JSON } as NodeJS.ProcessEnv,
+        barrier: new SharedDispatchBarrier(),
+      },
     )
 
     const error = await service
@@ -222,7 +232,11 @@ describe("AC2/AC5 — allowlista rejestru i zero wysyłki spoza niej", () => {
     const service = new BrevoNotificationProviderService(
       {},
       {},
-      { client: { sendTransacEmail }, env: {} as NodeJS.ProcessEnv },
+      {
+        client: { sendTransacEmail },
+        env: {} as NodeJS.ProcessEnv,
+        barrier: new SharedDispatchBarrier(),
+      },
     )
 
     await expect(service.send(baseNotification() as never)).rejects.toThrow(

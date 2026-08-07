@@ -45,6 +45,7 @@
     "test:integration:stripe-multi-order": "TEST_TYPE=stripe-multi-order NODE_OPTIONS=--experimental-vm-modules jest --silent=false --runInBand --forceExit",
     "test:integration:completed-order-pg": "TEST_TYPE=completed-order-pg NODE_OPTIONS=--experimental-vm-modules jest --silent=false --runInBand --forceExit",
     "test:integration:replay-guard-pg": "TEST_TYPE=replay-guard-pg NODE_OPTIONS=--experimental-vm-modules jest --silent=false --runInBand --forceExit",
+    "test:integration:dispatch-barrier-pg": "TEST_TYPE=dispatch-barrier-pg NODE_OPTIONS=--experimental-vm-modules jest --silent=false --runInBand --forceExit",
     "test:integration:modules": "TEST_TYPE=integration:modules NODE_OPTIONS=--experimental-vm-modules jest --silent=false --runInBand --forceExit",
     "test:integration:voucher-rls": "TEST_TYPE=voucher-rls-pg NODE_OPTIONS=--experimental-vm-modules jest --silent=false --runInBand --forceExit",
     "test:integration:compensation-failure-pg": "TEST_TYPE=compensation-failure-pg NODE_OPTIONS=--experimental-vm-modules jest --silent=false --runInBand --forceExit",

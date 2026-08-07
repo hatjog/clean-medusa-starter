@@ -83,7 +83,29 @@ interface BuyerClaimNotificationDispatcher {
     locale: "pl" | "en"
     voucher_id: string
     market_id?: string | null
+    /** v1.15.0 Story 4.1 (AC2) — patrz `buildBuyerClaimDispatchIdempotencyKey`. */
+    idempotency_key: string
   }): Promise<{ notificationId: string | null }>
+}
+
+/**
+ * Klucz bariery idempotencji wysyłki (v1.15.0 Story 4.1, AC2 — wariant (b):
+ * call-site BEZ wiersza skutku dostaje barierę z oknem ważności).
+ *
+ * Tożsamość skutku to KONKRETNY odbiór vouchera, nie sam voucher: po
+ * wycofaniu i ponownym odbiorze (`withdraw → reclaim`) `claimed_at` jest inne,
+ * więc druga — legalna — wysyłka przechodzi. Klucz oparty na samym
+ * `voucher_id` skleiłby te dwa zdarzenia w jedno.
+ *
+ * Brak `claimed_at` jest ODRÓŻNIALNY od wartości (`-`), a nie zastępowany
+ * czasem bieżącym: znacznik z zegara czyniłby klucz losowym, czyli barierą,
+ * która nigdy nie trafia.
+ */
+export function buildBuyerClaimDispatchIdempotencyKey(input: {
+  voucherId: string
+  claimedAt?: string | null
+}): string {
+  return ["buyer-claim-notification", input.voucherId, input.claimedAt ?? "-"].join(":")
 }
 
 type NotificationModuleLike = {
@@ -188,8 +210,12 @@ function createBuyerClaimNotificationDispatcher(
         // `template` = pole kontraktu Medusy; `data.template_key` = kanoniczne GP
         // (ADR-158). Obie wartości z tej samej stałej rejestru.
         template: NOTIFICATION_TEMPLATE_KEYS.BUYER_CLAIM_NOTIFICATION,
+        // Top-level włącza trwały dedupe modułu Notification Medusy; kopia
+        // w `data` zasila barierę gatewaya (Story 4.1). Jedna wartość, dwa pola.
+        idempotency_key: input.idempotency_key,
         data: {
           template_key: NOTIFICATION_TEMPLATE_KEYS.BUYER_CLAIM_NOTIFICATION,
+          idempotency_key: input.idempotency_key,
           // R-2.2-M4: rynek z danych domenowych, gdy jest; fallback konfiguracyjny
           // wyłącznie z głośnym ostrzeżeniem (to wysyłka market-scoped).
           market_id: resolveMarketScopedNotificationMarketId({
@@ -301,6 +327,10 @@ export async function handleVoucherClaimedForBuyerNotification(
         // AC6b: event (gdy niesie) → projekcja źródłowa → fallback konfiguracyjny
         // (ten ostatni wyłącznie z głośnym `warn`).
         market_id: payload.market_id ?? source.market_id ?? null,
+        idempotency_key: buildBuyerClaimDispatchIdempotencyKey({
+          voucherId: voucher_id,
+          claimedAt: source.claimed_at ?? null,
+        }),
       })
 
       deps.logger?.info?.("[buyer-claim] notification sent", {

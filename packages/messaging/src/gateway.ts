@@ -12,6 +12,13 @@ import type {
   CommunicationKpiSourceEventType,
   FlowKpiTelemetryHook,
 } from "./flow-kpi-telemetry";
+import {
+  DEFAULT_BARRIER_AMBIGUOUS_WINDOW_MS,
+  DEFAULT_BARRIER_IN_FLIGHT_WINDOW_MS,
+  MESSAGING_BARRIER_UNAVAILABLE,
+  type BarrierClaim,
+  type DispatchIdempotencyBarrier,
+} from "./idempotency-barrier";
 import type { IMessagingProvider } from "./provider";
 import type {
   Channel,
@@ -38,18 +45,50 @@ export interface DispatchKpiContext {
   dispatch_time?: string;
 }
 
-interface CachedDispatch {
-  dispatch: NotificationDispatch;
-  expires_at_ms: number;
-}
+/**
+ * Kod zwracany, gdy bariera stwierdziła, że TEN SAM klucz jest właśnie
+ * obsługiwany przez inny proces (zajęcie `in_flight` bez rozstrzygnięcia).
+ *
+ * To NIE jest „nie udało się wysłać" — to jest „ktoś inny wysyła to teraz i
+ * drugi mail byłby duplikatem". Wołający ma ponowić później; na ścieżce
+ * zakupowej dogania to reconciliation sweep.
+ */
+export const MESSAGING_DISPATCH_IN_FLIGHT = "MESSAGING_DISPATCH_IN_FLIGHT";
 
-interface CachedDispatchContext {
-  context: DispatchKpiContext;
-  expires_at_ms: number;
-}
+/**
+ * KOMPLET kodów wysyłki pochodzących od samej bariery — czyli takich, których
+ * przyczyna NIE jest odrzuceniem przez providera i NIE ustępuje przez udział
+ * konkretnego wiersza dostawy.
+ *
+ * ── Po co ta lista istnieje (R-4.1-H2) ────────────────────────────────────
+ * Story 4.1 wprowadziła dwa NOWE stany porażki wysyłki i nie dopisała ich do
+ * klasyfikacji awarii globalnych reconciliation sweepa. Zmierzona konsekwencja:
+ * `SWEEP_MAX_ATTEMPT_COUNT (5) × cadence (15 min) = 75 min` i wiersz ledgera
+ * zostaje wykluczony ze skanu NA STAŁE — naprawa połączenia z bazą przestaje
+ * pomagać, a mail wymaga ręcznego `UPDATE` na produkcyjnej bazie.
+ *
+ * Oba kody spełniają definicję awarii globalnej z `SWEEP_GLOBAL_FAILURE_ERROR_CODES`
+ * („stan środowiska dotyczący wszystkich wierszy naraz, ustępujący bez ich udziału"):
+ *
+ *  * {@link MESSAGING_BARRIER_UNAVAILABLE} — kontener nie oddał połączenia
+ *    z bazą. Dotyczy z definicji WSZYSTKICH wierszy i ustępuje po naprawie
+ *    połączenia. Skoro bariery nie było, to nic nie poszło do providera, więc
+ *    ponowienie jest legalne i MUSI wysłać.
+ *  * {@link MESSAGING_DISPATCH_IN_FLIGHT} — inna instancja obsługuje właśnie
+ *    ten klucz. Stan PRZEJŚCIOWY: ustępuje sam po zamknięciu tamtego przebiegu
+ *    albo po wygaśnięciu okna `in_flight` (15 min), bez udziału tego wiersza.
+ *    Zużywanie na niego budżetu prób parkowałoby wiersz za cudzą pracę.
+ *
+ * Sweep SPREADUJE tę listę zamiast powtarzać kody, więc nowy kod bariery
+ * dodany tutaj jest sklasyfikowany od razu. Kontrola, która PĘKA, gdy pojawia
+ * się kod bariery spoza tej listy, siedzi w
+ * `packages/api/src/__tests__/lib/messaging-dispatch-barrier.unit.spec.ts`.
+ */
+export const MESSAGING_BARRIER_TRANSIENT_ERROR_CODES: readonly string[] = [
+  MESSAGING_BARRIER_UNAVAILABLE,
+  MESSAGING_DISPATCH_IN_FLIGHT,
+];
 
-const DEFAULT_TTL_MS = 24 * 60 * 60 * 1000;
-const DEFAULT_MAX_CACHE_SIZE = 10000;
 const SUPPORTED_CHANNELS: ReadonlySet<Channel> = new Set([
   "email",
   "sms",
@@ -60,7 +99,21 @@ export type MessagingProviderRegistry =
   | Map<string, IMessagingProvider>
   | Partial<Record<string, IMessagingProvider>>;
 
+/** Minimalny odbiorca zdarzeń diagnostycznych — bez zależności od loggera Medusy. */
+export interface MessagingGatewayLogger {
+  warn?: (message: string, meta?: Record<string, unknown>) => void;
+  error?: (message: string, meta?: Record<string, unknown>) => void;
+}
+
 export interface MessagingGatewayOptions {
+  /**
+   * TRWAŁA bariera idempotencji (Story 4.1, AD-23). WYMAGANA — nie ma wariantu
+   * „gateway bez bariery": brak nośnika oznaczałby cichą wysyłkę bez ochrony,
+   * czyli dokładnie stan, który ta story zamyka. Wołający, który nie ma
+   * połączenia z bazą, wstrzykuje barierę ODMAWIAJĄCĄ (patrz
+   * `unavailableDispatchBarrier` w `packages/api`), a nie `undefined`.
+   */
+  barrier: DispatchIdempotencyBarrier;
   flagResolver?: ICommunicationFlowFlagResolver;
   // H1 (5-9): opcjonalny hook telemetryczny KPI. Gdy wstrzyknięty (loader Medusa
   // wiąże go przez createFlowKpiTelemetryHook z approvalLookup z 5-8), gateway
@@ -68,77 +121,62 @@ export interface MessagingGatewayOptions {
   flowKpiTelemetry?: FlowKpiTelemetryHook;
   clock?: () => Date;
   uuid?: () => string;
-  idempotencyTtlMs?: number;
-  maxCacheSize?: number;
+  /**
+   * Źródło TOKENU ZAJĘCIA bariery (R-4.1-M3). Świadomie ODRĘBNE od `uuid`:
+   * `uuid` jest źródłem `dispatch_id` i identyfikatorów audytu, więc czerpanie
+   * z niego tokenu przesuwałoby całą deterministyczną sekwencję wołającego —
+   * czyli zmieniałoby obserwowalne `dispatch_id` bez związku z barierą.
+   */
+  claimToken?: () => string;
+  /** Patrz `DEFAULT_BARRIER_IN_FLIGHT_WINDOW_MS`. */
+  barrierInFlightWindowMs?: number;
+  /** Patrz `DEFAULT_BARRIER_AMBIGUOUS_WINDOW_MS`. */
+  barrierAmbiguousWindowMs?: number;
+  logger?: MessagingGatewayLogger;
 }
 
 export class DefaultMessagingGateway implements MessagingGateway {
-  private readonly idempotencyCache = new Map<string, CachedDispatch>();
-  // H1: bounded korelacja dispatch_id → kontekst flow, by recordDeliveryEvent()
-  // mógł zbudować KPI dla zdarzeń webhooka (delivered/clicked/unsubscribed),
-  // które niosą tylko dispatch_id. LRU/TTL współdzieli granicę z idempotencyCache.
-  private readonly dispatchContext = new Map<string, CachedDispatchContext>();
   // F-12: Map storage zamiast Object — żaden prototypowy klucz (`__proto__`, `constructor`)
   // nie pollutuje lookup; klucze pochodzą wprost z rejestracji providerów.
   private readonly providers: Map<string, IMessagingProvider>;
   private readonly clock: () => Date;
   private readonly uuid: () => string;
-  private readonly idempotencyTtlMs: number;
-  private readonly maxCacheSize: number;
+  /** Patrz `MessagingGatewayOptions.claimToken`. */
+  private readonly claimToken: () => string;
+  /**
+   * Story 4.1: JEDYNY nośnik idempotencji wysyłki. Zastąpił mapę
+   * `idempotencyCache` w pamięci procesu — nie stoi obok niej. Wariant „mapa
+   * zostaje jako cache przed barierą" jest odrzucony wprost przez AD-23
+   * („druga, słabsza kopia po skutku jest do usunięcia, nie migracji").
+   */
+  private readonly barrier: DispatchIdempotencyBarrier;
+  private readonly barrierInFlightWindowMs: number;
+  private readonly barrierAmbiguousWindowMs: number;
+  private readonly logger?: MessagingGatewayLogger;
   private readonly flagResolver?: ICommunicationFlowFlagResolver;
   private readonly flowKpiTelemetry?: FlowKpiTelemetryHook;
 
-  // F-02: explicit overloady TS rozdzielają nowy options-object API od legacy
-  // positional sygnatury Story 5.1 — bez nich TS pozwalał skompilować mieszany
-  // call (object + dodatkowe argumenty) gdzie runtime po cichu ignorował uuid/ttl.
-  constructor(
-    providers: MessagingProviderRegistry,
-    defaultProvider: NotificationProvider,
-    options?: MessagingGatewayOptions,
-  );
   /**
-   * @deprecated Sygnatura pozycyjna zachowana dla Story 5.1 callsites; preferuj
-   * przekazanie `MessagingGatewayOptions`. Pozycyjne argumenty po `clock` (`uuid`,
-   * `idempotencyTtlMs`, `maxCacheSize`) działają TYLKO gdy 3-ci argument jest
-   * funkcją; w połączeniu z options-objectem są ignorowane.
+   * Story 4.1 usunęła sygnaturę POZYCYJNĄ (legacy Story 5.1). Powód nie jest
+   * kosmetyczny: jej argumenty 5 i 6 nazywały się `idempotencyTtlMs` i
+   * `maxCacheSize` — czyli parametry MAPY, której już nie ma. Zachowanie ich
+   * jako ignorowanych dawałoby call-site, który wygląda na konfigurujący
+   * barierę, a nie konfiguruje niczego.
    */
   constructor(
     providers: MessagingProviderRegistry,
-    defaultProvider: NotificationProvider,
-    clock: () => Date,
-    uuid?: () => string,
-    idempotencyTtlMs?: number,
-    maxCacheSize?: number,
-    // H1 (5-9): legacy positional hook telemetryczny KPI (7-my argument).
-    flowKpiTelemetry?: FlowKpiTelemetryHook,
-  );
-  constructor(
-    providers: MessagingProviderRegistry,
     private readonly defaultProvider: NotificationProvider,
-    optionsOrClock: MessagingGatewayOptions | (() => Date) = {},
-    uuid?: () => string,
-    idempotencyTtlMs: number = DEFAULT_TTL_MS,
-    maxCacheSize: number = DEFAULT_MAX_CACHE_SIZE,
-    // H1 (5-9): w wariancie pozycyjnym (legacy Story 5.1/5.9 callsites) hook
-    // telemetryczny KPI przychodzi jako 7-my argument; w wariancie options-object
-    // (5-4) pochodzi z options.flowKpiTelemetry.
-    flowKpiTelemetry?: FlowKpiTelemetryHook,
+    options: MessagingGatewayOptions,
   ) {
-    const options =
-      typeof optionsOrClock === "function"
-        ? {
-            clock: optionsOrClock,
-            uuid,
-            idempotencyTtlMs,
-            maxCacheSize,
-            flowKpiTelemetry,
-          }
-        : optionsOrClock;
-
     this.clock = options.clock ?? (() => new Date());
     this.uuid = options.uuid ?? (() => randomUUID());
-    this.idempotencyTtlMs = options.idempotencyTtlMs ?? DEFAULT_TTL_MS;
-    this.maxCacheSize = options.maxCacheSize ?? DEFAULT_MAX_CACHE_SIZE;
+    this.claimToken = options.claimToken ?? (() => randomUUID());
+    this.barrier = options.barrier;
+    this.barrierInFlightWindowMs =
+      options.barrierInFlightWindowMs ?? DEFAULT_BARRIER_IN_FLIGHT_WINDOW_MS;
+    this.barrierAmbiguousWindowMs =
+      options.barrierAmbiguousWindowMs ?? DEFAULT_BARRIER_AMBIGUOUS_WINDOW_MS;
+    this.logger = options.logger;
     this.flagResolver = options.flagResolver;
     this.flowKpiTelemetry = options.flowKpiTelemetry;
     this.providers =
@@ -163,12 +201,9 @@ export class DefaultMessagingGateway implements MessagingGateway {
       return gatedDispatch;
     }
 
-    const cacheKey = buildCacheKey(intent);
-    const cached = this.getCachedDispatch(cacheKey);
-    if (cached) {
-      return cached;
-    }
-
+    // Rozwiązanie providera stoi PRZED zajęciem bariery świadomie: to czysty
+    // lookup w mapie, bez skutku ubocznego, a rzucenie PO zajęciu blokowałoby
+    // klucz na całe okno `in_flight` za coś, co nawet nie dotknęło providera.
     const provider = this.providers.get(this.defaultProvider);
     if (!provider) {
       throw new UnsupportedProviderError(
@@ -187,6 +222,55 @@ export class DefaultMessagingGateway implements MessagingGateway {
       );
     }
 
+    // ── BARIERA: jedna operacja atomowa, PRZED skutkiem (AD-23) ─────────────
+    // Werdykt pochodzi z wyniku pojedynczego stwierdzenia po stronie magazynu
+    // trwałego, a nie z odczytu porównanego w kodzie. Wszystko, co następuje
+    // niżej, dzieje się WYŁĄCZNIE po zajęciu klucza.
+    const barrierKey = buildBarrierKey(intent);
+
+    // R-4.1-H2 / R-4.1-L1 — awaria SAMEJ bariery musi dojechać do ledgera jako
+    // WYNIK z kodem, a nie jako surowy wyjątek. Gdy `claim()` leciało poza
+    // blokiem `try`, `BarrierUnavailableError` propagował na zewnątrz, do
+    // wiersza dostawy nie trafiał żaden `error_code`, a
+    // `isGlobalFailureErrorCode(null)` zwraca `false` — więc ścieżka „naprawa
+    // infrastruktury → odparkowanie wiersza" nie istniała w ogóle.
+    // Token TEGO przebiegu (R-4.1-M3). Generuje go WOŁAJĄCY i tylko on go zna,
+    // więc `settle`/`release` trafiają wyłącznie we własne zajęcie. Bariera go
+    // nie oddaje z powrotem — pole, którego nikt nie czyta, byłoby drugą
+    // deklaracją bez konsumenta.
+    const claimToken = this.claimToken();
+
+    let claim: BarrierClaim;
+    try {
+      claim = await this.barrier.claim({
+        barrier_key: barrierKey,
+        now: this.clock(),
+        in_flight_window_ms: this.barrierInFlightWindowMs,
+        claim_token: claimToken,
+      });
+    } catch (error) {
+      if (error instanceof MessagingProviderError) {
+        return await this.barrierUnavailableDispatch(
+          intent,
+          barrierKey,
+          claimToken,
+          error,
+        );
+      }
+      throw error;
+    }
+
+    if (claim.outcome === "blocked") {
+      if (claim.dispatch) {
+        // Poprzedni przebieg się rozstrzygnął — ponowienie dostaje TEN SAM
+        // wynik, bez dotykania providera.
+        return claim.dispatch;
+      }
+      // Zajęcie bez rozstrzygnięcia = ktoś inny (inna instancja) jest w locie.
+      // NIE wysyłamy: to jest ten przypadek, dla którego bariera istnieje.
+      return this.inFlightDispatch(intent, barrierKey);
+    }
+
     try {
       const providerResponse = await provider.send(intent);
       const dispatch: NotificationDispatch = {
@@ -203,8 +287,12 @@ export class DefaultMessagingGateway implements MessagingGateway {
         }),
       };
 
-      this.cacheDispatch(cacheKey, dispatch);
-      this.rememberDispatchContext(dispatch);
+      // Sukces: bariera zostaje ZAMKNIĘTA BEZTERMINOWO (`expires_at = null`).
+      // To jest ta sama semantyka, którą deklaruje migracja wiersza skutku
+      // `1778933000000` („NIE ma TTL i nie wolno go czyścić dla wierszy
+      // sent/delivered — usunięcie = ryzyko duplikatu maila"). Okno dotyczy
+      // WYŁĄCZNIE stanu niejednoznacznego, nie dostawy, która się udała.
+      await this.settleBarrier(barrierKey, claimToken, dispatch, null);
       this.emitDispatchKpi(dispatch);
 
       return dispatch;
@@ -217,7 +305,7 @@ export class DefaultMessagingGateway implements MessagingGateway {
         // zwrócił deterministyczny ten sam wynik. dispatch_id jest stabilnie
         // wyprowadzony z cache key (a nie losowy uuid), więc jest powtarzalny
         // nawet gdyby cache wygasł i provider zwrócił ten sam błąd ponownie.
-        const dispatchId = deriveFailedDispatchId(cacheKey);
+        const dispatchId = deriveFailedDispatchId(barrierKey);
         const failedDispatch: NotificationDispatch = {
           dispatch_id: dispatchId,
           provider: provider.key,
@@ -232,21 +320,197 @@ export class DefaultMessagingGateway implements MessagingGateway {
           }),
         };
 
-        // R-2.2-M2: pre-flight fail (BREVO_TEMPLATE_NOT_CONFIGURED,
-        // BREVO_SENDER_NOT_CONFIGURED, BREVO_API_KEY_NOT_CONFIGURED, walidacja
-        // payloadu) jest JEDNOZNACZNY — nic nie wyszło do providera. Cache'owanie
-        // go przez DEFAULT_TTL_MS (24 h) zablokowałoby główny scenariusz wyjścia
-        // ze stanu „rejestr pusty": po uzupełnieniu ID szablonów retry z tym
-        // samym idempotency_key nie zawołałby providera. Cache'ujemy WYŁĄCZNIE
-        // fail niejednoznaczny (timeout-after-send — wiadomość mogła pójść).
-        if (!error.preflight) {
-          this.cacheDispatch(cacheKey, failedDispatch);
+        // R-2.2-M2 / Story 4.1 AC3 — klasyfikacja PRZEŻYWA przeniesienie na
+        // warstwę trwałą i ma DOKŁADNIE JEDNO źródło prawdy: flagę `preflight`
+        // na `MessagingProviderError`. Warstwa trwała nie zna i nie ma prawa
+        // znać żadnej listy kodów błędów — druga lista rozjechałaby się przy
+        // pierwszym nowym kodzie.
+        //
+        //  * pre-flight fail (BREVO_TEMPLATE_NOT_CONFIGURED,
+        //    BREVO_SENDER_NOT_CONFIGURED, BREVO_API_KEY_NOT_CONFIGURED,
+        //    walidacja payloadu) — JEDNOZNACZNY: nic nie wyszło do providera.
+        //    Bariera jest ZWALNIANA, więc po uzupełnieniu konfiguracji to samo
+        //    zdarzenie realnie wysyła mail. To jest główny scenariusz wyjścia
+        //    ze stanu „rejestr pusty" i nie wolno go zablokować oknem.
+        //  * każdy inny fail (w tym timeout-after-send i KOD NIEZNANY) —
+        //    NIEJEDNOZNACZNY: wiadomość mogła pójść. Bariera zostaje zamknięta
+        //    na okno, więc ponowienie NIE woła providera. Domyślna wartość
+        //    `preflight` to `false` (errors.ts), więc nierozpoznany błąd trafia
+        //    tu z DEFINICJI, a nie przez przypadek: nieznane traktujemy jak
+        //    „mogło pójść", bo pomyłka w tę stronę kosztuje opóźniony mail,
+        //    a w drugą — drugi mail do klientki.
+        if (error.preflight) {
+          await this.releaseBarrier(barrierKey, claimToken);
+        } else {
+          await this.settleBarrier(
+            barrierKey,
+            claimToken,
+            failedDispatch,
+            new Date(this.clock().getTime() + this.barrierAmbiguousWindowMs),
+          );
         }
 
         return failedDispatch;
       }
 
+      // Błąd SPOZA kontraktu messagingu (np. awaria sieci rzucona surowo).
+      // Świadomie NIE zwalniamy bariery: skoro nie wiemy, na jakim etapie
+      // poleciał, musimy założyć, że mógł polecieć PO wysyłce. Zajęcie
+      // `in_flight` wygasa samo po `barrierInFlightWindowMs`, więc ponowienie
+      // jest możliwe — tylko nie natychmiast.
       throw error;
+    }
+  }
+
+  /**
+   * Wynik dla przypadku „inna instancja wysyła to teraz".
+   *
+   * Świadomie jest to `failed`, a nie cichy `queued`: wołający (wrapper
+   * notification-brevo) zamienia `failed` na głośny błąd, więc przypadek jest
+   * WIDOCZNY w logu i w ledgerze zamiast wyglądać jak udana wysyłka, która
+   * nigdy nie nastąpiła.
+   */
+  private inFlightDispatch(
+    intent: NotificationIntent,
+    barrierKey: string,
+  ): NotificationDispatch {
+    const dispatchId = deriveFailedDispatchId(barrierKey);
+    return {
+      dispatch_id: dispatchId,
+      provider: this.defaultProvider,
+      status: "failed",
+      audit_event: this.createAuditEvent({
+        intent,
+        provider: this.defaultProvider,
+        status: "failed",
+        dispatch_id: dispatchId,
+        error_code: MESSAGING_DISPATCH_IN_FLIGHT,
+        error_message:
+          "Ta sama wysyłka jest właśnie obsługiwana przez inny proces — " +
+          "drugi mail byłby duplikatem",
+      }),
+    };
+  }
+
+  /**
+   * Wynik dla przypadku „nośnik bariery odmówił / nie odpowiedział".
+   *
+   * Świadomie jest to `failed` Z KODEM, a nie surowy wyjątek: kod jedzie do
+   * wiersza dostawy, a `isGlobalFailureErrorCode` rozpoznaje go jako awarię
+   * globalną (patrz {@link MESSAGING_BARRIER_TRANSIENT_ERROR_CODES}), więc
+   * próba wraca do budżetu i naprawa połączenia realnie odparkowuje wiersz.
+   *
+   * ── Tu i TYLKO tu `preflight` zmienia zachowanie (R-4.1-L1) ──────────────
+   * Flaga nie jest ozdobą docstringa — rozstrzyga, czy po nieudanym `claim`
+   * trzeba jeszcze posprzątać:
+   *
+   *  * `preflight === true` (`BarrierUnavailableError`) — stwierdzenie NA PEWNO
+   *    nie doszło do bazy, więc nie ma czego zwalniać. Zwolnienie byłoby tu
+   *    drugim wywołaniem do nośnika, który właśnie odmówił.
+   *  * `preflight === false` — `claim` MÓGŁ wejść, a błąd polecieć po nim
+   *    (np. zerwane połączenie po `INSERT`). Zostawione zajęcie blokowałoby
+   *    ponowienie przez całe okno `in_flight`, więc próbujemy je zwolnić;
+   *    `releaseBarrier` jest z definicji nierzucające.
+   */
+  private async barrierUnavailableDispatch(
+    intent: NotificationIntent,
+    barrierKey: string,
+    claimToken: string,
+    error: MessagingProviderError,
+  ): Promise<NotificationDispatch> {
+    if (!error.preflight) {
+      await this.releaseBarrier(barrierKey, claimToken);
+    }
+
+    const dispatchId = deriveFailedDispatchId(barrierKey);
+    const errorCode = error.error_code || MESSAGING_BARRIER_UNAVAILABLE;
+
+    this.logger?.error?.(
+      "[messaging] bariera niedostępna — wysyłka wstrzymana, żeby nie pójść " +
+        "bez ochrony przed duplikatem",
+      {
+        error_code: errorCode,
+        dispatch_id: dispatchId,
+        preflight: error.preflight,
+      },
+    );
+
+    return {
+      dispatch_id: dispatchId,
+      provider: this.defaultProvider,
+      status: "failed",
+      audit_event: this.createAuditEvent({
+        intent,
+        provider: this.defaultProvider,
+        status: "failed",
+        dispatch_id: dispatchId,
+        error_code: errorCode,
+        error_message: error.message,
+      }),
+    };
+  }
+
+  /**
+   * Domknięcie bariery. Awaria magazynu NIE unieważnia wyniku wysyłki: mail
+   * albo poszedł, albo nie, i to jest już rozstrzygnięte. Podnoszenie tu
+   * wyjątku zamieniłoby udaną wysyłkę w błąd, a wołający ponowiłby ją.
+   *
+   * Ryzyko rezydualne jest NAZWANE (ADR-196 §D6): niedomknięte zajęcie wygasa
+   * po `barrierInFlightWindowMs`, więc po tym oknie ponowienie mogłoby wysłać
+   * drugi mail. Dlatego to jest `error`, a nie `warn` — ma budzić.
+   */
+  private async settleBarrier(
+    barrierKey: string,
+    claimToken: string,
+    dispatch: NotificationDispatch,
+    expiresAt: Date | null,
+  ): Promise<void> {
+    try {
+      await this.barrier.settle({
+        barrier_key: barrierKey,
+        claim_token: claimToken,
+        dispatch,
+        expires_at: expiresAt,
+      });
+    } catch (error) {
+      this.logger?.error?.(
+        "[messaging] MESSAGING_BARRIER_SETTLE_FAILED — zajęcie bariery nie zostało " +
+          "domknięte; wygaśnie po oknie in-flight i dopuści ponowienie",
+        {
+          error_code: "MESSAGING_BARRIER_SETTLE_FAILED",
+          dispatch_id: dispatch.dispatch_id,
+          dispatch_status: dispatch.status,
+          reason: error instanceof Error ? error.message : String(error),
+        },
+      );
+    }
+  }
+
+  /**
+   * Zwolnienie bariery po porażce ROZSTRZYGNIĘTEJ PRZED WYSYŁKĄ.
+   *
+   * Awaria zwolnienia jest mniej groźna niż awaria domknięcia (skutkuje
+   * opóźnieniem ponowienia o okno `in_flight`, nigdy duplikatem), ale nadal
+   * musi być widoczna — cicha byłaby nieodróżnialna od poprawnego zwolnienia.
+   */
+  private async releaseBarrier(
+    barrierKey: string,
+    claimToken: string,
+  ): Promise<void> {
+    try {
+      await this.barrier.release({
+        barrier_key: barrierKey,
+        claim_token: claimToken,
+      });
+    } catch (error) {
+      this.logger?.warn?.(
+        "[messaging] MESSAGING_BARRIER_RELEASE_FAILED — ponowienie po naprawie " +
+          "konfiguracji poczeka do końca okna in-flight",
+        {
+          error_code: "MESSAGING_BARRIER_RELEASE_FAILED",
+          reason: error instanceof Error ? error.message : String(error),
+        },
+      );
     }
   }
 
@@ -319,71 +583,37 @@ export class DefaultMessagingGateway implements MessagingGateway {
     });
   }
 
-  private getCachedDispatch(
-    cacheKey: string,
-  ): NotificationDispatch | undefined {
-    const cached = this.idempotencyCache.get(cacheKey);
-    if (!cached) {
-      return undefined;
-    }
-
-    if (cached.expires_at_ms <= this.clock().getTime()) {
-      this.idempotencyCache.delete(cacheKey);
-      return undefined;
-    }
-
-    return cached.dispatch;
-  }
-
-  private cacheDispatch(
-    cacheKey: string,
-    dispatch: NotificationDispatch,
-  ): void {
-    // F-03: lazy sweep wygasłych wpisów co N insertów + LRU-eviction po przekroczeniu max size,
-    // żeby long-running worker nie rósł w nieskończoność (in-memory bound v1.10.0; v1.11.0+ persistence).
-    if (this.idempotencyCache.size > 0 && this.idempotencyCache.size % 1000 === 0) {
-      this.pruneExpired();
-    }
-
-    while (this.idempotencyCache.size >= this.maxCacheSize) {
-      const oldestKey = this.idempotencyCache.keys().next().value;
-      if (oldestKey === undefined) {
-        break;
-      }
-      this.idempotencyCache.delete(oldestKey);
-    }
-
-    this.idempotencyCache.set(cacheKey, {
-      dispatch,
-      expires_at_ms: this.clock().getTime() + this.idempotencyTtlMs,
-    });
-  }
-
-  private pruneExpired(): void {
-    const nowMs = this.clock().getTime();
-    for (const [key, entry] of this.idempotencyCache) {
-      if (entry.expires_at_ms <= nowMs) {
-        this.idempotencyCache.delete(key);
-      }
-    }
-  }
-
-  // H1 (AC1): realny konsument znormalizowanego strumienia delivery/engagement
-  // (Story 5.5). Wołany przez subscriber webhooka Brevo po normalizacji zdarzenia;
-  // mapuje typ zdarzenia → KPI source event i emituje przez hook telemetryczny.
-  // Brak korelacji (nieznany dispatch_id, brak kontekstu) → kontrolowana degradacja
-  // (zwraca null, nie crashuje) zamiast cichego liczenia bez flow_id.
+  /**
+   * H1 (AC1): realny konsument znormalizowanego strumienia delivery/engagement
+   * (Story 5.5). Wołany przez subscriber webhooka Brevo po normalizacji
+   * zdarzenia; mapuje typ zdarzenia → KPI source event i emituje przez hook
+   * telemetryczny.
+   *
+   * ── Story 4.1: `context` jest WYMAGANY, a nie odtwarzany z mapy ───────────
+   * Do v1.14.0 kontekst dało się pominąć, a gateway odtwarzał go z mapy
+   * `dispatchContext` w pamięci procesu. Ta mapa ZNIKŁA i NIE została zastąpiona
+   * tabelą — zmierzony zbiór wywołujących `recordDeliveryEvent` poza plikiem
+   * definicji zawierał WYŁĄCZNIE `__tests__/gateway.test.ts`, bo endpoint
+   * webhooka jest dziś zaślepką. Utrwalenie mechanizmu, którego produkcja nie
+   * woła, byłoby przeniesieniem martwego mechanizmu, tylko droższym (AD-23).
+   *
+   * Nośnik korelacji dla Story 4.2 jest więc NAZWANY, nie domyślny: jest nim
+   * WIERSZ SKUTKU `voucher_delivery_dispatch`, który niesie już `flow_id`,
+   * `market_id`, `locale`, `recipient_hash` i `sent_at` (migracje
+   * `1778933000000`+). Subscriber webhooka odczyta kontekst stamtąd — po
+   * `provider_message_id` / `dispatch_id` — i poda go TUTAJ jawnie. Wymagany
+   * argument sprawia, że 4.2 nie może przeoczyć tego kroku po cichu.
+   */
   recordDeliveryEvent(
     event: NotificationDeliveryEvent,
-    context?: DispatchKpiContext,
+    context: DispatchKpiContext,
   ): ReturnType<FlowKpiTelemetryHook["emit"]> | null {
     if (!this.flowKpiTelemetry) return null;
 
     const kpiType = mapDeliveryEventType(event.event_type);
     if (!kpiType) return null;
 
-    const resolved = context ?? this.getDispatchContext(event.dispatch_id);
-    if (!resolved) return null;
+    const resolved = context;
 
     const sourceEvent: CommunicationKpiSourceEvent = {
       source: "normalized_event_store",
@@ -425,35 +655,6 @@ export class DefaultMessagingGateway implements MessagingGateway {
     };
 
     this.flowKpiTelemetry.emit(sourceEvent);
-  }
-
-  private rememberDispatchContext(dispatch: NotificationDispatch): void {
-    const audit = dispatch.audit_event;
-    while (this.dispatchContext.size >= this.maxCacheSize) {
-      const oldestKey = this.dispatchContext.keys().next().value;
-      if (oldestKey === undefined) break;
-      this.dispatchContext.delete(oldestKey);
-    }
-    this.dispatchContext.set(dispatch.dispatch_id, {
-      context: {
-        flow_id: audit.flow_id,
-        market: audit.market_id,
-        locale: audit.locale,
-        recipient_hash: audit.hashed_recipient,
-        dispatch_time: dispatch.sent_at ?? audit.occurred_at,
-      },
-      expires_at_ms: this.clock().getTime() + this.idempotencyTtlMs,
-    });
-  }
-
-  private getDispatchContext(dispatchId: string): DispatchKpiContext | undefined {
-    const cached = this.dispatchContext.get(dispatchId);
-    if (!cached) return undefined;
-    if (cached.expires_at_ms <= this.clock().getTime()) {
-      this.dispatchContext.delete(dispatchId);
-      return undefined;
-    }
-    return cached.context;
   }
 
   private createAuditEvent(input: {
@@ -528,9 +729,17 @@ export class DefaultMessagingGateway implements MessagingGateway {
   }
 }
 
-// F-08: composite cache key (market_id + flow_id + channel + idempotency_key) chroni
-// przed cross-tenant kolizją raw idempotency_key z różnych marketów/flow.
-function buildCacheKey(intent: NotificationIntent): string {
+/**
+ * Klucz bariery: `market_id | flow_id | channel | idempotency_key`.
+ *
+ * F-08: człony rynku, flow i kanału chronią przed cross-tenant kolizją surowego
+ * `idempotency_key` pochodzącego z różnych rynków i flow.
+ *
+ * Story 4.1: ta sama konstrukcja co dawny klucz mapy — zmienia się NOŚNIK, nie
+ * tożsamość wysyłki. Dzięki temu przeniesienie na warstwę trwałą nie zmienia
+ * tego, CO jest uznawane za „tę samą wysyłkę", tylko gdzie jest zapamiętane.
+ */
+export function buildBarrierKey(intent: NotificationIntent): string {
   return [
     intent.recipient.market_id,
     intent.flow_id,
@@ -539,12 +748,12 @@ function buildCacheKey(intent: NotificationIntent): string {
   ].join("|");
 }
 
-// R2-M1: deterministyczny dispatch_id dla failed dispatch wyprowadzony z cache key,
+// R2-M1: deterministyczny dispatch_id dla failed dispatch wyprowadzony z klucza bariery,
 // żeby retry tego samego intentu (po wygaśnięciu cache lub w nowym procesie) dał
 // powtarzalny identyfikator zamiast losowego uuid — eliminuje niedeterminizm
 // i ułatwia korelację duplikatów w audicie.
-function deriveFailedDispatchId(cacheKey: string): string {
-  const digest = createHash("sha256").update(cacheKey).digest("hex");
+function deriveFailedDispatchId(barrierKey: string): string {
+  const digest = createHash("sha256").update(barrierKey).digest("hex");
   // Format jako UUID-podobny (8-4-4-4-12) z deterministycznego hasha.
   return [
     digest.slice(0, 8),
