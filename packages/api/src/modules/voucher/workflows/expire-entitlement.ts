@@ -67,6 +67,12 @@ import {
   type TransitionLedgerWriter,
   type PostingActivationGate,
 } from "../entitlement-transition-wiring"
+import {
+  decideVoucherCodeInvalidation,
+  invalidateVoucherCode,
+  type VoucherCodeInvalidationResult,
+} from "../voucher-code-state"
+import type { VoucherStatus } from "../models/types"
 import { deriveLedgerTransactionId } from "../ledger-writer"
 import {
   EXPIRED_CUSTOMER_STATUS,
@@ -184,6 +190,12 @@ export type ExpireEntitlementResult = {
   posting: TransitionPostingResult
   /** true ⇒ replay (stan był już EXPIRED) — ZERO ponownego postingu/eventu. */
   idempotent: boolean
+  /**
+   * v1.15.0 Story 5.9: `true` ⇒ stan kodu vouchera został przestawiony na
+   * `expired` W TEJ SAMEJ transakcji. `false` obejmuje trzy rozłączne
+   * przypadki: replay, kod już unieważniony i uprawnienie bez kodu.
+   */
+  voucher_code_invalidated: boolean
   /** true ⇒ 2× emit eventu zawiódł (best-effort; reconciliation 2.6). */
   emit_failed: boolean
 }
@@ -224,6 +236,20 @@ export interface ExpireEntitlementTx {
    * Zwraca null gdy brak rekordów (nowy voucher bez redempcji → pomiń cross-check).
    */
   findIssuedGross(entitlementId: string): Promise<number | null>
+  /**
+   * v1.15.0 Story 5.9 (FR-12, AD-17): unieważnienie STANU KODU vouchera w TEJ
+   * SAMEJ transakcji, co przejście uprawnienia do EXPIRED.
+   *
+   * Do 5.9 stan kodu przy wygaśnięciu przestawiał bulk-UPDATE w
+   * `jobs/entitlement-expiry-sweeper.ts` — JEDNYM zapytaniem, PO pętli
+   * wygaszania, czyli poza transakcją którejkolwiek tranzycji. Uprawnienie
+   * mogło zejść do EXPIRED, a stan kodu zostać, gdyby ten drugi zapis padł.
+   */
+  invalidateVoucherCode(input: {
+    entitlement_id: string
+    to_state: EntitlementInstanceState
+    now: Date
+  }): Promise<VoucherCodeInvalidationResult>
 }
 
 export interface ExpireEntitlementStore {
@@ -384,6 +410,9 @@ export class ExpireEntitlementOperation {
 
       const wiringDeps = {
         appendAudit: tx.appendAudit.bind(tx),
+        // v1.15.0 Story 5.9 (AC3): stan kodu schodzi RAZEM z uprawnieniem,
+        // na `client`-cie tej samej transakcji.
+        invalidateVoucherCode: tx.invalidateVoucherCode.bind(tx),
         ...(this.deps.ledgerWriter
           ? { ledgerWriter: this.deps.ledgerWriter }
           : {}),
@@ -446,6 +475,7 @@ export class ExpireEntitlementOperation {
         kind: "applied" as const,
         remaining,
         posting: wired.posting,
+        invalidation: wired.invalidation,
         event: wired.event,
       }
     })
@@ -480,6 +510,9 @@ export class ExpireEntitlementOperation {
             "zaistnieć; idempotentny, sweep bezpieczny",
         },
         idempotent: true,
+        // Replay: uprawnienie było już EXPIRED, więc żadnej tranzycji (a zatem
+        // i żadnego unieważnienia kodu) w tym przebiegu nie było.
+        voucher_code_invalidated: false,
         emit_failed: false,
       }
     }
@@ -498,6 +531,7 @@ export class ExpireEntitlementOperation {
       customer_status: EXPIRED_CUSTOMER_STATUS,
       posting: txOut.posting,
       idempotent: false,
+      voucher_code_invalidated: txOut.invalidation?.outcome === "invalidated",
       emit_failed: emitFailed,
     }
   }
@@ -715,6 +749,18 @@ class PostgresExpireEntitlementTx implements ExpireEntitlementTx {
     const row = res.rows[0]
     return row ? Number(row.issued_gross_minor) : null
   }
+
+  /**
+   * v1.15.0 Story 5.9 (AC2/AC3): delegacja do JEDYNEGO producenta stanu kodu
+   * na `this.client` — bez własnego `connect()`, `BEGIN` i `COMMIT`.
+   */
+  async invalidateVoucherCode(input: {
+    entitlement_id: string
+    to_state: EntitlementInstanceState
+    now: Date
+  }): Promise<VoucherCodeInvalidationResult> {
+    return invalidateVoucherCode(this.client, input)
+  }
 }
 
 /**
@@ -756,14 +802,36 @@ export class PostgresPreExpiryDedupeStore implements PreExpiryDedupeStore {
 export class InMemoryExpireEntitlementStore implements ExpireEntitlementStore {
   private rows: Map<string, ExpirableEntitlement>
   private audits: TransitionAuditEnvelope[]
+  private codes: Map<string, VoucherStatus>
 
-  constructor(rows: ExpirableEntitlement[] = []) {
+  constructor(
+    rows: ExpirableEntitlement[] = [],
+    /** v1.15.0 Story 5.9: stany kodów vouchera — `kod → status`. */
+    codes: Record<string, VoucherStatus> = {}
+  ) {
     this.rows = new Map(rows.map((r) => [r.id, { ...r }]))
     this.audits = []
+    this.codes = new Map(Object.entries(codes))
+    // v1.15.0 Story 5.9: kody z fixture'ów rejestrowane jako `idle`, chyba że
+    // wołający poda inny stan. Bez tego każdy zastany test z voucherem
+    // KWOTOWYM przewracałby się na `VoucherCodeBridgeMissingError` — a to jest
+    // twierdzenie o BRAKU MOSTU, nie o zachowaniu, które test bada.
+    for (const row of this.rows.values()) {
+      const snap = row.policy_snapshot as Record<string, unknown>
+      const code = typeof snap.voucher_code === "string" ? snap.voucher_code : null
+      if (code && !this.codes.has(code)) {
+        this.codes.set(code, "idle")
+      }
+    }
   }
 
   get(id: string): ExpirableEntitlement | undefined {
     return this.rows.get(id)
+  }
+
+  /** Stan kodu po operacji — do asercji AC3 (oba wiersze, nie tylko jeden). */
+  getVoucherStatus(code: string): VoucherStatus | undefined {
+    return this.codes.get(code)
   }
 
   /** Append-only audyty utrwalone (po COMMIT) — do asercji AC2 w testach. */
@@ -778,12 +846,17 @@ export class InMemoryExpireEntitlementStore implements ExpireEntitlementStore {
       [...this.rows.entries()].map(([id, r]) => [id, { ...r }])
     )
     const auditsLen = this.audits.length
+    // v1.15.0 Story 5.9: stany kodów WCHODZĄ do migawki rollbacku.
+    const codesSnapshot = new Map(this.codes)
     try {
-      return await fn(new InMemoryExpireEntitlementTx(this.rows, this.audits))
+      return await fn(
+        new InMemoryExpireEntitlementTx(this.rows, this.audits, this.codes)
+      )
     } catch (err) {
       // Rollback: przywróć migawkę + odetnij audyty tej tx (fail-closed).
       this.rows = rowsSnapshot
       this.audits.length = auditsLen
+      this.codes = codesSnapshot
       throw err
     }
   }
@@ -792,7 +865,8 @@ export class InMemoryExpireEntitlementStore implements ExpireEntitlementStore {
 class InMemoryExpireEntitlementTx implements ExpireEntitlementTx {
   constructor(
     private readonly rows: Map<string, ExpirableEntitlement>,
-    private readonly audits: TransitionAuditEnvelope[]
+    private readonly audits: TransitionAuditEnvelope[],
+    private readonly codes: Map<string, VoucherStatus>
   ) {}
 
   async getEntitlementForUpdate(
@@ -836,6 +910,29 @@ class InMemoryExpireEntitlementTx implements ExpireEntitlementTx {
     // Testy in-memory: brak rekordu redemption → pomiń cross-walidację (null).
     // Testy cross-walidacji używają osobnych mocków/fake store.
     return null
+  }
+
+  /** v1.15.0 Story 5.9: mirror semantyki producenta (ta sama reguła co PG). */
+  async invalidateVoucherCode(input: {
+    entitlement_id: string
+    to_state: EntitlementInstanceState
+    now: Date
+  }): Promise<VoucherCodeInvalidationResult> {
+    const row = this.rows.get(input.entitlement_id)
+    const snapshot = (row?.policy_snapshot ?? {}) as Record<string, unknown>
+    const code =
+      typeof snapshot.voucher_code === "string" ? snapshot.voucher_code : null
+    const decision = decideVoucherCodeInvalidation({
+      entitlement_id: input.entitlement_id,
+      entitlement_type: row?.entitlement_type ?? null,
+      voucher_code: code,
+      current_status: code ? this.codes.get(code) ?? null : null,
+      to_state: input.to_state,
+    })
+    if (decision.outcome === "invalidated" && decision.voucher_code) {
+      this.codes.set(decision.voucher_code, decision.target_status)
+    }
+    return decision
   }
 }
 

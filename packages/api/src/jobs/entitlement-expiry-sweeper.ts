@@ -26,10 +26,12 @@ import {
  *      All three source states have EXPIRED in the legal transition list
  *      (per ALLOWED_ENTITLEMENT_TRANSITIONS — assertion baked into the SQL
  *      filter so the state machine cannot drift away silently).
- *   2. UPDATE voucher SET status='expired' WHERE status IN ('idle','consent_pending')
- *      AND expires_at < NOW(). `claimed` vouchers are NOT swept — once a
- *      recipient has claimed, expiry is a property of the underlying
- *      entitlement_instance, not the voucher row.
+ *   2. (v1.15.0 Story 5.9) Stan kodu vouchera NIE jest już przestawiany osobnym
+ *      bulk-UPDATE-em w tym pliku. Schodzi razem z uprawnieniem, w transakcji
+ *      `ExpireEntitlementOperation` — patrz `modules/voucher/voucher-code-state.ts`
+ *      (jedyny producent `UPDATE voucher SET status`). Poprzedni kształt
+ *      (`WHERE status IN ('idle','consent_pending') AND expires_at < NOW()`)
+ *      był drugim, nieatomowym producentem stanu kodu.
  *   3. Emit `gp.entitlements.entitlement_expired.v1` and `voucher.expired.v1`
  *      heartbeats to PostHog (per-row events are batched into counts only —
  *      individual event emission is deferred to the subscriber layer).
@@ -125,11 +127,6 @@ function resolveOptional<T>(
 type ExecResult = { rows: unknown[]; rowCount?: number | null }
 type ExecFn = (sql: string, params?: unknown[]) => Promise<ExecResult>
 
-async function runUpdate(exec: ExecFn, sql: string, params: unknown[]): Promise<number> {
-  const result = await exec(sql, params)
-  return result.rowCount ?? 0
-}
-
 export default async function entitlementExpirySweeper(
   container: MedusaContainer
 ): Promise<void> {
@@ -213,6 +210,10 @@ export default async function entitlementExpirySweeper(
       if (!result.idempotent) {
         entitlementsExpired++
       }
+      // Stan kodu unieważniony w TEJ SAMEJ transakcji (5.9).
+      if (result.voucher_code_invalidated) {
+        vouchersExpired++
+      }
     } catch (err) {
       // Log per-row błędy; kontynuuj sweep dla pozostałych wierszy (defense-in-depth).
       logger.error(
@@ -223,21 +224,18 @@ export default async function entitlementExpirySweeper(
     }
   }
 
-  // ── Voucher status flip (niezmienione — NIE routing przez operację) ─────────
-  try {
-    vouchersExpired = await runUpdate(
-      exec,
-      `UPDATE voucher
-          SET status = 'expired', updated_at = NOW()
-        WHERE status IN ('idle','consent_pending')
-          AND expires_at IS NOT NULL
-          AND expires_at < NOW()`,
-      []
-    )
-  } catch (err) {
-    logger.error("voucher expiry sweep failed", err)
-    throw err
-  }
+  // ── v1.15.0 Story 5.9 (FR-12, AD-17): DRUGI PRODUCENT STANU KODU USUNIĘTY ──
+  // Do tej story stał tu bulk `UPDATE voucher SET status='expired'` — JEDNO
+  // zapytanie wykonane PO pętli wygaszania, poza transakcją którejkolwiek
+  // tranzycji uprawnienia. Dawało to dwa niezależne zapisy: uprawnienie mogło
+  // zejść do EXPIRED, a stan kodu zostać (albo odwrotnie), bo nic ich nie
+  // spinało. Było to też DRUGIE miejsce piszące `voucher.status` w repo.
+  //
+  // Od 5.9 stan kodu schodzi RAZEM z uprawnieniem, w transakcji
+  // `ExpireEntitlementOperation` — przez `wireEntitlementTransitionPersisted`
+  // → `tx.invalidateVoucherCode` → jedyny producent (`voucher-code-state.ts`).
+  // Licznik `vouchers_expired` liczy więc unieważnienia, które FAKTYCZNIE
+  // zaszły w tych transakcjach, a nie osobny bulk-UPDATE.
 
   logger.info(
     `swept entitlements=${entitlementsExpired} skipped=${entitlementsSkipped} ` +

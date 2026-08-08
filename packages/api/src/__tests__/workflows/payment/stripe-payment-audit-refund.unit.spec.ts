@@ -129,6 +129,29 @@ class RefundFakeClient {
       return { rows: [] as T[], rowCount: 1 }
     }
 
+    // v1.15.0 Story 5.9 (FR-12, SM-7): zwrot unieważnia TAKŻE stan kodu
+    // vouchera, w tej samej transakcji. Fake musi znać most kod → uprawnienie
+    // i wiersz `voucher`, inaczej producent fail-closuje na braku mostu —
+    // słusznie, tylko z powodu luki fake'a, nie zachowania.
+    if (sql.includes("policy_snapshot->>'voucher_code'")) {
+      const id = params[0] as string
+      return {
+        rows: [
+          {
+            voucher_code: `GP-TEST-${id}`,
+            entitlement_type: "VOUCHER_AMOUNT",
+          },
+        ] as unknown as T[],
+        rowCount: 1,
+      }
+    }
+    if (sql.includes("FROM voucher WHERE code")) {
+      return { rows: [{ status: "idle" }] as unknown as T[], rowCount: 1 }
+    }
+    if (sql.includes("UPDATE voucher SET status")) {
+      return { rows: [] as T[], rowCount: 1 }
+    }
+
     if (sql.includes("SELECT id, state FROM entitlement_instance")) {
       const orderId = params[0] as string
       const matches = Array.from(this.entitlementRows.values()).filter(

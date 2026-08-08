@@ -64,6 +64,12 @@ import {
   type PostingActivationGate,
 } from "../entitlement-transition-wiring"
 import {
+  decideVoucherCodeInvalidation,
+  invalidateVoucherCode,
+  type VoucherCodeInvalidationResult,
+} from "../voucher-code-state"
+import type { VoucherStatus } from "../models/types"
+import {
   determineRefundMechanism,
   resolveRefundChannel,
   resolveRefundWindowDays,
@@ -259,6 +265,21 @@ export interface RefundEntitlementTx {
    * Stan terminalny ⇒ saldo = 0 (spójność stan↔saldo, reconciliation/raportowanie).
    */
   zeroRemainingAmount(id: string): Promise<void>
+  /**
+   * v1.15.0 Story 5.9 (FR-12, AD-17): unieważnienie STANU KODU vouchera —
+   * w TEJ SAMEJ transakcji co zmiana stanu uprawnienia.
+   *
+   * Metoda należy do `Tx`, a nie do `Store`, właśnie dlatego, że atomowość ma
+   * być własnością transakcji: implementacja PG woła jedynego producenta
+   * (`voucher-code-state.ts`) na `client`-cie tej transakcji i nie otwiera
+   * własnej. Rozdzielenie tego zapisu na drugą transakcję przewraca test
+   * atomowości — i o to chodzi.
+   */
+  invalidateVoucherCode(input: {
+    entitlement_id: string
+    to_state: EntitlementInstanceState
+    now: Date
+  }): Promise<VoucherCodeInvalidationResult>
 }
 
 export interface RefundEntitlementStore {
@@ -419,6 +440,8 @@ export class RefundEntitlementOperation {
 
       const wiringDeps = {
         appendAudit: tx.appendAudit.bind(tx),
+        // v1.15.0 Story 5.9 (AC2): zapis stanu kodu na `client`-cie TEJ tx.
+        invalidateVoucherCode: tx.invalidateVoucherCode.bind(tx),
         ...(this.deps.ledgerWriter
           ? { ledgerWriter: this.deps.ledgerWriter }
           : {}),
@@ -828,6 +851,19 @@ class PostgresRefundEntitlementTx implements RefundEntitlementTx {
       [id]
     )
   }
+
+  /**
+   * v1.15.0 Story 5.9 (AC2): delegacja do JEDYNEGO producenta stanu kodu, na
+   * `this.client` — czyli w tej samej transakcji, co zmiana stanu uprawnienia.
+   * Ta jedna linia jest całą atomowością: nie ma tu `connect()` ani `BEGIN`.
+   */
+  async invalidateVoucherCode(input: {
+    entitlement_id: string
+    to_state: EntitlementInstanceState
+    now: Date
+  }): Promise<VoucherCodeInvalidationResult> {
+    return invalidateVoucherCode(this.client, input)
+  }
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -839,19 +875,39 @@ export class InMemoryRefundEntitlementStore implements RefundEntitlementStore {
   private issuedGross: Map<string, number>
   private audits: TransitionAuditEnvelope[]
   private refundEvents: Map<string, RefundLifecycleEnvelope>
+  private codes: Map<string, VoucherStatus>
 
   constructor(
     rows: RefundableEntitlement[] = [],
-    issuedGross: Record<string, number> = {}
+    issuedGross: Record<string, number> = {},
+    /** v1.15.0 Story 5.9: stany kodów vouchera — `kod → status`. */
+    codes: Record<string, VoucherStatus> = {}
   ) {
     this.rows = new Map(rows.map((r) => [r.id, { ...r }]))
     this.issuedGross = new Map(Object.entries(issuedGross))
     this.audits = []
     this.refundEvents = new Map()
+    this.codes = new Map(Object.entries(codes))
+    // v1.15.0 Story 5.9: kody z fixture'ów rejestrowane jako `idle`, chyba że
+    // wołający poda inny stan. Bez tego każdy zastany test z voucherem
+    // KWOTOWYM przewracałby się na `VoucherCodeBridgeMissingError` — a to jest
+    // twierdzenie o BRAKU MOSTU, nie o zachowaniu, które test bada.
+    for (const row of this.rows.values()) {
+      const snap = row.policy_snapshot as Record<string, unknown>
+      const code = typeof snap.voucher_code === "string" ? snap.voucher_code : null
+      if (code && !this.codes.has(code)) {
+        this.codes.set(code, "idle")
+      }
+    }
   }
 
   get(id: string): RefundableEntitlement | undefined {
     return this.rows.get(id)
+  }
+
+  /** Stan kodu po operacji — do asercji AC2 (oba wiersze, nie tylko jeden). */
+  getVoucherStatus(code: string): VoucherStatus | undefined {
+    return this.codes.get(code)
   }
 
   /** Append-only audyty utrwalone (po COMMIT) — do asercji AC1/AC2 w testach. */
@@ -871,13 +927,18 @@ export class InMemoryRefundEntitlementStore implements RefundEntitlementStore {
     )
     const auditsLen = this.audits.length
     const refundEventsSnapshot = new Map(this.refundEvents)
+    // v1.15.0 Story 5.9: stany kodów WCHODZĄ do migawki rollbacku. Bez tego
+    // in-memory „transakcja" cofałaby uprawnienie, a zostawiała stan kodu —
+    // czyli modelowałaby dokładnie ten defekt, który ta story usuwa.
+    const codesSnapshot = new Map(this.codes)
     try {
       return await fn(
         new InMemoryRefundEntitlementTx(
           this.rows,
           this.issuedGross,
           this.audits,
-          this.refundEvents
+          this.refundEvents,
+          this.codes
         )
       )
     } catch (err) {
@@ -886,6 +947,7 @@ export class InMemoryRefundEntitlementStore implements RefundEntitlementStore {
       this.rows = rowsSnapshot
       this.audits.length = auditsLen
       this.refundEvents = refundEventsSnapshot
+      this.codes = codesSnapshot
       throw err
     }
   }
@@ -896,7 +958,8 @@ class InMemoryRefundEntitlementTx implements RefundEntitlementTx {
     private readonly rows: Map<string, RefundableEntitlement>,
     private readonly issuedGross: Map<string, number>,
     private readonly audits: TransitionAuditEnvelope[],
-    private readonly refundEvents: Map<string, RefundLifecycleEnvelope>
+    private readonly refundEvents: Map<string, RefundLifecycleEnvelope>,
+    private readonly codes: Map<string, VoucherStatus>
   ) {}
 
   async getEntitlementForUpdate(
@@ -968,6 +1031,34 @@ class InMemoryRefundEntitlementTx implements RefundEntitlementTx {
     if (row) {
       this.rows.set(id, { ...row, remaining_amount: 0 })
     }
+  }
+
+  /**
+   * v1.15.0 Story 5.9: mirror semantyki producenta. Rozstrzygnięcie bierze
+   * z TEJ SAMEJ funkcji (`decideVoucherCodeInvalidation`), co ścieżka PG —
+   * drugi zestaw reguł rozjechałby się cicho i zielony test przestałby mówić
+   * cokolwiek o produkcji.
+   */
+  async invalidateVoucherCode(input: {
+    entitlement_id: string
+    to_state: EntitlementInstanceState
+    now: Date
+  }): Promise<VoucherCodeInvalidationResult> {
+    const row = this.rows.get(input.entitlement_id)
+    const snapshot = (row?.policy_snapshot ?? {}) as Record<string, unknown>
+    const code =
+      typeof snapshot.voucher_code === "string" ? snapshot.voucher_code : null
+    const decision = decideVoucherCodeInvalidation({
+      entitlement_id: input.entitlement_id,
+      entitlement_type: row?.entitlement_type ?? null,
+      voucher_code: code,
+      current_status: code ? this.codes.get(code) ?? null : null,
+      to_state: input.to_state,
+    })
+    if (decision.outcome === "invalidated" && decision.voucher_code) {
+      this.codes.set(decision.voucher_code, decision.target_status)
+    }
+    return decision
   }
 }
 

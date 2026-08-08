@@ -16,6 +16,10 @@
  * mogłaby nie znać stanu, który baza zapisze. Nośnikiem zbioru jest CHECK
  * migracji; ta unia go LUSTRZE i walidator `validate_voucher_state_vocabulary`
  * porównuje obie strony.
+ *
+ * v1.15.0 Story 5.9 (FR-12, AD-17): dopisane `refunded`. Do tej story stan
+ * uprawnienia `REFUNDED` nie miał ODPOWIEDNIKA po stronie kodu — zwrot zmieniał
+ * uprawnienie, a kod zostawał `idle`/`consent_pending` i przechodził realizację.
  */
 export type VoucherStatus =
   | "idle"
@@ -23,6 +27,7 @@ export type VoucherStatus =
   | "claimed"
   | "withdrawn"
   | "expired"
+  | "refunded"
 
 export type VoucherEventType =
   | "created"
@@ -102,6 +107,13 @@ export type RedeemRefusalReason =
   | "already_redeemed"
   | "withdrawn"
   | "expired"
+  /**
+   * v1.15.0 Story 5.9 (FR-12, SM-7): voucher ZWRÓCONY. Rozłączny z
+   * „zrealizowany" i „wygasły" — pieniądze wróciły do klientki, więc salon
+   * nie ma za co wykonać zabiegu, a kosmetolożka ma prawo wiedzieć, dlaczego
+   * odmowa nie jest tym samym co „już zrealizowany".
+   */
+  | "refunded"
   /**
    * Stan spoza allow-listy, który NIE jest żadnym z trzech nazwanych — czyli
    * stan dopisany do CHECK-a bazy bez dopisania go do allow-listy. Nazwanie go

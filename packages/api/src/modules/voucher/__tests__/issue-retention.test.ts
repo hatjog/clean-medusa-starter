@@ -36,6 +36,9 @@ function entitlement(
       validity_months: 12,
       refund_channel: "original_payment",
       extension: { enabled: true, fee_pct: 10 },
+      // v1.15.0 Story 5.9: most kod → uprawnienie — retencja unieważnia
+      // STARY kod razem z uprawnieniem, w tej samej transakcji.
+      voucher_code: "GP-TEST-RETENTION-001",
     }),
     metadata: null,
     created_at: issuedAt,
@@ -375,6 +378,9 @@ describe("IssueRetentionWorkflow", () => {
       validity_months: 12,
       refund_channel: "original_payment",
       extension: { enabled: true, fee_pct: 10 },
+      // v1.15.0 Story 5.9: most kod → uprawnienie — retencja unieważnia
+      // STARY kod razem z uprawnieniem, w tej samej transakcji.
+      voucher_code: "GP-TEST-RETENTION-001",
     })
 
     // 1. Start with an ACTIVE entitlement (post-ISSUED lifecycle step)

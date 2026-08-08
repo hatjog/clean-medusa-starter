@@ -16,6 +16,12 @@ import {
 } from "../entitlement-boundary"
 // Import sentinel from reissue-lost-code (single source — F-02 fix).
 // Also re-exported so callers that resolve via issue-retention get the same value.
+import {
+  decideVoucherCodeInvalidation,
+  invalidateVoucherCode,
+  type VoucherCodeInvalidationResult,
+} from "../voucher-code-state"
+import type { VoucherStatus } from "../models/types"
 import { GP_PLATFORM_SCOPE_SENTINEL } from "./reissue-lost-code"
 export { GP_PLATFORM_SCOPE_SENTINEL } from "./reissue-lost-code"
 
@@ -129,6 +135,17 @@ export interface IssueRetentionTx {
     now: Date
   ): Promise<void>
   createRetentionEntitlement(row: RetentionEntitlement): Promise<void>
+  /**
+   * v1.15.0 Story 5.9 (FR-12, AD-17): unieważnienie STANU KODU starego
+   * vouchera — w TEJ SAMEJ transakcji, co `voidEntitlement`. Retencja
+   * wymienia voucher na nowy; stary kod ma przestać działać razem
+   * z uprawnieniem, nie kilka zapisów później i nie „prawie zawsze".
+   */
+  invalidateVoucherCode(input: {
+    entitlement_id: string
+    to_state: EntitlementInstanceState
+    now: Date
+  }): Promise<VoucherCodeInvalidationResult>
 }
 
 export type RetentionEventEmitter = {
@@ -218,6 +235,12 @@ export class IssueRetentionWorkflow {
       // when the source state does not permit VOIDED).
       assertTransition(old.state, EntitlementInstanceState.VOIDED)
       await tx.voidEntitlement(old.id, old.state, now)
+      // v1.15.0 Story 5.9 (AC3): stan kodu schodzi RAZEM z uprawnieniem.
+      await tx.invalidateVoucherCode({
+        entitlement_id: old.id,
+        to_state: EntitlementInstanceState.VOIDED,
+        now,
+      })
 
       // AC3 retention profile resolution:
       //   (a) body override → retention_voucher_template_id from input
@@ -465,6 +488,18 @@ class PostgresIssueRetentionTx implements IssueRetentionTx {
 
   constructor(private readonly client: PgClient) {}
 
+  /**
+   * v1.15.0 Story 5.9: delegacja do JEDYNEGO producenta stanu kodu, na
+   * `this.client` — bez własnego `connect()`, `BEGIN` i `COMMIT`.
+   */
+  async invalidateVoucherCode(input: {
+    entitlement_id: string
+    to_state: EntitlementInstanceState
+    now: Date
+  }): Promise<VoucherCodeInvalidationResult> {
+    return invalidateVoucherCode(this.client, input)
+  }
+
   async getEntitlementForUpdate(id: string): Promise<RetentionEntitlement | null> {
     const columns = await this.selectColumns()
     return this.getEntitlementBySql(
@@ -621,9 +656,28 @@ class PostgresIssueRetentionTx implements IssueRetentionTx {
 
 export class InMemoryIssueRetentionStore implements IssueRetentionStore {
   private rows: Map<string, RetentionEntitlement>
+  private codes: Map<string, VoucherStatus>
 
-  constructor(rows: RetentionEntitlement[] = []) {
+  constructor(
+    rows: RetentionEntitlement[] = [],
+    /** v1.15.0 Story 5.9: stany kodów vouchera — `kod → status`. */
+    codes: Record<string, VoucherStatus> = {}
+  ) {
     this.rows = new Map(rows.map((r) => [r.id, cloneEntitlement(r)]))
+    this.codes = new Map(Object.entries(codes))
+    // Kody z fixture'ów rejestrowane jako `idle`, chyba że podano inaczej.
+    for (const row of this.rows.values()) {
+      const snap = row.policy_snapshot as Record<string, unknown>
+      const code = typeof snap?.voucher_code === "string" ? snap.voucher_code : null
+      if (code && !this.codes.has(code)) {
+        this.codes.set(code, "idle")
+      }
+    }
+  }
+
+  /** Stan kodu po operacji — do asercji AC3 (oba wiersze, nie tylko jeden). */
+  getVoucherStatus(code: string): VoucherStatus | undefined {
+    return this.codes.get(code)
   }
 
   get(id: string): RetentionEntitlement | undefined {
@@ -639,17 +693,46 @@ export class InMemoryIssueRetentionStore implements IssueRetentionStore {
     const snapshot = new Map(
       [...this.rows.entries()].map(([id, r]) => [id, cloneEntitlement(r)])
     )
+    // v1.15.0 Story 5.9: stany kodów WCHODZĄ do migawki rollbacku.
+    const codesSnapshot = new Map(this.codes)
     try {
-      return await fn(new InMemoryIssueRetentionTx(this.rows))
+      return await fn(new InMemoryIssueRetentionTx(this.rows, this.codes))
     } catch (err) {
       this.rows = snapshot
+      this.codes = codesSnapshot
       throw err
     }
   }
 }
 
 class InMemoryIssueRetentionTx implements IssueRetentionTx {
-  constructor(private readonly rows: Map<string, RetentionEntitlement>) {}
+  constructor(
+    private readonly rows: Map<string, RetentionEntitlement>,
+    private readonly codes: Map<string, VoucherStatus>
+  ) {}
+
+  /** v1.15.0 Story 5.9: mirror semantyki producenta (ta sama reguła co PG). */
+  async invalidateVoucherCode(input: {
+    entitlement_id: string
+    to_state: EntitlementInstanceState
+    now: Date
+  }): Promise<VoucherCodeInvalidationResult> {
+    const row = this.rows.get(input.entitlement_id)
+    const snapshot = (row?.policy_snapshot ?? {}) as Record<string, unknown>
+    const code =
+      typeof snapshot.voucher_code === "string" ? snapshot.voucher_code : null
+    const decision = decideVoucherCodeInvalidation({
+      entitlement_id: input.entitlement_id,
+      entitlement_type: (row?.entitlement_type as string | undefined) ?? null,
+      voucher_code: code,
+      current_status: code ? this.codes.get(code) ?? null : null,
+      to_state: input.to_state,
+    })
+    if (decision.outcome === "invalidated" && decision.voucher_code) {
+      this.codes.set(decision.voucher_code, decision.target_status)
+    }
+    return decision
+  }
 
   async getEntitlementForUpdate(id: string): Promise<RetentionEntitlement | null> {
     return this.getEntitlement(id)

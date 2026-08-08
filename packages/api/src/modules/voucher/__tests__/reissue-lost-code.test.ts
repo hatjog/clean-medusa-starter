@@ -33,6 +33,8 @@ function entitlement(
       validity_months: 12,
       refund_channel: "original_payment",
       extension: { enabled: true, fee_pct: 10 },
+      // v1.15.0 Story 5.9: most kod → uprawnienie.
+      voucher_code: "GP-TEST-REISSUE-001",
     }),
     created_at: issuedAt,
     updated_at: issuedAt,
@@ -260,6 +262,9 @@ describe("ReissueLostCodeWorkflow", () => {
       validity_months: 12,
       refund_channel: "original_payment",
       extension: { enabled: true, fee_pct: 10 },
+      // v1.15.0 Story 5.9: most kod → uprawnienie (odzysk zgubionego kodu
+      // unieważnia STARY kod razem z uprawnieniem).
+      voucher_code: "GP-TEST-REISSUE-001",
     })
 
     // 1. Start with an ACTIVE entitlement (post-ISSUED lifecycle step)

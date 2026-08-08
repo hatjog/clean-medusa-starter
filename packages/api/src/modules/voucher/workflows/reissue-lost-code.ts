@@ -10,6 +10,12 @@ import {
   type EntitlementPolicySnapshot,
 } from "../models/entitlement"
 import { isWithinReissueWindow } from "../entitlement-boundary"
+import {
+  decideVoucherCodeInvalidation,
+  invalidateVoucherCode,
+  type VoucherCodeInvalidationResult,
+} from "../voucher-code-state"
+import type { VoucherStatus } from "../models/types"
 
 export const ENTITLEMENT_LOST_CODE_REISSUED_EVENT_TYPE =
   "gp.entitlements.entitlement_lost_code_reissued.v1" as const
@@ -137,6 +143,21 @@ export interface ReissueLostCodeTx {
     now: Date
   ): Promise<void>
   createReissuedEntitlement(row: ReissuableEntitlement): Promise<void>
+  /**
+   * v1.15.0 Story 5.9 (FR-12, AD-17): unieważnienie STANU KODU starego
+   * vouchera — w TEJ SAMEJ transakcji, co `voidEntitlement`.
+   *
+   * Bez tego odzysk zgubionego kodu unieważniał UPRAWNIENIE, a stary kod
+   * zostawał w stanie realizowalnym: klientka dostawała nowy kod, a stary
+   * dalej działał. Ta ścieżka NIE przechodzi przez
+   * `wireEntitlementTransitionPersisted` (workflow jest starszy i pisze stan
+   * wprost), więc producent jest wołany tu, jawnie.
+   */
+  invalidateVoucherCode(input: {
+    entitlement_id: string
+    to_state: EntitlementInstanceState
+    now: Date
+  }): Promise<VoucherCodeInvalidationResult>
 }
 
 export type EntitlementEventEmitter = {
@@ -222,6 +243,13 @@ export class ReissueLostCodeWorkflow {
 
       assertTransition(old.state, EntitlementInstanceState.VOIDED)
       await tx.voidEntitlement(old.id, old.state, now)
+      // v1.15.0 Story 5.9 (AC3): stan kodu schodzi RAZEM z uprawnieniem.
+      // Ta sama transakcja ⇒ rollback cofa oba wiersze.
+      await tx.invalidateVoucherCode({
+        entitlement_id: old.id,
+        to_state: EntitlementInstanceState.VOIDED,
+        now,
+      })
 
       const next: ReissuableEntitlement = {
         ...old,
@@ -455,6 +483,18 @@ class PostgresReissueLostCodeTx implements ReissueLostCodeTx {
     }
   }
 
+  /**
+   * v1.15.0 Story 5.9: delegacja do JEDYNEGO producenta stanu kodu, na
+   * `this.client` — bez własnego `connect()`, `BEGIN` i `COMMIT`.
+   */
+  async invalidateVoucherCode(input: {
+    entitlement_id: string
+    to_state: EntitlementInstanceState
+    now: Date
+  }): Promise<VoucherCodeInvalidationResult> {
+    return invalidateVoucherCode(this.client, input)
+  }
+
   async createReissuedEntitlement(row: ReissuableEntitlement): Promise<void> {
     const optionalColumns = await this.getOptionalColumns()
     const columns = [
@@ -572,8 +612,31 @@ const OPTIONAL_ENTITLEMENT_COLUMNS = [
 export class InMemoryReissueLostCodeStore implements ReissueLostCodeStore {
   private rows: Map<string, ReissuableEntitlement>
 
-  constructor(rows: ReissuableEntitlement[] = []) {
+  private codes: Map<string, VoucherStatus>
+
+  constructor(
+    rows: ReissuableEntitlement[] = [],
+    /** v1.15.0 Story 5.9: stany kodów vouchera — `kod → status`. */
+    codes: Record<string, VoucherStatus> = {}
+  ) {
     this.rows = new Map(rows.map((row) => [row.id, cloneEntitlement(row)]))
+    this.codes = new Map(Object.entries(codes))
+    // v1.15.0 Story 5.9: kody z fixture'ów rejestrowane jako `idle`, chyba że
+    // wołający poda inny stan. Bez tego każdy zastany test z voucherem
+    // KWOTOWYM przewracałby się na `VoucherCodeBridgeMissingError` — a to jest
+    // twierdzenie o BRAKU MOSTU, nie o zachowaniu, które test bada.
+    for (const row of this.rows.values()) {
+      const snap = row.policy_snapshot as Record<string, unknown>
+      const code = typeof snap.voucher_code === "string" ? snap.voucher_code : null
+      if (code && !this.codes.has(code)) {
+        this.codes.set(code, "idle")
+      }
+    }
+  }
+
+  /** Stan kodu po operacji — do asercji AC3 (oba wiersze, nie tylko jeden). */
+  getVoucherStatus(code: string): VoucherStatus | undefined {
+    return this.codes.get(code)
   }
 
   get(id: string): ReissuableEntitlement | undefined {
@@ -591,17 +654,46 @@ export class InMemoryReissueLostCodeStore implements ReissueLostCodeStore {
     const snapshot = new Map(
       [...this.rows.entries()].map(([id, row]) => [id, cloneEntitlement(row)])
     )
+    // v1.15.0 Story 5.9: stany kodów WCHODZĄ do migawki rollbacku.
+    const codesSnapshot = new Map(this.codes)
     try {
-      return await fn(new InMemoryReissueLostCodeTx(this.rows))
+      return await fn(new InMemoryReissueLostCodeTx(this.rows, this.codes))
     } catch (err) {
       this.rows = snapshot
+      this.codes = codesSnapshot
       throw err
     }
   }
 }
 
 class InMemoryReissueLostCodeTx implements ReissueLostCodeTx {
-  constructor(private readonly rows: Map<string, ReissuableEntitlement>) {}
+  constructor(
+    private readonly rows: Map<string, ReissuableEntitlement>,
+    private readonly codes: Map<string, VoucherStatus>
+  ) {}
+
+  /** v1.15.0 Story 5.9: mirror semantyki producenta (ta sama reguła co PG). */
+  async invalidateVoucherCode(input: {
+    entitlement_id: string
+    to_state: EntitlementInstanceState
+    now: Date
+  }): Promise<VoucherCodeInvalidationResult> {
+    const row = this.rows.get(input.entitlement_id)
+    const snapshot = (row?.policy_snapshot ?? {}) as Record<string, unknown>
+    const code =
+      typeof snapshot.voucher_code === "string" ? snapshot.voucher_code : null
+    const decision = decideVoucherCodeInvalidation({
+      entitlement_id: input.entitlement_id,
+      entitlement_type: (row?.entitlement_type as string | undefined) ?? null,
+      voucher_code: code,
+      current_status: code ? this.codes.get(code) ?? null : null,
+      to_state: input.to_state,
+    })
+    if (decision.outcome === "invalidated" && decision.voucher_code) {
+      this.codes.set(decision.voucher_code, decision.target_status)
+    }
+    return decision
+  }
 
   async getEntitlementForUpdate(
     id: string

@@ -560,6 +560,9 @@ const REFUSAL_CODES: Record<RedeemRefusalReason, string> = {
   withdrawn: "VOUCHER_WITHDRAWN",
   expired: "VOUCHER_EXPIRED",
   not_redeemable: "VOUCHER_NOT_REDEEMABLE",
+  // v1.15.0 Story 5.9 (FR-12/SM-7): powód ROZŁĄCZNY z „zrealizowany"
+  // i „wygasły" — pieniądze wróciły do klientki.
+  refunded: "VOUCHER_REFUNDED",
 }
 
 const REFUSAL_STATUSES: Record<RedeemRefusalReason, number> = {
@@ -567,6 +570,10 @@ const REFUSAL_STATUSES: Record<RedeemRefusalReason, number> = {
   withdrawn: 409,
   expired: 410,
   not_redeemable: 409,
+  // 409 Conflict, tak jak `already_redeemed`/`withdrawn`: żądanie jest
+  // poprawne, wyklucza je STAN zasobu. 410 byłoby kłamstwem (kod nie zniknął),
+  // 422 sugerowałoby błąd w treści żądania, którego nie ma.
+  refunded: 409,
 }
 
 const REFUSAL_MESSAGES: Record<RedeemRefusalReason, string> = {
@@ -575,6 +582,8 @@ const REFUSAL_MESSAGES: Record<RedeemRefusalReason, string> = {
   expired: "ten voucher wygasł i nie może zostać zrealizowany",
   not_redeemable:
     "stan tego vouchera nie jest na allow-liście stanów wejściowych realizacji",
+  refunded:
+    "ten voucher został zwrócony — pieniądze wróciły do klientki, więc kodu nie można zrealizować",
 }
 
 /**

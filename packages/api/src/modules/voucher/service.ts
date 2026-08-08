@@ -49,6 +49,11 @@ import {
   type TransitionEventEnvelope,
   type TransitionScope,
 } from "./entitlement-transition-wiring"
+// v1.15.0 Story 5.9 (FR-12, AD-17): JEDYNY producent `UPDATE voucher SET status`.
+import {
+  claimVoucherCode,
+  invalidateVoucherCode,
+} from "./voucher-code-state"
 
 // Local minimal shape for admin search projection (Layer 4-aware).
 // Mirrors fields from `lib/contracts/admin#EntitlementAdminView` that are
@@ -477,6 +482,11 @@ export function resolveRedeemRefusalReason(
   now: Date
 ): RedeemRefusalReason | null {
   if (status === "claimed") return "already_redeemed"
+  // v1.15.0 Story 5.9 (FR-12/SM-7): „zwrócony" PRZED gałęzią czasu. Voucher
+  // zwrócony bywa jednocześnie po terminie ważności; wtedy „wygasł" jest
+  // odpowiedzią prawdziwą, ale mniej istotną — i myli, bo sugeruje, że kod
+  // działałby, gdyby nie data. Powód ma być ROZŁĄCZNY i najbliższy przyczynie.
+  if (status === "refunded") return "refunded"
   if (status === "expired" || (expiresAt && expiresAt < now)) return "expired"
   if (status === "withdrawn") return "withdrawn"
   if (!VOUCHER_REDEMPTION_INPUT_STATES.has(status)) {
@@ -1735,6 +1745,10 @@ export class VoucherService {
           const wired = await wireEntitlementTransitionPersisted(
             {
               appendAudit: (audit) => this.appendTransitionAudit(client, audit),
+              // v1.15.0 Story 5.9 (AC3): VOIDED unieważnia uprawnienie, więc
+              // stan kodu schodzi w TEJ SAMEJ transakcji (`client`).
+              invalidateVoucherCode: (invalidation) =>
+                invalidateVoucherCode(client, invalidation),
               clock: () => new Date(markedAt),
             },
             {
@@ -1782,6 +1796,10 @@ export class VoucherService {
           const wired = await wireEntitlementTransitionPersisted(
             {
               appendAudit: (audit) => this.appendTransitionAudit(client, audit),
+              // v1.15.0 Story 5.9 (AC3): VOIDED unieważnia uprawnienie, więc
+              // stan kodu schodzi w TEJ SAMEJ transakcji (`client`).
+              invalidateVoucherCode: (invalidation) =>
+                invalidateVoucherCode(client, invalidation),
               clock: () => new Date(markedAt),
             },
             {
@@ -1962,12 +1980,14 @@ export class VoucherService {
           : await this.getByCode(code)
         return { status: "not_redeemable", voucher: current ?? voucher }
       }
-      const updRes = await client.query(
-        `UPDATE voucher SET status = 'claimed', updated_at = NOW()
-         WHERE code = $1 AND ${redemptionInputStatusInClause()}`,
-        [code]
-      )
-      if ((updRes.rowCount ?? 0) > 0) {
+      // v1.15.0 Story 5.9: zapis stanu kodu idzie przez JEDNEGO producenta
+      // (`voucher-code-state.ts`), na TYM SAMYM `client`-cie. Allow-lista
+      // zostaje tutaj — producent nie jest jej drugą kopią.
+      const claimedRows = await claimVoucherCode(client, {
+        code,
+        inputStatusInClause: redemptionInputStatusInClause(),
+      })
+      if (claimedRows > 0) {
         const eventId = randomUUID()
         await client.query(
           `INSERT INTO voucher_event (id, voucher_code, event_type, occurred_at, created_at)
@@ -2113,12 +2133,12 @@ export class VoucherService {
       // rozstrzyga POWÓD odmowy, a klauzula jest ostatnim bezpiecznikiem
       // przy współbieżności. Obie są generowane z jednego zbioru, więc nie
       // mogą się rozjechać.
-      const updRes = await client.query(
-        `UPDATE voucher SET status = 'claimed', updated_at = NOW()
-          WHERE code = $1 AND seller_id = $2 AND ${redemptionInputStatusInClause()}`,
-        [code, sellerId]
-      )
-      if ((updRes.rowCount ?? 0) === 0) {
+      const claimedRows = await claimVoucherCode(client, {
+        code,
+        seller_id: sellerId,
+        inputStatusInClause: redemptionInputStatusInClause(),
+      })
+      if (claimedRows === 0) {
         // Przegrany wyścig: równoległy najemca/żądanie już przestawiło stan.
         const current = await this.getByCodeWithClient(client, code)
         if (!txClient) await client.query("ROLLBACK")

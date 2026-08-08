@@ -14,6 +14,8 @@ import {
   assertTransition,
   snapshotPolicy,
 } from "../../modules/voucher/models/entitlement"
+// v1.15.0 Story 5.9 (FR-12, AD-17, SM-7): JEDYNY producent stanu kodu vouchera.
+import { invalidateVoucherCode } from "../../modules/voucher/voucher-code-state"
 
 type QueryResult<T> = Promise<{ rows: T[]; rowCount?: number | null }>
 export type PgClient = {
@@ -457,6 +459,15 @@ export async function compensateIssuedEntitlement(
         AND state NOT IN ('VOIDED','REFUNDED','CLOSED')`,
     [result.entitlement_id, EntitlementInstanceState.VOIDED]
   )
+  // v1.15.0 Story 5.9 (FR-12, AD-17): VOIDED unieważnia uprawnienie, więc
+  // stan kodu schodzi RAZEM z nim — na TYM SAMYM `client`-cie, czyli w tej
+  // samej transakcji kompensacji. Bez tego rollback wystawienia zostawiał kod
+  // w stanie realizowalnym przy uprawnieniu, którego już nie ma.
+  await invalidateVoucherCode(client, {
+    entitlement_id: result.entitlement_id,
+    to_state: EntitlementInstanceState.VOIDED,
+    now: new Date(),
+  })
 }
 
 /**
@@ -619,6 +630,16 @@ export async function revokeEntitlementsOnRefund(
         WHERE id = $1`,
       [row.id, terminalState, refundedAt]
     )
+    // v1.15.0 Story 5.9 (FR-12, SM-7): to jest ŚCIEŻKA, na której SM-7 się
+    // rozstrzyga — zwrot ze Stripe unieważnia uprawnienie. Do tej story kod
+    // vouchera zostawał nietknięty, więc kosmetolożka realizowała zabieg za
+    // coś, za co nikt nie zapłacił. Zapis idzie tym samym `client`-em, czyli
+    // w tej samej transakcji, co zmiana stanu uprawnienia i wiersz audytu.
+    await invalidateVoucherCode(client, {
+      entitlement_id: row.id,
+      to_state: terminalState,
+      now: refundedAt,
+    })
     revoked.push(row.id)
   }
 
