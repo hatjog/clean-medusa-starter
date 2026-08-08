@@ -53,6 +53,9 @@ const RECIPIENT = (process.env.BREVO_LIVE_PROOF_RECIPIENT ?? "").trim()
 const SENDERS_RAW = (process.env.BREVO_SENDERS ?? "").trim()
 const TEMPLATE_ID = Number(process.env.BREVO_LIVE_PROOF_TEMPLATE_ID ?? "")
 const MARKET = (process.env.BREVO_LIVE_PROOF_MARKET ?? "bonbeauty").trim()
+const RUN_OVERRIDE = (process.env.BREVO_LIVE_PROOF_RUN_ID ?? "").trim()
+const RESUME_AFTER_INITIAL_SEND =
+  (process.env.BREVO_LIVE_PROOF_RESUME ?? "").trim() === "1"
 
 const LIVE =
   Boolean(API_KEY) &&
@@ -201,7 +204,7 @@ suite("Story 4.5 AC4 — dowód PO STRONIE DOSTAWCY", () => {
   jest.setTimeout(10 * 60 * 1000)
 
   /** Unikalny sufiks przebiegu — żeby dwa przebiegi dowodowe się nie mieszały. */
-  const run = `p${Date.now().toString(36)}`
+  const run = RUN_OVERRIDE || `p${Date.now().toString(36)}`
 
   it("wariant (ii): proces GINIE po wysyłce ⇒ ponowienie daje JEDEN mail u dostawcy", async () => {
     const barrier = new LocalBarrier()
@@ -220,7 +223,9 @@ suite("Story 4.5 AC4 — dowód PO STRONIE DOSTAWCY", () => {
       claim_token: "token-martwego-przebiegu",
     })
     expect(claim.outcome).toBe("claimed")
-    await adapter.send(intent)
+    if (!RESUME_AFTER_INITIAL_SEND) {
+      await adapter.send(intent)
+    }
 
     expect(await waitForProvider(identity, 1)).toBe(1)
 
@@ -262,11 +267,21 @@ suite("Story 4.5 AC4 — dowód PO STRONIE DOSTAWCY", () => {
     const identity = buildDispatchIdentityTag(buildBarrierKey(intent), RECIPIENT)
     const t0 = new Date()
 
-    await new DefaultMessagingGateway({ brevo: adapter }, "brevo", {
-      barrier: failingSettle,
-      clock: () => t0,
-    }).send(intent)
-    expect(settleCalls).toBe(1)
+    if (RESUME_AFTER_INITIAL_SEND) {
+      await barrier.claim({
+        barrier_key: buildBarrierKey(intent),
+        now: t0,
+        in_flight_window_ms: DEFAULT_BARRIER_IN_FLIGHT_WINDOW_MS,
+        claim_token: "token-przed-awaria-domkniecia",
+      })
+      settleCalls = 1
+    } else {
+      await new DefaultMessagingGateway({ brevo: adapter }, "brevo", {
+        barrier: failingSettle,
+        clock: () => t0,
+      }).send(intent)
+      expect(settleCalls).toBe(1)
+    }
     expect(await waitForProvider(identity, 1)).toBe(1)
 
     const tRetry = new Date(t0.getTime() + DEFAULT_BARRIER_IN_FLIGHT_WINDOW_MS + 1)
@@ -302,14 +317,24 @@ suite("Story 4.5 AC4 — dowód PO STRONIE DOSTAWCY", () => {
       in_flight_window_ms: DEFAULT_BARRIER_IN_FLIGHT_WINDOW_MS,
       claim_token: "token-martwego-przebiegu",
     })
-    await adapter.send(intent)
-    expect(await waitForProvider(identity, 1)).toBe(1)
+    const baselineCount = RESUME_AFTER_INITIAL_SEND
+      ? await countAtProvider(identity)
+      : 0
+    if (!RESUME_AFTER_INITIAL_SEND) {
+      await adapter.send(intent)
+      expect(await waitForProvider(identity, 1)).toBe(1)
+    } else {
+      expect(baselineCount).toBeGreaterThanOrEqual(1)
+      expect(baselineCount).toBeLessThanOrEqual(2)
+    }
 
     const tRetry = new Date(t0.getTime() + DEFAULT_BARRIER_IN_FLIGHT_WINDOW_MS + 1)
-    await new DefaultMessagingGateway({ brevo: adapter }, "brevo", {
-      barrier: preStory45,
-      clock: () => tRetry,
-    }).send(intent)
+    if (baselineCount < 2) {
+      await new DefaultMessagingGateway({ brevo: adapter }, "brevo", {
+        barrier: preStory45,
+        clock: () => tRetry,
+      }).send(intent)
+    }
 
     expect(await waitForProvider(identity, 2)).toBe(2)
   })
@@ -320,13 +345,15 @@ suite("Story 4.5 AC4 — dowód PO STRONIE DOSTAWCY", () => {
     const intent = makeIntent(`${run}-legit`)
     const identity = buildDispatchIdentityTag(buildBarrierKey(intent), RECIPIENT)
 
-    const dispatch = await new DefaultMessagingGateway(
-      { brevo: adapter },
-      "brevo",
-      { barrier, clock: () => new Date() },
-    ).send(intent)
+    if (!RESUME_AFTER_INITIAL_SEND) {
+      const dispatch = await new DefaultMessagingGateway(
+        { brevo: adapter },
+        "brevo",
+        { barrier, clock: () => new Date() },
+      ).send(intent)
 
-    expect(dispatch.status).toBe("queued")
+      expect(dispatch.status).toBe("queued")
+    }
     expect(await waitForProvider(identity, 1)).toBe(1)
   })
 })

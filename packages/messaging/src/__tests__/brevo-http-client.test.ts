@@ -162,7 +162,7 @@ describe("BrevoHttpClient.findTransactionalMessages — kompletność okna", () 
     });
   });
 
-  it("R-4.5-L2: górny brzeg okna jedzie jako DOBA NASTĘPNA, więc strefa konta go nie obcina", async () => {
+  it("wysyła endDate bieżącej doby: provider wymaga brzegu, ale odrzuca datę z przyszłości", async () => {
     const urls: string[] = [];
     const client = new BrevoHttpClient({ apiKey: "k", fetchImpl: pagingFetch(0, urls) });
 
@@ -173,6 +173,6 @@ describe("BrevoHttpClient.findTransactionalMessages — kompletność okna", () 
     // Obcięcie do „2026-08-08" ukryłoby wiadomość wysłaną przed chwilą, gdyby
     // konto dostawcy liczyło doby w strefie za UTC — a `not_found` z tego
     // powodu jest zgodą na wysyłkę.
-    expect(params.get("endDate")).toBe("2026-08-09");
+    expect(params.get("endDate")).toBe("2026-08-08");
   });
 });

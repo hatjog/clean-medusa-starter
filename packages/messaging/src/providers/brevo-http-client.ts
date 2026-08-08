@@ -137,8 +137,7 @@ export class BrevoHttpClient implements IBrevoClient {
       const params = new URLSearchParams({
         email: query.email,
         startDate: toBrevoDate(query.startDate),
-        // R-4.5-L2: górny brzeg jedzie jako DOBA NASTĘPNA.
-        endDate: toBrevoUpperBoundDate(query.endDate),
+        endDate: toBrevoDate(query.endDate),
         limit: String(pageSize),
         offset: String(offset),
       });
@@ -260,27 +259,6 @@ export class BrevoHttpClient implements IBrevoClient {
 /** Dostawca oczekuje `YYYY-MM-DD` w `startDate`/`endDate` (zmierzone). */
 function toBrevoDate(value: Date): string {
   return value.toISOString().slice(0, 10);
-}
-
-/**
- * Górny brzeg okna — DOBA NASTĘPNA po podanej chwili (R-4.5-L2).
- *
- * ── Dlaczego nie zwykłe obcięcie ───────────────────────────────────────────
- * Brzeg jedzie do dostawcy jako DATA, nie znacznik czasu, a my liczymy ją
- * w UTC. Konto u dostawcy może mieć własną strefę (Brevo pozwala ją ustawić),
- * więc wiadomość wysłana „przed chwilą" potrafi u niego wypaść już poza dobą,
- * którą UTC uznaje za bieżącą. Konsekwencja jest ASYMETRYCZNA: brzeg DOLNY
- * obcięty w dół tylko rozszerza okno (nic nie kosztuje), a brzeg GÓRNY obcięty
- * w dół UKRYWA szukaną wiadomość — a `not_found` z tego powodu jest zgodą na
- * wysyłkę, czyli drugim mailem.
- *
- * Rozstrzygnięcie: górny brzeg zawsze o dobę dalej. Rozszerzenie okna nie
- * osłabia mechanizmu — dopasowanie tożsamości i tak robi adapter po stronie
- * klienta, a tożsamość jest unikalna dla zdarzenia, więc szersze okno nie może
- * dać trafienia fałszywego. Kosztuje wyłącznie kilka wierszy więcej w odczycie.
- */
-function toBrevoUpperBoundDate(value: Date): string {
-  return toBrevoDate(new Date(value.getTime() + 24 * 60 * 60 * 1000));
 }
 
 /**
