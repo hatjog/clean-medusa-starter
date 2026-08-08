@@ -2005,17 +2005,31 @@ export class VoucherService {
    *
    * To NIE JEST kontrola autoryzacyjna realizacji — ta siedzi pod blokadą
    * w {@link redeemForSeller}. Tutaj chodzi o odczyt (lookup) i o tani
-   * early-out, który przy odmowie wykonuje DOKŁADNIE tyle samo pracy w bazie
-   * dla „nieznany" co dla „nie twój" (jedno zapytanie po kodzie), żeby czas
-   * odpowiedzi nie stał się kanałem różnicującym.
+   * early-out.
+   *
+   * == Dlaczego predykat ma WŁASNE, wąskie zapytanie ==
+   * Kształt „`getByCode` + porównanie w pamięci" wykonywał dla kodu CUDZEGO
+   * DWA zapytania (voucher + CAŁA historia `voucher_event`, koszt rosnący
+   * liniowo z liczbą zdarzeń), a dla kodu NIEZNANEGO jedno — czyli sam czas
+   * odpowiedzi odróżniał „nie twój" od „nieznany", mimo że status, ciało
+   * i nagłówki są nieodróżnialne (UX-DR9). Review cyklu 1 (MEDIUM) zmierzył
+   * to na kodzie, a nie na komentarzu.
+   *
+   * Teraz OBIE ścieżki ODMOWY kończą się na jednym wąskim `SELECT seller_id`;
+   * pełny widok (z historią) czytany jest DOPIERO po przejściu predykatu,
+   * czyli wyłącznie na ścieżce sukcesu, która i tak jest odróżnialna treścią.
    */
   async getForSeller(
     sellerId: string,
     code: string
   ): Promise<VoucherWithEvents | null> {
-    const voucher = await this.getByCode(code)
-    if (!voucher) return null
-    return voucher.seller_id === sellerId ? voucher : null
+    const scope = await this.getPool().query<{ seller_id: string }>(
+      `SELECT seller_id FROM voucher WHERE code = $1`,
+      [code]
+    )
+    if (scope.rows.length === 0) return null
+    if (scope.rows[0].seller_id !== sellerId) return null
+    return this.getByCode(code)
   }
 
   /**

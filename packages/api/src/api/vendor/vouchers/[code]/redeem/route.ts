@@ -85,6 +85,7 @@ import {
   buildPanelIdempotencyKey,
   createRedeemPartialOperationFromPool,
   RedeemAmountError,
+  RedeemEntitlementStateError,
   RedeemNotRedeemableError,
   RedemptionBalanceError,
   RedemptionEntitlementAmbiguousError,
@@ -99,7 +100,14 @@ type VendorRedeemAuditEnvelope = {
   seller_id: string
   market_id: string | null
   code: string
-  prior_status: VoucherStatus
+  /**
+   * Stan SPRZED przejścia. `null` jest wartością ZNACZĄCĄ, nie brakiem danych:
+   * dla vouchera zrealizowanego PRZED wdrożeniem 5.8 zdarzenie `claimed` nie
+   * ma `payload.prior_status`, a podstawienie stanu BIEŻĄCEGO produkowałoby
+   * przy powtórce inną kopertę niż pierwsze żądanie — dokładnie to, czemu to
+   * pole miało zapobiec (review-fix cyklu 1, LOW).
+   */
+  prior_status: VoucherStatus | null
   /**
    * Skutek ZDARZENIA realizacji — zawsze `claimed`. Odpowiedź na KONKRETNE
    * żądanie (`claimed` / `already_claimed`) niesie pole `status` obok koperty:
@@ -292,8 +300,11 @@ async function redeemInSellerMarket(
   // gałęzią, jednym ciałem odmowy współdzielonym z trasą lookupu
   // (`VOUCHER_NOT_FOUND_BODY`), więc „nie twój" i „nieznany" są
   // nieodróżnialne co do statusu, ciała i nagłówków (UX-DR9). Oba przypadki
-  // wykonują tu DOKŁADNIE tę samą pracę w bazie (jeden odczyt po kodzie),
-  // więc czas odpowiedzi nie różnicuje ich na poziomie grubym.
+  // ODMOWY kończą się w `getForSeller` na jednym wąskim `SELECT seller_id`
+  // (historia zdarzeń czytana jest dopiero po przejściu predykatu), więc czas
+  // odpowiedzi nie różnicuje ich na poziomie grubym. Przed review cyklu 1
+  // „nie twój" ciągnął dodatkowo CAŁĄ historię zdarzeń, a to twierdzenie było
+  // mocniejsze niż kod.
   //
   // WIĄŻĄCY predykat własności NIE jest tutaj: siedzi pod blokadą w
   // `redeemForSeller`, na tym samym wierszu co mutacja. Ten odczyt jest
@@ -369,10 +380,24 @@ async function redeemInSellerMarket(
     // inwariancie domeny, a nie POWÓD, który da się przeczytać (UX-DR9).
     // ZMIERZONE: bez tego tłumaczenia trzeci przypadek UX-DR8 („już było, ale
     // nie to żądanie") wychodził jako 422 bez pola `reason`.
-    if (error instanceof RedeemNotRedeemableError) {
+    //
+    // ZAWĘŻONE w review-fix cyklu 1 (LOW): `RedeemNotRedeemableError` jest
+    // rzucany z PIĘCIU miejsc, z których tylko jedno dotyczy stanu uprawnienia.
+    // Łapanie całej klasy przypinało powód stanu vouchera („wycofany") odmowom
+    // o zupełnie innej przyczynie (nieobsługiwany `entitlement_type`, zerowe
+    // saldo, sprzeczne identyfikatory) — odmowa poprawna, powód zmyślony,
+    // a UX-DR9 żąda powodu ROZRÓŻNIALNEGO, czyli prawdziwego. Podtyp
+    // `RedeemEntitlementStateError` niesie dokładnie gałąź stanową.
+    if (error instanceof RedeemEntitlementStateError) {
+      // Snapshot `existing` pochodzi SPRZED transakcji, a etykieta ma opisywać
+      // stan, w którym voucher jest TERAZ (drugi człon tego samego findingu).
+      // Odczyt jest w zakresie najemcy i tani; gdy zniknie, zostaje snapshot.
+      const current =
+        (await voucherService.getForSeller(authenticatedSellerId, code)) ??
+        existing
       const reason = resolveRedeemRefusalReason(
-        existing.status,
-        existing.expires_at ?? null,
+        current.status,
+        current.expires_at ?? null,
         new Date(),
       )
       if (reason) {
@@ -428,10 +453,15 @@ async function redeemInSellerMarket(
     // różniłby się od koperty pierwszego żądania. Źródłem jest `payload`
     // najwcześniejszego zdarzenia `claimed`, zapisany przez `redeemForSeller`
     // W TEJ SAMEJ transakcji co przejście.
+    //
+    // Trzeci człon to `null`, a NIE stan bieżący (review-fix cyklu 1, LOW).
+    // Dla vouchera zrealizowanego PRZED 5.8 zdarzenie `claimed` nie ma
+    // `payload.prior_status` (`claim()` wstawiał event bez payloadu), więc
+    // podstawienie `existing.status` zwracałoby przy powtórce `"claimed"` —
+    // czyli INNĄ kopertę niż pierwsze żądanie, dokładnie ten defekt, przed
+    // którym to pole miało chronić. Cichy fallback zamieniony na jawny brak.
     prior_status:
-      priorStatus ??
-      earliestClaimedEvent(existing.events)?.prior_status ??
-      existing.status,
+      priorStatus ?? earliestClaimedEvent(existing.events)?.prior_status ?? null,
     // Koperta opisuje ZDARZENIE REALIZACJI, a to zdarzenie zaszło raz i miało
     // jeden skutek. `already_claimed` opisuje ODPOWIEDŹ na to żądanie i żyje
     // w polu `status` odpowiedzi — nie w kopercie, bo inaczej retry

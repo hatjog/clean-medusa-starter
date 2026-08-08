@@ -40,11 +40,12 @@
 import fs from "node:fs"
 import path from "node:path"
 
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "@jest/globals"
+import { afterAll, beforeAll, beforeEach, describe, expect, it, jest } from "@jest/globals"
 import { ContainerRegistrationKeys } from "@medusajs/framework/utils"
 import knex, { Knex } from "knex"
 import { Pool } from "pg"
 
+import { runInHttpMarketContext } from "../../lib/http-market-context"
 import { _resetRlsPoolHook, installRlsPoolHook } from "../../lib/rls-pool-hook"
 import GpCoreService, { VendorNotMappedError } from "../../modules/gp-core/service"
 import { VoucherService } from "../../modules/voucher/service"
@@ -491,9 +492,14 @@ runOrSkip("Story 5.8 — redeemForSeller na realnym Postgresie", () => {
       expect(await countRedemptions()).toBe(0)
     })
 
-    it("dwaj najemcy równolegle na ten sam kod: dokładnie JEDNA realizacja i tylko dla właściciela", async () => {
-      // Równolegle, nie sekwencyjnie: sekwencyjny przebieg przechodzi także
-      // przy defekcie, bo drugi odczyt widzi już skutek pierwszego.
+    it("cudzy najemca równolegle z właścicielem: odmowa i dokładnie JEDNA realizacja", async () => {
+      // UWAGA na wartość dowodową (review cyklu 1, INFO): `SELLER_OTHER` NIGDY
+      // nie był właścicielem `CODE_IDLE`, więc jego żądanie odpada na early-oucie
+      // `getForSeller` NIEZALEŻNIE od tego, czy blokada w `redeemForSeller`
+      // działa — ten przypadek świeciłby zielono także nad kodem sprzed 5.8.
+      // Zostaje jako kontrola powierzchniowa (404 + brak skutku ubocznego);
+      // dowód TOCTOU niesie test wyżej (podmiana `seller_id` w oknie), a dowód
+      // WYŚCIGU o ten sam wiersz — test poniżej (ten SAM właściciel).
       const [mine, other] = await Promise.all([
         callRedeemRoute(CODE_IDLE, "idem-par-mine", SELLER_MINE),
         callRedeemRoute(CODE_IDLE, "idem-par-other", SELLER_OTHER),
@@ -503,6 +509,68 @@ runOrSkip("Story 5.8 — redeemForSeller na realnym Postgresie", () => {
       expect(await voucherStatus(CODE_IDLE)).toBe("claimed")
       expect(await countRedemptions()).toBe(1)
       expect(await countClaimedEvents(CODE_IDLE)).toBe(1)
+    })
+
+    it("TEN SAM właściciel, dwa RÓŻNE klucze idempotencji, równolegle: jedna realizacja, druga odmowa", async () => {
+      // TO jest realny wyścig o ten sam wiersz (review cyklu 1, INFO): oba
+      // żądania przechodzą predykat własności, więc rozstrzyga WYŁĄCZNIE
+      // `SELECT … FOR UPDATE` + allow-lista w `UPDATE`. Różne klucze
+      // idempotencji ⇒ to NIE jest replay, tylko dwie odrębne próby.
+      // Nad kodem sprzed 5.8 (`claim` bez najemcy, predykat na innym snapshocie)
+      // ten przypadek potrafił zejść z saldem dwa razy.
+      const [first, second] = await Promise.all([
+        callRedeemRoute(CODE_IDLE, "idem-race-a", SELLER_MINE),
+        callRedeemRoute(CODE_IDLE, "idem-race-b", SELLER_MINE),
+      ])
+
+      const codes = [first.statusCode, second.statusCode].sort()
+      // Jedno 200, drugie 409 `VOUCHER_ALREADY_REDEEMED` — nigdy dwa 200.
+      expect(codes).toEqual([200, 409])
+
+      const refused = first.statusCode === 409 ? first : second
+      expect(refused.body.reason).toBe("already_redeemed")
+
+      expect(await voucherStatus(CODE_IDLE)).toBe("claimed")
+      expect(await countRedemptions()).toBe(1)
+      expect(await countClaimedEvents(CODE_IDLE)).toBe(1)
+    })
+  })
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // AC7 — kanał czasowy „nie twój" vs „nieznany" (review-fix cyklu 1, MEDIUM)
+  // ───────────────────────────────────────────────────────────────────────────
+
+  describe("AC7 — obie ścieżki odmowy robią w bazie tę samą pracę", () => {
+    it("odmowa NIE ciąga historii zdarzeń; pełny widok czyta dopiero sukces", async () => {
+      // Mierzone NOŚNIKIEM pracy, nie zegarem: `getByCode` jest jedyną drogą do
+      // drugiego zapytania (`SELECT * FROM voucher_event`). Przed poprawką
+      // `getForSeller` wołał je ZAWSZE, więc „cudzy voucher" wykonywał dwa
+      // zapytania, a „nieznany kod" jedno — sam czas odpowiedzi je odróżniał.
+      // Ten test PĘKA po powrocie do kształtu `getByCode` + porównanie w pamięci.
+      // Kontekst rynku jest OBOWIĄZKOWY: pod `FORCE RLS` połączenie bez
+      // `app.gp_market_id` widzi ZERO wierszy, więc bez tego opakowania nawet
+      // ścieżka sukcesu zwracałaby `null` — i test „mierzyłby" RLS zamiast
+      // kanału czasowego. (Zmierzone: bez `runInHttpMarketContext` kontrola
+      // dodatnia poniżej pękła.)
+      const spy = jest.spyOn(service, "getByCode")
+      try {
+        await runInHttpMarketContext(MARKET, async () => {
+          expect(await service.getForSeller(SELLER_MINE, CODE_OTHER)).toBeNull()
+          expect(
+            await service.getForSeller(SELLER_MINE, "V-STORY58-BRAK"),
+          ).toBeNull()
+          expect(spy).not.toHaveBeenCalled()
+
+          // Kontrola DODATNIA: bez niej „nigdy nie wołaj `getByCode`" przechodziłoby
+          // także dla implementacji, która nie zwraca zdarzeń nikomu.
+          const mine = await service.getForSeller(SELLER_MINE, CODE_IDLE)
+          expect(mine).not.toBeNull()
+          expect(Array.isArray(mine!.events)).toBe(true)
+          expect(spy).toHaveBeenCalledTimes(1)
+        })
+      } finally {
+        spy.mockRestore()
+      }
     })
   })
 

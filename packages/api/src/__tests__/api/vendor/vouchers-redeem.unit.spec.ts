@@ -145,6 +145,11 @@ const ENTITLEMENT_GROSS = 12_000
 function createRedemptionFakeDb(opts: {
   entitlementState?: string
   entitlementRows?: number
+  /**
+   * Typ uprawnienia SPOZA obsługiwanych — jedyny tani sposób, żeby wywołać
+   * `RedeemNotRedeemableError`, które NIE wynika ze stanu (review-fix cyklu 1).
+   */
+  entitlementType?: string
 } = {}) {
   const redemptions = new Map<string, Record<string, unknown>>()
   let state = opts.entitlementState ?? "ACTIVE"
@@ -153,7 +158,7 @@ function createRedemptionFakeDb(opts: {
 
   const entitlementRow = (index: number) => ({
     id: index === 0 ? ENTITLEMENT_ID : `${ENTITLEMENT_ID}_${index}`,
-    entitlement_type: "VOUCHER_AMOUNT",
+    entitlement_type: opts.entitlementType ?? "VOUCHER_AMOUNT",
     state,
     remaining_amount: remaining,
     policy_snapshot: {
@@ -574,6 +579,88 @@ describe("cc-4 F-05 — POST /vendor/vouchers/:code/redeem", () => {
     expect(res.statusCode).toBe(410)
     // v1.15.0 Story 5.8 (AC7): odmowa niesie ROZRÓŻNIALNY powód, nie tylko kod.
     expect((res.body as { reason: string }).reason).toBe("expired")
+  })
+
+  // ── review-fix cyklu 1 (findings LOW) ──────────────────────────────────────
+
+  // Odmowa warstwy uprawnienia, która ze STANEM VOUCHERA nie ma nic wspólnego
+  // (tu: nieobsługiwany `entitlement_type`), NIE MOŻE dostać etykiety stanu.
+  // Przed poprawką trasa łapała całą klasę `RedeemNotRedeemableError` i przy
+  // voucherze `withdrawn` odpowiadała `409 VOUCHER_WITHDRAWN` — odmowa
+  // poprawna, powód ZMYŚLONY, wbrew UX-DR9.
+  it("L12 — odmowa nie-stanowa uprawnienia ⇒ 422 REDEMPTION_REFUSED, bez zmyślonego powodu", async () => {
+    const withdrawn = makeVoucher({ status: "withdrawn" })
+    const mock = voucherMock(withdrawn)
+    const req = makeRequest({
+      voucherService: mock,
+      redemptionDb: createRedemptionFakeDb({ entitlementType: "MYSTERY_TYPE" }),
+    })
+    const res = makeRes()
+    await redeemPOST(req as never, res as never)
+
+    expect(res.statusCode).toBe(422)
+    const body = res.body as { code: string; reason?: string }
+    expect(body.code).toBe("REDEMPTION_REFUSED")
+    expect(body.reason).toBeUndefined()
+  })
+
+  // Kontrola DODATNIA do L12: zawężenie nie mogło zabrać tłumaczenia tam, gdzie
+  // odmowa NAPRAWDĘ wynika ze stanu uprawnienia.
+  it("L13 — odmowa STANOWA uprawnienia nadal daje rozróżnialny powód stanu vouchera", async () => {
+    const withdrawn = makeVoucher({ status: "withdrawn" })
+    const mock = voucherMock(withdrawn)
+    const req = makeRequest({
+      voucherService: mock,
+      redemptionDb: createRedemptionFakeDb({ entitlementState: "REDEEMED_FULL" }),
+    })
+    const res = makeRes()
+    await redeemPOST(req as never, res as never)
+
+    expect(res.statusCode).toBe(409)
+    const body = res.body as { code: string; reason: string }
+    expect(body.reason).toBe("withdrawn")
+  })
+
+  // Powtórka realizacji sprzed 5.8: zdarzenie `claimed` NIE MA
+  // `payload.prior_status`, bo zapisywał je stary `claim()`. Koperta replayu
+  // musi wtedy powiedzieć „nie wiem" (`null`), a nie podstawić stan BIEŻĄCY —
+  // podstawienie produkowało kopertę INNĄ niż przy pierwszym żądaniu, czyli
+  // dokładnie defekt, przed którym to pole miało chronić.
+  it("L14 — replay danych sprzed 5.8 zwraca prior_status=null, nie stan bieżący", async () => {
+    const legacyClaimEvent = {
+      event_type: "claimed",
+      occurred_at: new Date("2026-05-24T10:00:00Z"),
+    }
+    const claimedVoucher = makeVoucher({
+      status: "claimed",
+      events: [legacyClaimEvent],
+    })
+    const mock = voucherMock(claimedVoucher, {
+      status: "redeemed",
+      prior_status: null,
+      voucher: claimedVoucher,
+    })
+    const redemptionDb = createRedemptionFakeDb()
+
+    const first = makeRes()
+    await redeemPOST(
+      makeRequest({ voucherService: mock, redemptionDb }) as never,
+      first as never,
+    )
+    expect(first.statusCode).toBe(200)
+
+    const second = makeRes()
+    await redeemPOST(
+      makeRequest({ voucherService: mock, redemptionDb }) as never,
+      second as never,
+    )
+    expect(second.statusCode).toBe(200)
+    const body = second.body as {
+      idempotent: boolean
+      envelope: { prior_status: string | null }
+    }
+    expect(body.idempotent).toBe(true)
+    expect(body.envelope.prior_status).toBeNull()
   })
 
   // v1.15.0 Story 2.6 cykl 1 (finding HIGH #1) — kontrola, która PĘKA po zepsuciu

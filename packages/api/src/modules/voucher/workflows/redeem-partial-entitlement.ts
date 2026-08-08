@@ -251,6 +251,28 @@ export class RedeemNotRedeemableError extends Error {
   }
 }
 
+/**
+ * Odmowa warstwy uprawnienia wynikająca WYŁĄCZNIE ze STANU uprawnienia
+ * (`REDEEMABLE_SOURCE_STATES`) — v1.15.0 Story 5.8, review-fix cyklu 1 (LOW).
+ *
+ * Po co osobny podtyp: trasa `/vendor/vouchers/:code/redeem` tłumaczy odmowę
+ * warstwy uprawnienia na ROZRÓŻNIALNY powód stanu vouchera (UX-DR9). Łapanie
+ * całej klasy `RedeemNotRedeemableError` przypinało tę etykietę także odmowom,
+ * które ze stanem nie mają nic wspólnego — nieobsługiwany `entitlement_type`,
+ * `remaining <= 0`, podanie obu identyfikatorów naraz albo żadnego. Skutek:
+ * odmowa poprawna (fail-closed), ale powód ZMYŚLONY („voucher wycofany”, gdy
+ * realną przyczyną był typ uprawnienia).
+ *
+ * Podtyp, a nie nowa klasa: wszystkie istniejące `catch (RedeemNotRedeemableError)`
+ * (i mapowanie na `422 REDEMPTION_REFUSED`) działają dalej bez zmian.
+ */
+export class RedeemEntitlementStateError extends RedeemNotRedeemableError {
+  constructor(message: string) {
+    super(message)
+    this.name = "RedeemEntitlementStateError"
+  }
+}
+
 export class RedeemChoiceSetItemError extends Error {
   constructor(message: string) {
     super(message)
@@ -1176,7 +1198,7 @@ export class RedeemPartialEntitlementOperation {
 
       // ── Inwarianty redeemowalności (fail-closed) ──────────────────────────
       if (!REDEEMABLE_SOURCE_STATES.has(ent.state)) {
-        throw new RedeemNotRedeemableError(
+        throw new RedeemEntitlementStateError(
           `redeem: entitlement ${ent.id} w stanie ${ent.state} nie jest ` +
             `redeemowalny (dozwolone: ACTIVE / REDEEMED_PARTIAL)`
         )

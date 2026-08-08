@@ -204,8 +204,34 @@ export function resolveGpCoreRlsEnforced(raw = process.env.GP_CORE_RLS_ENFORCED)
  * oznaczałby, że rezolucja vendora patrzy w inny wycinek bazy niż zasiew.
  */
 export function resolveGpCoreInstanceId(explicit?: string): string {
-  const value = (explicit ?? process.env.GP_INSTANCE_ID ?? "gp-dev").trim()
-  return value.length > 0 ? value : "gp-dev"
+  return resolveGpCoreInstanceIdWithSource(explicit).value
+}
+
+/** Skąd realnie pochodzi zakres — nośnik, nie tylko wartość. */
+export type GpCoreInstanceIdSource = "option" | "env" | "default"
+
+/**
+ * Ta sama rezolucja co {@link resolveGpCoreInstanceId}, ale zwraca też NOŚNIK
+ * (review-fix cyklu 1, LOW).
+ *
+ * Po co: w środowisku bez `GP_INSTANCE_ID` i bez opcji modułu zakres schodzi
+ * na `gp-dev`, w którym poza devem NIE MA żadnego mapowania — więc CAŁA
+ * powierzchnia `/vendor/*` odmawia `403 VENDOR_NOT_MAPPED` komunikatem
+ * wskazującym na DANE („to konto nie jest powiązane z salonem"), podczas gdy
+ * realną przyczyną jest KONFIGURACJA. Zachowanie zostaje fail-closed; zmienia
+ * się to, że przyczyna przestaje być niewidoczna dla operatora.
+ */
+export function resolveGpCoreInstanceIdWithSource(explicit?: string): {
+  value: string
+  source: GpCoreInstanceIdSource
+} {
+  const fromOption = typeof explicit === "string" ? explicit.trim() : ""
+  if (fromOption.length > 0) return { value: fromOption, source: "option" }
+
+  const fromEnv = (process.env.GP_INSTANCE_ID ?? "").trim()
+  if (fromEnv.length > 0) return { value: fromEnv, source: "env" }
+
+  return { value: "gp-dev", source: "default" }
 }
 
 export default class GpCoreService {
@@ -946,6 +972,21 @@ export default class GpCoreService {
     )
 
     if (!row) {
+      // Odmowa zostaje fail-closed, ale operator ma zobaczyć, że zakres mógł
+      // zejść na DOMYŚLKĘ — bo wtedy „brak mapowania" jest objawem braku
+      // `GP_INSTANCE_ID`, a nie braku danych (review-fix cyklu 1, LOW).
+      const { source } = resolveGpCoreInstanceIdWithSource(
+        this.moduleOptions_.instanceId
+      )
+      if (source === "default") {
+        this.logger_.warn?.(
+          `gp_core.resolveVendorId: brak mapowania dla sellera ${sellerId} ` +
+            `w zakresie instance_id="${instanceId}" pochodzącym z DOMYŚLKI ` +
+            `(ani opcja modułu \`instanceId\`, ani GP_INSTANCE_ID nie są ustawione). ` +
+            `Poza dev to najczęstsza przyczyna 403 VENDOR_NOT_MAPPED na CAŁEJ ` +
+            `powierzchni /vendor/* — sprawdź konfigurację, zanim zaczniesz szukać danych.`
+        )
+      }
       throw new VendorNotMappedError(sellerId, instanceId)
     }
 
