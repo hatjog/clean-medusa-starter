@@ -34,7 +34,13 @@ class CompensateFakeClient {
         return { rows: [] as T[], rowCount: 0 }
       }
       this.entitlementState = params[1] as string
-      return { rows: [] as T[], rowCount: 1 }
+      // review-fix cyklu 2 (C2-HIGH-1): guard `RETURNING entitlement_type` —
+      // wołanie producenta jest bramkowane przynależnością typu, a typ bierze
+      // się z wiersza, który TA transakcja właśnie przestawiła.
+      return {
+        rows: [{ entitlement_type: "VOUCHER_AMOUNT" }] as unknown as T[],
+        rowCount: 1,
+      }
     }
     if (sql.includes("policy_snapshot->>'voucher_code'")) {
       return {

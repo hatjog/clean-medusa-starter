@@ -16,6 +16,7 @@ import {
   ENTITLEMENT_RETENTION_ISSUED_EVENT_TYPE,
   InMemoryIssueRetentionStore,
   IssueRetentionWorkflow,
+  PostgresIssueRetentionStore,
   RetentionAmountBoundaryError,
   RetentionEntitlementNotFoundError,
   generateRetentionEntitlementCode,
@@ -460,5 +461,133 @@ describe("IssueRetentionWorkflow", () => {
     const code = generateRetentionEntitlementCode(oldId, idempotencyKey)
     expect(code).not.toBe(oldId)
     expect(code).toMatch(/^GP-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}$/)
+  })
+})
+
+// ===========================================================================
+// v1.15.0 Story 5.9 review-fix cyklu 2 — C2-MEDIUM-1 / C2-MEDIUM-2
+// ===========================================================================
+
+describe("C2-MEDIUM-1 — kod następcy niesie kwotę RETENCJI, nie kwotę oryginału", () => {
+  /**
+   * Store in-memory nie trzyma `value_minor`, więc kwota jest mierzalna
+   * WYŁĄCZNIE na producencie PG. Fake łapie parametry `INSERT INTO voucher`
+   * i to one są dowodem — nie mapa atrapy.
+   */
+  function pgTxFake() {
+    const calls: { sql: string; params: unknown[] }[] = []
+    const client = {
+      query: async (sql: string, params: unknown[] = []) => {
+        calls.push({ sql, params })
+        if (/INSERT INTO voucher/i.test(sql)) return { rows: [], rowCount: 1 }
+        return { rows: [], rowCount: 0 }
+      },
+      release: () => undefined,
+    }
+    return { calls, client }
+  }
+
+  it("PG: `value_minor` klonu jest NADPISANE kwotą retencji (COALESCE($4, value_minor))", async () => {
+    const { calls, client } = pgTxFake()
+    const store = new PostgresIssueRetentionStore({
+      connect: async () => client,
+    } as never)
+
+    const outcome = await store.withTransaction((tx) =>
+      tx.issueSuccessorVoucherCode({
+        from_code: "GP-OLD",
+        to_code: "GP-NEW",
+        value_minor: 22000,
+        now: new Date("2026-06-01T00:00:00Z"),
+      })
+    )
+
+    expect(outcome).toBe("issued")
+    const insert = calls.find((c) => /INSERT INTO voucher/i.test(c.sql))!
+    // Kwota JEST czwartym parametrem, a SQL bierze ją przed klonem.
+    expect(insert.params[3]).toBe(22000)
+    expect(insert.sql).toContain("COALESCE($4::integer, value_minor)")
+  })
+
+  it("PG: `value_minor: null` = przepisz z klonu (odzysk zgubionego kodu)", async () => {
+    const { calls, client } = pgTxFake()
+    const store = new PostgresIssueRetentionStore({
+      connect: async () => client,
+    } as never)
+
+    await store.withTransaction((tx) =>
+      tx.issueSuccessorVoucherCode({
+        from_code: "GP-OLD",
+        to_code: "GP-NEW",
+        value_minor: null,
+        now: new Date("2026-06-01T00:00:00Z"),
+      })
+    )
+
+    const insert = calls.find((c) => /INSERT INTO voucher/i.test(c.sql))!
+    expect(insert.params[3]).toBeNull()
+  })
+
+  it("kwota ułamkowa jest odrzucana PRZED zapisem (jedno wyrażenie dla obu nośników)", async () => {
+    const old = entitlement()
+    const { store, workflow } = workflowWith([old])
+
+    await expect(
+      workflow.issueRetention({
+        entitlement_id: old.id,
+        amount: 550.5,
+        reason: "Kwota ułamkowa",
+        admin_user_id: "user_admin_001",
+      })
+    ).rejects.toThrow(/minor units/)
+    // Fail-closed PRZED efektem: stare uprawnienie nietknięte.
+    expect(store.get(old.id)?.state).toBe("ACTIVE")
+  })
+})
+
+describe("C2-MEDIUM-2 — brak cichego fallbacku do kodu unieważnionego w tej samej tx", () => {
+  it("snapshot następcy NIGDY nie niesie starego kodu — stary jest `withdrawn`", async () => {
+    const old = entitlement()
+    const { store, workflow } = workflowWith([old])
+
+    const result = await workflow.issueRetention({
+      entitlement_id: old.id,
+      amount: 550,
+      reason: "Retencja",
+      admin_user_id: "user_admin_001",
+    })
+
+    const next = store.get(result.retention_entitlement_id)!
+    const snap = next.policy_snapshot as Record<string, unknown>
+    expect(snap.voucher_code).toBe(result.retention_code)
+    expect(snap.voucher_code).not.toBe("GP-TEST-RETENTION-001")
+    // Stary kod jest unieważniony — gdyby snapshot na niego wskazywał,
+    // aktywne uprawnienie wskazywałoby mostem 5.7 kod martwy.
+    expect(store.getVoucherStatus("GP-TEST-RETENTION-001")).toBe("withdrawn")
+    expect(store.getVoucherStatus(result.retention_code)).toBe("idle")
+  })
+
+  it("`source_missing` jest FAIL-CLOSED, nie fallbackiem (kontrola przeciwna do cichego no-opu)", async () => {
+    // Uprawnienie niesie kod w snapshotcie, ale store nie zna tego kodu —
+    // most złamany. Przed fixem wołający dostawał `false` i przepisywał STARY
+    // kod do snapshotu następcy.
+    const old = entitlement()
+    const store = new InMemoryIssueRetentionStore([old])
+    // Usuwamy wiersz kodu wprowadzony automatycznie przez konstruktor atrapy.
+    ;(store as unknown as { codes: Map<string, string> }).codes.delete(
+      "GP-TEST-RETENTION-001"
+    )
+    const workflow = new IssueRetentionWorkflow(store, {
+      emit: jest.fn<() => Promise<void>>().mockResolvedValue(undefined),
+    })
+
+    await expect(
+      workflow.issueRetention({
+        entitlement_id: old.id,
+        amount: 550,
+        reason: "Most złamany",
+        admin_user_id: "user_admin_001",
+      })
+    ).rejects.toThrow(/most kod|VoucherCodeBridgeMissing|SuccessorVoucherCodeBridge/)
   })
 })

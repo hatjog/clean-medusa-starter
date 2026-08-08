@@ -85,18 +85,66 @@ export function isInvalidatingEntitlementState(
 }
 
 /**
- * Stany kodu, z których przejście na stan unieważniający jest legalne.
+ * Stany kodu, z których przejście na DANY stan unieważniający jest legalne —
+ * LUSTRO `invalidating_transitions.source_states` z kontraktu słownika
+ * (review-fix cyklu 2, C2-MEDIUM-4).
  *
- * ALLOW-LISTA, nie negacja (AD-17). `claimed` jest tu ŚWIADOMIE: voucher
- * zrealizowany też może zostać zwrócony (zwrot po realizacji jest ścieżką
- * mechanizmu (b) w `refund-entitlement.ts`), a kod ma wtedy przestać działać
- * na wypadek kolejnej próby. Stany unieważnione (`refunded`, `expired`,
- * `withdrawn`) NIE są tu wymienione — przejście z nich rozstrzyga PRECEDENCJA
- * (`SUPERSEDING_VOUCHER_STATUS`), a nie ta lista: patrz
+ * ALLOW-LISTA, nie negacja (AD-17). Do tego fixu zbiór był JEDEN dla
+ * wszystkich celów i zawierał `claimed` — a uzasadnienie w kodzie dotyczyło
+ * WYŁĄCZNIE zwrotu („voucher zrealizowany też może zostać zwrócony"). Reguła
+ * była więc szersza niż jej powód, i to w mierzalny sposób:
+ *
+ *   - `VoucherService.claim()` przestawia `voucher.status` na `claimed` i NIE
+ *     dotyka `entitlement_instance`, więc para (kod `claimed`, uprawnienie
+ *     `ACTIVE`) jest stanem NORMALNYM;
+ *   - `EXPIRY_SOURCE_STATES` zawiera `ACTIVE`, a backfill 1779010000000 —
+ *     dołożony w tym samym review-fixie — DOPISAŁ tym wierszom `expires_at`,
+ *     czyli własnoręcznie powiększył populację wpadającą w tę gałąź;
+ *   - sweeper przestawiał wtedy kod ZREALIZOWANY na `expired`, a
+ *     `resolveRedeemRefusalReason` zwracał `expired`/410 zamiast
+ *     `already_redeemed`/409. Dla reklamacji i raportowania to jest zapis
+ *     KŁAMIĄCY o tym, co się wydarzyło.
+ *
+ * Usunięty w 5.9 bulk-UPDATE wykluczał `claimed` ŚWIADOMIE
+ * (`WHERE status IN ('idle','consent_pending')`) — następca to wykluczenie
+ * zgubił. Teraz zbiór zależy od CELU, tak jak precedencja, i pochodzi
+ * z kontraktu, żeby bramka go pilnowała.
+ *
+ * Stany unieważnione (`refunded`, `expired`, `withdrawn`) NIE są tu
+ * wymienione — przejście z nich rozstrzyga PRECEDENCJA
+ * (`SUPERSEDING_VOUCHER_STATUS`), a nie ta mapa: patrz
  * `decideVoucherCodeInvalidation`.
  */
-export const CODE_INVALIDATION_SOURCE_STATES: ReadonlySet<VoucherStatus> =
-  new Set<VoucherStatus>(["idle", "consent_pending", "claimed"])
+export const CODE_INVALIDATION_SOURCE_STATES_BY_TARGET: Readonly<
+  Record<VoucherStatus, readonly VoucherStatus[]>
+> = {
+  // Zwrot: „pieniądze wróciły" unieważnia kod NIEZALEŻNIE od tego, czy zabieg
+  // został już zrealizowany — dlatego i tylko dlatego `claimed` jest źródłem.
+  refunded: ["idle", "consent_pending", "claimed"],
+  // Wygaśnięcie: kod ZREALIZOWANY nie wygasa. Relabel `claimed` → `expired`
+  // niszczyłby fakt realizacji.
+  expired: ["idle", "consent_pending"],
+  // Wycofanie zgody / kompensacja wystawienia: jak wyżej.
+  withdrawn: ["idle", "consent_pending"],
+  // Poniższe NIE są celami unieważnienia (nie występują w mapie kontraktu);
+  // wpisy istnieją, bo rekord jest WYCZERPUJĄCY po `VoucherStatus` — dopisanie
+  // stanu kodu nie skompiluje się bez świadomej odpowiedzi, z czego wolno
+  // w niego wejść.
+  idle: [],
+  consent_pending: [],
+  claimed: [],
+}
+
+/**
+ * Stany źródłowe dla KONKRETNEGO celu. Wydzielone, żeby wołający nie sięgał do
+ * rekordu wprost i żeby komunikat błędu wymieniał zbiór ZALEŻNY OD CELU,
+ * a nie zbiór unii.
+ */
+export function codeInvalidationSourceStates(
+  target: VoucherStatus
+): ReadonlySet<VoucherStatus> {
+  return new Set(CODE_INVALIDATION_SOURCE_STATES_BY_TARGET[target] ?? [])
+}
 
 /**
  * Stany kodu, które SĄ już unieważnione — derywowane z mapy, nie wypisane
@@ -157,6 +205,27 @@ export type VoucherCodeInvalidationOutcome =
    * wynik jest zwracany, nazwany i asertowany w testach.
    */
   | "no_voucher_code"
+  /**
+   * Kod jest `claimed` (zabieg wykonany), a cel NIE jest zwrotem
+   * (review-fix cyklu 2, C2-MEDIUM-4).
+   *
+   * Relabel `claimed → expired` / `claimed → withdrawn` NISZCZYŁBY fakt
+   * realizacji: `resolveRedeemRefusalReason` zwracałby wtedy `expired`/410
+   * zamiast `already_redeemed`/409, a `voucher.status` przestałby nieść to,
+   * co się faktycznie wydarzyło — dla reklamacji i raportowania to jest zapis
+   * kłamiący. Usunięty w 5.9 bulk-UPDATE wykluczał `claimed` z tego samego
+   * powodu (`WHERE status IN ('idle','consent_pending')`).
+   *
+   * SM-7 nie jest zagrożone: `claimed` jest POZA allow-listą wejściową
+   * realizacji (`voucher_status_redemption_input_allowlist` = idle,
+   * consent_pending), więc kod i tak nie przejdzie realizacji. Uprawnienie
+   * schodzi normalnie; kod zostaje przy prawdzie.
+   *
+   * Wynik jest NAZWANY, nie rzucony: rzut przewracałby transakcję sweepera
+   * i uprawnienie w ogóle by nie wygasło — czyli lek gorszy niż choroba,
+   * i dokładnie ta klasa, którą precedencja zamknęła w cyklu 1.
+   */
+  | "already_redeemed_code"
 
 export type VoucherCodeInvalidationResult = {
   outcome: VoucherCodeInvalidationOutcome
@@ -212,15 +281,17 @@ export class VoucherCodeBridgeMissingError extends Error {
 export class VoucherCodeNotInvalidatableError extends Error {
   readonly voucher_code: string
   readonly status: VoucherStatus
+  readonly target_status: VoucherStatus
   constructor(code: string, status: VoucherStatus, target: VoucherStatus) {
     super(
       `invalidateVoucherCode: kod ${code} jest w stanie '${status}', z którego ` +
-        `przejście na '${target}' nie jest na allow-liście ` +
-        `(${[...CODE_INVALIDATION_SOURCE_STATES].join(", ")})`
+        `przejście na '${target}' nie jest na allow-liście dla TEGO celu ` +
+        `(${[...codeInvalidationSourceStates(target)].join(", ")})`
     )
     this.name = "VoucherCodeNotInvalidatableError"
     this.voucher_code = code
     this.status = status
+    this.target_status = target
   }
 }
 
@@ -339,8 +410,27 @@ export function decideVoucherCodeInvalidation(input: {
     }
   }
 
-  // Allow-lista stanów źródłowych — fail-closed PRZED efektem.
-  if (!CODE_INVALIDATION_SOURCE_STATES.has(input.current_status)) {
+  // Allow-lista stanów źródłowych ZALEŻNA OD CELU (review-fix cyklu 2,
+  // C2-MEDIUM-4). `claimed → refunded` przechodzi (zwrot unieważnia voucher
+  // także po zabiegu); `claimed → expired`/`withdrawn` NIE — kod zrealizowany
+  // nie wygasa i nie jest wycofywany.
+  if (!codeInvalidationSourceStates(target).has(input.current_status)) {
+    if (input.current_status === "claimed") {
+      // Wynik NAZWANY, nie rzut: rzut przewracałby transakcję sweepera, więc
+      // uprawnienie w ogóle by nie wygasło. Kod zostaje `claimed` — poza
+      // allow-listą wejściową realizacji, czyli nierealizowalny.
+      return {
+        outcome: "already_redeemed_code",
+        entitlement_id: input.entitlement_id,
+        voucher_code: code,
+        prior_status: input.current_status,
+        target_status: target,
+      }
+    }
+    // Stan spoza allow-listy i spoza nazwanych wyjątków — fail-closed PRZED
+    // efektem. Dziś nieosiągalny (stany unieważnione rozstrzyga precedencja
+    // wyżej), ale dopisanie stanu do `VoucherStatus` bez decyzji, z czego
+    // wolno w cel wejść, ma być błędem, a nie cichym przejściem.
     throw new VoucherCodeNotInvalidatableError(code, input.current_status, target)
   }
 

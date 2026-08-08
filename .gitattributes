@@ -43,3 +43,16 @@ packages/api/src/workflows/entitlements/live-issue-from-payment-intent.ts text e
 packages/api/src/workflows/entitlements/issue-entitlement.ts text eol=lf
 packages/api/src/__tests__/workflows/payment/stripe-payment-audit-refund.unit.spec.ts text eol=lf
 packages/api/src/__tests__/workflows/entitlements/** text eol=lf
+
+# Review-fix cyklu 2 Story 5.9 — pliki DOŁOŻONE przez ten fix. Pinowane od razu,
+# razem z `git add --renormalize` w TYM SAMYM commicie (C2-LOW-1): pin bez
+# renormalizacji zostawia plik trwale „modified" w świeżym checkoucie, czyli
+# dokładnie ten stan, którego pin miał uniknąć.
+packages/api/src/modules/voucher/__tests__/entitlement-expires-at-backfill-migration.test.ts text eol=lf
+packages/api/src/__tests__/workflows/payment/stripe-payment-audit-refund-live-bridge.unit.spec.ts text eol=lf
+# Pliki, ktorych konce linii przewrocil TEN commit (edycja z Linuksa na plikach
+# lezacych w indeksie jako CRLF). Ta sama klasa i to samo domkniecie: pin
+# + `git add --renormalize` w tym samym commicie.
+packages/api/src/__tests__/integration/entitlement-instance-creation.test.ts text eol=lf
+packages/api/src/__tests__/workflows/payment/stripe-payment-audit.unit.spec.ts text eol=lf
+packages/api/src/__tests__/workflows/payment/stripe-payment-audit-active-emit.unit.spec.ts text eol=lf

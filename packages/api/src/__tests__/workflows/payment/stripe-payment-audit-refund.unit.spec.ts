@@ -165,13 +165,20 @@ class RefundFakeClient {
       return { rows: [] as T[], rowCount: 1 }
     }
 
-    if (sql.includes("SELECT id, state FROM entitlement_instance")) {
+    // v1.15.0 Story 5.9 review-fix cyklu 2 (C2-HIGH-1): `revokeEntitlementsOnRefund`
+    // dociąga `entitlement_type`, bo decyzja „czy jest co unieważniać" należy do
+    // wołającego, nie do producenta.
+    if (sql.includes("SELECT id, state, entitlement_type FROM entitlement_instance")) {
       const orderId = params[0] as string
       const matches = Array.from(this.entitlementRows.values()).filter(
         (r) => r.order_id === orderId
       )
       return {
-        rows: matches.map((r) => ({ id: r.id, state: r.state })) as T[],
+        rows: matches.map((r) => ({
+          id: r.id,
+          state: r.state,
+          entitlement_type: "VOUCHER_AMOUNT",
+        })) as T[],
         rowCount: matches.length,
       }
     }
@@ -190,6 +197,14 @@ class RefundFakeClient {
           row.state = newState
         }
       }
+      if (sql.includes("RETURNING entitlement_type")) {
+        return {
+          rows: (row
+            ? [{ entitlement_type: "VOUCHER_AMOUNT" }]
+            : []) as unknown as T[],
+          rowCount: row ? 1 : 0,
+        }
+      }
       return { rows: [] as T[], rowCount: row ? 1 : 0 }
     }
 
@@ -203,6 +218,27 @@ class RefundFakeClient {
         rows: match ? ([{ id: match.id }] as T[]) : ([] as T[]),
         rowCount: match ? 1 : 0,
       }
+    }
+
+    // review-fix cyklu 2 (C2-HIGH-1): produkcyjne zapytanie linii niesie dane
+    // sprzedawcy — captured-path wydaje kod przy wystawieniu.
+    if (sql.includes("FROM order_item oi")) {
+      return {
+        rows: [
+          {
+            line_item_id: "line_1",
+            metadata: null,
+            line_title: "Zabieg testowy",
+            seller_id: "sel_test",
+            seller_name: "Salon Testowy",
+            seller_handle: "salon-testowy",
+          },
+        ] as unknown as T[],
+        rowCount: 1,
+      }
+    }
+    if (sql.includes("INSERT INTO voucher")) {
+      return { rows: [] as T[], rowCount: 1 }
     }
 
     if (sql.includes("INSERT INTO entitlement_instance")) {

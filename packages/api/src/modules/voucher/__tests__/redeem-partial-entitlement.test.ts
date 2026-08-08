@@ -899,3 +899,70 @@ describe("Story 4.1 L6 — param drift: reużyty idempotency_key z innym amount_
     expect(replay.idempotent).toBe(true)
   })
 })
+
+// ===========================================================================
+// v1.15.0 Story 5.9 review-fix cyklu 2 (C2-HIGH-2) — ODWRÓCENIE i stan kodu
+//
+// Do tego fixu `test:unit` nie zawierał ANI JEDNEGO wystąpienia `reverse` na
+// tej operacji: pomiar „zbiór nazw porażek NIEZMIENIONY" był prawdziwy i pusty
+// w tym punkcie, bo nie było testu, który mógłby stan zmienić. Odwrócenie
+// PEŁNE prowadzi do `REFUNDED` — stanu UNIEWAŻNIAJĄCEGO — więc od 5.9 wymaga
+// producenta stanu kodu w `wiringDeps`. Bez niego okablowanie fail-closuje
+// PRZED jakimkolwiek efektem (`MissingVoucherCodeInvalidatorError`).
+// ===========================================================================
+
+describe("C2-HIGH-2 — odwrócenie realizacji domyka też stan kodu vouchera", () => {
+  const CODE = "GP-REV-0001"
+
+  function makeCodedOp(remaining = 300) {
+    return makeOp({
+      rows: [
+        makeEntitlement({
+          remaining_amount: remaining,
+          policy_snapshot: { transferability: "bearer", voucher_code: CODE },
+        }),
+      ],
+    })
+  }
+
+  it("odwrócenie PEŁNE (Σ REVERSAL == Σ REDEMPTION) ⇒ REFUNDED i kod `refunded`", async () => {
+    const { op, store } = makeCodedOp()
+    const redeemed = await op.redeem(baseInput({ amount_minor: 300 }))
+    expect(store.getVoucherStatus(CODE)).toBe("idle")
+
+    const res = await op.reverse({
+      reverses_redemption_id: redeemed.redemption_id,
+      voucher_net_minor: 244,
+      voucher_vat_minor: 56,
+      currency: "PLN",
+    })
+
+    expect(res.fully_reversed).toBe(true)
+    expect(res.entitlement_state_after).toBe("REFUNDED")
+    expect(store.get("ent_amount_1")!.state).toBe("REFUNDED")
+    // AD-17: stan kodu schodzi w TEJ SAMEJ transakcji co stan uprawnienia.
+    expect(store.getVoucherStatus(CODE)).toBe("refunded")
+  })
+
+  it("kontrola przeciwna: odwrócenie CZĘŚCIOWE ⇒ REDEEMED_PARTIAL, kod NIETKNIĘTY", async () => {
+    const { op, store } = makeCodedOp()
+    const first = await op.redeem(
+      baseInput({ amount_minor: 100, idempotency_key: "rev-part-1" })
+    )
+    await op.redeem(
+      baseInput({ amount_minor: 200, idempotency_key: "rev-part-2" })
+    )
+
+    const res = await op.reverse({
+      reverses_redemption_id: first.redemption_id,
+      voucher_net_minor: 244,
+      voucher_vat_minor: 56,
+      currency: "PLN",
+    })
+
+    expect(res.fully_reversed).toBe(false)
+    expect(res.entitlement_state_after).toBe("REDEEMED_PARTIAL")
+    // Uprawnienie nie zeszło do stanu unieważniającego ⇒ kod zostaje realizowalny.
+    expect(store.getVoucherStatus(CODE)).toBe("idle")
+  })
+})

@@ -15,7 +15,10 @@ import {
   invalidateVoucherCode,
   type VoucherCodeInvalidationResult,
 } from "../voucher-code-state"
-import type { VoucherStatus } from "../models/types"
+import type {
+  SuccessorVoucherCodeOutcome,
+  VoucherStatus,
+} from "../models/types"
 
 export const ENTITLEMENT_LOST_CODE_REISSUED_EVENT_TYPE =
   "gp.entitlements.entitlement_lost_code_reissued.v1" as const
@@ -125,6 +128,38 @@ export class LostCodeReissueChainError extends Error {
   }
 }
 
+/**
+ * v1.15.0 Story 5.9 review-fix cyklu 2 (C2-MEDIUM-2).
+ *
+ * Uprawnienie źródłowe niesie `voucher_code` w snapshotcie, ale w tabeli
+ * `voucher` nie ma odpowiadającego mu wiersza — więc nie ma czego sklonować
+ * dla następcy. FAIL-CLOSED, nie fallback: poprzedni kształt (`boolean`
+ * `false` ⇒ `oldSnapshot`) dawał następcy STARY kod, który ta sama transakcja
+ * kilka linii wyżej przestawiła na `withdrawn`. Aktywne uprawnienie
+ * wskazujące mostem 5.7 kod martwy to defekt MEDIUM-1 cyklu 1 w całości,
+ * tyle że za warunkiem.
+ *
+ * Na ścieżce produkcyjnej ta gałąź jest NIEOSIĄGALNA: `invalidateVoucherCode`
+ * wołany kilka linii wyżej rzuca `VoucherCodeBridgeMissingError` na dokładnie
+ * tej samej przyczynie. Klasa istnieje po to, żeby ewentualna zmiana tamtej
+ * kolejności nie zamieniła fail-closed w cichy no-op.
+ */
+export class SuccessorVoucherCodeBridgeError extends Error {
+  readonly from_code: string
+  readonly to_code: string
+  constructor(fromCode: string, toCode: string, operation: string) {
+    super(
+      `issueSuccessorVoucherCode (${operation}): kod źródłowy ${fromCode} nie ma ` +
+        `wiersza w tabeli 'voucher', więc kodu następcy ${toCode} nie da się wydać. ` +
+        "Fail-closed: przepisanie starego kodu do snapshotu następcy dałoby " +
+        "aktywne uprawnienie wskazujące kod unieważniony w TEJ transakcji."
+    )
+    this.name = "SuccessorVoucherCodeBridgeError"
+    this.from_code = fromCode
+    this.to_code = toCode
+  }
+}
+
 /** Pattern for GP-issued reissue successor ids (GP-XXXX-XXXX-XXXX). */
 const REISSUE_SUCCESSOR_ID_RE = /^GP-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}$/
 
@@ -172,15 +207,26 @@ export interface ReissueLostCodeTx {
    * był kodem martwym, a stary — od 5.9 — `withdrawn`. Klientka zostawała
    * z niczym.
    *
-   * Zwraca `false`, gdy stary kod nie ma wiersza `voucher` (uprawnienie
-   * niewspierane kodem) — wtedy nie ma czego klonować i następca też kodu nie
-   * dostaje.
+   * review-fix cyklu 2 (C2-MEDIUM-1): `value_minor` bierzemy z `input`, a nie
+   * z klonu, gdy wołający poda kwotę — kwota retencji jest osobnym wejściem
+   * ([100 %, 200 %] źródła), więc klon rozjeżdżał nośnik kodu z nośnikiem
+   * uprawnienia. `null` = przepisz z klonu (odzysk: ta sama kwota).
+   *
+   * review-fix cyklu 2 (C2-MEDIUM-2): wynik ROZŁĄCZNY — `issued` /
+   * `already_issued` / `source_missing`. Poprzedni `boolean` sklejał dwie
+   * ostatnie przyczyny w jedno `false`, a wołający na obu wpadał w fallback do
+   * kodu przed chwilą unieważnionego.
    */
   issueSuccessorVoucherCode(input: {
     from_code: string
     to_code: string
+    /**
+     * Kwota nośnika kodu (minor units). `null` = przepisz z klonu — odzysk
+     * zgubionego kodu wydaje TĘ SAMĄ wartość.
+     */
+    value_minor: number | null
     now: Date
-  }): Promise<boolean>
+  }): Promise<SuccessorVoucherCodeOutcome>
 }
 
 export type EntitlementEventEmitter = {
@@ -281,22 +327,32 @@ export class ReissueLostCodeWorkflow {
         typeof oldSnapshot.voucher_code === "string"
           ? oldSnapshot.voucher_code
           : null
-      const successorCodeIssued = oldCode
-        ? await tx.issueSuccessorVoucherCode({
-            from_code: oldCode,
-            to_code: newCode,
-            now,
-          })
-        : false
+      // review-fix cyklu 2 (C2-MEDIUM-2): wynik ROZŁĄCZNY, bez fallbacku na
+      // kod przed chwilą unieważniony. `value_minor: null` = przepisz z klonu —
+      // odzysk zgubionego kodu wydaje TĘ SAMĄ wartość, więc kwota nie jest tu
+      // osobnym wejściem (w odróżnieniu od retencji, C2-MEDIUM-1).
+      if (oldCode) {
+        const outcome = await tx.issueSuccessorVoucherCode({
+          from_code: oldCode,
+          to_code: newCode,
+          value_minor: null,
+          now,
+        })
+        if (outcome === "source_missing") {
+          throw new SuccessorVoucherCodeBridgeError(
+            oldCode,
+            newCode,
+            "odzysk zgubionego kodu"
+          )
+        }
+      }
 
       const next: ReissuableEntitlement = {
         ...old,
         id: newCode,
         state: EntitlementInstanceState.ACTIVE,
         policy_snapshot: snapshotPolicy(
-          successorCodeIssued
-            ? { ...oldSnapshot, voucher_code: newCode }
-            : oldSnapshot
+          oldCode ? { ...oldSnapshot, voucher_code: newCode } : oldSnapshot
         ),
         issued_at: old.issued_at ?? old.created_at,
         created_at: now,
@@ -549,26 +605,43 @@ class PostgresReissueLostCodeTx implements ReissueLostCodeTx {
    * był kodem martwym, a stary — od 5.9 — `withdrawn`. Klientka zostawała
    * z niczym.
    *
-   * Zwraca `false`, gdy stary kod nie ma wiersza `voucher` (uprawnienie
-   * niewspierane kodem) — wtedy nie ma czego klonować i następca też kodu nie
-   * dostaje.
+   * review-fix cyklu 2 (C2-MEDIUM-1): `value_minor` bierzemy z `input`, a nie
+   * z klonu, gdy wołający poda kwotę — kwota retencji jest osobnym wejściem
+   * ([100 %, 200 %] źródła), więc klon rozjeżdżał nośnik kodu z nośnikiem
+   * uprawnienia. `null` = przepisz z klonu (odzysk: ta sama kwota).
+   *
+   * review-fix cyklu 2 (C2-MEDIUM-2): wynik ROZŁĄCZNY — `issued` /
+   * `already_issued` / `source_missing`. Poprzedni `boolean` sklejał dwie
+   * ostatnie przyczyny w jedno `false`, a wołający na obu wpadał w fallback do
+   * kodu przed chwilą unieważnionego.
    */
   async issueSuccessorVoucherCode(input: {
     from_code: string
     to_code: string
+    value_minor: number | null
     now: Date
-  }): Promise<boolean> {
+  }): Promise<SuccessorVoucherCodeOutcome> {
     const res = await this.client.query(
       `INSERT INTO voucher
          (code, market_id, seller_id, seller_name, seller_handle, product_title,
           value_minor, currency_code, status, expires_at, created_at, updated_at)
        SELECT $2, market_id, seller_id, seller_name, seller_handle, product_title,
-              value_minor, currency_code, 'idle', expires_at, $3, $3
+              COALESCE($4::integer, value_minor), currency_code, 'idle',
+              expires_at, $3, $3
          FROM voucher WHERE code = $1
        ON CONFLICT (code) DO NOTHING`,
-      [input.from_code, input.to_code, input.now]
+      [input.from_code, input.to_code, input.now, input.value_minor]
     )
-    return (res.rowCount ?? 0) > 0
+    if ((res.rowCount ?? 0) > 0) return "issued"
+    // `rowCount = 0` ma DWIE przyczyny i wołający musi je rozróżnić: brak
+    // wiersza źródłowego (złamany most) vs `ON CONFLICT DO NOTHING` na własnym
+    // wierszu z wcześniejszej próby. Jedno dodatkowe zapytanie w ścieżce
+    // rzadkiej jest tańsze niż `boolean`, który je sklejał.
+    const existing = await this.client.query(
+      `SELECT 1 FROM voucher WHERE code = $1`,
+      [input.to_code]
+    )
+    return (existing.rowCount ?? 0) > 0 ? "already_issued" : "source_missing"
   }
 
   async createReissuedEntitlement(row: ReissuableEntitlement): Promise<void> {
@@ -771,16 +844,22 @@ class InMemoryReissueLostCodeTx implements ReissueLostCodeTx {
     return decision
   }
 
-  /** v1.15.0 Story 5.9 review-fix: mirror wydania kodu następcy. */
+  /**
+   * v1.15.0 Story 5.9 review-fix: mirror wydania kodu następcy — rozłączny
+   * wynik, tak jak w PG (review-fix cyklu 2, C2-MEDIUM-2). Atrapa nie trzyma
+   * `value_minor`, więc parametr jest tu bez efektu; kwotę mierzą testy PG
+   * i evidence, a nie ta mapa.
+   */
   async issueSuccessorVoucherCode(input: {
     from_code: string
     to_code: string
+    value_minor: number | null
     now: Date
-  }): Promise<boolean> {
-    if (!this.codes.has(input.from_code)) return false
-    if (this.codes.has(input.to_code)) return false
+  }): Promise<SuccessorVoucherCodeOutcome> {
+    if (this.codes.has(input.to_code)) return "already_issued"
+    if (!this.codes.has(input.from_code)) return "source_missing"
     this.codes.set(input.to_code, "idle")
-    return true
+    return "issued"
   }
 
   async getEntitlementForUpdate(

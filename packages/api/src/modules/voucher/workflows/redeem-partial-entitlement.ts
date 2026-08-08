@@ -60,6 +60,16 @@ import {
   type PostingActivationGate,
 } from "../entitlement-transition-wiring"
 import { deriveLedgerTransactionId } from "../ledger-writer"
+// v1.15.0 Story 5.9 review-fix cyklu 2 (C2-HIGH-2): odwrócenie PEŁNE realizacji
+// prowadzi do `REFUNDED`, czyli stanu UNIEWAŻNIAJĄCEGO — okablowanie wymaga
+// wtedy producenta stanu kodu (fail-closed `MissingVoucherCodeInvalidatorError`),
+// a `wiringDeps` tej ścieżki go nie niosły.
+import {
+  decideVoucherCodeInvalidation,
+  invalidateVoucherCode,
+  type VoucherCodeInvalidationResult,
+} from "../voucher-code-state"
+import type { VoucherStatus } from "../models/types"
 
 // ──────────────────────────────────────────────────────────────────────────
 // Stany redeemowalne (źródło tranzycji) — voucher kwotowy z saldem
@@ -702,6 +712,22 @@ export interface RedeemPartialTx {
   ): Promise<void>
   /** Append-only audit (w obrębie tej tx — atomowy ze zmianą stanu). */
   appendAudit(audit: TransitionAuditEnvelope): Promise<void>
+  /**
+   * Unieważnienie stanu kodu vouchera — W TEJ SAMEJ transakcji co zmiana stanu
+   * uprawnienia (v1.15.0 Story 5.9, AD-17; dołożone w review-fixie cyklu 2,
+   * C2-HIGH-2).
+   *
+   * Ta ścieżka POTRZEBUJE producenta, choć na pierwszy rzut oka nie unieważnia
+   * niczego: odwrócenie realizacji domyka uprawnienie do `REFUNDED`, gdy po nim
+   * `Σ REVERSAL == Σ REDEMPTION` (ADR-198). Cel jest liczony dynamicznie
+   * (`reversalTargetState`), więc ani bramka statyczna, ani lektura pliku po
+   * nazwie stanu tego nie pokazywały — dopiero wykonanie.
+   */
+  invalidateVoucherCode(input: {
+    entitlement_id: string
+    to_state: EntitlementInstanceState
+    now: Date
+  }): Promise<VoucherCodeInvalidationResult>
   /**
    * Klient TEJ transakcji, wystawiony dla PROJEKCJI o jednym producencie
    * (ADR-178 §2.2 M6: `voucher_event` + `voucher.status` pisane W TEJ SAMEJ
@@ -1515,7 +1541,14 @@ export class RedeemPartialEntitlementOperation {
    * zwrot nie jest odblokowaniem, więc `REDEEMED_PARTIAL` nie nadaje tu nowej
    * realizowalności — przy `remaining = 0` redeem odmawia na saldzie.
    *
-   * GRANICA: unieważnienie KODU vouchera przy zwrocie należy do Story 5.9.
+   * STAN KODU (v1.15.0 Story 5.9, review-fix cyklu 2 / C2-HIGH-2): odwrócenie
+   * PEŁNE domyka uprawnienie do `REFUNDED`, więc kod vouchera schodzi na
+   * `refunded` W TEJ SAMEJ transakcji, przez `tx.invalidateVoucherCode`.
+   * Odwrócenie CZĘŚCIOWE zostawia `REDEEMED_PARTIAL` i kodu nie dotyka —
+   * uprawnienie nadal żyje. Poprzednia treść tego akapitu („granica: należy do
+   * Story 5.9") była prawdziwa do czasu, gdy 5.9 dołożyła fail-closed
+   * w okablowaniu — od tamtej chwili ta ścieżka nie miała granicy, tylko
+   * wyjątek na starcie.
    */
   async reverse(input: ReverseRedemptionInput): Promise<ReverseRedemptionResult> {
     const now = input.now ?? this.deps.clock?.() ?? new Date()
@@ -1627,6 +1660,14 @@ export class RedeemPartialEntitlementOperation {
 
       const wiringDeps = {
         appendAudit: tx.appendAudit.bind(tx),
+        // v1.15.0 Story 5.9 review-fix cyklu 2 (C2-HIGH-2): producent stanu
+        // kodu MUSI tu być. `reversalTargetState` bywa `REFUNDED`, a
+        // okablowanie fail-closuje PRZED jakimkolwiek efektem, gdy tranzycja
+        // unieważniająca nie ma czym zejść na stan kodu. Bez tej linii
+        // odwrócenie OSTATNIEJ niezwróconej raty — produkt Story 5.7 /
+        // ADR-198, jedyna ścieżka zejścia licznika prowizji do zera —
+        // wywracało się w całości.
+        invalidateVoucherCode: tx.invalidateVoucherCode.bind(tx),
         ...(this.deps.ledgerWriter
           ? { ledgerWriter: this.deps.ledgerWriter }
           : {}),
@@ -2191,6 +2232,18 @@ class PostgresRedeemPartialTx implements RedeemPartialTx {
       ]
     )
   }
+
+  /**
+   * v1.15.0 Story 5.9 (AC2/AC3): delegacja do JEDYNEGO producenta stanu kodu
+   * na `this.client` — bez własnego `connect()`, `BEGIN` i `COMMIT`.
+   */
+  async invalidateVoucherCode(input: {
+    entitlement_id: string
+    to_state: EntitlementInstanceState
+    now: Date
+  }): Promise<VoucherCodeInvalidationResult> {
+    return invalidateVoucherCode(this.client, input)
+  }
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -2216,19 +2269,40 @@ export class InMemoryRedeemPartialStore implements RedeemPartialStore {
   private redemptions: Map<string, RedemptionRecord>
   private choiceSetItems: Map<string, RedeemableChoiceSetItem>
   private audits: TransitionAuditEnvelope[]
+  private codes: Map<string, VoucherStatus>
 
   constructor(
     rows: RedeemableAmountEntitlement[] = [],
-    choiceSetItems: RedeemableChoiceSetItem[] = []
+    choiceSetItems: RedeemableChoiceSetItem[] = [],
+    /** v1.15.0 Story 5.9 review-fix cyklu 2: stany kodów — `kod → status`. */
+    codes: Record<string, VoucherStatus> = {}
   ) {
     this.rows = new Map(rows.map((r) => [r.id, { ...r }]))
     this.redemptions = new Map()
     this.choiceSetItems = new Map(choiceSetItems.map((i) => [i.id, { ...i }]))
     this.audits = []
+    this.codes = new Map(Object.entries(codes))
+    // Kody z fixture'ów rejestrowane jako `idle`, chyba że wołający poda inny
+    // stan — dokładnie jak w `InMemoryExpireEntitlementStore`. Bez tego każdy
+    // zastany test z voucherem KWOTOWYM przewracałby się na
+    // `VoucherCodeBridgeMissingError`, czyli na twierdzeniu o braku mostu,
+    // a nie o zachowaniu, które test bada.
+    for (const row of this.rows.values()) {
+      const snap = (row.policy_snapshot ?? {}) as Record<string, unknown>
+      const code = typeof snap.voucher_code === "string" ? snap.voucher_code : null
+      if (code && !this.codes.has(code)) {
+        this.codes.set(code, "idle")
+      }
+    }
   }
 
   get(id: string): RedeemableAmountEntitlement | undefined {
     return this.rows.get(id)
+  }
+
+  /** Stan kodu po operacji — do asercji AC3 (oba wiersze, nie tylko jeden). */
+  getVoucherStatus(code: string): VoucherStatus | undefined {
+    return this.codes.get(code)
   }
 
   listRedemptions(): RedemptionRecord[] {
@@ -2257,13 +2331,16 @@ export class InMemoryRedeemPartialStore implements RedeemPartialStore {
       [...this.choiceSetItems.entries()].map(([k, r]) => [k, { ...r }])
     )
     const auditsLen = this.audits.length
+    // v1.15.0 Story 5.9: stany kodów WCHODZĄ do migawki rollbacku.
+    const codesSnapshot = new Map(this.codes)
     try {
       return await fn(
         new InMemoryRedeemPartialTx(
           this.rows,
           this.redemptions,
           this.choiceSetItems,
-          this.audits
+          this.audits,
+          this.codes
         )
       )
     } catch (err) {
@@ -2273,6 +2350,7 @@ export class InMemoryRedeemPartialStore implements RedeemPartialStore {
       this.redemptions = redemptionsSnapshot
       this.choiceSetItems = choiceSetSnapshot
       this.audits.length = auditsLen
+      this.codes = codesSnapshot
       throw err
     }
   }
@@ -2283,8 +2361,37 @@ class InMemoryRedeemPartialTx implements RedeemPartialTx {
     private readonly rows: Map<string, RedeemableAmountEntitlement>,
     private readonly redemptions: Map<string, RedemptionRecord>,
     private readonly choiceSetItems: Map<string, RedeemableChoiceSetItem>,
-    private readonly audits: TransitionAuditEnvelope[]
+    private readonly audits: TransitionAuditEnvelope[],
+    private readonly codes: Map<string, VoucherStatus> = new Map()
   ) {}
+
+  /**
+   * v1.15.0 Story 5.9 review-fix cyklu 2: mirror semantyki producenta — ta sama
+   * REGUŁA (`decideVoucherCodeInvalidation`), nie druga jej kopia. Mirror pisany
+   * drugi raz rozjeżdża się cicho, a wtedy zielony test jednostkowy przestaje
+   * mówić cokolwiek o zachowaniu produkcyjnym.
+   */
+  async invalidateVoucherCode(input: {
+    entitlement_id: string
+    to_state: EntitlementInstanceState
+    now: Date
+  }): Promise<VoucherCodeInvalidationResult> {
+    const row = this.rows.get(input.entitlement_id)
+    const snapshot = (row?.policy_snapshot ?? {}) as Record<string, unknown>
+    const code =
+      typeof snapshot.voucher_code === "string" ? snapshot.voucher_code : null
+    const decision = decideVoucherCodeInvalidation({
+      entitlement_id: input.entitlement_id,
+      entitlement_type: row?.entitlement_type ?? null,
+      voucher_code: code,
+      current_status: code ? this.codes.get(code) ?? null : null,
+      to_state: input.to_state,
+    })
+    if (decision.outcome === "invalidated" && decision.voucher_code) {
+      this.codes.set(decision.voucher_code, decision.target_status)
+    }
+    return decision
+  }
 
   async getEntitlementForUpdate(
     id: string

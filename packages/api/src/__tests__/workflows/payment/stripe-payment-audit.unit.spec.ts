@@ -34,6 +34,14 @@ class FakeClient {
   queries: string[] = []
   released = false
   orderLineMetadata: Record<string, unknown> | null = null
+  /** Dane sprzedawcy zwracane przez JOIN `product_product_seller_seller`. */
+  sellerContext: Record<string, unknown> | null = {
+    line_title: "Zabieg testowy",
+    seller_id: "sel_test",
+    seller_name: "Salon Testowy",
+    seller_handle: "salon-testowy",
+  }
+  voucherCodes: string[] = []
 
   async query<T = Record<string, unknown>>(sql: string, params: ReadonlyArray<unknown> = []) {
     this.queries.push(sql)
@@ -61,13 +69,26 @@ class FakeClient {
     if (sql.includes("SELECT id FROM entitlement_instance")) {
       return { rows: [] as T[], rowCount: 0 }
     }
+    // v1.15.0 Story 5.9 review-fix cyklu 2 (C2-HIGH-1): produkcyjne zapytanie
+    // linii niesie TAKŻE dane sprzedawcy i tytuł usługi — ścieżka
+    // `payment.captured` wydaje od tego fixa kod vouchera przy wystawieniu.
+    // `sellerContext = null` odwzorowuje produkt BEZ powiązanego sprzedawcy:
+    // wtedy wydanie kodu fail-loudzi, tak samo jak na Path Y.
     if (sql.includes("FROM order_item")) {
-      return {
-        rows: this.orderLineMetadata
-          ? ([{ metadata: this.orderLineMetadata }] as T[])
-          : ([] as T[]),
-        rowCount: this.orderLineMetadata ? 1 : 0,
+      const row = {
+        line_item_id: "line_1",
+        metadata: this.orderLineMetadata,
+        ...(this.sellerContext ?? {}),
       }
+      const present = this.orderLineMetadata || this.sellerContext
+      return {
+        rows: present ? ([row] as unknown as T[]) : ([] as T[]),
+        rowCount: present ? 1 : 0,
+      }
+    }
+    if (sql.includes("INSERT INTO voucher")) {
+      this.voucherCodes.push(params[0] as string)
+      return { rows: [] as T[], rowCount: 1 }
     }
     if (sql.includes("INSERT INTO entitlement_instance")) {
       this.rows.set(params[0] as string, { id: params[0] })

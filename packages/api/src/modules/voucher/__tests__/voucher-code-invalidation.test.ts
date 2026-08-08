@@ -17,7 +17,8 @@ import {
 } from "../models/entitlement"
 import type { VoucherStatus } from "../models/types"
 import {
-  CODE_INVALIDATION_SOURCE_STATES,
+  CODE_INVALIDATION_SOURCE_STATES_BY_TARGET,
+  codeInvalidationSourceStates,
   INVALIDATED_VOUCHER_STATUSES,
   SUPERSEDING_VOUCHER_STATUS,
   VOUCHER_BACKED_ENTITLEMENT_TYPES,
@@ -86,14 +87,52 @@ describe("Story 5.9 — reguła unieważnienia (allow-lista, idempotencja, fail-
     }
   })
 
-  it("`claimed` JEST na allow-liście — zwrot po realizacji też unieważnia kod", () => {
-    expect(CODE_INVALIDATION_SOURCE_STATES.has("claimed")).toBe(true)
+  it("`claimed` JEST źródłem dla ZWROTU — zwrot po realizacji unieważnia kod", () => {
+    expect(codeInvalidationSourceStates("refunded").has("claimed")).toBe(true)
     const d = decideVoucherCodeInvalidation({
       ...BASE,
       current_status: "claimed",
       to_state: EntitlementInstanceState.REFUNDED,
     })
     expect(d.outcome).toBe("invalidated")
+  })
+
+  // ── review-fix cyklu 2 (C2-MEDIUM-4) ─────────────────────────────────────
+  // Allow-lista stanów źródłowych ZALEŻY OD CELU. Jeden zbiór dla wszystkich
+  // celów pozwalał sweeperowi przestawić kod ZREALIZOWANY na `expired`, przez
+  // co panel zwracał „wygasł"/410 zamiast „już zrealizowany"/409.
+  it("`claimed` NIE jest źródłem dla `expired`/`withdrawn` — kod zrealizowany nie wygasa", () => {
+    expect(codeInvalidationSourceStates("expired").has("claimed")).toBe(false)
+    expect(codeInvalidationSourceStates("withdrawn").has("claimed")).toBe(false)
+
+    for (const state of [
+      EntitlementInstanceState.EXPIRED,
+      EntitlementInstanceState.VOIDED,
+    ] as const) {
+      const d = decideVoucherCodeInvalidation({
+        ...BASE,
+        current_status: "claimed",
+        to_state: state,
+      })
+      // NAZWANY wynik, nie rzut: rzut przewracałby transakcję sweepera
+      // i uprawnienie w ogóle by nie wygasło.
+      expect(d.outcome).toBe("already_redeemed_code")
+      expect(d.prior_status).toBe("claimed")
+    }
+  })
+
+  it("rekord stanów źródłowych jest WYCZERPUJĄCY po `VoucherStatus`", () => {
+    // Dopisanie stanu kodu bez decyzji, z czego wolno w niego wejść, ma być
+    // błędem kompilacji — a tu dodatkowo błędem asercji, gdyby ktoś rekord
+    // rozluźnił.
+    expect(Object.keys(CODE_INVALIDATION_SOURCE_STATES_BY_TARGET).sort()).toEqual([
+      "claimed",
+      "consent_pending",
+      "expired",
+      "idle",
+      "refunded",
+      "withdrawn",
+    ])
   })
 
   it("powtórzenie jest no-opem z NAZWANYM wynikiem, nie błędem", () => {

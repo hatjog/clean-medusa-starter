@@ -133,3 +133,39 @@ export type RedeemForSellerResult =
   | { status: "redeemed"; prior_status: VoucherStatus; voucher: VoucherWithEvents }
   | { status: "refused"; reason: RedeemRefusalReason; voucher: VoucherWithEvents }
   | { status: "not_found"; voucher: null }
+
+/**
+ * Wynik WYDANIA kodu NASTĘPCY (retencja, odzysk zgubionego kodu) —
+ * v1.15.0 Story 5.9 review-fix cyklu 2 (C2-MEDIUM-2).
+ *
+ * Do tego fixu nośnikiem był `boolean`, a `false` znaczyło DWIE różne rzeczy:
+ * „stary kod nie ma wiersza `voucher`" (udokumentowane) oraz „kod następcy JUŻ
+ * ISTNIEJE" (`ON CONFLICT (code) DO NOTHING` — nieudokumentowane). Wołający nie
+ * potrafił ich rozróżnić i na OBU wpadał w ten sam fallback: snapshot następcy
+ * dostawał STARY `voucher_code`, czyli kod, który ta sama transakcja kilka
+ * linii wyżej przestawiła na `withdrawn`. To odtwarzało w całości defekt
+ * MEDIUM-1 cyklu 1, tyle że za warunkiem.
+ *
+ * Reszta tej story konsekwentnie stosuje regułę „brak efektu = wynik NAZWANY
+ * albo fail-closed, nigdy cichy no-op" (`already_invalidated_other`,
+ * `no_voucher_code`, `MissingVoucherCodeInvalidatorError`). Ten typ dopisuje
+ * ten sam kształt tutaj.
+ */
+export type SuccessorVoucherCodeOutcome =
+  /** Wiersz `voucher` następcy powstał w TEJ transakcji. */
+  | "issued"
+  /**
+   * Wiersz następcy JUŻ istniał (`ON CONFLICT DO NOTHING`) — deterministyczny
+   * kod następcy trafił we WŁASNY wiersz z wcześniejszej próby. Most jest
+   * ważny, więc snapshot następcy wskazuje NOWY kod, tak samo jak przy
+   * `issued`.
+   */
+  | "already_issued"
+  /**
+   * Stary kod nie ma wiersza `voucher`. Dla uprawnienia niosącego
+   * `voucher_code` w snapshotcie jest to ZŁAMANY MOST — a nie stan do
+   * pominięcia: producent stanu kodu (`invalidateVoucherCode`) wołany kilka
+   * linii wyżej rzuca na dokładnie tej samej przyczynie, więc ta wartość jest
+   * na ścieżce produkcyjnej nieosiągalna i wołający traktuje ją fail-closed.
+   */
+  | "source_missing"

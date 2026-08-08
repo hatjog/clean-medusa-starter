@@ -479,7 +479,7 @@ const VOUCHER_CODE_ALPHABET = "23456789ABCDEFGHJKMNPQRSTUVWXYZ"
  * ten sam entitlement zawsze wskazuje ten sam kod, a `ON CONFLICT DO NOTHING`
  * czyni powtórzony INSERT no-opem.
  */
-function buildVoucherCode(dedupeKey: string, marketId: string): string {
+export function buildVoucherCode(dedupeKey: string, marketId: string): string {
   const prefix = (marketId.toUpperCase().replace(/[^A-Z0-9]/g, "") + "XX").slice(0, 2)
   const digest = createHash("sha256").update(`voucher-code:${dedupeKey}`).digest()
   let body = ""
@@ -615,7 +615,8 @@ async function issueSingleIssuedRow(
       currency,
       validityMonths: readNumber(snapshot.validity_months),
       lineItemId,
-      payload,
+      context:
+        `order ${payload.order_id}, payment_intent ${payload.payment_intent_id}`,
       now,
     })
   }
@@ -974,8 +975,17 @@ function readVatClassification(value: unknown): VatClassification | undefined {
  * „Salon" — czyli dokładnie defekt, który ta funkcja domyka. Rzut wycofuje CAŁĄ
  * transakcję (w tym `event_processed`), więc zdarzenie wraca przez retry/DLQ z
  * czytelną przyczyną, zamiast utrwalać wydanie bez danych sprzedawcy.
+ *
+ * v1.15.0 Story 5.9 review-fix cyklu 2 (C2-HIGH-1): funkcja jest EKSPORTOWANA
+ * i wołana także przez ścieżkę `payment.captured`
+ * (`workflows/entitlements/issue-entitlement.ts`). Powód jest pomiarem, nie
+ * estetyką: gdyby tamta ścieżka dostała WŁASNY `INSERT INTO voucher`, rejestr
+ * producentów (`redemption-producers.v1.yaml`) musiałby dostać drugi nazwany
+ * wyjątek dla tabeli `voucher`, a dwa wyrażenia budujące ten sam wiersz
+ * rozjechałyby się cicho — dokładnie ta klasa, którą 5.9 zamyka. `context`
+ * zastąpił `payload`, bo wołający spoza Path Y nie ma `PaymentIntentSucceeded`.
  */
-async function issueVoucherCodeWithinTx(
+export async function issueVoucherCodeWithinTx(
   client: LiveIssuePgClient,
   args: {
     code: string
@@ -988,7 +998,8 @@ async function issueVoucherCodeWithinTx(
     currency: string
     validityMonths: number | undefined
     lineItemId: string
-    payload: PaymentIntentSucceededPayload
+    /** Opis pochodzenia wydania — wchodzi WYŁĄCZNIE do komunikatu fail-loud. */
+    context: string
     now: Date
   }
 ): Promise<void> {
@@ -1008,8 +1019,7 @@ async function issueVoucherCodeWithinTx(
   if (missing.length > 0) {
     throw new Error(
       `issueVoucherCodeWithinTx: brak wymaganych danych vouchera [${missing.join(", ")}] ` +
-        `(linia ${args.lineItemId}, order ${args.payload.order_id}, payment_intent ` +
-        `${args.payload.payment_intent_id}) — fail-loud przed INSERT. Zapis pustych ` +
+        `(linia ${args.lineItemId}, ${args.context}) — fail-loud przed INSERT. Zapis pustych ` +
         `wartości dałby kupującemu mail z pustym salonem i kodem bez pokrycia.`
     )
   }

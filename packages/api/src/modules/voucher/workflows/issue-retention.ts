@@ -21,9 +21,16 @@ import {
   invalidateVoucherCode,
   type VoucherCodeInvalidationResult,
 } from "../voucher-code-state"
-import type { VoucherStatus } from "../models/types"
-import { GP_PLATFORM_SCOPE_SENTINEL } from "./reissue-lost-code"
+import type {
+  SuccessorVoucherCodeOutcome,
+  VoucherStatus,
+} from "../models/types"
+import {
+  GP_PLATFORM_SCOPE_SENTINEL,
+  SuccessorVoucherCodeBridgeError,
+} from "./reissue-lost-code"
 export { GP_PLATFORM_SCOPE_SENTINEL } from "./reissue-lost-code"
+export { SuccessorVoucherCodeBridgeError } from "./reissue-lost-code"
 
 export const ENTITLEMENT_RETENTION_ISSUED_EVENT_TYPE =
   "gp.entitlements.entitlement_retention_issued.v1" as const
@@ -112,6 +119,31 @@ export class RetentionAmountBoundaryError extends Error {
   }
 }
 
+/**
+ * v1.15.0 Story 5.9 review-fix cyklu 2 (C2-MEDIUM-1).
+ *
+ * `input.amount` zasila od tego fixu DWA nośniki tej samej kwoty:
+ * `entitlement_instance.amount` następcy i `voucher.value_minor` jego kodu.
+ * Druga kolumna to `integer NOT NULL CHECK (value_minor >= 0)`, więc wartość
+ * ułamkowa albo wywróciłaby INSERT w środku transakcji retencji, albo — gdyby
+ * kiedyś typ się poluzował — rozjechałaby oba nośniki. Guard jest tu, PRZED
+ * jakimkolwiek zapisem, i nazywa przyczynę. Minor units są konwencją całej
+ * ścieżki pieniądza w GP (ADR-166), więc to jest doprecyzowanie kontraktu
+ * wejścia, nie nowa reguła biznesowa.
+ */
+export class RetentionAmountNotMinorUnitsError extends Error {
+  readonly amount: number
+  constructor(amount: number) {
+    super(
+      `Retention amount ${amount} nie jest całkowitą liczbą minor units — ` +
+        "kwota zasila `voucher.value_minor` (integer NOT NULL) oraz `amount` " +
+        "wiersza następcy, więc musi być jednym, całkowitym wyrażeniem."
+    )
+    this.name = "RetentionAmountNotMinorUnitsError"
+    this.amount = amount
+  }
+}
+
 export class RetentionEntitlementNotFoundError extends Error {
   constructor(id: string) {
     super(`entitlement_instance ${id} was not found`)
@@ -160,15 +192,28 @@ export interface IssueRetentionTx {
    * był kodem martwym, a stary — od 5.9 — `withdrawn`. Klientka zostawała
    * z niczym.
    *
-   * Zwraca `false`, gdy stary kod nie ma wiersza `voucher` (uprawnienie
-   * niewspierane kodem) — wtedy nie ma czego klonować i następca też kodu nie
-   * dostaje.
+   * review-fix cyklu 2 (C2-MEDIUM-1): `value_minor` NIE jest przepisywane
+   * z klonu. Kwota retencji jest osobnym wejściem, a jej granica to
+   * [100 %, 200 %] kwoty źródłowej — klon rozjeżdżał więc nośnik kodu
+   * z nośnikiem uprawnienia dla KAŻDEJ retencji ≠ 100 %, i to w liczbie, którą
+   * kosmetolożka widzi przed realizacją (`GET /vendor/vouchers/:code/lookup`
+   * projektuje `value_minor` prosto z wiersza `voucher`).
+   *
+   * review-fix cyklu 2 (C2-MEDIUM-2): wynik jest ROZŁĄCZNY
+   * ({@link SuccessorVoucherCodeOutcome}), nie `boolean` — `false` znaczyło
+   * dwie różne rzeczy i obie prowadziły do cichego fallbacku na kod, który ta
+   * sama transakcja właśnie unieważniła.
    */
   issueSuccessorVoucherCode(input: {
     from_code: string
     to_code: string
+    /**
+     * Kwota nośnika kodu (minor units). `null` = przepisz z klonu — używane
+     * przez odzysk zgubionego kodu, gdzie kwota z definicji się nie zmienia.
+     */
+    value_minor: number | null
     now: Date
-  }): Promise<boolean>
+  }): Promise<SuccessorVoucherCodeOutcome>
 }
 
 export type RetentionEventEmitter = {
@@ -253,6 +298,12 @@ export class IssueRetentionWorkflow {
       if (!isRetentionAmountWithinBoundary(input.amount, originalAmount)) {
         throw new RetentionAmountBoundaryError(input.amount, originalAmount)
       }
+      // review-fix cyklu 2 (C2-MEDIUM-1): od tego fixu kwota zasila TAKŻE
+      // `voucher.value_minor` (integer NOT NULL) — jedno wyrażenie dla obu
+      // nośników. Guard PRZED jakimkolwiek zapisem.
+      if (!Number.isInteger(input.amount)) {
+        throw new RetentionAmountNotMinorUnitsError(input.amount)
+      }
 
       // AC2 void old entitlement (assertTransition throws EntitlementTransitionError
       // when the source state does not permit VOIDED).
@@ -287,16 +338,28 @@ export class IssueRetentionWorkflow {
         typeof oldSnapshot.voucher_code === "string"
           ? oldSnapshot.voucher_code
           : null
-      const successorCodeIssued = oldCode
-        ? await tx.issueSuccessorVoucherCode({
-            from_code: oldCode,
-            to_code: retentionCode,
-            now,
-          })
-        : false
-
+      //
+      // review-fix cyklu 2 (C2-MEDIUM-1/C2-MEDIUM-2): kwota nośnika kodu
+      // pochodzi z `input.amount` — TEGO SAMEGO wyrażenia, co `amount` wiersza
+      // następcy niżej — a wynik wydania jest ROZŁĄCZNY, bez fallbacku na kod
+      // przed chwilą unieważniony.
+      if (oldCode) {
+        const outcome = await tx.issueSuccessorVoucherCode({
+          from_code: oldCode,
+          to_code: retentionCode,
+          value_minor: input.amount,
+          now,
+        })
+        if (outcome === "source_missing") {
+          throw new SuccessorVoucherCodeBridgeError(
+            oldCode,
+            retentionCode,
+            "retencja"
+          )
+        }
+      }
       const retentionPolicy = snapshotPolicy(
-        successorCodeIssued
+        oldCode
           ? { ...oldSnapshot, voucher_code: retentionCode }
           : oldSnapshot
       )
@@ -555,26 +618,43 @@ class PostgresIssueRetentionTx implements IssueRetentionTx {
    * był kodem martwym, a stary — od 5.9 — `withdrawn`. Klientka zostawała
    * z niczym.
    *
-   * Zwraca `false`, gdy stary kod nie ma wiersza `voucher` (uprawnienie
-   * niewspierane kodem) — wtedy nie ma czego klonować i następca też kodu nie
-   * dostaje.
+   * review-fix cyklu 2 (C2-MEDIUM-1): `value_minor` bierzemy z `input`, a nie
+   * z klonu, gdy wołający poda kwotę — kwota retencji jest osobnym wejściem
+   * ([100 %, 200 %] źródła), więc klon rozjeżdżał nośnik kodu z nośnikiem
+   * uprawnienia. `null` = przepisz z klonu (odzysk: ta sama kwota).
+   *
+   * review-fix cyklu 2 (C2-MEDIUM-2): wynik ROZŁĄCZNY — `issued` /
+   * `already_issued` / `source_missing`. Poprzedni `boolean` sklejał dwie
+   * ostatnie przyczyny w jedno `false`, a wołający na obu wpadał w fallback do
+   * kodu przed chwilą unieważnionego.
    */
   async issueSuccessorVoucherCode(input: {
     from_code: string
     to_code: string
+    value_minor: number | null
     now: Date
-  }): Promise<boolean> {
+  }): Promise<SuccessorVoucherCodeOutcome> {
     const res = await this.client.query(
       `INSERT INTO voucher
          (code, market_id, seller_id, seller_name, seller_handle, product_title,
           value_minor, currency_code, status, expires_at, created_at, updated_at)
        SELECT $2, market_id, seller_id, seller_name, seller_handle, product_title,
-              value_minor, currency_code, 'idle', expires_at, $3, $3
+              COALESCE($4::integer, value_minor), currency_code, 'idle',
+              expires_at, $3, $3
          FROM voucher WHERE code = $1
        ON CONFLICT (code) DO NOTHING`,
-      [input.from_code, input.to_code, input.now]
+      [input.from_code, input.to_code, input.now, input.value_minor]
     )
-    return (res.rowCount ?? 0) > 0
+    if ((res.rowCount ?? 0) > 0) return "issued"
+    // `rowCount = 0` ma DWIE przyczyny i wołający musi je rozróżnić: brak
+    // wiersza źródłowego (złamany most) vs `ON CONFLICT DO NOTHING` na własnym
+    // wierszu z wcześniejszej próby. Jedno dodatkowe zapytanie w ścieżce
+    // rzadkiej jest tańsze niż `boolean`, który je sklejał.
+    const existing = await this.client.query(
+      `SELECT 1 FROM voucher WHERE code = $1`,
+      [input.to_code]
+    )
+    return (existing.rowCount ?? 0) > 0 ? "already_issued" : "source_missing"
   }
 
   async getEntitlementForUpdate(id: string): Promise<RetentionEntitlement | null> {
@@ -811,16 +891,22 @@ class InMemoryIssueRetentionTx implements IssueRetentionTx {
     return decision
   }
 
-  /** v1.15.0 Story 5.9 review-fix: mirror wydania kodu następcy. */
+  /**
+   * v1.15.0 Story 5.9 review-fix: mirror wydania kodu następcy — rozłączny
+   * wynik, tak jak w PG (review-fix cyklu 2, C2-MEDIUM-2). Atrapa nie trzyma
+   * `value_minor`, więc parametr jest tu bez efektu; kwotę mierzą testy PG
+   * i evidence, a nie ta mapa.
+   */
   async issueSuccessorVoucherCode(input: {
     from_code: string
     to_code: string
+    value_minor: number | null
     now: Date
-  }): Promise<boolean> {
-    if (!this.codes.has(input.from_code)) return false
-    if (this.codes.has(input.to_code)) return false
+  }): Promise<SuccessorVoucherCodeOutcome> {
+    if (this.codes.has(input.to_code)) return "already_issued"
+    if (!this.codes.has(input.from_code)) return "source_missing"
     this.codes.set(input.to_code, "idle")
-    return true
+    return "issued"
   }
 
   async getEntitlementForUpdate(id: string): Promise<RetentionEntitlement | null> {

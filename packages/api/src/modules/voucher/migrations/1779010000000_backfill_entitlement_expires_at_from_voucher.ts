@@ -29,34 +29,83 @@ import { Migration } from "@medusajs/framework/mikro-orm/migrations"
  * wygaszaniem po danych, których operacja nie zablokowała. Więc uzupełniamy
  * dane, zamiast osłabiać guard.
  *
- * `down()` jest ODWRACALNY WĄSKO: cofa do NULL wyłącznie te wiersze, których
- * `expires_at` jest RÓWNY terminowi z mostu — czyli te, które ta migracja
- * mogła ustawić. Terminu ustawionego ręcznie (`voucher.extend`) nie rusza.
+ * ── `down()` — ODCISK MIGRACJI, NIE NIEZMIENNIK PRODUKCJI (review-fix cyklu 2,
+ *    C2-MEDIUM-3) ─────────────────────────────────────────────────────────
+ * Pierwsza wersja `down()` uznawała za „swoje" te wiersze, których
+ * `expires_at` jest RÓWNY terminowi z mostu. To był błąd kategorii: sąsiednia
+ * połowa TEGO SAMEGO fixa sprawia, że KAŻDY nowo wystawiony wiersz spełnia ten
+ * predykat z konstrukcji — oba nośniki liczy jedno wyrażenie
+ * `computeValidityEnd`, celowo, „bo dwa wyrażenia rozjechałyby się cicho".
+ * Równość, która miała być odciskiem palca, jest niezmiennikiem produkcji, więc
+ * rollback kasował `expires_at` WSZYSTKICH normalnie wystawionych voucherów —
+ * a sweeper filtruje po `expires_at IS NOT NULL`, czyli `down()` przywracał
+ * naprawiany defekt na CAŁEJ populacji. Rollback niszczący dane produkcyjne
+ * jest gorszy niż brak rollbacku.
+ *
+ * Odciskiem jest teraz coś, czego produkcja nie stawia sama: tabela-rejestr
+ * `entitlement_expires_at_backfill_1779010000000`, wypełniana przez `up()`
+ * z `RETURNING` — czyli DOKŁADNIE zbiorem wierszy, które ta migracja
+ * przestawiła, wraz z wartością, którą im nadała. `down()` cofa wyłącznie te
+ * wiersze i wyłącznie wtedy, gdy nadal trzymają tę wartość (termin przedłużony
+ * później przez `voucher.extend` zostaje nietknięty), a na końcu usuwa
+ * rejestr — nie zostawia po sobie powierzchni.
+ *
+ * Rejestr jest artefaktem MIGRACJI, nie powierzchnią zapisu domeny: nie ma
+ * producenta w `redemption-producers.v1.yaml`, nie ma trasy, nie ma RLS,
+ * i znika razem z `down()`. Trzyma wyłącznie identyfikator uprawnienia
+ * i znacznik czasu — bez PII i bez danych finansowych.
  */
+const BACKFILL_LEDGER = "entitlement_expires_at_backfill_1779010000000"
+
 export class Migration1779010000000 extends Migration {
   async up(): Promise<void> {
-    // Idempotentne: warunek `IS NULL` sprawia, że drugi przebieg obejmuje
-    // zero wierszy.
     this.addSql(`
-      UPDATE entitlement_instance e
-         SET expires_at = v.expires_at,
-             updated_at = NOW()
-        FROM voucher v
-       WHERE e.expires_at IS NULL
-         AND v.expires_at IS NOT NULL
-         AND v.code = e.policy_snapshot->>'voucher_code'
+      CREATE TABLE IF NOT EXISTS ${BACKFILL_LEDGER} (
+        entitlement_id  text PRIMARY KEY,
+        set_expires_at  timestamptz NOT NULL
+      )
+    `)
+    // Idempotentne w OBU nośnikach: warunek `IS NULL` sprawia, że drugi
+    // przebieg obejmuje zero wierszy, a `ON CONFLICT DO NOTHING` chroni
+    // rejestr przed podwójnym wpisem, gdyby migracja została powtórzona po
+    // częściowym `down()`.
+    this.addSql(`
+      WITH touched AS (
+        UPDATE entitlement_instance e
+           SET expires_at = v.expires_at,
+               updated_at = NOW()
+          FROM voucher v
+         WHERE e.expires_at IS NULL
+           AND v.expires_at IS NOT NULL
+           AND v.code = e.policy_snapshot->>'voucher_code'
+        RETURNING e.id, e.expires_at
+      )
+      INSERT INTO ${BACKFILL_LEDGER} (entitlement_id, set_expires_at)
+      SELECT id, expires_at FROM touched
+      ON CONFLICT (entitlement_id) DO NOTHING
     `)
   }
 
   async down(): Promise<void> {
+    // Brak rejestru = `up()` nie przebiegł na tej bazie ⇒ `down()` jest
+    // no-opem. To jest zamierzone: rollback bez odcisku NIE MA prawa zgadywać,
+    // które wiersze są jego. `CREATE TABLE IF NOT EXISTS` jest tu po to, żeby
+    // ten no-op był NO-OPEM, a nie błędem „relation does not exist" —
+    // rollback, który się wywraca, nie jest rollbackiem.
+    this.addSql(`
+      CREATE TABLE IF NOT EXISTS ${BACKFILL_LEDGER} (
+        entitlement_id  text PRIMARY KEY,
+        set_expires_at  timestamptz NOT NULL
+      )
+    `)
     this.addSql(`
       UPDATE entitlement_instance e
          SET expires_at = NULL,
              updated_at = NOW()
-        FROM voucher v
-       WHERE e.expires_at IS NOT NULL
-         AND v.code = e.policy_snapshot->>'voucher_code'
-         AND v.expires_at = e.expires_at
+        FROM ${BACKFILL_LEDGER} b
+       WHERE b.entitlement_id = e.id
+         AND e.expires_at = b.set_expires_at
     `)
+    this.addSql(`DROP TABLE IF EXISTS ${BACKFILL_LEDGER}`)
   }
 }
