@@ -15,10 +15,18 @@ import { MessagingProviderError } from "../errors";
 import type {
   BrevoSendResponse,
   BrevoTransactionalEmailPayload,
+  BrevoTransactionalMessage,
+  BrevoTransactionalMessageQuery,
   IBrevoClient,
 } from "./brevo-client";
 
 export const BREVO_DEFAULT_ENDPOINT = "https://api.brevo.com/v3/smtp/email";
+/**
+ * Endpoint ODCZYTU (Story 4.5). Ta sama baza, inny zasób — `…/smtp/emails`
+ * (liczba mnoga) zwraca wiadomości PRZYJĘTE przez dostawcę.
+ */
+export const BREVO_DEFAULT_MESSAGES_ENDPOINT =
+  "https://api.brevo.com/v3/smtp/emails";
 export const BREVO_DEFAULT_TIMEOUT_MS = 10_000;
 
 /** Minimalny kontrakt `fetch` — wstrzykiwany w testach (zero ruchu sieciowego). */
@@ -27,7 +35,7 @@ export type BrevoFetch = (
   init: {
     method: string;
     headers: Record<string, string>;
-    body: string;
+    body?: string;
     signal?: AbortSignal;
   },
 ) => Promise<{
@@ -39,6 +47,8 @@ export type BrevoFetch = (
 export interface BrevoHttpClientOptions {
   apiKey: string;
   endpoint?: string;
+  /** Patrz {@link BREVO_DEFAULT_MESSAGES_ENDPOINT}. */
+  messagesEndpoint?: string;
   timeoutMs?: number;
   fetchImpl?: BrevoFetch;
 }
@@ -46,6 +56,7 @@ export interface BrevoHttpClientOptions {
 export class BrevoHttpClient implements IBrevoClient {
   private readonly apiKey: string;
   private readonly endpoint: string;
+  private readonly messagesEndpoint: string;
   private readonly timeoutMs: number;
   private readonly fetchImpl: BrevoFetch;
 
@@ -57,27 +68,99 @@ export class BrevoHttpClient implements IBrevoClient {
     }
     this.apiKey = options.apiKey.trim();
     this.endpoint = options.endpoint?.trim() || BREVO_DEFAULT_ENDPOINT;
+    this.messagesEndpoint =
+      options.messagesEndpoint?.trim() || BREVO_DEFAULT_MESSAGES_ENDPOINT;
     this.timeoutMs = options.timeoutMs ?? BREVO_DEFAULT_TIMEOUT_MS;
     this.fetchImpl =
       options.fetchImpl ?? ((input, init) => globalThis.fetch(input, init as RequestInit));
   }
 
+  /**
+   * ODCZYT wiadomości przyjętych przez dostawcę (Story 4.5).
+   *
+   * ── Co jest zlecane serwerowi, a co NIE (i dlaczego) ──────────────────────
+   * Serwerowi zlecamy WYŁĄCZNIE te predykaty, które są ZMIERZONE jako
+   * działające: `email` (filtr obowiązkowy — bez niego `400 missing_parameter`),
+   * `templateId` oraz okno `startDate`/`endDate` (zmierzone zawężenie 9 → 6
+   * wierszy, a okno sprzed lat → 0).
+   *
+   * Serwerowego filtra `tags` NIE UŻYWAMY, i to jest rozstrzygnięcie oparte na
+   * pomiarze, nie ostrożność: zapytanie z tagiem, KTÓREGO NIE MA, zwróciło
+   * KOMPLET wierszy — filtr jest na tym endpoincie no-opem. Mechanizm, który by
+   * mu zaufał, na każde pytanie odpowiadałby „ta wiadomość istnieje", blokował
+   * WSZYSTKIE wysyłki i wyglądał przy tym na działający (żaden duplikat nigdy
+   * nie powstaje). Dopasowanie tożsamości robi więc adapter, na zwróconych
+   * wierszach.
+   *
+   * @throws MessagingProviderError przy każdej odpowiedzi innej niż 2xx oraz
+   *         przy awarii transportu. Pusta lista jest zwracana WYŁĄCZNIE po
+   *         udanym odczycie — inaczej „nie udało mi się zapytać" byłoby
+   *         nieodróżnialne od „zapytałem i nie ma".
+   */
+  async findTransactionalMessages(
+    query: BrevoTransactionalMessageQuery,
+  ): Promise<BrevoTransactionalMessage[]> {
+    const params = new URLSearchParams({
+      email: query.email,
+      startDate: toBrevoDate(query.startDate),
+      endDate: toBrevoDate(query.endDate),
+      limit: String(query.limit ?? 100),
+    });
+    if (typeof query.templateId === "number") {
+      params.set("templateId", String(query.templateId));
+    }
+
+    const body = await this.request(
+      `${this.messagesEndpoint}?${params.toString()}`,
+      { method: "GET" },
+      "BREVO_LOOKUP",
+    );
+    const rows = (body as { transactionalEmails?: unknown }).transactionalEmails;
+    if (!Array.isArray(rows)) {
+      // Brak klucza w odpowiedzi 200 to u tego dostawcy „zero trafień"
+      // (zmierzone: `{}` dla okna sprzed lat), a nie awaria.
+      return [];
+    }
+    return rows as BrevoTransactionalMessage[];
+  }
+
   async sendTransacEmail(
     payload: BrevoTransactionalEmailPayload,
   ): Promise<BrevoSendResponse> {
+    const body = await this.request(
+      this.endpoint,
+      { method: "POST", body: JSON.stringify(payload) },
+      "BREVO",
+    );
+    return body as BrevoSendResponse;
+  }
+
+  /**
+   * Wspólny transport dla wysyłki i odczytu.
+   *
+   * `errorPrefix` rozróżnia oba kierunki w kodzie błędu (`BREVO_REQUEST_TIMEOUT`
+   * vs `BREVO_LOOKUP_REQUEST_TIMEOUT`) — bez tego awaria ODCZYTU byłaby
+   * w telemetrii nieodróżnialna od awarii WYSYŁKI, a to są przeciwne
+   * konsekwencje: pierwsza wstrzymuje maila, druga go nie dowozi.
+   */
+  private async request(
+    url: string,
+    init: { method: string; body?: string },
+    errorPrefix: string,
+  ): Promise<Record<string, unknown>> {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.timeoutMs);
 
     let response: Awaited<ReturnType<BrevoFetch>>;
     try {
-      response = await this.fetchImpl(this.endpoint, {
-        method: "POST",
+      response = await this.fetchImpl(url, {
+        method: init.method,
         headers: {
           "api-key": this.apiKey,
           "content-type": "application/json",
           accept: "application/json",
         },
-        body: JSON.stringify(payload),
+        ...(init.body === undefined ? {} : { body: init.body }),
         signal: controller.signal,
       });
     } catch (error) {
@@ -89,8 +172,8 @@ export class BrevoHttpClient implements IBrevoClient {
           : "Brevo request failed before receiving a response",
         {
           error_code: controller.signal.aborted
-            ? "BREVO_REQUEST_TIMEOUT"
-            : "BREVO_TRANSPORT_ERROR",
+            ? `${errorPrefix}_REQUEST_TIMEOUT`
+            : `${errorPrefix}_TRANSPORT_ERROR`,
         },
       );
     } finally {
@@ -103,14 +186,22 @@ export class BrevoHttpClient implements IBrevoClient {
     if (!response.ok) {
       // Kształt zgodny z tym, co `toBrevoPayload`/`toMessagingProviderError`
       // w BrevoAdapter potrafi rozłożyć (status + body.code + body.message).
+      // Dotyczy TAKŻE `429`, które przy odczycie zmierzyliśmy jako realne
+      // (seria zapytań w oknie pomiarowym) — rate limit MUSI dojechać jako
+      // błąd, nigdy jako „zero trafień".
       throw Object.assign(new Error("Brevo API returned an error response"), {
         status: response.status,
         body,
       });
     }
 
-    return body as BrevoSendResponse;
+    return body;
   }
+}
+
+/** Dostawca oczekuje `YYYY-MM-DD` w `startDate`/`endDate` (zmierzone). */
+function toBrevoDate(value: Date): string {
+  return value.toISOString().slice(0, 10);
 }
 
 /**
@@ -126,6 +217,20 @@ export class NotConfiguredBrevoClient implements IBrevoClient {
       "Brevo API key is not configured — refusing to dispatch (set BREVO_API_KEY)",
       // R-2.2-M2: nic nie poszło do Brevo → gateway nie cache'uje tego failu,
       // więc retry po ustawieniu sekretu realnie dotknie providera.
+      { error_code: "BREVO_API_KEY_NOT_CONFIGURED", preflight: true },
+    );
+  }
+
+  /**
+   * RZUCA, a nie zwraca pustej listy (Story 4.5). Bez klucza nie zadaliśmy
+   * dostawcy żadnego pytania, więc odpowiedź „w oknie nie ma tej wiadomości"
+   * byłaby zmyślona — i zwolniłaby drogę do drugiego maila dokładnie w tym
+   * przebiegu, który ta bariera ma zatrzymać.
+   */
+  async findTransactionalMessages(): Promise<never> {
+    throw new MessagingProviderError(
+      "Brevo API key is not configured — nie da się rozstrzygnąć, czy wiadomość " +
+        "już poszła (set BREVO_API_KEY)",
       { error_code: "BREVO_API_KEY_NOT_CONFIGURED", preflight: true },
     );
   }

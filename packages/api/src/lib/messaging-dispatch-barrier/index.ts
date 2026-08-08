@@ -132,6 +132,20 @@ function parseDispatch(value: unknown): NotificationDispatch | null {
   return null
 }
 
+/**
+ * `claim_count` z `RETURNING`. Sterownik potrafi oddać `integer` jako string
+ * (NUMERIC/BIGINT przez `node-pg`), a `Number("")` daje `0` — czyli cichą
+ * degradację do „zajęcie pierwotne", która wyłączyłaby rozstrzyganie po stronie
+ * dostawcy bez jednego śladu. Nierozpoznany kształt oddaje więc `2`, czyli
+ * stronę BEZPIECZNĄ: „to mogło być przejęcie, zapytaj dostawcę".
+ */
+function readClaimCount(row: unknown): number {
+  const raw = (row as { claim_count?: unknown } | null)?.claim_count
+  const parsed =
+    typeof raw === "number" ? raw : typeof raw === "string" ? Number(raw) : NaN
+  return Number.isFinite(parsed) && parsed >= 1 ? parsed : 2
+}
+
 export class PgDispatchIdempotencyBarrier implements DispatchIdempotencyBarrier {
   constructor(private readonly db: DispatchBarrierDb) {}
 
@@ -156,15 +170,25 @@ export class PgDispatchIdempotencyBarrier implements DispatchIdempotencyBarrier 
              updated_at  = EXCLUDED.updated_at
        WHERE ${MESSAGING_DISPATCH_BARRIER_TABLE}.expires_at IS NOT NULL
          AND ${MESSAGING_DISPATCH_BARRIER_TABLE}.expires_at <= $3
-       RETURNING barrier_key`,
+       RETURNING barrier_key, claim_count`,
       [input.barrier_key, expiresIso, nowIso, input.claim_token],
     )
 
-    const claimed = returnedRows(await this.db.raw(text, bindings)).length > 0
-    if (claimed) {
+    // `claim_count` wraca z TEJ SAMEJ operacji, która zajmuje klucz (Story 4.5).
+    // Osobny `SELECT` po werdykcie byłby drugim spojrzeniem na stan, który mógł
+    // się w międzyczasie zmienić — czyli tym samym kształtem `odczyt → operacja`,
+    // który AD-23 nazywa defektem. `1` = zajęcie pierwotne, `> 1` = PRZEJĘTE po
+    // wygaśnięciu, czyli stan, w którym poprzedni przebieg mógł już dotknąć
+    // providera.
+    const rows = returnedRows(await this.db.raw(text, bindings))
+    if (rows.length > 0) {
       // Wiersz niesie teraz token TEGO przebiegu (`EXCLUDED.claim_token` na
       // obu gałęziach), więc domknięcie wołającego trafi we własne zajęcie.
-      return { outcome: "claimed", dispatch: null }
+      return {
+        outcome: "claimed",
+        dispatch: null,
+        claim_count: readClaimCount(rows[0]),
+      }
     }
 
     // PO werdykcie: odtworzenie wyniku poprzedniego przebiegu. `null` znaczy
@@ -172,6 +196,7 @@ export class PgDispatchIdempotencyBarrier implements DispatchIdempotencyBarrier 
     return {
       outcome: "blocked",
       dispatch: await this.findSettledDispatch(input.barrier_key),
+      claim_count: 0,
     }
   }
 

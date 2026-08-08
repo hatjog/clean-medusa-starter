@@ -113,6 +113,14 @@ if (process.env.TEST_TYPE === "integration:http") {
   module.exports.testMatch = [
     "**/packages/api/src/__tests__/integration/messaging-dispatch-barrier-pg.integration.test.[jt]s",
   ];
+} else if (process.env.TEST_TYPE === "dispatch-window-provider") {
+  // v1.15.0 Story 4.5 (AC4) — DOWOD PO STRONIE DOSTAWCY. Wysyla REALNE maile
+  // przez `BrevoHttpClient` i liczy je odczytem z konta Brevo. Bez
+  // `BREVO_API_KEY` / `BREVO_LIVE_PROOF_RECIPIENT` suita jest `describe.skip` —
+  // nigdy nie klamie zielenia.
+  module.exports.testMatch = [
+    "**/packages/api/src/__tests__/integration/dispatch-window-provider.integration.test.[jt]s",
+  ];
 } else if (process.env.TEST_TYPE === "unit") {
   module.exports.testMatch = [
     "**/packages/api/src/**/__tests__/**/*.unit.spec.[jt]s",

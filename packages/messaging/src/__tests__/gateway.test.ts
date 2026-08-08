@@ -374,9 +374,23 @@ describe("DefaultMessagingGateway", () => {
     // Czas jest STEROWANY (wstrzyknięty zegar), nie odmierzany zegarem ściennym.
     // Żaden proces sprzątający nie istnieje w tej suicie i nie odpala się między
     // brzegami — wygasanie realizuje WYŁĄCZNIE predykat operacji `claim`.
+    //
+    // Story 4.5 dołożyła tu JEDEN warunek i warto go nazwać, żeby nie czytał
+    // się jak szum: po wygaśnięciu okna zajęcie jest PRZEJMOWANE, a przejęcie
+    // uruchamia pytanie do DOSTAWCY („czy ta wiadomość już u ciebie jest?").
+    // Predykat okna, który ten przypadek mierzy, działa dokładnie jak dotąd —
+    // bariera przepuszcza. Zmieniło się to, że przepuszczenie nie jest już
+    // ostatnim słowem: gdy dostawca ODPOWIE „nie ma", wysyłka idzie (niżej),
+    // a gdy nie da się go zapytać, gateway ODMAWIA zamiast wysyłać w ciemno
+    // (osobny przypadek w `gateway-dispatch-window.test.ts`).
     let now = fixedNow;
     const windowMs = 60_000;
     const provider = makeProvider();
+    // Produkcyjnym providerem jest `BrevoAdapter`, który tę zdolność MA.
+    // Atrapa bez niej mierzyłaby konfigurację, która w produkcji nie istnieje.
+    (provider as Record<string, unknown>).resolveDispatched = async () => ({
+      outcome: "not_found" as const,
+    });
     const sendMock = provider.send as jest.MockedFunction<IMessagingProvider["send"]>;
     sendMock.mockRejectedValue(
       new MessagingProviderError("timeout-after-send", { error_code: "BREVO_TIMEOUT" }),

@@ -20,6 +20,13 @@ import {
   type DispatchIdempotencyBarrier,
 } from "./idempotency-barrier";
 import type { IMessagingProvider } from "./provider";
+import {
+  DISPATCH_RESOLUTION_LOOKBACK_MS,
+  MESSAGING_BARRIER_RECLAIM_UNRESOLVED,
+  buildDispatchIdentityTag,
+  type IProviderDispatchResolver,
+  type ProviderDispatchResolution,
+} from "./provider-dispatch-resolution";
 import type {
   Channel,
   NotificationAuditEnvelope,
@@ -83,10 +90,18 @@ export const MESSAGING_DISPATCH_IN_FLIGHT = "MESSAGING_DISPATCH_IN_FLIGHT";
  * dodany tutaj jest sklasyfikowany od razu. Kontrola, która PĘKA, gdy pojawia
  * się kod bariery spoza tej listy, siedzi w
  * `packages/api/src/__tests__/lib/messaging-dispatch-barrier.unit.spec.ts`.
+ *
+ * Story 4.5 dokłada trzeci: {@link MESSAGING_BARRIER_RECLAIM_UNRESOLVED} —
+ * zajęcie zostało PRZEJĘTE po wygaśnięciu okna, a dostawca nie potrafił
+ * odpowiedzieć, czy wiadomość już u niego jest. To także jest stan ŚRODOWISKA
+ * (rate limit dostawcy, sieć, brak poświadczeń), a nie właściwość tego wiersza,
+ * i ustępuje bez jego udziału. Zużywanie na niego budżetu prób zaparkowałoby
+ * dostawę na stałe za awarię, która minęła sama.
  */
 export const MESSAGING_BARRIER_TRANSIENT_ERROR_CODES: readonly string[] = [
   MESSAGING_BARRIER_UNAVAILABLE,
   MESSAGING_DISPATCH_IN_FLIGHT,
+  MESSAGING_BARRIER_RECLAIM_UNRESOLVED,
 ];
 
 const SUPPORTED_CHANNELS: ReadonlySet<Channel> = new Set([
@@ -271,6 +286,69 @@ export class DefaultMessagingGateway implements MessagingGateway {
       return this.inFlightDispatch(intent, barrierKey);
     }
 
+    // ── OKNO WYSYŁKA↔POTWIERDZENIE (Story 4.5, FR-9f, AD-23) ───────────────
+    // `claim_count > 1` znaczy: TEN klucz był już raz zajęty, a tamto zajęcie
+    // WYGASŁO. Poprzedni przebieg mógł więc zdążyć dotknąć providera i zginąć
+    // przed `settle` — bez wyjątku, bez `catch`, bez loga. Po naszej stronie
+    // nie ma czego odczytać; jedyne miejsce, gdzie ta informacja istnieje, to
+    // dostawca. Pytamy go ZANIM wyślemy.
+    //
+    // Przy `claim_count === 1` nie ma czego rozstrzygać — pierwsza wysyłka nie
+    // płaci za to ani jednym wywołaniem HTTP.
+    if (claim.claim_count > 1) {
+      const resolution = await this.resolveAlreadyDispatched(
+        provider,
+        intent,
+        barrierKey,
+      );
+
+      if (resolution.outcome === "confirmed_sent") {
+        // Dostawca potwierdził. Dokańczamy to, czego martwy przebieg nie
+        // zdążył: bariera domknięta BEZTERMINOWO (`expires_at = null`), więc
+        // każde kolejne ponowienie rozstrzyga się już TANIM odczytem naszego
+        // wiersza, bez pytania dostawcy.
+        const dispatch: NotificationDispatch = {
+          dispatch_id: deriveFailedDispatchId(barrierKey),
+          provider: provider.key,
+          status: "sent",
+          provider_message_id: resolution.provider_message_id,
+          sent_at: resolution.sent_at ?? this.clock().toISOString(),
+          audit_event: this.createAuditEvent({
+            intent,
+            provider: provider.key,
+            status: "sent",
+            dispatch_id: deriveFailedDispatchId(barrierKey),
+          }),
+        };
+        await this.settleBarrier(barrierKey, claimToken, dispatch, null);
+        // KPI świadomie NIE jest emitowane: `sent` dla tej dostawy policzył już
+        // przebieg, który realnie zawołał providera. Druga emisja liczyłaby tę
+        // samą logiczną wysyłkę dwa razy — czyli robiłaby w metrykach dokładnie
+        // to, czemu ta bariera zapobiega w skrzynce klientki.
+        return dispatch;
+      }
+
+      if (resolution.outcome === "unknown") {
+        // NIE WOLNO wysłać: poprzedni przebieg MÓGŁ już wysłać, a my nie
+        // potrafimy tego sprawdzić. Odmowa jest GŁOŚNA i KLASYFIKOWANA
+        // (`MESSAGING_BARRIER_TRANSIENT_ERROR_CODES`), więc sweep po ten wiersz
+        // wróci, gdy odczyt znów zacznie działać.
+        //
+        // Zajęcie zostaje ZWOLNIONE — jego utrzymywanie przez 15 minut nic nie
+        // chroni (chroni tożsamość u dostawcy, nie nasz wiersz), a blokowałoby
+        // ponowienie, które mogłoby się już rozstrzygnąć.
+        await this.releaseBarrier(barrierKey, claimToken);
+        return this.reclaimUnresolvedDispatch(
+          intent,
+          provider,
+          barrierKey,
+          resolution.reason,
+        );
+      }
+      // `not_found` — dostawca ODPOWIEDZIAŁ i w oknie ważności nie ma tej
+      // wiadomości. Wysyłka jest legalna, lecimy dalej.
+    }
+
     try {
       const providerResponse = await provider.send(intent);
       const dispatch: NotificationDispatch = {
@@ -446,6 +524,104 @@ export class DefaultMessagingGateway implements MessagingGateway {
         dispatch_id: dispatchId,
         error_code: errorCode,
         error_message: error.message,
+      }),
+    };
+  }
+
+  /**
+   * Pytanie do DOSTAWCY: „czy wiadomość o tej tożsamości już u ciebie jest?".
+   *
+   * Tożsamość jest wyprowadzona z klucza bariery, więc jest znana PRZED
+   * wysyłką i odtwarzalna przez ponowienie, które nie ma dostępu do niczego,
+   * co martwy przebieg zapisał.
+   *
+   * Provider bez tej zdolności (SMS, push, atrapa testowa) daje `unknown`,
+   * czyli ODMOWĘ po przejęciu zajęcia — nigdy cichą zgodę na wysyłkę. Milcząca
+   * zgoda byłaby dokładnie tym „mechanizm istnieje, ale nie odpala", którym ta
+   * story się zajmuje.
+   */
+  private async resolveAlreadyDispatched(
+    provider: IMessagingProvider,
+    intent: NotificationIntent,
+    barrierKey: string,
+  ): Promise<ProviderDispatchResolution> {
+    const resolver = provider as Partial<IProviderDispatchResolver>;
+    if (typeof resolver.resolveDispatched !== "function") {
+      return {
+        outcome: "unknown",
+        reason: `provider '${provider.key}' nie ma zdolności rozstrzygania po stronie dostawcy`,
+      };
+    }
+
+    const recipientEmail = intent.recipient.email?.trim();
+    if (!recipientEmail) {
+      // Odczyt u dostawcy wymaga filtra obowiązkowego (zmierzone: `email`,
+      // `messageId` albo `templateId`). Bez adresu nie ma pytania — i nie ma
+      // prawa być domyślnej odpowiedzi „nie znalazłem".
+      return {
+        outcome: "unknown",
+        reason: "intent nie niesie adresu odbiorcy, więc odczyt u dostawcy nie ma filtra",
+      };
+    }
+
+    const now = this.clock();
+    try {
+      return await resolver.resolveDispatched({
+        dispatch_identity: buildDispatchIdentityTag(barrierKey),
+        recipient_email: recipientEmail,
+        template_key: intent.template_key,
+        // OKNO W PREDYKACIE OPERACJI (AD-23): dolny brzeg jedzie do dostawcy
+        // jako parametr TEGO SAMEGO zapytania, które rozstrzyga barierę.
+        sent_after: new Date(now.getTime() - DISPATCH_RESOLUTION_LOOKBACK_MS),
+        now,
+      });
+    } catch (error) {
+      // Wyjątek NIE MOŻE degradować się do `not_found`. To jest ta sama klasa
+      // cichej awarii, którą Story 4.5 zamyka: „nie udało mi się zapytać"
+      // i „zapytałem i nie ma" prowadzą do przeciwnych decyzji.
+      return {
+        outcome: "unknown",
+        reason: error instanceof Error ? error.message : String(error),
+      };
+    }
+  }
+
+  /**
+   * Wynik ODMOWY po przejęciu zajęcia, którego nie dało się rozstrzygnąć.
+   *
+   * Kształt jest ten sam, co dla pozostałych awarii bariery: `failed` Z KODEM,
+   * a nie surowy wyjątek — inaczej do wiersza dostawy nie trafiłby żaden
+   * `error_code`, a klasyfikacja awarii globalnych w sweepie nie miałaby czego
+   * rozpoznać (R-4.1-L1).
+   */
+  private reclaimUnresolvedDispatch(
+    intent: NotificationIntent,
+    provider: IMessagingProvider,
+    barrierKey: string,
+    reason: string,
+  ): NotificationDispatch {
+    const dispatchId = deriveFailedDispatchId(barrierKey);
+    this.logger?.error?.(
+      "[messaging] MESSAGING_BARRIER_RECLAIM_UNRESOLVED — zajęcie przejęte po " +
+        "wygaśnięciu okna, a dostawca nie rozstrzygnął, czy wiadomość już poszła; " +
+        "wysyłka WSTRZYMANA, żeby nie wysłać drugiego maila",
+      {
+        error_code: MESSAGING_BARRIER_RECLAIM_UNRESOLVED,
+        dispatch_id: dispatchId,
+        reason,
+      },
+    );
+    return {
+      dispatch_id: dispatchId,
+      provider: provider.key,
+      status: "failed",
+      audit_event: this.createAuditEvent({
+        intent,
+        provider: provider.key,
+        status: "failed",
+        dispatch_id: dispatchId,
+        error_code: MESSAGING_BARRIER_RECLAIM_UNRESOLVED,
+        error_message: reason,
       }),
     };
   }

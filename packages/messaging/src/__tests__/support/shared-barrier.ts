@@ -43,6 +43,13 @@ interface BarrierRow {
    * ukrywałaby dokładnie ten defekt, przed którym chroni kolumna `claim_token`.
    */
   claim_token: string;
+  /**
+   * Story 4.5: odpowiednik `claim_count` z `RETURNING`. Atrapa MUSI go
+   * modelować, bo to jest JEDYNY sygnał, po którym gateway poznaje, że zajęcie
+   * zostało PRZEJĘTE po wygaśnięciu — czyli że trzeba zapytać dostawcę. Atrapa
+   * zwracająca zawsze `1` ukrywałaby całą tę ścieżkę.
+   */
+  claim_count: number;
 }
 
 export class SharedDispatchBarrier implements DispatchIdempotencyBarrier {
@@ -67,16 +74,21 @@ export class SharedDispatchBarrier implements DispatchIdempotencyBarrier {
         // Odczyt PO werdykcie — nie zmienia go, odtwarza tylko wynik poprzedniego
         // przebiegu. `null` przy `in_flight` znaczy „ktoś inny wysyła TERAZ".
         dispatch: existing!.state === "settled" ? existing!.dispatch : null,
+        claim_count: 0,
       };
     }
 
+    // `claim_count + 1` na gałęzi `DO UPDATE`, `1` na gałęzi `INSERT` — tak samo
+    // jak w SQL. `> 1` znaczy „zajęcie PRZEJĘTE po wygaśnięciu poprzedniego".
+    const claimCount = (existing?.claim_count ?? 0) + 1;
     this.rows.set(input.barrier_key, {
       state: "in_flight",
       dispatch: null,
       expires_at_ms: nowMs + input.in_flight_window_ms,
       claim_token: input.claim_token,
+      claim_count: claimCount,
     });
-    return { outcome: "claimed", dispatch: null };
+    return { outcome: "claimed", dispatch: null, claim_count: claimCount };
   }
 
   /** Domyka WYŁĄCZNIE własne zajęcie — `WHERE … AND claim_token = $token`. */
@@ -90,6 +102,7 @@ export class SharedDispatchBarrier implements DispatchIdempotencyBarrier {
       dispatch: input.dispatch,
       expires_at_ms: input.expires_at ? input.expires_at.getTime() : null,
       claim_token: input.claim_token,
+      claim_count: existing.claim_count,
     });
   }
 

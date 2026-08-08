@@ -102,6 +102,31 @@ export interface BarrierClaim {
    * „nie ma bariery". Wołający nie ma prawa potraktować tego jak zgody na wysyłkę.
    */
   dispatch: NotificationDispatch | null;
+  /**
+   * Który to raz TEN klucz został zajęty. `1` = zajęcie PIERWOTNE (wiersza nie
+   * było). `> 1` = ZAJĘCIE PRZEJĘTE po wygaśnięciu poprzedniego.
+   *
+   * ── Po co to pole istnieje i kto je czyta (Story 4.5) ────────────────────
+   * Bo `> 1` jest DOKŁADNIE tym stanem, w którym poprzedni przebieg mógł już
+   * dotknąć providera, a my nie wiemy, czy dotknął: albo zginął między
+   * `provider.send` a `settle` (zajęcie zostało `in_flight` i wygasło), albo
+   * rozstrzygnął się niejednoznacznie i jego okno minęło. W obu wypadkach
+   * wysłanie w ciemno to drugi mail do klientki.
+   *
+   * Gateway czyta to pole, żeby zawołać rozstrzyganie po stronie DOSTAWCY
+   * ({@link ../provider-dispatch-resolution}) — czyli zapytać o informację,
+   * której po naszej stronie z definicji nie ma. Przy `1` nie ma czego
+   * rozstrzygać i pytanie się nie odbywa: gorąca ścieżka pierwszej wysyłki
+   * NIE płaci za nie ani jednym wywołaniem HTTP.
+   *
+   * Wartość pochodzi z `RETURNING` tej samej operacji atomowej, która zajmuje
+   * klucz — nie z osobnego `SELECT`. Osobny odczyt byłby drugim spojrzeniem na
+   * stan, który mógł się w międzyczasie zmienić, czyli tym samym kształtem
+   * `odczyt → operacja`, który AD-23 nazywa defektem.
+   *
+   * Przy `blocked` wartość jest `0`: nic nie zajęliśmy, więc nie ma czego liczyć.
+   */
+  claim_count: number;
 }
 
 export interface BarrierClaimInput {
