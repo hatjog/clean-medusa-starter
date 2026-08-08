@@ -368,6 +368,23 @@ export async function purgeExpiredDispatchBarrierRows(
     { origin: options?.origin, logger: options?.logger },
   )
 
+  // ── HIGIENA NIE MA PRAWA ZMIENIĆ WERDYKTU (R-4.5-H1, konsekwencja) ────────
+  // Wiersz niesie `claim_count` — sygnał „ten klucz mógł już dotknąć dostawcy",
+  // po którym gateway wie, że ma zapytać dostawcę zamiast wysyłać. Skasowanie
+  // wiersza, do którego ponowienie MOŻE JESZCZE LEGALNIE WRÓCIĆ, zeruje ten
+  // sygnał — i wtedy ponowienie zajmuje klucz od zera, rozstrzygania nie woła
+  // i wysyła drugi mail. Dokładnie ten defekt Story 4.5 zamknęła w gatewayu
+  // (odmowa przestała kasować wiersz); zostawienie go tutaj przywracałoby go
+  // tylnymi drzwiami, i to w mechanizmie, który z założenia jest wyłącznie
+  // higieną.
+  //
+  // Kasujemy więc dopiero POZA HORYZONTEM PONOWIEŃ: wiersz wygasły co najmniej
+  // `BARRIER_AMBIGUOUS_WINDOW_MS` temu jest wierszem, po który żaden sweep już
+  // nie wróci, więc jego usunięcie nie może zmienić żadnego werdyktu.
+  // Przetrzymanie wiersza dłużej kosztuje wyłącznie miejsce w tabeli — ta sama
+  // asymetria, która wyznaczyła samą wartość okna.
+  const purgeBefore = new Date(now.getTime() - BARRIER_AMBIGUOUS_WINDOW_MS)
+
   const { text, bindings } = toKnexPositionalSql(
     `DELETE FROM ${MESSAGING_DISPATCH_BARRIER_TABLE}
       WHERE expires_at IS NOT NULL
@@ -376,7 +393,7 @@ export async function purgeExpiredDispatchBarrierRows(
     // `split_part`, a nie `LIKE '<market>|%'`: identyfikator rynku jest danymi,
     // a `%`/`_` w danych zamieniłyby zawężenie w dopasowanie szersze, niż
     // deklaruje kontekst — czyli kasowanie cudzych wierszy.
-    [now.toISOString(), marketId],
+    [purgeBefore.toISOString(), marketId],
   )
   const result = await db.raw(text, bindings)
   if (result && typeof result === "object") {

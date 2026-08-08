@@ -435,8 +435,8 @@ runOrSkip("Story 4.1 — bariera dostawy na REALNYM Postgresie (knex.raw)", () =
               (existing !== null && existing <= input.now.getTime())
             rows.set(input.barrier_key, input.now.getTime() + input.in_flight_window_ms)
             return free
-              ? ({ outcome: "claimed", dispatch: null } as const)
-              : ({ outcome: "blocked", dispatch: null } as const)
+              ? ({ outcome: "claimed", dispatch: null, claim_count: 1 } as const)
+              : ({ outcome: "blocked", dispatch: null, claim_count: 0 } as const)
           },
           settle: async () => {},
           release: async () => {},

@@ -388,7 +388,10 @@ describe("DefaultMessagingGateway", () => {
     const provider = makeProvider();
     // Produkcyjnym providerem jest `BrevoAdapter`, który tę zdolność MA.
     // Atrapa bez niej mierzyłaby konfigurację, która w produkcji nie istnieje.
-    (provider as Record<string, unknown>).resolveDispatched = async () => ({
+    // R-4.5-M3: konwersja MUSI przejść przez `unknown` (TS2352) — inaczej ta
+    // linia dokłada błąd typów do zbioru, który story zadeklarowała jako
+    // niezmieniony.
+    (provider as unknown as Record<string, unknown>).resolveDispatched = async () => ({
       outcome: "not_found" as const,
     });
     const sendMock = provider.send as jest.MockedFunction<IMessagingProvider["send"]>;

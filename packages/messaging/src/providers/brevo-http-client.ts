@@ -29,6 +29,29 @@ export const BREVO_DEFAULT_MESSAGES_ENDPOINT =
   "https://api.brevo.com/v3/smtp/emails";
 export const BREVO_DEFAULT_TIMEOUT_MS = 10_000;
 
+/**
+ * Rozmiar STRONY odczytu. Dostawca stronicuje `limit`/`offset`, więc jedna
+ * strona nigdy nie jest dowodem na to, że w oknie czegoś nie ma.
+ */
+export const BREVO_LOOKUP_PAGE_SIZE = 100;
+
+/**
+ * Twardy sufit stronicowania (R-4.5-M2).
+ *
+ * Okno wynosi 8 dni, a jedynym filtrem zawężającym bywa sam adres (`templateId`
+ * jest opcjonalny — brak wpisu w `options.templates` znaczy zapytanie WYŁĄCZNIE
+ * po adresie). Adres wysokoobrotowy — skrzynka współdzielona, adres rolowy,
+ * konto testowe — przekracza w tym oknie tysiące wiadomości, a odczyt siedzi na
+ * ścieżce ponowienia i nie może iść w nieskończoność.
+ *
+ * Sufit jest więc konieczny, ale jego osiągnięcie NIE MOŻE degradować się do
+ * „nie znalazłem": to jest odpowiedź NIEPEŁNA, nie odpowiedź przecząca. Po
+ * osiągnięciu sufitu klient RZUCA, a adapter zamienia to na `unknown` — odmowę
+ * wysyłki. Wybór jest asymetryczny świadomie: pomyłka w tę stronę kosztuje
+ * opóźnioną dostawę, w drugą — drugi mail do klientki.
+ */
+export const BREVO_LOOKUP_MAX_ROWS = 1_000;
+
 /** Minimalny kontrakt `fetch` — wstrzykiwany w testach (zero ruchu sieciowego). */
 export type BrevoFetch = (
   input: string,
@@ -92,36 +115,71 @@ export class BrevoHttpClient implements IBrevoClient {
    * nie powstaje). Dopasowanie tożsamości robi więc adapter, na zwróconych
    * wierszach.
    *
-   * @throws MessagingProviderError przy każdej odpowiedzi innej niż 2xx oraz
-   *         przy awarii transportu. Pusta lista jest zwracana WYŁĄCZNIE po
-   *         udanym odczycie — inaczej „nie udało mi się zapytać" byłoby
-   *         nieodróżnialne od „zapytałem i nie ma".
+   * ── Odczyt jest STRONICOWANY do wyczerpania okna (R-4.5-M2) ───────────────
+   * Jedna strona nie jest dowodem nieobecności: obcięcie odpowiedzi do rozmiaru
+   * strony jest odpowiedzią NIEPEŁNĄ, a nie przeczącą. Pętla idzie po `offset`,
+   * aż strona wróci NIEPEŁNA (okno wyczerpane) albo zbiór przekroczy
+   * {@link BREVO_LOOKUP_MAX_ROWS} — wtedy metoda RZUCA, żeby wołający dostał
+   * odmowę zamiast fałszywego „nie ma".
+   *
+   * @throws MessagingProviderError przy każdej odpowiedzi innej niż 2xx, przy
+   *         awarii transportu oraz przy oknie NIEWYCZERPANYM. Pusta lista jest
+   *         zwracana WYŁĄCZNIE po udanym i KOMPLETNYM odczycie — inaczej „nie
+   *         udało mi się zapytać" byłoby nieodróżnialne od „zapytałem i nie ma".
    */
   async findTransactionalMessages(
     query: BrevoTransactionalMessageQuery,
   ): Promise<BrevoTransactionalMessage[]> {
-    const params = new URLSearchParams({
-      email: query.email,
-      startDate: toBrevoDate(query.startDate),
-      endDate: toBrevoDate(query.endDate),
-      limit: String(query.limit ?? 100),
-    });
-    if (typeof query.templateId === "number") {
-      params.set("templateId", String(query.templateId));
-    }
+    const pageSize = query.limit ?? BREVO_LOOKUP_PAGE_SIZE;
+    const collected: BrevoTransactionalMessage[] = [];
 
-    const body = await this.request(
-      `${this.messagesEndpoint}?${params.toString()}`,
-      { method: "GET" },
-      "BREVO_LOOKUP",
-    );
-    const rows = (body as { transactionalEmails?: unknown }).transactionalEmails;
-    if (!Array.isArray(rows)) {
-      // Brak klucza w odpowiedzi 200 to u tego dostawcy „zero trafień"
-      // (zmierzone: `{}` dla okna sprzed lat), a nie awaria.
-      return [];
+    for (let offset = 0; ; offset += pageSize) {
+      const params = new URLSearchParams({
+        email: query.email,
+        startDate: toBrevoDate(query.startDate),
+        // R-4.5-L2: górny brzeg jedzie jako DOBA NASTĘPNA.
+        endDate: toBrevoUpperBoundDate(query.endDate),
+        limit: String(pageSize),
+        offset: String(offset),
+      });
+      if (typeof query.templateId === "number") {
+        params.set("templateId", String(query.templateId));
+      }
+
+      const body = await this.request(
+        `${this.messagesEndpoint}?${params.toString()}`,
+        { method: "GET" },
+        "BREVO_LOOKUP",
+      );
+      const rows = (body as { transactionalEmails?: unknown }).transactionalEmails;
+      if (!Array.isArray(rows)) {
+        // Brak klucza w odpowiedzi 200 to u tego dostawcy „zero trafień"
+        // (zmierzone: `{}` dla okna sprzed lat), a nie awaria.
+        return collected;
+      }
+      collected.push(...(rows as BrevoTransactionalMessage[]));
+
+      if (rows.length < pageSize) {
+        // Strona NIEPEŁNA = okno wyczerpane. To jest jedyny warunek, po którym
+        // wolno powiedzieć „widziałem całe okno".
+        return collected;
+      }
+      if (collected.length >= BREVO_LOOKUP_MAX_ROWS) {
+        // R-4.5-M2: okno NIE zostało wyczerpane, a dalej nie idziemy. Zwrócenie
+        // tego, co zebrane, degradowałoby się w adapterze do `not_found`, czyli
+        // do ZGODY NA WYSYŁKĘ — na podstawie odpowiedzi, o której WIEMY, że jest
+        // niekompletna. To jest trzeci stan, którego reguła „«nie udało mi się
+        // zapytać» to `unknown`" nie obejmowała: zapytanie SIĘ UDAŁO, ale nie
+        // zobaczyliśmy całego okna. Rzucamy, więc adapter zwróci `unknown`
+        // (odmowę), a nie zgodę.
+        throw new MessagingProviderError(
+          `Odczyt u dostawcy nie wyczerpał okna: ${collected.length} wierszy ` +
+            `osiągnęło limit ${BREVO_LOOKUP_MAX_ROWS} i nie wiadomo, czy szukana ` +
+            `wiadomość leży dalej`,
+          { error_code: "BREVO_LOOKUP_WINDOW_TRUNCATED" },
+        );
+      }
     }
-    return rows as BrevoTransactionalMessage[];
   }
 
   async sendTransacEmail(
@@ -202,6 +260,27 @@ export class BrevoHttpClient implements IBrevoClient {
 /** Dostawca oczekuje `YYYY-MM-DD` w `startDate`/`endDate` (zmierzone). */
 function toBrevoDate(value: Date): string {
   return value.toISOString().slice(0, 10);
+}
+
+/**
+ * Górny brzeg okna — DOBA NASTĘPNA po podanej chwili (R-4.5-L2).
+ *
+ * ── Dlaczego nie zwykłe obcięcie ───────────────────────────────────────────
+ * Brzeg jedzie do dostawcy jako DATA, nie znacznik czasu, a my liczymy ją
+ * w UTC. Konto u dostawcy może mieć własną strefę (Brevo pozwala ją ustawić),
+ * więc wiadomość wysłana „przed chwilą" potrafi u niego wypaść już poza dobą,
+ * którą UTC uznaje za bieżącą. Konsekwencja jest ASYMETRYCZNA: brzeg DOLNY
+ * obcięty w dół tylko rozszerza okno (nic nie kosztuje), a brzeg GÓRNY obcięty
+ * w dół UKRYWA szukaną wiadomość — a `not_found` z tego powodu jest zgodą na
+ * wysyłkę, czyli drugim mailem.
+ *
+ * Rozstrzygnięcie: górny brzeg zawsze o dobę dalej. Rozszerzenie okna nie
+ * osłabia mechanizmu — dopasowanie tożsamości i tak robi adapter po stronie
+ * klienta, a tożsamość jest unikalna dla zdarzenia, więc szersze okno nie może
+ * dać trafienia fałszywego. Kosztuje wyłącznie kilka wierszy więcej w odczycie.
+ */
+function toBrevoUpperBoundDate(value: Date): string {
+  return toBrevoDate(new Date(value.getTime() + 24 * 60 * 60 * 1000));
 }
 
 /**

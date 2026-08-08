@@ -63,6 +63,10 @@ export interface BrevoTransactionalMessageQuery {
   /** Dolny brzeg okna ważności — patrz `DISPATCH_RESOLUTION_LOOKBACK_MS`. */
   startDate: Date;
   endDate: Date;
+  /**
+   * Rozmiar STRONY, nie sufit wyniku (R-4.5-M2). Implementacja stronicuje do
+   * wyczerpania okna; jedna strona nie jest dowodem nieobecności wiadomości.
+   */
   limit?: number;
 }
 

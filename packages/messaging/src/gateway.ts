@@ -22,6 +22,7 @@ import {
 import type { IMessagingProvider } from "./provider";
 import {
   DISPATCH_RESOLUTION_LOOKBACK_MS,
+  DISPATCH_UNRESOLVED_RETRY_WINDOW_MS,
   MESSAGING_BARRIER_RECLAIM_UNRESOLVED,
   buildDispatchIdentityTag,
   type IProviderDispatchResolver,
@@ -307,17 +308,23 @@ export class DefaultMessagingGateway implements MessagingGateway {
         // zdążył: bariera domknięta BEZTERMINOWO (`expires_at = null`), więc
         // każde kolejne ponowienie rozstrzyga się już TANIM odczytem naszego
         // wiersza, bez pytania dostawcy.
+        const dispatchId = deriveDeterministicDispatchId(barrierKey);
         const dispatch: NotificationDispatch = {
-          dispatch_id: deriveFailedDispatchId(barrierKey),
+          dispatch_id: dispatchId,
           provider: provider.key,
           status: "sent",
           provider_message_id: resolution.provider_message_id,
-          sent_at: resolution.sent_at ?? this.clock().toISOString(),
+          // R-4.5-L1: `sent_at` NIE degraduje się do `this.clock()`. Zegar tego
+          // przebiegu to czas PONOWIENIA, nie wysyłki — wpisanie go tutaj
+          // byłoby znacznikiem zmyślonym, i to o kilkanaście minut za późnym.
+          // Gdy dostawca nie oddał daty, pole zostaje PUSTE: brak znacznika
+          // jest odróżnialny od znacznika fałszywego, a fałszywy nie jest.
+          ...(resolution.sent_at ? { sent_at: resolution.sent_at } : {}),
           audit_event: this.createAuditEvent({
             intent,
             provider: provider.key,
             status: "sent",
-            dispatch_id: deriveFailedDispatchId(barrierKey),
+            dispatch_id: dispatchId,
           }),
         };
         await this.settleBarrier(barrierKey, claimToken, dispatch, null);
@@ -334,16 +341,31 @@ export class DefaultMessagingGateway implements MessagingGateway {
         // (`MESSAGING_BARRIER_TRANSIENT_ERROR_CODES`), więc sweep po ten wiersz
         // wróci, gdy odczyt znów zacznie działać.
         //
-        // Zajęcie zostaje ZWOLNIONE — jego utrzymywanie przez 15 minut nic nie
-        // chroni (chroni tożsamość u dostawcy, nie nasz wiersz), a blokowałoby
-        // ponowienie, które mogłoby się już rozstrzygnąć.
-        await this.releaseBarrier(barrierKey, claimToken);
-        return this.reclaimUnresolvedDispatch(
+        // ── Odmowa DOMYKA barierę z OKNEM, NIE kasuje wiersza (R-4.5-H1) ────
+        // Wcześniej stało tu `releaseBarrier`, czyli `DELETE`. Kasowało to
+        // wiersz razem z `claim_count` — a `claim_count > 1` jest JEDYNYM
+        // sygnałem, po którym ten gateway w ogóle wie, że ma zapytać dostawcę.
+        // Kolejne ponowienie zajmowało klucz OD ZERA, rozstrzygania nie wołało
+        // i wysyłało DRUGI MAIL (zmierzone: dwie te same tożsamości u dostawcy).
+        // Odmowa nie ma prawa kasować nośnika sygnału, który sama uzasadnia.
+        //
+        // Okno jest KRÓTKIE (`DISPATCH_UNRESOLVED_RETRY_WINDOW_MS`), więc
+        // ponowienie po naprawie odczytu nie czeka dłużej niż jedna cadence
+        // sweepa — a przez ten czas dostaje deterministycznie TEN SAM wynik
+        // `failed` z tym samym kodem, zamiast odbijać się od pustego stanu.
+        const unresolved = this.reclaimUnresolvedDispatch(
           intent,
           provider,
           barrierKey,
           resolution.reason,
         );
+        await this.settleBarrier(
+          barrierKey,
+          claimToken,
+          unresolved,
+          new Date(this.clock().getTime() + DISPATCH_UNRESOLVED_RETRY_WINDOW_MS),
+        );
+        return unresolved;
       }
       // `not_found` — dostawca ODPOWIEDZIAŁ i w oknie ważności nie ma tej
       // wiadomości. Wysyłka jest legalna, lecimy dalej.
@@ -383,7 +405,7 @@ export class DefaultMessagingGateway implements MessagingGateway {
         // zwrócił deterministyczny ten sam wynik. dispatch_id jest stabilnie
         // wyprowadzony z cache key (a nie losowy uuid), więc jest powtarzalny
         // nawet gdyby cache wygasł i provider zwrócił ten sam błąd ponownie.
-        const dispatchId = deriveFailedDispatchId(barrierKey);
+        const dispatchId = deriveDeterministicDispatchId(barrierKey);
         const failedDispatch: NotificationDispatch = {
           dispatch_id: dispatchId,
           provider: provider.key,
@@ -452,7 +474,7 @@ export class DefaultMessagingGateway implements MessagingGateway {
     intent: NotificationIntent,
     barrierKey: string,
   ): NotificationDispatch {
-    const dispatchId = deriveFailedDispatchId(barrierKey);
+    const dispatchId = deriveDeterministicDispatchId(barrierKey);
     return {
       dispatch_id: dispatchId,
       provider: this.defaultProvider,
@@ -500,7 +522,7 @@ export class DefaultMessagingGateway implements MessagingGateway {
       await this.releaseBarrier(barrierKey, claimToken);
     }
 
-    const dispatchId = deriveFailedDispatchId(barrierKey);
+    const dispatchId = deriveDeterministicDispatchId(barrierKey);
     const errorCode = error.error_code || MESSAGING_BARRIER_UNAVAILABLE;
 
     this.logger?.error?.(
@@ -567,7 +589,11 @@ export class DefaultMessagingGateway implements MessagingGateway {
     const now = this.clock();
     try {
       return await resolver.resolveDispatched({
-        dispatch_identity: buildDispatchIdentityTag(barrierKey),
+        // R-4.5-M1: tożsamość obejmuje ADRES, bo zapytanie odczytowe jest do
+        // adresu przywiązane (filtr `email` jest u dostawcy obowiązkowy).
+        // Tożsamość bez adresu kazałaby szukać tagu w skrzynce, do której go
+        // nigdy nie wysłano — a `not_found` z tego powodu jest zgodą na wysyłkę.
+        dispatch_identity: buildDispatchIdentityTag(barrierKey, recipientEmail),
         recipient_email: recipientEmail,
         template_key: intent.template_key,
         // OKNO W PREDYKACIE OPERACJI (AD-23): dolny brzeg jedzie do dostawcy
@@ -600,7 +626,7 @@ export class DefaultMessagingGateway implements MessagingGateway {
     barrierKey: string,
     reason: string,
   ): NotificationDispatch {
-    const dispatchId = deriveFailedDispatchId(barrierKey);
+    const dispatchId = deriveDeterministicDispatchId(barrierKey);
     this.logger?.error?.(
       "[messaging] MESSAGING_BARRIER_RECLAIM_UNRESOLVED — zajęcie przejęte po " +
         "wygaśnięciu okna, a dostawca nie rozstrzygnął, czy wiadomość już poszła; " +
@@ -924,11 +950,24 @@ export function buildBarrierKey(intent: NotificationIntent): string {
   ].join("|");
 }
 
-// R2-M1: deterministyczny dispatch_id dla failed dispatch wyprowadzony z klucza bariery,
-// żeby retry tego samego intentu (po wygaśnięciu cache lub w nowym procesie) dał
-// powtarzalny identyfikator zamiast losowego uuid — eliminuje niedeterminizm
-// i ułatwia korelację duplikatów w audicie.
-function deriveFailedDispatchId(barrierKey: string): string {
+// R2-M1: deterministyczny dispatch_id wyprowadzony z klucza bariery, żeby retry
+// tego samego intentu (po wygaśnięciu cache lub w nowym procesie) dał powtarzalny
+// identyfikator zamiast losowego uuid — eliminuje niedeterminizm i ułatwia
+// korelację duplikatów w audicie.
+//
+// R-4.5-L1: funkcja nazywała się `deriveFailedDispatchId` i była udokumentowana
+// jako identyfikator PORAŻKI — a Story 4.5 zaczęła jej używać także na ścieżce
+// `confirmed_sent`, czyli dla wysyłki UDANEJ. Nazwa przeczyła użyciu i czytelnik
+// audytu dostawał identyfikator „porażki" przy statusie `sent`. Nazwa jest teraz
+// neutralna, bo neutralna jest własność: to jest deterministyczny identyfikator
+// TEGO KLUCZA, niezależny od tego, jak przebieg się skończył.
+//
+// Zamierzona konsekwencja, która ZOSTAJE: przebieg odtwarzający po potwierdzeniu
+// nadaje inny `dispatch_id` niż przebieg, który realnie wysłał (tamten dostał go
+// od providera). Korelacja jednej logicznej wysyłki idzie wtedy po
+// `provider_message_id`, który jest w OBU wierszach ten sam — i to on, a nie nasz
+// identyfikator, jest tożsamością wysyłki po stronie dostawcy.
+function deriveDeterministicDispatchId(barrierKey: string): string {
   const digest = createHash("sha256").update(barrierKey).digest("hex");
   // Format jako UUID-podobny (8-4-4-4-12) z deterministycznego hasha.
   return [

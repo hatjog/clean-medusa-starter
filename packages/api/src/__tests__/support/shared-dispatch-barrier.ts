@@ -35,6 +35,8 @@ interface BarrierRow {
    * ukrywałaby dokładnie ten defekt, przed którym chroni kolumna `claim_token`.
    */
   claim_token: string
+  /** Story 4.5: „który to raz TEN klucz został zajęty" — `> 1` = zajęcie PRZEJĘTE. */
+  claim_count: number
 }
 
 export class SharedDispatchBarrier implements DispatchIdempotencyBarrier {
@@ -55,16 +57,23 @@ export class SharedDispatchBarrier implements DispatchIdempotencyBarrier {
       return {
         outcome: "blocked",
         dispatch: existing!.state === "settled" ? existing!.dispatch : null,
+        // Story 4.5 dołożyła `claim_count` do kontraktu; atrapa MUSI go
+        // modelować, inaczej rozjeżdża się z portem po cichu (R-4.5-M3:
+        // `tsc` był jedynym miejscem, gdzie ten rozjazd było widać).
+        // `0` przy `blocked` — nic nie zajęliśmy, więc nie ma czego liczyć.
+        claim_count: 0,
       }
     }
 
+    const claimCount = (existing?.claim_count ?? 0) + 1
     this.rows.set(input.barrier_key, {
       state: "in_flight",
       dispatch: null,
       expires_at_ms: nowMs + input.in_flight_window_ms,
       claim_token: input.claim_token,
+      claim_count: claimCount,
     })
-    return { outcome: "claimed", dispatch: null }
+    return { outcome: "claimed", dispatch: null, claim_count: claimCount }
   }
 
   /** Domyka WYŁĄCZNIE własne zajęcie — `WHERE … AND claim_token = $token`. */
@@ -78,6 +87,10 @@ export class SharedDispatchBarrier implements DispatchIdempotencyBarrier {
       dispatch: input.dispatch,
       expires_at_ms: input.expires_at ? input.expires_at.getTime() : null,
       claim_token: input.claim_token,
+      // `settle` NIE rusza `claim_count` — tak samo jak `UPDATE` w SQL. To jest
+      // własność, na której stoi R-4.5-H1: domknięcie po odmowie zachowuje
+      // sygnał „ten klucz mógł już dotknąć dostawcy".
+      claim_count: existing.claim_count,
     })
   }
 

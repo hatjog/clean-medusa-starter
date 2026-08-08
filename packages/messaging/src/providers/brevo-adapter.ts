@@ -187,7 +187,10 @@ export class BrevoAdapter
       // nie ma dostępu do niczego, co poprzedni (martwy) przebieg zapisał.
       // To jest jedyny nośnik pozwalający zapytać dostawcę „czy TA konkretna
       // wiadomość już u ciebie jest" — patrz `resolveDispatched` niżej.
-      tags: [buildDispatchIdentityTag(buildBarrierKey(intent))],
+      // R-4.5-M1: adres jest CZĘŚCIĄ tożsamości, bo odczyt u dostawcy filtruje
+      // po adresie obowiązkowo. Ta sama funkcja normalizuje go po obu stronach,
+      // więc wysyłka i późniejszy odczyt wyprowadzają identyczną wartość.
+      tags: [buildDispatchIdentityTag(buildBarrierKey(intent), recipientEmail)],
       // F-09: `headers` w Brevo TransactionalEmailsApi to message headers (widoczne w `view source`
       // wiadomości po stronie odbiorcy). Usunęliśmy X-GP-Flow-Id / X-GP-Template-Key / X-GP-Locale
       // (PII/routing leak ryzyko).

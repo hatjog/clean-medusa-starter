@@ -34,6 +34,7 @@ import {
   BrevoAdapter,
   BrevoHttpClient,
   DEFAULT_BARRIER_IN_FLIGHT_WINDOW_MS,
+  DISPATCH_RESOLUTION_LOOKBACK_MS,
   DefaultMessagingGateway,
   buildBarrierKey,
   buildDispatchIdentityTag,
@@ -171,9 +172,13 @@ async function countAtProvider(identity: string): Promise<number> {
   const rows = await client.findTransactionalMessages({
     email: RECIPIENT,
     templateId: TEMPLATE_ID,
-    startDate: new Date(now.getTime() - 2 * 24 * 60 * 60 * 1000),
+    // R-4.5-M2: dowód liczy PRZY PARAMETRACH PRODUKCJI, nie przy wygodniejszych.
+    // Wcześniej stało tu okno 2 dni i `limit: 500`, podczas gdy produkcja pyta
+    // z oknem `DISPATCH_RESOLUTION_LOOKBACK_MS` (8 dni) i stronicuje po
+    // `BREVO_LOOKUP_PAGE_SIZE`. Zieleń zmierzona na łagodniejszych parametrach
+    // nie pokrywa stanu, w którym obcięcie odpowiedzi w ogóle występuje.
+    startDate: new Date(now.getTime() - DISPATCH_RESOLUTION_LOOKBACK_MS),
     endDate: now,
-    limit: 500,
   })
   return rows.filter((row) => (row.tags ?? []).includes(identity)).length
 }
@@ -202,7 +207,7 @@ suite("Story 4.5 AC4 — dowód PO STRONIE DOSTAWCY", () => {
     const barrier = new LocalBarrier()
     const adapter = makeAdapter()
     const intent = makeIntent(`${run}-dead`)
-    const identity = buildDispatchIdentityTag(buildBarrierKey(intent))
+    const identity = buildDispatchIdentityTag(buildBarrierKey(intent), RECIPIENT)
     const t0 = new Date()
 
     // ── Martwy przebieg: zajmuje barierę, wysyła REALNY mail, i znika ──────
@@ -254,7 +259,7 @@ suite("Story 4.5 AC4 — dowód PO STRONIE DOSTAWCY", () => {
     }
     const adapter = makeAdapter()
     const intent = makeIntent(`${run}-settlefail`)
-    const identity = buildDispatchIdentityTag(buildBarrierKey(intent))
+    const identity = buildDispatchIdentityTag(buildBarrierKey(intent), RECIPIENT)
     const t0 = new Date()
 
     await new DefaultMessagingGateway({ brevo: adapter }, "brevo", {
@@ -288,7 +293,7 @@ suite("Story 4.5 AC4 — dowód PO STRONIE DOSTAWCY", () => {
     }
     const adapter = makeAdapter()
     const intent = makeIntent(`${run}-baseline`)
-    const identity = buildDispatchIdentityTag(buildBarrierKey(intent))
+    const identity = buildDispatchIdentityTag(buildBarrierKey(intent), RECIPIENT)
     const t0 = new Date()
 
     await preStory45.claim({
@@ -313,7 +318,7 @@ suite("Story 4.5 AC4 — dowód PO STRONIE DOSTAWCY", () => {
     const barrier = new LocalBarrier()
     const adapter = makeAdapter()
     const intent = makeIntent(`${run}-legit`)
-    const identity = buildDispatchIdentityTag(buildBarrierKey(intent))
+    const identity = buildDispatchIdentityTag(buildBarrierKey(intent), RECIPIENT)
 
     const dispatch = await new DefaultMessagingGateway(
       { brevo: adapter },

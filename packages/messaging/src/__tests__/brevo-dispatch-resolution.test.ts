@@ -67,7 +67,9 @@ describe("BrevoAdapter — nośnik tożsamości w payloadzie", () => {
       intent,
     );
 
-    expect(payload.tags).toEqual([buildDispatchIdentityTag(buildBarrierKey(intent))]);
+    expect(payload.tags).toEqual([
+      buildDispatchIdentityTag(buildBarrierKey(intent), "buyer@example.com"),
+    ]);
   });
 
   it("`X-Mailin-Tag` NIE jest nośnikiem tożsamości — ten sam dla każdej wysyłki szablonu", () => {
@@ -93,7 +95,7 @@ describe("BrevoAdapter — nośnik tożsamości w payloadzie", () => {
 
 describe("BrevoAdapter.resolveDispatched", () => {
   const intent = makeIntent();
-  const identity = buildDispatchIdentityTag(buildBarrierKey(intent));
+  const identity = buildDispatchIdentityTag(buildBarrierKey(intent), "buyer@example.com");
   const lookup = {
     dispatch_identity: identity,
     recipient_email: "buyer@example.com",
@@ -128,7 +130,7 @@ describe("BrevoAdapter.resolveDispatched", () => {
     // a suita mierząca „czy powstał duplikat" świeciłaby na zielono.
     const client = makeClient([
       { messageId: "<obcy-1>", tags: ["bonbeauty,gp,v1.7.0,transactional"] },
-      { messageId: "<obcy-2>", tags: [buildDispatchIdentityTag("inny|klucz|email|x")] },
+      { messageId: "<obcy-2>", tags: [buildDispatchIdentityTag("inny|klucz|email|x", "ktos@example.com")] },
       { messageId: "<obcy-3>" },
     ]);
     const resolution = await new BrevoAdapter(client, ADAPTER_OPTIONS).resolveDispatched(
@@ -143,7 +145,10 @@ describe("BrevoAdapter.resolveDispatched", () => {
     await new BrevoAdapter(client, ADAPTER_OPTIONS).resolveDispatched(lookup);
 
     expect(client.queries).toHaveLength(1);
-    const query = client.queries[0] as Record<string, unknown>;
+    // R-4.5-M3: `as Record<string, unknown>` na tym typie jest konwersją
+    // NIEDOZWOLONĄ (TS2352) — przejście przez `unknown` jest jawnym
+    // stwierdzeniem „patrzę na ten obiekt jak na worek pól", a nie obejściem.
+    const query = client.queries[0] as unknown as Record<string, unknown>;
     expect(query.email).toBe("buyer@example.com");
     expect(query.templateId).toBe(4);
     expect(query.startDate).toEqual(lookup.sent_after);
@@ -172,6 +177,50 @@ describe("BrevoAdapter.resolveDispatched", () => {
       },
     };
     const resolution = await new BrevoAdapter(blind, ADAPTER_OPTIONS).resolveDispatched(
+      lookup,
+    );
+    expect(resolution.outcome).toBe("unknown");
+  });
+
+  it("R-4.5-M1: ten sam klucz bariery, INNY odbiorca ⇒ tożsamość jest INNA, więc pytamy o właściwą skrzynkę", async () => {
+    // Reprodukcja finding-u: serwerowy filtr `email` jest OBOWIĄZKOWY, więc
+    // zapytanie o tożsamość wyprowadzoną z samego klucza bariery szukałoby jej
+    // w CUDZEJ skrzynce i wracało `not_found` — czyli zgodą na wysyłkę.
+    const innyOdbiorca = makeIntent({
+      recipient: { email: "inna@example.com", market_id: "bonbeauty" },
+    });
+    expect(buildBarrierKey(innyOdbiorca)).toBe(buildBarrierKey(intent));
+    expect(
+      buildDispatchIdentityTag(buildBarrierKey(innyOdbiorca), "inna@example.com"),
+    ).not.toBe(identity);
+
+    // Wysyłka i odczyt wyprowadzają TĘ SAMĄ wartość dla tego samego adresu —
+    // to jest własność, na której stoi całe rozstrzyganie.
+    const payload = new BrevoAdapter(makeClient([]), ADAPTER_OPTIONS).toBrevoPayload(
+      innyOdbiorca,
+    );
+    const client = makeClient([{ messageId: "<x>", tags: payload.tags }]);
+    const resolution = await new BrevoAdapter(client, ADAPTER_OPTIONS).resolveDispatched({
+      ...lookup,
+      recipient_email: "inna@example.com",
+      dispatch_identity: buildDispatchIdentityTag(
+        buildBarrierKey(innyOdbiorca),
+        "inna@example.com",
+      ),
+    });
+    expect(resolution.outcome).toBe("confirmed_sent");
+  });
+
+  it("R-4.5-M2: NIEWYCZERPANE okno odczytu daje `unknown`, nie `not_found`", async () => {
+    // Klient rzuca, gdy stronicowanie nie doszło do końca okna. Adapter NIE MA
+    // prawa zamienić tego w „nie ma" — odpowiedź jest niepełna, nie przecząca.
+    const client = makeClient(
+      Object.assign(new Error("okno nie wyczerpane"), {
+        status: 200,
+        body: { code: "BREVO_LOOKUP_WINDOW_TRUNCATED" },
+      }),
+    );
+    const resolution = await new BrevoAdapter(client, ADAPTER_OPTIONS).resolveDispatched(
       lookup,
     );
     expect(resolution.outcome).toBe("unknown");
