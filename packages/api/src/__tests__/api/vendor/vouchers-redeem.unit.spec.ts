@@ -81,6 +81,118 @@ type VoucherMock = {
   claim: jest.Mock
 }
 
+const ENTITLEMENT_ID = "ent_unit_redeem_1"
+const ENTITLEMENT_GROSS = 12_000
+
+/**
+ * v1.15.0 Story 5.7 — atrapa połączenia dla ŚCIEŻKI KANONICZNEJ.
+ *
+ * ── Czego ta atrapa NIE dowodzi (nazwane wprost) ────────────────────────────
+ * Nie dowodzi NICZEGO o schemacie, CHECK-ach, grantach, RLS ani o typach
+ * zwracanych przez `node-pg` — a więc nie jest i nie może być dowodem dla AC1.
+ * Honoruje `ON CONFLICT DO NOTHING` po stronie JS, więc pokazuje wyłącznie, jak
+ * TRASA reaguje na wynik producenta: kody HTTP, kształt koperty i kolejność
+ * fakt → projekcja. Dowód z wykonania na realnym Postgresie leży w
+ * `packages/api/src/__tests__/rls/voucher-redemption.integration.spec.ts`
+ * (profil `TEST_TYPE=voucher-redemption-pg`); ADR-166 jest precedensem tego,
+ * co się dzieje, gdy atrapa zostaje uznana za dowód.
+ */
+function createRedemptionFakeDb(opts: {
+  entitlementState?: string
+  entitlementRows?: number
+} = {}) {
+  const redemptions = new Map<string, Record<string, unknown>>()
+  let state = opts.entitlementState ?? "ACTIVE"
+  let remaining = ENTITLEMENT_GROSS
+  const entitlementCount = opts.entitlementRows ?? 1
+
+  const entitlementRow = (index: number) => ({
+    id: index === 0 ? ENTITLEMENT_ID : `${ENTITLEMENT_ID}_${index}`,
+    entitlement_type: "VOUCHER_AMOUNT",
+    state,
+    remaining_amount: remaining,
+    policy_snapshot: {
+      voucher_code: VOUCHER_CODE,
+      market_id: "bonbeauty",
+      amount_minor: ENTITLEMENT_GROSS,
+      currency_code: "PLN",
+      transferability: "bearer",
+    },
+    vat_classification: "MPV",
+    market_id: "bonbeauty",
+    sales_channel_id: null,
+    recipient_customer_id: null,
+  })
+
+  const query = async (sql: string, params: unknown[] = []) => {
+    const text = sql.trim()
+    if (/^(BEGIN|COMMIT|ROLLBACK)/i.test(text)) return { rows: [], rowCount: 0 }
+    if (/FROM entitlement_instance/i.test(text)) {
+      const rows = Array.from({ length: entitlementCount }, (_, i) =>
+        entitlementRow(i),
+      )
+      return { rows, rowCount: rows.length }
+    }
+    if (/^SELECT[\s\S]*FROM voucher_redemption/i.test(text)) {
+      if (/commission_base_minor/i.test(text)) {
+        let base = 0
+        for (const row of redemptions.values()) {
+          base +=
+            row.kind === "REVERSAL"
+              ? -Number(row.amount_minor)
+              : Number(row.amount_minor)
+        }
+        return { rows: [{ commission_base_minor: String(base) }], rowCount: 1 }
+      }
+      const key = JSON.stringify([params[0], params[1], params[2] ?? "REDEMPTION"])
+      const found = redemptions.get(key)
+      return { rows: found ? [found] : [], rowCount: found ? 1 : 0 }
+    }
+    if (/^INSERT INTO voucher_redemption/i.test(text)) {
+      const key = JSON.stringify([params[0], params[1], params[8]])
+      if (redemptions.has(key)) return { rows: [], rowCount: 0 }
+      redemptions.set(key, {
+        entitlement_id: params[0],
+        idempotency_key: params[1],
+        redemption_id: params[2],
+        // `node-pg` zwraca `bigint` jako STRING — atrapa musi to odwzorować,
+        // inaczej maskowałaby dokładnie ten defekt, o który chodzi w ADR-166.
+        amount_minor: String(params[3]),
+        resulting_state: params[4],
+        remaining_after_minor: String(params[5]),
+        issued_gross_minor: String(params[6]),
+        created_at: String(params[7]),
+        kind: params[8],
+        reverses_redemption_id: params[9],
+        market_id: params[10],
+        purchase_market_id: params[11],
+        redemption_market_id: params[12],
+      })
+      return { rows: [], rowCount: 1 }
+    }
+    if (/^UPDATE entitlement_instance/i.test(text)) {
+      const from = params[1]
+      if (from !== state) return { rows: [], rowCount: 0 }
+      state = params[2] as string
+      if (params.length >= 5 && typeof params[3] === "number") {
+        remaining = params[3] as number
+      }
+      return { rows: [], rowCount: 1 }
+    }
+    if (/^INSERT INTO voucher_event/i.test(text)) return { rows: [], rowCount: 1 }
+    return { rows: [], rowCount: 0 }
+  }
+
+  const connection = { query }
+  return {
+    redemptions,
+    client: {
+      acquireConnection: async () => connection,
+      releaseConnection: async () => {},
+    },
+  }
+}
+
 function makeRequest(opts: {
   voucherService: VoucherMock
   appendCalls?: AppendCall[]
@@ -88,6 +200,14 @@ function makeRequest(opts: {
   params?: Record<string, string>
   /** `null` = sprzedawca BEZ zadeklarowanego rynku (kontrola negatywna 2.6). */
   sellerMarketId?: string | null
+  /**
+   * v1.15.0 Story 5.7: nagłówek `Idempotency-Key`. `null` = ŚWIADOMY brak
+   * (kontrola negatywna M4 pkt 2). Domyślnie obecny, bo bez niego trasa odmawia
+   * i żaden z pozostałych przypadków nie zmierzyłby tego, po co powstał.
+   */
+  idempotencyKey?: string | null
+  /** Współdzielona atrapa kanonicznej — dla przypadków wielo-żądaniowych. */
+  redemptionDb?: ReturnType<typeof createRedemptionFakeDb>
 }) {
   const sigHeader = buildVendorSignatureHeader(
     SELLER_ID,
@@ -97,11 +217,17 @@ function makeRequest(opts: {
   // Fresh barrier per request builder: these cases are about the route, not
   // about replay, so each built request must carry a nonce that is still free.
   const replayGuardDb = createReplayGuardTestDb()
+  const redemptionDb = opts.redemptionDb ?? createRedemptionFakeDb()
+  const idempotencyKey =
+    "idempotencyKey" in opts ? opts.idempotencyKey : "panel-unit-key-0001"
   return {
     params: opts.params ?? { code: VOUCHER_CODE },
     body: {},
     query: {},
-    headers: { "x-vendor-signature": sigHeader },
+    headers: {
+      "x-vendor-signature": sigHeader,
+      ...(idempotencyKey ? { "idempotency-key": idempotencyKey } : {}),
+    },
     scope: {
       resolve: (key: string) => {
         if (key === "voucher") return opts.voucherService
@@ -140,6 +266,11 @@ function makeRequest(opts: {
           }
         }) as unknown as Record<string, unknown> & ((t: string) => unknown)
         ;(knexStub as any).raw = replayGuardDb.raw
+        // v1.15.0 Story 5.7: producent kanonicznej jedzie TĄ SAMĄ pulą, którą
+        // łata hook RLS — czyli `PG_CONNECTION.client` (`resolveRlsConnectionSource`).
+        // Bez tego pola trasa odmawiałaby `GP_RLS_CONNECTION_SOURCE_UNAVAILABLE`,
+        // i słusznie: własna pula byłaby drugim nośnikiem kontekstu (AD-21 §4).
+        ;(knexStub as any).client = redemptionDb.client
         ;(knexStub as any).insert = () => ({
           returning: async () => {
             throw new Error("audit write skipped in unit test")
@@ -273,6 +404,47 @@ describe("cc-4 F-05 — POST /vendor/vouchers/:code/redeem", () => {
     expect(body.envelope.code).toBe(VOUCHER_CODE)
     expect(body.envelope.prior_status).toBe("idle")
     expect(body.envelope.new_status).toBe("claimed")
+    // v1.15.0 Story 5.7: koperta niesie teraz także identyfikator wiersza
+    // KANONICZNEGO i kwotę — bez nich trasa opisywała zdarzenie finansowe
+    // bez ani jednej liczby.
+    expect(body.envelope.redemption_id).toMatch(/^RDM-[0-9A-F]{12}$/)
+    expect(body.envelope.amount_minor).toBe(ENTITLEMENT_GROSS)
+    expect(body.envelope.remaining_after_minor).toBe(0)
+  })
+
+  // v1.15.0 Story 5.7 (ADR-178 §2.2 M4 pkt 2) — kontrola, która PĘKA po zepsuciu
+  // mechanizmu: gdyby serwer podstawiał klucz „na wszelki wypadek", ten przypadek
+  // zwróciłby 200 i każdy retry tworzyłby drugi wiersz kanoniczny.
+  it("L9 — brak nagłówka Idempotency-Key ⇒ 400, PRZED dotknięciem vouchera", async () => {
+    const mock: VoucherMock = {
+      getByCode: jest.fn(async () => makeVoucher()),
+      claim: jest.fn(),
+    }
+    const req = makeRequest({ voucherService: mock, idempotencyKey: null })
+    const res = makeRes()
+    await redeemPOST(req as never, res as never, jest.fn() as never)
+    expect(res.statusCode).toBe(400)
+    expect((res.body as { code: string }).code).toBe("IDEMPOTENCY_KEY_REQUIRED")
+    expect(mock.getByCode).not.toHaveBeenCalled()
+    expect(mock.claim).not.toHaveBeenCalled()
+  })
+
+  // v1.15.0 Story 5.7 (ADR-178 §2.2 M3) — wiele uprawnień na jeden kod jest
+  // ODMOWĄ, nie cichym wyborem „pierwszego lepszego" wiersza.
+  it("L10 — dwa uprawnienia na jeden kod ⇒ 409 ENTITLEMENT_AMBIGUOUS", async () => {
+    const mock: VoucherMock = {
+      getByCode: jest.fn(async () => makeVoucher()),
+      claim: jest.fn(),
+    }
+    const req = makeRequest({
+      voucherService: mock,
+      redemptionDb: createRedemptionFakeDb({ entitlementRows: 2 }),
+    })
+    const res = makeRes()
+    await redeemPOST(req as never, res as never, jest.fn() as never)
+    expect(res.statusCode).toBe(409)
+    expect((res.body as { code: string }).code).toBe("ENTITLEMENT_AMBIGUOUS")
+    expect(mock.claim).not.toHaveBeenCalled()
   })
 
   it("L5 — returns 404 for cross-vendor redeem attempt (no state mutation)", async () => {
@@ -288,26 +460,49 @@ describe("cc-4 F-05 — POST /vendor/vouchers/:code/redeem", () => {
     expect(mock.claim).not.toHaveBeenCalled()
   })
 
-  it("L6 — second call returns idempotent=true with already_claimed", async () => {
+  // v1.15.0 Story 5.7 (ADR-178 §2.2 M5): źródłem `already_claimed` jest teraz
+  // `ON CONFLICT DO NOTHING` na kanonicznej — zero wstawionych wierszy ⇒ replay —
+  // a nie sam `voucher.status`. Ten przypadek robi więc DWA żądania z TYM SAMYM
+  // nagłówkiem przeciw TEJ SAMEJ atrapie kanonicznej, zamiast opisywać drugie
+  // żądanie mockiem serwisu.
+  it("L6 — drugie żądanie z tym samym Idempotency-Key ⇒ idempotent=true, already_claimed", async () => {
     const claimEvent = { event_type: "claimed", occurred_at: new Date("2026-05-24T10:00:00Z") }
     const claimedVoucher = makeVoucher({ status: "claimed", events: [claimEvent] })
     const mock: VoucherMock = {
-      getByCode: jest.fn(async () => claimedVoucher),
-      claim: jest.fn(async () => ({
-        status: "already_claimed",
-        voucher: claimedVoucher,
-      })),
+      getByCode: jest.fn(async () => makeVoucher()),
+      claim: jest.fn(async () => ({ status: "claimed", voucher: claimedVoucher })),
     }
-    const req = makeRequest({ voucherService: mock })
-    const res = makeRes()
-    await redeemPOST(req as never, res as never, jest.fn() as never)
-    expect(res.statusCode).toBe(200)
-    const body = res.body as {
+    const redemptionDb = createRedemptionFakeDb()
+
+    const first = makeRes()
+    await redeemPOST(
+      makeRequest({ voucherService: mock, redemptionDb }) as never,
+      first as never,
+      jest.fn() as never,
+    )
+    expect(first.statusCode).toBe(200)
+    expect((first.body as { idempotent: boolean }).idempotent).toBe(false)
+
+    const second = makeRes()
+    await redeemPOST(
+      makeRequest({ voucherService: mock, redemptionDb }) as never,
+      second as never,
+      jest.fn() as never,
+    )
+    expect(second.statusCode).toBe(200)
+    const body = second.body as {
       idempotent: boolean
-      envelope: { new_status: string }
+      envelope: { new_status: string; audit_log_id: string }
     }
     expect(body.idempotent).toBe(true)
     expect(body.envelope.new_status).toBe("already_claimed")
+    // Powtórzenie NIE tworzy drugiego wiersza kanonicznego.
+    expect(redemptionDb.redemptions.size).toBe(1)
+    // …a koperta audytowa jest TA SAMA (M4 pkt 4: `audit_log_id` jest POCHODNĄ
+    // klucza idempotencji, nie losową wartością per żądanie).
+    expect(body.envelope.audit_log_id).toBe(
+      (first.body as { envelope: { audit_log_id: string } }).envelope.audit_log_id,
+    )
   })
 
   it("L7 — returns 410 on expired voucher", async () => {

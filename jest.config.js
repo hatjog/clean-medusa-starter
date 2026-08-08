@@ -75,6 +75,17 @@ if (process.env.TEST_TYPE === "integration:http") {
   module.exports.testMatch = [
     "**/packages/api/src/__tests__/rls/voucher-module-rls.integration.spec.[jt]s",
   ];
+} else if (process.env.TEST_TYPE === "voucher-redemption-pg") {
+  // v1.15.0 Story 5.7 (FR-12a/b/c, AI-2.2) — kanoniczna `voucher_redemption`
+  // OŻYWIONA, na REALNYM Postgresie: DDL wykonany z plików migracji, ruch rolą
+  // BEZ superusera i BEZ własności tabeli, kontrola negatywna grantów jako
+  // realna próba zapisu. Profil istnieje, bo suita, której nie odpala żaden
+  // profil, jest mechanizmem martwym — dokładnie ten defekt znalazła 2.6
+  // w `packages/api/src/__tests__/rls/**` (`No tests found`).
+  // DATABASE_URL musi wskazywać IZOLOWANĄ DB: suita DROP-uje tabele modułu.
+  module.exports.testMatch = [
+    "**/packages/api/src/__tests__/rls/voucher-redemption.integration.spec.[jt]s",
+  ];
 } else if (process.env.TEST_TYPE === "compensation-failure-pg") {
   // v1.15.0 Story 3.5 (FR-6c, NFR-3, AD-22) — rejestr nieudanych kompensacji
   // sciezki pieniadza wykonany przez sam modul na realnym Postgresie

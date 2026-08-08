@@ -526,7 +526,8 @@ describe("Story 4.1 AC1 — derecognition posting przez writer (sym. aktywacja)"
       .reduce((s, p) => s + Number(p[4]), 0)
     expect(outputCredits).toBe(1122)
     // transaction_id deterministyczny per redemption_id.
-    const rid = buildRedemptionId("ent_amount_1", "mpv-1")
+    // v1.15.0 Story 5.7 (ADR-178 §2.3): preimage objął `kind`.
+    const rid = buildRedemptionId("ent_amount_1", "mpv-1", "REDEMPTION")
     expect(res.posting.transaction_id).toBe(
       deriveLedgerTransactionId({
         entitlement_id: "ent_amount_1",
