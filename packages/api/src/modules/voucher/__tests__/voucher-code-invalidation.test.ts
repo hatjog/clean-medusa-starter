@@ -11,9 +11,16 @@
 
 import { describe, it, expect } from "@jest/globals"
 
-import { EntitlementInstanceState } from "../models/entitlement"
+import {
+  EntitlementInstanceState,
+  EntitlementType,
+} from "../models/entitlement"
+import type { VoucherStatus } from "../models/types"
 import {
   CODE_INVALIDATION_SOURCE_STATES,
+  INVALIDATED_VOUCHER_STATUSES,
+  SUPERSEDING_VOUCHER_STATUS,
+  VOUCHER_BACKED_ENTITLEMENT_TYPES,
   INVALIDATING_ENTITLEMENT_STATES,
   INVALIDATING_ENTITLEMENT_STATE_TO_VOUCHER_STATUS,
   NotAnInvalidatingStateError,
@@ -99,14 +106,82 @@ describe("Story 5.9 — reguła unieważnienia (allow-lista, idempotencja, fail-
     expect(d.prior_status).toBe("refunded")
   })
 
-  it("stan spoza allow-listy jest fail-closed PRZED efektem", () => {
+  it("stan spoza allow-listy i spoza zbioru unieważnionych jest fail-closed", () => {
+    // review-fix 5.9: ten test BADAŁ `withdrawn → refunded`, czyli świecił
+    // zielono na zachowaniu, które wywracało zwrot (patrz opis precedencji).
+    // Guard allow-listy zostaje — od czego jest, widać dopiero na stanie
+    // DOPISANYM do CHECK-a bazy bez dopisania go do którejkolwiek z list.
     expect(() =>
       decideVoucherCodeInvalidation({
+        ...BASE,
+        current_status: "reserved_by_drift" as VoucherStatus,
+        to_state: EntitlementInstanceState.REFUNDED,
+      })
+    ).toThrow(VoucherCodeNotInvalidatableError)
+  })
+
+  describe("precedencja stanów unieważnionych (review-fix 5.9)", () => {
+    it("`refunded` NADPISUJE `expired` — zwrot wygasłego uprawnienia przechodzi", () => {
+      // Ścieżka legalna w grafie: EXPIRED → REFUND_REQUESTED → REFUNDED.
+      // Przed fixem producent rzucał, a leżąc w transakcji wołającego
+      // przewracał CAŁY zwrot.
+      const d = decideVoucherCodeInvalidation({
+        ...BASE,
+        current_status: "expired",
+        to_state: EntitlementInstanceState.REFUNDED,
+      })
+      expect(d.outcome).toBe("invalidated")
+      expect(d.prior_status).toBe("expired")
+      expect(d.target_status).toBe("refunded")
+    })
+
+    it("`refunded` NADPISUJE `withdrawn` z tego samego powodu", () => {
+      const d = decideVoucherCodeInvalidation({
         ...BASE,
         current_status: "withdrawn",
         to_state: EntitlementInstanceState.REFUNDED,
       })
-    ).toThrow(VoucherCodeNotInvalidatableError)
+      expect(d.outcome).toBe("invalidated")
+      expect(d.target_status).toBe("refunded")
+    })
+
+    it("reguła NIE działa w drugą stronę: `expired` nie nadpisuje `refunded`", () => {
+      const d = decideVoucherCodeInvalidation({
+        ...BASE,
+        current_status: "refunded",
+        to_state: EntitlementInstanceState.EXPIRED,
+      })
+      expect(d.outcome).toBe("already_invalidated_other")
+      expect(d.prior_status).toBe("refunded")
+      // Kod pozostaje nierealizowalny — SM-7 nie jest zagrożony.
+      expect(d.target_status).toBe("expired")
+    })
+
+    it("`withdrawn` przy kodzie `expired` też jest nazwanym no-opem, nie błędem", () => {
+      const d = decideVoucherCodeInvalidation({
+        ...BASE,
+        current_status: "expired",
+        to_state: EntitlementInstanceState.VOIDED,
+      })
+      expect(d.outcome).toBe("already_invalidated_other")
+    })
+
+    it("nadpisujący stan jest LUSTREM kontraktu, nie stałą wpisaną w regule", () => {
+      expect(SUPERSEDING_VOUCHER_STATUS).toBe("refunded")
+      expect(
+        [...INVALIDATED_VOUCHER_STATUSES].sort()
+      ).toEqual(["expired", "refunded", "withdrawn"])
+      expect(INVALIDATED_VOUCHER_STATUSES.has(SUPERSEDING_VOUCHER_STATUS)).toBe(true)
+    })
+  })
+
+  it("typ voucherowy jest derywowany z taksonomii, nie z listy literałów", () => {
+    // review-fix 5.9: dopisanie wariantu do `EntitlementType` bez decyzji
+    // „czy niesie kod" ma nie kompilować się, a nie cicho dawać `no_voucher_code`.
+    expect([...VOUCHER_BACKED_ENTITLEMENT_TYPES].sort()).toEqual([
+      EntitlementType.VOUCHER_AMOUNT,
+      EntitlementType.VOUCHER_SERVICE,
+    ])
   })
 
   it("brak mostu przy uprawnieniu VOUCHEROWYM = fail-closed, NIE cichy no-op", () => {

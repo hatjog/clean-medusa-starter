@@ -803,6 +803,16 @@ export async function buildLostCodeRecoveryWiring(
      * realizowalny obok uprawnienia, którego już nie ma.
      */
     invalidateVoucherCode?: TransitionWiringDeps["invalidateVoucherCode"]
+    /*
+     * GRANICA POMIARU (review-fix 5.9, INFO-3): `buildLostCodeRecoveryWiring`
+     * jest eksportowane i re-eksportowane z `modules/voucher/index.ts`, ale NIE
+     * MA produkcyjnego wołającego — odzysk zgubionego kodu biegnie przez
+     * `workflows/reissue-lost-code.ts`, wpięte osobno. Fail-closed powyżej jest
+     * więc dziś MECHANIZMEM BEZ REALNEJ ŚCIEŻKI: zadziała, gdy ten builder
+     * zostanie wpięty, i nie mierzy niczego, dopóki nie zostanie. Stan jest
+     * zastany (plik był taki przed 5.9); zapisany tutaj, żeby „7 call-site'ów"
+     * z opisu story nie czytało się jako „7 czynnych ścieżek".
+     */
   },
   input: BuildLostCodeWiringInput
 ): Promise<LostCodeRecoveryWiringResult> {

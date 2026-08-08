@@ -1421,7 +1421,19 @@ export class VoucherService {
          product_title = EXCLUDED.product_title,
          value_minor = EXCLUDED.value_minor,
          currency_code = EXCLUDED.currency_code,
-         status = EXCLUDED.status,
+         -- v1.15.0 Story 5.9 review-fix: upsert NIE ozywia uniewaznionego kodu.
+         -- ON CONFLICT ... DO UPDATE SET status jest zapisem stanu kodu, choc
+         -- nie pasuje do wzorca UPDATE voucher SET status, wiec bramka
+         -- validate_voucher_code_invalidation.py go NIE widziala (w tym samym
+         -- review-fixie wzorzec zostal poszerzony). Nadpisanie refunded/expired/
+         -- withdrawn wartoscia wejsciowa przywracaloby realizowalnosc kodu, za
+         -- ktory pieniadze juz wrocily -- czyli SM-7 > 0 zupelnie inna droga
+         -- niz ta, ktora story zamyka.
+         status = CASE
+           WHEN voucher.status IN ('refunded','expired','withdrawn')
+             THEN voucher.status
+           ELSE EXCLUDED.status
+         END,
          expires_at = EXCLUDED.expires_at,
          updated_at = NOW()`,
       [
@@ -1985,6 +1997,7 @@ export class VoucherService {
       // zostaje tutaj — producent nie jest jej drugą kopią.
       const claimedRows = await claimVoucherCode(client, {
         code,
+        now,
         inputStatusInClause: redemptionInputStatusInClause(),
       })
       if (claimedRows > 0) {
@@ -2136,6 +2149,7 @@ export class VoucherService {
       const claimedRows = await claimVoucherCode(client, {
         code,
         seller_id: sellerId,
+        now,
         inputStatusInClause: redemptionInputStatusInClause(),
       })
       if (claimedRows === 0) {

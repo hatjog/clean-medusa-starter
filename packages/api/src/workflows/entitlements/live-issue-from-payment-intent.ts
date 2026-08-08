@@ -561,6 +561,7 @@ async function issueSingleIssuedRow(
   })
 
   const entitlementId = buildIssuedEntitlementId(dedupeKey)
+  const validityEnd = computeValidityEnd(now, readNumber(snapshot.validity_months))
 
   // INSERT ISSUED `ON CONFLICT (entitlement_dedupe_key) DO NOTHING` — barriera
   // per-entitlement. Zwraca id przy faktycznym INSERT; brak wiersza ⇒ no-op
@@ -570,8 +571,8 @@ async function issueSingleIssuedRow(
        (id, entitlement_profile_id, entitlement_type, order_id, line_item_id,
         state, policy_snapshot, market_id, sales_channel_id, vat_classification,
         reference_price_minor, entitlement_dedupe_key, recipient_index, recipient_customer_id,
-        created_at, updated_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11, $12, $13, $14, $15, $15)
+        expires_at, created_at, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11, $12, $13, $14, $16, $15, $15)
      ${ENTITLEMENT_DEDUPE_ON_CONFLICT_CLAUSE}
      RETURNING id`,
     [
@@ -590,6 +591,10 @@ async function issueSingleIssuedRow(
       recipient.recipient_index,
       recipient.recipient_customer_id,
       now,
+      // v1.15.0 Story 5.9 review-fix (HIGH-2): termin ważności zapisany TAKŻE
+      // na uprawnieniu — to on steruje sweeperem wygaszeń, a więc i zejściem
+      // stanu kodu. Wyliczany tą samą funkcją, co `voucher.expires_at`.
+      validityEnd,
     ]
   )
 
@@ -1009,10 +1014,7 @@ async function issueVoucherCodeWithinTx(
     )
   }
 
-  const expiresAt =
-    args.validityMonths && args.validityMonths > 0
-      ? new Date(new Date(args.now).setMonth(args.now.getMonth() + args.validityMonths))
-      : null
+  const expiresAt = computeValidityEnd(args.now, args.validityMonths)
 
   await client.query(
     `INSERT INTO voucher
@@ -1033,6 +1035,32 @@ async function issueVoucherCodeWithinTx(
       args.now,
     ]
   )
+}
+
+/**
+ * Koniec ważności wyliczony z `validity_months` — JEDNO miejsce dla OBU
+ * nośników terminu (v1.15.0 Story 5.9 review-fix, HIGH-2).
+ *
+ * Do tego fixu termin trafiał WYŁĄCZNIE do `voucher.expires_at`, a
+ * `entitlement_instance.expires_at` zostawało NULL-em (kolumny nie było na
+ * liście INSERT-a). Dopóki stan kodu gasił bulk-UPDATE po `voucher.expires_at`,
+ * nikt tego nie widział. Story 5.9 usunęła tamten zapis i przeniosła wygaszanie
+ * na tranzycję uprawnienia, a sweeper bierze kandydatów po
+ * `entitlement_instance.expires_at IS NOT NULL` — czyli od 5.9 voucher
+ * wystawiony produkcyjną ścieżką Path Y NIGDY by nie wygasł: producent stanu
+ * `expired` istniałby w kontrakcie i w bramce, a na realnej ścieżce nie
+ * odpaliłby się ani razu. Dokładnie ta klasa defektu, którą story usuwa.
+ *
+ * Dwa nośniki terminu liczone dwoma wyrażeniami rozjechałyby się cicho, więc
+ * wyrażenie jest tu jedno i wołane dwa razy.
+ */
+export function computeValidityEnd(
+  now: Date,
+  validityMonths: number | undefined
+): Date | null {
+  return validityMonths && validityMonths > 0
+    ? new Date(new Date(now).setMonth(now.getMonth() + validityMonths))
+    : null
 }
 
 function assertPositiveIntegerMinor(value: unknown, field: string): number {

@@ -42,7 +42,10 @@
  * dołożone do CHECK-a w v1.11.0).
  */
 
-import { EntitlementInstanceState } from "./models/entitlement"
+import {
+  EntitlementInstanceState,
+  EntitlementType,
+} from "./models/entitlement"
 import type { VoucherStatus } from "./models/types"
 
 /** Minimalny kształt klienta — ten sam, którego używają `service.ts` i workflowy. */
@@ -88,11 +91,52 @@ export function isInvalidatingEntitlementState(
  * zrealizowany też może zostać zwrócony (zwrot po realizacji jest ścieżką
  * mechanizmu (b) w `refund-entitlement.ts`), a kod ma wtedy przestać działać
  * na wypadek kolejnej próby. Stany unieważnione (`refunded`, `expired`,
- * `withdrawn`) NIE są tu wymienione — przejście z nich jest obsługiwane
- * osobno jako idempotencja albo odmowa, patrz `invalidateVoucherCode`.
+ * `withdrawn`) NIE są tu wymienione — przejście z nich rozstrzyga PRECEDENCJA
+ * (`SUPERSEDING_VOUCHER_STATUS`), a nie ta lista: patrz
+ * `decideVoucherCodeInvalidation`.
  */
 export const CODE_INVALIDATION_SOURCE_STATES: ReadonlySet<VoucherStatus> =
   new Set<VoucherStatus>(["idle", "consent_pending", "claimed"])
+
+/**
+ * Stany kodu, które SĄ już unieważnione — derywowane z mapy, nie wypisane
+ * drugi raz.
+ */
+export const INVALIDATED_VOUCHER_STATUSES: ReadonlySet<VoucherStatus> = new Set(
+  Object.values(INVALIDATING_ENTITLEMENT_STATE_TO_VOUCHER_STATUS) as VoucherStatus[]
+)
+
+/**
+ * Stan kodu, który MOŻE nadpisać inny stan unieważniony — LUSTRO
+ * `invalidating_transitions.superseding_status` z kontraktu (review-fix 5.9).
+ *
+ * ── Dlaczego ta reguła w ogóle istnieje ─────────────────────────────────────
+ * Pierwsze podejście traktowało allow-listę jako jedyną bramkę: kod w stanie
+ * `expired`/`withdrawn` przy tranzycji uprawnienia do REFUNDED wpadał na
+ * `VoucherCodeNotInvalidatableError`, a że producent leży w transakcji
+ * wołającego, wyjątek przewracał CAŁY zwrot. Ta ścieżka NIE jest hipotetyczna:
+ *   (a) graf uprawnień dopuszcza `EXPIRED → REFUND_REQUESTED → REFUNDED`
+ *       (`ALLOWED_ENTITLEMENT_TRANSITIONS[EXPIRED]`), więc zwrot wygasłego
+ *       uprawnienia jest legalny;
+ *   (b) na danych zastanych stan kodu bywa `expired` przy uprawnieniu ACTIVE,
+ *       bo usunięty w tej story bulk-sweeper gasił kody po `voucher.expires_at`
+ *       NIEZALEŻNIE od stanu uprawnienia.
+ * Zwrot pieniędzy, który wywraca się na tym, że kod i tak już nie działał,
+ * jest gorszy niż defekt, który 5.9 usuwa.
+ *
+ * ── Dlaczego akurat `refunded` ──────────────────────────────────────────────
+ * „Pieniądze wróciły" jest faktem MOCNIEJSZYM niż „minęła data" i „zgoda
+ * wycofana": tylko on zmienia odpowiedź na pytanie, czy salon ma za co wykonać
+ * zabieg. Trasa realizacji rozstrzyga tak samo — `resolveRedeemRefusalReason`
+ * stawia `refunded` PRZED gałęzią czasu. Gdyby kod zwróconego vouchera
+ * zostawał `expired`, kosmetolożka dostałaby powód „wygasł", czyli dokładnie
+ * ten mylący komunikat, który AC każe rozróżnić.
+ *
+ * W drugą stronę reguła NIE działa: `expired`/`withdrawn` nigdy nie nadpisują
+ * `refunded` — wynik jest wtedy nazwany (`already_invalidated_other`), nie
+ * zapisany i nie rzucony.
+ */
+export const SUPERSEDING_VOUCHER_STATUS: VoucherStatus = "refunded"
 
 /** Wynik operacji unieważnienia — rozłączny, bez cichego „nic się nie stało". */
 export type VoucherCodeInvalidationOutcome =
@@ -100,6 +144,13 @@ export type VoucherCodeInvalidationOutcome =
   | "invalidated"
   /** Kod był już w docelowym stanie unieważnionym — powtórzenie = no-op. */
   | "already_invalidated"
+  /**
+   * Kod był już unieważniony, ale INNYM stanem, którego ten cel nie nadpisuje
+   * (patrz `SUPERSEDING_VOUCHER_STATUS`). Kod pozostaje nierealizowalny, więc
+   * SM-7 nie jest zagrożony — ale wynik jest NAZWANY i asertowany, bo cichy
+   * no-op w tym miejscu byłby nie do odróżnienia od defektu.
+   */
+  | "already_invalidated_other"
   /**
    * Uprawnienie nie jest wsparte kodem vouchera (`policy_snapshot` bez
    * `voucher_code`) i jego typ tego nie wymaga. To NIE jest cichy no-op:
@@ -173,11 +224,35 @@ export class VoucherCodeNotInvalidatableError extends Error {
   }
 }
 
+/**
+ * Czy typ uprawnienia JEST wsparty kodem vouchera — decyzja podjęta dla
+ * KAŻDEGO wariantu taksonomii z osobna (review-fix 5.9).
+ *
+ * Zapis jako `Record<EntitlementType, boolean>`, a nie jako zbiór literałów
+ * stringowych, jest tu pomiarem, nie estetyką: dopisanie wariantu do
+ * `EntitlementType` (ADR-099 wymaga ADR + PR) nie skompiluje się, dopóki ktoś
+ * świadomie nie odpowie, czy nowy typ niesie kod. Poprzedni kształt
+ * (`new Set(["VOUCHER_AMOUNT","VOUCHER_SERVICE"])`) przepuściłby nowy typ
+ * voucherowy jako `no_voucher_code` — czyli CICHO wróciłby dokładnie ten
+ * defekt, który ta story usuwa: uprawnienie schodzi, kod zostaje.
+ */
+const ENTITLEMENT_TYPE_IS_VOUCHER_BACKED: Readonly<
+  Record<EntitlementType, boolean>
+> = {
+  [EntitlementType.VOUCHER_AMOUNT]: true,
+  [EntitlementType.VOUCHER_SERVICE]: true,
+  [EntitlementType.CREDIT_PACK]: false,
+  [EntitlementType.SUBSCRIPTION_B2C]: false,
+  [EntitlementType.SUBSCRIPTION_B2B]: false,
+  [EntitlementType.BUNDLE]: false,
+}
+
 /** Typy uprawnień, dla których BRAK kodu vouchera jest błędem, nie stanem. */
-const VOUCHER_BACKED_ENTITLEMENT_TYPES: ReadonlySet<string> = new Set([
-  "VOUCHER_AMOUNT",
-  "VOUCHER_SERVICE",
-])
+export const VOUCHER_BACKED_ENTITLEMENT_TYPES: ReadonlySet<string> = new Set(
+  Object.entries(ENTITLEMENT_TYPE_IS_VOUCHER_BACKED)
+    .filter(([, backed]) => backed)
+    .map(([type]) => type)
+)
 
 /**
  * REGUŁA unieważnienia — czysta, bez IO. Jedno źródło rozstrzygnięcia dla
@@ -233,6 +308,30 @@ export function decideVoucherCodeInvalidation(input: {
   if (input.current_status === target) {
     return {
       outcome: "already_invalidated",
+      entitlement_id: input.entitlement_id,
+      voucher_code: code,
+      prior_status: input.current_status,
+      target_status: target,
+    }
+  }
+
+  // Kod jest już unieważniony, ale INNYM stanem (review-fix 5.9). Rozstrzyga
+  // precedencja z kontraktu, nie allow-lista: tylko `refunded` nadpisuje.
+  // Rzucenie tutaj przewracało transakcję wołającego, czyli wywracało ZWROT
+  // wygasłego uprawnienia — ścieżkę legalną w grafie i realną na danych
+  // zastanych.
+  if (INVALIDATED_VOUCHER_STATUSES.has(input.current_status)) {
+    if (target !== SUPERSEDING_VOUCHER_STATUS) {
+      return {
+        outcome: "already_invalidated_other",
+        entitlement_id: input.entitlement_id,
+        voucher_code: code,
+        prior_status: input.current_status,
+        target_status: target,
+      }
+    }
+    return {
+      outcome: "invalidated",
       entitlement_id: input.entitlement_id,
       voucher_code: code,
       prior_status: input.current_status,
@@ -346,7 +445,11 @@ export async function invalidateVoucherCode(
  * `client`-a wołającego.
  *
  * Wydzielone z `service.ts` w 5.9 wyłącznie po to, żeby zapis `voucher.status`
- * miał JEDEN nośnik. Zachowanie jest niezmienione: warunek `status IN (…)`
+ * miał JEDEN nośnik. Czas przychodzi od WOŁAJĄCEGO (`now`), tak samo jak
+ * w `invalidateVoucherCode` — review-fix 5.9 (LOW-5). Wcześniej ta funkcja
+ * pisała `updated_at = NOW()` (zegar bazy), a jej sąsiadka `input.now` (zegar
+ * wołającego): dwa kanały czasu w JEDNYM nośniku, czyli dokładnie ta oś, którą
+ * review-fix 5.8 przed chwilą zrównał. Zachowanie jest niezmienione: warunek `status IN (…)`
  * jest generowany z allow-listy `VOUCHER_REDEMPTION_INPUT_STATES` (5.8) i
  * przekazywany przez wołającego, żeby ten plik nie stał się drugą kopią
  * allow-listy realizacji.
@@ -359,16 +462,18 @@ export async function claimVoucherCode(
     inputStatusInClause: string
     /** Zawężenie do najemcy (`redeemForSeller`); `null` dla ścieżki `claim()`. */
     seller_id?: string | null
+    /** Zegar WOŁAJĄCEGO — ten sam kanał, co w `invalidateVoucherCode`. */
+    now: Date
   }
 ): Promise<number> {
-  const params: unknown[] = [input.code]
+  const params: unknown[] = [input.code, input.now]
   let sellerPredicate = ""
   if (input.seller_id != null) {
     params.push(input.seller_id)
     sellerPredicate = ` AND seller_id = $${params.length}`
   }
   const res = await client.query(
-    `UPDATE voucher SET status = 'claimed', updated_at = NOW()
+    `UPDATE voucher SET status = 'claimed', updated_at = $2
       WHERE code = $1${sellerPredicate} AND ${input.inputStatusInClause}`,
     params
   )

@@ -146,6 +146,29 @@ export interface IssueRetentionTx {
     to_state: EntitlementInstanceState
     now: Date
   }): Promise<VoucherCodeInvalidationResult>
+  /**
+   * v1.15.0 Story 5.9 review-fix (MEDIUM-1): WYDANIE kodu następcy — wiersz
+   * `voucher` sklonowany ze starego kodu, z nowym kodem i stanem `idle`,
+   * w TEJ SAMEJ transakcji.
+   *
+   * Do tego fixu następca dziedziczył `voucher_code` STAREGO kodu przez
+   * `snapshotPolicy(old.policy_snapshot)`, a żaden nowy wiersz `voucher` nie
+   * powstawał. Skutki były dwa i oba realne: (1) most 5.7
+   * (`policy_snapshot->>'voucher_code'`) przestawał być jednoznaczny — dwa
+   * uprawnienia wskazywały ten sam kod; (2) `new_code` zwracany klientce nie
+   * istniał w tabeli, po której rozstrzyga trasa realizacji, więc „nowy kod"
+   * był kodem martwym, a stary — od 5.9 — `withdrawn`. Klientka zostawała
+   * z niczym.
+   *
+   * Zwraca `false`, gdy stary kod nie ma wiersza `voucher` (uprawnienie
+   * niewspierane kodem) — wtedy nie ma czego klonować i następca też kodu nie
+   * dostaje.
+   */
+  issueSuccessorVoucherCode(input: {
+    from_code: string
+    to_code: string
+    now: Date
+  }): Promise<boolean>
 }
 
 export type RetentionEventEmitter = {
@@ -256,8 +279,26 @@ export class IssueRetentionWorkflow {
       // catalog is OOS, so we always copy the source policy_snapshot verbatim
       // regardless of whether templateId is set, and document this in the
       // Completion Notes. This is the AC3 fallback path for all BonBeauty cases.
+      // v1.15.0 Story 5.9 review-fix (MEDIUM-1): voucher retencyjny dostaje
+      // WŁASNY kod — kopiowanie kodu źródłowego zostawiało klientce kod,
+      // który ta sama transakcja przed chwilą przestawiła na `withdrawn`.
+      const oldSnapshot = old.policy_snapshot as Record<string, unknown>
+      const oldCode =
+        typeof oldSnapshot.voucher_code === "string"
+          ? oldSnapshot.voucher_code
+          : null
+      const successorCodeIssued = oldCode
+        ? await tx.issueSuccessorVoucherCode({
+            from_code: oldCode,
+            to_code: retentionCode,
+            now,
+          })
+        : false
+
       const retentionPolicy = snapshotPolicy(
-        old.policy_snapshot as Record<string, unknown>
+        successorCodeIssued
+          ? { ...oldSnapshot, voucher_code: retentionCode }
+          : oldSnapshot
       )
 
       const next: RetentionEntitlement = {
@@ -500,6 +541,42 @@ class PostgresIssueRetentionTx implements IssueRetentionTx {
     return invalidateVoucherCode(this.client, input)
   }
 
+  /**
+   * v1.15.0 Story 5.9 review-fix (MEDIUM-1): WYDANIE kodu następcy — wiersz
+   * `voucher` sklonowany ze starego kodu, z nowym kodem i stanem `idle`,
+   * w TEJ SAMEJ transakcji.
+   *
+   * Do tego fixu następca dziedziczył `voucher_code` STAREGO kodu przez
+   * `snapshotPolicy(old.policy_snapshot)`, a żaden nowy wiersz `voucher` nie
+   * powstawał. Skutki były dwa i oba realne: (1) most 5.7
+   * (`policy_snapshot->>'voucher_code'`) przestawał być jednoznaczny — dwa
+   * uprawnienia wskazywały ten sam kod; (2) `new_code` zwracany klientce nie
+   * istniał w tabeli, po której rozstrzyga trasa realizacji, więc „nowy kod"
+   * był kodem martwym, a stary — od 5.9 — `withdrawn`. Klientka zostawała
+   * z niczym.
+   *
+   * Zwraca `false`, gdy stary kod nie ma wiersza `voucher` (uprawnienie
+   * niewspierane kodem) — wtedy nie ma czego klonować i następca też kodu nie
+   * dostaje.
+   */
+  async issueSuccessorVoucherCode(input: {
+    from_code: string
+    to_code: string
+    now: Date
+  }): Promise<boolean> {
+    const res = await this.client.query(
+      `INSERT INTO voucher
+         (code, market_id, seller_id, seller_name, seller_handle, product_title,
+          value_minor, currency_code, status, expires_at, created_at, updated_at)
+       SELECT $2, market_id, seller_id, seller_name, seller_handle, product_title,
+              value_minor, currency_code, 'idle', expires_at, $3, $3
+         FROM voucher WHERE code = $1
+       ON CONFLICT (code) DO NOTHING`,
+      [input.from_code, input.to_code, input.now]
+    )
+    return (res.rowCount ?? 0) > 0
+  }
+
   async getEntitlementForUpdate(id: string): Promise<RetentionEntitlement | null> {
     const columns = await this.selectColumns()
     return this.getEntitlementBySql(
@@ -732,6 +809,18 @@ class InMemoryIssueRetentionTx implements IssueRetentionTx {
       this.codes.set(decision.voucher_code, decision.target_status)
     }
     return decision
+  }
+
+  /** v1.15.0 Story 5.9 review-fix: mirror wydania kodu następcy. */
+  async issueSuccessorVoucherCode(input: {
+    from_code: string
+    to_code: string
+    now: Date
+  }): Promise<boolean> {
+    if (!this.codes.has(input.from_code)) return false
+    if (this.codes.has(input.to_code)) return false
+    this.codes.set(input.to_code, "idle")
+    return true
   }
 
   async getEntitlementForUpdate(id: string): Promise<RetentionEntitlement | null> {

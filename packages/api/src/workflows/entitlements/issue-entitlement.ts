@@ -451,7 +451,7 @@ export async function compensateIssuedEntitlement(
   // hold a reference, and avoids setting a precedent for the refund path
   // (F-CC1-002) of "compensation == DELETE row". Idempotency check: only
   // transition if not already in a terminal state.
-  await client.query(
+  const voided = await client.query(
     `UPDATE entitlement_instance
         SET state = $2,
             updated_at = NOW()
@@ -463,11 +463,22 @@ export async function compensateIssuedEntitlement(
   // stan kodu schodzi RAZEM z nim — na TYM SAMYM `client`-cie, czyli w tej
   // samej transakcji kompensacji. Bez tego rollback wystawienia zostawiał kod
   // w stanie realizowalnym przy uprawnieniu, którego już nie ma.
-  await invalidateVoucherCode(client, {
-    entitlement_id: result.entitlement_id,
-    to_state: EntitlementInstanceState.VOIDED,
-    now: new Date(),
-  })
+  //
+  // review-fix 5.9: TYLKO gdy tranzycja FAKTYCZNIE zaszła. `UPDATE` wyżej jest
+  // strzeżony (`state NOT IN ('VOIDED','REFUNDED','CLOSED')`), więc dla wiersza
+  // już terminalnego obejmuje ZERO wierszy — a bezwarunkowe wołanie producenta
+  // przestawiało wtedy stan kodu bez żadnej tranzycji uprawnienia. Dla wiersza
+  // `CLOSED` (kod `claimed`) unieważniało to ZREALIZOWANY kod na `withdrawn`,
+  // czyli zapis kłamiący o tym, co się wydarzyło. Ta gałąź jest jedynym
+  // miejscem, w którym producent NIE jest wołany — i jest tak dlatego, że nie
+  // ma tu tranzycji, którą miałby domykać.
+  if ((voided.rowCount ?? 0) > 0) {
+    await invalidateVoucherCode(client, {
+      entitlement_id: result.entitlement_id,
+      to_state: EntitlementInstanceState.VOIDED,
+      now: new Date(),
+    })
+  }
 }
 
 /**

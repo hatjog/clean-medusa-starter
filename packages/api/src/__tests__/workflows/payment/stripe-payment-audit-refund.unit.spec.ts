@@ -94,6 +94,9 @@ class RefundFakeClient {
     })
   }
 
+  /** v1.15.0 Story 5.9 review-fix: stan kodu jest STANEM fake'a, nie stałą. */
+  voucherStatus = "idle"
+
   async query<T = Record<string, unknown>>(
     sql: string,
     params: ReadonlyArray<unknown> = []
@@ -146,9 +149,19 @@ class RefundFakeClient {
       }
     }
     if (sql.includes("FROM voucher WHERE code")) {
-      return { rows: [{ status: "idle" }] as unknown as T[], rowCount: 1 }
+      return {
+        rows: [{ status: this.voucherStatus }] as unknown as T[],
+        rowCount: 1,
+      }
     }
     if (sql.includes("UPDATE voucher SET status")) {
+      // review-fix 5.9: fake NIE udaje sukcesu w oderwaniu od stanu — WHERE
+      // producenta wiąże `status = prior`, więc rowCount zależy od tego, co
+      // fake właśnie zwrócił jako stan bieżący. Bez tego test „przechodzi",
+      // choćby producent pisał do wiersza, którego nie zablokował.
+      const prior = params[3] as string
+      if (prior !== this.voucherStatus) return { rows: [] as T[], rowCount: 0 }
+      this.voucherStatus = params[1] as string
       return { rows: [] as T[], rowCount: 1 }
     }
 
@@ -291,6 +304,51 @@ describe("v1.9.0 wf5 H-3 / F-CC1-002 — refund path → entitlement REFUNDED", 
     expect(result.refundRevocation?.already_terminal_entitlement_ids.length).toBe(2)
     expect(client.entitlementRows.get("ent_already_refunded")?.state).toBe("REFUNDED")
     expect(client.entitlementRows.get("ent_voided")?.state).toBe("VOIDED")
+  })
+
+  it("zwrot kodu JUŻ `expired` przechodzi i schodzi na `refunded` (review-fix 5.9)", async () => {
+    // Regresja: przed fixem producent rzucał `VoucherCodeNotInvalidatableError`
+    // na stanie kodu spoza allow-listy, a leżąc w transakcji wołającego
+    // przewracał CAŁY zwrot. Stan `expired` przy uprawnieniu ACTIVE jest realny
+    // na danych zastanych — usunięty w 5.9 bulk-sweeper gasił kody niezależnie
+    // od stanu uprawnienia.
+    const client = new RefundFakeClient()
+    client.voucherStatus = "expired"
+    client.seedEntitlement({
+      id: "ent_expired_code",
+      order_id: "ord_refund_1",
+      state: "ACTIVE",
+    })
+    const workflow = new StripePaymentAuditWorkflow({
+      connect: async () => client,
+    })
+
+    const result = await workflow.process("payment.refunded", refundPayload())
+
+    expect(result.refundRevocation?.revoked_entitlement_ids).toEqual([
+      "ent_expired_code",
+    ])
+    expect(client.entitlementRows.get("ent_expired_code")?.state).toBe("REFUNDED")
+    // Stan kodu NADPISANY: „pieniądze wróciły" jest faktem mocniejszym niż
+    // „minęła data" — i tylko on daje powód odmowy rozróżnialny od „wygasł".
+    expect(client.voucherStatus).toBe("refunded")
+  })
+
+  it("`refunded` NIE jest cofane przez późniejsze unieważnienie (kontrola przeciwna)", async () => {
+    const client = new RefundFakeClient()
+    client.voucherStatus = "refunded"
+    client.seedEntitlement({
+      id: "ent_refund_twice",
+      order_id: "ord_refund_1",
+      state: "ACTIVE",
+    })
+    const workflow = new StripePaymentAuditWorkflow({
+      connect: async () => client,
+    })
+
+    await workflow.process("payment.refunded", refundPayload())
+
+    expect(client.voucherStatus).toBe("refunded")
   })
 
   it("REFUNDED voucher cannot be 'redeemed' — state machine rejects ACTIVE re-entry", async () => {

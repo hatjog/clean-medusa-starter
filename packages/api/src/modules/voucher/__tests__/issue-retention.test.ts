@@ -268,7 +268,14 @@ describe("IssueRetentionWorkflow", () => {
     expect(result.event.payload.retention_voucher_template_id).toBeUndefined()
     // policy_snapshot is deep-equal to source but not the same reference
     const next = store.get(result.retention_entitlement_id)
-    expect(next?.policy_snapshot).toEqual(old.policy_snapshot)
+    // v1.15.0 Story 5.9 review-fix (MEDIUM-1): snapshot następcy jest verbatim
+    // WE WSZYSTKIM POZA `voucher_code` — następca dostaje własny, świeżo wydany
+    // kod. Poprzednia asercja („deep-equal") betonowała stan, w którym klientka
+    // dostawała kod przed chwilą unieważniony przez tę samą transakcję.
+    expect(next?.policy_snapshot).toEqual({
+      ...(old.policy_snapshot as Record<string, unknown>),
+      voucher_code: next?.id,
+    })
     expect(next?.policy_snapshot).not.toBe(old.policy_snapshot)
   })
 
@@ -419,7 +426,14 @@ describe("IssueRetentionWorkflow", () => {
       activeEntitlement.entitlement_type
     )
     // policy_snapshot is deep-equal (verbatim fallback) but a distinct object
-    expect(retentionEnt?.policy_snapshot).toEqual(originalPolicy)
+    // v1.15.0 Story 5.9 review-fix (MEDIUM-1): snapshot następcy jest verbatim
+    // WE WSZYSTKIM POZA `voucher_code` — następca dostaje własny, świeżo wydany
+    // kod. Poprzednia asercja („deep-equal") betonowała stan, w którym klientka
+    // dostawała kod przed chwilą unieważniony przez tę samą transakcję.
+    expect(retentionEnt?.policy_snapshot).toEqual({
+      ...(originalPolicy as Record<string, unknown>),
+      voucher_code: retentionEnt?.id,
+    })
     expect(retentionEnt?.policy_snapshot).not.toBe(originalPolicy)
 
     // 3. Idempotent re-trigger: same result, no duplicate, emit called once
