@@ -93,6 +93,8 @@ export interface DispatchIdentity {
 }
 
 export interface ReserveDispatchInput extends DispatchIdentity {
+  env: string
+  instance_id: string
   market_id: string
   flow_id: string
   locale: string
@@ -127,6 +129,8 @@ export interface DispatchRow {
   entitlement_id: string
   template_key: string
   recipient_hash: string
+  env: string
+  instance_id: string
   market_id: string
   flow_id: string
   locale: string
@@ -516,7 +520,7 @@ export class DispatchLedgerError extends Error {
 }
 
 const SELECT_COLUMNS = `
-  dispatch_id, entitlement_id, template_key, recipient_hash, market_id,
+  dispatch_id, entitlement_id, template_key, recipient_hash, env, instance_id, market_id,
   flow_id, locale, status, provider, provider_message_id, error_code, attempt_count,
   first_error_code, first_failed_at, configuration_recovery_count, queued_at,
   provider_status_code, provider_message, provider_error_kind, correlation_token,
@@ -585,6 +589,7 @@ export class PgDispatchLedger
     input: ReserveDispatchInput,
   ): Promise<ReserveDispatchResult> {
     assertRecipientHash(input.recipient_hash)
+    assertMeasurementContext(input)
     // AD-23 (Story 4.4): numer próby nadaje POLITYKA. Typ już go nie ma, ale
     // wejście bywa budowane dynamicznie (payload webhooka 4.2/4.3, `as`) —
     // ciche zignorowanie `attempt_no` wyglądałoby jak skuteczne nadanie numeru.
@@ -595,9 +600,9 @@ export class PgDispatchLedger
 
     const inserted = await this.queryRows<DispatchRow>(
       `INSERT INTO ${VOUCHER_DELIVERY_DISPATCH_TABLE} (
-         dispatch_id, entitlement_id, template_key, recipient_hash, market_id,
-         flow_id, locale, status, attempt_count, queued_at, created_at, updated_at
-       ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'queued', 1, $8, $9, $10)
+         dispatch_id, entitlement_id, template_key, recipient_hash, env, instance_id,
+         market_id, flow_id, locale, status, attempt_count, queued_at, created_at, updated_at
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'queued', 1, $10, $11, $12)
        ON CONFLICT (entitlement_id, template_key, recipient_hash) DO NOTHING
        RETURNING ${SELECT_COLUMNS}`,
       [
@@ -605,6 +610,8 @@ export class PgDispatchLedger
         input.entitlement_id,
         input.template_key,
         input.recipient_hash,
+        input.env,
+        input.instance_id,
         input.market_id,
         input.flow_id,
         input.locale,
@@ -640,6 +647,18 @@ export class PgDispatchLedger
         attempt_count: 0,
         queued_at: null,
       }
+    }
+
+    if (
+      existing.env !== input.env ||
+      existing.instance_id !== input.instance_id ||
+      existing.market_id !== input.market_id
+    ) {
+      throw new DispatchLedgerError(
+        "istniejący wiersz dostawy ma inny env/instance_id/market_id — " +
+          "próba nie może mieszać środowisk (AD-25)",
+        "VOUCHER_DELIVERY_MEASUREMENT_CONTEXT_MISMATCH",
+      )
     }
 
     if (DISPATCH_STATES_BLOCKING_RESEND.includes(existing.status)) {
@@ -856,7 +875,9 @@ export class PgDispatchLedger
     return true
   }
 
-  async findByIdentity(identity: DispatchIdentity): Promise<DispatchRow | null> {
+  async findByIdentity(
+    identity: DispatchIdentity,
+  ): Promise<DispatchRow | null> {
     assertRecipientHash(identity.recipient_hash)
     const rows = await this.queryRows<DispatchRow>(
       `SELECT ${SELECT_COLUMNS}
@@ -949,7 +970,9 @@ export class PgDispatchLedger
     const templatePlaceholders = templateKeys
       .map(() => `($${++position})`)
       .join(", ")
-    const statePlaceholders = sourceStates.map(() => `$${++position}`).join(", ")
+    const statePlaceholders = sourceStates
+      .map(() => `$${++position}`)
+      .join(", ")
     const typePlaceholders = entitlementTypes
       .map(() => `$${++position}`)
       .join(", ")
@@ -1029,7 +1052,10 @@ export class PgDispatchLedger
   async scanStalledDispatches(
     input: ScanStalledDispatchesInput,
   ): Promise<DeliveryGapCandidate[]> {
-    if (input.source_states.length === 0 || input.entitlement_types.length === 0) {
+    if (
+      input.source_states.length === 0 ||
+      input.entitlement_types.length === 0
+    ) {
       throw new DispatchLedgerError(
         "scanStalledDispatches wymaga niepustych zbiorów source_states " +
           "i entitlement_types",
@@ -1057,7 +1083,9 @@ export class PgDispatchLedger
     const retryPlaceholders = retryStates.map(() => `$${++position}`).join(", ")
     const maxAttemptPlaceholder = `$${++position}`
     const maxTotalPlaceholder = `$${++position}`
-    const statePlaceholders = sourceStates.map(() => `$${++position}`).join(", ")
+    const statePlaceholders = sourceStates
+      .map(() => `$${++position}`)
+      .join(", ")
     const typePlaceholders = entitlementTypes
       .map(() => `$${++position}`)
       .join(", ")
@@ -1262,9 +1290,7 @@ export class PgDispatchLedger
       recipient_hash:
         row.recipient_hash == null ? null : String(row.recipient_hash),
       attempt_count: Number(row.attempt_count ?? 0),
-      non_recipient_failure_count: Number(
-        row.non_recipient_failure_count ?? 0,
-      ),
+      non_recipient_failure_count: Number(row.non_recipient_failure_count ?? 0),
       error_code: row.error_code == null ? null : String(row.error_code),
       first_error_code:
         row.first_error_code == null ? null : String(row.first_error_code),
@@ -1349,7 +1375,9 @@ export class PgDispatchLedger
     )
     assertConfigurationRecoveryLimit(input.max_configuration_recoveries)
     const codes = [...input.error_codes]
-    const codePlaceholders = codes.map((_code, index) => `$${index + 5}`).join(", ")
+    const codePlaceholders = codes
+      .map((_code, index) => `$${index + 5}`)
+      .join(", ")
     const nowIso = this.now().toISOString()
     const rows = await this.queryRows<DispatchRow>(
       `UPDATE ${VOUCHER_DELIVERY_DISPATCH_TABLE}
@@ -1418,7 +1446,9 @@ export class PgDispatchLedger
     const entitlementTypes = [...input.entitlement_types]
 
     let position = 0
-    const statePlaceholders = sourceStates.map(() => `$${++position}`).join(", ")
+    const statePlaceholders = sourceStates
+      .map(() => `$${++position}`)
+      .join(", ")
     const typePlaceholders = entitlementTypes
       .map(() => `$${++position}`)
       .join(", ")
@@ -1539,15 +1569,17 @@ export class PgDispatchLedger
   ): Promise<void> {
     await this.queryRows(
       `INSERT INTO ${VOUCHER_DELIVERY_DISPATCH_AUDIT_TABLE} (
-         dispatch_id, entitlement_id, template_key, recipient_hash, market_id,
+         dispatch_id, entitlement_id, template_key, recipient_hash, env, instance_id, market_id,
          from_status, to_status, error_code, attempt_count, occurred_at,
          provider_status_code, provider_message, provider_error_kind
-       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
       [
         row.dispatch_id,
         row.entitlement_id,
         row.template_key,
         row.recipient_hash,
+        row.env,
+        row.instance_id,
         row.market_id,
         fromStatus,
         toStatus,
@@ -1681,6 +1713,8 @@ function normalizeRow(raw: unknown): DispatchRow {
     entitlement_id: String(record.entitlement_id ?? ""),
     template_key: String(record.template_key ?? ""),
     recipient_hash: String(record.recipient_hash ?? ""),
+    env: String(record.env ?? ""),
+    instance_id: String(record.instance_id ?? ""),
     market_id: String(record.market_id ?? ""),
     flow_id: String(record.flow_id ?? ""),
     locale: String(record.locale ?? ""),
@@ -1694,7 +1728,9 @@ function normalizeRow(raw: unknown): DispatchRow {
     first_error_code:
       record.first_error_code == null ? null : String(record.first_error_code),
     first_failed_at: normalizeTimestamp(record.first_failed_at),
-    configuration_recovery_count: Number(record.configuration_recovery_count ?? 0),
+    configuration_recovery_count: Number(
+      record.configuration_recovery_count ?? 0,
+    ),
     // `provider_status_code` jest `integer`, ale sterownik potrafi oddać go
     // jako string — ten sam kształt defektu co ADR-166 R-1 (`numeric` → string,
     // `typeof === "number"` cicho degradowało do fallbacku). Konwertujemy
@@ -1707,7 +1743,9 @@ function normalizeRow(raw: unknown): DispatchRow {
     // zna — `null` znaczy „nie rozpoznano" i to jest uczciwe.
     provider_error_kind: normalizeProviderErrorKind(record.provider_error_kind),
     correlation_token:
-      record.correlation_token == null ? null : String(record.correlation_token),
+      record.correlation_token == null
+        ? null
+        : String(record.correlation_token),
     attempt_count: Number(record.attempt_count ?? 0),
     queued_at: normalizeTimestamp(record.queued_at),
     non_recipient_failure_count: Number(
@@ -1740,8 +1778,7 @@ function normalizeGapCandidate(raw: unknown): DeliveryGapCandidate {
     market_id: record.market_id == null ? null : String(record.market_id),
     entitlement_state: String(record.entitlement_state ?? ""),
     template_key: String(record.template_key ?? ""),
-    dispatch_id:
-      record.dispatch_id == null ? null : String(record.dispatch_id),
+    dispatch_id: record.dispatch_id == null ? null : String(record.dispatch_id),
     dispatch_status: status == null ? null : status,
     queued_at: normalizeTimestamp(record.queued_at),
     attempt_count: Number(record.attempt_count ?? 0),
@@ -1802,7 +1839,10 @@ function assertEscalationWindowStart(createdAfter: string): void {
   }
 }
 
-function assertGapScanWindow(createdAfter: string, createdBefore: string): void {
+function assertGapScanWindow(
+  createdAfter: string,
+  createdBefore: string,
+): void {
   if (!createdAfter || !createdBefore) {
     throw new DispatchLedgerError(
       "skan luk wymaga OBU granic okna (created_after, created_before) — skan " +
@@ -1879,6 +1919,25 @@ function assertNoCallerAttemptNumber(input: object): void {
       `numer próby nadaje polityka, nie wywołujący (AD-23) — wejście niesie: ${carried.join(", ")}`,
       "VOUCHER_DELIVERY_ATTEMPT_NUMBER_NOT_CALLER_OWNED",
     )
+  }
+}
+
+function assertMeasurementContext(
+  input: Pick<ReserveDispatchInput, "env" | "instance_id">,
+): void {
+  for (const field of ["env", "instance_id"] as const) {
+    const value = input[field]
+    if (
+      typeof value !== "string" ||
+      value.trim().length === 0 ||
+      value === "unattributed"
+    ) {
+      throw new DispatchLedgerError(
+        `${field} musi być jawną etykietą kontekstu pomiaru; brak i ` +
+          "unattributed są odmową rezerwacji (AD-25)",
+        "VOUCHER_DELIVERY_MEASUREMENT_CONTEXT_REQUIRED",
+      )
+    }
   }
 }
 

@@ -78,12 +78,18 @@ class FakeDispatchSql implements DispatchLedgerSql {
     const normalized = sql.replace(/\s+/g, " ").trim()
     this.statements.push(normalized)
 
-    if (normalized.includes(`INSERT INTO ${VOUCHER_DELIVERY_DISPATCH_AUDIT_TABLE}`)) {
+    if (
+      normalized.includes(
+        `INSERT INTO ${VOUCHER_DELIVERY_DISPATCH_AUDIT_TABLE}`,
+      )
+    ) {
       const [
         dispatch_id,
         entitlement_id,
         template_key,
         recipient_hash,
+        env,
+        instance_id,
         market_id,
         from_status,
         to_status,
@@ -100,6 +106,8 @@ class FakeDispatchSql implements DispatchLedgerSql {
         entitlement_id,
         template_key,
         recipient_hash,
+        env,
+        instance_id,
         market_id,
         from_status,
         to_status,
@@ -119,6 +127,8 @@ class FakeDispatchSql implements DispatchLedgerSql {
         entitlement_id,
         template_key,
         recipient_hash,
+        env,
+        instance_id,
         market_id,
         flow_id,
         locale,
@@ -134,6 +144,8 @@ class FakeDispatchSql implements DispatchLedgerSql {
         entitlement_id,
         template_key,
         recipient_hash,
+        env,
+        instance_id,
         market_id,
         flow_id,
         locale,
@@ -151,7 +163,8 @@ class FakeDispatchSql implements DispatchLedgerSql {
     }
 
     if (normalized.startsWith(`SELECT`)) {
-      const [entitlement_id, template_key, recipient_hash] = bindings as string[]
+      const [entitlement_id, template_key, recipient_hash] =
+        bindings as string[]
       const row = this.find(entitlement_id, template_key, recipient_hash)
       return { rows: row ? [{ ...row }] : [] }
     }
@@ -180,8 +193,8 @@ class FakeDispatchSql implements DispatchLedgerSql {
           correlation_token: normalized.includes(
             "correlation_token = COALESCE(",
           )
-            ? correlation_token ?? row.correlation_token ?? null
-            : correlation_token ?? null,
+            ? (correlation_token ?? row.correlation_token ?? null)
+            : (correlation_token ?? null),
           error_code: null,
           sent_at: now,
         })
@@ -276,15 +289,52 @@ function identity() {
     entitlement_id: "ent_1",
     template_key: TEMPLATE_KEY,
     recipient_hash: hashRecipientEmail(EMAIL),
+    env: "dev",
+    instance_id: "gp-dev",
     market_id: "bonbeauty",
     flow_id: "voucher_purchase_delivery",
     locale: "pl",
   }
 }
 
+describe("PgDispatchLedger — etykiety środowiska (Story 4.8, AC1)", () => {
+  it.each(["env", "instance_id"] as const)(
+    "odmawia rezerwacji bez niepustego pola %s",
+    async (field) => {
+      const sql = new FakeDispatchSql()
+      const ledger = makeLedger(sql)
+      const input = { ...identity() } as Record<string, unknown>
+      delete input[field]
+
+      await expect(
+        ledger.reserveDispatch(input as never),
+      ).rejects.toMatchObject({
+        error_code: "VOUCHER_DELIVERY_MEASUREMENT_CONTEXT_REQUIRED",
+      })
+      expect(sql.dispatch).toHaveLength(0)
+      expect(sql.audit).toHaveLength(0)
+    },
+  )
+
+  it("zapisuje env i instance_id w podsumowaniu oraz audycie", async () => {
+    const sql = new FakeDispatchSql()
+    const ledger = makeLedger(sql)
+
+    await ledger.reserveDispatch(identity())
+
+    expect(sql.dispatch[0]).toMatchObject({
+      env: "dev",
+      instance_id: "gp-dev",
+    })
+    expect(sql.audit[0]).toMatchObject({ env: "dev", instance_id: "gp-dev" })
+  })
+})
+
 describe("recipient-hash — normalizacja i zero PII (AC1)", () => {
   it("normalizuje trim + lowercase przed hashem", () => {
-    expect(normalizeRecipientEmail("  Ala@Example.COM  ")).toBe("ala@example.com")
+    expect(normalizeRecipientEmail("  Ala@Example.COM  ")).toBe(
+      "ala@example.com",
+    )
   })
 
   it("różne warianty zapisu tego samego adresu dają TEN SAM hash", () => {
@@ -450,7 +500,11 @@ describe("AC5 — ponowienie legalne jest ODRÓŻNIALNE od duplikatu (z DANYCH)"
     const transitions = sql.audit.map(
       (row) => `${String(row.from_status)}→${String(row.to_status)}`,
     )
-    expect(transitions).toEqual(["null→queued", "queued→failed", "failed→queued"])
+    expect(transitions).toEqual([
+      "null→queued",
+      "queued→failed",
+      "failed→queued",
+    ])
   })
 
   it("duplikat kończy się `blocked`/`in_flight` — ZERO nowych tranzycji i zero prób", async () => {
@@ -491,7 +545,9 @@ describe("AC5 — ponowienie legalne jest ODRÓŻNIALNE od duplikatu (z DANYCH)"
 
     // Guard `status IN (...)` w `WHERE` czyni przejęcie retry ATOMOWYM — drugi
     // wołający widzi `in_flight`, a nie drugą próbę.
-    expect(results.filter((r) => r.outcome === "retry_reserved")).toHaveLength(1)
+    expect(results.filter((r) => r.outcome === "retry_reserved")).toHaveLength(
+      1,
+    )
     expect(results.filter((r) => r.outcome === "in_flight")).toHaveLength(1)
     // Jeden inkrement, nie dwa: budżet prób zużyty raz na jedno ponowienie.
     expect(Number(sql.dispatch[0].attempt_count)).toBe(2)
@@ -634,7 +690,9 @@ describe("PgDispatchLedger — tranzycje queued→sent|failed (AC2 / AC5)", () =
     })
 
     expect(sql.dispatch[0].error_code).toBe("BREVO_TEMPLATE_NOT_CONFIGURED")
-    expect(sql.dispatch[0].first_error_code).toBe("BREVO_TEMPLATE_NOT_CONFIGURED")
+    expect(sql.dispatch[0].first_error_code).toBe(
+      "BREVO_TEMPLATE_NOT_CONFIGURED",
+    )
     expect(sql.audit.at(-1)).toMatchObject({
       from_status: "queued",
       to_status: "failed",

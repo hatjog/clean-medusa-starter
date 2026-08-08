@@ -202,6 +202,7 @@ export type PurchaseDeliveryTrigger = {
   entitlement_id: string | null
   to_state: string | null
   from_state: string | null
+  instance_id: string | null
   market_id: string | null
   /**
    * Story 4.4 — cel dosyłki. `null` w ścieżce ZDARZENIOWEJ: subscriber nadal
@@ -311,11 +312,58 @@ export type PurchaseDeliveryResult = {
 /** Która z dwóch wysyłek matrycy AD-7 jest właśnie realizowana. */
 type DispatchKind = "buyer" | "handoff"
 
+type DeliveryMeasurementContext = {
+  env: string
+  instance_id: string
+}
+
+class DeliveryMeasurementContextError extends Error {
+  readonly error_code = "VOUCHER_DELIVERY_MEASUREMENT_CONTEXT_REQUIRED"
+}
+
+function resolveDeliveryMeasurementContext(
+  trigger: Pick<PurchaseDeliveryTrigger, "instance_id">,
+  env: NodeJS.ProcessEnv | undefined,
+): DeliveryMeasurementContext {
+  const configuredInstanceId = nonEmpty(env?.GP_INSTANCE_ID)
+  const instanceId = trigger.instance_id ?? configuredInstanceId
+  const rawEnvironment = nonEmpty(env?.GP_ENV) ?? nonEmpty(env?.NODE_ENV)
+  const normalizedEnvironment =
+    rawEnvironment === "development"
+      ? "dev"
+      : rawEnvironment === "production"
+        ? "prod"
+        : rawEnvironment
+
+  if (!instanceId || !normalizedEnvironment) {
+    throw new DeliveryMeasurementContextError(
+      "env i instance_id muszą pochodzić z jawnego kontekstu wykonania (AD-25)",
+    )
+  }
+  if (
+    configuredInstanceId &&
+    trigger.instance_id !== null &&
+    configuredInstanceId !== trigger.instance_id
+  ) {
+    throw new DeliveryMeasurementContextError(
+      "instance_id koperty nie zgadza się z instancją runtime",
+    )
+  }
+  if (["unknown", "unattributed"].includes(normalizedEnvironment)) {
+    throw new DeliveryMeasurementContextError(
+      "env unknown/unattributed nie może etykietować nowej wysyłki",
+    )
+  }
+
+  return { env: normalizedEnvironment, instance_id: instanceId }
+}
+
 /** Kontekst wspólny dla obu wysyłek — liczony RAZ, nie per szablon. */
 type DispatchAttemptContext = {
   trigger: PurchaseDeliveryTrigger
   entitlementId: string
   marketId: string
+  measurementContext: DeliveryMeasurementContext
   locale: string
   voucherCode: string
   /** Deep-link `/{locale}/voucher/{code}` — jeden dla obu maili (5.7 AC6.5). */
@@ -363,6 +411,7 @@ export function extractPurchaseDeliveryTrigger(
     entitlement_id: nonEmpty(payload?.entitlement_id),
     to_state: nonEmpty(payload?.to_state),
     from_state: nonEmpty(payload?.from_state),
+    instance_id: nonEmpty(scope?.instance_id),
     // `scope.market_id` JEST w kopercie eventu (2.1) — to pierwszy, najtańszy
     // nośnik rynku z danych domenowych (R-2.2-M4 / AC6b).
     market_id: nonEmpty(scope?.market_id),
@@ -406,7 +455,8 @@ function ignoreUntrustedDispatchTarget(
         // Sam klucz szablonu, nigdy `recipient_hash` (nośnik tożsamości odbiorcy).
         target_template_key:
           typeof raw === "object" && raw !== null
-            ? (nonEmpty((raw as { template_key?: unknown }).template_key) ?? null)
+            ? (nonEmpty((raw as { template_key?: unknown }).template_key) ??
+              null)
             : null,
       },
     )
@@ -451,7 +501,8 @@ function isWithinDispatchTarget(
   if (target.template_key !== templateKey) return false
   // Hash porównujemy WYŁĄCZNIE, gdy cel go niesie: sweep go nie zna, a wymaganie
   // go zawsze zamieniłoby dosyłkę kanonicznej luki w odmowę.
-  if (target.recipient_hash && target.recipient_hash !== recipientHash) return false
+  if (target.recipient_hash && target.recipient_hash !== recipientHash)
+    return false
   return true
 }
 
@@ -485,7 +536,10 @@ export async function handleVoucherPurchaseDelivery(
   // Odmowa PRZED jakimkolwiek I/O — dzięki temu „zero wysyłek" znaczy też
   // „zero wierszy ledgera", również na ścieżkach fail-loud konfiguracji.
   const dispatchTarget = trigger.dispatch_target
-  if (dispatchTarget && !TARGETABLE_TEMPLATE_KEYS.has(dispatchTarget.template_key)) {
+  if (
+    dispatchTarget &&
+    !TARGETABLE_TEMPLATE_KEYS.has(dispatchTarget.template_key)
+  ) {
     deps.logger?.warn?.(
       "[voucher-purchase-delivery] odmowa: cel dosyłki spoza matrycy AD-7",
       {
@@ -496,13 +550,7 @@ export async function handleVoucherPurchaseDelivery(
         target_template_key: dispatchTarget.template_key || null,
       },
     )
-    return result(
-      "skipped_dispatch_target_invalid",
-      trigger,
-      null,
-      null,
-      null,
-    )
+    return result("skipped_dispatch_target_invalid", trigger, null, null, null)
   }
 
   let source: PurchaseDeliverySource | null = null
@@ -538,6 +586,33 @@ export async function handleVoucherPurchaseDelivery(
     logger: deps.logger,
     env: deps.env,
   })
+
+  let measurementContext: DeliveryMeasurementContext
+  try {
+    measurementContext = resolveDeliveryMeasurementContext(trigger, deps.env)
+  } catch (error) {
+    const errorCode = readErrorCode(
+      error,
+      "VOUCHER_DELIVERY_MEASUREMENT_CONTEXT_REQUIRED",
+    )
+    deps.logger?.error?.(
+      "[voucher-purchase-delivery] brak jawnego kontekstu pomiaru — wysyłka wstrzymana",
+      {
+        entitlement_id: entitlementId,
+        market_id: marketId,
+        error_code: errorCode,
+      },
+    )
+    return {
+      outcome: "failed",
+      entitlement_id: entitlementId,
+      dispatch_id: null,
+      market_id: marketId,
+      locale: null,
+      error_code: errorCode,
+      handoff: null,
+    }
+  }
 
   const recipientEmail = nonEmpty(source.buyer_email)
   // Review 4.4, finding #1: tożsamość wiersza handoffu na potrzeby wiersza
@@ -613,7 +688,10 @@ export async function handleVoucherPurchaseDelivery(
   //
   // Brak `purchase_locale` (zamówienia historyczne, ścieżki admin/import) NIE
   // jest tym przypadkiem — tam `locales.default` jest legalnym wyborem (AC3).
-  if (marketLocaleRead.degraded && localeResolution.reason === "not_supported_by_market") {
+  if (
+    marketLocaleRead.degraded &&
+    localeResolution.reason === "not_supported_by_market"
+  ) {
     deps.logger?.error?.(
       "[voucher-purchase-delivery] konfiguracja locale rynku niedostępna, a dane domenowe " +
         "niosą inne locale — wysyłka wstrzymana zamiast downgrade'u do locale domyślnego",
@@ -639,6 +717,7 @@ export async function handleVoucherPurchaseDelivery(
           recipientEmail,
           handoffRecipientEmail,
           dispatchTarget,
+          measurementContext,
         },
         deps,
       ),
@@ -665,10 +744,17 @@ export async function handleVoucherPurchaseDelivery(
       voucherCode,
     })
   } catch (error) {
-    const errorCode = readErrorCode(error, "VOUCHER_DELIVERY_STOREFRONT_URL_NOT_CONFIGURED")
+    const errorCode = readErrorCode(
+      error,
+      "VOUCHER_DELIVERY_STOREFRONT_URL_NOT_CONFIGURED",
+    )
     deps.logger?.error?.(
       "[voucher-purchase-delivery] konfiguracja base URL storefrontu niekompletna — wysyłka wstrzymana",
-      { entitlement_id: entitlementId, market_id: marketId, error_code: errorCode },
+      {
+        entitlement_id: entitlementId,
+        market_id: marketId,
+        error_code: errorCode,
+      },
     )
     return {
       outcome: "failed",
@@ -682,6 +768,7 @@ export async function handleVoucherPurchaseDelivery(
           recipientEmail,
           handoffRecipientEmail,
           dispatchTarget,
+          measurementContext,
         },
         deps,
       ),
@@ -733,6 +820,7 @@ export async function handleVoucherPurchaseDelivery(
           recipientEmail,
           handoffRecipientEmail,
           dispatchTarget,
+          measurementContext,
         },
         deps,
       ),
@@ -752,6 +840,7 @@ export async function handleVoucherPurchaseDelivery(
     trigger,
     entitlementId,
     marketId,
+    measurementContext,
     locale,
     voucherCode,
     voucherPageUrl,
@@ -895,8 +984,14 @@ async function runDispatchAttempt(
   context: DispatchAttemptContext,
   deps: PurchaseDeliveryDeps,
 ): Promise<PurchaseDeliveryResult> {
-  const { trigger, entitlementId, marketId, locale, voucherCode, voucherPageUrl } =
-    context
+  const {
+    trigger,
+    entitlementId,
+    marketId,
+    locale,
+    voucherCode,
+    voucherPageUrl,
+  } = context
   const templateKey =
     kind === "buyer"
       ? NOTIFICATION_TEMPLATE_KEYS.VOUCHER_PURCHASE_CONFIRMATION
@@ -960,6 +1055,8 @@ async function runDispatchAttempt(
       entitlement_id: entitlementId,
       template_key: templateKey,
       recipient_hash: recipientHash,
+      env: context.measurementContext.env,
+      instance_id: context.measurementContext.instance_id,
       market_id: marketId,
       flow_id: VOUCHER_PURCHASE_DELIVERY_FLOW_ID,
       locale,
@@ -967,10 +1064,17 @@ async function runDispatchAttempt(
   } catch (error) {
     // Ledger niedostępny → NIE wysyłamy. Wysyłka bez rezerwacji łamie
     // idempotencję (NFR3) w najgorszym możliwym momencie: przy retry.
-    const errorCode = readErrorCode(error, "VOUCHER_DELIVERY_LEDGER_UNAVAILABLE")
+    const errorCode = readErrorCode(
+      error,
+      "VOUCHER_DELIVERY_LEDGER_UNAVAILABLE",
+    )
     deps.logger?.error?.(
       `${tag} rezerwacja w ledgerze nieudana — wysyłka wstrzymana`,
-      { entitlement_id: entitlementId, market_id: marketId, error_code: errorCode },
+      {
+        entitlement_id: entitlementId,
+        market_id: marketId,
+        error_code: errorCode,
+      },
     )
     return {
       outcome: "failed",
@@ -986,12 +1090,15 @@ async function runDispatchAttempt(
   if (reservation.outcome === "blocked") {
     // `sent`/`delivered` blokują BEZWARUNKOWO (AC5) — to jest miejsce, w którym
     // ACTIVE-po-ISSUED przestaje generować drugi mail.
-    deps.logger?.info?.(`${tag} pominięto: wysyłka już zamknięta dla tego klucza`, {
-      entitlement_id: entitlementId,
-      market_id: marketId,
-      to_state: trigger.to_state,
-      dispatch_status: reservation.status,
-    })
+    deps.logger?.info?.(
+      `${tag} pominięto: wysyłka już zamknięta dla tego klucza`,
+      {
+        entitlement_id: entitlementId,
+        market_id: marketId,
+        to_state: trigger.to_state,
+        dispatch_status: reservation.status,
+      },
+    )
     return {
       outcome: "skipped_already_sent",
       entitlement_id: entitlementId,
@@ -1007,7 +1114,10 @@ async function runDispatchAttempt(
     // R-2.3-L9: rezerwacja starsza niż próg to najpewniej wiersz PORZUCONY
     // (crash między INSERT-em a domknięciem), a nie wysyłka w locie. Bez sweepa
     // 2.5 nikt jej nie dogoni, więc utrata maila nie może być `info`.
-    const stale = isStaleQueued(reservation.queued_at, deps.now?.() ?? new Date())
+    const stale = isStaleQueued(
+      reservation.queued_at,
+      deps.now?.() ?? new Date(),
+    )
     const meta = {
       entitlement_id: entitlementId,
       market_id: marketId,
@@ -1044,10 +1154,13 @@ async function runDispatchAttempt(
   if (!dispatchId) {
     // Rezerwacja bez identyfikatora jest niedomykalna (nie da się przejść
     // queued→sent), więc traktujemy to jak awarię, nie jak sukces.
-    deps.logger?.error?.(`${tag} rezerwacja bez dispatch_id — wysyłka wstrzymana`, {
-      entitlement_id: entitlementId,
-      market_id: marketId,
-    })
+    deps.logger?.error?.(
+      `${tag} rezerwacja bez dispatch_id — wysyłka wstrzymana`,
+      {
+        entitlement_id: entitlementId,
+        market_id: marketId,
+      },
+    )
     return {
       outcome: "failed",
       entitlement_id: entitlementId,
@@ -1099,7 +1212,11 @@ async function runDispatchAttempt(
       deps.logger?.warn?.(
         `${tag} mail wysłany, ale tranzycja queued→sent nie zaskoczyła ` +
           "(wiersz zmieniony współbieżnie)",
-        { entitlement_id: entitlementId, market_id: marketId, dispatch_id: dispatchId },
+        {
+          entitlement_id: entitlementId,
+          market_id: marketId,
+          dispatch_id: dispatchId,
+        },
       )
     }
 
@@ -1146,12 +1263,15 @@ async function runDispatchAttempt(
         provider_message: providerResponse.message,
       })
     } catch (ledgerError) {
-      deps.logger?.error?.(`${tag} nie udało się zapisać stanu failed w ledgerze`, {
-        entitlement_id: entitlementId,
-        market_id: marketId,
-        dispatch_id: dispatchId,
-        error_class: errorClass(ledgerError),
-      })
+      deps.logger?.error?.(
+        `${tag} nie udało się zapisać stanu failed w ledgerze`,
+        {
+          entitlement_id: entitlementId,
+          market_id: marketId,
+          dispatch_id: dispatchId,
+          error_class: errorClass(ledgerError),
+        },
+      )
     }
 
     deps.logger?.warn?.(`${tag} wysyłka nieudana`, {
@@ -1191,7 +1311,10 @@ export default async function voucherPurchaseDeliverySubscriber({
       ContainerRegistrationKeys.PG_CONNECTION,
     ) as DispatchLedgerSql & MarketLocalesSql
     const notificationModule = container.resolve(Modules.NOTIFICATION) as {
-      createNotifications?: (data: unknown, ...rest: unknown[]) => Promise<unknown>
+      createNotifications?: (
+        data: unknown,
+        ...rest: unknown[]
+      ) => Promise<unknown>
       send?: (data: unknown, ...rest: unknown[]) => Promise<unknown>
     }
 
@@ -1209,6 +1332,7 @@ export default async function voucherPurchaseDeliverySubscriber({
       },
       marketLocales: createMarketLocalesReader(sql, logger),
       logger,
+      env: process.env,
     }
   } catch (error) {
     // Brak zależności w kontenerze (np. moduł Notification niezarejestrowany)
@@ -1286,6 +1410,7 @@ async function recordPreflightConfigurationFailure(
     handoffRecipientEmail: string | null
     /** Story 4.4 — cel dosyłki; wiersz ograniczający też jest wysyłką co do celu. */
     dispatchTarget: DispatchTarget | null
+    measurementContext: DeliveryMeasurementContext
   },
   deps: PurchaseDeliveryDeps,
 ): Promise<string | null> {
@@ -1332,6 +1457,8 @@ async function recordPreflightConfigurationFailure(
       entitlement_id: input.entitlementId,
       template_key: templateKey,
       recipient_hash: recipientHash,
+      env: input.measurementContext.env,
+      instance_id: input.measurementContext.instance_id,
       market_id: input.marketId,
       flow_id: VOUCHER_PURCHASE_DELIVERY_FLOW_ID,
       locale: input.locale,
@@ -1421,7 +1548,10 @@ function readErrorCode(error: unknown, fallback: string): string {
   const record = error as Record<string, unknown>
   for (const key of ["error_code", "code"] as const) {
     const candidate = record[key]
-    if (typeof candidate === "string" && /^[A-Z0-9_]+$/.test(candidate.trim())) {
+    if (
+      typeof candidate === "string" &&
+      /^[A-Z0-9_]+$/.test(candidate.trim())
+    ) {
       return candidate.trim()
     }
   }
@@ -1450,9 +1580,7 @@ function readProviderResponse(error: unknown): {
   message: string | null
 } {
   const record =
-    error && typeof error === "object"
-      ? (error as Record<string, unknown>)
-      : {}
+    error && typeof error === "object" ? (error as Record<string, unknown>) : {}
 
   const directStatus = record.status_code
   const statusCode =
@@ -1535,7 +1663,9 @@ function resolveLogger(
   container: SubscriberArgs<unknown>["container"],
 ): LoggerLike {
   try {
-    return (container.resolve as unknown as (key: string) => LoggerLike)("logger")
+    return (container.resolve as unknown as (key: string) => LoggerLike)(
+      "logger",
+    )
   } catch {
     return console
   }

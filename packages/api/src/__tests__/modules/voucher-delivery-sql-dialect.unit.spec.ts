@@ -21,7 +21,10 @@
 import { knex, type Knex } from "knex"
 
 import { createMarketLocalesReader } from "../../lib/read-market-locales"
-import { toKnexPositionalSql, SqlDialectError } from "../../lib/knex-positional-sql"
+import {
+  toKnexPositionalSql,
+  SqlDialectError,
+} from "../../lib/knex-positional-sql"
 import {
   PgDispatchLedger,
   VOUCHER_DELIVERY_DISPATCH_TABLE,
@@ -39,6 +42,8 @@ function baseRow(status: string): Record<string, unknown> {
     entitlement_id: "ent_1",
     template_key: "voucher_purchase_confirmation",
     recipient_hash: RECIPIENT_HASH,
+    env: "test",
+    instance_id: "gp-test",
     market_id: "bonbeauty",
     flow_id: "voucher_purchase_delivery",
     locale: "pl",
@@ -93,6 +98,8 @@ async function recordLedgerCalls(): Promise<Call[]> {
     entitlement_id: "ent_1",
     template_key: "voucher_purchase_confirmation",
     recipient_hash: RECIPIENT_HASH,
+    env: "test",
+    instance_id: "gp-test",
     market_id: "bonbeauty",
     flow_id: "voucher_purchase_delivery",
     locale: "pl",
@@ -215,7 +222,9 @@ async function recordSweepScanCalls(): Promise<Call[]> {
   })
   calls.push(...parked.calls)
 
-  const parkedCount = new RecordingSql(() => [{ market_id: "bonbeauty", parked: 1 }])
+  const parkedCount = new RecordingSql(() => [
+    { market_id: "bonbeauty", parked: 1 },
+  ])
   await new PgDispatchLedger(parkedCount).countParkedDispatchesByMarket({
     max_attempt_count: 5,
     max_total_attempt_count: 40,
@@ -243,7 +252,9 @@ async function recordSweepScanCalls(): Promise<Call[]> {
   calls.push(...releaseClaims.calls)
 
   const historicalRelease = new RecordingSql(() => [])
-  await new PgDispatchLedger(historicalRelease).releaseParkedConfigurationFailureBudgets({
+  await new PgDispatchLedger(
+    historicalRelease,
+  ).releaseParkedConfigurationFailureBudgets({
     max_attempt_count: 5,
     // review-fix cyklu 1 (M1): odparkowanie zna OBIE granice parkowania.
     max_total_attempt_count: 40,
@@ -350,7 +361,9 @@ describe("Story 2.5 — SQL sweepa jest wykonywalny przez REALNY formatter Knexa
 
     it("skan stalled wchodzi przez LEDGER i respektuje próg prób", () => {
       const stalled = calls.find((call) =>
-        call.sql.includes("JOIN entitlement_instance e ON e.id = d.entitlement_id"),
+        call.sql.includes(
+          "JOIN entitlement_instance e ON e.id = d.entitlement_id",
+        ),
       )
       expect(stalled).toBeDefined()
       const sql = (stalled as Call).sql.replace(/\s+/g, " ")
@@ -391,10 +404,14 @@ describe("Story 2.5 — SQL sweepa jest wykonywalny przez REALNY formatter Knexa
     })
 
     it("odparkowanie historycznej awarii używa trwałej pierwszej przyczyny", () => {
-      const release = calls.find((call) => call.sql.includes("SET attempt_count = LEAST"))
+      const release = calls.find((call) =>
+        call.sql.includes("SET attempt_count = LEAST"),
+      )
       expect(release).toBeDefined()
       const sql = (release as Call).sql.replace(/\s+/g, " ")
-      expect(sql).toContain("AND error_code = 'VOUCHER_DELIVERY_DISPATCH_FAILED'")
+      expect(sql).toContain(
+        "AND error_code = 'VOUCHER_DELIVERY_DISPATCH_FAILED'",
+      )
       expect(sql).toContain("AND first_error_code IS NOT NULL")
       expect(sql).toContain("first_error_code LIKE '%\\_NOT\\_CONFIGURED'")
       expect(sql).toContain("AND configuration_recovery_count < ?")
@@ -406,9 +423,7 @@ describe("Story 2.5 — SQL sweepa jest wykonywalny przez REALNY formatter Knexa
       //  2. próg parkowania pochodzi ze WSPÓLNEJ definicji, nie z piątej,
       //     rozpisanej tu kopii `attempt_count >= max_attempt_count`.
       expect(sql).toContain("AND non_recipient_failure_count = 0")
-      expect(sql).toContain(
-        "attempt_count - non_recipient_failure_count >= ?",
-      )
+      expect(sql).toContain("attempt_count - non_recipient_failure_count >= ?")
       expect(sql).not.toMatch(/AND attempt_count >= \?/)
     })
   })
@@ -427,7 +442,9 @@ describe("Story 2.5 — SQL sweepa jest wykonywalny przez REALNY formatter Knexa
 
 describe("R-2.3-H1 — reader locale rynku używa tego samego dialektu", () => {
   it("SELECT z `market_runtime_config` przechodzi przez formatter Knexa", async () => {
-    const recorder = new RecordingSql(() => [{ locales: { default: "pl", supported: ["pl"] } }])
+    const recorder = new RecordingSql(() => [
+      { locales: { default: "pl", supported: ["pl"] } },
+    ])
     const read = await createMarketLocalesReader(recorder).read("bonbeauty")
 
     expect(read.degraded).toBe(false)
@@ -439,18 +456,18 @@ describe("R-2.3-H1 — reader locale rynku używa tego samego dialektu", () => {
 
 describe("toKnexPositionalSql — guardy kształtów, które Knex cicho przekłamuje", () => {
   it("zamienia `$N` na `?` w kolejności WYSTĄPIEŃ (powtórzony `$8` = trzy bindingi)", () => {
-    const { text, bindings } = toKnexPositionalSql(
-      "VALUES ($1, $2, $2, $2)",
-      ["a", "b"],
-    )
+    const { text, bindings } = toKnexPositionalSql("VALUES ($1, $2, $2, $2)", [
+      "a",
+      "b",
+    ])
     expect(text).toBe("VALUES (?, ?, ?, ?)")
     expect(bindings).toEqual(["a", "b", "b", "b"])
   })
 
   it("odrzuca binding tablicowy (Knex rozwinąłby go w listę `?, ?`)", () => {
-    expect(() => toKnexPositionalSql("WHERE status = ANY($1)", [["failed"]])).toThrow(
-      SqlDialectError,
-    )
+    expect(() =>
+      toKnexPositionalSql("WHERE status = ANY($1)", [["failed"]]),
+    ).toThrow(SqlDialectError)
   })
 
   it("odrzuca mieszanie dialektów (`?` w wejściowym SQL-u)", () => {
@@ -460,6 +477,8 @@ describe("toKnexPositionalSql — guardy kształtów, które Knex cicho przekła
   })
 
   it("odrzuca placeholder bez wartości (literówka `$7` przy 6 wartościach)", () => {
-    expect(() => toKnexPositionalSql("VALUES ($1, $7)", ["a"])).toThrow(SqlDialectError)
+    expect(() => toKnexPositionalSql("VALUES ($1, $7)", ["a"])).toThrow(
+      SqlDialectError,
+    )
   })
 })

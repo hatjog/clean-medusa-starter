@@ -108,7 +108,10 @@ function makeCountingSql(): DispatchLedgerSql & { statements: string[] } {
  * czerwieniłaby się na deklaracji typu, a to nie jest drugi próg.
  */
 function normalizeToken(raw: string): string {
-  return raw.split(";")[0].replace(/[}\s]+$/, "").trim()
+  return raw
+    .split(";")[0]
+    .replace(/[}\s]+$/, "")
+    .trim()
 }
 
 describe("AC4 — budżet prób ma JEDEN nośnik po stronie polityki", () => {
@@ -148,7 +151,9 @@ describe("AC4 — budżet prób ma JEDEN nośnik po stronie polityki", () => {
       // kotwicy na granicy słowa sufit wpadałby także do zbioru budżetów i oba
       // pomiary mówiłyby o jednym polu. Kotwica jest częścią pomiaru, nie
       // kosmetyką.
-      for (const match of source.matchAll(/(?<![\w.])max_attempt_count:\s*([^,\n]+)/g)) {
+      for (const match of source.matchAll(
+        /(?<![\w.])max_attempt_count:\s*([^,\n]+)/g,
+      )) {
         injectedBudgets.push({ file, value: normalizeToken(match[1]) })
       }
       for (const match of source.matchAll(
@@ -196,14 +201,20 @@ describe("AC4 — budżet prób ma JEDEN nośnik po stronie polityki", () => {
     // powstał drugi próg.
     const budgetOffenders = injectedBudgets
       .filter((entry) => !ALLOWED_BUDGET_TOKENS.has(entry.value))
-      .map((entry) => `${entry.file.replace(API_SRC_ROOT, "src")}: ${entry.value}`)
+      .map(
+        (entry) => `${entry.file.replace(API_SRC_ROOT, "src")}: ${entry.value}`,
+      )
     const recoveryOffenders = injectedRecoveries
       .filter((entry) => !ALLOWED_RECOVERY_TOKENS.has(entry.value))
-      .map((entry) => `${entry.file.replace(API_SRC_ROOT, "src")}: ${entry.value}`)
+      .map(
+        (entry) => `${entry.file.replace(API_SRC_ROOT, "src")}: ${entry.value}`,
+      )
 
     const ceilingOffenders = injectedCeilings
       .filter((entry) => !ALLOWED_CEILING_TOKENS.has(entry.value))
-      .map((entry) => `${entry.file.replace(API_SRC_ROOT, "src")}: ${entry.value}`)
+      .map(
+        (entry) => `${entry.file.replace(API_SRC_ROOT, "src")}: ${entry.value}`,
+      )
 
     expect(budgetOffenders).toEqual([])
     expect(recoveryOffenders).toEqual([])
@@ -228,9 +239,11 @@ describe("AC4 — budżet prób ma JEDEN nośnik po stronie polityki", () => {
     expect(injected).toEqual(["3"])
     expect(
       injected.every((value) =>
-        ["SWEEP_MAX_ATTEMPT_COUNT", "VOUCHER_DELIVERY_MAX_ATTEMPT_COUNT", "number"].includes(
-          value,
-        ),
+        [
+          "SWEEP_MAX_ATTEMPT_COUNT",
+          "VOUCHER_DELIVERY_MAX_ATTEMPT_COUNT",
+          "number",
+        ].includes(value),
       ),
     ).toBe(false)
   })
@@ -239,7 +252,9 @@ describe("AC4 — budżet prób ma JEDEN nośnik po stronie polityki", () => {
     // Bez tej asercji pomyłka w ścieżce zamieniłaby bramkę w zawsze-zieloną.
     expect(PRODUCTION_SOURCES.length).toBeGreaterThan(50)
     expect(PRODUCTION_SOURCES).toContain(SWEEP_SOURCE_PATH)
-    expect(PRODUCTION_SOURCES.every((file) => !file.includes("__tests__"))).toBe(true)
+    expect(
+      PRODUCTION_SOURCES.every((file) => !file.includes("__tests__")),
+    ).toBe(true)
   })
 
   it("job nie definiuje progu — przypisanie literału do stałej progu jest RED", () => {
@@ -260,6 +275,8 @@ describe("AC4 — numer próby nadaje ledger, nie wywołujący (dowód z wykonan
     entitlement_id: "entinst_4_4_policy",
     template_key: "voucher_purchase_confirmation",
     recipient_hash: RECIPIENT_HASH as never,
+    env: "test",
+    instance_id: "gp-test",
     market_id: "bonbeauty",
     flow_id: "voucher-purchase-delivery",
     locale: "pl",

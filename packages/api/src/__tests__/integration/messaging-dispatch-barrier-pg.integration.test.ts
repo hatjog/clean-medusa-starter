@@ -576,6 +576,8 @@ runOrSkip("Story 4.1 — bariera dostawy na REALNYM Postgresie (knex.raw)", () =
         entitlement_id: "entitlement-1",
         template_key: "voucher_purchase_confirmation",
         recipient_hash: hashRecipientEmail("marta@example.com"),
+        env: "test",
+        instance_id: "gp-test",
         market_id: "bonbeauty",
         flow_id: "voucher_purchase_delivery",
         locale: "pl-PL",
