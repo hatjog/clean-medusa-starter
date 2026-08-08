@@ -18,6 +18,7 @@ import {
 import {
   VOUCHER_BACKED_ENTITLEMENT_TYPES,
   invalidateVoucherCode,
+  type VoucherCodeInvalidationOutcome,
 } from "../../modules/voucher/voucher-code-state"
 // v1.15.0 Story 5.9 review-fix cyklu 2 (C2-HIGH-1): most kod → uprawnienie
 // POWSTAJE przy wystawieniu, także na ścieżce `payment.captured`. Nośnik kodu
@@ -97,6 +98,71 @@ export class MissingEntitlementProfileError extends Error {
 }
 
 /**
+ * v1.15.0 Story 5.9 review-fix cyklu 3 (REG-HIGH-2) — RODZINA „wystawienie
+ * kodu zablokowane danymi", nie kolejna warstwa fail-loudu.
+ *
+ * ── Co zmierzono ───────────────────────────────────────────────────────────
+ * Cykl 2 dołożył na ścieżce `payment.captured` wołanie
+ * `issueVoucherCodeWithinTx`, które jest fail-loud na braku któregokolwiek
+ * z `seller_id`/`seller_name`/`seller_handle`/`product_title`. Jedynym źródłem
+ * tych pól są LEFT JOIN-y (`VOUCHER_LINE_CONTEXT_JOINS`), a LEFT JOIN na
+ * produkcie bez aktywnego `product_product_seller_seller` daje `null`, a nie
+ * brak wiersza — czyli trafia prosto w rzut. Ścieżka ta PRZED cyklem 2
+ * przechodziła.
+ *
+ * PEŁNA LISTA WOŁAJĄCYCH (`grep -rn "issueEntitlementsForAllLineItems"`,
+ * bez testów) i co każdy z nich robił z takim rzutem PRZED tym fixem:
+ *
+ *   1. `workflows/payment/stripe-payment-audit.ts:253` — wołanie leży w
+ *      transakcji audytu webhooka, a `catch` przepuszczał dalej wszystko poza
+ *      `MissingEntitlementProfileError`. Rzut wywracał CAŁĄ transakcję: brak
+ *      uprawnienia, brak wiersza audytu/dedupe, więc Stripe ponawiał w kółko,
+ *      a każde ponowienie wywracało się identycznie.
+ *   2. `subscribers/on-order-placed-stripe-retry.ts:275` — `catch` obsługiwał
+ *      WYŁĄCZNIE `MissingEntitlementProfileError`; każdy inny wyjątek uciekał
+ *      z `withTransaction`, `markDeferredResolved` nigdy się nie wykonywało,
+ *      więc odroczone przechwycenie zostawało w kolejce i było odtwarzane bez
+ *      końca.
+ *
+ * Trzeci potencjalny wołający, `issueEntitlementWithinPaymentTransaction`
+ * (linia 155), deleguje do `issueEntitlementsForAllLineItems` i ma jedno
+ * wywołanie produkcyjne (`issue-entitlement.ts:933`), czyli dziedziczy
+ * zachowanie wołających (1) i (2) — nie jest osobnym przypadkiem.
+ *
+ * ── Czego ten fix NIE robi ─────────────────────────────────────────────────
+ * NIE bramkuje wołania i NIE wystawia uprawnienia bez kodu: to przywróciłoby
+ * defekt sedna story (wiersz, którego zwrot nie unieważni, SM-7 > 0).
+ * Fail-closed ZOSTAJE. Zmienia się wyłącznie jego ZASIĘG RAŻENIA — z „wywróć
+ * transakcję webhooka i pętl się w nieskończoność" na „nazwij powód, utrwal go
+ * w kopercie audytu, nie wystawiaj". To jest DOKŁADNIE kształt, który ten plik
+ * stosuje już dla `MissingEntitlementProfileError`; rodzina istnieje po to,
+ * żeby oba wołające miejsca obsługiwały jeden warunek zamiast listy nazw.
+ *
+ * Wspólna nadklasa jest tu nośnikiem kontraktu: dopisanie kolejnego powodu
+ * zablokowania wystawienia NIE wymaga edycji dwóch `catch`-ów — a to właśnie
+ * rozjazd między rzutem a jego obsługą zrodził ten finding.
+ */
+export abstract class VoucherIssuanceBlockedError extends Error {
+  readonly order_id: string
+  readonly line_item_id: string | null
+  /** Krótki, stabilny dyskryminator do kopert audytu i logów. */
+  readonly reason: string
+  protected constructor(
+    message: string,
+    name: string,
+    reason: string,
+    orderId: string,
+    lineItemId: string | null
+  ) {
+    super(message)
+    this.name = name
+    this.reason = reason
+    this.order_id = orderId
+    this.line_item_id = lineItemId
+  }
+}
+
+/**
  * v1.15.0 Story 5.9 review-fix cyklu 2 (C2-HIGH-1).
  *
  * Uprawnienie typu voucherowego wystawiane bez rynku, z którego da się
@@ -104,21 +170,94 @@ export class MissingEntitlementProfileError extends Error {
  * bez mostu do kodu jest wierszem, którego ZWROT nie da się unieważnić —
  * czyli dokładnie defekt, który ta story usuwa, tyle że przesunięty z fazy
  * zwrotu do fazy wystawienia, gdzie nikt go już nie łączy z 5.9.
+ *
+ * review-fix cyklu 3 (REG-LOW-2): wciągnięty do rodziny
+ * {@link VoucherIssuanceBlockedError}. Soczewka regresji słusznie zauważyła, że
+ * `IssueEntitlementInput.market_id` jest w typie OPCJONALNE, a obaj produkcyjni
+ * wołający podają je przelotowo z danych, których nie kontrolują (`payload.market_id`
+ * z webhooka, `row.market_id` z odroczonego wiersza audytu). Rzut zostaje —
+ * wiersz bez rynku jest niezapisywalny pod RLS i nieunieważnialny przy zwrocie —
+ * ale przestaje być nieobsłużonym wyjątkiem u obu wołających.
  */
-export class MissingVoucherIssuanceMarketError extends Error {
-  readonly order_id: string
-  readonly line_item_id: string | null
+export class MissingVoucherIssuanceMarketError extends VoucherIssuanceBlockedError {
   constructor(orderId: string, lineItemId: string | null, type: string) {
     super(
       `issueSingleEntitlementRow: uprawnienie typu ${type} (order ${orderId}, ` +
         `linia ${lineItemId ?? "brak"}) jest voucher-backed, ale payload nie niesie ` +
         "`market_id` — kodu vouchera nie da się wyprowadzić, a wiersz bez kodu " +
         "byłby uprawnieniem, którego zwrot NIE unieważni (SM-7). Fail-closed " +
-        "PRZED zapisem."
+        "PRZED zapisem.",
+      "MissingVoucherIssuanceMarketError",
+      "missing_market",
+      orderId,
+      lineItemId
     )
-    this.name = "MissingVoucherIssuanceMarketError"
-    this.order_id = orderId
-    this.line_item_id = lineItemId
+  }
+}
+
+/**
+ * v1.15.0 Story 5.9 review-fix cyklu 3 (REG-HIGH-2).
+ *
+ * Linia voucherowa, dla której nie da się ustalić salonu ani tytułu usługi —
+ * produkt bez aktywnego `product_product_seller_seller` albo sprzedawca bez
+ * `handle`. Kolumny `voucher.*` są NOT NULL, a kod bez salonu jest kodem,
+ * którego nikt nie zrealizuje.
+ *
+ * Rzucany PRZED `INSERT INTO entitlement_instance`, nie po nim: to jest różnica
+ * między „nie wystawiliśmy nic" a „wystawiliśmy uprawnienie bez kodu", czyli
+ * między odmową a defektem SM-7. Producent (`issueVoucherCodeWithinTx`) ma ten
+ * sam zestaw kontroli i ZOSTAJE — jest ostatnią barierą dla Path Y i dla
+ * przyszłych wołających; tutaj wyprzedzamy go, żeby rzut nie zostawiał po sobie
+ * połowicznego zapisu.
+ */
+export class MissingVoucherLineContextError extends VoucherIssuanceBlockedError {
+  readonly missing_fields: readonly string[]
+  constructor(orderId: string, lineItemId: string | null, missing: readonly string[]) {
+    super(
+      `issueSingleEntitlementRow: linia voucherowa (order ${orderId}, linia ` +
+        `${lineItemId ?? "brak"}) nie ma wymaganych danych [${missing.join(", ")}]. ` +
+        "Kolumny `voucher.*` są NOT NULL, a kod bez salonu jest kodem, którego " +
+        "kosmetolożka nie zrealizuje, i mailem z pustym salonem do kupującej. " +
+        "Fail-closed PRZED zapisem uprawnienia — wiersz bez kodu byłby " +
+        "uprawnieniem, którego zwrot NIE unieważni (SM-7).",
+      "MissingVoucherLineContextError",
+      "missing_line_context",
+      orderId,
+      lineItemId
+    )
+    this.missing_fields = missing
+  }
+}
+
+/**
+ * v1.15.0 Story 5.9 review-fix cyklu 3 (REG-MEDIUM-1).
+ *
+ * Ścieżka direct-payload bez `line_item_id` na zamówieniu WIELOPOZYCYJNYM.
+ * Do tego fixu `resolveVoucherLineContext` pomijał wtedy predykat linii
+ * i kończył zapytanie `ORDER BY oi.created_at ASC LIMIT 1`, czyli brał
+ * DOWOLNĄ (pierwszą chronologicznie) linię — a jej `seller_id` szedł prosto
+ * do `INSERT INTO voucher`.
+ *
+ * Koszt nie był kosmetyczny: `claimVoucherCode` zawęża realizację po najemcy
+ * (`AND seller_id = $N`), więc właściwy salon kodu BY NIE ZREALIZOWAŁ,
+ * a obcy salon zobaczyłby go u siebie; `voucher.seller_name` i `product_title`
+ * idą dodatkowo do maila do kupującej. Zgadywanie najemcy jest gorsze niż
+ * odmowa wystawienia.
+ */
+export class AmbiguousVoucherLineError extends VoucherIssuanceBlockedError {
+  constructor(orderId: string) {
+    super(
+      `resolveVoucherLineContext: zamówienie ${orderId} ma więcej niż jedną ` +
+        "pozycję, a payload nie wskazuje `line_item_id` — nie da się ustalić, " +
+        "do której linii (a więc do którego SALONU) należy kod vouchera. " +
+        "Wybranie pierwszej chronologicznie przypisałoby kod cudzemu " +
+        "sprzedawcy: trasa realizacji zawęża po `seller_id`, więc właściwy " +
+        "salon by go nie zrealizował. Fail-closed zamiast zgadywania.",
+      "AmbiguousVoucherLineError",
+      "ambiguous_line",
+      orderId,
+      null
+    )
   }
 }
 
@@ -348,7 +487,15 @@ async function resolveVoucherLineContext(
     params.push(lineItemId)
     linePredicate = ` AND oli.id = $${params.length}`
   }
-  const row = await client.query<VoucherLineContext>(
+  // review-fix cyklu 3 (REG-MEDIUM-1): `LIMIT 2`, nie `LIMIT 1`.
+  //
+  // Przy WSKAZANEJ linii `oli.id` jest kluczem głównym, więc drugi wiersz nie
+  // powstanie i limit jest bez znaczenia. Przy linii NIEWSKAZANEJ drugi wiersz
+  // jest JEDYNYM sygnałem, że wybór „pierwsza chronologicznie" byłby
+  // zgadywaniem najemcy — a `LIMIT 1` ten sygnał USUWAŁ, zanim ktokolwiek
+  // mógł go zobaczyć. Zapytanie musi zwrócić dowód niejednoznaczności, żeby
+  // wołający miał na czym oprzeć odmowę.
+  const rows = await client.query<VoucherLineContext>(
     `SELECT ${VOUCHER_LINE_CONTEXT_COLUMNS}
        FROM order_item oi
        JOIN order_line_item oli ON oli.id = oi.item_id
@@ -357,10 +504,37 @@ async function resolveVoucherLineContext(
         AND oi.deleted_at IS NULL
         AND oli.deleted_at IS NULL
       ORDER BY oi.created_at ASC
-      LIMIT 1`,
+      LIMIT 2`,
     params
   )
-  return row.rows[0] ?? null
+  if (!lineItemId && rows.rows.length > 1) {
+    throw new AmbiguousVoucherLineError(orderId)
+  }
+  return rows.rows[0] ?? null
+}
+
+/**
+ * Pola `voucher.*`, które są NOT NULL — jeden zestaw dla kontroli wyprzedzającej
+ * tutaj i dla fail-loudu producenta (`issueVoucherCodeWithinTx`). Dwie listy
+ * rozjechałyby się cicho, a wtedy kontrola wyprzedzająca przepuszczałaby wiersz,
+ * na którym producent i tak by się wywrócił — czyli dokładnie ten połowiczny
+ * zapis, którego ten fix unika.
+ */
+function missingVoucherLineFields(
+  ctx: VoucherLineContext | null
+): readonly string[] {
+  const isBlank = (v: string | null | undefined) =>
+    typeof v !== "string" || v.trim().length === 0
+  return (
+    [
+      ["seller_id", ctx?.seller_id],
+      ["seller_name", ctx?.seller_name],
+      ["seller_handle", ctx?.seller_handle],
+      ["product_title", ctx?.line_title],
+    ] as const
+  )
+    .filter(([, value]) => isBlank(value))
+    .map(([field]) => field)
 }
 
 async function issueSingleEntitlementRow(
@@ -454,6 +628,24 @@ async function issueSingleEntitlementRow(
       `${payload.order_id}:${lineItemId ?? "_"}`,
       marketId
     )
+    // review-fix cyklu 3 (REG-HIGH-2): kontrola danych salonu WYPRZEDZA
+    // `INSERT INTO entitlement_instance`.
+    //
+    // Do tego fixu ten sam warunek sprawdzał dopiero producent kodu, wołany
+    // PO wstawieniu uprawnienia — więc rzut zostawiał w transakcji wiersz
+    // uprawnienia bez kodu i wywracał ją w całości u wołającego. Przesunięcie
+    // kontroli przed pierwszy zapis sprawia, że odmowa nie ma czego cofać:
+    // dla tej linii nie powstaje NIC, a wołający dostaje nazwany powód
+    // (`VoucherIssuanceBlockedError`) zamiast anonimowego `Error`, którego
+    // oba `catch`-e przepuszczały dalej.
+    const missing = missingVoucherLineFields(lineContext)
+    if (missing.length > 0) {
+      throw new MissingVoucherLineContextError(
+        payload.order_id,
+        lineItemId,
+        missing
+      )
+    }
   }
 
   const snapshot = snapshotPolicy({
@@ -639,8 +831,8 @@ function readObject(value: unknown): Record<string, unknown> | undefined {
 export async function compensateIssuedEntitlement(
   client: PgClient,
   result: IssueEntitlementResult | undefined
-): Promise<void> {
-  if (!result || result.idempotent) return
+): Promise<VoucherCodeInvalidationOutcome | null> {
+  if (!result || result.idempotent) return null
   // CC-1 F-CC1-016 fix (v1.9.0 wf5): transition to VOIDED instead of hard
   // DELETE. The compensation path runs on workflow rollback (insert→entitlement
   // failed → rollback both). Replacing DELETE with state transition preserves
@@ -675,16 +867,23 @@ export async function compensateIssuedEntitlement(
   // tym samym zbiorem co ścieżka zwrotu — `RETURNING entitlement_type` bierze
   // typ z wiersza, który TA transakcja właśnie przestawiła, więc nie ma tu
   // drugiego zapytania ani drugiego źródła prawdy.
+  // review-fix cyklu 3 (REG-LOW-1): wynik producenta jest ZWRACANY, nie
+  // odrzucany. Ta funkcja nie ma loggera ani koperty audytu, więc jedynym
+  // uczciwym nośnikiem jest wartość zwracana — wołający, który zechce ją
+  // odnotować, ma co odnotować, a test ma co zaasertować na ścieżce
+  // produkcyjnej zamiast wyłącznie w testach samego producenta.
   if (
     (voided.rowCount ?? 0) > 0 &&
     isVoucherBackedType(voided.rows[0]?.entitlement_type)
   ) {
-    await invalidateVoucherCode(client, {
+    const invalidation = await invalidateVoucherCode(client, {
       entitlement_id: result.entitlement_id,
       to_state: EntitlementInstanceState.VOIDED,
       now: new Date(),
     })
+    return invalidation.outcome
   }
+  return null
 }
 
 /**
@@ -720,6 +919,20 @@ export type RefundEntitlementRevocationResult = {
    * pominięcia jest zwracany i asertowany, nie przemilczany.
    */
   code_invalidation_skipped_entitlement_ids: string[]
+  /**
+   * v1.15.0 Story 5.9 review-fix cyklu 3 (REG-LOW-1): wynik producenta stanu
+   * kodu dla KAZDEGO wiersza voucherowego, ktory przeszedl przez zwrot.
+   *
+   * Producent rozroznia piec wynikow i opisuje to jako "wynik NAZWANY, nie
+   * przemilczany". Pomiar pokazal, ze oba produkcyjne wolania odrzucaly
+   * wartosc zwracana, wiec na sciezce produkcyjnej byly one nierozroznialne,
+   * a wlasciwosc "nie cichy no-op" trzymala sie wylacznie na testach
+   * jednostkowych producenta.
+   */
+  code_invalidation_outcomes: ReadonlyArray<{
+    entitlement_id: string
+    outcome: VoucherCodeInvalidationOutcome
+  }>
 }
 
 export async function revokeEntitlementsOnRefund(
@@ -749,6 +962,10 @@ export async function revokeEntitlementsOnRefund(
   const revoked: string[] = []
   const alreadyTerminal: string[] = []
   const codeInvalidationSkipped: string[] = []
+  const codeInvalidationOutcomes: {
+    entitlement_id: string
+    outcome: VoucherCodeInvalidationOutcome
+  }[] = []
 
   for (const row of rows.rows) {
     const currentState = row.state as EntitlementInstanceState
@@ -898,10 +1115,29 @@ export async function revokeEntitlementsOnRefund(
     // wiersz może pochodzić już tylko z danych zastanych, a te mają jawną
     // dyspozycję (DW-15-114), nie ciche `continue`.
     if (isVoucherBackedType(row.entitlement_type)) {
-      await invalidateVoucherCode(client, {
+      // review-fix cyklu 3 (REG-LOW-1): wynik producenta jest ZACHOWYWANY.
+      //
+      // Do tego fixu oba produkcyjne wołania miały postać
+      // `await invalidateVoucherCode(...)` z ODRZUCONĄ wartością zwracaną —
+      // bez przypisania, bez logu, bez asercji. Producent starannie rozróżnia
+      // `invalidated` / `already_invalidated` / `already_invalidated_other` /
+      // `already_redeemed_code` / `no_voucher_code` i opisuje to jako
+      // „wynik NAZWANY, nie przemilczany" — ale na ścieżce produkcyjnej
+      // wszystkie te wyniki były nierozróżnialne, bo nikt ich nie czytał.
+      //
+      // Konkretny koszt: `already_redeemed_code` (kod `claimed` przy
+      // uprawnieniu schodzącym do stanu unieważniającego) oznacza rozjazd
+      // „uprawnienie zwrócone, kod nadal zrealizowany". SM-7 nie rośnie, bo
+      // `claimed` jest poza allow-listą wejściową realizacji — ale bez śladu
+      // ten rozjazd jest operacyjnie niewidoczny.
+      const invalidation = await invalidateVoucherCode(client, {
         entitlement_id: row.id,
         to_state: terminalState,
         now: refundedAt,
+      })
+      codeInvalidationOutcomes.push({
+        entitlement_id: row.id,
+        outcome: invalidation.outcome,
       })
     } else {
       codeInvalidationSkipped.push(row.id)
@@ -913,6 +1149,7 @@ export async function revokeEntitlementsOnRefund(
     revoked_entitlement_ids: revoked,
     already_terminal_entitlement_ids: alreadyTerminal,
     code_invalidation_skipped_entitlement_ids: codeInvalidationSkipped,
+    code_invalidation_outcomes: codeInvalidationOutcomes,
   }
 }
 

@@ -539,23 +539,53 @@ export async function invalidateVoucherCode(
  * w `invalidateVoucherCode` — review-fix 5.9 (LOW-5). Wcześniej ta funkcja
  * pisała `updated_at = NOW()` (zegar bazy), a jej sąsiadka `input.now` (zegar
  * wołającego): dwa kanały czasu w JEDNYM nośniku, czyli dokładnie ta oś, którą
- * review-fix 5.8 przed chwilą zrównał. Zachowanie jest niezmienione: warunek `status IN (…)`
- * jest generowany z allow-listy `VOUCHER_REDEMPTION_INPUT_STATES` (5.8) i
- * przekazywany przez wołającego, żeby ten plik nie stał się drugą kopią
- * allow-listy realizacji.
+ * review-fix 5.8 przed chwilą zrównał.
+ *
+ * ── Allow-lista: ZBIÓR, nie SQL (review-fix cyklu 3, SEC-3) ────────────────
+ * Do cyklu 3 ta funkcja przyjmowała `inputStatusInClause: string` —
+ * gotową klauzulę `status IN (…)`, konkatenowaną do `UPDATE`. Powód był
+ * słuszny (producent nie ma być drugą kopią allow-listy 5.8), ale cena była
+ * taka, że KONTROLA SM-7 — jakie stany kodu wolno w ogóle zrealizować —
+ * przestała być kodem i stała się PARAMETREM TYPU `string`, wklejanym do SQL-a
+ * bez żadnej walidacji. Wołający, który poda `"1=1"` albo `"status IS NOT NULL"`,
+ * przestawia na `claimed` kod w stanie `refunded` — czyli produkuje `SM-7 > 0`
+ * przy WSZYSTKICH pozostałych kontrolach tej story sprawnych i przy zielonej
+ * bramce. Szew był latentny (obaj wołający podawali generator), ale to jest
+ * dokładnie ten kanał cichego rozjazdu, przed którym ostrzega cała
+ * argumentacja 5.9 — tyle że przesunięty o jeden poziom.
+ *
+ * Teraz przyjmowany jest ZBIÓR stanów, a klauzula powstaje TUTAJ, z tego
+ * zbioru. Cel 5.8 jest zachowany w całości: zbiór nadal pochodzi od wołającego
+ * (`VOUCHER_REDEMPTION_INPUT_STATES`), więc ten plik nie jest jego drugą kopią,
+ * literały nadal są czytelne w logu zapytań, a istniejący człon parity bramki
+ * ma dalej co porównywać z kontraktem. Znika wyłącznie możliwość podania
+ * czegokolwiek, co nie jest stanem z domkniętej unii `VoucherStatus`.
  */
 export async function claimVoucherCode(
   client: VoucherCodeStateClient,
   input: {
     code: string
-    /** Klauzula `status IN (…)` wygenerowana z allow-listy 5.8. */
-    inputStatusInClause: string
+    /**
+     * Allow-lista stanów WEJŚCIOWYCH realizacji (5.8). Przekazywana jako zbiór,
+     * nie jako SQL — patrz nagłówek funkcji.
+     */
+    inputStates: ReadonlySet<VoucherStatus>
     /** Zawężenie do najemcy (`redeemForSeller`); `null` dla ścieżki `claim()`. */
     seller_id?: string | null
     /** Zegar WOŁAJĄCEGO — ten sam kanał, co w `invalidateVoucherCode`. */
     now: Date
   }
 ): Promise<number> {
+  // Pusty zbiór to nie „przepuść wszystko" — to `IN ()`, czyli błąd składni
+  // albo, po naiwnym pominięciu klauzuli, `UPDATE` bez guardu na stan.
+  // Fail-closed: brak allow-listy jest brakiem zgody, nie zgodą milczącą.
+  if (input.inputStates.size === 0) {
+    throw new Error(
+      "claimVoucherCode: pusta allow-lista stanów wejściowych realizacji. " +
+        "Bez guardu na stan `UPDATE` przestawiłby na `claimed` DOWOLNY kod, " +
+        "w tym `refunded` — czyli SM-7 > 0. Fail-closed."
+    )
+  }
   const params: unknown[] = [input.code, input.now]
   let sellerPredicate = ""
   if (input.seller_id != null) {
@@ -564,8 +594,37 @@ export async function claimVoucherCode(
   }
   const res = await client.query(
     `UPDATE voucher SET status = 'claimed', updated_at = $2
-      WHERE code = $1${sellerPredicate} AND ${input.inputStatusInClause}`,
+      WHERE code = $1${sellerPredicate} AND ${renderVoucherStatusInClause(
+        input.inputStates
+      )}`,
     params
   )
   return res.rowCount ?? 0
+}
+
+/**
+ * JEDYNY renderer klauzuli `<kolumna> IN (…)` ze zbioru stanów kodu.
+ *
+ * ADR-199 §2.2 (Story 5.8) stawia niezmiennik: „klauzula `WHERE` jest
+ * GENEROWANA ze zbioru, nie pisana obok niego — dwie ręcznie utrzymywane kopie
+ * tej samej listy rozjeżdżają się cicho". Review-fix cyklu 3 przeniósł
+ * przekazywanie allow-listy ze `string`-a na `ReadonlySet` (SEC-3), więc
+ * renderowanie musiało trafić do producenta — ale niezmiennik ADR-199 zostaje
+ * dotrzymany dosłownie tylko wtedy, gdy renderer jest JEDEN. Ta funkcja nim
+ * jest; `redemptionInputStatusInClause()` w `service.ts` do niej deleguje.
+ *
+ * Literały są bezpieczne, bo pochodzą z domkniętej unii `VoucherStatus`
+ * (typ wymusza to statycznie), a nie z wejścia użytkownika. Kolejność
+ * posortowana, żeby tekst zapytania był stabilny między przebiegami — inaczej
+ * porównanie planów i diff logów zapytań szumiałyby bez powodu.
+ */
+export function renderVoucherStatusInClause(
+  states: ReadonlySet<VoucherStatus>,
+  column = "status"
+): string {
+  const values = [...states]
+    .sort()
+    .map((state) => `'${state}'`)
+    .join(", ")
+  return `${column} IN (${values})`
 }

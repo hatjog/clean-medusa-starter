@@ -52,6 +52,7 @@ import {
 // v1.15.0 Story 5.9 (FR-12, AD-17): JEDYNY producent `UPDATE voucher SET status`.
 import {
   claimVoucherCode,
+  renderVoucherStatusInClause,
   invalidateVoucherCode,
 } from "./voucher-code-state"
 
@@ -460,12 +461,26 @@ export const VOUCHER_REDEMPTION_INPUT_STATES: ReadonlySet<VoucherStatus> = new S
  * a nie z wejścia użytkownika; parametryzacja `= ANY($n)` byłaby możliwa, ale
  * wtedy zbiór nie byłby CZYTELNY w logu zapytań, a bramka statyczna nie miałaby
  * czego porównać z kontraktem.
+ *
+ * ── GRANICA POMIARU (review-fix cyklu 3, SEC-3) ────────────────────────────
+ * Ta funkcja NIE MA dziś wołającego produkcyjnego. Do cyklu 3 miała dwóch
+ * (`service.ts:1998` i `:2153`), które przekazywały jej wynik — gotowy SQL —
+ * do producenta stanu kodu. Producent przyjmuje teraz ZBIÓR stanów zamiast
+ * `string`-a, bo klauzula w parametrze typu `string` była kanałem, przez który
+ * dowolny wołający mógł wkleić własny warunek do `UPDATE voucher SET
+ * status = 'claimed'` i przestawić kod `refunded` na realizowalny.
+ *
+ * Zostaje tutaj mimo braku wołającego i jest to decyzja, nie przeoczenie:
+ * `redemptionInputStatusInClause()` jest symbolem NAZWANYM w ADR-199 §2.2
+ * i w nocie kontraktu `voucher-state-vocabulary.v1.yaml`, a oba należą do
+ * SIOSTRZANEJ Story 5.8 — review-fix 5.9 nie przepisuje cudzych decyzji.
+ * Żeby brak wołającego nie oznaczał drugiej kopii renderera (czyli dokładnie
+ * tego rozjazdu, przed którym ADR-199 §2.2 ostrzega), funkcja DELEGUJE do
+ * jedynego renderera w producencie. Usunięcie jej należy do story, która
+ * dotknie ADR-199 i kontraktu 5.8.
  */
 export function redemptionInputStatusInClause(column = "status"): string {
-  const values = [...VOUCHER_REDEMPTION_INPUT_STATES]
-    .map((state) => `'${state}'`)
-    .join(", ")
-  return `${column} IN (${values})`
+  return renderVoucherStatusInClause(VOUCHER_REDEMPTION_INPUT_STATES, column)
 }
 
 /**
@@ -1414,8 +1429,23 @@ export class VoucherService {
       `INSERT INTO voucher (code, market_id, seller_id, seller_name, seller_handle, product_title, value_minor, currency_code, status, expires_at, created_at, updated_at)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW(), NOW())
        ON CONFLICT (code) DO UPDATE SET
-         market_id = EXCLUDED.market_id,
-         seller_id = EXCLUDED.seller_id,
+         -- v1.15.0 Story 5.9 review-fix cyklu 3 (SEC-4): market_id i seller_id
+         -- USUNIETE z listy DO UPDATE SET.
+         --
+         -- To sa klucze NAJEMCY i RYNKU: po market_id orzeka polityka RLS
+         -- market_isolation, a po seller_id redeemForSeller odroznia swoj
+         -- voucher od cudzego. Bezwarunkowe przepisanie ich z wejscia
+         -- POTRAFILO PRZENIESC istniejacy kod do innego rynku/sprzedawcy --
+         -- czyli przez upsert robilo to, czego cala reszta tej story pilnuje,
+         -- zeby nie dalo sie zrobic przez trase. Polityka RLS blokowala to
+         -- tylko dopoki polaczenie ma ustawiony app.gp_market_id, wiec
+         -- fail-closed zalezal od nosnika kontekstu, a nie od samej instrukcji.
+         --
+         -- Kod vouchera jest globalnie unikalny (code text PRIMARY KEY), a jego
+         -- najemca jest ustalany przy GENEZIE. Upsert nie jest miejscem na
+         -- zmiane wlasciciela; brak tych kolumn w DO UPDATE SET znaczy
+         -- "istniejacy wiersz zachowuje swojego najemce", a nie "milcząco
+         -- przyjmuje cudzego".
          seller_name = EXCLUDED.seller_name,
          seller_handle = EXCLUDED.seller_handle,
          product_title = EXCLUDED.product_title,
@@ -1429,8 +1459,23 @@ export class VoucherService {
          -- withdrawn wartoscia wejsciowa przywracaloby realizowalnosc kodu, za
          -- ktory pieniadze juz wrocily -- czyli SM-7 > 0 zupelnie inna droga
          -- niz ta, ktora story zamyka.
+         -- review-fix cyklu 3 (SEC-4): 'claimed' DOPISANY do zbioru chronionego.
+         --
+         -- Utwardzenie cyklu 2 objelo stany UNIEWAZNIONE, ale zostawilo stan
+         -- ZREALIZOWANY. Kod 'claimed' dawal sie cofnac upsertem do 'idle',
+         -- a 'idle' jest na allow-liscie wejsciowej realizacji -- czyli powrot
+         -- do stanu realizowalnego z pominieciem producenta, dokladnie ta sama
+         -- klasa co wskrzeszenie 'refunded', tylko o jeden stan obok.
+         -- Konsekwencja byloby wykonanie DRUGIEGO zabiegu za jeden oplacony
+         -- kod. Argument tej story "relabel claimed niszczy fakt realizacji"
+         -- (voucher-code-state.ts) stosuje sie tu doslownie.
+         --
+         -- Zbior = stany unieważnione (kontrakt: invalidating_transitions)
+         -- PLUS stan zrealizowany. 'claimed' nie jest stanem unieważniającym,
+         -- wiec nie wchodzi do mapy kontraktu -- i dlatego musi byc wymieniony
+         -- tutaj jawnie, a nie oczekiwany od bramki derywujacej z tej mapy.
          status = CASE
-           WHEN voucher.status IN ('refunded','expired','withdrawn')
+           WHEN voucher.status IN ('refunded','expired','withdrawn','claimed')
              THEN voucher.status
            ELSE EXCLUDED.status
          END,
@@ -1998,7 +2043,7 @@ export class VoucherService {
       const claimedRows = await claimVoucherCode(client, {
         code,
         now,
-        inputStatusInClause: redemptionInputStatusInClause(),
+        inputStates: VOUCHER_REDEMPTION_INPUT_STATES,
       })
       if (claimedRows > 0) {
         const eventId = randomUUID()
@@ -2150,7 +2195,7 @@ export class VoucherService {
         code,
         seller_id: sellerId,
         now,
-        inputStatusInClause: redemptionInputStatusInClause(),
+        inputStates: VOUCHER_REDEMPTION_INPUT_STATES,
       })
       if (claimedRows === 0) {
         // Przegrany wyścig: równoległy najemca/żądanie już przestawiło stan.

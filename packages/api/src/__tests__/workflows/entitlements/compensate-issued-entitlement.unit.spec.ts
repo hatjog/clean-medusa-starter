@@ -94,9 +94,20 @@ describe("Story 5.9 review-fix — kompensacja wystawienia a stan kodu", () => {
   it("NIE wywraca się, gdy uprawnienie jest już REFUNDED", async () => {
     const client = new CompensateFakeClient("REFUNDED", "refunded")
 
+    // review-fix cyklu 3 (REG-LOW-1): `compensateIssuedEntitlement` zwraca
+    // teraz WYNIK producenta stanu kodu zamiast `void` — do tego fixu wartość
+    // zwracana przez producenta była odrzucana, więc `invalidated`,
+    // `already_invalidated` i `no_voucher_code` były na ścieżce produkcyjnej
+    // nierozróżnialne. `null` znaczy „producent NIE był wołany", czyli
+    // dokładnie ten przypadek: wiersz jest już terminalny, `UPDATE` obejmuje
+    // zero wierszy, nie ma tranzycji do domknięcia.
+    //
+    // Asercja mierzy to, co ten test mierzył od początku — że kompensacja NIE
+    // WYWRACA SIĘ na wierszu terminalnym — tyle że wobec aktualnego kontraktu
+    // zwracanej wartości, a nie wobec nieobecności kontraktu.
     await expect(
       compensateIssuedEntitlement(client, RESULT)
-    ).resolves.toBeUndefined()
+    ).resolves.toBeNull()
 
     expect(client.voucherStatus).toBe("refunded")
   })

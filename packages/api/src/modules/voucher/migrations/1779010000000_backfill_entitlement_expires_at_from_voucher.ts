@@ -51,20 +51,118 @@ import { Migration } from "@medusajs/framework/mikro-orm/migrations"
  * rejestr — nie zostawia po sobie powierzchni.
  *
  * Rejestr jest artefaktem MIGRACJI, nie powierzchnią zapisu domeny: nie ma
- * producenta w `redemption-producers.v1.yaml`, nie ma trasy, nie ma RLS,
- * i znika razem z `down()`. Trzyma wyłącznie identyfikator uprawnienia
+ * producenta w `redemption-producers.v1.yaml`, nie ma trasy, nie ma polityki
+ * RLS, i znika razem z `down()`. Trzyma wyłącznie identyfikator uprawnienia
  * i znacznik czasu — bez PII i bez danych finansowych.
+ *
+ * ── `REVOKE` na rejestrze (review-fix cyklu 3, SEC-2) ──────────────────────
+ * „Nie ma RLS" było wyżej napisane jako właściwość BEZPIECZNA. Nie jest: tabela
+ * powstaje w schemacie, dla którego `infra/postgres/migrations/003` i `009`
+ * deklarują `ALTER DEFAULT PRIVILEGES … GRANT SELECT, INSERT, UPDATE, DELETE
+ * ON TABLES` dla ról ruchu, więc bez `REVOKE` rejestr DZIEDZICZY pełny DML.
+ * Konsekwencja nie jest teoretyczna: `down()` ufa rejestrowi bezwarunkowo, więc
+ * rola z `INSERT` na nim wskazuje rollbackowi DOWOLNE uprawnienia do
+ * wyzerowania `expires_at` — czyli wypycha je z filtra sweepera wygaszeń
+ * i odwraca dokładnie ten defekt, dla którego ta migracja powstała.
+ * Wzorzec `REVOKE` jest ten sam, co w siostrzanej `1779004000000:293-320`.
+ *
+ * ── STRAŻNIK WIDOCZNOŚCI (review-fix cyklu 3, REG-HIGH-1) ─────────────────
+ * `entitlement_instance` i `voucher` są od `1779000000000` pod `FORCE ROW LEVEL
+ * SECURITY`, a `FORCE` obejmuje WŁAŚCICIELA tabeli. Rola migracyjna bez
+ * `BYPASSRLS`/superusera i bez `app.gp_market_id` widzi ZERO wierszy
+ * źródłowych, więc `UPDATE` wyżej obejmował zero wierszy, rejestr zostawał
+ * pusty, a migracja kończyła się ZIELONO — poprawka, która nie wykonuje się
+ * w warunkach produkcyjnych, nie jest poprawką. Zmierzone na żywym PG 17.6:
+ * `evidence/5-9/backfill-rls-kontrola.out`, wariant RED.
+ *
+ * Gorsze od samego pominięcia było to, że po fixie cyklu 2 BRAK SYGNAŁU stał
+ * się NIEODRÓŻNIALNY OD SUKCESU: pusty rejestr czyta się identycznie jako „nie
+ * było czego backfillować" i jako „RLS mnie odciął". Dlatego strażnik mierzy
+ * WIDOCZNOŚĆ (czy rola w ogóle może zobaczyć populację), a nie tylko wynik —
+ * post-warunek na „ile zostało" pod odcięciem RLS też zwróciłby zero.
+ *
+ * Ryzyko było już NAZWANE w tym samym module przez siostrzaną migrację tego
+ * samego release'u (`1779004000000:30-37`), która broni się `RAISE EXCEPTION`.
+ * Ta robi teraz to samo, w dwóch krokach: przed backfillem — widoczność,
+ * po backfillu — kompletność.
  */
 const BACKFILL_LEDGER = "entitlement_expires_at_backfill_1779010000000"
 
+/** Role ruchu, które dziedziczą DML z `ALTER DEFAULT PRIVILEGES` (003 / 009). */
+const TRAFFIC_ROLES = ["medusa_store", "medusa_market_ops"] as const
+
+/**
+ * Predykat mostu kod → uprawnienie. JEDNO wyrażenie dla backfillu i dla
+ * post-warunku: dwie kopie rozjechałyby się cicho, a wtedy post-warunek
+ * mierzyłby coś innego niż to, co migracja przestawia.
+ */
+const BRIDGE_PREDICATE = `e.expires_at IS NULL
+           AND v.expires_at IS NOT NULL
+           AND v.code = e.policy_snapshot->>'voucher_code'`
+
 export class Migration1779010000000 extends Migration {
   async up(): Promise<void> {
+    // ── (1) STRAŻNIK WIDOCZNOŚCI — PRZED jakimkolwiek zapisem ───────────────
+    // Pytanie brzmi „czy ta rola w ogóle MOŻE zobaczyć populację źródłową",
+    // a nie „ile wierszy zostało". Pod odcięciem RLS oba pytania zwracają zero
+    // i tylko pierwsze potrafi je od siebie odróżnić.
+    this.addSql(`
+      DO $$
+      DECLARE
+        v_bypass  boolean;
+        v_super   boolean;
+        v_forced  boolean;
+      BEGIN
+        SELECT rolbypassrls, rolsuper INTO v_bypass, v_super
+          FROM pg_roles WHERE rolname = current_user;
+
+        SELECT bool_or(c.relforcerowsecurity) INTO v_forced
+          FROM pg_class c
+         WHERE c.oid IN (to_regclass('entitlement_instance'), to_regclass('voucher'));
+
+        IF COALESCE(v_forced, false)
+           AND NOT COALESCE(v_bypass, false)
+           AND NOT COALESCE(v_super, false) THEN
+          RAISE EXCEPTION
+            'GP_ENTITLEMENT_EXPIRES_AT_BACKFILL_BLIND: rola migracyjna % nie ma ani '
+            'BYPASSRLS, ani superusera, a entitlement_instance/voucher sa pod FORCE ROW '
+            'LEVEL SECURITY (2.6, migracja 1779000000000) — FORCE obejmuje takze '
+            'WLASCICIELA tabeli. Taka rola widzi co najwyzej JEDEN rynek (ten z '
+            'app.gp_market_id), a bez niego ZERO wierszy: backfill konczylby sie ZIELONO '
+            'nie naprawiajac niczego, a pusty rejestr jest nieodroznialny od "nie bylo '
+            'czego backfillowac". Backfill CALEJ populacji zastanej wymaga widocznosci '
+            'CALEJ populacji. Uruchom migracje rola z BYPASSRLS albo superuserem.',
+            current_user;
+        END IF;
+      END
+      $$;
+    `)
+
     this.addSql(`
       CREATE TABLE IF NOT EXISTS ${BACKFILL_LEDGER} (
         entitlement_id  text PRIMARY KEY,
         set_expires_at  timestamptz NOT NULL
       )
     `)
+
+    // ── (2) REVOKE na rejestrze (SEC-2) ────────────────────────────────────
+    // Rejestr steruje `down()`, więc rola ruchu z `INSERT`/`UPDATE` na nim
+    // steruje tym, komu rollback wyzeruje `expires_at`. `REVOKE ALL` odcina
+    // dziedziczenie z `ALTER DEFAULT PRIVILEGES`; żadna rola ruchu nie dostaje
+    // niczego z powrotem — rejestr obsługuje wyłącznie rola migracyjna.
+    this.addSql(`REVOKE ALL ON ${BACKFILL_LEDGER} FROM PUBLIC`)
+    for (const role of TRAFFIC_ROLES) {
+      this.addSql(`
+        DO $$
+        BEGIN
+          IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '${role}') THEN
+            REVOKE ALL ON ${BACKFILL_LEDGER} FROM ${role};
+          END IF;
+        END
+        $$;
+      `)
+    }
+
     // Idempotentne w OBU nośnikach: warunek `IS NULL` sprawia, że drugi
     // przebieg obejmuje zero wierszy, a `ON CONFLICT DO NOTHING` chroni
     // rejestr przed podwójnym wpisem, gdyby migracja została powtórzona po
@@ -75,15 +173,39 @@ export class Migration1779010000000 extends Migration {
            SET expires_at = v.expires_at,
                updated_at = NOW()
           FROM voucher v
-         WHERE e.expires_at IS NULL
-           AND v.expires_at IS NOT NULL
-           AND v.code = e.policy_snapshot->>'voucher_code'
+         WHERE ${BRIDGE_PREDICATE}
         RETURNING e.id, e.expires_at
       )
       INSERT INTO ${BACKFILL_LEDGER} (entitlement_id, set_expires_at)
       SELECT id, expires_at FROM touched
       ON CONFLICT (entitlement_id) DO NOTHING
     `)
+
+    // ── (3) DLACZEGO NIE MA TU POST-WARUNKU `count(*)` ─────────────────────
+    // Odruch podpowiada dopisać post-warunek „ile uprawnien zostalo z
+    // expires_at IS NULL mimo mostu" — tak jak robi siostrzana `1779004000000`.
+    // Zmierzone: tutaj taki post-warunek byłby DEKORACJĄ, a nie pomiarem.
+    //
+    // Powód jest strukturalny: post-warunek dzieliłby z `UPDATE`-em POWYŻEJ
+    // zarówno predykat (`BRIDGE_PREDICATE`, ta sama stała), jak i WIDOCZNOŚĆ
+    // (ta sama rola, ta sama sesja, te same polityki RLS). Po strażniku (1)
+    // rola ma `BYPASSRLS`, więc `UPDATE` obejmuje CAŁY zbiór spełniający
+    // predykat — a wtedy post-warunek liczący ten sam predykat zwraca zero
+    // ZAWSZE, niezależnie od tego, czy backfill zadziałał. Mechanizm bez
+    // osiągalnego wejścia czyta się jak dowód, a nim nie jest.
+    //
+    // Zmierzone wykonaniem, nie rozumowaniem: wariant z post-warunkiem był
+    // uruchomiony na żywym PG 17.6 przeciw populacji dwurynkowej z kontekstem
+    // ustawionym dla JEDNEGO rynku (`evidence/5-9/backfill-rls-kontrola.sh`,
+    // sekcja GREEN-c pierwszego przebiegu) i NIE zaczerwienił się — bo sam
+    // `SELECT count(*)` był odcięty przez tę samą politykę, która odcięła
+    // `UPDATE`. To jest ta sama klasa co pomiar sekretu na pliku roboczym
+    // zamiast na historii gałęzi: właściwy warunek, zły nośnik pomiaru.
+    //
+    // Dlatego kompletność jest tu egzekwowana WEJŚCIEM (strażnik (1): pełna
+    // widoczność albo zatrzymanie), a nie wyjściem. Post-warunek na wyjściu
+    // wymagałby drugiego, niezależnego nośnika widoczności — a takiego ta
+    // migracja nie ma i nie powinna sobie dorabiać.
   }
 
   async down(): Promise<void> {
