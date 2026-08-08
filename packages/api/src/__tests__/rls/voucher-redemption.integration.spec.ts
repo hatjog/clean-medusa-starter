@@ -85,6 +85,23 @@ const CODE_A = "V-STORY57-A"
 const ENT_A = "ent_story57_a"
 const ISSUED_GROSS = 12300
 
+/**
+ * Uprawnienie WIELORATOWE (ADR-198) — osobny byt, żeby nie zmieniać ani jednej
+ * asercji przypadków jednoratowych.
+ *
+ * Liczby NIE są dowolne: `net=999, vat=1, gross=1000` przy dwóch ratach po 500
+ * to DOKŁADNIE przykład z ADR-197 §2.12, na którym formuła wprost proporcjonalna
+ * rozjeżdża się z kumulatywno-marginalną (Σ rozpoznanego VAT = 1, Σ odwróconego
+ * liczonego wprost = 2, czyli `vat:output` schodzi PONIŻEJ zera przy ledgerze
+ * zbilansowanym per wpis). Ten fixture jest więc jednocześnie kontrolą taksonomii
+ * (dwa odwrócenia muszą być WYKONALNE) i kontrolą asymetrii zaokrągleń.
+ */
+const ENT_MULTI = "ent_story57_multi"
+const MULTI_NET = 999
+const MULTI_VAT = 1
+const MULTI_GROSS = MULTI_NET + MULTI_VAT
+const MULTI_INSTALMENT = 500
+
 const MIGRATIONS_DIR = path.resolve(
   __dirname, "..", "..", "modules", "voucher", "migrations",
 )
@@ -165,16 +182,26 @@ const EXTERNAL_FIXTURE_DDL = [
      id text PRIMARY KEY,
      metadata jsonb NULL
    )`,
+  // Kolumny WYWIEDZIONE Z `appendNotificationLog` (`lib/vendor-notification-log.ts`),
+  // nie z domysłu. Poprzedni fixture był węższy niż `INSERT` trasy (`vendor_handle`,
+  // `error_message`, `forced`, `sent_at`, brak defaultu na `id`), więc zapis padał
+  // — a trasa łapie błąd w `.catch(() => {})` jako observability-only. Efekt:
+  // ZERO wierszy i suita nie umiała tego zobaczyć. Wąski fixture nie był tu
+  // zawężeniem świadomym, tylko cichą dziurą w pomiarze.
   `CREATE TABLE IF NOT EXISTS vendor_notification_log (
-     id text PRIMARY KEY,
+     id text PRIMARY KEY DEFAULT gen_random_uuid()::text,
      vendor_id text NULL,
+     vendor_handle text NULL,
      notification_type text NULL,
      locale text NULL,
      recipient_email text NULL,
      status text NULL,
+     error_message text NULL,
      triggered_by text NULL,
+     forced boolean NULL,
      metadata jsonb NULL,
-     created_at timestamptz NOT NULL DEFAULT now()
+     sent_at timestamptz NULL,
+     created_at timestamptz NOT NULL DEFAULT clock_timestamp()
    )`,
 ]
 
@@ -241,6 +268,63 @@ async function seedVoucherAndEntitlement(): Promise<void> {
       ISSUED_GROSS,
     ],
   )
+}
+
+/**
+ * Uprawnienie pod realizację WIELORATOWĄ. Bez wiersza `voucher`: ta ścieżka jedzie
+ * `entitlement_id`, więc projekcja `voucher_event` nie jest wołana (M6 — projekcja
+ * tylko razem z faktem, a faktu z kodu tu nie ma). Fixture jest zawężony ŚWIADOMIE.
+ */
+async function seedMultiInstallmentEntitlement(): Promise<void> {
+  await admin.raw(
+    `INSERT INTO entitlement_instance
+       (id, entitlement_profile_id, entitlement_type, state, policy_snapshot,
+        market_id, remaining_amount, vat_classification, created_at, updated_at)
+     VALUES (?, 'prof_story57', 'VOUCHER_AMOUNT', 'ACTIVE', ?::jsonb, ?, ?, 'MPV', now(), now())`,
+    [
+      ENT_MULTI,
+      JSON.stringify({
+        market_id: MARKET_A,
+        amount_minor: MULTI_GROSS,
+        currency_code: "PLN",
+        transferability: "bearer",
+      }),
+      MARKET_A,
+      MULTI_GROSS,
+    ],
+  )
+}
+
+/** Stan uprawnienia czytany POZA RLS — mierzy FAKT w bazie, nie zwrotkę operacji. */
+async function entitlementState(entitlementId: string): Promise<string> {
+  const res = await admin.raw(
+    `SELECT state FROM entitlement_instance WHERE id = ?`,
+    [entitlementId],
+  )
+  return res.rows[0].state as string
+}
+
+/**
+ * Σ debit i Σ credit na koncie `vat:output` dla WSZYSTKICH wpisów uprawnienia.
+ * `assertBalanced` pilnuje bilansu KAŻDEGO wpisu z osobna, więc konto zbiorczo
+ * mogło zejść poniżej zera przy każdym wpisie poprawnym — dlatego pomiar idzie
+ * po sumie kolumn, a nie po liczbie wierszy.
+ */
+async function vatOutputSums(
+  entitlementId: string,
+): Promise<{ debit: number; credit: number }> {
+  const res = await admin.raw(
+    `SELECT COALESCE(SUM(e.debit_minor), 0)::bigint  AS debit,
+            COALESCE(SUM(e.credit_minor), 0)::bigint AS credit
+       FROM voucher_ledger_entry e
+       JOIN voucher_ledger_transaction t USING (transaction_id)
+      WHERE e.account = 'vat:output' AND t.instance_id = ?`,
+    [entitlementId],
+  )
+  return {
+    debit: Number(res.rows[0].debit),
+    credit: Number(res.rows[0].credit),
+  }
 }
 
 /** `SELECT count(*)` na kanonicznej — poza RLS, żeby mierzyć FAKT, nie widoczność. */
@@ -374,6 +458,7 @@ runOrSkip("Story 5.7 — voucher_redemption ożywiona na realnym Postgresie", ()
     await admin.raw(`DELETE FROM voucher_event`)
     await admin.raw(`DELETE FROM voucher`)
     await admin.raw(`DELETE FROM entitlement_instance`)
+    await admin.raw(`DELETE FROM vendor_notification_log`)
     await admin.raw(`DELETE FROM seller`)
     await admin.raw(
       `INSERT INTO seller (id, metadata) VALUES (?, ?::jsonb)`,
@@ -854,6 +939,35 @@ runOrSkip("Story 5.7 — voucher_redemption ożywiona na realnym Postgresie", ()
       )
     })
 
+    it("log obserwowalności liczy PRÓBY: replay dokłada wiersz, ale OZNACZONY", async () => {
+      // Człon 2 findingu L-4: `appendNotificationLog` stoi poza warunkiem na
+      // `redemption.idempotent`, więc replay dokłada drugi wiersz do
+      // `vendor_notification_log`. To jest DECYZJA (log opisuje PRÓBY, żeby
+      // SecOps widział drugą sesję), nie przeoczenie — ale dwa wiersze
+      // o IDENTYCZNEJ kopercie czytały się jak DWIE realizacje, bo koperta jest
+      // przy replayu bajt w bajt ta sama. Rozróżnienie jest teraz JAWNE.
+      await callRedeemRoute(CODE_A, "panel-action-obs")
+      await callRedeemRoute(CODE_A, "panel-action-obs")
+
+      // Kanoniczna: JEDEN fakt. Log: DWIE próby. Ta asymetria jest zamierzona.
+      expect(await countRedemptions()).toBe(1)
+      const rows = await admin.raw(
+        `SELECT metadata FROM vendor_notification_log
+          WHERE notification_type = 'voucher_redeem' AND vendor_id = ?
+          ORDER BY created_at, id`,
+        [VENDOR_A],
+      )
+      expect(rows.rows).toHaveLength(2)
+      const [attempt1, attempt2] = rows.rows.map((r: any) => r.metadata)
+      expect(attempt1.idempotent_replay).toBe(false)
+      expect(attempt2.idempotent_replay).toBe(true)
+      // Koperta faktu jest w OBU wierszach ta sama — czyli rozróżnienie niesie
+      // WYŁĄCZNIE nowe pole, i to jest dokładnie to, co miało być nazwane.
+      expect(attempt2.redemption_id).toBe(attempt1.redemption_id)
+      expect(attempt2.audit_log_id).toBe(attempt1.audit_log_id)
+      expect(attempt2.claimed_at).toBe(attempt1.claimed_at)
+    })
+
     it("RÓŻNY Idempotency-Key na tym samym uprawnieniu NIE przechodzi ponad saldo", async () => {
       await callRedeemRoute(CODE_A, "panel-action-first")
       // Pierwsza realizacja zabrała całe saldo; druga akcja użytkownika trafia
@@ -1103,8 +1217,13 @@ runOrSkip("Story 5.7 — voucher_redemption ożywiona na realnym Postgresie", ()
       expect(await countRedemptions()).toBe(2)
     })
 
-    it("reguła bilansu jest EGZEKWOWANA: ręczne przekroczenie brutto emisji jest odmawiane", async () => {
-      // Predykat agregatowy działa PRZED INSERT-em (CHECK tabelowy go nie widzi).
+    it("odwrócenie wiersza, którego NIE MA, jest odmawiane (REVERSAL_TARGET_NOT_FOUND)", async () => {
+      // NAZWA sprostowana: ten przypadek nosił wcześniej tytuł „reguła bilansu
+      // jest EGZEKWOWANA: ręczne przekroczenie brutto emisji jest odmawiane",
+      // a w ciele odwracał nieistniejący `redemption_id` i asertował
+      // `REVERSAL_TARGET_NOT_FOUND`. Żadnego INSERT-u przekraczającego brutto
+      // emisji tu nie było — nazwa była dowodem samą sobą. Reguła bilansu ma
+      // teraz TRZY własne kontrole niżej.
       const { runInHttpMarketContext } = require("../../lib/http-market-context")
       await callRedeemRoute(CODE_A, "panel-action-balance")
       const source = resolveRlsConnectionSource(
@@ -1117,6 +1236,241 @@ runOrSkip("Story 5.7 — voucher_redemption ożywiona na realnym Postgresie", ()
           op.reverse({ reverses_redemption_id: "RDM-NIEISTNIEJE" }),
         ),
       ).rejects.toThrow(/REVERSAL_TARGET_NOT_FOUND|brak wiersza realizacji/)
+    })
+
+    // ── Reguła bilansu ADR-178 §2.3 — kontrole, które PĘKAJĄ po jej usunięciu ──
+    // Przed tym cyklem `assertCommissionBaseWithinBounds` i guard L-1 nie miały
+    // ANI JEDNEJ kontroli: usunięcie obu wywołań nie zaczerwieniłoby niczego,
+    // a `RedemptionBalanceError` był w tym pliku zaimportowany i nieużyty
+    // (`tsconfig` bez `noUnusedLocals`, więc martwy import nie zapala lampki).
+
+    it("reguła bilansu: druga realizacja podnosząca bazę PONAD brutto emisji jest ODMAWIANA", async () => {
+      const { runInHttpMarketContext } = require("../../lib/http-market-context")
+      await seedMultiInstallmentEntitlement()
+      const op = operationWithLedger()
+
+      // Rata 1: baza = 500 z brutto emisji 1000 — przechodzi.
+      await runInHttpMarketContext(MARKET_A, async () =>
+        op.redeem({
+          entitlement_id: ENT_MULTI,
+          amount_minor: MULTI_INSTALMENT,
+          idempotency_key: "balance-rata-1",
+          voucher_net_minor: MULTI_NET,
+          voucher_vat_minor: MULTI_VAT,
+        }),
+      )
+
+      // Podniesienie SALDA ponad brutto emisji rolą admina (czyli obejściem,
+      // którego kod nie ma): baza po drugiej racie wyszłaby na 1500 > 1000.
+      // Bez predykatu agregatowego INSERT by przeszedł — CHECK tabelowy nie
+      // widzi sumy, a to jest cała stawka reguły bilansu.
+      await admin.raw(
+        `UPDATE entitlement_instance SET remaining_amount = ? WHERE id = ?`,
+        [MULTI_GROSS, ENT_MULTI],
+      )
+      await expect(
+        runInHttpMarketContext(MARKET_A, async () =>
+          op.redeem({
+            entitlement_id: ENT_MULTI,
+            amount_minor: MULTI_GROSS,
+            idempotency_key: "balance-rata-2",
+            voucher_net_minor: MULTI_NET,
+            voucher_vat_minor: MULTI_VAT,
+          }),
+        ),
+      ).rejects.toThrow(RedemptionBalanceError)
+
+      // Fail-closed: drugi wiersz NIE powstał.
+      expect(await countRedemptions(ENT_MULTI)).toBe(1)
+      expect(await commissionBase(ENT_MULTI)).toBe(MULTI_INSTALMENT)
+    })
+
+    it("guard L-1: odwrócenie z ZAWYŻONYM rozbiciem net/VAT jest odmawiane, z OBIEMA liczbami", async () => {
+      // Guard dołożony w cyklu 1 wszedł na ścieżkę pieniądza bez dowodu.
+      // Bez niego zawyżone rozbicie przechodziło i odwracało VAT policzony na
+      // ZŁEJ PODSTAWIE — jedynym guardem było porównanie z brutto vouchera.
+      const { runInHttpMarketContext } = require("../../lib/http-market-context")
+      const redemptionId = await redeemThenBuildOperation()
+
+      const attempt = runInHttpMarketContext(MARKET_A, async () =>
+        operationWithLedger().reverse({
+          reverses_redemption_id: redemptionId,
+          voucher_net_minor: 50000,
+          voucher_vat_minor: 11500,
+        }),
+      )
+      await expect(attempt).rejects.toThrow(RedemptionBalanceError)
+      // Komunikat MUSI nazywać obie liczby — inaczej diagnoza wymaga debuggera.
+      await expect(attempt).rejects.toThrow(/61500/)
+      await expect(attempt).rejects.toThrow(new RegExp(String(ISSUED_GROSS)))
+
+      // Wiersz odwracający NIE powstał, licznik nietknięty.
+      expect(await countRedemptions()).toBe(1)
+      expect(await commissionBase()).toBe(ISSUED_GROSS)
+    })
+
+    it("reguła bilansu: odwrócenie, które zbiłoby licznik PONIŻEJ ZERA, jest odmawiane", async () => {
+      // Odróżnienie od przypadku replaya jest tu istotą: przy TYM SAMYM kluczu
+      // short-circuit idempotencji wychodzi PRZED predykatem, więc licznik nie
+      // schodzi poniżej zera dlatego, że drugi wiersz w ogóle nie powstaje —
+      // a nie dlatego, że reguła bilansu odmówiła. Ta kontrola odwraca wiersz
+      // JESZCZE NIEODWRÓCONY (żadnego replaya), przy liczniku już wyzerowanym,
+      // więc jedynym możliwym źródłem odmowy jest `assertCommissionBaseWithinBounds`.
+      const { runInHttpMarketContext } = require("../../lib/http-market-context")
+      await seedMultiInstallmentEntitlement()
+      const op = operationWithLedger()
+      const netVat = {
+        voucher_net_minor: MULTI_NET,
+        voucher_vat_minor: MULTI_VAT,
+      }
+
+      const r1 = await runInHttpMarketContext(MARKET_A, async () =>
+        op.redeem({
+          entitlement_id: ENT_MULTI,
+          amount_minor: MULTI_INSTALMENT,
+          idempotency_key: "underflow-rata-1",
+          ...netVat,
+        }),
+      )
+      const r2 = await runInHttpMarketContext(MARKET_A, async () =>
+        op.redeem({
+          entitlement_id: ENT_MULTI,
+          amount_minor: MULTI_INSTALMENT,
+          idempotency_key: "underflow-rata-2",
+          ...netVat,
+        }),
+      )
+      await runInHttpMarketContext(MARKET_A, async () =>
+        op.reverse({ reverses_redemption_id: r1.redemption_id, ...netVat }),
+      )
+      expect(await commissionBase(ENT_MULTI)).toBe(MULTI_INSTALMENT)
+
+      // Drugi wiersz REVERSAL wstawiony ADMINEM pod INNY klucz idempotencji —
+      // wejście, którego producent sam nie wygeneruje, ale które zeruje licznik
+      // BEZ odwrócenia raty 2. `CHECK` tabelowy tego nie pilnuje (nie widzi
+      // agregatu), więc INSERT przechodzi — i to jest cała stawka predykatu.
+      const forged = buildRedemptionId(ENT_MULTI, "underflow-forged", "REVERSAL")
+      await admin.raw(
+        `INSERT INTO voucher_redemption
+           (entitlement_id, idempotency_key, redemption_id, amount_minor,
+            resulting_state, remaining_after_minor, issued_gross_minor,
+            created_at, kind, reverses_redemption_id, market_id,
+            purchase_market_id, redemption_market_id)
+         VALUES (?, 'underflow-forged', ?, ?, 'REDEEMED_PARTIAL', 0, ?,
+                 ?, 'REVERSAL', ?, ?, ?, ?)`,
+        [
+          ENT_MULTI, forged, MULTI_INSTALMENT, MULTI_GROSS, Date.now(),
+          r1.redemption_id, MARKET_A, MARKET_A, MARKET_A,
+        ],
+      )
+      expect(await commissionBase(ENT_MULTI)).toBe(0)
+
+      // Rata 2 NIE była odwracana, więc replay nie zachodzi: odmowa przychodzi
+      // z reguły bilansu, bo baza zeszłaby do −500.
+      await expect(
+        runInHttpMarketContext(MARKET_A, async () =>
+          op.reverse({ reverses_redemption_id: r2.redemption_id, ...netVat }),
+        ),
+      ).rejects.toThrow(RedemptionBalanceError)
+      // Fail-closed: licznik nietknięty, wiersz odwracający nie powstał.
+      expect(await commissionBase(ENT_MULTI)).toBe(0)
+      expect(await countRedemptions(ENT_MULTI)).toBe(4)
+    })
+
+    // ── ADR-198: odwrócenie WIELORATOWE ────────────────────────────────────
+    it("DWIE raty i DWA odwrócenia: licznik → 0 oraz Σ debit(vat:output) == Σ credit(vat:output)", async () => {
+      // TO JEST kontrola, która przed tym cyklem była CZERWONA — i to był werdykt.
+      // Dwa niezależne defekty spotykały się w jednym przebiegu:
+      //   (1) TAKSONOMIA — odwrócenie pierwszej raty wchodziło w terminalny
+      //       `REFUNDED` (`ALLOWED[REFUNDED] = []`), więc drugie odwrócenie
+      //       rzucało `EntitlementTransitionError` i licznik zostawał na 500;
+      //   (2) VAT — `reversed_gross_to_date_minor` nie miało OSIĄGALNEGO wejścia
+      //       niezerowego, więc formuła kumulatywno-marginalna degenerowała się
+      //       do wprost proporcjonalnej i `vat:output` schodziło poniżej zera.
+      // Dowód M-3 z cyklu 1 tego nie pokazał, bo wołał `generateVoucherPosting`
+      // BEZPOŚREDNIO. Ta kontrola jedzie PRODUCENTEM (`redeem`/`reverse`).
+      const { runInHttpMarketContext } = require("../../lib/http-market-context")
+      await seedMultiInstallmentEntitlement()
+      const op = operationWithLedger()
+
+      const netVat = {
+        voucher_net_minor: MULTI_NET,
+        voucher_vat_minor: MULTI_VAT,
+      }
+      const r1 = await runInHttpMarketContext(MARKET_A, async () =>
+        op.redeem({
+          entitlement_id: ENT_MULTI,
+          amount_minor: MULTI_INSTALMENT,
+          idempotency_key: "multi-rata-1",
+          ...netVat,
+        }),
+      )
+      const r2 = await runInHttpMarketContext(MARKET_A, async () =>
+        op.redeem({
+          entitlement_id: ENT_MULTI,
+          amount_minor: MULTI_INSTALMENT,
+          idempotency_key: "multi-rata-2",
+          ...netVat,
+        }),
+      )
+      expect(r1.new_state).toBe("REDEEMED_PARTIAL")
+      expect(r2.new_state).toBe("REDEEMED_FULL")
+      expect(await commissionBase(ENT_MULTI)).toBe(MULTI_GROSS)
+
+      // Σ rozpoznanego VAT po DOWOLNYM podziale rat = VAT zawieszony (VER-H1):
+      // rata 1 rozpoznaje 1, rata 2 rozpoznaje 0 (reszta zaokrąglenia).
+      const afterRedeem = await vatOutputSums(ENT_MULTI)
+      expect(afterRedeem.credit).toBe(MULTI_VAT)
+      expect(afterRedeem.debit).toBe(0)
+
+      // ── Odwrócenie raty 1: NIE domyka uprawnienia ─────────────────────────
+      const rev1 = await runInHttpMarketContext(MARKET_A, async () =>
+        op.reverse({ reverses_redemption_id: r1.redemption_id, ...netVat }),
+      )
+      expect(rev1.fully_reversed).toBe(false)
+      expect(rev1.entitlement_state_after).toBe("REDEEMED_PARTIAL")
+      // Stan w BAZIE, nie tylko w zwrotce operacji.
+      expect(await entitlementState(ENT_MULTI)).toBe("REDEEMED_PARTIAL")
+      expect(await commissionBase(ENT_MULTI)).toBe(MULTI_INSTALMENT)
+
+      // ── Odwrócenie raty 2: WYKONALNE (to jest cała stawka ADR-198) ────────
+      const rev2 = await runInHttpMarketContext(MARKET_A, async () =>
+        op.reverse({ reverses_redemption_id: r2.redemption_id, ...netVat }),
+      )
+      expect(rev2.fully_reversed).toBe(true)
+      expect(rev2.entitlement_state_after).toBe("REFUNDED")
+      expect(await entitlementState(ENT_MULTI)).toBe("REFUNDED")
+
+      // ── Werdykt 1: licznik prowizji SCHODZI DO ZERA ───────────────────────
+      expect(await commissionBase(ENT_MULTI)).toBe(0)
+      expect(await countRedemptions(ENT_MULTI)).toBe(4)
+
+      // ── Werdykt 2: `vat:output` netuje do zera ────────────────────────────
+      // Pod formułą wprost proporcjonalną byłoby debit=2 / credit=1, czyli
+      // konto poniżej zera przy KAŻDYM wpisie zbilansowanym (ADR-197 §2.12).
+      const afterReversal = await vatOutputSums(ENT_MULTI)
+      expect(afterReversal.debit).toBe(afterReversal.credit)
+      expect(afterReversal.debit).toBe(MULTI_VAT)
+    })
+
+    it("odwrócenie z terminalnego REFUNDED (ścieżka NIE-5.7) jest odmawiane komunikatem DOMENOWYM", async () => {
+      // Uprawnienie mogło dojść do `REFUNDED` inną ścieżką (`refund-entitlement.ts`,
+      // `DISPUTED → REFUNDED`). Wtedy odmowa przychodziła z okablowania jako
+      // `EntitlementTransitionError` — komunikat o krawędzi grafu tam, gdzie
+      // faktem domenowym jest „to uprawnienie jest już zwrócone".
+      const { runInHttpMarketContext } = require("../../lib/http-market-context")
+      const redemptionId = await redeemThenBuildOperation()
+      await admin.raw(
+        `UPDATE entitlement_instance SET state = 'REFUNDED' WHERE id = ?`,
+        [ENT_A],
+      )
+      await expect(
+        runInHttpMarketContext(MARKET_A, async () =>
+          operationWithLedger().reverse({ reverses_redemption_id: redemptionId }),
+        ),
+      ).rejects.toThrow(/REFUNDED.*graf nie prowadzi do REFUND_REQUESTED/s)
+      // Fail-closed PRZED jakimkolwiek zapisem.
+      expect(await countRedemptions()).toBe(1)
     })
 
     it("UPDATE i DELETE na kanonicznej są ZAKAZANE MECHANIZMEM, nie komentarzem", async () => {

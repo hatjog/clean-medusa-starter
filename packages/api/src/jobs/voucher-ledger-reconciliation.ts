@@ -98,10 +98,28 @@ export type ExpectedLedgerEventRef = {
   expected_transaction_id: string
 }
 
-/** Referencja terminalnego entitlementu REFUNDED (M1 — out-of-scope, alarm-only). */
+/**
+ * Referencja terminalnego entitlementu REFUNDED (M1 — alarm-only, NO posting).
+ *
+ * v1.15.0 Story 5.7: `REFUNDED` PRZESTAŁ być jednorodny. Odwrócenie realizacji
+ * (`reverse()`) wykonuje posting `lifecycle_event = REFUNDED` i zostawia po sobie
+ * wiersz `voucher_redemption.kind = 'REVERSAL'`. Klasyfikowanie KAŻDEGO
+ * `REFUNDED` jako „refund out-of-scope, NO posting" jest po 5.7 twierdzeniem
+ * NIEPRAWDZIWYM — dlatego skaner musi rozróżniać dwie populacje:
+ *   - `REFUNDED` OBSŁUŻONY ścieżką 5.7 (`has_reversal_row = true`) — posting
+ *     istnieje albo należy do gałęzi (2), nigdy „out of scope";
+ *   - `REFUNDED` osiągnięty ścieżką SPRZED 5.7 (`refund-entitlement.ts`,
+ *     `DISPUTED → REFUNDED`) — nadal bez postingu, nadal alarm.
+ */
 export type RefundedEntitlementRef = {
   entitlement_id: string
   market_id: string | null
+  /**
+   * `true` gdy uprawnienie ma wiersz `kind='REVERSAL'` w kanonicznej, czyli
+   * przeszło przez producenta 5.7. Pole opcjonalne, bo porty testowe sprzed 5.7
+   * go nie znają — brak wartości czytamy jako `false` (fail-closed: alarm).
+   */
+  has_reversal_row?: boolean
 }
 
 /**
@@ -189,8 +207,11 @@ const METRIC_PROJECTION_DRIFT = "voucher_ledger.reconciliation.projection_drift"
 /**
  * Uruchamia inwariant reconciliation. Zwraca raport.
  *
- * 1. REFUNDED (M1): dla każdego terminalnego REFUNDED ⇒ ALARM `refund_out_of_scope`
- *    (NO posting; ADR-139 §Granice) — widoczne w monitoringu LNE, NIE silent skip.
+ * 1. REFUNDED (M1): dla terminalnego REFUNDED **bez** wiersza `kind='REVERSAL'`
+ *    ⇒ ALARM `refund_out_of_scope` (NO posting; ADR-139 §Granice) — widoczne
+ *    w monitoringu LNE, NIE silent skip. Z wierszem `REVERSAL` ⇒ zwrot obsłużony
+ *    producentem 5.7, posting REFUNDED jest w zakresie (ADR-197 §2.4, ADR-198),
+ *    więc alarmu NIE MA; kompletność mierzy gałąź (2).
  * 2. Oczekiwane zdarzenia (per-rata, H1/H2): dla każdego bez wpisu:
  *    - re-derywuj `transaction_id` z dyskryminatora; dryf vs projekcja ⇒ alarm;
  *    - `market_id` NULL ⇒ alarm `null_market_id` (obserwowalność), kontynuuj;
@@ -216,10 +237,26 @@ export async function runVoucherLedgerReconciliation(
     alarms: [],
   }
 
-  // (1) REFUNDED — out-of-scope, alarm-only (M1, ADR-139 §Granice).
+  // (1) REFUNDED — alarm WYŁĄCZNIE dla ścieżek SPRZED Story 5.7 (M1, ADR-139
+  //     §Granice). Uprawnienie z wierszem `kind='REVERSAL'` przeszło przez
+  //     producenta 5.7, który WYKONUJE posting `lifecycle_event = REFUNDED`
+  //     (ADR-197 §2.4, ADR-198). Alarmowanie go byłoby powtarzaniem nieprawdy
+  //     w każdym cyklu crona — i to na zawsze, bo `REFUNDED` jest terminalny,
+  //     więc taki alarm nigdy się nie wyczyści. Kompletność postingu odwrócenia
+  //     mierzy gałąź (2): jest per-rata (`transaction_id`) i niezależna od stanu.
   if (refunded) {
     const refundedRefs = await refunded.scanRefundedTerminal()
     for (const r of refundedRefs) {
+      if (r.has_reversal_row) {
+        report.noop += 1
+        logger.info(
+          `[${SCHEDULE_NAME}] entitlement '${r.entitlement_id}' terminalny REFUNDED ` +
+            `z wierszem kind='REVERSAL' — zwrot OBSŁUŻONY producentem 5.7, posting ` +
+            `REFUNDED jest w zakresie (ADR-197 §2.4). Kompletność mierzy gałąź (2), ` +
+            `nie ten alarm.`
+        )
+        continue
+      }
       report.alarms.push({
         entitlement_id: r.entitlement_id,
         lifecycle_event: null,
@@ -230,8 +267,10 @@ export async function runVoucherLedgerReconciliation(
       })
       logger.error(
         `[${SCHEDULE_NAME}] ALARM fail-closed: entitlement '${r.entitlement_id}' ` +
-          `terminalny REFUNDED — refund-after-redeem OUT-OF-SCOPE (ADR-139 §Granice, ` +
-          `osobny ADR). NO posting; alarm do interwencji operacyjnej (monitoring LNE).`
+          `terminalny REFUNDED BEZ wiersza kind='REVERSAL' — zwrot osiągnięty ` +
+          `ścieżką spoza producenta 5.7 (refund-entitlement.ts / DISPUTED→REFUNDED), ` +
+          `więc NO posting; alarm do interwencji operacyjnej (monitoring LNE). ` +
+          `Wpięcie tych ścieżek w reverse() należy do Story 5.9 (DW-15-112).`
       )
     }
   }
@@ -457,14 +496,29 @@ export function createPgRefundedScanner(
       try {
         // REFUNDED jest GENUINELY terminalny (brak outbound transitions —
         // models/entitlement.ts) ⇒ skan po stanie jest tu odporny (M1).
-        const res = await client.query<{ id: string; market_id: string | null }>(
-          `SELECT e.id AS id, e.market_id AS market_id
+        //
+        // v1.15.0 Story 5.7: `has_reversal_row` odróżnia zwrot OBSŁUŻONY
+        // producentem 5.7 od zwrotu ze ścieżki sprzed 5.7. Bez tego rozróżnienia
+        // każdy legalny zwrot stawał się TRWAŁYM alarmem operacyjnym opisującym
+        // nieprawdę („NO posting"), bo posting odwracający jest wykonywany.
+        const res = await client.query<{
+          id: string
+          market_id: string | null
+          has_reversal_row: boolean
+        }>(
+          `SELECT e.id         AS id,
+                  e.market_id  AS market_id,
+                  EXISTS (
+                    SELECT 1 FROM voucher_redemption r
+                     WHERE r.entitlement_id = e.id AND r.kind = 'REVERSAL'
+                  )          AS has_reversal_row
              FROM entitlement_instance e
             WHERE e.state = 'REFUNDED'`
         )
         return res.rows.map((row) => ({
           entitlement_id: row.id,
           market_id: row.market_id ?? null,
+          has_reversal_row: row.has_reversal_row === true,
         }))
       } finally {
         client.release?.()

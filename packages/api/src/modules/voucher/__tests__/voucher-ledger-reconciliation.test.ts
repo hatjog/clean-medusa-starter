@@ -309,6 +309,68 @@ describe("Story 2.6 AC3 — reconciliation inwariant kompletności (ADR-139 D2)"
     expect(log.error).toHaveBeenCalled()
   })
 
+  // ── Story 5.7 — REFUNDED OBSŁUŻONY producentem NIE jest „out of scope" ────────
+  it("5.7: REFUNDED z wierszem kind='REVERSAL' ⇒ ZERO alarmów (posting jest w zakresie)", async () => {
+    // Ta kontrola była CZERWONA przed domknięciem: gałąź (1) alarmowała
+    // BEZWARUNKOWO dla każdego `REFUNDED`, twierdząc „NO posting" — a Story 5.7
+    // wykonuje posting `lifecycle_event = REFUNDED`. Ponieważ `REFUNDED` jest
+    // terminalny, alarm NIGDY się nie czyścił: każdy legalny zwrot stawałby się
+    // trwałym alarmem operacyjnym opisującym nieprawdę.
+    const write = jest.fn()
+    const met = metrics()
+    const log = logger()
+    const deps: ReconciliationDeps = {
+      expected: { scanExpectedEventsWithoutPosting: async () => [] },
+      refunded: {
+        scanRefundedTerminal: async () => [
+          { entitlement_id: "ent_rev57", market_id: "pl", has_reversal_row: true },
+        ],
+      },
+      snapshots: { loadSnapshot: async () => null },
+      writer: { write: write as ReconciliationDeps["writer"]["write"] },
+      logger: log,
+      metrics: met,
+      ...ENABLED,
+    }
+    const report = await runVoucherLedgerReconciliation(deps)
+    expect(report.alarms).toEqual([])
+    expect(met.increment).not.toHaveBeenCalledWith(
+      "voucher_ledger.reconciliation.refund_out_of_scope",
+      expect.anything()
+    )
+    expect(log.error).not.toHaveBeenCalled()
+    // Nie „cichy skip": fakt jest policzony i zalogowany z powodem.
+    expect(report.noop).toBe(1)
+    expect(log.info).toHaveBeenCalled()
+    expect(write).not.toHaveBeenCalled()
+  })
+
+  it("5.7: MIESZANA populacja — alarmuje TYLKO zwrot spoza producenta", async () => {
+    // Bez tej kontroli „zero alarmów" byłoby nieodróżnialne od „nigdy nie alarmuje".
+    const log = logger()
+    const deps: ReconciliationDeps = {
+      expected: { scanExpectedEventsWithoutPosting: async () => [] },
+      refunded: {
+        scanRefundedTerminal: async () => [
+          { entitlement_id: "ent_rev57", market_id: "pl", has_reversal_row: true },
+          { entitlement_id: "ent_legacy", market_id: "pl", has_reversal_row: false },
+          // Port sprzed 5.7 nie zna pola — fail-closed czyta brak jako `false`.
+          { entitlement_id: "ent_unknown", market_id: "pl" },
+        ],
+      },
+      snapshots: { loadSnapshot: async () => null },
+      writer: { write: jest.fn() as ReconciliationDeps["writer"]["write"] },
+      logger: log,
+      ...ENABLED,
+    }
+    const report = await runVoucherLedgerReconciliation(deps)
+    expect(report.alarms.map((a) => a.entitlement_id)).toEqual([
+      "ent_legacy",
+      "ent_unknown",
+    ])
+    expect(report.noop).toBe(1)
+  })
+
   // ── L1 — market_id NULL ⇒ alarm null_market_id (+ dosyłka via snapshot) ───────
   it("L1: market_id NULL dla oczekiwanego zdarzenia ⇒ alarm null_market_id, dosyłka nadal działa", async () => {
     const { ref, snapshot } = expiredMpvRefAndSnapshot("ent_nullmkt", null)
@@ -394,7 +456,12 @@ type ProjectionRow = {
 function makeFakeScannerPool(opts: {
   projection: ProjectionRow[]
   appliedTxIds: Set<string>
-  refunded: { id: string; market_id: string | null }[]
+  refunded: {
+    id: string
+    market_id: string | null
+    /** v1.15.0 Story 5.7: czy uprawnienie ma wiersz `kind='REVERSAL'`. */
+    has_reversal_row?: boolean
+  }[]
 }): LedgerPgPool {
   const query = (async (sql: string) => {
     const s = sql.trim()
@@ -406,7 +473,17 @@ function makeFakeScannerPool(opts: {
       return { rows, rowCount: rows.length }
     }
     if (s.includes("entitlement_instance") && s.includes("REFUNDED")) {
-      const rows = opts.refunded.map((r) => ({ id: r.id, market_id: r.market_id }))
+      // Atrapa MUSI odwzorować `EXISTS (… voucher_redemption … kind='REVERSAL')`
+      // z realnego zapytania — inaczej kontrola mierzyłaby atrapę, nie skaner.
+      const selectsReversal =
+        s.includes("voucher_redemption") && s.includes("REVERSAL")
+      const rows = opts.refunded.map((r) => ({
+        id: r.id,
+        market_id: r.market_id,
+        ...(selectsReversal
+          ? { has_reversal_row: r.has_reversal_row === true }
+          : {}),
+      }))
       return { rows, rowCount: rows.length }
     }
     return { rows: [], rowCount: 0 }
@@ -464,8 +541,26 @@ describe("Story 2.6 AC3 — skaner PG (createPgExpectedEventScanner / createPgRe
     })
     const out = await createPgRefundedScanner(pool).scanRefundedTerminal()
     expect(out).toEqual([
-      { entitlement_id: "ent_r1", market_id: "pl" },
-      { entitlement_id: "ent_r2", market_id: null },
+      { entitlement_id: "ent_r1", market_id: "pl", has_reversal_row: false },
+      { entitlement_id: "ent_r2", market_id: null, has_reversal_row: false },
+    ])
+  })
+
+  it("createPgRefundedScanner: MIERZY wiersz kind='REVERSAL' (Story 5.7)", async () => {
+    // Kontrola PĘKA po wyrzuceniu `EXISTS (… kind='REVERSAL')` z zapytania:
+    // atrapa oddaje `has_reversal_row` TYLKO wtedy, gdy SQL o nie pyta.
+    const pool = makeFakeScannerPool({
+      projection: [],
+      appliedTxIds: new Set(),
+      refunded: [
+        { id: "ent_57", market_id: "pl", has_reversal_row: true },
+        { id: "ent_legacy", market_id: "pl", has_reversal_row: false },
+      ],
+    })
+    const out = await createPgRefundedScanner(pool).scanRefundedTerminal()
+    expect(out).toEqual([
+      { entitlement_id: "ent_57", market_id: "pl", has_reversal_row: true },
+      { entitlement_id: "ent_legacy", market_id: "pl", has_reversal_row: false },
     ])
   })
 })

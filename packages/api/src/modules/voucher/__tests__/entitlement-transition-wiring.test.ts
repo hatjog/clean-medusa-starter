@@ -16,7 +16,9 @@ import {
   EntitlementInstanceState,
   ALL_ENTITLEMENT_INSTANCE_STATES,
   ALLOWED_ENTITLEMENT_TRANSITIONS,
+  TERMINAL_ENTITLEMENT_STATES,
   EntitlementTransitionError,
+  canTransition,
 } from "../models/entitlement"
 import { assertEventEnvelopeMatchesContract } from "../../gp-core/market-lifecycle-events"
 import { VOUCHER_LIABILITY_ONLY_V1 } from "../posting-profile"
@@ -351,9 +353,16 @@ describe("Story 3.4 AC3 — inwariant taksonomii (wyłącznie okablowanie, D-5)"
     ])
   })
 
-  it("graf ALLOWED_ENTITLEMENT_TRANSITIONS niezmieniony względem baseline (snapshot D-5)", () => {
+  it("graf ALLOWED_ENTITLEMENT_TRANSITIONS = baseline D-5 + JEDNA krawędź z ADR-198", () => {
     // Snapshot baseline (models/entitlement.ts @ baseline_commit) — okablowanie 3.4
-    // NIE zmienia semantyki żadnej tranzycji ani nie dodaje/usuwa stanu.
+    // NIE zmieniło semantyki żadnej tranzycji ani nie dodało/usunęło stanu.
+    //
+    // JEDYNA zmiana od tamtego baseline'u pochodzi z v1.15.0 Story 5.7 / ADR-198:
+    // `REFUND_REQUESTED → REDEEMED_PARTIAL` (odwrócenie CZĘŚCIOWE). Snapshot jest
+    // aktualizowany JAWNIE, z nazwanym ADR-em, a nie „dociągnięty do zieleni":
+    // pomiar zasięgu tej zmiany (pełna suita tranzycji) pokazał, że pęka
+    // DOKŁADNIE ten jeden snapshot i nic poza nim — żadna inna dziedzina nie
+    // czyta tej krawędzi. Liczba stanów pozostaje 13 (asercja wyżej).
     expect(ALLOWED_ENTITLEMENT_TRANSITIONS).toEqual({
       ISSUED: ["ACTIVE", "VOIDED", "EXPIRED"],
       ACTIVE: [
@@ -384,7 +393,7 @@ describe("Story 3.4 AC3 — inwariant taksonomii (wyłącznie okablowanie, D-5)"
       CLOSED: [],
       VOIDED: [],
       EXPIRED: ["REFUND_REQUESTED", "CLOSED"],
-      REFUND_REQUESTED: ["REFUNDED", "DISPUTED", "ACTIVE"],
+      REFUND_REQUESTED: ["REFUNDED", "DISPUTED", "ACTIVE", "REDEEMED_PARTIAL"],
       REFUNDED: [],
       DISPUTED: ["ACTIVE", "REFUNDED", "CLOSED", "VOIDED"],
       // 'ACTIVE' below is a voucher entitlement state; the only seller/store/vendor
@@ -392,6 +401,40 @@ describe("Story 3.4 AC3 — inwariant taksonomii (wyłącznie okablowanie, D-5)"
       // Mercur 1.5 seller status — migration-drift false positive, suppressed inline:
       PENDING_VENDOR_DECISION: ["VOIDED", "ACTIVE", "REDEEMED_PARTIAL", "REDEEMED_FULL"], // noqa: mercur15-drift
     })
+  })
+
+  // ── ADR-198: krawędź odwrócenia częściowego jest MECHANIZMEM, nie zapisem ──
+  it("ADR-198: REFUND_REQUESTED → REDEEMED_PARTIAL jest DOZWOLONA (odwrócenie częściowe)", () => {
+    // Kontrola PĘKA po usunięciu krawędzi z `models/entitlement.ts` — a wtedy
+    // odwrócenie drugiej raty znów byłoby strukturalnie niewykonalne.
+    expect(
+      canTransition(
+        EntitlementInstanceState.REFUND_REQUESTED,
+        EntitlementInstanceState.REDEEMED_PARTIAL
+      )
+    ).toBe(true)
+    expect(() =>
+      assertWiringTransition(
+        EntitlementInstanceState.REFUND_REQUESTED,
+        EntitlementInstanceState.REDEEMED_PARTIAL
+      )
+    ).not.toThrow()
+  })
+
+  it("ADR-198 NIE rozszczelnia terminalności: REFUNDED nadal bez wyjścia", () => {
+    // Naprawa mogła pójść drugą, GORSZĄ drogą: zrobić `REFUNDED` nieterminalnym.
+    // Ta kontrola trzyma wybraną decyzję — odwrócenie częściowe NIE wchodzi
+    // w `REFUNDED`, więc `REFUNDED` nie musi z niego wychodzić.
+    expect(ALLOWED_ENTITLEMENT_TRANSITIONS.REFUNDED).toEqual([])
+    expect(TERMINAL_ENTITLEMENT_STATES.has(EntitlementInstanceState.REFUNDED)).toBe(
+      true
+    )
+    expect(() =>
+      assertWiringTransition(
+        EntitlementInstanceState.REFUNDED,
+        EntitlementInstanceState.REFUND_REQUESTED
+      )
+    ).toThrow(EntitlementTransitionError)
   })
 
   it("buildTransitionEnvelopes jest czyste i nie woła assertTransition (wszystkie pary stanów)", () => {

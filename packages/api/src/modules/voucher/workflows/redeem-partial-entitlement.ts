@@ -37,6 +37,7 @@ import { createHash } from "node:crypto"
 import { Modules } from "@medusajs/framework/utils"
 
 import {
+  canTransition,
   EntitlementInstanceState,
   EntitlementType,
   snapshotPolicy,
@@ -343,6 +344,27 @@ export class RedemptionBalanceError extends Error {
   }
 }
 
+/**
+ * Odwrócenie ze stanu, z którego uprawnienie nie może wejść w ścieżkę zwrotu
+ * (ADR-198). Predykat NIE jest drugą kopią grafu: pyta wprost
+ * `canTransition(state, REFUND_REQUESTED)`, więc rozjazd z `models/entitlement.ts`
+ * jest strukturalnie niemożliwy. Istnieje dla DIAGNOSTYKI — bez niego odmowa
+ * przychodziła z okablowania jako `EntitlementTransitionError`, czyli komunikatem
+ * o krawędzi grafu tam, gdzie faktem domenowym jest „to uprawnienie jest już
+ * zwrócone / nie było realizowane".
+ */
+export class RedemptionReversalStateError extends Error {
+  readonly error_code = "REVERSAL_SOURCE_STATE_FORBIDDEN"
+  constructor(readonly entitlementId: string, readonly state: string) {
+    super(
+      `odwrócenie: uprawnienie ${entitlementId} jest w stanie '${state}', z którego ` +
+        "graf nie prowadzi do REFUND_REQUESTED — odwrócenie wymaga uprawnienia " +
+        "mogącego wejść w ścieżkę zwrotu (odmowa fail-closed, ADR-198)"
+    )
+    this.name = "RedemptionReversalStateError"
+  }
+}
+
 /** Rynek jest wymagany na ścieżce pieniądza (AD-22) — brak rynku = odmowa zapisu. */
 export class RedemptionMarketRequiredError extends Error {
   readonly error_code = "REDEMPTION_MARKET_REQUIRED"
@@ -472,6 +494,16 @@ export type ReverseRedemptionResult = {
   commission_base_before_minor?: number
   /** Podstawa prowizji PO odwróceniu. Musi być NIŻSZA — to jest cały dowód AC3. */
   commission_base_after_minor?: number
+  /**
+   * Stan uprawnienia PO odwróceniu (ADR-198). `REFUNDED` (terminalny) TYLKO gdy
+   * odwrócenie było pełne (`Σ REVERSAL == Σ REDEMPTION`); przy odwróceniu
+   * częściowym `REDEEMED_PARTIAL`, żeby pozostałe raty dały się odwrócić.
+   * Pole istnieje, bo bez niego rozróżnienie było niewidoczne dla callera —
+   * a od niego zależy, czy odwrócenie kolejnej raty jest jeszcze możliwe.
+   */
+  entitlement_state_after?: EntitlementInstanceState
+  /** `true` gdy to odwrócenie domknęło uprawnienie (Σ REVERSAL == Σ REDEMPTION). */
+  fully_reversed?: boolean
   idempotent: boolean
   posting: TransitionPostingResult
   emit_failed: boolean
@@ -1449,9 +1481,19 @@ export class RedeemPartialEntitlementOperation {
    *     `redemption_id` WIERSZA ODWRACAJĄCEGO — inny niż realizacji, więc
    *     `ledger_posting_applied` nie wchłonie go jako replay.
    *
+   * STAN UPRAWNIENIA PO ODWRÓCENIU (ADR-198). Odwrócenie prowadzi do
+   * terminalnego `REFUNDED` **wyłącznie wtedy**, gdy domyka realizację:
+   * `Σ REVERSAL == Σ REDEMPTION`. Przy odwróceniu CZĘŚCIOWYM (jedna rata z wielu)
+   * uprawnienie wraca do `REDEEMED_PARTIAL`, bo pozostała realizacja stoi.
+   * Wejście w `REFUNDED` po pierwszej racie zamykałoby uprawnienie na zawsze
+   * (`ALLOWED[REFUNDED] = []`) i czyniło odwrócenie kolejnych rat strukturalnie
+   * niewykonalnym — licznik prowizji nie miałby ścieżki zejścia do zera.
+   *
+   * Saldo NIE jest przywracane w ŻADNYM z tych przypadków (ADR-197 §2.5 / A4):
+   * zwrot nie jest odblokowaniem, więc `REDEEMED_PARTIAL` nie nadaje tu nowej
+   * realizowalności — przy `remaining = 0` redeem odmawia na saldzie.
+   *
    * GRANICA: unieważnienie KODU vouchera przy zwrocie należy do Story 5.9.
-   * Ta operacja zamyka uprawnienie (`REDEEMED_* → REFUND_REQUESTED → REFUNDED`)
-   * i NIE oddaje salda do ponownej realizacji — zwrot nie jest odblokowaniem.
    */
   async reverse(input: ReverseRedemptionInput): Promise<ReverseRedemptionResult> {
     const now = input.now ?? this.deps.clock?.() ?? new Date()
@@ -1493,6 +1535,16 @@ export class RedeemPartialEntitlementOperation {
         return { kind: "replay" as const, record: prior }
       }
 
+      // Odmowa PRZED policzeniem totals i przed jakimkolwiek efektem ubocznym:
+      // stan źródłowy musi mieć krawędź do REFUND_REQUESTED. Replay jest wyżej
+      // celowo — powtórzone odwrócenie zamkniętego uprawnienia ma być no-opem,
+      // nie odmową.
+      if (
+        !canTransition(ent.state, EntitlementInstanceState.REFUND_REQUESTED)
+      ) {
+        throw new RedemptionReversalStateError(ent.id, ent.state)
+      }
+
       // ── Reguła bilansu PRZED INSERT-em ────────────────────────────────────
       const baseBefore = await tx.getCommissionBaseMinor(target.entitlement_id)
       assertCommissionBaseWithinBounds(
@@ -1506,6 +1558,21 @@ export class RedeemPartialEntitlementOperation {
       const priorTotals = await tx.getRedemptionGrossTotals(
         target.entitlement_id
       )
+
+      // ── Stan docelowy odwrócenia (ADR-198) ────────────────────────────────
+      // `REFUNDED` jest TERMINALNY (`ALLOWED[REFUNDED] = []`), więc wejście w
+      // niego po odwróceniu PIERWSZEJ z wielu rat zamykało uprawnienie na
+      // zawsze i czyniło odwrócenie drugiej raty strukturalnie niewykonalnym —
+      // licznik prowizji nie miał ścieżki zejścia do zera. Odwrócenie domyka
+      // uprawnienie WYŁĄCZNIE wtedy, gdy po nim `Σ REVERSAL == Σ REDEMPTION`.
+      // Dopóki zostaje niezwrócona realizacja, uprawnienie wraca do
+      // `REDEEMED_PARTIAL`: pozostała realizacja stoi, a saldo NIE jest
+      // przywracane (ADR-197 §2.5 / A4), więc nie powstaje nowa realizowalność.
+      const reversedAfter = priorTotals.reversed_minor + target.amount_minor
+      const fullyReversed = reversedAfter >= priorTotals.redeemed_minor
+      const reversalTargetState = fullyReversed
+        ? EntitlementInstanceState.REFUNDED
+        : EntitlementInstanceState.REDEEMED_PARTIAL
 
       // Symetria z guardem L3 realizacji: ta sama klasa wejścia, ta sama klasa
       // odmowy. Bez tego zawyżone rozbicie net/VAT od callera (np. 50000+11500
@@ -1600,14 +1667,19 @@ export class RedeemPartialEntitlementOperation {
       await tx.updateEntitlementState(
         ent.id,
         EntitlementInstanceState.REFUND_REQUESTED,
-        EntitlementInstanceState.REFUNDED,
+        reversalTargetState,
         now
       )
 
-      // ── Krok 2: REFUND_REQUESTED → REFUNDED (FINANSOWY: posting odwracający) ─
+      // ── Krok 2: REFUND_REQUESTED → REFUNDED|REDEEMED_PARTIAL (FINANSOWY) ──
+      // `lifecycle_event` postingu zostaje `REFUNDED` NIEZALEŻNIE od stanu
+      // docelowego: klasa zdarzenia księgowego to „odwrócenie realizacji", a nie
+      // „uprawnienie się domknęło". Okablowanie nie sprzęga `to` z
+      // `lifecycle_event` (dyskryminatorem dedupe jest `redemption_id` wiersza
+      // odwracającego), więc rozróżnienie zostaje w jednym miejscu.
       const step2 = await wireEntitlementTransitionPersisted(wiringDeps, {
         from: EntitlementInstanceState.REFUND_REQUESTED,
-        to: EntitlementInstanceState.REFUNDED,
+        to: reversalTargetState,
         entitlement_id: ent.id,
         scope,
         actor,
@@ -1638,6 +1710,8 @@ export class RedeemPartialEntitlementOperation {
         reversed: target,
         commissionBaseBefore: baseBefore,
         commissionBaseAfter: baseAfter,
+        entitlementStateAfter: reversalTargetState,
+        fullyReversed,
         posting: step2.posting,
         events: [step1.event, step2.event],
       }
@@ -1683,6 +1757,8 @@ export class RedeemPartialEntitlementOperation {
       amount_minor: txOut.record.amount_minor,
       commission_base_before_minor: txOut.commissionBaseBefore,
       commission_base_after_minor: txOut.commissionBaseAfter,
+      entitlement_state_after: txOut.entitlementStateAfter,
+      fully_reversed: txOut.fullyReversed,
       idempotent: false,
       posting: txOut.posting,
       emit_failed: emitFailed,

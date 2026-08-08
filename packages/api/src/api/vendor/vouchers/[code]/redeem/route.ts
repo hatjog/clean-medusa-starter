@@ -338,6 +338,15 @@ async function redeemInSellerMarket(
   // correlate the redeem event with the vendor session. Failure does not
   // block the 200 response (audit row is observability, not business
   // invariant — the canonical record lives in `voucher_redemption`).
+  //
+  // DECYZJA (v1.15.0 Story 5.7, review cykl 2 / L-4 człon 2): ten log liczy
+  // PRÓBY, nie zdarzenia — dlatego replay ZOSTAWIA drugi wiersz i jest to
+  // zamierzone, a nie przeoczenie. Korelacja SecOps ma widzieć, że sprzedawca
+  // wysłał żądanie DWA razy; wygaszenie drugiego wiersza ukryłoby drugą sesję.
+  // Ale dwa wiersze o IDENTYCZNEJ kopercie (a koperta jest przy replayu bajt
+  // w bajt ta sama — `audit_log_id` i `claimed_at` są deterministyczne) czytają
+  // się jak DWIE realizacje. Dlatego różnica jest w metadanych JAWNIE:
+  // `idempotent_replay` odróżnia próbę od zdarzenia po stronie czytelnika.
   await appendNotificationLog(req.scope, {
     vendor_id: vendorId,
     notification_type: "voucher_redeem",
@@ -345,7 +354,7 @@ async function redeemInSellerMarket(
     recipient_email: "system",
     status: "sent",
     triggered_by: vendorId,
-    metadata: { ...envelope },
+    metadata: { ...envelope, idempotent_replay: redemption.idempotent },
   }).catch(() => {
     // observability-only
   })
