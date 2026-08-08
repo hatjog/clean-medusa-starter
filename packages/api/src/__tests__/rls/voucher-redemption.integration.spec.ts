@@ -113,8 +113,19 @@ function migrationFiles(includeStory57 = true): string[] {
 
 /** SQL migracji modułu — Z PLIKÓW, w kolejności znaczników. */
 async function collectModuleMigrationSql(includeStory57 = true): Promise<string[]> {
+  return collectSqlFromFiles(migrationFiles(includeStory57))
+}
+
+/** SQL WYŁĄCZNIE migracji 5.7 — potrzebny, żeby odpalić ją na stanie zastanym. */
+async function collectStory57MigrationSql(): Promise<string[]> {
+  return collectSqlFromFiles(
+    migrationFiles().filter((f) => f.startsWith(STORY_57_STAMP)),
+  )
+}
+
+async function collectSqlFromFiles(files: string[]): Promise<string[]> {
   const statements: string[] = []
-  for (const file of migrationFiles(includeStory57)) {
+  for (const file of files) {
     const module_ = require(path.join(MIGRATIONS_DIR, file))
     const migrationClass = Object.values(module_).find(
       (v) => typeof v === "function" && typeof (v as any).prototype?.up === "function",
@@ -239,6 +250,19 @@ async function countRedemptions(entitlementId = ENT_A): Promise<number> {
     [entitlementId],
   )
   return res.rows[0].n
+}
+
+/**
+ * `SELECT count(*)` ROLĄ RUCHU, w kontekście rynku — mierzy WIDOCZNOŚĆ, czyli
+ * SKUTEK polityki RLS, a nie jej obecność w katalogu. Świadome przeciwieństwo
+ * {@link countRedemptions}: tamta celowo omija RLS, ta celowo mu podlega.
+ */
+async function countRedemptionsVisibleIn(market: string): Promise<number> {
+  const { runInHttpMarketContext } = require("../../lib/http-market-context")
+  return runInHttpMarketContext(market, async () => {
+    const res = await db.raw(`SELECT count(*)::int AS n FROM voucher_redemption`)
+    return res.rows[0].n as number
+  })
 }
 
 /** Licznik prowizji — WYKONANIE zapytania z ADR-178 §2.3. */
@@ -503,6 +527,241 @@ runOrSkip("Story 5.7 — voucher_redemption ożywiona na realnym Postgresie", ()
       expect(pol.rows).toHaveLength(1)
       expect(`${pol.rows[0].qual} ${pol.rows[0].with_check}`).not.toMatch(/IS NULL/i)
     })
+
+    // ── RLS mierzona SKUTKIEM, nie obecnością ────────────────────────────────
+    // Odczyt `pg_class`/`pg_policies` wyżej mówi tylko tyle, że polityka
+    // ISTNIEJE. Zepsucie jej treści (furtka, zamiana kolumny na
+    // `redemption_market_id`, literówka w nazwie zmiennej sesji) nie zaczerwieni
+    // ani jednej z tamtych asercji. Poniższa trójka mierzy WIDOCZNOŚĆ rolą
+    // ruchu `gp_voucher_runtime` (NOSUPERUSER, nie-właściciel): kontrola
+    // negatywna, kontrola dodatnia i test-the-test.
+
+    it("kontrola NEGATYWNA RLS: wiersz rynku A jest NIEWIDOCZNY z kontekstu rynku B", async () => {
+      await callRedeemRoute(CODE_A, "panel-action-rls-neg")
+      expect(await countRedemptions()).toBe(1) // FAKT istnieje (poza RLS)
+      expect(await countRedemptionsVisibleIn(MARKET_B)).toBe(0) // ale nie z B
+    })
+
+    it("kontrola DODATNIA RLS: ten sam wiersz JEST widoczny z kontekstu rynku A", async () => {
+      // Polityka, przez którą nie przechodzi NIC, jest awarią, nie izolacją —
+      // bez tej kontroli „0 wierszy z B" byłoby nieodróżnialne od „0 zawsze".
+      await callRedeemRoute(CODE_A, "panel-action-rls-pos")
+      expect(await countRedemptionsVisibleIn(MARKET_A)).toBe(1)
+    })
+
+    it("test-the-test RLS: po ROZSZCZELNIENIU polityki kontrola negatywna PĘKA", async () => {
+      await callRedeemRoute(CODE_A, "panel-action-rls-ttt")
+      expect(await countRedemptionsVisibleIn(MARKET_B)).toBe(0)
+
+      // Rozszczelnienie odtwarza REALNY tryb awarii (furtka w polityce), a nie
+      // jej brak: samo `DROP POLICY` przy włączonym RLS daje default-deny,
+      // czyli nadal zero — i kontrola negatywna przeszłaby przy ZEPSUTYM
+      // mechanizmie. Dlatego polityka jest PODMIENIANA na przepuszczającą.
+      await admin.raw(`DROP POLICY market_isolation ON voucher_redemption`)
+      await admin.raw(
+        `CREATE POLICY market_isolation ON voucher_redemption
+           USING (true) WITH CHECK (true)`,
+      )
+      try {
+        expect(await countRedemptionsVisibleIn(MARKET_B)).toBe(1)
+      } finally {
+        await admin.raw(`DROP POLICY market_isolation ON voucher_redemption`)
+        await admin.raw(
+          `CREATE POLICY market_isolation ON voucher_redemption
+             USING (market_id = current_setting('app.gp_market_id', true))
+             WITH CHECK (market_id = current_setting('app.gp_market_id', true))`,
+        )
+      }
+      // Stan docelowy przywrócony — i zmierzony, nie założony.
+      expect(await countRedemptionsVisibleIn(MARKET_B)).toBe(0)
+      expect(await countRedemptionsVisibleIn(MARKET_A)).toBe(1)
+    })
+  })
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // AC2 — GAŁĄŹ NIEPUSTA migracji: backfill i fail-closed, WYKONANE
+  // ───────────────────────────────────────────────────────────────────────────
+
+  describe("AC2 — migracja na tabeli NIEPUSTEJ (gałąź backfillu)", () => {
+    // Suita główna kasuje tabele w `beforeAll` i migruje od zera, więc
+    // `existing_rows = 0` ZAWSZE — gałąź `ELSE` (backfill + `RAISE EXCEPTION`
+    // fail-closed) nie odpalała się ani razu. Kod fail-closed, którego nikt nie
+    // próbował wywołać, jest deklaracją: odwrócone `IF`, literówka w warunku
+    // albo wcześniejszy `COALESCE(…, 'unknown')` zachowałyby się identycznie —
+    // zielono. Tu gałąź jest WYKONANA, na osobnym schemacie.
+    //
+    // Rola migracyjna jest CELOWO nie-superuserem i CELOWO właścicielem tabel:
+    // `entitlement_instance` jest pod `FORCE ROW LEVEL SECURITY` od 2.6, a
+    // `FORCE` obejmuje właściciela. To jest DOKŁADNIE model produkcyjny, którego
+    // konsekwencję migracja 5.7 opisuje w komentarzu — poniżej jest ona
+    // zmierzona wykonaniem, a nie wyrozumowana.
+    const SCHEMA = "story57_backfill"
+    const MIGRATOR_LOGIN = "gp_story57_migrator"
+    const ORPHAN_ENT = "ent_story57_orphan"
+
+    let probe: Knex
+
+    async function exec(sql: string): Promise<any> {
+      // `search_path` CELOWO bez `public`: migracje zawierają
+      // `ALTER TABLE IF EXISTS entitlement_instance`, a przy `public` w ścieżce
+      // ta instrukcja trafiłaby w PRAWDZIWĄ tabelę suity, zanim powstanie kopia
+      // w schemacie roboczym. Sonda nie może zmieniać stanu, który mierzy.
+      const res = await probe.raw(`SET search_path TO ${SCHEMA}; ${sql}`)
+      // Zapytanie wieloinstrukcyjne wraca z node-pg TABLICĄ wyników; bez tego
+      // rozpakowania `res.rows` byłoby `undefined`, a asercja na długość
+      // pękałaby komunikatem o matcherze zamiast o mechanizmie.
+      return Array.isArray(res) ? res[res.length - 1] : res
+    }
+
+    async function setMarketContext(market: string | null): Promise<void> {
+      await probe.raw(`SELECT set_config('app.gp_market_id', ?, false)`, [
+        market ?? "",
+      ])
+    }
+
+    beforeEach(async () => {
+      await admin.raw(`
+        DO $$ BEGIN
+          IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '${MIGRATOR_LOGIN}') THEN
+            CREATE ROLE ${MIGRATOR_LOGIN} LOGIN NOSUPERUSER CREATEROLE
+              PASSWORD '${LOGIN_PASSWORD}';
+          END IF;
+        END $$;
+      `)
+      // Bez GRANT OPTION migracja 2.6 zatrzymałaby się na
+      // `GP_RLS_MIGRATION_REQUIRES_GRANT` — to jej własny, poprawny fail-closed,
+      // ale nie jest przedmiotem tego pomiaru.
+      await admin.raw(
+        `GRANT USAGE ON SCHEMA public TO ${MIGRATOR_LOGIN} WITH GRANT OPTION`,
+      )
+      await admin.raw(`DROP SCHEMA IF EXISTS ${SCHEMA} CASCADE`)
+      await admin.raw(`CREATE SCHEMA ${SCHEMA} AUTHORIZATION ${MIGRATOR_LOGIN}`)
+
+      probe = knex({
+        client: "pg",
+        connection: { connectionString: loginUrl(MIGRATOR_LOGIN) },
+        // JEDNO połączenie: `SET search_path` i `set_config(..., false)` są
+        // sesyjne, więc pula > 1 rozjechałaby kontekst między instrukcjami.
+        pool: { min: 1, max: 1 },
+      })
+
+      for (const sql of await collectModuleMigrationSql(false)) {
+        await exec(sql)
+      }
+    })
+
+    afterEach(async () => {
+      await probe?.destroy()
+      await admin.raw(`DROP SCHEMA IF EXISTS ${SCHEMA} CASCADE`)
+    })
+
+    /** Wiersz ZASTANY w kształcie SPRZED 5.7 (osiem kolumn, zero rynku). */
+    async function seedLegacyRedemption(entitlementId: string): Promise<void> {
+      await exec(`
+        INSERT INTO voucher_redemption
+          (entitlement_id, idempotency_key, redemption_id, amount_minor,
+           resulting_state, remaining_after_minor, issued_gross_minor, created_at)
+        VALUES ('${entitlementId}', 'legacy-1', 'RDM-LEGACY00001', ${ISSUED_GROSS},
+                'REDEEMED_FULL', 0, ${ISSUED_GROSS}, 1)
+      `)
+    }
+
+    async function seedEntitlement(id: string, market: string): Promise<void> {
+      await setMarketContext(market)
+      await exec(`
+        INSERT INTO entitlement_instance
+          (id, entitlement_profile_id, entitlement_type, state, policy_snapshot,
+           market_id, remaining_amount, vat_classification, created_at, updated_at)
+        VALUES ('${id}', 'prof_story57', 'VOUCHER_AMOUNT', 'REDEEMED_FULL',
+                '{"voucher_code":"${CODE_A}","market_id":"${market}"}'::jsonb,
+                '${market}', 0, 'MPV', now(), now())
+      `)
+    }
+
+    async function runStory57(): Promise<void> {
+      for (const sql of await collectStory57MigrationSql()) {
+        await exec(sql)
+      }
+    }
+
+    it("gałąź NIEPUSTA: wiersz zastany dostaje rynek z entitlement_instance, kind=REDEMPTION i NOT NULL", async () => {
+      // Rynek CELOWO inny niż domyślny rynek suity — gdyby backfill brał
+      // wartość skądinąd (literał, DEFAULT), ta asercja by to pokazała.
+      await seedEntitlement(ENT_A, MARKET_B)
+      await seedLegacyRedemption(ENT_A)
+      await setMarketContext(MARKET_B) // rola migracyjna WIDZI źródło
+
+      await runStory57()
+
+      const row = await exec(
+        `SELECT market_id, purchase_market_id, redemption_market_id, kind,
+                reverses_redemption_id
+           FROM voucher_redemption WHERE entitlement_id = '${ENT_A}'`,
+      )
+      expect(row.rows).toHaveLength(1)
+      expect(row.rows[0]).toEqual({
+        market_id: MARKET_B,
+        purchase_market_id: MARKET_B,
+        redemption_market_id: MARKET_B,
+        kind: "REDEMPTION",
+        reverses_redemption_id: null,
+      })
+
+      // Droga trójfazowa MUSI kończyć się tym samym stanem co gałąź pusta.
+      const nullability = await exec(
+        `SELECT column_name, is_nullable FROM information_schema.columns
+          WHERE table_schema = '${SCHEMA}' AND table_name = 'voucher_redemption'
+            AND column_name IN ('market_id','purchase_market_id',
+                                'redemption_market_id','kind')
+          ORDER BY column_name`,
+      )
+      expect(nullability.rows.map((r: any) => r.is_nullable)).toEqual([
+        "NO",
+        "NO",
+        "NO",
+        "NO",
+      ])
+    })
+
+    it("FAIL-CLOSED: wiersz bez odpowiadającego uprawnienia ZATRZYMUJE migrację", async () => {
+      // Test-the-test fail-closed: gdyby `RAISE EXCEPTION` miał odwrócony
+      // warunek albo gdyby backfill domykał brak rynku literałem 'unknown',
+      // ta asercja pękłaby — migracja przeszłaby na zielono.
+      await seedEntitlement(ENT_A, MARKET_A)
+      await seedLegacyRedemption(ORPHAN_ENT) // sierota: brak entitlementu
+      await setMarketContext(MARKET_A)
+
+      await expect(runStory57()).rejects.toThrow(
+        /GP_VOUCHER_REDEMPTION_BACKFILL_NO_MARKET/,
+      )
+
+      // Zatrzymana znaczy ZATRZYMANA. Cały blok `DO $$` jest jedną instrukcją,
+      // więc `RAISE EXCEPTION` wycofuje także `ADD COLUMN` — po odmowie tabela
+      // nie ma ANI JEDNEJ kolumny rynku. Żaden wiersz nie dostał 'unknown',
+      // bo żadna kolumna nie przetrwała.
+      const cols = await exec(
+        `SELECT column_name FROM information_schema.columns
+          WHERE table_schema = '${SCHEMA}' AND table_name = 'voucher_redemption'
+            AND column_name LIKE '%market%'`,
+      )
+      expect(cols.rows).toEqual([])
+    })
+
+    it("ROLA MIGRACYJNA BEZ KONTEKSTU RYNKU nie widzi źródła pod FORCE RLS ⇒ fail-closed", async () => {
+      // To jest scenariusz, który migracja opisywała WYŁĄCZNIE rozumowaniem
+      // („rola migracyjna bez app.gp_market_id zobaczy zero wierszy"). Skutek
+      // jest taki, że na NIEPUSTYM środowisku migracja NIE PRZEJDZIE bez
+      // ustawienia kontekstu rynku — i lepiej wiedzieć to tutaj niż przy
+      // deployu. Fakt jest udokumentowany w ADR-197 §2.10 i w rejestrze
+      // zaległości jako wymóg runbooka operatora.
+      await seedEntitlement(ENT_A, MARKET_A)
+      await seedLegacyRedemption(ENT_A)
+      await setMarketContext(null) // BEZ kontekstu — jak zwykły `migration up`
+
+      await expect(runStory57()).rejects.toThrow(
+        /GP_VOUCHER_REDEMPTION_BACKFILL_NO_MARKET/,
+      )
+    })
   })
 
   // ───────────────────────────────────────────────────────────────────────────
@@ -514,6 +773,16 @@ runOrSkip("Story 5.7 — voucher_redemption ożywiona na realnym Postgresie", ()
       // Odtworzenie DOKŁADNIE tego, co trasa robiła przed tą story: `claim()`
       // i nic więcej. Bez tego pomiaru „ożywiliśmy" jest nieodróżnialne od
       // „zawsze tak było".
+      //
+      // CZYM TEN DOWÓD NIE JEST (wzorzec werdyktu `_testPool` z 2.6): to NIE
+      // jest przebieg na HEAD sprzed zmiany. AC1 mówi „ten sam przebieg na HEAD
+      // sprzed zmiany daje count(*) = 0", a tu odtwarzamy ZACHOWANIE sprzed
+      // zmiany na NOWYM kodzie. Argument jest konstrukcyjny: projekcja
+      // (`VoucherService.claim`) nie ma dostępu do kanonicznej i nie ma jak jej
+      // zapisać — nie odwołuje się do `voucher_redemption` w ogóle. Realnym
+      // przebiegiem „przed" jest baseline SCHEMATU niżej (AC2), wykonany na
+      // komplecie migracji BEZ 5.7. Ta różnica jest tu nazwana, a nie
+      // przemilczana.
       const { runInHttpMarketContext } = require("../../lib/http-market-context")
       await runInHttpMarketContext(MARKET_A, async () => {
         const result = await service.claim(CODE_A)
@@ -568,9 +837,20 @@ runOrSkip("Story 5.7 — voucher_redemption ożywiona na realnym Postgresie", ()
       // TO jest asercja, o którą chodzi: powtórzenie NIE tworzy drugiego wiersza.
       expect(await countRedemptions()).toBe(1)
 
-      // …a koperta audytowa jest TA SAMA, nie druga koperta o tym samym zdarzeniu.
-      expect(second.body.envelope.audit_log_id).toBe(
-        first.body.envelope.audit_log_id,
+      // …a koperta audytowa opisuje TO SAMO ZDARZENIE, nie drugie zdarzenie
+      // o tym samym identyfikatorze. Asercja na sam `audit_log_id`
+      // przepuszczała `claimed_at` z czasem DRUGIEGO żądania — identyfikator
+      // był ten sam, koperta inna.
+      //
+      // `prior_status`/`new_status` są ŚWIADOMIE wyłączone z porównania: opisują
+      // ŻĄDANIE (idle→claimed, potem claimed→already_claimed), a nie fakt
+      // realizacji. To jest ta sama rozdzielność, którą niesie M5.
+      const factFields = ({ prior_status, new_status, ...rest }: any) => rest
+      expect(factFields(second.body.envelope)).toEqual(
+        factFields(first.body.envelope),
+      )
+      expect(second.body.envelope.claimed_at).toBe(
+        first.body.envelope.claimed_at,
       )
     })
 
@@ -720,7 +1000,9 @@ runOrSkip("Story 5.7 — voucher_redemption ożywiona na realnym Postgresie", ()
     it("posting odwracający DOCIERA do ledgera i NIE jest deduplikowany jako replay", async () => {
       const { runInHttpMarketContext } = require("../../lib/http-market-context")
 
-      // Ta kontrola jedzie ŚCIEŻKĄ WORKFLOWOWĄ z JAWNYM rozbiciem net/VAT,
+      // Ta kontrola jedzie BEZPOŚREDNIM WYWOŁANIEM OPERACJI z tego pliku
+      // (nie trasą i nie workflowem — takiej ścieżki produkcyjnej NIE MA,
+      // wpięcie `reverse()` należy do Story 5.9, DW-15-107), z JAWNYM rozbiciem net/VAT,
       // bo `policy_snapshot` rozbicia nie niesie, a bez VAT-u generator zwraca
       // udokumentowany no-op i do ledgera nie ma czego zapisać. Nazwane wprost:
       // przez trasę panelową (VAT = 0) ten posting jest no-opem z powodem,
@@ -856,6 +1138,30 @@ runOrSkip("Story 5.7 — voucher_redemption ożywiona na realnym Postgresie", ()
       ).rejects.toThrow(/permission denied/i)
       expect(await countRedemptions()).toBe(1)
     })
+
+    it("UPDATE/DELETE są zakazane TAKŻE POZA kontekstem rynku (ścieżka bez HTTP)", async () => {
+      // Poprzednia kontrola jedzie WEWNĄTRZ `runInHttpMarketContext`, czyli
+      // dokładnie tam, gdzie hook puli wykonał już `SET ROLE medusa_store`.
+      // Hook przełącza rolę WARUNKOWO (`if (!ctx?.market_id) return connection`),
+      // więc job, subscriber, workflow albo skrypt operacyjny bez kontekstu
+      // rynku jedzie rolą z `DATABASE_URL`. Ta kontrola mierzy TĘ ścieżkę.
+      //
+      // GRANICA POMIARU, nazwana wprost: w suicie rola logowania
+      // (`gp_voucher_runtime`) NIE JEST właścicielem tabel modułu, więc granty
+      // ją wiążą także bez `SET ROLE`. Na środowisku, gdzie `DATABASE_URL`
+      // wskazuje rolę WŁAŚCICIELA tabel, granty jej nie wiążą — to jest
+      // zależność, od której gwarancja append-only realnie zależy (ADR-197 §5,
+      // rejestr zaległości). Suita nie może tego wykryć za środowisko;
+      // może tylko nie udawać, że wykrywa.
+      await callRedeemRoute(CODE_A, "panel-action-nocontext")
+      await expect(
+        db.raw(`UPDATE voucher_redemption SET amount_minor = 1`),
+      ).rejects.toThrow(/permission denied for table voucher_redemption/i)
+      await expect(
+        db.raw(`DELETE FROM voucher_redemption`),
+      ).rejects.toThrow(/permission denied for table voucher_redemption/i)
+      expect(await countRedemptions()).toBe(1)
+    })
   })
 
   // ───────────────────────────────────────────────────────────────────────────
@@ -950,35 +1256,22 @@ runOrSkip("Story 5.7 — voucher_redemption ożywiona na realnym Postgresie", ()
       // Gdyby ktoś usunął `up()` migracji 5.7, ta asercja pęka — a nie „nie widzi".
     })
 
-    it("test-the-test: podmiana typu kolumny kwotowej na integer CZERWIENI suitę", async () => {
+    it("kolumna kwotowa jest bigint — asercja, która PĘKA po podmianie typu", async () => {
       // ADR-166: fixture z własnym `integer` maskował błędny typ i suita
-      // świeciła na zielono. Tu mechanizm jest psuty realnie i kontrola pęka.
-      const typeOf = async () => {
-        const res = await admin.raw(
-          `SELECT data_type FROM information_schema.columns
-            WHERE table_name = 'voucher_redemption' AND column_name = 'amount_minor'`,
-        )
-        return res.rows[0].data_type
-      }
-
-      expect(await typeOf()).toBe("bigint") // przebieg 1: stan docelowy
-
-      await admin.raw(
-        `ALTER TABLE voucher_redemption ALTER COLUMN amount_minor TYPE integer`,
+      // świeciła na zielono. To jest asercja DOCELOWA — jedyna forma, która
+      // realnie czerwienieje po zepsuciu mechanizmu.
+      //
+      // Wcześniejsza redakcja psuła typ tutaj i ŁAPAŁA własną porażkę
+      // (`rejects.toThrow()` na `expect(...).toBe(...)`), przez co test
+      // pozostawał ZIELONY w OBU stanach kolumny — dowodził właściwości Jesta,
+      // nie właściwości mechanizmu. Realny czerwony przebieg (`ALTER COLUMN …
+      // TYPE integer` wykonany poza suitą) jest zapisany w evidence jako
+      // `test-the-test-c-amount-minor-integer.out`, symetrycznie do a/b.
+      const res = await admin.raw(
+        `SELECT data_type FROM information_schema.columns
+          WHERE table_name = 'voucher_redemption' AND column_name = 'amount_minor'`,
       )
-      try {
-        // przebieg 2: mechanizm zepsuty — asercja typu PĘKA.
-        expect(await typeOf()).toBe("integer")
-        await expect(
-          (async () => expect(await typeOf()).toBe("bigint"))(),
-        ).rejects.toThrow()
-      } finally {
-        // przebieg 3: przywrócenie stanu docelowego.
-        await admin.raw(
-          `ALTER TABLE voucher_redemption ALTER COLUMN amount_minor TYPE bigint`,
-        )
-      }
-      expect(await typeOf()).toBe("bigint")
+      expect(res.rows[0].data_type).toBe("bigint")
     })
 
     it("kwoty wracają z node-pg jako STRING — asercja `=== liczba` na surowym wierszu PĘKA", async () => {

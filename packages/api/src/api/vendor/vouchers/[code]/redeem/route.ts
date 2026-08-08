@@ -131,6 +131,22 @@ function readIdempotencyKeyHeader(req: MedusaRequest): string | null {
   return IDEMPOTENCY_KEY_SHAPE.test(trimmed) ? trimmed : null
 }
 
+/**
+ * Czas NAJWCZEŚNIEJSZEGO zdarzenia `claimed` z projekcji — jedno źródło dla
+ * pierwszego żądania i dla replayu. „Najwcześniejsze", nie „ostatnie": koperta
+ * opisuje zdarzenie realizacji, a ono zaszło raz.
+ */
+function earliestClaimedAt(
+  events: Array<{ event_type: string; occurred_at: Date | string }> | undefined
+): string | null {
+  const claimed = (events ?? [])
+    .filter((e) => e.event_type === "claimed")
+    .map((e) => new Date(e.occurred_at).getTime())
+    .filter((t) => Number.isFinite(t))
+    .sort((a, b) => a - b)[0]
+  return claimed === undefined ? null : new Date(claimed).toISOString()
+}
+
 export const POST = async (
   req: RequestWithVendorAuth,
   res: MedusaResponse,
@@ -258,18 +274,8 @@ async function redeemInSellerMarket(
         throw new VoucherExpiredDuringRedeemError(context.voucher_code)
       }
       claimStatus = result.status
-      const claimedEvent = result.voucher.events
-        ?.filter((e) => e.event_type === "claimed")
-        .sort(
-          (a, b) =>
-            new Date(a.occurred_at).getTime() - new Date(b.occurred_at).getTime(),
-        )[0]
       claimedAt =
-        claimedEvent?.occurred_at instanceof Date
-          ? claimedEvent.occurred_at.toISOString()
-          : claimedEvent?.occurred_at
-          ? new Date(claimedEvent.occurred_at).toISOString()
-          : context.now.toISOString()
+        earliestClaimedAt(result.voucher.events) ?? context.now.toISOString()
     },
   })
 
@@ -315,7 +321,14 @@ async function redeemInSellerMarket(
     code,
     prior_status: priorStatus,
     new_status: status,
-    claimed_at: claimedAt ?? new Date().toISOString(),
+    // Przy REPLAYU `writeProjection` nie jest wołany (M6 — projekcja tylko
+    // razem z faktem), więc `claimedAt` zostaje `null`. Świeży `new Date()`
+    // dawałby wtedy czas DRUGIEGO żądania: `audit_log_id` byłby ten sam,
+    // a koperta — inna. Deklarowana własność „retry produkuje TĘ SAMĄ kopertę"
+    // ma obejmować CAŁĄ kopertę, więc czas realizacji jest odczytywany
+    // z istniejącego `voucher_event`, pobranego PRZED realizacją.
+    claimed_at:
+      claimedAt ?? earliestClaimedAt(existing.events) ?? new Date().toISOString(),
     redemption_id: redemption.redemption_id,
     amount_minor: redemption.amount_minor,
     remaining_after_minor: redemption.remaining_after_minor,

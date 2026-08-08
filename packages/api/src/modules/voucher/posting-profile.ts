@@ -251,6 +251,28 @@ export type VoucherPostingInput = {
    * w której każdy konsument musi pamiętać o znaku).
    */
   reversed_gross_minor?: number
+  /**
+   * REFUNDED: brutto odwrócone WCZEŚNIEJSZYMI odwróceniami tego uprawnienia
+   * (bez bieżącego), minor units.
+   *
+   * Istnieje z tego samego powodu co `redeemed_gross_to_date_minor` i musi być
+   * podawane symetrycznie do niego. `proportionalVat` zaokrągla, więc VAT
+   * liczony wprost proporcjonalnie od pojedynczej raty NIE sumuje się do VAT-u
+   * rozpoznanego kumulatywnie-marginalnie przy realizacji. Zmierzony przykład:
+   * `net=999, vat=1, gross=1000`, dwie raty po 500 ⇒ Σ rozpoznanego VAT = 1
+   * (`round(0.5) − 0 = 1`, potem `1 − 1 = 0`), a dwa odwrócenia liczone wprost
+   * dałyby Σ = 2 (`round(0.5)` dwa razy). `vat:output` zszedłby wtedy PONIŻEJ
+   * ZERA przy zbilansowanym per-wpis ledgerze — `assertBalanced` tego nie łapie,
+   * bo każdy wpis z osobna jest poprawny.
+   */
+  reversed_gross_to_date_minor?: number
+  /**
+   * REFUNDED: brutto zrealizowane do tej pory (Σ REDEMPTION), minor units.
+   * Sufit odwrócenia: Σ odwróceń nie może przekroczyć Σ realizacji — ledger
+   * dopuszczałby inaczej over-reversal strukturalnie, bo jedynym guardem było
+   * porównanie z brutto vouchera.
+   */
+  redeemed_gross_total_minor?: number
   // koperta `ledger-transaction.v1`
   transaction_id: string
   occurred_at: string
@@ -617,12 +639,30 @@ function generateRedemptionReversal(
   assertNonNegativeInteger(input.net_minor, "net_minor")
   const reversedGross = input.reversed_gross_minor ?? 0
   assertNonNegativeInteger(reversedGross, "reversed_gross_minor")
+  const priorReversedGross = input.reversed_gross_to_date_minor ?? 0
+  assertNonNegativeInteger(priorReversedGross, "reversed_gross_to_date_minor")
 
   const totalGross = input.net_minor + input.vat_minor
-  if (reversedGross > totalGross) {
+  const cumulativeReversedGross = priorReversedGross + reversedGross
+  if (cumulativeReversedGross > totalGross) {
     throw new VoucherPostingInvariantError(
-      `over-reverse: reversed_gross_minor (${reversedGross}) > brutto vouchera (${totalGross})`
+      `over-reverse: reversed-to-date (${priorReversedGross}) + reversed_gross_minor (${reversedGross}) = ${cumulativeReversedGross} > brutto vouchera (${totalGross})`
     )
+  }
+
+  // Sufit odwrócenia to Σ REALIZACJI, nie brutto vouchera. Bez tego guardu
+  // over-reversal był dopuszczony strukturalnie: można było odwrócić więcej,
+  // niż kiedykolwiek zrealizowano, byle mieścić się w brutto emisji.
+  if (input.redeemed_gross_total_minor !== undefined) {
+    assertNonNegativeInteger(
+      input.redeemed_gross_total_minor,
+      "redeemed_gross_total_minor"
+    )
+    if (cumulativeReversedGross > input.redeemed_gross_total_minor) {
+      throw new VoucherPostingInvariantError(
+        `over-reverse: reversed-to-date + reversed_gross_minor = ${cumulativeReversedGross} > zrealizowane brutto (${input.redeemed_gross_total_minor})`
+      )
+    }
   }
 
   if (input.vat_classification === "SPV") {
@@ -633,7 +673,13 @@ function generateRedemptionReversal(
     }
   }
 
-  const vatReversed = proportionalVat(input.vat_minor, reversedGross, totalGross)
+  // KUMULATYWNIE-MARGINALNIE, symetrycznie do `generateRedeemed`. Wprost
+  // proporcjonalny VAT od pojedynczej raty rozjeżdża się z rozpoznanym na
+  // resztach zaokrągleń i pozwala zdjąć z `vat:output` więcej, niż tam
+  // kiedykolwiek trafiło (patrz `reversed_gross_to_date_minor`).
+  const vatReversed =
+    proportionalVat(input.vat_minor, cumulativeReversedGross, totalGross) -
+    proportionalVat(input.vat_minor, priorReversedGross, totalGross)
   if (vatReversed === 0) {
     return {
       posted: false,

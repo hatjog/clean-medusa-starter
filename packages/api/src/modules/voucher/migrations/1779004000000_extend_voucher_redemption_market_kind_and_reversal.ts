@@ -251,6 +251,21 @@ export class Migration1779004000000 extends Migration {
         WHERE reverses_redemption_id IS NOT NULL
     `)
 
+    // ── (4b) Indeks MOSTU kod → uprawnienie (ADR-197 §2.9) ───────────────────
+    // `resolveEntitlementsByVoucherCodeForUpdate` filtruje po wyrażeniu
+    // `policy_snapshot->>'voucher_code'` i robi to POD `FOR UPDATE`, czyli
+    // wewnątrz transakcji trzymającej row-lock. Bez indeksu wyrażeniowego każde
+    // `POST /vendor/vouchers/:code/redeem` wykonuje SEKWENCYJNY SKAN
+    // `entitlement_instance` dokładnie w oknie, w którym czekają równoległe
+    // realizacje TEGO SAMEGO uprawnienia. To jest decyzja o schemacie ścieżki
+    // pieniądza, więc należy do ADR-a (ADR-197 §2.9), nie do komentarza w kodzie.
+    // Indeks jest wyrażeniowy, bo denormalizacja `voucher_code` do własnej
+    // kolumny zmieniałaby kształt zamrożony w ADR-178 §2.4.
+    this.addSql(`
+      CREATE INDEX IF NOT EXISTS idx_entitlement_instance_voucher_code
+        ON entitlement_instance ((policy_snapshot->>'voucher_code'))
+    `)
+
     // ── (5) RLS na kanonicznej — wejście zaplanowane przez 2.6 ───────────────
     // Migracja 2.6 (`1779000000000`) świadomie zostawiła `voucher_redemption`
     // poza swoim zakresem, nazywając 5.7 jako story, która ją wprowadza.

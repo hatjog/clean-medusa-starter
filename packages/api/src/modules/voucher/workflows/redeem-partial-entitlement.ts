@@ -191,6 +191,30 @@ export const COMMISSION_BASE_QUERY = `
   WHERE entitlement_id = $1
 ` as const
 
+/**
+ * Rozbicie licznika na DWA składniki, których `COMMISSION_BASE_QUERY` nie
+ * rozróżnia, bo je odejmuje. Posting odwracający potrzebuje obu osobno:
+ * `reversed_minor` jako `reversed_gross_to_date_minor` (kumulatywno-marginalne
+ * rozpoznanie VAT, symetryczne do realizacji), `redeemed_minor` jako sufit
+ * odwrócenia (Σ odwróceń ≤ Σ realizacji). Różnica tych dwóch liczb to ten sam
+ * licznik — dlatego to jest rozbicie, a nie drugie źródło prawdy.
+ */
+export const REDEMPTION_GROSS_TOTALS_QUERY = `
+  SELECT
+    COALESCE(SUM(CASE WHEN kind = 'REDEMPTION' THEN amount_minor ELSE 0 END), 0)
+      AS redeemed_minor,
+    COALESCE(SUM(CASE WHEN kind = 'REVERSAL' THEN amount_minor ELSE 0 END), 0)
+      AS reversed_minor
+  FROM voucher_redemption
+  WHERE entitlement_id = $1
+` as const
+
+/** Σ realizacji i Σ odwróceń dla uprawnienia, w minor units. */
+export type RedemptionGrossTotals = {
+  redeemed_minor: number
+  reversed_minor: number
+}
+
 // ──────────────────────────────────────────────────────────────────────────
 // Błędy fail-closed
 // ──────────────────────────────────────────────────────────────────────────
@@ -580,6 +604,11 @@ export interface RedeemPartialTx {
    * {@link COMMISSION_BASE_QUERY} (ADR-178 §2.3), nie własna wersja.
    */
   getCommissionBaseMinor(entitlementId: string): Promise<number>
+  /**
+   * Σ realizacji i Σ odwróceń OSOBNO ({@link REDEMPTION_GROSS_TOTALS_QUERY}).
+   * Wołane PRZED wstawieniem wiersza odwracającego, więc zwraca stan „prior".
+   */
+  getRedemptionGrossTotals(entitlementId: string): Promise<RedemptionGrossTotals>
   /**
    * Zwraca DOWOLNY istniejący record dla danego entitlementu (pierwsza rata
    * multi-installment). Używany do walidacji spójności net/vat (L3, VER-H1).
@@ -1167,11 +1196,20 @@ export class RedeemPartialEntitlementOperation {
         )
       }
 
+      // Rynek jest FAKTEM ŚCIEŻKI PIENIĄDZA (AD-22), nie polem opcjonalnym:
+      // brak rynku zakupu to ODMOWA zapisu, nie `'unknown'`. Rezolucja stoi
+      // PRZED budową scope'u postingu, żeby ta sama wartość niosła oba użycia —
+      // wcześniej scope domykał brak rynku literałem `"unknown"`, czyli
+      // dokładnie wartością, którą migracja i producent nazywają zakazaną.
+      // Kolejność jest tu częścią mechanizmu: odmowa zapada PRZED jakąkolwiek
+      // mutacją stanu, a nie po niej.
+      const markets = resolveRedemptionMarkets(ent, input)
+
       // L4: scope postingu dziedziczy vendor_id/location_id z entitlement_instance
       // (nie tylko z inputu callera). Zapis entitlementu jest źródłem prawdy.
       const scope: TransitionScope = {
         instance_id: ent.id,
-        market_id: (input.market_id ?? ent.market_id) ?? "unknown",
+        market_id: markets.market_id,
         sales_channel_id: input.sales_channel_id ?? ent.sales_channel_id ?? null,
         vendor_id: input.vendor_id ?? ent.vendor_id ?? null,
         location_id: input.location_id ?? ent.location_id ?? null,
@@ -1217,9 +1255,6 @@ export class RedeemPartialEntitlementOperation {
       // insertRedemption i updateRemaining POPRZEDZAJĄ posting hook (krok 2).
       // Zapobiega rozjazdowi state↔ledger po aktywacji: jeśli INSERT rzuci
       // (anomalia serializacji), rollback cofa mutacje stanu, a posting NIE nastąpił.
-      // Rynek jest FAKTEM ŚCIEŻKI PIENIĄDZA (AD-22), nie polem opcjonalnym:
-      // brak rynku zakupu to odmowa zapisu, a nie `'unknown'`.
-      const markets = resolveRedemptionMarkets(ent, input)
 
       // ── Reguła bilansu (ADR-178 §2.3) — FAIL-CLOSED PRZED INSERT-em ────────
       // CHECK tabelowy nie widzi agregatu, więc predykat musi być tutaj.
@@ -1466,6 +1501,28 @@ export class RedeemPartialEntitlementOperation {
         target.issued_gross_minor
       )
 
+      // Σ realizacji / Σ odwróceń PRZED tym odwróceniem — posting odwracający
+      // liczy VAT kumulatywnie-marginalnie i potrzebuje obu członów osobno.
+      const priorTotals = await tx.getRedemptionGrossTotals(
+        target.entitlement_id
+      )
+
+      // Symetria z guardem L3 realizacji: ta sama klasa wejścia, ta sama klasa
+      // odmowy. Bez tego zawyżone rozbicie net/VAT od callera (np. 50000+11500
+      // dla wiersza o brutto 12300) przechodziło i odwracało VAT policzony na
+      // ZŁEJ PODSTAWIE — jedynym guardem było `reversedGross > totalGross`
+      // w generatorze, czyli porównanie z brutto vouchera, nie z odwracanym
+      // wierszem.
+      const reversalGross = reversalNetVat.netMinor + reversalNetVat.vatMinor
+      if (reversalGross !== target.issued_gross_minor) {
+        throw new RedemptionBalanceError(
+          `odwrócenie: niespójne wejście — rozbicie net/VAT (${reversalNetVat.netMinor}+` +
+            `${reversalNetVat.vatMinor}=${reversalGross}) różni się od brutto emisji ` +
+            `odwracanego wiersza (${target.issued_gross_minor}); odwrócenie cofa ` +
+            "DOKŁADNIE tę podstawę, którą rozpoznała realizacja (fail-closed)"
+        )
+      }
+
       const scope: TransitionScope = {
         instance_id: ent.id,
         market_id: target.market_id,
@@ -1564,6 +1621,8 @@ export class RedeemPartialEntitlementOperation {
           net_minor: reversalNetVat.netMinor,
           vat_minor: reversalNetVat.vatMinor,
           reversed_gross_minor: target.amount_minor,
+          reversed_gross_to_date_minor: priorTotals.reversed_minor,
+          redeemed_gross_total_minor: priorTotals.redeemed_minor,
           // Dyskryminator = redemption_id WIERSZA ODWRACAJĄCEGO (ADR-178 §2.3).
           redemption_id: reversalId,
           currency,
@@ -1859,6 +1918,20 @@ class PostgresRedeemPartialTx implements RedeemPartialTx {
       [entitlementId]
     )
     return Number(res.rows[0]?.commission_base_minor ?? 0)
+  }
+
+  async getRedemptionGrossTotals(
+    entitlementId: string
+  ): Promise<RedemptionGrossTotals> {
+    const res = await this.client.query<Record<string, unknown>>(
+      REDEMPTION_GROSS_TOTALS_QUERY,
+      [entitlementId]
+    )
+    // `bigint` wraca z node-pg STRINGiem (ADR-166) — `Number` jest tu jawny.
+    return {
+      redeemed_minor: Number(res.rows[0]?.redeemed_minor ?? 0),
+      reversed_minor: Number(res.rows[0]?.reversed_minor ?? 0),
+    }
   }
 
   async findAnyRedemptionByEntitlementId(
@@ -2177,6 +2250,24 @@ class InMemoryRedeemPartialTx implements RedeemPartialTx {
           : record.amount_minor
     }
     return base
+  }
+
+  async getRedemptionGrossTotals(
+    entitlementId: string
+  ): Promise<RedemptionGrossTotals> {
+    const totals: RedemptionGrossTotals = {
+      redeemed_minor: 0,
+      reversed_minor: 0,
+    }
+    for (const record of this.redemptions.values()) {
+      if (record.entitlement_id !== entitlementId) continue
+      if (record.kind === REDEMPTION_KIND_REVERSAL) {
+        totals.reversed_minor += record.amount_minor
+      } else {
+        totals.redeemed_minor += record.amount_minor
+      }
+    }
+    return totals
   }
 
   async findAnyRedemptionByEntitlementId(
