@@ -26,7 +26,7 @@ import {
   type CompetitiveInsightsData,
 } from "../../../lib/competitive-insights-aggregator"
 import { resolveInsightSnapshots } from "../../../lib/competitive-insights-source"
-import { NotImplementedError } from "../../../modules/gp-core/service"
+import { VendorNotMappedError } from "../../../modules/gp-core/service"
 import { appendNotificationLog } from "../../../lib/vendor-notification-log"
 
 type RequestWithSellerContext = MedusaRequest & {
@@ -106,11 +106,15 @@ export const GET = async (
   try {
     vendorId = await gpCore.resolveVendorId(sellerId)
   } catch (error) {
-    if (error instanceof NotImplementedError) {
-      logger.warn?.(`[competitive-insights] resolveVendorId stub: ${error.message}`)
-      res.status(501).json({
-        code: "vendor_id_resolution_not_implemented",
-        message: "Vendor ID resolution not yet implemented",
+    // v1.15.0 Story 5.8 (AC1): `resolveVendorId` przestał być stubem, więc
+    // `501 vendor_id_resolution_not_implemented` nie ma już czego opisywać.
+    // Brak mapowania jest ODMOWĄ autoryzacyjną.
+    if (error instanceof VendorNotMappedError) {
+      logger.warn?.(`[competitive-insights] ${error.message}`)
+      res.status(403).json({
+        code: "vendor_not_mapped",
+        message:
+          "to konto sprzedawcy nie jest powiązane z żadnym salonem GP",
       } as unknown as ErrorResponse & CompetitiveInsightsResponse)
       return
     }

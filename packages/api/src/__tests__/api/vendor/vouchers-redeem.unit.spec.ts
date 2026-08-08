@@ -10,10 +10,19 @@
  *   - L6  — POST /vendor/vouchers/:code/redeem → idempotent on second call
  *   - L7  — POST /vendor/vouchers/:code/redeem → 410 on expired voucher
  *
- * Strategy: run the route through the REAL `/vendor/*` gate (Story 5.4) with a
- * signature made from the seller's own provisioned secret. The handler
- * signs/verifies via the production helpers; no Mercur DB is touched.
- * VoucherService is mocked at the container resolve seam.
+ * Strategy (ZMIENIONA w v1.15.0 Story 5.8, AC2): obie trasy są ZWOLNIONE
+ * z bramki HMAC wpisami w `VENDOR_HMAC_EXEMPT_ROUTES` — uwierzytelnia je łańcuch
+ * Mercura (`authenticate("member", …)` + `ensureSellerMiddleware`), który
+ * wypełnia `req.seller_context.seller_id`. Przepuszczanie ich tutaj przez
+ * `withVendorGate` mierzyłoby ścieżkę, którą produkcja już nie chodzi, i to
+ * właśnie ta ścieżka dawała panelowi `401`.
+ *
+ * Ten łańcuch (upstream Mercura) NIE JEST wykonywalny w teście jednostkowym,
+ * więc suita buduje jego SKUTEK — `seller_context` — i wywołuje handler wprost.
+ * Bezpiecznik fail-closed („brak kontekstu ⇒ 401") ma tu WŁASNY przypadek (L11),
+ * a dowodem uwierzytelnienia na realnej ścieżce jest kontrola wykonaniem na
+ * prod-buildzie (AC2/AC3), nie ta suita. VoucherService jest atrapą na szwie
+ * `container.resolve`.
  */
 import { describe, it, expect, beforeEach, afterEach, jest } from "@jest/globals"
 import { buildVendorSignatureHeader } from "../../../lib/vendor-hmac"
@@ -26,11 +35,11 @@ import { GET as lookupHandler } from "../../../api/vendor/vouchers/[code]/lookup
 import { POST as redeemHandler } from "../../../api/vendor/vouchers/[code]/redeem/route"
 import { withVendorGate } from "../../helpers/vendor-auth-chain"
 
-// Story 5.4: the route handlers are bare; authentication is the /vendor/*
-// matcher. Calling them directly would measure the route with NO auth at all,
-// so every case below goes through the production gate first.
-const lookupGET = withVendorGate(lookupHandler)
-const redeemPOST = withVendorGate(redeemHandler)
+// v1.15.0 Story 5.8: trasy są ZWOLNIONE z bramki HMAC, więc `withVendorGate`
+// nie jest już ich ścieżką produkcyjną. Handler jest wołany wprost, a tożsamość
+// przychodzi tak, jak przychodzi w produkcji — w `req.seller_context`.
+const lookupGET = lookupHandler
+const redeemPOST = redeemHandler
 
 const HMAC_SECRET = "vendor-redeem-test-secret"
 const SELLER_ID = "seller_test_001"
@@ -76,9 +85,45 @@ afterEach(() => {
 })
 
 type AppendCall = { input: Record<string, unknown> }
+/**
+ * Atrapa serwisu na szwie kontenera. Od 5.8 trasa woła DWIE operacje
+ * przyjmujące najemcę zamiast pary `getByCode` + `claim`:
+ *   - `getForSeller(sellerId, code)` — tani early-out, `null` dla nieznanego
+ *     I dla cudzego (UX-DR9),
+ *   - `redeemForSeller(sellerId, code, opts)` — WIĄŻĄCY predykat pod blokadą.
+ */
 type VoucherMock = {
-  getByCode: jest.Mock
-  claim: jest.Mock
+  getForSeller: jest.Mock
+  redeemForSeller: jest.Mock
+}
+
+/**
+ * Buduje atrapę z jednego vouchera: `getForSeller` sam odwzorowuje regułę
+ * zakresu (cudzy ⇒ `null`), więc przypadek cross-vendor nie musi jej udawać
+ * ręcznie — a gdyby ktoś ją z trasy usunął, przypadek L5 nadal by ją zmierzył
+ * przez `redeemForSeller`.
+ */
+function voucherMock(
+  voucher: ReturnType<typeof makeVoucher> | null,
+  redeemResult?: unknown,
+): VoucherMock {
+  return {
+    getForSeller: jest.fn(async (sellerId: string) =>
+      voucher && voucher.seller_id === sellerId ? voucher : null,
+    ),
+    redeemForSeller: jest.fn(async (sellerId: string) => {
+      if (!voucher || voucher.seller_id !== sellerId) {
+        return { status: "not_found", voucher: null }
+      }
+      return (
+        redeemResult ?? {
+          status: "redeemed",
+          prior_status: voucher.status,
+          voucher,
+        }
+      )
+    }),
+  }
 }
 
 const ENTITLEMENT_ID = "ent_unit_redeem_1"
@@ -208,6 +253,12 @@ function makeRequest(opts: {
   idempotencyKey?: string | null
   /** Współdzielona atrapa kanonicznej — dla przypadków wielo-żądaniowych. */
   redemptionDb?: ReturnType<typeof createRedemptionFakeDb>
+  /**
+   * `null` = ŚWIADOMY brak kontekstu sprzedawcy (kontrola negatywna L11).
+   * Domyślnie obecny, bo w produkcji wypełnia go łańcuch Mercura PRZED
+   * handlerem.
+   */
+  sellerContext?: { seller_id: string } | null
 }) {
   const sigHeader = buildVendorSignatureHeader(
     SELLER_ID,
@@ -224,6 +275,10 @@ function makeRequest(opts: {
     params: opts.params ?? { code: VOUCHER_CODE },
     body: {},
     query: {},
+    seller_context:
+      "sellerContext" in opts
+        ? (opts.sellerContext ?? undefined)
+        : { seller_id: SELLER_ID },
     headers: {
       "x-vendor-signature": sigHeader,
       ...(idempotencyKey ? { "idempotency-key": idempotencyKey } : {}),
@@ -325,13 +380,10 @@ function makeVoucher(overrides: Partial<{
 describe("cc-4 F-05 — GET /vendor/vouchers/:code/lookup", () => {
   it("L1 — returns 200 + vendor view for owner seller", async () => {
     const voucher = makeVoucher()
-    const mock: VoucherMock = {
-      getByCode: jest.fn(async () => voucher),
-      claim: jest.fn(),
-    }
+    const mock = voucherMock(voucher)
     const req = makeRequest({ voucherService: mock })
     const res = makeRes()
-    await lookupGET(req as never, res as never, jest.fn() as never)
+    await lookupGET(req as never, res as never)
     expect(res.statusCode).toBe(200)
     const body = res.body as { voucher: { code: string; market_id: string | null } }
     expect(body.voucher.code).toBe(VOUCHER_CODE)
@@ -339,26 +391,32 @@ describe("cc-4 F-05 — GET /vendor/vouchers/:code/lookup", () => {
   })
 
   it("L2 — returns 404 for unknown code", async () => {
-    const mock: VoucherMock = {
-      getByCode: jest.fn(async () => null),
-      claim: jest.fn(),
-    }
+    const mock = voucherMock(null)
     const req = makeRequest({ voucherService: mock })
     const res = makeRes()
-    await lookupGET(req as never, res as never, jest.fn() as never)
+    await lookupGET(req as never, res as never)
     expect(res.statusCode).toBe(404)
   })
 
   it("L3 — returns 404 for cross-vendor lookup (no existence leak)", async () => {
     const voucher = makeVoucher({ seller_id: OTHER_SELLER_ID })
-    const mock: VoucherMock = {
-      getByCode: jest.fn(async () => voucher),
-      claim: jest.fn(),
-    }
+    const mock = voucherMock(voucher)
     const req = makeRequest({ voucherService: mock })
     const res = makeRes()
-    await lookupGET(req as never, res as never, jest.fn() as never)
+    await lookupGET(req as never, res as never)
     expect(res.statusCode).toBe(404)
+  })
+
+  // v1.15.0 Story 5.8 (AC2) — bezpiecznik fail-closed. Łańcuch Mercura odrzuca
+  // takie żądanie wcześniej, ale gdyby ktoś go rozmontował, handler MUSI
+  // odmówić, a nie czytać `undefined` jako tożsamość.
+  it("L11 — brak kontekstu sprzedawcy ⇒ 401, handler nie dotyka vouchera", async () => {
+    const mock = voucherMock(makeVoucher())
+    const req = makeRequest({ voucherService: mock, sellerContext: null })
+    const res = makeRes()
+    await lookupGET(req as never, res as never)
+    expect(res.statusCode).toBe(401)
+    expect(mock.getForSeller).not.toHaveBeenCalled()
   })
 })
 
@@ -366,16 +424,14 @@ describe("cc-4 F-05 — POST /vendor/vouchers/:code/redeem", () => {
   it("L4 — returns 200 + 8-key audit envelope", async () => {
     const claimEvent = { event_type: "claimed", occurred_at: new Date("2026-05-24T10:00:00Z") }
     const voucher = makeVoucher()
-    const mock: VoucherMock = {
-      getByCode: jest.fn(async () => voucher),
-      claim: jest.fn(async () => ({
-        status: "claimed",
-        voucher: makeVoucher({ status: "claimed", events: [claimEvent] }),
-      })),
-    }
+    const mock = voucherMock(voucher, {
+      status: "redeemed",
+      prior_status: "idle",
+      voucher: makeVoucher({ status: "claimed", events: [claimEvent] }),
+    })
     const req = makeRequest({ voucherService: mock })
     const res = makeRes()
-    await redeemPOST(req as never, res as never, jest.fn() as never)
+    await redeemPOST(req as never, res as never)
     expect(res.statusCode).toBe(200)
     const body = res.body as {
       ok: boolean
@@ -416,48 +472,39 @@ describe("cc-4 F-05 — POST /vendor/vouchers/:code/redeem", () => {
   // mechanizmu: gdyby serwer podstawiał klucz „na wszelki wypadek", ten przypadek
   // zwróciłby 200 i każdy retry tworzyłby drugi wiersz kanoniczny.
   it("L9 — brak nagłówka Idempotency-Key ⇒ 400, PRZED dotknięciem vouchera", async () => {
-    const mock: VoucherMock = {
-      getByCode: jest.fn(async () => makeVoucher()),
-      claim: jest.fn(),
-    }
+    const mock = voucherMock(makeVoucher())
     const req = makeRequest({ voucherService: mock, idempotencyKey: null })
     const res = makeRes()
-    await redeemPOST(req as never, res as never, jest.fn() as never)
+    await redeemPOST(req as never, res as never)
     expect(res.statusCode).toBe(400)
     expect((res.body as { code: string }).code).toBe("IDEMPOTENCY_KEY_REQUIRED")
-    expect(mock.getByCode).not.toHaveBeenCalled()
-    expect(mock.claim).not.toHaveBeenCalled()
+    expect(mock.getForSeller).not.toHaveBeenCalled()
+    expect(mock.redeemForSeller).not.toHaveBeenCalled()
   })
 
   // v1.15.0 Story 5.7 (ADR-178 §2.2 M3) — wiele uprawnień na jeden kod jest
   // ODMOWĄ, nie cichym wyborem „pierwszego lepszego" wiersza.
   it("L10 — dwa uprawnienia na jeden kod ⇒ 409 ENTITLEMENT_AMBIGUOUS", async () => {
-    const mock: VoucherMock = {
-      getByCode: jest.fn(async () => makeVoucher()),
-      claim: jest.fn(),
-    }
+    const mock = voucherMock(makeVoucher())
     const req = makeRequest({
       voucherService: mock,
       redemptionDb: createRedemptionFakeDb({ entitlementRows: 2 }),
     })
     const res = makeRes()
-    await redeemPOST(req as never, res as never, jest.fn() as never)
+    await redeemPOST(req as never, res as never)
     expect(res.statusCode).toBe(409)
     expect((res.body as { code: string }).code).toBe("ENTITLEMENT_AMBIGUOUS")
-    expect(mock.claim).not.toHaveBeenCalled()
+    expect(mock.redeemForSeller).not.toHaveBeenCalled()
   })
 
   it("L5 — returns 404 for cross-vendor redeem attempt (no state mutation)", async () => {
     const voucher = makeVoucher({ seller_id: OTHER_SELLER_ID })
-    const mock: VoucherMock = {
-      getByCode: jest.fn(async () => voucher),
-      claim: jest.fn(),
-    }
+    const mock = voucherMock(voucher)
     const req = makeRequest({ voucherService: mock })
     const res = makeRes()
-    await redeemPOST(req as never, res as never, jest.fn() as never)
+    await redeemPOST(req as never, res as never)
     expect(res.statusCode).toBe(404)
-    expect(mock.claim).not.toHaveBeenCalled()
+    expect(mock.redeemForSeller).not.toHaveBeenCalled()
   })
 
   // v1.15.0 Story 5.7 (ADR-178 §2.2 M5): źródłem `already_claimed` jest teraz
@@ -468,34 +515,41 @@ describe("cc-4 F-05 — POST /vendor/vouchers/:code/redeem", () => {
   it("L6 — drugie żądanie z tym samym Idempotency-Key ⇒ idempotent=true, already_claimed", async () => {
     const claimEvent = { event_type: "claimed", occurred_at: new Date("2026-05-24T10:00:00Z") }
     const claimedVoucher = makeVoucher({ status: "claimed", events: [claimEvent] })
-    const mock: VoucherMock = {
-      getByCode: jest.fn(async () => makeVoucher()),
-      claim: jest.fn(async () => ({ status: "claimed", voucher: claimedVoucher })),
-    }
+    const mock = voucherMock(makeVoucher(), {
+      status: "redeemed",
+      prior_status: "idle",
+      voucher: claimedVoucher,
+    })
     const redemptionDb = createRedemptionFakeDb()
 
     const first = makeRes()
     await redeemPOST(
       makeRequest({ voucherService: mock, redemptionDb }) as never,
       first as never,
-      jest.fn() as never,
     )
     expect(first.statusCode).toBe(200)
     expect((first.body as { idempotent: boolean }).idempotent).toBe(false)
+    expect((first.body as { outcome: string }).outcome).toBe("redeemed_now")
 
     const second = makeRes()
     await redeemPOST(
       makeRequest({ voucherService: mock, redemptionDb }) as never,
       second as never,
-      jest.fn() as never,
     )
     expect(second.statusCode).toBe(200)
     const body = second.body as {
       idempotent: boolean
+      outcome: string
+      status: string
       envelope: { new_status: string; audit_log_id: string }
     }
     expect(body.idempotent).toBe(true)
-    expect(body.envelope.new_status).toBe("already_claimed")
+    // v1.15.0 Story 5.8 (AC6): odpowiedź niesie `already_claimed`, a KOPERTA —
+    // skutek ZDARZENIA (`claimed`). Gdyby `already_claimed` siedziało w kopercie,
+    // retry produkowałby INNĄ kopertę tego samego zdarzenia.
+    expect(body.outcome).toBe("replayed_same_request")
+    expect(body.status).toBe("already_claimed")
+    expect(body.envelope.new_status).toBe("claimed")
     // Powtórzenie NIE tworzy drugiego wiersza kanonicznego.
     expect(redemptionDb.redemptions.size).toBe(1)
     // …a koperta audytowa jest TA SAMA (M4 pkt 4: `audit_log_id` jest POCHODNĄ
@@ -509,14 +563,17 @@ describe("cc-4 F-05 — POST /vendor/vouchers/:code/redeem", () => {
     const expiredVoucher = makeVoucher({
       expires_at: new Date(Date.now() - 86_400_000),
     })
-    const mock: VoucherMock = {
-      getByCode: jest.fn(async () => expiredVoucher),
-      claim: jest.fn(async () => ({ status: "expired", voucher: expiredVoucher })),
-    }
+    const mock = voucherMock(expiredVoucher, {
+      status: "refused",
+      reason: "expired",
+      voucher: expiredVoucher,
+    })
     const req = makeRequest({ voucherService: mock })
     const res = makeRes()
-    await redeemPOST(req as never, res as never, jest.fn() as never)
+    await redeemPOST(req as never, res as never)
     expect(res.statusCode).toBe(410)
+    // v1.15.0 Story 5.8 (AC7): odmowa niesie ROZRÓŻNIALNY powód, nie tylko kod.
+    expect((res.body as { reason: string }).reason).toBe("expired")
   })
 
   // v1.15.0 Story 2.6 cykl 1 (finding HIGH #1) — kontrola, która PĘKA po zepsuciu
@@ -526,17 +583,14 @@ describe("cc-4 F-05 — POST /vendor/vouchers/:code/redeem", () => {
   // ścieżce realizacji.
   it("L8 — sprzedawca BEZ zadeklarowanego rynku dostaje 409, nie ciche 404", async () => {
     const voucher = makeVoucher()
-    const mock: VoucherMock = {
-      getByCode: jest.fn(async () => voucher),
-      claim: jest.fn(async () => ({ status: "claimed", voucher })),
-    }
+    const mock = voucherMock(voucher)
     const req = makeRequest({ voucherService: mock, sellerMarketId: null })
     const res = makeRes()
-    await redeemPOST(req as never, res as never, jest.fn() as never)
+    await redeemPOST(req as never, res as never)
     expect(res.statusCode).toBe(409)
     expect((res.body as { code: string }).code).toBe("MARKET_CONTEXT_REQUIRED")
     // Odmowa jest PRZED dotknięciem vouchera — żadnego odczytu ani mutacji.
-    expect(mock.getByCode).not.toHaveBeenCalled()
-    expect(mock.claim).not.toHaveBeenCalled()
+    expect(mock.getForSeller).not.toHaveBeenCalled()
+    expect(mock.redeemForSeller).not.toHaveBeenCalled()
   })
 })

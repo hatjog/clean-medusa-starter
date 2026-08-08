@@ -231,10 +231,19 @@ async function callRedeemRoute(
   const req: any = {
     params: { code },
     headers: idempotencyKey ? { "idempotency-key": idempotencyKey } : {},
-    vendorAuth: { vendor_id: VENDOR_A, seller_id: SELLER_A },
+    // v1.15.0 Story 5.8 (AC2): trasa jest ZWOLNIONA z bramki HMAC i czyta
+    // tożsamość z kontekstu sprzedawcy Mercura, a nie z `req.vendorAuth`.
+    // `vendor_id` powstaje z `gp_core.resolveVendorId`, który od 5.8 nie jest
+    // stubem — tu podstawiony, bo `gp_core` mieszka w INNEJ bazie niż moduł
+    // vouchera i ta suita jej nie stawia (rezolucja na realnym Postgresie ma
+    // własną suitę: `voucher-redeem-for-seller.integration.spec.ts`).
+    seller_context: { seller_id: SELLER_A },
     scope: {
       resolve: (key: string) => {
         if (key === ContainerRegistrationKeys.PG_CONNECTION) return db
+        if (key === "gp_core") {
+          return { resolveVendorId: async () => VENDOR_A }
+        }
         return service
       },
     },
@@ -972,8 +981,16 @@ runOrSkip("Story 5.7 — voucher_redemption ożywiona na realnym Postgresie", ()
       await callRedeemRoute(CODE_A, "panel-action-first")
       // Pierwsza realizacja zabrała całe saldo; druga akcja użytkownika trafia
       // w allow-listę stanów wejściowych, nie w cichy drugi wiersz.
+      //
+      // v1.15.0 Story 5.8 (AC7, UX-DR9): status zmienił się `422` → `409`,
+      // i to jest ULEPSZENIE, a nie regresja. `422 REDEMPTION_REFUSED` mówiło
+      // „inwariant domeny", czyli nic, co kosmetolożka może przeczytać. Teraz
+      // odmowa niesie ROZRÓŻNIALNY powód, a `409` opisuje ją poprawnie:
+      // żądanie jest w porządku, wyklucza je STAN zasobu.
       const second = await callRedeemRoute(CODE_A, "panel-action-second")
-      expect(second.statusCode).toBe(422)
+      expect(second.statusCode).toBe(409)
+      expect(second.body.code).toBe("VOUCHER_ALREADY_REDEEMED")
+      expect(second.body.reason).toBe("already_redeemed")
       expect(await countRedemptions()).toBe(1)
     })
 

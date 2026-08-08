@@ -66,12 +66,20 @@ import {
   runInHttpMarketContext,
 } from "../../../../../lib/http-market-context"
 import { resolveRlsConnectionSource } from "../../../../../lib/rls-connection-source"
-import type { VendorAuthContext } from "../../../../../lib/vendor-auth"
+import {
+  resolveVendorForSeller,
+  VendorSellerContextError,
+  type RequestWithSellerContext,
+} from "../../../../../lib/vendor-seller-context"
 import { appendNotificationLog } from "../../../../../lib/vendor-notification-log"
 import {
   VOUCHER_MODULE,
   type VoucherService,
+  type RedeemRefusalReason,
+  type VoucherStatus,
+  resolveRedeemRefusalReason,
 } from "../../../../../modules/voucher"
+import { VOUCHER_NOT_FOUND_BODY } from "../lookup/route"
 import {
   buildAuditLogIdFromIdempotencyKey,
   buildPanelIdempotencyKey,
@@ -85,18 +93,20 @@ import {
   RedemptionMarketRequiredError,
 } from "../../../../../modules/voucher/workflows/redeem-partial-entitlement"
 
-type RequestWithVendorAuth = MedusaRequest & {
-  vendorAuth?: VendorAuthContext
-}
-
 type VendorRedeemAuditEnvelope = {
   audit_log_id: string
   vendor_id: string
   seller_id: string
   market_id: string | null
   code: string
-  prior_status: "idle" | "consent_pending" | "claimed" | "withdrawn"
-  new_status: "claimed" | "already_claimed"
+  prior_status: VoucherStatus
+  /**
+   * Skutek ZDARZENIA realizacji — zawsze `claimed`. Odpowiedź na KONKRETNE
+   * żądanie (`claimed` / `already_claimed`) niesie pole `status` obok koperty:
+   * gdyby siedziało tutaj, powtórka produkowałaby inną kopertę tego samego
+   * zdarzenia i deklaracja „retry daje TĘ SAMĄ kopertę" byłaby nieprawdziwa.
+   */
+  new_status: "claimed"
   claimed_at: string
   /** 5.7: identyfikator wiersza kanonicznego — podstawa rozliczenia. */
   redemption_id: string
@@ -106,9 +116,22 @@ type VendorRedeemAuditEnvelope = {
   remaining_after_minor: number
 }
 
+/**
+ * TRZY rozróżnialne wyniki realizacji (v1.15.0 Story 5.8, AC6, UX-DR8).
+ *
+ * Dwa docierają tu jako `200`; trzeci — „już zrealizowany INNYM żądaniem" —
+ * jest odmową `409 VOUCHER_ALREADY_REDEEMED` z `reason: "already_redeemed"`,
+ * bo `claimed` nie jest na allow-liście stanów wejściowych (AD-17). To NIE
+ * jest ta sama sytuacja co replay: replay ma TEN SAM klucz idempotencji
+ * klienta, więc serwer wie, że to Twoje żądanie doszło dwa razy.
+ */
+type VendorRedeemOutcome = "redeemed_now" | "replayed_same_request"
+
 type VendorRedeemResponse = {
   ok: true
+  /** Zachowane dla zgodności z konsumentami sprzed 5.8. */
   idempotent: boolean
+  outcome: VendorRedeemOutcome
   status: "claimed" | "already_claimed"
   envelope: VendorRedeemAuditEnvelope
 }
@@ -136,19 +159,40 @@ function readIdempotencyKeyHeader(req: MedusaRequest): string | null {
  * pierwszego żądania i dla replayu. „Najwcześniejsze", nie „ostatnie": koperta
  * opisuje zdarzenie realizacji, a ono zaszło raz.
  */
-function earliestClaimedAt(
-  events: Array<{ event_type: string; occurred_at: Date | string }> | undefined
-): string | null {
+function earliestClaimedEvent(
+  events:
+    | Array<{
+        event_type: string
+        occurred_at: Date | string
+        payload?: Record<string, unknown> | null
+      }>
+    | undefined
+): { at: string; prior_status: VoucherStatus | null } | null {
   const claimed = (events ?? [])
     .filter((e) => e.event_type === "claimed")
-    .map((e) => new Date(e.occurred_at).getTime())
-    .filter((t) => Number.isFinite(t))
-    .sort((a, b) => a - b)[0]
-  return claimed === undefined ? null : new Date(claimed).toISOString()
+    .filter((e) => Number.isFinite(new Date(e.occurred_at).getTime()))
+    .sort(
+      (a, b) =>
+        new Date(a.occurred_at).getTime() - new Date(b.occurred_at).getTime()
+    )[0]
+  if (!claimed) return null
+  const prior = claimed.payload?.prior_status
+  return {
+    at: new Date(claimed.occurred_at).toISOString(),
+    prior_status: typeof prior === "string" ? (prior as VoucherStatus) : null,
+  }
+}
+
+function earliestClaimedAt(
+  events:
+    | Array<{ event_type: string; occurred_at: Date | string }>
+    | undefined
+): string | null {
+  return earliestClaimedEvent(events)?.at ?? null
 }
 
 export const POST = async (
-  req: RequestWithVendorAuth,
+  req: RequestWithSellerContext,
   res: MedusaResponse,
 ): Promise<void> => {
   const code = (req.params as { code?: string })?.code
@@ -174,7 +218,23 @@ export const POST = async (
     return
   }
 
-  const { vendor_id: vendorId, seller_id: authenticatedSellerId } = req.vendorAuth!
+  // v1.15.0 Story 5.8 (AC2): tożsamość pochodzi z transportu przeglądarkowego
+  // zadeklarowanego w `VENDOR_HMAC_EXEMPT_ROUTES`, a nie z `req.vendorAuth`
+  // (ta trasa jest ZWOLNIONA z bramki HMAC — patrz nagłówek pliku).
+  let vendorId: string
+  let authenticatedSellerId: string
+  try {
+    // Odczyt kontekstu sprzedawcy JEST TUTAJ, w module trasy — to jest dowód
+    // transportu, który czyta `assert_auth_transport.py`.
+    ;({ vendor_id: vendorId, seller_id: authenticatedSellerId } =
+      await resolveVendorForSeller(req.scope, req.seller_context?.seller_id))
+  } catch (error) {
+    if (error instanceof VendorSellerContextError) {
+      res.status(error.status).json({ code: error.code, message: error.message })
+      return
+    }
+    throw error
+  }
 
   // v1.15.0 Story 2.6 (FR-14e, AD-21 §4) — ta trasa jest HTTP, ale NIE `/store/*`,
   // więc nie przechodzi przez `marketContextMiddleware`. Po włączeniu FORCE RLS
@@ -209,7 +269,7 @@ export const POST = async (
 }
 
 async function redeemInSellerMarket(
-  req: RequestWithVendorAuth,
+  req: RequestWithSellerContext,
   res: MedusaResponse,
   {
     code,
@@ -227,22 +287,25 @@ async function redeemInSellerMarket(
 ): Promise<void> {
   const voucherService = req.scope.resolve(VOUCHER_MODULE) as VoucherService
 
-  // Pre-check: cross-vendor lookup attempts return 404 BEFORE claim() runs
-  // so a malicious vendor cannot flip another vendor's voucher to "claimed".
-  // VoucherService.claim does not enforce vendor scoping on its own.
-  const existing = await voucherService.getByCode(code)
+  // ── Early-out, NIE decyzja autoryzacyjna (v1.15.0 Story 5.8, AD-20) ────────
+  // `getForSeller` zwraca `null` dla kodu nieznanego I cudzego — jedną
+  // gałęzią, jednym ciałem odmowy współdzielonym z trasą lookupu
+  // (`VOUCHER_NOT_FOUND_BODY`), więc „nie twój" i „nieznany" są
+  // nieodróżnialne co do statusu, ciała i nagłówków (UX-DR9). Oba przypadki
+  // wykonują tu DOKŁADNIE tę samą pracę w bazie (jeden odczyt po kodzie),
+  // więc czas odpowiedzi nie różnicuje ich na poziomie grubym.
+  //
+  // WIĄŻĄCY predykat własności NIE jest tutaj: siedzi pod blokadą w
+  // `redeemForSeller`, na tym samym wierszu co mutacja. Ten odczyt jest
+  // wyłącznie tanim odcięciem, żeby nie otwierać transakcji realizacji dla
+  // kodu, który i tak nie ma prawa przejść. Gdyby stan zmienił się między nim
+  // a blokadą, rozstrzyga blokada — i to jest cała różnica wobec kształtu
+  // sprzed 5.8, w którym rozstrzygał TEN odczyt.
+  const existing = await voucherService.getForSeller(authenticatedSellerId, code)
   if (!existing) {
-    res.status(404).json({ code: "VOUCHER_NOT_FOUND", message: "Voucher not found" })
+    res.status(404).json(VOUCHER_NOT_FOUND_BODY)
     return
   }
-  if (existing.seller_id !== authenticatedSellerId) {
-    res.status(404).json({ code: "VOUCHER_NOT_FOUND", message: "Voucher not found" })
-    return
-  }
-
-  // Capture prior status BEFORE the redemption mutates state so the audit
-  // envelope reflects the actual pre-transition value.
-  const priorStatus = existing.status
 
   // Producent kanonicznej jedzie TĄ SAMĄ pulą, którą łata hook RLS (Story 2.6,
   // AD-21 §4). Własna pula byłaby drugim nośnikiem kontekstu rynku i pod
@@ -252,28 +315,35 @@ async function redeemInSellerMarket(
     ContainerRegistrationKeys.PG_CONNECTION,
   )
 
-  // Projekcja ma JEDNEGO producenta: `VoucherService`. Jest wołana z KLIENTEM
-  // TEJ SAMEJ TRANSAKCJI, w której powstał wiersz kanoniczny (M6).
-  let claimStatus: "claimed" | "already_claimed" | null = null
+  // ── JEDNA operacja domenowa przyjmująca najemcę (AD-20) ───────────────────
+  // Do 5.8 stało tu `voucherService.claim(code)` — operacja, która najemcy NIE
+  // ZNA — a własność była sprawdzana wyżej, na innym snapshocie. Teraz
+  // wywoływane jest `redeemForSeller(sellerId, code)`, w którym `seller_id`,
+  // `status` i `expires_at` pochodzą z TEGO SAMEGO `SELECT … FOR UPDATE`, co
+  // mutacja. Klient transakcji jest przekazywany, więc blokada należy do tej
+  // samej transakcji, w której powstał wiersz kanoniczny (M6).
+  //
+  // Każde `throw` stąd wycofuje CAŁĄ transakcję — łącznie z wierszem
+  // kanonicznym — więc odmowa nigdy nie zostawia faktu bez projekcji ani
+  // projekcji bez faktu.
+  let priorStatus: VoucherStatus | null = null
   let claimedAt: string | null = null
   const operation = createRedeemPartialOperationFromPool(connectionSource, {
     async writeProjection(client, context) {
-      const result = await voucherService.claim(context.voucher_code, {
-        now: context.now,
-        client,
-      })
+      const result = await voucherService.redeemForSeller(
+        authenticatedSellerId,
+        context.voucher_code,
+        { now: context.now, client },
+      )
       if (result.status === "not_found") {
-        // Kanoniczna już powstała w tej tx — rozjazd fakt↔projekcja byłby
-        // gorszy niż odmowa. Rzucenie wycofuje CAŁĄ transakcję.
-        throw new RedeemNotRedeemableError(
-          `realizacja: projekcja nie znalazła vouchera '${context.voucher_code}' ` +
-            "po zapisie kanonicznym — rollback fail-closed",
-        )
+        // Kod zniknął ALBO zmienił właściciela między early-outem a blokadą.
+        // Jedno i drugie jest tą samą odmową co wyżej — bajt w bajt.
+        throw new VoucherNotFoundDuringRedeemError(context.voucher_code)
       }
-      if (result.status === "expired") {
-        throw new VoucherExpiredDuringRedeemError(context.voucher_code)
+      if (result.status === "refused") {
+        throw new VoucherRefusedDuringRedeemError(result.reason, context.voucher_code)
       }
-      claimStatus = result.status
+      priorStatus = result.prior_status
       claimedAt =
         earliestClaimedAt(result.voucher.events) ?? context.now.toISOString()
     },
@@ -293,6 +363,26 @@ async function redeemInSellerMarket(
       actor_hint: "vendor:panel-redeem",
     })
   } catch (error) {
+    // Warstwa UPRAWNIENIA odmawia PIERWSZA (`REDEEMABLE_SOURCE_STATES`), więc
+    // przy voucherze już zrealizowanym gałąź `redeemForSeller` nigdy nie biegnie
+    // i kosmetolożka dostawałaby `422 REDEMPTION_REFUSED` — komunikat o
+    // inwariancie domeny, a nie POWÓD, który da się przeczytać (UX-DR9).
+    // ZMIERZONE: bez tego tłumaczenia trzeci przypadek UX-DR8 („już było, ale
+    // nie to żądanie") wychodził jako 422 bez pola `reason`.
+    if (error instanceof RedeemNotRedeemableError) {
+      const reason = resolveRedeemRefusalReason(
+        existing.status,
+        existing.expires_at ?? null,
+        new Date(),
+      )
+      if (reason) {
+        respondToRedemptionError(
+          res,
+          new VoucherRefusedDuringRedeemError(reason, code),
+        )
+        return
+      }
+    }
     respondToRedemptionError(res, error)
     return
   }
@@ -305,13 +395,27 @@ async function redeemInSellerMarket(
   )
   const auditLogId = buildAuditLogIdFromIdempotencyKey(boundIdempotencyKey)
 
-  // M5: źródłem `already_claimed` jest `ON CONFLICT DO NOTHING` na kanonicznej
-  // (zero wstawionych wierszy ⇒ replay), a nie sam `voucher.status`. Dwie
-  // niezależne bariery idempotencji na jednej trasie to dwie prawdy o tym
-  // samym zdarzeniu.
+  // M5: źródłem replayu jest `ON CONFLICT DO NOTHING` na kanonicznej (zero
+  // wstawionych wierszy ⇒ replay), a nie sam `voucher.status`. Dwie niezależne
+  // bariery idempotencji na jednej trasie to dwie prawdy o tym samym zdarzeniu.
+  //
+  // v1.15.0 Story 5.8 (AC6, UX-DR8): wynik ma TRZY przypadki, nie dwa.
+  // Trzeci — „już zrealizowany, ale INNYM żądaniem" — nie dociera tutaj:
+  // jest ODMOWĄ (`VOUCHER_ALREADY_REDEEMED`, 409) z `redeemForSeller`, bo
+  // `claimed` nie jest na allow-liście stanów wejściowych. Dwa przypadki
+  // kończące się sukcesem to:
+  //   `redeemed_now`          — przejście zaszło TERAZ,
+  //   `replayed_same_request` — TEN SAM klucz idempotencji klienta; saldo nie
+  //                             schodzi drugi raz, koperta jest ta sama.
+  // Bez klucza generowanego przez klienta te dwa były nieodróżnialne od
+  // realizacji przez KOGOŚ INNEGO na tym samym koncie salonu — dokładnie ten
+  // scenariusz opisuje UX-DR8.
+  const outcome: VendorRedeemOutcome = redemption.idempotent
+    ? "replayed_same_request"
+    : "redeemed_now"
   const status: "claimed" | "already_claimed" = redemption.idempotent
     ? "already_claimed"
-    : claimStatus ?? "claimed"
+    : "claimed"
 
   const envelope: VendorRedeemAuditEnvelope = {
     audit_log_id: auditLogId,
@@ -319,8 +423,20 @@ async function redeemInSellerMarket(
     seller_id: authenticatedSellerId,
     market_id: existing.market_id ?? sellerMarketId,
     code,
-    prior_status: priorStatus,
-    new_status: status,
+    // Przy replayu projekcja nie biegnie (M6), więc `prior_status` z blokady
+    // nie powstaje. Stan BIEŻĄCY (`claimed`) NIE nadaje się na zamiennik —
+    // różniłby się od koperty pierwszego żądania. Źródłem jest `payload`
+    // najwcześniejszego zdarzenia `claimed`, zapisany przez `redeemForSeller`
+    // W TEJ SAMEJ transakcji co przejście.
+    prior_status:
+      priorStatus ??
+      earliestClaimedEvent(existing.events)?.prior_status ??
+      existing.status,
+    // Koperta opisuje ZDARZENIE REALIZACJI, a to zdarzenie zaszło raz i miało
+    // jeden skutek. `already_claimed` opisuje ODPOWIEDŹ na to żądanie i żyje
+    // w polu `status` odpowiedzi — nie w kopercie, bo inaczej retry
+    // produkowałby inną kopertę tego samego zdarzenia.
+    new_status: "claimed",
     // Przy REPLAYU `writeProjection` nie jest wołany (M6 — projekcja tylko
     // razem z faktem), więc `claimedAt` zostaje `null`. Świeży `new Date()`
     // dawałby wtedy czas DRUGIEGO żądania: `audit_log_id` byłby ten sam,
@@ -362,19 +478,73 @@ async function redeemInSellerMarket(
   const response: VendorRedeemResponse = {
     ok: true,
     idempotent: redemption.idempotent,
+    outcome,
     status,
     envelope,
   }
   res.status(200).json(response)
 }
 
-/** Voucher wygasł między pre-checkiem a projekcją — wycofuje całą transakcję. */
-class VoucherExpiredDuringRedeemError extends Error {
-  readonly error_code = "VOUCHER_EXPIRED"
+/**
+ * Kod zniknął albo zmienił właściciela między early-outem a blokadą.
+ * Wycofuje całą transakcję i wychodzi TĄ SAMĄ odmową co early-out.
+ */
+class VoucherNotFoundDuringRedeemError extends Error {
   constructor(code: string) {
-    super(`voucher '${code}' wygasł i nie może zostać zrealizowany`)
-    this.name = "VoucherExpiredDuringRedeemError"
+    super(`voucher '${code}' nie istnieje w zakresie tego sprzedawcy`)
+    this.name = "VoucherNotFoundDuringRedeemError"
   }
+}
+
+/**
+ * Odmowa z ROZRÓŻNIALNYM powodem (v1.15.0 Story 5.8, AC7, UX-DR9).
+ *
+ * Powód jest kodem MASZYNOWYM; zdanie dla kosmetolożki składa panel z klucza
+ * i18n wywiedzionego z tego kodu — serwer nie wysyła polskiego tekstu, bo
+ * język interfejsu jest własnością panelu, a nie odpowiedzi HTTP.
+ */
+class VoucherRefusedDuringRedeemError extends Error {
+  readonly reason: RedeemRefusalReason
+  readonly error_code: string
+  readonly http_status: number
+
+  constructor(reason: RedeemRefusalReason, code: string) {
+    super(`voucher '${code}': ${REFUSAL_MESSAGES[reason]}`)
+    this.name = "VoucherRefusedDuringRedeemError"
+    this.reason = reason
+    this.error_code = REFUSAL_CODES[reason]
+    this.http_status = REFUSAL_STATUSES[reason]
+  }
+}
+
+/**
+ * Powód → kod maszynowy / status / opis diagnostyczny.
+ *
+ * `expired` zostaje przy `410 Gone` (zachowanie zastane, semantycznie trafne).
+ * `already_redeemed` i `withdrawn` to `409 Conflict`: żądanie jest poprawne,
+ * ale stan zasobu je wyklucza. `422` byłoby tu gorsze — sugerowałoby błąd
+ * w treści żądania, którego nie ma.
+ */
+const REFUSAL_CODES: Record<RedeemRefusalReason, string> = {
+  already_redeemed: "VOUCHER_ALREADY_REDEEMED",
+  withdrawn: "VOUCHER_WITHDRAWN",
+  expired: "VOUCHER_EXPIRED",
+  not_redeemable: "VOUCHER_NOT_REDEEMABLE",
+}
+
+const REFUSAL_STATUSES: Record<RedeemRefusalReason, number> = {
+  already_redeemed: 409,
+  withdrawn: 409,
+  expired: 410,
+  not_redeemable: 409,
+}
+
+const REFUSAL_MESSAGES: Record<RedeemRefusalReason, string> = {
+  already_redeemed: "ten voucher został już zrealizowany",
+  withdrawn: "ten voucher został wycofany i nie może zostać zrealizowany",
+  expired: "ten voucher wygasł i nie może zostać zrealizowany",
+  not_redeemable:
+    "stan tego vouchera nie jest na allow-liście stanów wejściowych realizacji",
 }
 
 /**
@@ -395,8 +565,20 @@ function respondToRedemptionError(res: MedusaResponse, error: unknown): void {
     res.status(400).json({ code: error.error_code, message: error.message })
     return
   }
-  if (error instanceof VoucherExpiredDuringRedeemError) {
-    res.status(410).json({ code: error.error_code, message: error.message })
+  // v1.15.0 Story 5.8 (AC7): odmowa niesie ROZRÓŻNIALNY powód jako pole
+  // `reason` obok kodu — panel mapuje je na zdanie po polsku.
+  if (error instanceof VoucherRefusedDuringRedeemError) {
+    res.status(error.http_status).json({
+      code: error.error_code,
+      reason: error.reason,
+      message: error.message,
+    })
+    return
+  }
+  // Ta odmowa jest CELOWO nieodróżnialna od „kod nieznany": to samo ciało,
+  // ten sam status, ten sam literał źródłowy co w trasie lookupu.
+  if (error instanceof VoucherNotFoundDuringRedeemError) {
+    res.status(404).json(VOUCHER_NOT_FOUND_BODY)
     return
   }
   if (

@@ -86,6 +86,16 @@ if (process.env.TEST_TYPE === "integration:http") {
   module.exports.testMatch = [
     "**/packages/api/src/__tests__/rls/voucher-redemption.integration.spec.[jt]s",
   ];
+} else if (process.env.TEST_TYPE === "redeem-for-seller-pg") {
+  // v1.15.0 Story 5.8 (FR-10a/d/e/f, AD-17, AD-20, ADR-199) — `redeemForSeller`
+  // na REALNYM Postgresie: allow-lista stanow z dowodem czerwieni wykonanym
+  // w suicie, kontrola TOCTOU ROWNOLEGLA (sekwencyjna nie zlapalaby defektu),
+  // idempotencja liczona wierszami kanonicznej. Suita bez profilu jest
+  // mechanizmem martwym — dokladnie ten defekt znalazla 2.6.
+  // DATABASE_URL musi wskazywac IZOLOWANA DB: suita DROP-uje tabele modulu.
+  module.exports.testMatch = [
+    "**/packages/api/src/__tests__/rls/voucher-redeem-for-seller.integration.spec.[jt]s",
+  ];
 } else if (process.env.TEST_TYPE === "compensation-failure-pg") {
   // v1.15.0 Story 3.5 (FR-6c, NFR-3, AD-22) — rejestr nieudanych kompensacji
   // sciezki pieniadza wykonany przez sam modul na realnym Postgresie

@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, jest } from "@jest/globals"
 
-import GpCoreService, { NotImplementedError } from "../service"
+import GpCoreService, { NotImplementedError, VendorNotMappedError } from "../service"
 import {
   EntitlementStatus,
   type Entitlement,
@@ -163,8 +163,60 @@ describe("GpCoreService — Entitlement Stubs", () => {
     await expect(service.redeemVoucher(dto)).rejects.toThrow(NotImplementedError)
   })
 
-  it("resolveVendorId throws NotImplementedError", async () => {
-    await expect(service.resolveVendorId("seller-123")).rejects.toThrow(NotImplementedError)
+  // v1.15.0 Story 5.8 (AC1): przypadek NIE ZNIKA — zostaje PRZEPISANY na nowy
+  // kontrakt. Usunięcie go po cichu zabrałoby jedyny ślad, że ta metoda kiedyś
+  // rzucała `NotImplementedError`, a `lib/vendor-auth.ts` zamieniał to na `501`
+  // na KAŻDYM uwierzytelnionym żądaniu `/vendor/*`.
+  it("resolveVendorId zwraca vendor_id z gp_core.vendor_seller_mappings", async () => {
+    const query = jest.fn() as jest.MockedFunction<
+      (sql: string, params?: unknown[]) => Promise<{ rows: unknown[] }>
+    >
+    query.mockResolvedValue({ rows: [{ vendor_id: "vnd-42" }] })
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    ;(service as any).corePool_ = { query }
+
+    await expect(service.resolveVendorId("sel_01ABC")).resolves.toBe("vnd-42")
+
+    const [sql, params] = query.mock.calls[0] as [string, unknown[]]
+    expect(sql).toContain("gp_core.vendor_seller_mappings")
+    // Zakres `instance_id` jest CZĘŚCIĄ klucza unikalności
+    // `(instance_id, mercur_seller_id)`, a nie ozdobnikiem: bez niego ten sam
+    // `seller_id` z innej instancji rozwiązałby się na cudzego vendora.
+    expect(sql).toContain("instance_id")
+    expect(params).toEqual(["gp-dev", "sel_01ABC"])
+  })
+
+  it("resolveVendorId: brak mapowania to ODMOWA, nie NotImplementedError", async () => {
+    const query = jest.fn() as jest.MockedFunction<
+      (sql: string, params?: unknown[]) => Promise<{ rows: unknown[] }>
+    >
+    query.mockResolvedValue({ rows: [] })
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    ;(service as any).corePool_ = { query }
+
+    await expect(service.resolveVendorId("sel_NIEZNANY")).rejects.toBeInstanceOf(
+      VendorNotMappedError
+    )
+    // `501` znaczyłoby „serwer tego nie umie". Serwer umie — to tożsamość
+    // nie istnieje, a to jest stan AUTORYZACYJNY.
+    await expect(service.resolveVendorId("sel_NIEZNANY")).rejects.not.toBeInstanceOf(
+      NotImplementedError
+    )
+  })
+
+  it("resolveVendorId nie zgaduje identyfikatora dla pustego seller_id", async () => {
+    const query = jest.fn() as jest.MockedFunction<
+      (sql: string, params?: unknown[]) => Promise<{ rows: unknown[] }>
+    >
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    ;(service as any).corePool_ = { query }
+
+    await expect(service.resolveVendorId("   ")).rejects.toBeInstanceOf(
+      VendorNotMappedError
+    )
+    // Fallback na wartość współdzieloną zniknął w Story 5.4 i nie wraca:
+    // pusta tożsamość nie może w ogóle dotknąć bazy.
+    expect(query).not.toHaveBeenCalled()
   })
 
   it("searchVouchers throws NotImplementedError", async () => {

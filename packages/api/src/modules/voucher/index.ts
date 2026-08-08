@@ -24,6 +24,11 @@ export {
   ENTITLEMENT_NO_SHOW_EVENT_TYPE,
   EntitlementExtensionError,
   EntitlementRefundError,
+  // v1.15.0 Story 5.8 (AD-17): allow-lista stanów wejściowych realizacji
+  // dla warstwy `voucher_status` + jej generator klauzuli `WHERE`.
+  VOUCHER_REDEMPTION_INPUT_STATES,
+  redemptionInputStatusInClause,
+  resolveRedeemRefusalReason,
 } from "./service"
 export type {
   ExtendEntitlementInput,
@@ -48,6 +53,8 @@ export type {
   UpsertVoucherInput,
   AppendEventInput,
   ClaimResult,
+  RedeemForSellerResult,
+  RedeemRefusalReason,
   VoucherStatus,
   VoucherEventType,
 } from "./models/types"

@@ -295,6 +295,13 @@ export async function POST(
       client,
     })
 
+    // v1.15.0 Story 5.8 (AD-17): `claim` zna teraz czwarty wynik —
+    // `not_redeemable` (stan spoza allow-listy, np. `withdrawn`). Wcześniej
+    // taki voucher PRZECHODZIŁ, bo `WHERE status <> 'claimed'` go przepuszczał.
+    // Ta gałąź kieruje go do fail-closed `404 not_found`: odbiorczyni nie
+    // dowiaduje się, że kod istnieje, ale został wycofany, a realizacja nie
+    // zachodzi. Rozróżnialny powód należy do powierzchni SPRZEDAWCY (UX-DR9),
+    // nie do publicznej strony odbiorczyni.
     if (claimResult.status !== "claimed") {
       const outcome =
         claimResult.status === "already_claimed"
