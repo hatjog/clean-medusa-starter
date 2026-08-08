@@ -43,6 +43,28 @@ export const VOUCHER_DELIVERY_ATTEMPT_POLICY = Object.freeze({
    * przenosi NOŚNIK, nie zmienia progu.
    */
   max_configuration_recoveries: 1,
+  /**
+   * TWARDY SUFIT prob lacznie dla JEDNEGO wiersza — ochrona przed petla
+   * (Story 4.6, FR-9g).
+   *
+   * Od 4.6 budzet `max_attempt_count` konsumuja WYLACZNIE porazki przypisywalne
+   * odbiorcy: budzet odbiorcy to `attempt_count - non_recipient_failure_count`.
+   * Sam ten warunek jest jednak WYCIEKIEM, nie naprawa — awaria dostawcy, ktora
+   * nie ustepuje, przestaje cokolwiek zuzywac, wiec skan ponawialby ten sam
+   * wiersz co 15 minut bez konca. Dokladnie ta klasa defektu, ktora fala
+   * naprawiala jako N-1 (odparkowanie co cykl crona).
+   *
+   * Ten sufit jest odpowiedzia i jest TRWALY (liczy go kolumna `attempt_count`,
+   * nie pamiec procesu). 40 prob przy cyklu 15 minut to okolo 10 godzin ciaglej
+   * awarii dostawcy — dluzej niz okno, ktore operator ma zauwazyc z eskalacji
+   * (wiersz ktory dobil do sufitu eskaluje z powodem `total_attempt_ceiling`,
+   * rozroznialnym od `recipient_budget`). Granica ZEWNETRZNA pozostaje okno
+   * skanu `SWEEP_GAP_LOOKBACK_MS` (7 dni) — wiersz starszy wypada ze skanu.
+   *
+   * Musi byc ostro wiekszy od `max_attempt_count`, inaczej sufit techniczny
+   * zjadalby budzet odbiorcy zanim ten zdazy sie wyczerpac.
+   */
+  max_total_attempt_count: 40,
 } as const)
 
 /** Skrót na najczęściej czytane pole polityki. */
@@ -52,6 +74,10 @@ export const VOUCHER_DELIVERY_MAX_ATTEMPT_COUNT =
 /** Skrót na trwałą granicę zwrotów budżetu po awarii konfiguracji. */
 export const VOUCHER_DELIVERY_MAX_CONFIGURATION_RECOVERIES =
   VOUCHER_DELIVERY_ATTEMPT_POLICY.max_configuration_recoveries
+
+/** Skrót na twardy sufit prób łącznie (ochrona przed pętlą, Story 4.6). */
+export const VOUCHER_DELIVERY_MAX_TOTAL_ATTEMPT_COUNT =
+  VOUCHER_DELIVERY_ATTEMPT_POLICY.max_total_attempt_count
 
 /**
  * Pola, których wywołujący NIE MOŻE podać przy rezerwacji wysyłki (AD-23).

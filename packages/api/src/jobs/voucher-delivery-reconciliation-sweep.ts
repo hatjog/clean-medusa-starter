@@ -99,12 +99,18 @@ import {
   type DeliveryGapCandidate,
   type DeliveryGapScanPort,
   type DispatchLedgerSql,
+  isParkedDispatch,
 } from "../modules/voucher-delivery/dispatch-ledger"
 import { DISPATCH_STATES_ALLOWING_RETRY } from "../modules/voucher-delivery/delivery-state"
 import {
   VOUCHER_DELIVERY_MAX_ATTEMPT_COUNT,
   VOUCHER_DELIVERY_MAX_CONFIGURATION_RECOVERIES,
+  VOUCHER_DELIVERY_MAX_TOTAL_ATTEMPT_COUNT,
 } from "../modules/voucher-delivery/attempt-policy"
+import {
+  emitEscalationEvent,
+  VOUCHER_DELIVERY_ESCALATION_EVENT,
+} from "../modules/voucher-delivery/escalation-event"
 import {
   ENTITLEMENT_STATE_CHANGED_EVENT,
   handleVoucherPurchaseDelivery,
@@ -184,6 +190,33 @@ export const SWEEP_MAX_ATTEMPT_COUNT = VOUCHER_DELIVERY_MAX_ATTEMPT_COUNT
  */
 export const SWEEP_MAX_CONFIGURATION_RECOVERIES =
   VOUCHER_DELIVERY_MAX_CONFIGURATION_RECOVERIES
+
+/**
+ * Story 4.6 — re-eksport TWARDEGO SUFITU prób łącznie z polityki dostawy.
+ *
+ * Ta sama zasada co przy `SWEEP_MAX_ATTEMPT_COUNT`: stała istnieje wyłącznie
+ * dla czytelności wywołań w tym pliku, NIE jest drugim źródłem wartości i nie
+ * wolno jej przypisać literału (pilnuje tego
+ * `voucher-delivery-attempt-policy.unit.spec.ts`).
+ *
+ * Po co: od 4.6 błąd dostawcy i awaria sieci nie konsumują budżetu odbiorcy,
+ * więc bez tej granicy wiersz dławiony cudzą infrastrukturą ponawiałby się
+ * w KAŻDYM cyklu crona bez końca. Zdjęcie konsumpcji bez zamiennika limitu
+ * zamieniłoby naprawę w wyciek.
+ */
+export const SWEEP_MAX_TOTAL_ATTEMPT_COUNT =
+  VOUCHER_DELIVERY_MAX_TOTAL_ATTEMPT_COUNT
+
+/**
+ * Ile eskalacji wolno wypuścić w JEDNYM przebiegu (AC1).
+ *
+ * Pierwszy przebieg po wdrożeniu widzi CAŁĄ zastaną populację zaparkowanych
+ * wierszy naraz. Bez limitu jedno wdrożenie wysypałoby na człowieka całą
+ * historię w jednej sekundzie — a alert, który przychodzi tysiącem, jest tą
+ * samą ciszą co alert, który nie przychodzi wcale. Reszta jedzie w kolejnych
+ * cyklach; skan chodzi co 15 minut.
+ */
+export const SWEEP_ESCALATION_BATCH_LIMIT = 50
 
 /**
  * Okno skanu i licznika granicy H1 (7 dni) — JEDNA stała, bo obie liczby muszą
@@ -445,6 +478,15 @@ export type SweepReport = {
   parked_total: number
   /** Zwroty budżetu prób po awarii globalnej (odparkowanie, R-2.5-H3). */
   attempt_budget_released: number
+  /** Story 4.6 — eskalacje WYSŁANE do człowieka w tym przebiegu (AC1). */
+  escalations_emitted: number
+  /**
+   * Story 4.6 — eskalacje ZAJĘTE, których nie udało się wysłać (brak nośnika
+   * albo błąd sterownika). NIE jest to zero „bo się udało" — zajęcie jest
+   * zwracane, więc wiersz eskaluje w kolejnym przebiegu. Osobny licznik, bo
+   * „nikt się nie dowiedział" i „dowiedział się" to dwa różne stany świata.
+   */
+  escalations_undelivered: number
   /** Przejęte porzucone rezerwacje `queued` (D3). */
   reclaimed_queued: number
   /** Wyjątki per-wiersz (przebieg kontynuowany). */
@@ -498,6 +540,8 @@ function emptyReport(status: SweepRunStatus): SweepReport {
     state_mismatch: 0,
     exhausted: 0,
     parked_total: 0,
+    escalations_emitted: 0,
+    escalations_undelivered: 0,
     attempt_budget_released: 0,
     reclaimed_queued: 0,
     errored: 0,
@@ -718,6 +762,7 @@ export async function runVoucherDeliveryReconciliationSweep(
       created_after: createdAfter,
       stale_queued_before: staleQueuedBefore,
       max_attempt_count: SWEEP_MAX_ATTEMPT_COUNT,
+      max_total_attempt_count: SWEEP_MAX_TOTAL_ATTEMPT_COUNT,
       limit: batchLimit,
     })
   } catch (error) {
@@ -748,6 +793,7 @@ export async function runVoucherDeliveryReconciliationSweep(
       created_before: createdBefore,
       created_after: createdAfter,
       max_attempt_count: SWEEP_MAX_ATTEMPT_COUNT,
+      max_total_attempt_count: SWEEP_MAX_TOTAL_ATTEMPT_COUNT,
       limit: batchLimit,
     })
   } catch (error) {
@@ -804,6 +850,7 @@ export async function runVoucherDeliveryReconciliationSweep(
     const parkedRows = await scanner.listParkedDispatches({
       entitlement_ids: [...targets.keys()],
       max_attempt_count: SWEEP_MAX_ATTEMPT_COUNT,
+      max_total_attempt_count: SWEEP_MAX_TOTAL_ATTEMPT_COUNT,
     })
     for (const row of parkedRows) {
       parkedRowKeys.add(dispatchRowKey(row.entitlement_id, row.template_key))
@@ -884,14 +931,6 @@ export async function runVoucherDeliveryReconciliationSweep(
         applyBucket(report, bucket)
         tally.resolve(marketId, bucket)
 
-        await releaseBudgetOnGlobalFailure(
-          result.outcome,
-          result.dispatch_id,
-          result.error_code,
-          deps,
-          report,
-        )
-
         // Handoff jest osobnym wierszem ledgera i osobnym licznikiem (R-2.5-M7)
         // — WYŁĄCZNIE gdy realnie doszło do próby wysyłki. `skipped_*` (zakup
         // dla siebie, wysyłka poza celem) zalałoby liczniki.
@@ -900,24 +939,6 @@ export async function runVoucherDeliveryReconciliationSweep(
           tally.handoff(marketId, handoff.outcome)
           if (handoff.outcome === "sent") report.handoff_recovered += 1
           else report.handoff_still_failing += 1
-          // Review 4.4, finding #6: przy dosyłce CELOWANEJ w handoff handler
-          // zwraca wynik handoffu również „na wierzchu" (`result.dispatch_id ===
-          // handoff.dispatch_id`), więc bez tego warunku zwrot budżetu leciałby
-          // DWA RAZY z identycznymi argumentami. Dziś maskuje to guard SQL
-          // `configuration_recovery_count < max_configuration_recoveries` przy
-          // progu 1 — ale próg jest wartością POLITYKI (`attempt-policy.ts`),
-          // którą konsumuje 4.6/FR-9g. Podniesienie go do 2 zamieniłoby jedną
-          // awarię w dwa odzyski, czyli podwoiłoby realny limit bez żadnej
-          // zmiany w polityce. Deduplikujemy po `dispatch_id` w obrębie iteracji.
-          if (handoff.dispatch_id !== result.dispatch_id) {
-            await releaseBudgetOnGlobalFailure(
-              handoff.outcome,
-              handoff.dispatch_id,
-              handoff.error_code,
-              deps,
-              report,
-            )
-          }
         }
 
         logDispatchOutcome(logger, row, result, bucket)
@@ -946,6 +967,7 @@ export async function runVoucherDeliveryReconciliationSweep(
   try {
     for (const row of await scanner.countParkedDispatchesByMarket({
       max_attempt_count: SWEEP_MAX_ATTEMPT_COUNT,
+      max_total_attempt_count: SWEEP_MAX_TOTAL_ATTEMPT_COUNT,
     })) {
       tally.parked(row.market_id, row.parked)
       report.parked_total += row.parked
@@ -953,6 +975,87 @@ export async function runVoucherDeliveryReconciliationSweep(
   } catch (error) {
     logger.warn(
       `[${SCHEDULE_NAME}] licznik wierszy zaparkowanych nieosiągalny`,
+      { error_class: errorClass(error), error_code: errorCode(error) },
+    )
+  }
+
+  // ── Story 4.6 (FR-9g, NFR-3): eskalacja PER WIERSZ do człowieka ───────────
+  //
+  // Licznik `parked` wyżej odpowiada na „ILE wierszy umarło na tym rynku".
+  // Robert pyta „KTÓRA klientka". Agregat tej odpowiedzi nie ma i mieć nie
+  // może — dlatego zdarzenie poniżej jest DOŁOŻENIEM, a nazwy pól `METRIC_GAP`
+  // (`exhausted`, `parked`, `entitlements_without_dispatch`) zostają nietknięte:
+  // reguła alertu czyta je po nazwie.
+  //
+  // Zajęcie jest ATOMOWE i TRWAŁE (`escalated_at`), więc kolejny przebieg skanu
+  // widzący ten sam zaparkowany wiersz NIE produkuje drugiej eskalacji. Skan
+  // chodzi co 15 minut; alert powtarzany co cykl człowiek wycisza po dwóch
+  // dniach — czyli wraca cisza, tylko okrężną drogą.
+  try {
+    const claimed = await scanner.claimAttemptPolicyEscalations({
+      max_attempt_count: SWEEP_MAX_ATTEMPT_COUNT,
+      max_total_attempt_count: SWEEP_MAX_TOTAL_ATTEMPT_COUNT,
+      limit: SWEEP_ESCALATION_BATCH_LIMIT,
+    })
+
+    const undelivered: string[] = []
+    for (const row of claimed) {
+      const emission = emitEscalationEvent(
+        metrics,
+        row,
+        {
+          max_attempt_count: SWEEP_MAX_ATTEMPT_COUNT,
+          max_total_attempt_count: SWEEP_MAX_TOTAL_ATTEMPT_COUNT,
+        },
+        SCHEDULE_NAME,
+      )
+
+      if (emission.status === "emitted") {
+        report.escalations_emitted += 1
+        // Log jest DRUGIM kanałem, nie zamiennikiem: nosi tożsamość wiersza,
+        // więc operator bez dostępu do PostHoga też dojdzie do zakupu.
+        logger.warn(
+          `[${SCHEDULE_NAME}] wyczerpana polityka prób — eskalacja do człowieka`,
+          {
+            event: VOUCHER_DELIVERY_ESCALATION_EVENT,
+            ...emission.properties,
+          },
+        )
+        continue
+      }
+
+      // Nośnika nie ma albo sterownik rzucił: zajęcie WRACA, żeby wiersz
+      // eskalował w kolejnym przebiegu. Bez tego jeden przebieg bez
+      // `POSTHOG_API_KEY` kasowałby eskalację na zawsze — wiersz byłby
+      // oznaczony jako zgłoszony, nie będąc nigdy zgłoszonym.
+      report.escalations_undelivered += 1
+      undelivered.push(row.dispatch_id)
+      logger.error(
+        `[${SCHEDULE_NAME}] eskalacja wyczerpanej polityki prób NIE dotarła ` +
+          "do nośnika — zajęcie zwrócone, ponowienie w kolejnym przebiegu",
+        {
+          dispatch_id: row.dispatch_id,
+          entitlement_id: row.entitlement_id,
+          market_id: row.market_id,
+          template_key: row.template_key,
+          reason: emission.status,
+          error_class:
+            emission.status === "carrier_error"
+              ? errorClass(emission.error)
+              : null,
+        },
+      )
+    }
+
+    if (undelivered.length > 0) {
+      await scanner.releaseEscalationClaims({ dispatch_ids: undelivered })
+    }
+  } catch (error) {
+    // Eskalacja nie może wywrócić przebiegu ani dosyłek, które już się udały.
+    // Cicha nie jest: `error`, nie `warn` — to jest ścieżka NFR-3.
+    logger.error(
+      `[${SCHEDULE_NAME}] zajęcie wierszy do eskalacji nieudane — wyczerpane ` +
+        "wiersze pozostają niezgłoszone w tym przebiegu",
       { error_class: errorClass(error), error_code: errorCode(error) },
     )
   }
@@ -1077,6 +1180,8 @@ function heartbeatCounters(report: SweepReport): Record<string, unknown> {
     state_mismatch: report.state_mismatch,
     exhausted: report.exhausted,
     parked_total: report.parked_total,
+    escalations_emitted: report.escalations_emitted,
+    escalations_undelivered: report.escalations_undelivered,
     attempt_budget_released: report.attempt_budget_released,
     reclaimed_queued: report.reclaimed_queued,
     errored: report.errored,
@@ -1111,7 +1216,19 @@ async function prepareCandidate(
 
   // Defense-in-depth: wiersze z wyczerpanym budżetem są WYKLUCZONE już w SQL-u
   // skanu (R-2.5-H3), więc tutaj mogą trafić tylko z innej implementacji portu.
-  if (candidate.attempt_count >= SWEEP_MAX_ATTEMPT_COUNT) {
+  //
+  // Story 4.6: rozstrzyga `isParkedDispatch` — TA SAMA definicja, którą składa
+  // SQL (`parkedPredicateSql`). Zastane `attempt_count >= SWEEP_MAX_ATTEMPT_COUNT`
+  // byłoby tu drugą definicją i cofałoby AC2 w całości: wiersz z pięcioma
+  // próbami spalonymi przez awarię dostawcy ma budżet odbiorcy NIETKNIĘTY,
+  // ale ten guard odmówiłby mu dosyłki — czyli błąd dostawcy nadal kasowałby
+  // voucher, tylko o jedną warstwę wyżej.
+  if (
+    isParkedDispatch(candidate, {
+      max_attempt_count: SWEEP_MAX_ATTEMPT_COUNT,
+      max_total_attempt_count: SWEEP_MAX_TOTAL_ATTEMPT_COUNT,
+    })
+  ) {
     deps.logger.warn(
       `[${SCHEDULE_NAME}] wiersz wyczerpał próg prób — dosyłka wstrzymana`,
       {
@@ -1120,7 +1237,9 @@ async function prepareCandidate(
         template_key: candidate.template_key,
         dispatch_status: candidate.dispatch_status,
         attempt_count: candidate.attempt_count,
+        non_recipient_failure_count: candidate.non_recipient_failure_count,
         max_attempt_count: SWEEP_MAX_ATTEMPT_COUNT,
+        max_total_attempt_count: SWEEP_MAX_TOTAL_ATTEMPT_COUNT,
       },
     )
     return "exhausted"
@@ -1216,43 +1335,6 @@ function applyBucket(report: SweepReport, bucket: SweepBucket): void {
   else if (bucket === "state_mismatch") report.state_mismatch += 1
   else if (bucket === "errored") report.errored += 1
   else report.skipped += 1
-}
-
-/**
- * R-2.5-H3 — zwrot budżetu prób po awarii GLOBALNEJ. Bez tego kill-switch albo
- * brak szablonu dla `ua`/`de` (stan trwający do Epiku 4) parkowałby WSZYSTKIE
- * wiersze rynku po 75 minutach, a jedyną ścieżką powrotu byłby ręczny UPDATE
- * na produkcyjnej bazie.
- */
-async function releaseBudgetOnGlobalFailure(
-  outcome: PurchaseDeliveryOutcome,
-  dispatchId: string | null,
-  errorCodeValue: string | null,
-  deps: SweepDeps,
-  report: SweepReport,
-): Promise<void> {
-  if (outcome !== "failed" || !dispatchId) return
-  if (!isGlobalFailureErrorCode(errorCodeValue)) return
-
-  try {
-    const released = await deps.scanner.releaseAttemptBudget({
-      dispatch_id: dispatchId,
-      error_code: errorCodeValue as string,
-      max_configuration_recoveries: SWEEP_MAX_CONFIGURATION_RECOVERIES,
-    })
-    if (released) report.attempt_budget_released += 1
-  } catch (error) {
-    // Nieudany zwrot budżetu nie może wywrócić przebiegu — najgorsze, co się
-    // stanie, to jedna zużyta próba więcej.
-    deps.logger.warn(
-      `[${SCHEDULE_NAME}] zwrot budżetu prób po awarii globalnej nieudany`,
-      {
-        dispatch_id: dispatchId,
-        error_code: errorCodeValue,
-        error_class: errorClass(error),
-      },
-    )
-  }
 }
 
 /** Log per dosyłkę; „luka niedomykalna" jest `error`, nie `info` (R-2.5-H4). */

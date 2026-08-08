@@ -190,6 +190,7 @@ async function recordSweepScanCalls(): Promise<Call[]> {
     created_after: "2026-07-19T12:00:00.000Z",
     stale_queued_before: "2026-07-26T11:45:00.000Z",
     max_attempt_count: 5,
+    max_total_attempt_count: 40,
     limit: 200,
   })
   calls.push(...scan.calls)
@@ -201,6 +202,7 @@ async function recordSweepScanCalls(): Promise<Call[]> {
     created_before: "2026-07-26T11:30:00.000Z",
     created_after: "2026-07-19T12:00:00.000Z",
     max_attempt_count: 5,
+    max_total_attempt_count: 40,
     limit: 200,
   })
   calls.push(...stalled.calls)
@@ -209,22 +211,34 @@ async function recordSweepScanCalls(): Promise<Call[]> {
   await new PgDispatchLedger(parked).listParkedDispatches({
     entitlement_ids: ["ent_1", "ent_2"],
     max_attempt_count: 5,
+    max_total_attempt_count: 40,
   })
   calls.push(...parked.calls)
 
   const parkedCount = new RecordingSql(() => [{ market_id: "bonbeauty", parked: 1 }])
   await new PgDispatchLedger(parkedCount).countParkedDispatchesByMarket({
     max_attempt_count: 5,
+    max_total_attempt_count: 40,
   })
   calls.push(...parkedCount.calls)
 
-  const release = new RecordingSql(() => [])
-  await new PgDispatchLedger(release).releaseAttemptBudget({
-    dispatch_id: "dispatch-1",
-    error_code: "FLOW_DISABLED",
-    max_configuration_recoveries: 1,
+  // Story 4.6: `releaseAttemptBudget` USUNIETY (atrybucja w `markFailed`
+  // przejela jego role). W jego miejsce dialekt musi pokryc dwa NOWE
+  // zapytania eskalacji — inaczej `UPDATE … FOR UPDATE SKIP LOCKED` nie
+  // przeszedlby przez zaden test dialektu.
+  const claim = new RecordingSql(() => [])
+  await new PgDispatchLedger(claim).claimAttemptPolicyEscalations({
+    max_attempt_count: 5,
+    max_total_attempt_count: 40,
+    limit: 50,
   })
-  calls.push(...release.calls)
+  calls.push(...claim.calls)
+
+  const releaseClaims = new RecordingSql(() => [])
+  await new PgDispatchLedger(releaseClaims).releaseEscalationClaims({
+    dispatch_ids: ["dispatch-1", "dispatch-2"],
+  })
+  calls.push(...releaseClaims.calls)
 
   const historicalRelease = new RecordingSql(() => [])
   await new PgDispatchLedger(historicalRelease).releaseParkedConfigurationFailureBudgets({
@@ -315,7 +329,13 @@ describe("Story 2.5 — SQL sweepa jest wykonywalny przez REALNY formatter Knexa
 
     it("gałąź `queued` wymaga staleness, a wiersze zaparkowane są wykluczone", () => {
       expect(scanSql()).toContain("d.status = 'queued' AND d.queued_at < ?")
-      expect(scanSql()).toContain("d.attempt_count < ?")
+      // Story 4.6: kwalifikacja kandydata to NEGACJA predykatu parkowania,
+      // a ten ma dwa człony (budżet odbiorcy ALBO sufit prób łącznie).
+      expect(scanSql()).toContain(
+        "d.attempt_count - d.non_recipient_failure_count >= ?",
+      )
+      expect(scanSql()).toContain("OR d.attempt_count >= ?")
+      expect(scanSql()).toContain("OR NOT (")
     })
 
     it("sortowanie stawia najmniej próbowane wiersze PIERWSZE (anty-starvation)", () => {
@@ -331,20 +351,36 @@ describe("Story 2.5 — SQL sweepa jest wykonywalny przez REALNY formatter Knexa
       expect(stalled).toBeDefined()
       const sql = (stalled as Call).sql.replace(/\s+/g, " ")
       expect(sql).toMatch(/d\.status IN \(\?, \?\)/)
-      expect(sql).toContain("d.attempt_count < ?")
+      expect(sql).toContain(
+        "d.attempt_count - d.non_recipient_failure_count >= ?",
+      )
+      expect(sql).toContain("AND NOT (")
       expect(sql).not.toMatch(/\b(INSERT|UPDATE|DELETE)\b/i)
     })
 
-    it("zwrot budżetu prób ma guard statusu i kodu błędu", () => {
-      const release = calls.find((call) =>
-        call.sql.includes("SET attempt_count = GREATEST"),
+    it("zajęcie do eskalacji jest ATOMOWE i bierze tylko jeszcze niezgłoszone", () => {
+      // Story 4.6 zastąpiła `releaseAttemptBudget` (guard statusu i kodu błędu)
+      // atrybucją w `markFailed`. Tamto zapytanie nie istnieje; w jego miejsce
+      // dialekt musi udźwignąć `UPDATE … FOR UPDATE SKIP LOCKED`, bo to na nim
+      // stoi niepowtarzalność eskalacji przy dwóch instancjach.
+      expect(
+        calls.find((call) => call.sql.includes("SET attempt_count = GREATEST")),
+      ).toBeUndefined()
+
+      const claim = calls.find((call) =>
+        call.sql.includes("SET escalated_at ="),
       )
-      expect(release).toBeDefined()
-      const sql = (release as Call).sql.replace(/\s+/g, " ")
-      expect(sql).toContain("AND status = 'failed'")
-      expect(sql).toContain("AND error_code = ?")
-      expect(sql).toContain("AND attempt_count > 0")
-      expect(sql).toContain("AND configuration_recovery_count < ?")
+      expect(claim).toBeDefined()
+      const sql = (claim as Call).sql.replace(/\s+/g, " ")
+      expect(sql).toContain("AND p.escalated_at IS NULL")
+      expect(sql).toContain("FOR UPDATE SKIP LOCKED")
+      expect(sql).toContain(
+        "p.attempt_count - p.non_recipient_failure_count >= ?",
+      )
+      // Tożsamość wiersza wraca w RETURNING — inaczej eskalacja nie miałaby
+      // czego nieść i znów byłaby licznikiem.
+      expect(sql).toContain("RETURNING d.dispatch_id")
+      expect(sql).toContain("d.recipient_hash")
     })
 
     it("odparkowanie historycznej awarii używa trwałej pierwszej przyczyny", () => {

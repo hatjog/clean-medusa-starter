@@ -180,9 +180,13 @@ class FakeSql implements DispatchLedgerSql {
         // nowa kolumna SET przesuwa liste — to juz trzeci fake w repo z tym
         // sprzezeniem (patrz voucher-delivery-dispatch-ledger.unit.spec.ts).
         const id = bindings[bindings.length - 1] as string
-        const providerErrorKind = bindings[bindings.length - 2] ?? null
-        const providerMessage = bindings[bindings.length - 3] ?? null
-        const providerStatusCode = bindings[bindings.length - 4] ?? null
+        // Story 4.6 dolozyla `non_recipient_failure_count` jako OSTATNIA
+        // kolumne SET — i tak, to jest dokladnie to sprzezenie, ktore komentarz
+        // wyzej zapowiadal. Nadal liczymy OD KONCA.
+        const nonRecipientDelta = Number(bindings[bindings.length - 2] ?? 0)
+        const providerErrorKind = bindings[bindings.length - 3] ?? null
+        const providerMessage = bindings[bindings.length - 4] ?? null
+        const providerStatusCode = bindings[bindings.length - 5] ?? null
         const row = this.byId(id)
         if (!row || row.status !== "queued") return { rows: [] }
         Object.assign(row, {
@@ -191,6 +195,8 @@ class FakeSql implements DispatchLedgerSql {
           error_code: errorCode,
           provider_status_code: providerStatusCode,
           provider_message: providerMessage,
+          non_recipient_failure_count:
+            Number(row.non_recipient_failure_count ?? 0) + nonRecipientDelta,
           provider_error_kind: providerErrorKind,
         })
         return { rows: [{ ...row }] }

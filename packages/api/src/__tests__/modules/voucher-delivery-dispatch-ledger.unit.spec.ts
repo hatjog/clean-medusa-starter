@@ -195,9 +195,14 @@ class FakeDispatchSql implements DispatchLedgerSql {
         // kolejnej kolumny SET nie przesunelo znowu calej listy.
         const [provider, error_code, , now] = bindings as string[]
         const dispatch_id = bindings[bindings.length - 1] as string
-        const provider_error_kind = bindings[bindings.length - 2] ?? null
-        const provider_status_code = bindings[bindings.length - 4] ?? null
-        const provider_message = bindings[bindings.length - 3] ?? null
+        // Story 4.6 dolozyla ostatnia kolumne SET
+        // (`non_recipient_failure_count`), wiec odpowiedz providera przesunela
+        // sie o jeden dalej od konca. Nadal liczymy OD KONCA — guard `WHERE`
+        // rozwija sie jako ostatni.
+        const non_recipient_delta = Number(bindings[bindings.length - 2] ?? 0)
+        const provider_error_kind = bindings[bindings.length - 3] ?? null
+        const provider_message = bindings[bindings.length - 4] ?? null
+        const provider_status_code = bindings[bindings.length - 5] ?? null
         const row = this.byId(dispatch_id)
         if (!row || row.status !== "queued") return { rows: [] }
         Object.assign(row, {
@@ -209,6 +214,8 @@ class FakeDispatchSql implements DispatchLedgerSql {
           provider_status_code,
           provider_message,
           provider_error_kind,
+          non_recipient_failure_count:
+            Number(row.non_recipient_failure_count ?? 0) + non_recipient_delta,
         })
         return { rows: [{ ...row }] }
       }
