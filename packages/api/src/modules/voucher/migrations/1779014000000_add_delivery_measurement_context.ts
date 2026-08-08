@@ -26,6 +26,10 @@ export class Migration1779014000000 extends Migration {
           ALTER COLUMN instance_id DROP DEFAULT
       `)
     }
+    this.addSql(`
+      ALTER TABLE voucher_delivery_dispatch
+        ADD COLUMN IF NOT EXISTS provider_attempted_at timestamptz NULL
+    `)
   }
 
   override async down(): Promise<void> {

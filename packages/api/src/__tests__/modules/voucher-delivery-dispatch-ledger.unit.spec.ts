@@ -213,9 +213,9 @@ class FakeDispatchSql implements DispatchLedgerSql {
         // sie o jeden dalej od konca. Nadal liczymy OD KONCA — guard `WHERE`
         // rozwija sie jako ostatni.
         const non_recipient_delta = Number(bindings[bindings.length - 2] ?? 0)
-        const provider_error_kind = bindings[bindings.length - 3] ?? null
-        const provider_message = bindings[bindings.length - 4] ?? null
-        const provider_status_code = bindings[bindings.length - 5] ?? null
+        const provider_error_kind = bindings[bindings.length - 4] ?? null
+        const provider_message = bindings[bindings.length - 5] ?? null
+        const provider_status_code = bindings[bindings.length - 6] ?? null
         const row = this.byId(dispatch_id)
         if (!row || row.status !== "queued") return { rows: [] }
         Object.assign(row, {
@@ -227,6 +227,7 @@ class FakeDispatchSql implements DispatchLedgerSql {
           provider_status_code,
           provider_message,
           provider_error_kind,
+          provider_attempted_at: provider ? now : row.provider_attempted_at ?? null,
           non_recipient_failure_count:
             Number(row.non_recipient_failure_count ?? 0) + non_recipient_delta,
         })
@@ -235,7 +236,7 @@ class FakeDispatchSql implements DispatchLedgerSql {
 
       // Przejęcie retry: guard `status IN (?, ?)` — lista stanów jest rozwinięta
       // na jawne placeholdery (tablica w bindingu byłaby błędem dialektu).
-      const [now, , locale, market_id, flow_id, dispatch_id, ...allowed] =
+      const [now, , locale, market_id, flow_id, env, instance_id, dispatch_id, ...allowed] =
         bindings as string[]
       const row = this.byId(dispatch_id)
       if (!row || !allowed.includes(row.status as string)) return { rows: [] }
@@ -248,6 +249,8 @@ class FakeDispatchSql implements DispatchLedgerSql {
         locale,
         market_id,
         flow_id,
+        env,
+        instance_id,
       })
       return { rows: [{ ...row }] }
     }
@@ -327,6 +330,25 @@ describe("PgDispatchLedger — etykiety środowiska (Story 4.8, AC1)", () => {
       instance_id: "gp-dev",
     })
     expect(sql.audit[0]).toMatchObject({ env: "dev", instance_id: "gp-dev" })
+  })
+
+  it("pozwala retry historycznego failed i przypisuje scope dopiero nowej próbie", async () => {
+    const sql = new FakeDispatchSql()
+    const ledger = makeLedger(sql)
+    await ledger.reserveDispatch(identity())
+    await ledger.markFailed({
+      dispatch_id: sql.dispatch[0].dispatch_id,
+      error_code: "BREVO_TEMPLATE_NOT_CONFIGURED",
+    })
+    Object.assign(sql.dispatch[0], {
+      env: "unattributed",
+      instance_id: "unattributed",
+    })
+
+    const retry = await ledger.reserveDispatch(identity())
+
+    expect(retry.outcome).toBe("retry_reserved")
+    expect(sql.dispatch[0]).toMatchObject({ env: "dev", instance_id: "gp-dev" })
   })
 })
 

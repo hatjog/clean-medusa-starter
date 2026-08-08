@@ -51,6 +51,13 @@ describe("Migration1779014000000 — kontekst pomiaru dostawy (Story 4.8, AC1)",
     expect(sql.match(/ALTER COLUMN instance_id DROP DEFAULT/g)).toHaveLength(2)
   })
 
+  it("dodaje trwały marker rzeczywistego wywołania providera", async () => {
+    const sql = await runUp()
+    expect(sql).toContain(
+      "ADD COLUMN IF NOT EXISTS provider_attempted_at timestamptz NULL",
+    )
+  })
+
   it("jest addytywna i ma non-destrukcyjny down", async () => {
     const sql = await runUp()
     expect(sql).not.toMatch(/\bDROP\s+(TABLE|COLUMN)\b/i)

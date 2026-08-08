@@ -160,7 +160,8 @@ class FakeSql implements DispatchLedgerSql {
         // `[, , , , id]` trafiało w znacznik czasu, więc UPDATE NIGDY nie
         // znajdował wiersza i status zostawał `queued` — 8 asercji `sent` było
         // przez to CZERWONYCH na `main`.
-        const [provider, messageId, , , , id] = bindings as string[]
+        const [provider, messageId] = bindings as string[]
+        const id = bindings[bindings.length - 1] as string
         const row = this.byId(id)
         if (!row || row.status !== "queued") return { rows: [] }
         Object.assign(row, {
@@ -190,9 +191,9 @@ class FakeSql implements DispatchLedgerSql {
         // kolumne SET — i tak, to jest dokladnie to sprzezenie, ktore komentarz
         // wyzej zapowiadal. Nadal liczymy OD KONCA.
         const nonRecipientDelta = Number(bindings[bindings.length - 2] ?? 0)
-        const providerErrorKind = bindings[bindings.length - 3] ?? null
-        const providerMessage = bindings[bindings.length - 4] ?? null
-        const providerStatusCode = bindings[bindings.length - 5] ?? null
+        const providerErrorKind = bindings[bindings.length - 4] ?? null
+        const providerMessage = bindings[bindings.length - 5] ?? null
+        const providerStatusCode = bindings[bindings.length - 6] ?? null
         const row = this.byId(id)
         if (!row || row.status !== "queued") return { rows: [] }
         Object.assign(row, {
@@ -204,10 +205,11 @@ class FakeSql implements DispatchLedgerSql {
           non_recipient_failure_count:
             Number(row.non_recipient_failure_count ?? 0) + nonRecipientDelta,
           provider_error_kind: providerErrorKind,
+          provider_attempted_at: provider ? new Date().toISOString() : null,
         })
         return { rows: [{ ...row }] }
       }
-      const [now, , locale, market_id, flow_id, id, ...allowed] =
+      const [now, , locale, market_id, flow_id, env, instance_id, id, ...allowed] =
         bindings as string[]
       const row = this.byId(id)
       if (!row || !allowed.includes(row.status as string)) return { rows: [] }
@@ -222,6 +224,8 @@ class FakeSql implements DispatchLedgerSql {
         locale,
         market_id,
         flow_id,
+        env,
+        instance_id,
       })
       return { rows: [{ ...row }] }
     }

@@ -106,6 +106,7 @@ import {
   NOTIFICATION_TEMPLATE_KEYS,
   sanitizeProviderDetail,
 } from "@gp/messaging"
+import { runInSystemMarketContext } from "../lib/system-market-context"
 
 /** Ten sam literał, co `ENTITLEMENT_STATE_CHANGED_EVENT_TYPE` z 2.1 (AR-EVENTS). */
 export const ENTITLEMENT_STATE_CHANGED_EVENT =
@@ -1344,7 +1345,19 @@ export default async function voucherPurchaseDeliverySubscriber({
     return
   }
 
-  await handleVoucherPurchaseDelivery(event.data, deps)
+  const trigger = extractPurchaseDeliveryTrigger(event.data)
+  if (!trigger.market_id) {
+    await handleVoucherPurchaseDelivery(event.data, deps)
+    return
+  }
+  await runInSystemMarketContext(
+    {
+      markets: [trigger.market_id],
+      origin: { surface: "subscriber", name: "voucher-purchase-delivery" },
+      logger,
+    },
+    async () => handleVoucherPurchaseDelivery(event.data, deps),
+  )
 }
 
 export const config: SubscriberConfig = {

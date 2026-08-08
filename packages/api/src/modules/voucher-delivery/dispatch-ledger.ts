@@ -137,6 +137,7 @@ export interface DispatchRow {
   status: DeliveryDispatchState
   provider: string | null
   provider_message_id: string | null
+  provider_attempted_at: string | null
   error_code: string | null
   /** Pierwotna przyczyna — nie jest kasowana przez retry summary row. */
   first_error_code: string | null
@@ -521,7 +522,8 @@ export class DispatchLedgerError extends Error {
 
 const SELECT_COLUMNS = `
   dispatch_id, entitlement_id, template_key, recipient_hash, env, instance_id, market_id,
-  flow_id, locale, status, provider, provider_message_id, error_code, attempt_count,
+  flow_id, locale, status, provider, provider_message_id, provider_attempted_at,
+  error_code, attempt_count,
   first_error_code, first_failed_at, configuration_recovery_count, queued_at,
   provider_status_code, provider_message, provider_error_kind, correlation_token,
   non_recipient_failure_count, escalated_at
@@ -649,10 +651,13 @@ export class PgDispatchLedger
       }
     }
 
+    const legacyUnattributed =
+      existing.env === "unattributed" && existing.instance_id === "unattributed"
     if (
-      existing.env !== input.env ||
-      existing.instance_id !== input.instance_id ||
-      existing.market_id !== input.market_id
+      !legacyUnattributed &&
+      (existing.env !== input.env ||
+        existing.instance_id !== input.instance_id ||
+        existing.market_id !== input.market_id)
     ) {
       throw new DispatchLedgerError(
         "istniejący wiersz dostawy ma inny env/instance_id/market_id — " +
@@ -693,7 +698,7 @@ export class PgDispatchLedger
       // w `toKnexPositionalSql`).
       const retryStates = [...DISPATCH_STATES_ALLOWING_RETRY]
       const retryPlaceholders = retryStates
-        .map((_state, index) => `$${index + 7}`)
+        .map((_state, index) => `$${index + 9}`)
         .join(", ")
       const reclaimed = await this.queryRows<DispatchRow>(
         `UPDATE ${VOUCHER_DELIVERY_DISPATCH_TABLE}
@@ -712,8 +717,10 @@ export class PgDispatchLedger
                 updated_at = $2,
                 locale = $3,
                 market_id = $4,
-                flow_id = $5
-          WHERE dispatch_id = $6
+                flow_id = $5,
+                env = $6,
+                instance_id = $7
+          WHERE dispatch_id = $8
             AND status IN (${retryPlaceholders})
         RETURNING ${SELECT_COLUMNS}`,
         [
@@ -722,6 +729,8 @@ export class PgDispatchLedger
           input.locale,
           input.market_id,
           input.flow_id,
+          input.env,
+          input.instance_id,
           existing.dispatch_id,
           ...retryStates,
         ],
@@ -777,6 +786,7 @@ export class PgDispatchLedger
               -- udanej próbie. Zapisany token jest faktem o dostarczonej
               -- wiadomości, a nie o ostatnim wywołaniu.
               correlation_token = COALESCE($3, correlation_token),
+              provider_attempted_at = $4,
               error_code = NULL,
               -- Sukces kasuje diagnostyke porazki razem ze statusem bledu:
               -- wiersz 'sent' z HTTP 401 poprzedniej proby czytalby sie jak
@@ -843,6 +853,7 @@ export class PgDispatchLedger
               provider_status_code = $6,
               provider_message = $7,
               provider_error_kind = $8,
+              provider_attempted_at = CASE WHEN provider IS NOT NULL THEN $3 ELSE provider_attempted_at END,
               non_recipient_failure_count =
                 non_recipient_failure_count + $9
         WHERE dispatch_id = $5
@@ -1724,6 +1735,7 @@ function normalizeRow(raw: unknown): DispatchRow {
       record.provider_message_id == null
         ? null
         : String(record.provider_message_id),
+    provider_attempted_at: normalizeTimestamp(record.provider_attempted_at),
     error_code: record.error_code == null ? null : String(record.error_code),
     first_error_code:
       record.first_error_code == null ? null : String(record.first_error_code),
