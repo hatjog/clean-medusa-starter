@@ -46,6 +46,17 @@
  * `track.ts`, ktory rzuca, nie strippuje) — jest domknieta TUTAJ, przez
  * `assertNoPii`, wspoldzielaca liste nazw pol z `track.ts`. Wspoldzielona, a nie
  * przepisana: druga lista rozjechalaby sie z pierwsza przy pierwszym dopisaniu.
+ *
+ * ── review-fix cyklu 1 (L1): bramka siedzi na NOSNIKU, nie przy jednej funkcji ─
+ * Pierwsza wersja wolala `assertNoPii` wylacznie w `buildEscalationEventProperties`,
+ * ktore sklada obiekt z 16 LITERALOW zapisanych 15 linii wyzej. Zbior kluczy byl
+ * domkniety w typie i staly w czasie wykonania, wiec petla po `PII_FORBIDDEN_FIELDS`
+ * nie mogla trafic dla ZADNEGO osiagalnego wejscia — bramka byla strukturalnie
+ * zielona, a nie zielona z pomiaru, i mijaly ja obok pozostale zdarzenia tego
+ * samego nosnika (`METRIC_GAP`, `METRIC_HEARTBEAT`). Od tego cyklu `withPiiGuard`
+ * opakowuje CALY sterownik nosnika, wiec bramka widzi kazde zdarzenie, ktore
+ * skan wypuszcza — w tym te, ktorych ladunek powstaje ze `spread`u licznikow
+ * per-rynek, czyli jedyne o kluczach nieznanych w czasie kompilacji.
  */
 
 import { PII_FORBIDDEN_FIELDS } from "../../lib/instrumentation/track"
@@ -158,6 +169,32 @@ export function assertNoPii(
         )
       }
     }
+  }
+}
+
+/**
+ * Opakowuje sterownik nosnika bramka PII (L1 review-fix cyklu 1).
+ *
+ * Bramka przy jednym producencie chroni jednego producenta. Bramka na nosniku
+ * chroni nosnik — a to jest to, co AC1 obiecuje („brakujaca bramke PII dokladamy
+ * do wybranego nosnika"). Rzuca, nie strippuje: cicha redakcja zostawilaby
+ * producenta wysylajacego adres i nikogo, kto o tym wie.
+ *
+ * `null`/`undefined` przechodzi bez zmiany — brak nosnika jest rozstrzygany
+ * WYZEJ (`emitEscalationEvent` zwraca `carrier_unavailable`), a udawanie tu
+ * pustego sterownika zamienialoby brak nosnika w cichy sukces.
+ */
+export function withPiiGuard<S extends EscalationSink>(
+  sink: S | null | undefined,
+  origin: string,
+): S | undefined {
+  if (!sink) return undefined
+  return {
+    ...sink,
+    capture(event: string, properties: Record<string, unknown>) {
+      assertNoPii(properties, `${origin}:${event}`)
+      sink.capture(event, properties)
+    },
   }
 }
 

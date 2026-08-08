@@ -483,6 +483,8 @@ export interface DeliveryGapScanPort {
   claimAttemptPolicyEscalations(input: {
     max_attempt_count: number
     max_total_attempt_count: number
+    /** Dolna granica okna (R-2.5-H1) — obowiązkowa, patrz implementacja. */
+    created_after: string
     limit: number
   }): Promise<EscalationClaimRow[]>
   /** Story 4.6 (AC1) — zwrot zajęcia, gdy zdarzenie nie wyszło do nośnika. */
@@ -497,6 +499,7 @@ export interface DeliveryGapScanPort {
    */
   releaseParkedConfigurationFailureBudgets(input: {
     max_attempt_count: number
+    max_total_attempt_count: number
     max_configuration_recoveries: number
     error_codes: readonly string[]
   }): Promise<number>
@@ -1180,9 +1183,32 @@ export class PgDispatchLedger
    * wysypałoby na człowieka tysiąc zdarzeń w jednej sekundzie — co jest tą samą
    * ciszą, tylko przez zalanie. Reszta jedzie w kolejnych cyklach.
    */
+  /**
+   * review-fix cyklu 1 (M4) — zajęcie ZNA okno skanu.
+   *
+   * Każde inne zapytanie skanu ma dolną granicę okna (R-2.5-H1, 7 dni) z
+   * zapisanym powodem: „pierwszy przebieg NIE dosyła historii sprzed istnienia
+   * ledgera; backfill jest osobną, świadomą decyzją PO". Zajęcie do eskalacji
+   * jej NIE miało, więc po wdrożeniu migracji człowiek zacząłby dostawać
+   * zdarzenia o zakupach sprzed dowolnie dawna — 50 na cykl, 200 na godzinę,
+   * aż populacja się wyczerpie. `SWEEP_ESCALATION_BATCH_LIMIT` ogranicza SZCZYT,
+   * nie SUMĘ. Alert o zakupie sprzed pół roku, na który nie da się już
+   * zareagować, uczy człowieka wyciszać kanał — czyli produkuje tę samą ciszę,
+   * przed którą broni NFR-3, tylko okrężną drogą.
+   *
+   * Granica jest TA SAMA co dla dosyłki (jedna stała `SWEEP_GAP_LOOKBACK_MS`),
+   * bo rozstrzygnięcie jest to samo: wiersz sprzed okna nie jest przedmiotem
+   * działania tego przebiegu. Backfill historii pozostaje osobną decyzją PO —
+   * i tak samo jak przy dosyłce wykonuje się go przesunięciem kotwicy
+   * `GP_VOUCHER_DELIVERY_SWEEP_EPOCH`, nie zdjęciem granicy w kodzie.
+   *
+   * Parametr jest OBOWIĄZKOWY (brak wartości domyślnej): domyślne „bez okna"
+   * jest dokładnie tym ubytkiem, który tu naprawiamy.
+   */
   async claimAttemptPolicyEscalations(input: {
     max_attempt_count: number
     max_total_attempt_count: number
+    created_after: string
     limit: number
   }): Promise<EscalationClaimRow[]> {
     assertMaxAttemptCount(input.max_attempt_count)
@@ -1190,6 +1216,7 @@ export class PgDispatchLedger
       input.max_total_attempt_count,
       input.max_attempt_count,
     )
+    assertEscalationWindowStart(input.created_after)
     if (!Number.isInteger(input.limit) || input.limit < 1) {
       throw new DispatchLedgerError(
         "claimAttemptPolicyEscalations wymaga limitu >= 1 — zajęcie bez limitu " +
@@ -1209,8 +1236,10 @@ export class PgDispatchLedger
                  WHERE ${parkedPredicateSql("p", "$2", "$3")}
                    AND p.status NOT IN ${DISPATCH_SETTLED_STATES_SQL}
                    AND p.escalated_at IS NULL
+                   -- R-2.5-H1 (M4): dolna granica okna, ta sama co dosyłka.
+                   AND p.created_at >= $4
                  ORDER BY p.first_failed_at ASC NULLS LAST, p.dispatch_id ASC
-                 LIMIT $4
+                 LIMIT $5
                    FOR UPDATE SKIP LOCKED
               )
       RETURNING d.dispatch_id, d.entitlement_id, d.template_key, d.market_id,
@@ -1220,6 +1249,7 @@ export class PgDispatchLedger
         nowIso,
         input.max_attempt_count,
         input.max_total_attempt_count,
+        input.created_after,
         input.limit,
       ],
     )
@@ -1280,16 +1310,46 @@ export class PgDispatchLedger
    * zrekonstruować historii), więc dla nich ta ścieżka nadal jest jedyną drogą
    * z parkingu. Zostaje jako naprawa POPULACJI ZASTANEJ — nie jako drugi,
    * równoległy nośnik atrybucji.
+   *
+   * ── review-fix cyklu 1 (M1): PIĄTA kopia progu parkowania ──────────────────
+   * Ta metoda przeoczyła migrację 4.6 na dwa sposoby naraz i oba były realne
+   * dla wiersza POmigracyjnego, nie tylko zastanego:
+   *
+   *   1. używała progu `attempt_count >= max_attempt_count` — czyli STAREJ,
+   *      piątej definicji „zaparkowany", obok czterech zapytań korzystających
+   *      z `parkedPredicateSql`. Wiersz o `attempt_count = 5`,
+   *      `non_recipient_failure_count = 5` (pięć porażek NIEprzypisywalnych
+   *      odbiorcy, budżet odbiorcy nietknięty) zaparkowany NIE BYŁ, a mimo to
+   *      pasował do predykatu i był „odparkowywany" w każdym cyklu crona;
+   *   2. obniżała `attempt_count`, nie ruszając `non_recipient_failure_count` —
+   *      z `LEAST(5, 4) = 4` przy liczniku `5` robił się budżet odbiorcy `-1`,
+   *      czyli fantomowy kredyt. Przy okazji wypalała jedyny
+   *      `configuration_recovery_count` na wierszu, który odzysku nie
+   *      potrzebował, i kasowała `escalated_at`, przez co wiersz eskalował
+   *      DRUGI raz za tę samą awarię (wbrew AC1).
+   *
+   * Naprawa jest jedna dla obu: metoda operuje odtąd WYŁĄCZNIE na populacji
+   * zastanej, rozpoznawanej po `non_recipient_failure_count = 0` — bo wiersz
+   * POmigracyjny, którego wszystkie porażki są nieprzypisywalne odbiorcy, ma
+   * ten licznik równy `attempt_count` i odzysku nie potrzebuje z definicji.
+   * Próg parkowania pochodzi teraz z `parkedPredicateSql`, więc piątej kopii
+   * już nie ma. Niezmiennik `non_recipient_failure_count <= attempt_count`
+   * pilnuje dodatkowo `CHECK` z migracji `1779012000000`.
    */
   async releaseParkedConfigurationFailureBudgets(input: {
     max_attempt_count: number
+    max_total_attempt_count: number
     max_configuration_recoveries: number
     error_codes: readonly string[]
   }): Promise<number> {
     assertMaxAttemptCount(input.max_attempt_count)
+    assertMaxTotalAttemptCount(
+      input.max_total_attempt_count,
+      input.max_attempt_count,
+    )
     assertConfigurationRecoveryLimit(input.max_configuration_recoveries)
     const codes = [...input.error_codes]
-    const codePlaceholders = codes.map((_code, index) => `$${index + 4}`).join(", ")
+    const codePlaceholders = codes.map((_code, index) => `$${index + 5}`).join(", ")
     const nowIso = this.now().toISOString()
     const rows = await this.queryRows<DispatchRow>(
       `UPDATE ${VOUCHER_DELIVERY_DISPATCH_TABLE}
@@ -1303,7 +1363,13 @@ export class PgDispatchLedger
               escalated_at = NULL,
               updated_at = $2
         WHERE status = 'failed'
-          AND attempt_count >= $1
+          -- POPULACJA ZASTANA i tylko ona (M1). Wiersz zapisany po migracji
+          -- 4.6 ma atrybucję, więc jego budżet odbiorcy już jest chroniony;
+          -- obniżenie mu attempt_count dałoby budżet UJEMNY.
+          AND non_recipient_failure_count = 0
+          -- JEDNA definicja „zaparkowany", ta sama co w pozostałych czterech
+          -- zapytaniach. Poprzednio był tu rozpisany, piąty próg.
+          AND ${parkedPredicateSql("", "$1", "$4")}
           -- Tylko historyczny summary z utraconą diagnostyką. Stabilne ID
           -- notyfikacji chroni aktualny kod od następnej próby; ten fallback
           -- wolno wykonać ograniczoną liczbę razy, nie w każdym cyklu crona.
@@ -1319,6 +1385,7 @@ export class PgDispatchLedger
         input.max_attempt_count,
         nowIso,
         input.max_configuration_recoveries,
+        input.max_total_attempt_count,
         ...codes,
       ],
     )
@@ -1716,6 +1783,25 @@ function normalizeTimestamp(value: unknown): string | null {
  * granicy nie jest „szerszym skanem", tylko dosyłką do całej historii sprzed
  * istnienia ledgera; odwrócone okno byłoby cichym no-opem.
  */
+/**
+ * review-fix cyklu 1 (M4) — zajęcie do eskalacji też ma dolną granicę okna.
+ *
+ * Rzuca zamiast domyślać: pusty łańcuch albo data nie-ISO oznaczałaby zajęcie
+ * CAŁEJ historii ledgera przy pierwszym przebiegu po wdrożeniu, a to jest
+ * dokładnie ta lawina, którą `SWEEP_ESCALATION_BATCH_LIMIT` tylko rozkłada
+ * w czasie, zamiast jej zapobiegać.
+ */
+function assertEscalationWindowStart(createdAfter: string): void {
+  if (!createdAfter || Number.isNaN(new Date(createdAfter).getTime())) {
+    throw new DispatchLedgerError(
+      "zajęcie wierszy do eskalacji wymaga dolnej granicy okna " +
+        "(created_after, ISO 8601) — zajęcie bez okna wysypuje na człowieka " +
+        "historię sprzed istnienia ledgera",
+      "VOUCHER_DELIVERY_ESCALATION_WINDOW_INVALID",
+    )
+  }
+}
+
 function assertGapScanWindow(createdAfter: string, createdBefore: string): void {
   if (!createdAfter || !createdBefore) {
     throw new DispatchLedgerError(

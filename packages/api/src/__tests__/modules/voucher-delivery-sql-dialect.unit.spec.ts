@@ -230,6 +230,8 @@ async function recordSweepScanCalls(): Promise<Call[]> {
   await new PgDispatchLedger(claim).claimAttemptPolicyEscalations({
     max_attempt_count: 5,
     max_total_attempt_count: 40,
+    // review-fix cyklu 1 (M4): zajecie zna dolna granice okna skanu.
+    created_after: "2026-07-19T12:00:00.000Z",
     limit: 50,
   })
   calls.push(...claim.calls)
@@ -243,6 +245,8 @@ async function recordSweepScanCalls(): Promise<Call[]> {
   const historicalRelease = new RecordingSql(() => [])
   await new PgDispatchLedger(historicalRelease).releaseParkedConfigurationFailureBudgets({
     max_attempt_count: 5,
+    // review-fix cyklu 1 (M1): odparkowanie zna OBIE granice parkowania.
+    max_total_attempt_count: 40,
     max_configuration_recoveries: 1,
     error_codes: ["FLOW_DISABLED", "MARKET_LOCALES_UNAVAILABLE"],
   })
@@ -374,6 +378,9 @@ describe("Story 2.5 — SQL sweepa jest wykonywalny przez REALNY formatter Knexa
       const sql = (claim as Call).sql.replace(/\s+/g, " ")
       expect(sql).toContain("AND p.escalated_at IS NULL")
       expect(sql).toContain("FOR UPDATE SKIP LOCKED")
+      // review-fix cyklu 1 (M4): granica R-2.5-H1 obowiązuje TAKŻE tutaj —
+      // zajęcie bez okna wysypuje na człowieka historię sprzed ledgera.
+      expect(sql).toContain("AND p.created_at >= ?")
       expect(sql).toContain(
         "p.attempt_count - p.non_recipient_failure_count >= ?",
       )
@@ -390,8 +397,19 @@ describe("Story 2.5 — SQL sweepa jest wykonywalny przez REALNY formatter Knexa
       expect(sql).toContain("AND error_code = 'VOUCHER_DELIVERY_DISPATCH_FAILED'")
       expect(sql).toContain("AND first_error_code IS NOT NULL")
       expect(sql).toContain("first_error_code LIKE '%\\_NOT\\_CONFIGURED'")
-      expect(sql).toContain("AND attempt_count >= ?")
       expect(sql).toContain("AND configuration_recovery_count < ?")
+      // review-fix cyklu 1 (M1) — dwie rzeczy naraz i obie muszą tu pęknąć,
+      // gdyby ktoś je cofnął:
+      //  1. metoda operuje WYŁĄCZNIE na populacji zastanej (wiersz
+      //     pomigracyjny ma atrybucję, więc odzysku nie potrzebuje, a
+      //     obniżenie mu attempt_count dałoby budżet UJEMNY);
+      //  2. próg parkowania pochodzi ze WSPÓLNEJ definicji, nie z piątej,
+      //     rozpisanej tu kopii `attempt_count >= max_attempt_count`.
+      expect(sql).toContain("AND non_recipient_failure_count = 0")
+      expect(sql).toContain(
+        "attempt_count - non_recipient_failure_count >= ?",
+      )
+      expect(sql).not.toMatch(/AND attempt_count >= \?/)
     })
   })
 

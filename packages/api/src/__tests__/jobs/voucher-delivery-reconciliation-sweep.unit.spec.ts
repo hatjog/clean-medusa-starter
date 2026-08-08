@@ -132,6 +132,8 @@ type DispatchSeed = {
   /** Story 4.6 — znacznik już wysłanej eskalacji (`null` = jeszcze nie). */
   escalated_at?: string | null
   first_failed_at?: string | null
+  /** review-fix cyklu 1 (M4) — wiersz ma wiek; zajęcie do eskalacji zna okno. */
+  created_at?: string
 }
 
 /** Guard dialektu — ten sam, co w teście ledgera 2.3 (R-2.3-H1). */
@@ -217,6 +219,7 @@ class FakeSql implements DispatchLedgerSql {
       escalated_at: seed.escalated_at ?? null,
       first_failed_at: seed.first_failed_at ?? null,
       queued_at: seed.queued_at ?? minutesAgo(60),
+      created_at: seed.created_at ?? seed.queued_at ?? minutesAgo(60),
       sent_at: null,
       failed_at: null,
     })
@@ -325,12 +328,19 @@ class FakeSql implements DispatchLedgerSql {
     }
 
     if (q.includes("SET attempt_count = LEAST")) {
-      const [maxAttemptCount, , maxConfigurationRecoveries] = bindings as number[]
-      const globalCodes = bindings.slice(3).map(String)
+      const [maxAttemptCount, , maxConfigurationRecoveries, maxTotalAttemptCount] =
+        bindings as number[]
+      const globalCodes = bindings.slice(4).map(String)
       const released = this.dispatch.filter(
         (row) =>
           row.status === "failed" &&
-          Number(row.attempt_count ?? 0) >= maxAttemptCount &&
+          // review-fix cyklu 1 (M1): POPULACJA ZASTANA i wspólna definicja
+          // parkowania — nie piąta kopia progu `attempt_count >= max`.
+          Number(row.non_recipient_failure_count ?? 0) === 0 &&
+          (Number(row.attempt_count ?? 0) -
+            Number(row.non_recipient_failure_count ?? 0) >=
+            maxAttemptCount ||
+            Number(row.attempt_count ?? 0) >= maxTotalAttemptCount) &&
           row.error_code === "VOUCHER_DELIVERY_DISPATCH_FAILED" &&
           Number(row.configuration_recovery_count ?? 0) < maxConfigurationRecoveries &&
           (globalCodes.includes(String(row.first_error_code)) ||
@@ -590,9 +600,17 @@ class FakeSql implements DispatchLedgerSql {
 
   /** Story 4.6 — atomowe zajecie do eskalacji (AC1): tylko `escalated_at IS NULL`. */
   private claimEscalations(bindings: readonly unknown[]): Row[] {
-    const [now, max, maxTotal, limit] = bindings as (string | number)[]
+    // `SET escalated_at = $1, updated_at = $1` -> `$1` wystepuje DWA razy, a
+    // konwerter dialektu rozwija bindingi po WYSTAPIENIACH, nie po numerach.
+    const [now, , max, maxTotal, createdAfter, limit] = bindings as (
+      | string
+      | number
+    )[]
     const claimed = this.parkedRows(Number(max), Number(maxTotal))
       .filter((row) => row.escalated_at == null)
+      // review-fix cyklu 1 (M4): dolna granica okna — wiersz sprzed okna nie
+      // jest przedmiotem działania tego przebiegu.
+      .filter((row) => String(row.created_at) >= String(createdAfter))
       .slice(0, Number(limit))
     for (const row of claimed) row.escalated_at = now
     return claimed.map((row) => ({
@@ -1510,7 +1528,12 @@ describe("AC5 (e) / AC1 — stan spoza ISSUED/ACTIVE: pominięty bez błędu, al
 // ── AC4: no-op bez readiness-green providera ───────────────────────────────
 
 describe("AC4 — brak readiness-green providera: no-op z JEDNYM logiem", () => {
-  it("zero wysyłek, zero zapytań (także niemutujących), zero wierszy `failed`", async () => {
+  it("zero wysyłek i zero zapytań ŚCIEŻKI WYSYŁKI, zero wierszy `failed`", async () => {
+    // review-fix cyklu 1 (M3): kontrakt no-opu dotyczy WYSYŁKI. Poprzednia
+    // wersja tego testu asertowała `sql.statements` = 0 na przebiegu BEZ
+    // ani jednego zaparkowanego wiersza — czyli mierzyła stan, w którym
+    // eskalacja i tak nie miałaby czego zajmować, i przez to nie mogła
+    // złapać tego, że jedyny producent zdarzenia eskalacyjnego stoi za bramką.
     const { deps, sql, dispatchCalls } = makeHarness({
       entitlements: [issuedEntitlement("ent_no_provider")],
       providerReady: false,
@@ -1520,10 +1543,60 @@ describe("AC4 — brak readiness-green providera: no-op z JEDNYM logiem", () => 
 
     expect(report.status).toBe("skipped_provider_not_ready")
     expect(dispatchCalls).toHaveLength(0)
-    expect(sql.statements).toHaveLength(0)
-    expect(sql.mutatingStatements).toHaveLength(0)
+    // Skan luk, licznik granicy H1, przejęcie `queued`, odparkowanie — nic
+    // z tego nie wolno wykonać. Jedyne dopuszczalne zapytanie to zajęcie
+    // wierszy JUŻ TERMINALNYCH do eskalacji.
+    expect(
+      sql.statements.filter((statement) => !statement.includes("SET escalated_at")),
+    ).toHaveLength(0)
+    expect(
+      sql.mutatingStatements.filter(
+        (statement) => !statement.includes("SET escalated_at"),
+      ),
+    ).toHaveLength(0)
     expect(sql.dispatch).toHaveLength(0)
     expect(sql.audit).toHaveLength(0)
+    expect(report.escalations_emitted).toBe(0)
+  })
+
+  it("M3 — niegotowy provider NIE wycisza eskalacji wiersza zaparkowanego", async () => {
+    // Kontrola, która PĘKA po cofnięciu naprawy M3. Waga: dopóki
+    // `recipient_budget` jest nieosiągalny (H1), jedynym powodem eskalacji
+    // jest awaria dostawcy — czyli dokładnie ta klasa incydentu, w której
+    // provider bywa niegotowy. Wygaszenie eskalacji za bramką znaczyłoby, że
+    // NFR-3 milczy zawsze wtedy, gdy ma coś do powiedzenia.
+    const { deps, captured, sql } = makeHarness({
+      entitlements: [issuedEntitlement("ent_parked_no_provider")],
+      dispatchRows: [
+        {
+          dispatch_id: "dispatch-parked-no-provider",
+          entitlement_id: "ent_parked_no_provider",
+          status: "failed",
+          error_code: "BREVO_PROVIDER_ERROR",
+          first_error_code: "BREVO_PROVIDER_ERROR",
+          first_failed_at: "2026-07-25T10:00:00.000Z",
+          attempt_count: SWEEP_MAX_TOTAL_ATTEMPT_COUNT,
+          non_recipient_failure_count: SWEEP_MAX_TOTAL_ATTEMPT_COUNT,
+        },
+      ],
+      providerReady: false,
+    })
+
+    const report = await runVoucherDeliveryReconciliationSweep(deps)
+
+    expect(report.status).toBe("skipped_provider_not_ready")
+    expect(report.escalations_emitted).toBe(1)
+    const escalations = captured.filter(
+      (call) => call.event === VOUCHER_DELIVERY_ESCALATION_EVENT,
+    )
+    expect(escalations).toHaveLength(1)
+    expect(escalations[0].properties).toMatchObject({
+      dispatch_id: "dispatch-parked-no-provider",
+      escalation_reason: "total_attempt_ceiling",
+    })
+    // Zajęcie jest TRWAŁE także na tej ścieżce — inaczej kolejny przebieg
+    // z niegotowym providerem eskalowałby ten sam wiersz co 15 minut.
+    expect(sql.dispatch[0].escalated_at).not.toBeNull()
   })
 
   it("DOKŁADNIE jeden log na przebieg (nie per wiersz)", async () => {
@@ -1556,6 +1629,11 @@ describe("AC4 — brak readiness-green providera: no-op z JEDNYM logiem", () => 
         properties: {
           schedule_name: SCHEDULE_NAME,
           status: "skipped_provider_not_ready",
+          // review-fix cyklu 1 (M3): heartbeat niegotowego providera niesie
+          // wynik eskalacji, bo eskalacja na tej ścieżce JUŻ się wykonuje.
+          escalations_emitted: 0,
+          escalations_undelivered: 0,
+          escalations_claim_stuck: 0,
         },
       },
     ])
@@ -3181,7 +3259,21 @@ describe("Story 4.6 / AC2 — budżet konsumują WYŁĄCZNIE porażki przypisywa
     expect(recipientBudgetUsed(row)).toBe(0)
   })
 
-  it("kontrola DODATNIA: odbicie przypisywalne odbiorcy budżet ZUŻYWA", async () => {
+  it("kontrola DODATNIA REGUŁY (nie ścieżki produkcyjnej): kod przypisywalny odbiorcy budżet ZUŻYWA", async () => {
+    // review-fix cyklu 1 (H1) — PRZEMIANOWANA, bo poprzednia nazwa twierdziła
+    // więcej, niż test mierzy.
+    //
+    // Marker `[gp_error_code=HARD_BOUNCE]` jest wymuszony przez atrapę i NIE
+    // POWSTAJE w żadnym producencie na ścieżce wysyłki: `brevo-adapter.ts`
+    // normalizuje kody dostawcy do `BREVO_*` / `BREVO_HTTP_<status>` /
+    // `BREVO_PROVIDER_ERROR`, a klas odbić nie zna — te żyją wyłącznie na
+    // ścieżce WEBHOOKA, która do `voucher_delivery_dispatch` nie pisze
+    // (DW-15-120, ADR odroczenia w `## Fixes Applied` review 4.6).
+    //
+    // Ten test mierzy więc REGUŁĘ atrybucji („kod przypisywalny odbiorcy
+    // konsumuje budżet"), a nie sekwencję zdarzeń osiągalną dziś na produkcji.
+    // Do czasu domknięcia korelacji webhook → wiersz dostawy jedynym
+    // osiągalnym powodem eskalacji jest `total_attempt_ceiling`.
     const { deps, sql } = makeHarness({
       entitlements: [issuedEntitlement("ent_hard_bounce")],
       dispatchImpl: async () => {
@@ -3264,6 +3356,214 @@ describe("Story 4.6 / AC2 — budżet konsumują WYŁĄCZNIE porażki przypisywa
     for (const code of SWEEP_GLOBAL_FAILURE_ERROR_CODES) {
       expect(consumesRecipientAttemptForErrorCode(code)).toBe(false)
     }
+  })
+})
+
+describe("Story 4.6 / review-fix cyklu 1 — kontrole, ktore PEKAJA po cofnieciu naprawy", () => {
+  /** Niezmiennik z `CHECK` migracji: budzet odbiorcy nie moze byc UJEMNY. */
+  function expectNoNegativeRecipientBudget(rows: readonly Row[]): void {
+    for (const row of rows) {
+      expect(
+        Number(row.attempt_count ?? 0) -
+          Number(row.non_recipient_failure_count ?? 0),
+      ).toBeGreaterThanOrEqual(0)
+    }
+  }
+
+  it("M1: wiersz POmigracyjny (atrybucja pelna) NIE jest odparkowywany i nie dostaje ujemnego budzetu", async () => {
+    // Piec porazek NIEprzypisywalnych odbiorcy: wiersz NIE jest zaparkowany
+    // (5 < 40, budzet odbiorcy = 0), a pierwsza przyczyna jest awaria
+    // konfiguracji — czyli dokladnie ksztalt, ktory stary prog lapal.
+    const { deps, sql } = makeHarness({
+      entitlements: [issuedEntitlement("ent_post_migration")],
+      dispatchRows: [
+        {
+          dispatch_id: "dispatch-post-migration",
+          entitlement_id: "ent_post_migration",
+          status: "failed",
+          error_code: "VOUCHER_DELIVERY_DISPATCH_FAILED",
+          first_error_code: "BREVO_TEMPLATE_NOT_CONFIGURED",
+          attempt_count: SWEEP_MAX_ATTEMPT_COUNT,
+          non_recipient_failure_count: SWEEP_MAX_ATTEMPT_COUNT,
+          configuration_recovery_count: 0,
+        },
+      ],
+    })
+
+    const report = await runVoucherDeliveryReconciliationSweep(deps)
+
+    const row = sql.dispatch[0]
+    // ZERO odparkowan: wiersz nie byl zaparkowany, wiec nie ma czego odzyskiwac.
+    expect(report.attempt_budget_released).toBe(0)
+    // Jedyny odzysku niepotrzebujacy limit ZOSTAJE nietkniety — przed naprawa
+    // byl wypalany w kazdym cyklu crona na wierszu, ktory go nie potrzebowal.
+    expect(Number(row.configuration_recovery_count)).toBe(0)
+    // `attempt_count` rosnie WYLACZNIE z ponowienia dosylki (wiersz nie jest
+    // zaparkowany, wiec sweep go legalnie ponawia) — nie zostal obnizony.
+    expect(Number(row.attempt_count)).toBe(SWEEP_MAX_ATTEMPT_COUNT + 1)
+    expect(row.escalated_at).toBeNull()
+    expectNoNegativeRecipientBudget(sql.dispatch)
+  })
+
+  it("M1: wiersz ZASTANY (bez atrybucji) nadal ma droge z parkingu — naprawa nie jest wylaczeniem", async () => {
+    const { deps, sql } = makeHarness({
+      entitlements: [issuedEntitlement("ent_legacy")],
+      dispatchRows: [
+        {
+          dispatch_id: "dispatch-legacy",
+          entitlement_id: "ent_legacy",
+          status: "failed",
+          error_code: "VOUCHER_DELIVERY_DISPATCH_FAILED",
+          first_error_code: "BREVO_TEMPLATE_NOT_CONFIGURED",
+          attempt_count: SWEEP_MAX_ATTEMPT_COUNT,
+          // Populacja sprzed migracji: backfill nie mial z czego zrekonstruowac
+          // historii, wiec licznik zostal na zerze.
+          non_recipient_failure_count: 0,
+          configuration_recovery_count: 0,
+        },
+      ],
+    })
+
+    const report = await runVoucherDeliveryReconciliationSweep(deps)
+
+    expect(report.attempt_budget_released).toBe(1)
+    expect(Number(sql.dispatch[0].configuration_recovery_count)).toBe(1)
+    // Odparkowany do `max - 1`, a nastepnie ponowiony w tym samym przebiegu —
+    // czyli wiersz REALNIE wrocil do obiegu, a nie tylko zmienil licznik.
+    expect(Number(sql.dispatch[0].attempt_count)).toBe(SWEEP_MAX_ATTEMPT_COUNT)
+    expect(sql.dispatch[0].status).toBe("sent")
+    expectNoNegativeRecipientBudget(sql.dispatch)
+  })
+
+  it("M2: wyjatek emisji w POLOWIE batcha zwraca zajecie POZOSTALYCH wierszy", async () => {
+    const ids = ["ent_m2_a", "ent_m2_b", "ent_m2_c", "ent_m2_d", "ent_m2_e"]
+    let seen = 0
+    const { deps, sql } = makeHarness({
+      entitlements: ids.map((id) => issuedEntitlement(id)),
+      dispatchRows: ids.map((id) => ({
+        dispatch_id: `dispatch-${id}`,
+        entitlement_id: id,
+        status: "failed",
+        error_code: "BREVO_PROVIDER_ERROR",
+        first_error_code: "BREVO_PROVIDER_ERROR",
+        first_failed_at: "2026-07-25T10:00:00.000Z",
+        attempt_count: SWEEP_MAX_TOTAL_ATTEMPT_COUNT,
+        non_recipient_failure_count: SWEEP_MAX_TOTAL_ATTEMPT_COUNT,
+      })),
+      metricsOverridden: true,
+      metricsOverride: {
+        capture() {
+          seen += 1
+          if (seen === 2) throw new Error("nosnik padl w polowie batcha")
+        },
+      },
+    })
+
+    const report = await runVoucherDeliveryReconciliationSweep(deps)
+
+    // Wyjatek z `capture` jest lapany w `emitEscalationEvent` jako
+    // `carrier_error`, wiec petla dochodzi do konca — ale gdyby rzucil
+    // cokolwiek POZA nia (np. bramka PII), `finally` i tak musi zwrocic
+    // wszystkie niepotwierdzone. Asercja jest na SKUTKU, nie na sciezce.
+    const stillClaimed = sql.dispatch.filter((row) => row.escalated_at != null)
+    // Kazdy z pieciu wierszy jest rozstrzygniety: albo zgloszony, albo zwrocony.
+    expect(report.escalations_emitted + report.escalations_undelivered).toBe(
+      ids.length,
+    )
+    // Zajecie zostaje WYLACZNIE na wierszach realnie zgloszonych.
+    expect(stillClaimed).toHaveLength(report.escalations_emitted)
+    expect(report.escalations_emitted).toBe(ids.length - 1)
+    expect(report.escalations_claim_stuck).toBe(0)
+  })
+
+  it("M2: NIEUDANY zwrot zajecia jest GLOSNY i ma wlasny licznik — nie udaje sukcesu", async () => {
+    const { deps, logger } = makeHarness({
+      entitlements: [issuedEntitlement("ent_m2_stuck")],
+      dispatchRows: [
+        {
+          dispatch_id: "dispatch-m2-stuck",
+          entitlement_id: "ent_m2_stuck",
+          status: "failed",
+          error_code: "BREVO_PROVIDER_ERROR",
+          first_error_code: "BREVO_PROVIDER_ERROR",
+          first_failed_at: "2026-07-25T10:00:00.000Z",
+          attempt_count: SWEEP_MAX_TOTAL_ATTEMPT_COUNT,
+          non_recipient_failure_count: SWEEP_MAX_TOTAL_ATTEMPT_COUNT,
+        },
+      ],
+      // Brak nosnika => emisja `carrier_unavailable` => zwrot zajecia…
+      metricsOverridden: true,
+      metricsOverride: undefined,
+    })
+    // …ktory rzuca. Przed naprawa M2 zajecie zostawalo ustawione, a jedyny log
+    // mowil „zajecie nieudane" — czyli cos nieprawdziwego.
+    deps.scanner = scannerWith(deps.scanner, {
+      async releaseEscalationClaims() {
+        throw new Error("zerwane polaczenie do bazy")
+      },
+    })
+
+    const report = await runVoucherDeliveryReconciliationSweep(deps)
+
+    expect(report.escalations_claim_stuck).toBe(1)
+    expect(report.escalations_undelivered).toBe(1)
+    const stuck = logger.entries.find((entry) =>
+      String(entry.meta?.error_code) ===
+      "VOUCHER_DELIVERY_ESCALATION_CLAIM_STUCK",
+    )
+    expect(stuck).toBeDefined()
+    expect(stuck?.level).toBe("error")
+    expect(stuck?.meta?.dispatch_ids).toEqual(["dispatch-m2-stuck"])
+  })
+
+  it("M4: wiersz SPRZED okna skanu nie jest zajmowany do eskalacji", async () => {
+    const { deps, sql, captured } = makeHarness({
+      entitlements: [issuedEntitlement("ent_m4_old")],
+      dispatchRows: [
+        {
+          dispatch_id: "dispatch-m4-old",
+          entitlement_id: "ent_m4_old",
+          status: "failed",
+          error_code: "BREVO_PROVIDER_ERROR",
+          first_error_code: "BREVO_PROVIDER_ERROR",
+          // Ponad rok przed `NOW` — zakup, na ktory czlowiek i tak juz nie
+          // zareaguje; alert o nim uczy wyciszac kanal.
+          created_at: "2025-01-01T00:00:00.000Z",
+          first_failed_at: "2025-01-01T01:00:00.000Z",
+          attempt_count: SWEEP_MAX_TOTAL_ATTEMPT_COUNT,
+          non_recipient_failure_count: SWEEP_MAX_TOTAL_ATTEMPT_COUNT,
+        },
+      ],
+    })
+
+    const report = await runVoucherDeliveryReconciliationSweep(deps)
+
+    expect(report.escalations_emitted).toBe(0)
+    expect(sql.dispatch[0].escalated_at).toBeNull()
+    expect(
+      captured.some((call) => call.event === VOUCHER_DELIVERY_ESCALATION_EVENT),
+    ).toBe(false)
+  })
+
+  it("L1: bramka PII siedzi na NOSNIKU — lapie TAKZE zdarzenia spoza eskalacji", () => {
+    const seen: string[] = []
+    const guarded = createPosthogSweepMetrics({
+      capture: (args) => seen.push(args.event),
+    })
+
+    // Kontrola dodatnia: zwykly ladunek przechodzi.
+    expect(() =>
+      guarded?.capture(METRIC_GAP, { market_id: "bonbeauty", exhausted: 1 }),
+    ).not.toThrow()
+    expect(seen).toEqual([METRIC_GAP])
+
+    // Kontrola, ktora PEKA po zdjeciu bramki: `METRIC_GAP` (jedyny ladunek
+    // skanu o kluczach nieznanych w czasie kompilacji) z polem PII MUSI rzucic,
+    // a nie zostac po cichu zredagowany.
+    expect(() =>
+      guarded?.capture(METRIC_GAP, { recipient_email: "kupujaca@example.test" }),
+    ).toThrow(/nie moze niesc PII/)
+    expect(seen).toEqual([METRIC_GAP])
   })
 })
 

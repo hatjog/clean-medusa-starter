@@ -110,6 +110,8 @@ import {
 import {
   emitEscalationEvent,
   VOUCHER_DELIVERY_ESCALATION_EVENT,
+  VOUCHER_DELIVERY_ESCALATION_RUNBOOK,
+  withPiiGuard,
 } from "../modules/voucher-delivery/escalation-event"
 import {
   ENTITLEMENT_STATE_CHANGED_EVENT,
@@ -487,6 +489,17 @@ export type SweepReport = {
    * „nikt się nie dowiedział" i „dowiedział się" to dwa różne stany świata.
    */
   escalations_undelivered: number
+  /**
+   * review-fix cyklu 1 (M2) — zajęcia, których NIE UDAŁO SIĘ ZWRÓCIĆ.
+   *
+   * Rozłączny z `escalations_undelivered` i to jest cały jego sens:
+   * „niedostarczone" znaczy „wróci w kolejnym przebiegu", a to znaczy
+   * „PRZEPADŁO — wiersz ma `escalated_at` ustawiony, nie będąc nigdy
+   * zgłoszonym, i żaden kolejny przebieg go nie podniesie". Zwinięcie obu
+   * w jeden licznik ukryłoby dokładnie ten stan, którego kolumna `escalated_at`
+   * miała pilnować.
+   */
+  escalations_claim_stuck: number
   /** Przejęte porzucone rezerwacje `queued` (D3). */
   reclaimed_queued: number
   /** Wyjątki per-wiersz (przebieg kontynuowany). */
@@ -542,6 +555,7 @@ function emptyReport(status: SweepRunStatus): SweepReport {
     parked_total: 0,
     escalations_emitted: 0,
     escalations_undelivered: 0,
+    escalations_claim_stuck: 0,
     attempt_budget_released: 0,
     reclaimed_queued: 0,
     errored: 0,
@@ -676,6 +690,160 @@ export function resolveScanWindowStart(
 }
 
 /**
+ * Story 4.6 (FR-9g, NFR-3) — eskalacja PER WIERSZ do człowieka.
+ *
+ * Licznik `parked` odpowiada na „ILE wierszy umarło na tym rynku". Robert pyta
+ * „KTÓRA klientka". Agregat tej odpowiedzi nie ma i mieć nie może — dlatego
+ * zdarzenie poniżej jest DOŁOŻENIEM, a nazwy pól `METRIC_GAP` (`exhausted`,
+ * `parked`, `entitlements_without_dispatch`) zostają nietknięte: reguła alertu
+ * czyta je po nazwie.
+ *
+ * Zajęcie jest ATOMOWE i TRWAŁE (`escalated_at`), więc kolejny przebieg skanu
+ * widzący ten sam zaparkowany wiersz NIE produkuje drugiej eskalacji.
+ *
+ * ── review-fix cyklu 1 (M3): dlaczego to jest OSOBNA funkcja ────────────────
+ * Blok żył wcześniej w środku `runVoucherDeliveryReconciliationSweep`, ZA
+ * bramką readiness providera i ZA gałęzią `scan_failed`. Skutek był odwrotny
+ * do NFR-3: gdy znikał klucz providera albo kill-switch szedł w dół, wiersze
+ * dalej parkowały (poprzednie przebiegi zdążyły podbić `attempt_count`), a
+ * JEDYNY producent zdarzenia eskalacyjnego był wygaszany — czyli eskalacja
+ * milkła dokładnie w tej klasie incydentu, która jako jedyna potrafi ją dziś
+ * wywołać (`total_attempt_ceiling` = awaria dostawcy). Uzasadnienie bramki
+ * („no-op musi być zerowy również w liczbie zapytań") dotyczy WYSYŁEK;
+ * eskalacja wysyłką nie jest — to odczyt i jeden `UPDATE` na wierszach już
+ * terminalnych, które żadnej gotowości providera nie potrzebują.
+ *
+ * ── review-fix cyklu 1 (M2): zwrot zajęcia w `finally`, po liście NIEPOTWIERDZONYCH ─
+ * Poprzednia wersja trzymała `claim`, pętlę emisji i `releaseEscalationClaims`
+ * w jednym `try`. Wyjątek z samego zwrotu (albo z pętli, w połowie batcha)
+ * zostawiał do 50 wierszy z ustawionym `escalated_at` bez ani jednej emisji —
+ * a `claimAttemptPolicyEscalations` bierze wyłącznie `escalated_at IS NULL`,
+ * więc żaden kolejny przebieg by ich nie podniósł. Nikt nigdy nie dostałby
+ * powiadomienia o tych zakupach, a stan wyglądałby identycznie jak sukces.
+ * Zwrot idzie więc z `finally` i po ZBIORZE NIEPOTWIERDZONYCH (`pending`), a
+ * nie po liście zbieranej w pętli — bo pętla mogła się nie dokończyć.
+ */
+async function escalateExhaustedDispatches(
+  scanner: DeliveryGapScanPort,
+  metrics: SweepMetricsPort | undefined,
+  logger: SweepLogger,
+  report: SweepReport,
+  createdAfter: string,
+): Promise<void> {
+  let claimed: EscalationClaimRow[]
+  try {
+    claimed = await scanner.claimAttemptPolicyEscalations({
+      max_attempt_count: SWEEP_MAX_ATTEMPT_COUNT,
+      max_total_attempt_count: SWEEP_MAX_TOTAL_ATTEMPT_COUNT,
+      // M4: ta sama dolna granica okna co dosyłka — zajęcie bez okna wysypuje
+      // na człowieka historię sprzed istnienia ledgera, 50 na cykl.
+      created_after: createdAfter,
+      limit: SWEEP_ESCALATION_BATCH_LIMIT,
+    })
+  } catch (error) {
+    // Eskalacja nie może wywrócić przebiegu ani dosyłek, które już się udały.
+    // Cicha nie jest: `error`, nie `warn` — to jest ścieżka NFR-3. Tu komunikat
+    // jest PRAWDZIWY: zajęcia nie było, więc nic nie zostało zablokowane.
+    logger.error(
+      `[${SCHEDULE_NAME}] zajęcie wierszy do eskalacji nieudane — wyczerpane ` +
+        "wiersze pozostają niezgłoszone w tym przebiegu",
+      { error_class: errorClass(error), error_code: errorCode(error) },
+    )
+    return
+  }
+
+  if (claimed.length === 0) return
+
+  // Zajęte i JESZCZE NIEPOTWIERDZONE. Emisja usuwa stąd wiersz; cokolwiek tu
+  // zostanie na końcu — także po wyjątku w połowie pętli — musi wrócić.
+  const pending = new Set(claimed.map((row) => row.dispatch_id))
+
+  try {
+    for (const row of claimed) {
+      const emission = emitEscalationEvent(
+        metrics,
+        row,
+        {
+          max_attempt_count: SWEEP_MAX_ATTEMPT_COUNT,
+          max_total_attempt_count: SWEEP_MAX_TOTAL_ATTEMPT_COUNT,
+        },
+        SCHEDULE_NAME,
+      )
+
+      if (emission.status === "emitted") {
+        pending.delete(row.dispatch_id)
+        report.escalations_emitted += 1
+        // Log jest DRUGIM kanałem, nie zamiennikiem: nosi tożsamość wiersza,
+        // więc operator bez dostępu do PostHoga też dojdzie do zakupu.
+        logger.warn(
+          `[${SCHEDULE_NAME}] wyczerpana polityka prób — eskalacja do człowieka`,
+          {
+            event: VOUCHER_DELIVERY_ESCALATION_EVENT,
+            ...emission.properties,
+          },
+        )
+        continue
+      }
+
+      // Nośnika nie ma albo sterownik rzucił: zajęcie WRACA (w `finally`), żeby
+      // wiersz eskalował w kolejnym przebiegu. Bez tego jeden przebieg bez
+      // `POSTHOG_API_KEY` kasowałby eskalację na zawsze.
+      logger.error(
+        `[${SCHEDULE_NAME}] eskalacja wyczerpanej polityki prób NIE dotarła ` +
+          "do nośnika — zajęcie zwrócone, ponowienie w kolejnym przebiegu",
+        {
+          dispatch_id: row.dispatch_id,
+          entitlement_id: row.entitlement_id,
+          market_id: row.market_id,
+          template_key: row.template_key,
+          reason: emission.status,
+          error_class:
+            emission.status === "carrier_error"
+              ? errorClass(emission.error)
+              : null,
+        },
+      )
+    }
+  } catch (error) {
+    // Wyjątek Z PĘTLI (np. bramka PII na ładunku). Reszta batcha nie została
+    // przetworzona — i właśnie dlatego zwrot jest w `finally`, nie tutaj.
+    logger.error(
+      `[${SCHEDULE_NAME}] pętla eskalacji przerwana wyjątkiem — pozostałe ` +
+        "zajęte wiersze wracają do zajęcia w kolejnym przebiegu",
+      { error_class: errorClass(error), error_code: errorCode(error) },
+    )
+  } finally {
+    if (pending.size > 0) {
+      const undelivered = [...pending]
+      report.escalations_undelivered += undelivered.length
+      try {
+        await scanner.releaseEscalationClaims({ dispatch_ids: undelivered })
+      } catch (error) {
+        // NAJGORSZY stan tej ścieżki i jedyny, który wygląda jak sukces:
+        // wiersz jest oznaczony jako zgłoszony, nie będąc nigdy zgłoszonym,
+        // i żaden kolejny przebieg go nie podniesie. Osobny licznik i osobny
+        // kod błędu, bo „wróci w następnym cyklu" i „przepadło" to dwa różne
+        // stany świata.
+        report.escalations_claim_stuck += undelivered.length
+        logger.error(
+          `[${SCHEDULE_NAME}] ZWROT zajęcia eskalacji NIEUDANY — ${undelivered.length} ` +
+            "wierszy pozostaje oznaczonych jako zgłoszone, nie będąc zgłoszonymi; " +
+            "kolejny przebieg ICH NIE PODNIESIE (wymagana interwencja: " +
+            "UPDATE voucher_delivery_dispatch SET escalated_at = NULL WHERE dispatch_id IN (…))",
+          {
+            error_code: "VOUCHER_DELIVERY_ESCALATION_CLAIM_STUCK",
+            error_class: errorClass(error),
+            release_error_code: errorCode(error),
+            dispatch_ids: undelivered,
+            runbook_path: VOUCHER_DELIVERY_ESCALATION_RUNBOOK,
+          },
+        )
+      }
+    }
+  }
+}
+
+/**
  * Rdzeń sweepa — czysta funkcja na wstrzykiwanych portach. Testowalna bez
  * kontenera Medusy, bez żywego Postgresa i bez sieci. NIGDY nie rzuca.
  */
@@ -697,29 +865,9 @@ export async function runVoucherDeliveryReconciliationSweep(
   const env = deps.env ?? process.env
   const lookbackMs = deps.lookbackMs ?? SWEEP_GAP_LOOKBACK_MS
 
-  // ── AC4: gate readiness PRZED jakimkolwiek zapytaniem ─────────────────────
-  // Kolejność jest częścią kontraktu: no-op musi być zerowy również w liczbie
-  // zapytań, żeby lokalny dev i CI nie generowały wierszy `failed`/DLQ „z niczego".
-  if (!isReady()) {
-    // DOKŁADNIE jeden log na przebieg — nie per wiersz, nie per minutę.
-    logger.info(
-      `[${SCHEDULE_NAME}] provider notyfikacji nie jest readiness-green — ` +
-        "przebieg pominięty (no-op: zero zapytań, zero wysyłek, zero DLQ)",
-      { status: "skipped_provider_not_ready" },
-    )
-    // Telemetria rozróżnia „nie działało" od „0 luk" — inaczej alert milczałby
-    // dokładnie wtedy, gdy nic nie działa.
-    metrics?.capture(METRIC_HEARTBEAT, {
-      schedule_name: SCHEDULE_NAME,
-      status: "skipped_provider_not_ready",
-    })
-    return emptyReport("skipped_provider_not_ready")
-  }
-
+  // Okno skanu liczone PRZED bramką readiness — nie jest zapytaniem, a
+  // eskalacja (która za bramką już nie stoi, patrz M3) go potrzebuje.
   const startedAt = now()
-  const createdBefore = new Date(
-    startedAt.getTime() - SWEEP_ENTITLEMENT_GRACE_MS,
-  ).toISOString()
   // R-2.5-H1 — DOLNA granica okna. Pierwszy przebieg NIE dosyła historii
   // sprzed istnienia ledgera; backfill jest osobną, świadomą decyzją PO.
   const createdAfter = resolveScanWindowStart(
@@ -727,6 +875,46 @@ export async function runVoucherDeliveryReconciliationSweep(
     lookbackMs,
     env,
     logger,
+  ).toISOString()
+
+  // ── AC4: gate readiness PRZED jakimkolwiek zapytaniem WYSYŁKI ─────────────
+  // Kolejność jest częścią kontraktu: no-op musi być zerowy również w liczbie
+  // zapytań, żeby lokalny dev i CI nie generowały wierszy `failed`/DLQ „z niczego".
+  //
+  // review-fix cyklu 1 (M3): „zero zapytań" dotyczy ŚCIEŻKI WYSYŁKI. Eskalacja
+  // wierszy już terminalnych przechodzi, bo inaczej NFR-3 milczałby dokładnie
+  // w tej klasie incydentu, która jako jedyna potrafi dziś eskalację wywołać.
+  if (!isReady()) {
+    // DOKŁADNIE jeden log na przebieg — nie per wiersz, nie per minutę.
+    logger.info(
+      `[${SCHEDULE_NAME}] provider notyfikacji nie jest readiness-green — ` +
+        "przebieg pominięty (no-op: zero zapytań, zero wysyłek, zero DLQ)",
+      { status: "skipped_provider_not_ready" },
+    )
+    const skippedReport = emptyReport("skipped_provider_not_ready")
+    // M3: eskalacja NIE jest wysyłką — wiersze są już terminalne, a bez tego
+    // wywołania cała klasa incydentu „provider padł" kończyłaby się ciszą.
+    await escalateExhaustedDispatches(
+      scanner,
+      metrics,
+      logger,
+      skippedReport,
+      createdAfter,
+    )
+    // Telemetria rozróżnia „nie działało" od „0 luk" — inaczej alert milczałby
+    // dokładnie wtedy, gdy nic nie działa.
+    metrics?.capture(METRIC_HEARTBEAT, {
+      schedule_name: SCHEDULE_NAME,
+      status: "skipped_provider_not_ready",
+      escalations_emitted: skippedReport.escalations_emitted,
+      escalations_undelivered: skippedReport.escalations_undelivered,
+      escalations_claim_stuck: skippedReport.escalations_claim_stuck,
+    })
+    return skippedReport
+  }
+
+  const createdBefore = new Date(
+    startedAt.getTime() - SWEEP_ENTITLEMENT_GRACE_MS,
   ).toISOString()
   const staleQueuedBefore = new Date(
     startedAt.getTime() - SWEEP_STALE_QUEUED_MS,
@@ -742,6 +930,9 @@ export async function runVoucherDeliveryReconciliationSweep(
     report.attempt_budget_released +=
       await scanner.releaseParkedConfigurationFailureBudgets({
         max_attempt_count: SWEEP_MAX_ATTEMPT_COUNT,
+        // M1: ta metoda musi znać OBIE granice parkowania, bo od 4.6 „wiersz
+        // zaparkowany" jest alternatywą dwóch progów, nie jednym progiem.
+        max_total_attempt_count: SWEEP_MAX_TOTAL_ATTEMPT_COUNT,
         max_configuration_recoveries: SWEEP_MAX_CONFIGURATION_RECOVERIES,
         error_codes: SWEEP_GLOBAL_FAILURE_ERROR_CODES,
       })
@@ -770,11 +961,24 @@ export async function runVoucherDeliveryReconciliationSweep(
       `[${SCHEDULE_NAME}] skan luk nieudany — przebieg przerwany bez wysyłek`,
       { error_class: errorClass(error), error_code: errorCode(error) },
     )
+    const failedReport = emptyReport("scan_failed")
+    // M3: awaria skanu luk nie może zabierać ze sobą eskalacji wierszy, które
+    // ze skanem nie mają nic wspólnego.
+    await escalateExhaustedDispatches(
+      scanner,
+      metrics,
+      logger,
+      failedReport,
+      createdAfter,
+    )
     metrics?.capture(METRIC_HEARTBEAT, {
       schedule_name: SCHEDULE_NAME,
       status: "scan_failed",
+      escalations_emitted: failedReport.escalations_emitted,
+      escalations_undelivered: failedReport.escalations_undelivered,
+      escalations_claim_stuck: failedReport.escalations_claim_stuck,
     })
-    return emptyReport("scan_failed")
+    return failedReport
   }
 
   report.truncated = scan.truncated
@@ -991,74 +1195,7 @@ export async function runVoucherDeliveryReconciliationSweep(
   // widzący ten sam zaparkowany wiersz NIE produkuje drugiej eskalacji. Skan
   // chodzi co 15 minut; alert powtarzany co cykl człowiek wycisza po dwóch
   // dniach — czyli wraca cisza, tylko okrężną drogą.
-  try {
-    const claimed = await scanner.claimAttemptPolicyEscalations({
-      max_attempt_count: SWEEP_MAX_ATTEMPT_COUNT,
-      max_total_attempt_count: SWEEP_MAX_TOTAL_ATTEMPT_COUNT,
-      limit: SWEEP_ESCALATION_BATCH_LIMIT,
-    })
-
-    const undelivered: string[] = []
-    for (const row of claimed) {
-      const emission = emitEscalationEvent(
-        metrics,
-        row,
-        {
-          max_attempt_count: SWEEP_MAX_ATTEMPT_COUNT,
-          max_total_attempt_count: SWEEP_MAX_TOTAL_ATTEMPT_COUNT,
-        },
-        SCHEDULE_NAME,
-      )
-
-      if (emission.status === "emitted") {
-        report.escalations_emitted += 1
-        // Log jest DRUGIM kanałem, nie zamiennikiem: nosi tożsamość wiersza,
-        // więc operator bez dostępu do PostHoga też dojdzie do zakupu.
-        logger.warn(
-          `[${SCHEDULE_NAME}] wyczerpana polityka prób — eskalacja do człowieka`,
-          {
-            event: VOUCHER_DELIVERY_ESCALATION_EVENT,
-            ...emission.properties,
-          },
-        )
-        continue
-      }
-
-      // Nośnika nie ma albo sterownik rzucił: zajęcie WRACA, żeby wiersz
-      // eskalował w kolejnym przebiegu. Bez tego jeden przebieg bez
-      // `POSTHOG_API_KEY` kasowałby eskalację na zawsze — wiersz byłby
-      // oznaczony jako zgłoszony, nie będąc nigdy zgłoszonym.
-      report.escalations_undelivered += 1
-      undelivered.push(row.dispatch_id)
-      logger.error(
-        `[${SCHEDULE_NAME}] eskalacja wyczerpanej polityki prób NIE dotarła ` +
-          "do nośnika — zajęcie zwrócone, ponowienie w kolejnym przebiegu",
-        {
-          dispatch_id: row.dispatch_id,
-          entitlement_id: row.entitlement_id,
-          market_id: row.market_id,
-          template_key: row.template_key,
-          reason: emission.status,
-          error_class:
-            emission.status === "carrier_error"
-              ? errorClass(emission.error)
-              : null,
-        },
-      )
-    }
-
-    if (undelivered.length > 0) {
-      await scanner.releaseEscalationClaims({ dispatch_ids: undelivered })
-    }
-  } catch (error) {
-    // Eskalacja nie może wywrócić przebiegu ani dosyłek, które już się udały.
-    // Cicha nie jest: `error`, nie `warn` — to jest ścieżka NFR-3.
-    logger.error(
-      `[${SCHEDULE_NAME}] zajęcie wierszy do eskalacji nieudane — wyczerpane ` +
-        "wiersze pozostają niezgłoszone w tym przebiegu",
-      { error_class: errorClass(error), error_code: errorCode(error) },
-    )
-  }
+  await escalateExhaustedDispatches(scanner, metrics, logger, report, createdAfter)
 
   // ── Granica H1: luki poza matrycą stanów — liczone, NIE dosyłane ───────────
   try {
@@ -1182,6 +1319,7 @@ function heartbeatCounters(report: SweepReport): Record<string, unknown> {
     parked_total: report.parked_total,
     escalations_emitted: report.escalations_emitted,
     escalations_undelivered: report.escalations_undelivered,
+    escalations_claim_stuck: report.escalations_claim_stuck,
     attempt_budget_released: report.attempt_budget_released,
     reclaimed_queued: report.reclaimed_queued,
     errored: report.errored,
@@ -1476,11 +1614,18 @@ export function createPosthogSweepMetrics(
   posthog: PosthogCaptureClient | null,
 ): SweepMetricsPort | undefined {
   if (!posthog) return undefined
-  return {
-    capture(event, properties) {
-      posthog.capture({ distinctId: SCHEDULE_NAME, event, properties })
+  // review-fix cyklu 1 (L1): bramka PII siedzi na NOSNIKU, nie przy jednym
+  // producencie — inaczej `METRIC_GAP` i `METRIC_HEARTBEAT` mijaly ja obok,
+  // a `METRIC_GAP` jest jedynym ladunkiem skanu o kluczach nieznanych w czasie
+  // kompilacji (liczniki per-rynek skladane spreadem).
+  return withPiiGuard<SweepMetricsPort>(
+    {
+      capture(event, properties) {
+        posthog.capture({ distinctId: SCHEDULE_NAME, event, properties })
+      },
     },
-  }
+    SCHEDULE_NAME,
+  )
 }
 
 /**
