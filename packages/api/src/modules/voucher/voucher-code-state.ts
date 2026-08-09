@@ -19,7 +19,7 @@
  * realizację. To jest defekt, który 5.9 zamyka.
  *
  * Ten plik jest odpowiedzią na obie połowy problemu naraz: JEDEN producent
- * (kontrakt `specs/contracts/redemption/redemption-producers.v1.yaml`, tabela
+ * (kontrakt `specs/contracts/redemption/redemption-producers.v2.yaml`, tabela
  * `voucher`) i zapis WYŁĄCZNIE na `client`-cie wołającego, czyli w JEGO
  * transakcji (AD-17, atomowość jako własność transakcji, nie obietnica
  * w komentarzu).
@@ -35,7 +35,7 @@
  * ── Mapowanie unieważnień pochodzi z kontraktu, nie z pomysłu autora ─────────
  * `INVALIDATING_ENTITLEMENT_STATE_TO_VOUCHER_STATUS` jest LUSTREM sekcji
  * `invalidating_transitions` w
- * `specs/contracts/redemption/voucher-state-vocabulary.v1.yaml`. Rozjazd
+ * `specs/contracts/redemption/voucher-state-vocabulary.v3.yaml`. Rozjazd
  * w którąkolwiek stronę czerwieni bramkę — dzięki temu dopisanie stanu
  * unieważniającego do słownika BEZ producenta stanu kodu jest błędem bramki,
  * a nie cichym niczym (dokładnie tak przeszłoby niezauważone `'expired'`
@@ -246,7 +246,7 @@ export class NotAnInvalidatingStateError extends Error {
   constructor(state: EntitlementInstanceState) {
     super(
       `invalidateVoucherCode: stan uprawnienia ${state} nie jest stanem ` +
-        "unieważniającym w kontrakcie voucher-state-vocabulary.v1 " +
+        "unieważniającym w kontrakcie voucher-state-vocabulary.v3 " +
         `(dozwolone: ${[...INVALIDATING_ENTITLEMENT_STATES].join(", ")})`
     )
     this.name = "NotAnInvalidatingStateError"
@@ -611,7 +611,7 @@ export async function claimVoucherCode(
  * przekazywanie allow-listy ze `string`-a na `ReadonlySet` (SEC-3), więc
  * renderowanie musiało trafić do producenta — ale niezmiennik ADR-199 zostaje
  * dotrzymany dosłownie tylko wtedy, gdy renderer jest JEDEN. Ta funkcja nim
- * jest; `redemptionInputStatusInClause()` w `service.ts` do niej deleguje.
+ * jest i dostaje bezpośrednio zbiór stanów od wołającego.
  *
  * Literały są bezpieczne, bo pochodzą z domkniętej unii `VoucherStatus`
  * (typ wymusza to statycznie), a nie z wejścia użytkownika. Kolejność

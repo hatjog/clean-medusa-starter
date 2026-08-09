@@ -387,6 +387,7 @@ export class StripePaymentAuditWorkflow {
           payload.order_id as string,
           now
         )
+        transitionEvents.push(...refundRevocation.transition_events)
         envelope.revoked_entitlement_count =
           refundRevocation.revoked_entitlement_ids.length
         envelope.already_terminal_entitlement_count =

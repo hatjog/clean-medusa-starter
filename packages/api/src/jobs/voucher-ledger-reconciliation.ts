@@ -120,6 +120,8 @@ export type RefundedEntitlementRef = {
    * go nie znają — brak wartości czytamy jako `false` (fail-closed: alarm).
    */
   has_reversal_row?: boolean
+  /** `true` gdy zwrot ma już utrwalony posting, także po ręcznej remediacji. */
+  has_refund_posting?: boolean
 }
 
 /**
@@ -247,13 +249,13 @@ export async function runVoucherLedgerReconciliation(
   if (refunded) {
     const refundedRefs = await refunded.scanRefundedTerminal()
     for (const r of refundedRefs) {
-      if (r.has_reversal_row) {
+      if (r.has_reversal_row || r.has_refund_posting) {
         report.noop += 1
         logger.info(
           `[${SCHEDULE_NAME}] entitlement '${r.entitlement_id}' terminalny REFUNDED ` +
-            `z wierszem kind='REVERSAL' — zwrot OBSŁUŻONY producentem 5.7, posting ` +
-            `REFUNDED jest w zakresie (ADR-197 §2.4). Kompletność mierzy gałąź (2), ` +
-            `nie ten alarm.`
+            `ma ${r.has_reversal_row ? "wiersz kind='REVERSAL'" : "utrwalony posting REFUNDED"} — ` +
+            `zwrot jest obsłużony albo zremediowany. Kompletność nowych odwróceń ` +
+            `mierzy gałąź (2), nie ten alarm.`
         )
         continue
       }
@@ -505,13 +507,19 @@ export function createPgRefundedScanner(
           id: string
           market_id: string | null
           has_reversal_row: boolean
+          has_refund_posting: boolean
         }>(
           `SELECT e.id         AS id,
                   e.market_id  AS market_id,
                   EXISTS (
                     SELECT 1 FROM voucher_redemption r
                      WHERE r.entitlement_id = e.id AND r.kind = 'REVERSAL'
-                  )          AS has_reversal_row
+                  )          AS has_reversal_row,
+                  EXISTS (
+                    SELECT 1 FROM ledger_posting_applied a
+                     WHERE a.entitlement_id = e.id
+                       AND a.lifecycle_event = 'REFUNDED'
+                  )          AS has_refund_posting
              FROM entitlement_instance e
             WHERE e.state = 'REFUNDED'`
         )
@@ -519,6 +527,7 @@ export function createPgRefundedScanner(
           entitlement_id: row.id,
           market_id: row.market_id ?? null,
           has_reversal_row: row.has_reversal_row === true,
+          has_refund_posting: row.has_refund_posting === true,
         }))
       } finally {
         client.release?.()

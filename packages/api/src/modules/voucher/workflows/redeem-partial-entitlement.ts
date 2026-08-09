@@ -536,6 +536,7 @@ export type ReverseRedemptionResult = {
   entitlement_state_after?: EntitlementInstanceState
   /** `true` gdy to odwrócenie domknęło uprawnienie (Σ REVERSAL == Σ REDEMPTION). */
   fully_reversed?: boolean
+  code_invalidation_outcome?: VoucherCodeInvalidationResult["outcome"]
   idempotent: boolean
   posting: TransitionPostingResult
   emit_failed: boolean
@@ -1775,6 +1776,7 @@ export class RedeemPartialEntitlementOperation {
         commissionBaseAfter: baseAfter,
         entitlementStateAfter: reversalTargetState,
         fullyReversed,
+        codeInvalidationOutcome: step2.invalidation?.outcome,
         posting: step2.posting,
         events: [step1.event, step2.event],
       }
@@ -1822,6 +1824,9 @@ export class RedeemPartialEntitlementOperation {
       commission_base_after_minor: txOut.commissionBaseAfter,
       entitlement_state_after: txOut.entitlementStateAfter,
       fully_reversed: txOut.fullyReversed,
+      ...(txOut.codeInvalidationOutcome
+        ? { code_invalidation_outcome: txOut.codeInvalidationOutcome }
+        : {}),
       idempotent: false,
       posting: txOut.posting,
       emit_failed: emitFailed,
@@ -1926,6 +1931,8 @@ type PgClient = {
 }
 type PgPool = { connect: () => Promise<PgClient> }
 
+type BorrowedPgClient = Pick<PgClient, "query">
+
 export const VOUCHER_REDEMPTION_TABLE = "voucher_redemption" as const
 
 export class PostgresRedeemPartialStore implements RedeemPartialStore {
@@ -1950,7 +1957,7 @@ export class PostgresRedeemPartialStore implements RedeemPartialStore {
 }
 
 class PostgresRedeemPartialTx implements RedeemPartialTx {
-  constructor(private readonly client: PgClient) {}
+  constructor(private readonly client: BorrowedPgClient) {}
 
   async getEntitlementForUpdate(
     id: string
@@ -2243,6 +2250,16 @@ class PostgresRedeemPartialTx implements RedeemPartialTx {
     now: Date
   }): Promise<VoucherCodeInvalidationResult> {
     return invalidateVoucherCode(this.client, input)
+  }
+}
+
+class BorrowedTransactionRedeemPartialStore implements RedeemPartialStore {
+  constructor(private readonly client: BorrowedPgClient) {}
+
+  async withTransaction<T>(
+    fn: (tx: RedeemPartialTx) => Promise<T>
+  ): Promise<T> {
+    return fn(new PostgresRedeemPartialTx(this.client))
   }
 }
 
@@ -2602,6 +2619,22 @@ export function createRedeemPartialOperationFromPool(
 ): RedeemPartialEntitlementOperation {
   return new RedeemPartialEntitlementOperation({
     store: new PostgresRedeemPartialStore(pool),
+    events: { async emit() {} },
+    ...extra,
+  })
+}
+
+/**
+ * Buduje operację nad transakcją należącą do wołającego. Adapter nie otwiera,
+ * nie zatwierdza i nie zwalnia połączenia, więc reversal może być atomowy z
+ * webhookiem refundu, który już utrzymuje blokady `FOR UPDATE`.
+ */
+export function createRedeemPartialOperationFromTransaction(
+  client: BorrowedPgClient,
+  extra: Partial<Omit<RedeemPartialDeps, "store">> = {}
+): RedeemPartialEntitlementOperation {
+  return new RedeemPartialEntitlementOperation({
+    store: new BorrowedTransactionRedeemPartialStore(client),
     events: { async emit() {} },
     ...extra,
   })
