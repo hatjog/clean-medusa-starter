@@ -8,6 +8,7 @@ export * from "./idempotency-barrier";
 export * from "./notification-template-registry";
 export * from "./provider";
 export * from "./provider-detail";
+export * from "./provider-dispatch-resolution";
 export * from "./providers/brevo-adapter";
 export * from "./providers/brevo-client";
 export * from "./providers/brevo-http-client";

@@ -68,6 +68,11 @@ function makeEntitlement(
       validity_months: 12,
       refund_channel: "original_payment",
       currency_code: "PLN",
+      // v1.15.0 Story 5.9: most kod → uprawnienie (5.3 wpisuje kod do
+      // snapshotu przy wystawieniu). Fixture bez kodu modelowałby voucher
+      // KWOTOWY, którego w produkcji nie ma — i zwrot fail-closowałby
+      // słusznie, tylko z powodu luki fixture'u, nie zachowania.
+      voucher_code: "GP-TEST-REFUND-001",
     }),
     vat_classification: "MPV",
     issued_amount_currency: "PLN",
@@ -467,6 +472,7 @@ describe("refund — fail-closed guardy", () => {
           validity_months: 12,
           refund_channel: "bank_transfer", // spoza REFUND_CHANNELS
           currency_code: "PLN",
+          voucher_code: "GP-TEST-REFUND-001",
         }),
       }),
     ])

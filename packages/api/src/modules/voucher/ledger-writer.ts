@@ -114,6 +114,20 @@ function discriminatorFor(d: LedgerLifecycleDiscriminator): string {
         )
       }
       return d.redemption_id
+    case "REFUNDED":
+      // v1.15.0 Story 5.7 (ADR-178 §2.3): dyskryminatorem odwrócenia jest
+      // `redemption_id` WIERSZA ODWRACAJĄCEGO — liczony tą samą funkcją
+      // `buildRedemptionId`, ale z `kind='REVERSAL'` w preimage, więc RÓŻNY od
+      // realizacji nawet przy identycznym `idempotency_key`. Różnią się zatem
+      // OBA człony preimage `transaction_id` (`REDEEMED` vs `REFUNDED` oraz dwa
+      // różne `redemption_id`) i kolizja PK ledgera jest niemożliwa.
+      if (!d.redemption_id) {
+        throw new VoucherLedgerWriteError(
+          "REFUNDED wymaga redemption_id wiersza odwracającego do deterministycznego transaction_id (ADR-178 §2.3)",
+          "missing_discriminator"
+        )
+      }
+      return d.redemption_id
     case "EXPIRED":
       if (d.remaining_gross_snapshot == null) {
         throw new VoucherLedgerWriteError(
@@ -215,6 +229,15 @@ const CORRELATION_BY_LIFECYCLE: Readonly<
   REDEEMED: {
     entry_type: "ENTITLEMENT_REDEEMED",
     metadata_lifecycle: new Set(["REDEEMED", "REDEEMED_PARTIAL", "REDEEMED_FULL"]),
+  },
+  // v1.15.0 Story 5.7 (ADR-178 §2.3): odwrócenie realizacji należy do TEJ SAMEJ
+  // klasy wpisów co realizacja (`entry_type` ma zamrożoną allow-listę w migracji
+  // 1778927000000), ale niesie WŁASNE `metadata.lifecycle_event`. Wpisanie tu
+  // `REDEEMED` obok `REFUNDED` rozszczelniłoby korelację L3: wpis odwracający
+  // przeszedłby jako realizacja.
+  REFUNDED: {
+    entry_type: "ENTITLEMENT_REDEEMED",
+    metadata_lifecycle: new Set(["REFUNDED"]),
   },
   // EXPIRED unused → BREAKAGE (ADR-133 §Decyzja pkt 2b): entry_type ENTITLEMENT_BREAKAGE.
   EXPIRED: { entry_type: "ENTITLEMENT_BREAKAGE", metadata_lifecycle: new Set(["EXPIRED"]) },

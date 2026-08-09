@@ -271,7 +271,15 @@ describe("AD-21 — sprzątanie jest HIGIENĄ i konsumuje nośnik kontekstu rynk
     // zamieniłyby je w dopasowanie szersze niż deklaracja kontekstu.
     expect(sql).toMatch(/split_part\(barrier_key, '\|', 1\) = /)
     expect(sql).not.toMatch(/LIKE/i)
-    expect(bindings).toEqual([T0.toISOString(), "bonbeauty"])
+    // R-4.5-H1: górny brzeg kasowania leży POZA HORYZONTEM PONOWIEŃ, nie na
+    // „teraz". Wiersz niesie `claim_count` — sygnał „ten klucz mógł już dotknąć
+    // dostawcy" — więc skasowanie wiersza, po który sweep MOŻE JESZCZE WRÓCIĆ,
+    // zeruje ochronę przed drugim mailem przez mechanizm będący wyłącznie
+    // higieną. Ta asercja PĘKA, gdy brzeg wróci do `now`.
+    expect(bindings).toEqual([
+      new Date(T0.getTime() - BARRIER_AMBIGUOUS_WINDOW_MS).toISOString(),
+      "bonbeauty",
+    ])
   })
 })
 

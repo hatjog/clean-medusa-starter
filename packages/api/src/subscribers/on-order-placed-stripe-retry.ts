@@ -40,6 +40,7 @@ import { toKnexPositionalSql } from "../lib/knex-positional-sql"
 import {
   issueEntitlementsForAllLineItems,
   MissingEntitlementProfileError,
+  VoucherIssuanceBlockedError,
 } from "../workflows/entitlements/issue-entitlement"
 
 type LoggerLike = {
@@ -298,6 +299,31 @@ export default async function onOrderPlacedStripeRetry({
                 `[on-order-placed-stripe-retry] order_id=${orderId} ` +
                   `event_id=${row.event_id} still missing entitlement_profile ` +
                   `after order.placed — operator action required: ${err.message}`
+              )
+              continue
+            }
+            // v1.15.0 Story 5.9 review-fix cyklu 3 (REG-HIGH-2): wystawienie
+            // ZABLOKOWANE danymi obsługiwane tak samo jak brak profilu.
+            //
+            // Cykl 2 dołożył na tej ścieżce fail-loud na brakującym dowiązaniu
+            // salonu, a ten `catch` przepuszczał dalej wszystko poza brakiem
+            // profilu. Skutek: wyjątek uciekał z `withTransaction`,
+            // `markDeferredResolved` nigdy się nie wykonywało, więc odroczone
+            // przechwycenie zostawało w kolejce i było odtwarzane BEZ KOŃCA —
+            // przy każdym `order.placed`, z identycznym wynikiem.
+            //
+            // Wiersz odroczony ZOSTAJE nierozwiązany celowo (nie wołamy
+            // `markDeferredResolved`): dane katalogu mogą zostać naprawione
+            // i wtedy kolejny przebieg wystawi kod. Zmienia się to, że
+            // pozostałe wiersze tej samej paczki są przetwarzane dalej, zamiast
+            // wywracać się razem z tym jednym.
+            if (err instanceof VoucherIssuanceBlockedError) {
+              logger.warn?.(
+                `[on-order-placed-stripe-retry] order_id=${orderId} ` +
+                  `event_id=${row.event_id} voucher issuance blocked ` +
+                  `(reason=${err.reason}, line_item_id=${err.line_item_id ?? "brak"}) ` +
+                  `— uprawnienie NIE wystawione (fail-closed, SM-7), wiersz odroczony ` +
+                  `zostaje do ponowienia po naprawie danych: ${err.message}`
               )
               continue
             }

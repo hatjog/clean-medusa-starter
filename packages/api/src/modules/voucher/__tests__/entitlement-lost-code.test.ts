@@ -83,6 +83,25 @@ const DETERMINATION: LostCodeRecoveryDetermination = determineLostCodeRecoveryOu
 // Okna czasowe — zgłoszenie 30 dni + decyzja ≤7 dni (boundary, fail-closed)
 // ---------------------------------------------------------------------------
 
+/**
+ * v1.15.0 Story 5.9: stub producenta stanu kodu. Okablowanie nogi `void(old)`
+ * jest FAIL-CLOSED bez tej zależności (`MissingVoucherCodeInvalidatorError`),
+ * bo VOIDED unieważnia uprawnienie — a wtedy stan kodu MUSI zejść razem z nim.
+ * Testy tego pliku badają KOPERTY okablowania, nie zapis do bazy, więc stub
+ * zwraca wynik nazwany, zamiast udawać brak operacji.
+ */
+const CODE_INVALIDATOR = async (input: {
+  entitlement_id: string
+  to_state: EntitlementInstanceState
+  now: Date
+}) => ({
+  outcome: "invalidated" as const,
+  entitlement_id: input.entitlement_id,
+  voucher_code: "GP-TEST-LOSTCODE-001",
+  prior_status: "idle" as const,
+  target_status: "withdrawn" as const,
+})
+
 describe("okna czasowe — report 30d + decision 7d (boundary)", () => {
   it("stałe okien zgodne z FR20 (30 / 7)", () => {
     expect(LOST_CODE_REPORT_WINDOW_DAYS).toBe(30)
@@ -455,7 +474,7 @@ describe("buildLostCodeRecoveryWiring — para audytowana + posting audit-only (
 
   it("void(old) + issue(new): obie nogi audytowane, posting audit-only (NIE księguje)", async () => {
     const res = await buildLostCodeRecoveryWiring(
-      { clock: () => new Date("2026-06-13T12:00:00.000Z") },
+      { clock: () => new Date("2026-06-13T12:00:00.000Z"), invalidateVoucherCode: CODE_INVALIDATOR },
       wiring
     )
 
@@ -483,6 +502,7 @@ describe("buildLostCodeRecoveryWiring — para audytowana + posting audit-only (
     const audits: TransitionAuditEnvelope[] = []
     await buildLostCodeRecoveryWiring(
       {
+        invalidateVoucherCode: CODE_INVALIDATOR,
         appendAudit: async (a) => {
           audits.push(a)
         },
@@ -499,6 +519,7 @@ describe("buildLostCodeRecoveryWiring — para audytowana + posting audit-only (
     const events: TransitionEventEnvelope[] = []
     const res = await buildLostCodeRecoveryWiring(
       {
+        invalidateVoucherCode: CODE_INVALIDATOR,
         emitEvent: async (e) => {
           events.push(e)
         },
@@ -513,7 +534,7 @@ describe("buildLostCodeRecoveryWiring — para audytowana + posting audit-only (
 
   it("custom new_entitlement_id respektowane (override deterministycznego id)", async () => {
     const res = await buildLostCodeRecoveryWiring(
-      { clock: () => new Date("2026-06-13T12:00:00.000Z") },
+      { clock: () => new Date("2026-06-13T12:00:00.000Z"), invalidateVoucherCode: CODE_INVALIDATOR },
       { ...wiring, new_entitlement_id: "ent_custom_new", determination: wiringActive }
     )
     expect(res.new_entitlement_id).toBe("ent_custom_new")
@@ -540,6 +561,7 @@ describe("anti-double-spend — void(old) przed issue(new) (KRYTYCZNE)", () => {
     const order: string[] = []
     await buildLostCodeRecoveryWiring(
       {
+        invalidateVoucherCode: CODE_INVALIDATOR,
         appendAudit: async (a) => {
           order.push(
             a.to_state === EntitlementInstanceState.VOIDED ? "void" : "issue"
@@ -560,7 +582,7 @@ describe("anti-double-spend — void(old) przed issue(new) (KRYTYCZNE)", () => {
 
   it("stary kod ląduje w VOIDED (terminal) — brak krawędzi wyjściowej (redeem niemożliwy)", async () => {
     const res = await buildLostCodeRecoveryWiring(
-      { clock: () => new Date("2026-06-13T12:00:00.000Z") },
+      { clock: () => new Date("2026-06-13T12:00:00.000Z"), invalidateVoucherCode: CODE_INVALIDATOR },
       {
         old_entitlement_id: OLD_ID,
         old_state: EntitlementInstanceState.ISSUED,
@@ -584,7 +606,7 @@ describe("anti-double-spend — void(old) przed issue(new) (KRYTYCZNE)", () => {
     }
     await expect(
       buildLostCodeRecoveryWiring(
-        { clock: () => new Date("2026-06-13T12:00:00.000Z") },
+        { clock: () => new Date("2026-06-13T12:00:00.000Z"), invalidateVoucherCode: CODE_INVALIDATOR },
         {
           old_entitlement_id: OLD_ID,
           old_state: EntitlementInstanceState.VOIDED,
@@ -626,6 +648,7 @@ describe("posting GATED — brak nowego postingu/derecognition (ADR-139 D5)", ()
     })
     const res = await buildLostCodeRecoveryWiring(
       {
+        invalidateVoucherCode: CODE_INVALIDATOR,
         postingActivation: { runtimeEnabled: true, isMarketActivated: () => true },
         ledgerWriter: {
           write: async (req) => {
@@ -685,7 +708,7 @@ describe("M1 — sprzężenie gardów okien/idempotencji ze ścieżką side-effe
     expect(noopDetermination.directive).toBe("noop")
     await expect(
       buildLostCodeRecoveryWiring(
-        { clock: () => new Date("2026-06-13T12:00:00.000Z") },
+        { clock: () => new Date("2026-06-13T12:00:00.000Z"), invalidateVoucherCode: CODE_INVALIDATOR },
         {
           old_entitlement_id: OLD_ID,
           old_state: EntitlementInstanceState.ISSUED,
@@ -707,7 +730,7 @@ describe("M1 — sprzężenie gardów okien/idempotencji ze ścieżką side-effe
     }
     await expect(
       buildLostCodeRecoveryWiring(
-        { clock: () => new Date("2026-06-13T12:00:00.000Z") },
+        { clock: () => new Date("2026-06-13T12:00:00.000Z"), invalidateVoucherCode: CODE_INVALIDATOR },
         {
           old_entitlement_id: OLD_ID,
           old_state: EntitlementInstanceState.ISSUED,
@@ -728,7 +751,7 @@ describe("M2 — atomowy seam zapisu void+issue (AI-Review-2)", () => {
   it("write_seam zawiera old_id, new_id, remaining_new, expires_at, recovery_id (kontrakt atomowej tx)", async () => {
     const expiresAt = new Date("2027-12-01T00:00:00.000Z")
     const res = await buildLostCodeRecoveryWiring(
-      { clock: () => new Date("2026-06-13T12:00:00.000Z") },
+      { clock: () => new Date("2026-06-13T12:00:00.000Z"), invalidateVoucherCode: CODE_INVALIDATOR },
       {
         old_entitlement_id: OLD_ID,
         old_state: EntitlementInstanceState.ISSUED,
@@ -747,7 +770,7 @@ describe("M2 — atomowy seam zapisu void+issue (AI-Review-2)", () => {
 
   it("write_seam.expires_at = null gdy brak ważności (przeniesione 1:1)", async () => {
     const res = await buildLostCodeRecoveryWiring(
-      { clock: () => new Date("2026-06-13T12:00:00.000Z") },
+      { clock: () => new Date("2026-06-13T12:00:00.000Z"), invalidateVoucherCode: CODE_INVALIDATOR },
       {
         old_entitlement_id: OLD_ID,
         old_state: EntitlementInstanceState.ISSUED,
@@ -762,7 +785,7 @@ describe("M2 — atomowy seam zapisu void+issue (AI-Review-2)", () => {
 
   it("transfer w wyniku wiring = determination.transfer (net-zero, spójność danych)", async () => {
     const res = await buildLostCodeRecoveryWiring(
-      { clock: () => new Date("2026-06-13T12:00:00.000Z") },
+      { clock: () => new Date("2026-06-13T12:00:00.000Z"), invalidateVoucherCode: CODE_INVALIDATOR },
       {
         old_entitlement_id: OLD_ID,
         old_state: EntitlementInstanceState.ISSUED,

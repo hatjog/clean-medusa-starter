@@ -202,6 +202,15 @@ export const ALLOWED_ENTITLEMENT_TRANSITIONS: Readonly<
     EntitlementInstanceState.REFUNDED,
     EntitlementInstanceState.DISPUTED,
     EntitlementInstanceState.ACTIVE, // refund denied → restored
+    // v1.15.0 Story 5.7 / ADR-198: odwrócenie CZĘŚCIOWE. Zwrot jednej raty
+    // z wielu NIE domyka uprawnienia: dopóki `Σ REVERSAL < Σ REDEMPTION`,
+    // pozostała realizacja stoi, więc uprawnienie wraca do `REDEEMED_PARTIAL`,
+    // a nie do terminalnego `REFUNDED`. Bez tej krawędzi odwrócenie drugiej raty
+    // było STRUKTURALNIE niewykonalne (`ALLOWED[REFUNDED] = []`), a licznik
+    // prowizji nie miał ścieżki zejścia do zera. Saldo NIE jest przywracane
+    // (ADR-197 §2.5 / A4), więc stan `REDEEMED_PARTIAL` nie nadaje tu żadnej
+    // nowej realizowalności: przy `remaining = 0` redeem odmawia na saldzie.
+    EntitlementInstanceState.REDEEMED_PARTIAL,
   ],
   [EntitlementInstanceState.REFUNDED]: [],
   [EntitlementInstanceState.DISPUTED]: [

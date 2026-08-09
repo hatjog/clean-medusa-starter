@@ -26,10 +26,12 @@ import {
  *      All three source states have EXPIRED in the legal transition list
  *      (per ALLOWED_ENTITLEMENT_TRANSITIONS — assertion baked into the SQL
  *      filter so the state machine cannot drift away silently).
- *   2. UPDATE voucher SET status='expired' WHERE status IN ('idle','consent_pending')
- *      AND expires_at < NOW(). `claimed` vouchers are NOT swept — once a
- *      recipient has claimed, expiry is a property of the underlying
- *      entitlement_instance, not the voucher row.
+ *   2. (v1.15.0 Story 5.9) Stan kodu vouchera NIE jest już przestawiany osobnym
+ *      bulk-UPDATE-em w tym pliku. Schodzi razem z uprawnieniem, w transakcji
+ *      `ExpireEntitlementOperation` — patrz `modules/voucher/voucher-code-state.ts`
+ *      (jedyny producent `UPDATE voucher SET status`). Poprzedni kształt
+ *      (`WHERE status IN ('idle','consent_pending') AND expires_at < NOW()`)
+ *      był drugim, nieatomowym producentem stanu kodu.
  *   3. Emit `gp.entitlements.entitlement_expired.v1` and `voucher.expired.v1`
  *      heartbeats to PostHog (per-row events are batched into counts only —
  *      individual event emission is deferred to the subscriber layer).
@@ -125,11 +127,6 @@ function resolveOptional<T>(
 type ExecResult = { rows: unknown[]; rowCount?: number | null }
 type ExecFn = (sql: string, params?: unknown[]) => Promise<ExecResult>
 
-async function runUpdate(exec: ExecFn, sql: string, params: unknown[]): Promise<number> {
-  const result = await exec(sql, params)
-  return result.rowCount ?? 0
-}
-
 export default async function entitlementExpirySweeper(
   container: MedusaContainer
 ): Promise<void> {
@@ -213,6 +210,10 @@ export default async function entitlementExpirySweeper(
       if (!result.idempotent) {
         entitlementsExpired++
       }
+      // Stan kodu unieważniony w TEJ SAMEJ transakcji (5.9).
+      if (result.voucher_code_invalidated) {
+        vouchersExpired++
+      }
     } catch (err) {
       // Log per-row błędy; kontynuuj sweep dla pozostałych wierszy (defense-in-depth).
       logger.error(
@@ -223,25 +224,69 @@ export default async function entitlementExpirySweeper(
     }
   }
 
-  // ── Voucher status flip (niezmienione — NIE routing przez operację) ─────────
+  // ── v1.15.0 Story 5.9 (FR-12, AD-17): DRUGI PRODUCENT STANU KODU USUNIĘTY ──
+  // Do tej story stał tu bulk `UPDATE voucher SET status='expired'` — JEDNO
+  // zapytanie wykonane PO pętli wygaszania, poza transakcją którejkolwiek
+  // tranzycji uprawnienia. Dawało to dwa niezależne zapisy: uprawnienie mogło
+  // zejść do EXPIRED, a stan kodu zostać (albo odwrotnie), bo nic ich nie
+  // spinało. Było to też DRUGIE miejsce piszące `voucher.status` w repo.
+  //
+  // review-fix 5.9: usunięcie drugiego producenta ZWĘZIŁO zakres. Bulk-UPDATE
+  // gasił kody po `voucher.expires_at` NIEZALEŻNIE od tego, czy istnieje
+  // uprawnienie i w jakim jest stanie; następca gasi kod tylko przez tranzycję
+  // uprawnienia z `EXPIRY_SOURCE_STATES`. Kod po terminie, którego uprawnienie
+  // nie ma krawędzi →EXPIRED (albo nie istnieje w ogóle), zostanie więc
+  // `idle`/`consent_pending` NA ZAWSZE. To zwężenie jest ŚWIADOME (drugi
+  // producent poza transakcją był defektem), ale NIE jest zerowe — więc jest
+  // MIERZONE i głośne, zamiast niewidoczne. Pomiar jest read-only: ten job
+  // przestał być producentem stanu kodu i nim nie wraca.
+  //
+  // Od 5.9 stan kodu schodzi RAZEM z uprawnieniem, w transakcji
+  // `ExpireEntitlementOperation` — przez `wireEntitlementTransitionPersisted`
+  // → `tx.invalidateVoucherCode` → jedyny producent (`voucher-code-state.ts`).
+  // Licznik `vouchers_expired` liczy więc unieważnienia, które FAKTYCZNIE
+  // zaszły w tych transakcjach, a nie osobny bulk-UPDATE.
+
+  // Pomiar zwężenia zakresu (review-fix 5.9) — READ-ONLY, bez `UPDATE`.
+  let vouchersOrphaned = 0
   try {
-    vouchersExpired = await runUpdate(
-      exec,
-      `UPDATE voucher
-          SET status = 'expired', updated_at = NOW()
-        WHERE status IN ('idle','consent_pending')
-          AND expires_at IS NOT NULL
-          AND expires_at < NOW()`,
-      []
+    const orphans = await exec(
+      `SELECT count(*)::bigint AS n
+         FROM voucher v
+        WHERE v.status IN ('idle','consent_pending')
+          AND v.expires_at IS NOT NULL
+          AND v.expires_at < NOW()
+          AND NOT EXISTS (
+                SELECT 1
+                  FROM entitlement_instance e
+                 WHERE e.policy_snapshot->>'voucher_code' = v.code
+                   AND e.state = ANY($1::text[])
+                   AND e.expires_at IS NOT NULL
+                   AND e.expires_at < NOW()
+              )`,
+      [[...EXPIRY_SOURCE_STATES]]
     )
+    const raw = (orphans.rows[0] as { n?: unknown } | undefined)?.n
+    // node-pg zwraca `bigint`/`numeric` jako STRING — `Number(undefined)` dałoby
+    // NaN, więc konwersja jest jawna i domyślnie zerowa.
+    vouchersOrphaned = raw == null ? 0 : Number(raw)
   } catch (err) {
-    logger.error("voucher expiry sweep failed", err)
-    throw err
+    // Pomiar nie jest bramką sweepa: jego porażka nie może wywrócić wygaszania.
+    logger.error("voucher expiry orphan measurement failed", err)
+    vouchersOrphaned = -1
+  }
+  if (vouchersOrphaned > 0) {
+    logger.warn(
+      `voucher expiry orphans=${vouchersOrphaned}: kody po terminie bez ` +
+        "uprawnienia z krawędzią →EXPIRED — stan kodu NIE zejdzie sam " +
+        "(v1.15.0 Story 5.9 usunął bulk-UPDATE gasnący kody poza transakcją " +
+        "tranzycji). Wymagają decyzji domenowej, nie cichego UPDATE-u."
+    )
   }
 
   logger.info(
     `swept entitlements=${entitlementsExpired} skipped=${entitlementsSkipped} ` +
-      `vouchers=${vouchersExpired} ` +
+      `vouchers=${vouchersExpired} orphaned=${vouchersOrphaned} ` +
       `started=${startedAt.toISOString()} done=${new Date().toISOString()}`
   )
 
@@ -252,6 +297,10 @@ export default async function entitlementExpirySweeper(
       entitlements_expired: entitlementsExpired,
       entitlements_skipped: entitlementsSkipped,
       vouchers_expired: vouchersExpired,
+      // review-fix 5.9: `-1` ⇒ pomiaru NIE wykonano (zapytanie padło).
+      // Zero i „nie wiem" muszą być rozróżnialne, inaczej brak sygnału czyta
+      // się jak dowód braku problemu.
+      vouchers_expiry_orphaned: vouchersOrphaned,
       started_at: startedAt.toISOString(),
       completed_at: new Date().toISOString(),
     },

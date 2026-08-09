@@ -78,6 +78,8 @@ class FakeClient implements PgClient {
   public existingEntitlementId: string | null = null
   public orderLineMetadata: Record<string, unknown> | null = null
   public insertedEntitlementInstance: FakeRow | null = null
+  /** Kody wydane przez `issueVoucherCodeWithinTx` w tej transakcji. */
+  public readonly voucherCodes: string[] = []
 
   async query<T = Record<string, unknown>>(
     sql: string,
@@ -114,6 +116,32 @@ class FakeClient implements PgClient {
       return { rows: [] as T[], rowCount: this.existingEntitlementId ? 1 : 0 }
     }
 
+    // v1.15.0 Story 5.9 review-fix cyklu 2 (C2-HIGH-1): captured-path zadaje
+    // teraz DWA różne pytania do `order_item`, i fake musi je rozróżniać tak
+    // samo, jak rozróżnia je baza:
+    //   (1) skan linii voucherowych — niesie `oli.metadata` (rezolucja profilu);
+    //   (2) kontekst sprzedawcy dla WYDANIA kodu — bez `oli.metadata`,
+    //       wykonywany także na ścieżce inline-payload, bo `voucher.seller_*`
+    //       są NOT NULL.
+    // Sklejenie ich w jedną gałąź dałoby „profil znaleziony w bazie" tam, gdzie
+    // produkcja go nie szuka — czyli fałszywy pomiar.
+    if (
+      normalized.includes("FROM order_item") &&
+      !normalized.includes("oli.metadata")
+    ) {
+      return {
+        rows: [
+          {
+            line_title: "Zabieg testowy",
+            seller_id: "sel_test",
+            seller_name: "Salon Testowy",
+            seller_handle: "salon-testowy",
+          },
+        ] as unknown as T[],
+        rowCount: 1,
+      }
+    }
+
     if (normalized.includes("FROM order_item")) {
       // v1.9.0 wf5 H-6 fix: issueEntitlementsForAllLineItems issues per-line
       // and expects rows with both `line_item_id` AND `metadata`. The legacy
@@ -127,6 +155,10 @@ class FakeClient implements PgClient {
           {
             line_item_id: "line_item_synthetic",
             metadata: this.orderLineMetadata,
+            line_title: "Zabieg testowy",
+            seller_id: "sel_test",
+            seller_name: "Salon Testowy",
+            seller_handle: "salon-testowy",
           },
         ] as unknown as T[],
         rowCount: 1,
@@ -148,6 +180,14 @@ class FakeClient implements PgClient {
         market_id: params[7],
         created_at: params[8],
       }
+      return { rows: [] as T[], rowCount: 1 }
+    }
+
+    // v1.15.0 Story 5.9 review-fix cyklu 2 (C2-HIGH-1): wiersz `voucher`
+    // powstaje w TEJ SAMEJ transakcji, co wiersz uprawnienia — most kod →
+    // uprawnienie ma istnieć od chwili wystawienia, nie dopiero po zwrocie.
+    if (normalized.includes("INSERT INTO voucher")) {
+      this.voucherCodes.push(params[0] as string)
       return { rows: [] as T[], rowCount: 1 }
     }
 
@@ -214,10 +254,27 @@ describe("Story 1.10.1 — entitlement_instance creation contract (FakeClient la
       state: "ACTIVE",
       market_id: "bonbeauty",
     })
-    // No SELECT against order_item should happen when inline payload is complete.
-    expect(
-      client.queries.some(({ sql }) => sql.includes("FROM order_item"))
-    ).toBe(false)
+    // PROFIL nie jest już szukany w bazie — to jest własność, którą ten test
+    // pilnuje, i ona się nie zmieniła: zapytanie o profil zwraca `oli.metadata`
+    // z kolumną `metadata`, a inline payload je omija.
+    //
+    // v1.15.0 Story 5.9 review-fix cyklu 2 (C2-HIGH-1): zapytanie o KONTEKST
+    // SPRZEDAWCY jest osobnym zapytaniem i JEST wykonywane — kod vouchera
+    // powstaje przy wystawieniu, a `voucher.seller_*` są NOT NULL. Poprzednia
+    // asercja („zero zapytań do `order_item`") stała się twierdzeniem
+    // szerszym, niż jej powód; zawężamy ją do tego, co realnie chroni.
+    const orderItemQueries = client.queries.filter(({ sql }) =>
+      sql.includes("FROM order_item")
+    )
+    expect(orderItemQueries).toHaveLength(1)
+    expect(orderItemQueries[0].sql).toContain("AS seller_id")
+    expect(orderItemQueries[0].sql).not.toContain("oli.metadata")
+    // Most kod → uprawnienie POWSTAŁ: kod jest w snapshotcie i w tabeli.
+    const snapshot = client.insertedEntitlementInstance
+      ?.policy_snapshot as string
+    const issuedCode = JSON.parse(snapshot).voucher_code as string
+    expect(issuedCode).toMatch(/^BO-[0-9A-Z]{4}-[0-9A-Z]{4}$/)
+    expect(client.voucherCodes).toEqual([issuedCode])
   })
 
   it("(c) metadata fallback — order_line_item.metadata triad resolves the profile", async () => {

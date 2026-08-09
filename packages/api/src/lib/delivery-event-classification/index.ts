@@ -403,6 +403,56 @@ export function isBounceFamily(
   return reactionFor(eventType).bounce_family
 }
 
+/* -------------------------------------------------------------------------- */
+/* Atrybucja po KODZIE bledu (Story 4.6, FR-9g)                               */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Kody bledu, ktore ta tablica reakcji uznaje za PRZYPISYWALNE ODBIORCY.
+ *
+ * Zbior jest WYPROWADZONY z `REACTIONS`, nie przepisany. To jest cala jego
+ * wartosc: gdyby powstal jako druga lista literalow obok tablicy reakcji,
+ * dopisanie klasy odbicia w jednym miejscu i pominiecie w drugim dawaloby dwie
+ * prawdy o tym samym kodzie — dokladnie ten rozjazd, przed ktorym bronila
+ * Story 4.4 („drugi wywolujacy z innym progiem odparkowuje wiersze pierwszego").
+ */
+export const RECIPIENT_ATTRIBUTABLE_ERROR_CODES: ReadonlySet<string> = new Set(
+  Object.values(REACTIONS)
+    .filter((reaction) => reaction.consumes_recipient_attempt)
+    .map((reaction) => reaction.error_code)
+    .filter((code): code is string => code !== null),
+)
+
+/**
+ * Czy porazka o TYM kodzie bledu konsumuje budzet prob ODBIORCY (FR-9g).
+ *
+ * ── Dlaczego kod, a nie klasa zdarzenia ─────────────────────────────────────
+ * `reactionFor` przyjmuje nazwe zdarzenia DOSTAWCY — a ta istnieje wylacznie na
+ * sciezce webhooka. Sciezka WYSYLKI (`markFailed` w ledgerze) nie ma nazwy
+ * zdarzenia; ma `error_code`. Bez tego przejscia atrybucja z 4.3 nie mialaby jak
+ * dosiegnac miejsca, w ktorym budzet realnie sie konsumuje, i pozostalaby tym,
+ * czym byla do tej story: flaga bez konsumenta decyzyjnego.
+ *
+ * ── Dlaczego kod NIEZNANY jest NIEPRZYPISYWALNY ─────────────────────────────
+ * `false` jest tu ROZSTRZYGNIECIEM, nie brakiem galezi (AD-19 zabrania wartosci
+ * domyslnej tam, gdzie nadaje sie KLASE — tu nie nadajemy klasy, tylko czytamy
+ * przypisanie juz nadane). Kody sciezki wysylki (`VOUCHER_DELIVERY_DISPATCH_FAILED`,
+ * `BREVO_UNAUTHORIZED`, `*_NOT_CONFIGURED`, timeouty transportu) opisuja to, ze
+ * NIE UDALO SIE ODDAC wiadomosci dostawcy. Zadna z nich nie jest sygnalem o
+ * adresie odbiorcy, a obciazenie nia budzetu odbiorcy kasowaloby vouchery za
+ * awarie cudzej infrastruktury (ADR-192, komentarz przy `consumes_recipient_attempt`).
+ *
+ * OCHRONA PRZED PETLA nie lezy tutaj: to `max_total_attempt_count` z
+ * `voucher-delivery/attempt-policy.ts` (twardy sufit prob lacznie) oraz okno
+ * `SWEEP_GAP_LOOKBACK_MS` skanu. Sama ta funkcja budzetu NIE ogranicza.
+ */
+export function consumesRecipientAttemptForErrorCode(
+  errorCode: string | null | undefined,
+): boolean {
+  if (!errorCode) return false
+  return RECIPIENT_ATTRIBUTABLE_ERROR_CODES.has(errorCode)
+}
+
 /**
  * Numer kolejnej proby nadaje POLITYKA, nie wywolujacy (AD-23).
  *

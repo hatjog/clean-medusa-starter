@@ -12,3 +12,47 @@
 # story realnie posiada — tu przewrót końców linii jest już zmierzonym
 # zdarzeniem, nie hipotezą.
 packages/api/src/api/store/carts/** text eol=lf
+
+# v1.15.0 Story 5.9 review-fix (LOW) — ta sama klasa, ten sam zakres.
+#
+# Commit 5.9 przewrócił końce linii CZTERECH plików z CRLF na LF (edycja
+# z Linuksa), przez co `git show --stat` pokazał 5264 zmienione linie
+# w `service.ts` przy ~44 realnych, a `git blame` stracił historię. Przewrót
+# JUŻ SIĘ WYDARZYŁ i jest w indeksie — bez zapisania go tutaj następna edycja
+# z Windows przewróci pliki z powrotem i klasa wróci przy najbliższym merge'u.
+#
+# Zakres jest CELOWO wąski (ścieżki, które ta story realnie posiada), z tego
+# samego powodu co wyżej: `* text=auto eol=lf` wymagałoby
+# `git add --renormalize .` na tysiącach plików.
+packages/api/src/modules/voucher/service.ts text eol=lf
+packages/api/src/modules/voucher/voucher-code-state.ts text eol=lf
+packages/api/src/modules/voucher/workflows/expire-entitlement.ts text eol=lf
+packages/api/src/modules/voucher/workflows/reissue-lost-code.ts text eol=lf
+packages/api/src/jobs/entitlement-expiry-sweeper.ts text eol=lf
+
+# Review-fix cyklu 1 Story 5.9 — pliki, ktorych konce linii przewrocil TEN
+# commit (edycja z Linuksa na plikach lezacych w indeksie jako CRLF). Pinujemy
+# je z tego samego powodu, co wyzej: bez wpisu nastepna edycja z Windows
+# przewroci je z powrotem i szum wroci przy najblizszym merge'u.
+packages/api/src/modules/voucher/entitlement-lost-code.ts text eol=lf
+packages/api/src/modules/voucher/workflows/issue-retention.ts text eol=lf
+packages/api/src/modules/voucher/__tests__/issue-retention.test.ts text eol=lf
+packages/api/src/modules/voucher/__tests__/reissue-lost-code.test.ts text eol=lf
+packages/api/src/modules/voucher/__tests__/voucher-code-invalidation.test.ts text eol=lf
+packages/api/src/workflows/entitlements/live-issue-from-payment-intent.ts text eol=lf
+packages/api/src/workflows/entitlements/issue-entitlement.ts text eol=lf
+packages/api/src/__tests__/workflows/payment/stripe-payment-audit-refund.unit.spec.ts text eol=lf
+packages/api/src/__tests__/workflows/entitlements/** text eol=lf
+
+# Review-fix cyklu 2 Story 5.9 — pliki DOŁOŻONE przez ten fix. Pinowane od razu,
+# razem z `git add --renormalize` w TYM SAMYM commicie (C2-LOW-1): pin bez
+# renormalizacji zostawia plik trwale „modified" w świeżym checkoucie, czyli
+# dokładnie ten stan, którego pin miał uniknąć.
+packages/api/src/modules/voucher/__tests__/entitlement-expires-at-backfill-migration.test.ts text eol=lf
+packages/api/src/__tests__/workflows/payment/stripe-payment-audit-refund-live-bridge.unit.spec.ts text eol=lf
+# Pliki, ktorych konce linii przewrocil TEN commit (edycja z Linuksa na plikach
+# lezacych w indeksie jako CRLF). Ta sama klasa i to samo domkniecie: pin
+# + `git add --renormalize` w tym samym commicie.
+packages/api/src/__tests__/integration/entitlement-instance-creation.test.ts text eol=lf
+packages/api/src/__tests__/workflows/payment/stripe-payment-audit.unit.spec.ts text eol=lf
+packages/api/src/__tests__/workflows/payment/stripe-payment-audit-active-emit.unit.spec.ts text eol=lf

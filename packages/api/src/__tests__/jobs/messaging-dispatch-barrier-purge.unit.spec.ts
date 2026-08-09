@@ -38,7 +38,10 @@ import messagingDispatchBarrierPurge, {
   config,
 } from "../../jobs/messaging-dispatch-barrier-purge"
 import { marketContextStorage } from "../../lib/market-context"
-import { purgeExpiredDispatchBarrierRows } from "../../lib/messaging-dispatch-barrier"
+import {
+  BARRIER_AMBIGUOUS_WINDOW_MS,
+  purgeExpiredDispatchBarrierRows,
+} from "../../lib/messaging-dispatch-barrier"
 import {
   getSystemMarketContextDenials,
   SystemMarketContextError,
@@ -126,6 +129,26 @@ describe("messaging-dispatch-barrier-purge — nośnik retencji bariery (R-4.1-H
       // Wiersze BEZTERMINOWE (`expires_at IS NULL`) to dostawy, które POSZŁY.
       // Ich skasowanie zamieniłoby „mail poszedł" w „mail nigdy nie poszedł".
       expect(calls[0].sql).toContain("expires_at IS NOT NULL")
+    })
+
+    it("HIGIENA nie sięga po wiersze W HORYZONCIE PONOWIEŃ (R-4.5-H1)", async () => {
+      // Wiersz bariery niesie `claim_count` — sygnał „ten klucz mógł już
+      // dotknąć dostawcy", po którym gateway pyta dostawcę zamiast wysyłać.
+      // Skasowanie wiersza, po który sweep MOŻE JESZCZE WRÓCIĆ, zeruje ten
+      // sygnał i przywraca duplikat tylnymi drzwiami — przez mechanizm, który
+      // z założenia jest wyłącznie higieną i nie ma prawa zmienić werdyktu.
+      //
+      // Ta asercja PĘKA, gdy górny brzeg kasowania wróci do „teraz".
+      process.env[MARKETS_ENV_VAR] = "bonbeauty"
+      const { calls, container } = recordingContainer(0)
+
+      const przed = Date.now()
+      await messagingDispatchBarrierPurge(container)
+      const po = Date.now()
+
+      const brzeg = Date.parse(calls[0].bindings[0] as string)
+      expect(po - brzeg).toBeGreaterThanOrEqual(BARRIER_AMBIGUOUS_WINDOW_MS)
+      expect(przed - brzeg).toBeLessThanOrEqual(BARRIER_AMBIGUOUS_WINDOW_MS + 60_000)
     })
   })
 

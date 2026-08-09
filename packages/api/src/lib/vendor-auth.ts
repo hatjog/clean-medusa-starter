@@ -20,7 +20,12 @@
  * - Enforced mode (the only supported mode since cc-4 F-10): `x-vendor-signature`
  *   header — HMAC-SHA256 signed payload.
  * - Flow: verify signature -> seller_id -> resolveVendorId(seller_id) -> vendor_id -> inject
- * - Fallback: graceful HTTP 501 when resolveVendorId is stub (NotImplementedError)
+ * - Brak mapowania sprzedawca→vendor: `403 VENDOR_NOT_MAPPED` (v1.15.0 Story
+ *   5.8). Do 5.8 stało tu `501 { stub: true, story: "1.3" }`, bo
+ *   `resolveVendorId` był stubem — czyli KAŻDE poprawnie podpisane żądanie
+ *   `/vendor/*` kończyło się „not implemented". `501` znaczy „serwer tego nie
+ *   umie"; tutaj serwer umie, a to tożsamość nie istnieje — to jest odmowa
+ *   autoryzacyjna i musi się tak nazywać.
  * - VENDOR_HMAC_ENFORCED=false: returns 503 (config error), never accepts
  *   `x-vendor-token` as a seller_id substitute.
  *
@@ -90,7 +95,7 @@ import type {
   MedusaResponse,
 } from "@medusajs/framework/http"
 
-import { NotImplementedError } from "../modules/gp-core/service"
+import { VendorNotMappedError } from "../modules/gp-core/service"
 import {
   verifyVendorSignature,
   VENDOR_AUTH_SIGNATURE_MISSING,
@@ -444,12 +449,15 @@ export async function vendorAuthMiddleware(
     logger.info?.(`[vendor-auth] authenticated vendor=${vendorId} seller=${sellerId}`)
     next()
   } catch (error) {
-    if (error instanceof NotImplementedError) {
-      logger.warn?.(`[vendor-auth] resolveVendorId stub: ${error.message}`)
-      res.status(501).json({
-        message: "Vendor ID resolution not yet implemented",
-        stub: true,
-        story: "1.3",
+    // v1.15.0 Story 5.8 (AC1): brak mapowania to ODMOWA, nie brak
+    // implementacji i nie zgadywany identyfikator vendora.
+    if (error instanceof VendorNotMappedError) {
+      logger.warn?.(`[vendor-auth] ${error.message}`)
+      res.status(403).json({
+        code: error.code,
+        message:
+          "to konto sprzedawcy nie jest powiązane z żadnym salonem GP — " +
+          "skontaktuj się ze wsparciem, żeby dokończyć podłączenie",
       })
       return
     }

@@ -21,6 +21,9 @@ import type {
   UpsertVoucherInput,
   AppendEventInput,
   ClaimResult,
+  RedeemForSellerResult,
+  RedeemRefusalReason,
+  VoucherStatus,
 } from "./models/types"
 import {
   EntitlementInstanceState,
@@ -46,6 +49,12 @@ import {
   type TransitionEventEnvelope,
   type TransitionScope,
 } from "./entitlement-transition-wiring"
+// v1.15.0 Story 5.9 (FR-12, AD-17): JEDYNY producent `UPDATE voucher SET status`.
+import {
+  claimVoucherCode,
+  renderVoucherStatusInClause,
+  invalidateVoucherCode,
+} from "./voucher-code-state"
 
 // Local minimal shape for admin search projection (Layer 4-aware).
 // Mirrors fields from `lib/contracts/admin#EntitlementAdminView` that are
@@ -415,6 +424,92 @@ function readGiftContract(value: unknown): {
           ? null
           : false,
   }
+}
+
+/**
+ * ALLOW-LISTA stanów WEJŚCIOWYCH realizacji dla warstwy `voucher_status`
+ * (v1.15.0 Story 5.8, AD-17, ADR-199).
+ *
+ * == Dlaczego allow-lista, a nie negacja ==
+ * Do tej story przejście stanu opierało się na `WHERE code = $1 AND status <>
+ * 'claimed'`. Negacja nie jest komplementem zbioru dopuszczalnego — jest
+ * komplementem JEDNEGO stanu. Zbiór stanów kodu to
+ * `('idle','consent_pending','claimed','withdrawn','expired')`, więc `<>
+ * 'claimed'` przepuszczał voucher `withdrawn` (wycofany dawał się zrealizować)
+ * ORAZ voucher ze stanem `expired`, jeśli tylko `expires_at` było puste albo
+ * przyszłe — bo wygaśnięcie było odcinane po KOLUMNIE CZASU, nie po stanie.
+ * Dodanie kolejnego stanu do CHECK-a rozszerzało dziurę po cichu; allow-lista
+ * ją domyka z definicji: nowy stan jest odmową, dopóki ktoś świadomie go tu
+ * nie dopisze.
+ *
+ * Ten zbiór jest NOŚNIKIEM allow-listy dla kontraktu
+ * `specs/contracts/redemption/voucher-state-vocabulary.v1.yaml`
+ * (`voucher_status_redemption_input_allowlist`), a parity egzekwuje
+ * `_grow/tools/validate_voucher_state_vocabulary.py`. Klauzula `WHERE` jest
+ * GENEROWANA z tego zbioru ({@link redemptionInputStatusInClause}), a nie
+ * pisana obok niego — dwie kopie tej samej listy rozjeżdżają się cicho.
+ */
+export const VOUCHER_REDEMPTION_INPUT_STATES: ReadonlySet<VoucherStatus> = new Set<VoucherStatus>([
+  "idle",
+  "consent_pending",
+])
+
+/**
+ * `status IN ('idle','consent_pending')` — WYGENEROWANE z allow-listy.
+ *
+ * Literały są bezpieczne, bo pochodzą z domkniętej unii `VoucherStatus`,
+ * a nie z wejścia użytkownika; parametryzacja `= ANY($n)` byłaby możliwa, ale
+ * wtedy zbiór nie byłby CZYTELNY w logu zapytań, a bramka statyczna nie miałaby
+ * czego porównać z kontraktem.
+ *
+ * ── GRANICA POMIARU (review-fix cyklu 3, SEC-3) ────────────────────────────
+ * Ta funkcja NIE MA dziś wołającego produkcyjnego. Do cyklu 3 miała dwóch
+ * (`service.ts:1998` i `:2153`), które przekazywały jej wynik — gotowy SQL —
+ * do producenta stanu kodu. Producent przyjmuje teraz ZBIÓR stanów zamiast
+ * `string`-a, bo klauzula w parametrze typu `string` była kanałem, przez który
+ * dowolny wołający mógł wkleić własny warunek do `UPDATE voucher SET
+ * status = 'claimed'` i przestawić kod `refunded` na realizowalny.
+ *
+ * Zostaje tutaj mimo braku wołającego i jest to decyzja, nie przeoczenie:
+ * `redemptionInputStatusInClause()` jest symbolem NAZWANYM w ADR-199 §2.2
+ * i w nocie kontraktu `voucher-state-vocabulary.v1.yaml`, a oba należą do
+ * SIOSTRZANEJ Story 5.8 — review-fix 5.9 nie przepisuje cudzych decyzji.
+ * Żeby brak wołającego nie oznaczał drugiej kopii renderera (czyli dokładnie
+ * tego rozjazdu, przed którym ADR-199 §2.2 ostrzega), funkcja DELEGUJE do
+ * jedynego renderera w producencie. Usunięcie jej należy do story, która
+ * dotknie ADR-199 i kontraktu 5.8.
+ */
+export function redemptionInputStatusInClause(column = "status"): string {
+  return renderVoucherStatusInClause(VOUCHER_REDEMPTION_INPUT_STATES, column)
+}
+
+/**
+ * POWÓD odmowy dla stanu spoza allow-listy (UX-DR9).
+ *
+ * `null` znaczy „stan jest na allow-liście i nie wygasł" — czyli JEDYNE
+ * wejście, w którym przejście wolno wykonać. Kolejność gałęzi jest istotna:
+ * wygaśnięcie sprawdzamy PRZED ogólnym „nie na liście", żeby kosmetolożka
+ * dostała powód „wygasły" zamiast bezużytecznego „nie można".
+ */
+export function resolveRedeemRefusalReason(
+  status: VoucherStatus,
+  expiresAt: Date | null,
+  now: Date
+): RedeemRefusalReason | null {
+  if (status === "claimed") return "already_redeemed"
+  // v1.15.0 Story 5.9 (FR-12/SM-7): „zwrócony" PRZED gałęzią czasu. Voucher
+  // zwrócony bywa jednocześnie po terminie ważności; wtedy „wygasł" jest
+  // odpowiedzią prawdziwą, ale mniej istotną — i myli, bo sugeruje, że kod
+  // działałby, gdyby nie data. Powód ma być ROZŁĄCZNY i najbliższy przyczynie.
+  if (status === "refunded") return "refunded"
+  if (status === "expired" || (expiresAt && expiresAt < now)) return "expired"
+  if (status === "withdrawn") return "withdrawn"
+  if (!VOUCHER_REDEMPTION_INPUT_STATES.has(status)) {
+    // Nowy stan dopisany do CHECK-a bazy, a nie do allow-listy: odmawiamy
+    // uczciwą etykietą zamiast go przepuścić albo nazwać cudzym powodem.
+    return "not_redeemable"
+  }
+  return null
 }
 
 export class VoucherService {
@@ -1334,14 +1429,56 @@ export class VoucherService {
       `INSERT INTO voucher (code, market_id, seller_id, seller_name, seller_handle, product_title, value_minor, currency_code, status, expires_at, created_at, updated_at)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW(), NOW())
        ON CONFLICT (code) DO UPDATE SET
-         market_id = EXCLUDED.market_id,
-         seller_id = EXCLUDED.seller_id,
+         -- v1.15.0 Story 5.9 review-fix cyklu 3 (SEC-4): market_id i seller_id
+         -- USUNIETE z listy DO UPDATE SET.
+         --
+         -- To sa klucze NAJEMCY i RYNKU: po market_id orzeka polityka RLS
+         -- market_isolation, a po seller_id redeemForSeller odroznia swoj
+         -- voucher od cudzego. Bezwarunkowe przepisanie ich z wejscia
+         -- POTRAFILO PRZENIESC istniejacy kod do innego rynku/sprzedawcy --
+         -- czyli przez upsert robilo to, czego cala reszta tej story pilnuje,
+         -- zeby nie dalo sie zrobic przez trase. Polityka RLS blokowala to
+         -- tylko dopoki polaczenie ma ustawiony app.gp_market_id, wiec
+         -- fail-closed zalezal od nosnika kontekstu, a nie od samej instrukcji.
+         --
+         -- Kod vouchera jest globalnie unikalny (code text PRIMARY KEY), a jego
+         -- najemca jest ustalany przy GENEZIE. Upsert nie jest miejscem na
+         -- zmiane wlasciciela; brak tych kolumn w DO UPDATE SET znaczy
+         -- "istniejacy wiersz zachowuje swojego najemce", a nie "milcząco
+         -- przyjmuje cudzego".
          seller_name = EXCLUDED.seller_name,
          seller_handle = EXCLUDED.seller_handle,
          product_title = EXCLUDED.product_title,
          value_minor = EXCLUDED.value_minor,
          currency_code = EXCLUDED.currency_code,
-         status = EXCLUDED.status,
+         -- v1.15.0 Story 5.9 review-fix: upsert NIE ozywia uniewaznionego kodu.
+         -- ON CONFLICT ... DO UPDATE SET status jest zapisem stanu kodu, choc
+         -- nie pasuje do wzorca UPDATE voucher SET status, wiec bramka
+         -- validate_voucher_code_invalidation.py go NIE widziala (w tym samym
+         -- review-fixie wzorzec zostal poszerzony). Nadpisanie refunded/expired/
+         -- withdrawn wartoscia wejsciowa przywracaloby realizowalnosc kodu, za
+         -- ktory pieniadze juz wrocily -- czyli SM-7 > 0 zupelnie inna droga
+         -- niz ta, ktora story zamyka.
+         -- review-fix cyklu 3 (SEC-4): 'claimed' DOPISANY do zbioru chronionego.
+         --
+         -- Utwardzenie cyklu 2 objelo stany UNIEWAZNIONE, ale zostawilo stan
+         -- ZREALIZOWANY. Kod 'claimed' dawal sie cofnac upsertem do 'idle',
+         -- a 'idle' jest na allow-liscie wejsciowej realizacji -- czyli powrot
+         -- do stanu realizowalnego z pominieciem producenta, dokladnie ta sama
+         -- klasa co wskrzeszenie 'refunded', tylko o jeden stan obok.
+         -- Konsekwencja byloby wykonanie DRUGIEGO zabiegu za jeden oplacony
+         -- kod. Argument tej story "relabel claimed niszczy fakt realizacji"
+         -- (voucher-code-state.ts) stosuje sie tu doslownie.
+         --
+         -- Zbior = stany unieważnione (kontrakt: invalidating_transitions)
+         -- PLUS stan zrealizowany. 'claimed' nie jest stanem unieważniającym,
+         -- wiec nie wchodzi do mapy kontraktu -- i dlatego musi byc wymieniony
+         -- tutaj jawnie, a nie oczekiwany od bramki derywujacej z tej mapy.
+         status = CASE
+           WHEN voucher.status IN ('refunded','expired','withdrawn','claimed')
+             THEN voucher.status
+           ELSE EXCLUDED.status
+         END,
          expires_at = EXCLUDED.expires_at,
          updated_at = NOW()`,
       [
@@ -1665,6 +1802,10 @@ export class VoucherService {
           const wired = await wireEntitlementTransitionPersisted(
             {
               appendAudit: (audit) => this.appendTransitionAudit(client, audit),
+              // v1.15.0 Story 5.9 (AC3): VOIDED unieważnia uprawnienie, więc
+              // stan kodu schodzi w TEJ SAMEJ transakcji (`client`).
+              invalidateVoucherCode: (invalidation) =>
+                invalidateVoucherCode(client, invalidation),
               clock: () => new Date(markedAt),
             },
             {
@@ -1712,6 +1853,10 @@ export class VoucherService {
           const wired = await wireEntitlementTransitionPersisted(
             {
               appendAudit: (audit) => this.appendTransitionAudit(client, audit),
+              // v1.15.0 Story 5.9 (AC3): VOIDED unieważnia uprawnienie, więc
+              // stan kodu schodzi w TEJ SAMEJ transakcji (`client`).
+              invalidateVoucherCode: (invalidation) =>
+                invalidateVoucherCode(client, invalidation),
               clock: () => new Date(markedAt),
             },
             {
@@ -1861,7 +2006,7 @@ export class VoucherService {
         if (!txClient) await client.query("ROLLBACK")
         return { status: "not_found", voucher: null }
       }
-      const lockedStatus = lockRes.rows[0].status
+      const lockedStatus = lockRes.rows[0].status as VoucherStatus
       const lockedExpires = lockRes.rows[0].expires_at
         ? new Date(lockRes.rows[0].expires_at)
         : null
@@ -1872,19 +2017,35 @@ export class VoucherService {
           : await this.getByCode(code)
         return { status: "already_claimed", voucher: current ?? voucher }
       }
-      if (lockedExpires && lockedExpires < now) {
+      // v1.15.0 Story 5.8 (AD-17): wygaśnięcie ma DWA nośniki — stan `expired`
+      // i kolumnę `expires_at`. Do tej story sprawdzany był tylko drugi, więc
+      // voucher ze stanem `expired` i pustym `expires_at` przechodził.
+      if (lockedStatus === "expired" || (lockedExpires && lockedExpires < now)) {
         if (!txClient) await client.query("ROLLBACK")
         const current = txClient
           ? await this.getByCodeWithClient(txClient, code)
           : await this.getByCode(code)
         return { status: "expired", voucher: current ?? voucher }
       }
-      const updRes = await client.query(
-        `UPDATE voucher SET status = 'claimed', updated_at = NOW()
-         WHERE code = $1 AND status <> 'claimed'`,
-        [code]
-      )
-      if ((updRes.rowCount ?? 0) > 0) {
+      // ALLOW-LISTA (AD-17): wszystko poza `VOUCHER_REDEMPTION_INPUT_STATES`
+      // jest ODMOWĄ. Wcześniejsza negacja `<> 'claimed'` przepuszczała tu
+      // `withdrawn` — voucher wycofany dawał się zrealizować.
+      if (!VOUCHER_REDEMPTION_INPUT_STATES.has(lockedStatus)) {
+        if (!txClient) await client.query("ROLLBACK")
+        const current = txClient
+          ? await this.getByCodeWithClient(txClient, code)
+          : await this.getByCode(code)
+        return { status: "not_redeemable", voucher: current ?? voucher }
+      }
+      // v1.15.0 Story 5.9: zapis stanu kodu idzie przez JEDNEGO producenta
+      // (`voucher-code-state.ts`), na TYM SAMYM `client`-cie. Allow-lista
+      // zostaje tutaj — producent nie jest jej drugą kopią.
+      const claimedRows = await claimVoucherCode(client, {
+        code,
+        now,
+        inputStates: VOUCHER_REDEMPTION_INPUT_STATES,
+      })
+      if (claimedRows > 0) {
         const eventId = randomUUID()
         await client.query(
           `INSERT INTO voucher_event (id, voucher_code, event_type, occurred_at, created_at)
@@ -1910,6 +2071,168 @@ export class VoucherService {
       return { status: "already_claimed", voucher: updated }
     }
     return { status: "claimed", voucher: updated }
+  }
+
+  /**
+   * Odczyt vouchera W ZAKRESIE NAJEMCY (v1.15.0 Story 5.8, AD-20, UX-DR9).
+   *
+   * Zwraca `null` dla kodu NIEZNANEGO **i** dla kodu CUDZEGO — jednym
+   * wyjściem, bo rozróżnienie ich jest wyciekiem istnienia cudzych danych.
+   * Trasa `/vendor/*` nie porównuje więc `seller_id` u siebie: predykat
+   * własności należy do domeny, a nie do warstwy HTTP.
+   *
+   * To NIE JEST kontrola autoryzacyjna realizacji — ta siedzi pod blokadą
+   * w {@link redeemForSeller}. Tutaj chodzi o odczyt (lookup) i o tani
+   * early-out.
+   *
+   * == Dlaczego predykat ma WŁASNE, wąskie zapytanie ==
+   * Kształt „`getByCode` + porównanie w pamięci" wykonywał dla kodu CUDZEGO
+   * DWA zapytania (voucher + CAŁA historia `voucher_event`, koszt rosnący
+   * liniowo z liczbą zdarzeń), a dla kodu NIEZNANEGO jedno — czyli sam czas
+   * odpowiedzi odróżniał „nie twój" od „nieznany", mimo że status, ciało
+   * i nagłówki są nieodróżnialne (UX-DR9). Review cyklu 1 (MEDIUM) zmierzył
+   * to na kodzie, a nie na komentarzu.
+   *
+   * Teraz OBIE ścieżki ODMOWY kończą się na jednym wąskim `SELECT seller_id`;
+   * pełny widok (z historią) czytany jest DOPIERO po przejściu predykatu,
+   * czyli wyłącznie na ścieżce sukcesu, która i tak jest odróżnialna treścią.
+   */
+  async getForSeller(
+    sellerId: string,
+    code: string
+  ): Promise<VoucherWithEvents | null> {
+    const scope = await this.getPool().query<{ seller_id: string }>(
+      `SELECT seller_id FROM voucher WHERE code = $1`,
+      [code]
+    )
+    if (scope.rows.length === 0) return null
+    if (scope.rows[0].seller_id !== sellerId) return null
+    return this.getByCode(code)
+  }
+
+  /**
+   * `redeemForSeller(sellerId, code)` — JEDNA operacja domenowa przyjmująca
+   * najemcę (v1.15.0 Story 5.8, AD-20, AD-17, ADR-199).
+   *
+   * == Co zastępuje i dlaczego ==
+   * Do tej story ścieżka realizacji sprzedawcy była PARĄ: trasa
+   * `/vendor/vouchers/:code/redeem` robiła `getByCode(code)` POZA blokadą,
+   * porównywała `existing.seller_id` z uwierzytelnionym sprzedawcą, a potem
+   * wołała `claim(code)` — operację, która najemcy NIE ZNA w ogóle. Obserwacja
+   * własności i mutacja pochodziły więc z DWÓCH RÓŻNYCH snapshotów: między
+   * odczytem a `SELECT … FOR UPDATE` wewnątrz `claim` mieściła się dowolna
+   * zmiana `seller_id`. To jest kształt, którego AD-20 zabrania.
+   *
+   * Tutaj `seller_id`, `status` i `expires_at` pochodzą z TEGO SAMEGO
+   * ZABLOKOWANEGO WIERSZA, a `UPDATE` jest dodatkowo bramkowany allow-listą
+   * stanów. Przeniesienie samego porównania z trasy do serwisu BEZ wciągnięcia
+   * `seller_id` do zablokowanego odczytu przeniosłoby defekt, a nie usunęło —
+   * dlatego kolumna jest w `SELECT … FOR UPDATE`, nie w osobnym zapytaniu.
+   *
+   * == Kształt wyniku ==
+   *   - `not_found`  — kod nieznany **albo** cudzy (celowo nieodróżnialne),
+   *   - `refused`    — stan spoza allow-listy, z ROZRÓŻNIALNYM powodem
+   *                    (`already_redeemed` / `withdrawn` / `expired`, UX-DR9),
+   *   - `redeemed`   — przejście zaszło; `prior_status` niesie stan sprzed.
+   */
+  async redeemForSeller(
+    sellerId: string,
+    code: string,
+    opts: { now?: Date; client?: Queryable } = {}
+  ): Promise<RedeemForSellerResult> {
+    const now = opts.now ?? new Date()
+    const txClient = opts.client ?? null
+    const client = txClient ?? (await this.getPool().connect())
+
+    let priorStatus: VoucherStatus | null = null
+    try {
+      if (!txClient) await client.query("BEGIN")
+
+      // JEDEN zablokowany odczyt — `seller_id` RAZEM ze stanem. To jest
+      // cały sens tej metody: zakres najemcy i przejście stanu rozstrzygane
+      // na tym samym wierszu, pod tą samą blokadą.
+      const lockRes = await client.query<{
+        seller_id: string
+        status: string
+        expires_at: Date | null
+      }>(
+        `SELECT seller_id, status, expires_at FROM voucher WHERE code = $1 FOR UPDATE`,
+        [code]
+      )
+      if (lockRes.rows.length === 0) {
+        if (!txClient) await client.query("ROLLBACK")
+        return { status: "not_found", voucher: null }
+      }
+
+      const locked = lockRes.rows[0]
+      // Cudzy voucher wychodzi TĄ SAMĄ gałęzią co nieznany kod.
+      if (locked.seller_id !== sellerId) {
+        if (!txClient) await client.query("ROLLBACK")
+        return { status: "not_found", voucher: null }
+      }
+
+      const lockedStatus = locked.status as VoucherStatus
+      const lockedExpires = locked.expires_at ? new Date(locked.expires_at) : null
+      priorStatus = lockedStatus
+
+      const reason = resolveRedeemRefusalReason(lockedStatus, lockedExpires, now)
+      if (reason) {
+        // Odmowa MUSI zwrócić voucher (panel pokazuje, czego dotyczy), więc
+        // czytamy go tym samym klientem — w transakcji wywołującego wciąż
+        // trwa jego tx, a bez niej domykamy własną.
+        const current = await this.getByCodeWithClient(client, code)
+        if (!txClient) await client.query("ROLLBACK")
+        return current
+          ? { status: "refused", reason, voucher: current }
+          : { status: "not_found", voucher: null }
+      }
+
+      // Klauzula `WHERE` powtarza allow-listę CELOWO: gałąź TypeScriptu
+      // rozstrzyga POWÓD odmowy, a klauzula jest ostatnim bezpiecznikiem
+      // przy współbieżności. Obie są generowane z jednego zbioru, więc nie
+      // mogą się rozjechać.
+      const claimedRows = await claimVoucherCode(client, {
+        code,
+        seller_id: sellerId,
+        now,
+        inputStates: VOUCHER_REDEMPTION_INPUT_STATES,
+      })
+      if (claimedRows === 0) {
+        // Przegrany wyścig: równoległy najemca/żądanie już przestawiło stan.
+        const current = await this.getByCodeWithClient(client, code)
+        if (!txClient) await client.query("ROLLBACK")
+        return current
+          ? { status: "refused", reason: "already_redeemed", voucher: current }
+          : { status: "not_found", voucher: null }
+      }
+
+      // `payload.prior_status` NIE jest ozdobnikiem: przy POWTÓRCE tego samego
+      // żądania projekcja nie biegnie (M6), więc jedynym źródłem stanu SPRZED
+      // przejścia zostaje ten wiersz. Bez niego koperta audytowa replayu
+      // czytałaby stan BIEŻĄCY (`claimed`) i różniła się od koperty pierwszego
+      // żądania — a UX-DR8 wymaga, żeby retry produkował TĘ SAMĄ kopertę.
+      // ZMIERZONE: bez tego pola asercja równości koperty pękała na
+      // `prior_status` („idle" vs „claimed").
+      await client.query(
+        `INSERT INTO voucher_event (id, voucher_code, event_type, payload, occurred_at, created_at)
+         VALUES ($1, $2, 'claimed', $3::jsonb, $4, NOW())`,
+        [randomUUID(), code, JSON.stringify({ prior_status: lockedStatus }), now]
+      )
+      if (!txClient) await client.query("COMMIT")
+    } catch (err) {
+      if (!txClient) await client.query("ROLLBACK")
+      throw err
+    } finally {
+      if (!txClient) (client as RlsPoolClient).release()
+    }
+
+    const updated = txClient
+      ? await this.getByCodeWithClient(txClient, code)
+      : await this.getByCode(code)
+    if (!updated) {
+      throw new Error(`VoucherService.redeemForSeller: failed to read back ${code}`)
+    }
+    return { status: "redeemed", prior_status: priorStatus!, voucher: updated }
   }
 
   async extend(

@@ -57,6 +57,7 @@ import {
 } from "./delivery-state"
 import { isRecipientHash, type RecipientHash } from "./recipient-hash"
 import { CALLER_FORBIDDEN_ATTEMPT_FIELDS } from "./attempt-policy"
+import { consumesRecipientAttemptForErrorCode } from "../../lib/delivery-event-classification"
 
 export const VOUCHER_DELIVERY_DISPATCH_TABLE = "voucher_delivery_dispatch"
 export const VOUCHER_DELIVERY_DISPATCH_AUDIT_TABLE =
@@ -92,6 +93,8 @@ export interface DispatchIdentity {
 }
 
 export interface ReserveDispatchInput extends DispatchIdentity {
+  env: string
+  instance_id: string
   market_id: string
   flow_id: string
   locale: string
@@ -126,18 +129,42 @@ export interface DispatchRow {
   entitlement_id: string
   template_key: string
   recipient_hash: string
+  env: string
+  instance_id: string
   market_id: string
   flow_id: string
   locale: string
   status: DeliveryDispatchState
   provider: string | null
   provider_message_id: string | null
+  provider_attempted_at: string | null
   error_code: string | null
   /** Pierwotna przyczyna — nie jest kasowana przez retry summary row. */
   first_error_code: string | null
   first_failed_at: string | null
   /** Ile razy automat przywrócił budżet po awarii konfiguracji. */
   configuration_recovery_count: number
+  /**
+   * Story 4.6 (FR-9g) — ile z `attempt_count` prób padło z powodu NIE
+   * przypisywalnego odbiorcy (błąd dostawcy, awaria sieci, awaria konfiguracji).
+   *
+   * Budżet ODBIORCY to `attempt_count - non_recipient_failure_count`. Rozdział
+   * jest konieczny, bo `attempt_count` pełni DWIE role naraz: numeru próby
+   * (AD-23, backoff) i budżetu klientki (FR-9g). Zlanie ich znaczyło, że awaria
+   * cudzej infrastruktury kasowała voucher — mimo że klasyfikator 4.3
+   * rozstrzygał wprost, że nie powinna (`consumes_recipient_attempt: false`).
+   */
+  non_recipient_failure_count: number
+  /**
+   * Story 4.6 (AC1) — ISO 8601 momentu, w którym wyczerpanie polityki prób
+   * zostało zgłoszone człowiekowi; `null` gdy jeszcze nie było zgłoszone.
+   *
+   * Nośnik NIEPOWTARZALNOŚCI eskalacji, trwały z założenia: skan chodzi co 15
+   * minut i widzi ten sam zaparkowany wiersz w każdym przebiegu. Mapa w pamięci
+   * procesu dałaby przy dwóch instancjach dwie eskalacje — kształt, który
+   * Story 4.1 z tego kodu usuwała.
+   */
+  escalated_at: string | null
   /**
    * Kod HTTP ostatniej odpowiedzi providera (`401`, `429`, `500`, …) albo
    * `null`, gdy fail nastąpił ZANIM cokolwiek poszło do providera
@@ -240,6 +267,14 @@ export interface DeliveryGapCandidate {
   dispatch_status: DeliveryDispatchState | null
   queued_at: string | null
   attempt_count: number
+  /**
+   * Story 4.6 — ile z `attempt_count` NIE obciążyło budżetu odbiorcy. Kandydat
+   * niesie to pole, bo guard defense-in-depth w skanie musi rozstrzygać
+   * „zaparkowany?" TĄ SAMĄ definicją co SQL, który go wyfiltrował. Bez tego
+   * guard odmawiałby dosyłki wierszom, których sam skan zaparkowanymi nie
+   * uznaje — czyli cofałby naprawę AC2 zaraz po jej zrobieniu.
+   */
+  non_recipient_failure_count: number
 }
 
 export interface ScanDeliveryGapsInput {
@@ -278,6 +313,12 @@ export interface ScanDeliveryGapsInput {
    * widoczne — przez `countParkedDispatchesByMarket`, nie przez zjadanie batcha.
    */
   max_attempt_count: number
+  /**
+   * Story 4.6 — twardy sufit prób łącznie (`max_total_attempt_count`
+   * z `attempt-policy.ts`). Wchodzi tu razem z budżetem odbiorcy, bo od 4.6
+   * „zaparkowany" jest ALTERNATYWĄ dwóch granic, a nie jednym progiem.
+   */
+  max_total_attempt_count: number
   /** Bounded batch: maksymalna liczba wierszy na przebieg. */
   limit: number
 }
@@ -318,6 +359,12 @@ export interface ScanStalledDispatchesInput {
   created_before: string
   created_after: string
   max_attempt_count: number
+  /**
+   * Story 4.6 — twardy sufit prób łącznie (`max_total_attempt_count`
+   * z `attempt-policy.ts`). Wchodzi tu razem z budżetem odbiorcy, bo od 4.6
+   * „zaparkowany" jest ALTERNATYWĄ dwóch granic, a nie jednym progiem.
+   */
+  max_total_attempt_count: number
   limit: number
 }
 
@@ -335,6 +382,28 @@ export interface ParkedDispatchRow {
 export interface ParkedDispatchMarketCount {
   market_id: string | null
   parked: number
+}
+
+/**
+ * Story 4.6 (AC1) — wiersz ZAJĘTY do eskalacji, z tożsamością wystarczającą,
+ * żeby człowiek doszedł od zdarzenia do konkretnego zakupu.
+ *
+ * Szerszy niż `ParkedDispatchRow`, i to jest cała różnica między licznikiem
+ * a eskalacją: `ParkedDispatchRow` służy WYKLUCZENIU wiersza ze skanu (potrzeba
+ * klucza), ten służy POWIADOMIENIU człowieka (potrzeba powodu i historii).
+ * `recipient_hash` jest hashem — adresu tu nie ma i być nie może (`assertNoPii`).
+ */
+export interface EscalationClaimRow {
+  dispatch_id: string
+  entitlement_id: string
+  template_key: string
+  market_id: string | null
+  recipient_hash: string | null
+  attempt_count: number
+  non_recipient_failure_count: number
+  error_code: string | null
+  first_error_code: string | null
+  first_failed_at: string | null
 }
 
 /**
@@ -403,29 +472,30 @@ export interface DeliveryGapScanPort {
   listParkedDispatches(input: {
     entitlement_ids: readonly string[]
     max_attempt_count: number
+    max_total_attempt_count: number
   }): Promise<ParkedDispatchRow[]>
   /** R-2.5-H3 — zaparkowane per rynek (alert; wiersze NIE wracają ze skanu). */
   countParkedDispatchesByMarket(input: {
     max_attempt_count: number
+    max_total_attempt_count: number
   }): Promise<ParkedDispatchMarketCount[]>
   /**
-   * R-2.5-H3 — zwrot budżetu prób po awarii GLOBALNEJ (kill-switch, brak
-   * szablonu locale, brak klucza providera). Taka awaria nie jest odrzuceniem
-   * wysyłki przez providera, tylko brakiem konfiguracji: gdyby zużywała budżet,
-   * odwracalna awaria konfiguracji zamieniałaby się po 5 przebiegach (75 min)
-   * w TRWAŁĄ utratę maili dla całego okna awarii, bez ścieżki odparkowania.
-   *
-   * Guard `status='failed' AND error_code = …` sprawia, że dekrement dotyczy
-   * WYŁĄCZNIE wiersza, który właśnie padł z tym kodem — nie cofa prób zużytych
-   * na realne odrzucenia providera. `max_configuration_recoveries` stanowi
-   * trwałą granicę: konfiguracja, której operator nie naprawi, nie może
-   * uruchamiać tego samego wiersza bez końca.
+   * Story 4.6 (AC1) — atomowe zajęcie wierszy do eskalacji. Zwraca WYŁĄCZNIE
+   * te, które to wywołanie przestawiło z `escalated_at IS NULL`, więc drugi
+   * przebieg skanu na tym samym zaparkowanym wierszu nie produkuje drugiego
+   * zdarzenia.
    */
-  releaseAttemptBudget(input: {
-    dispatch_id: string
-    error_code: string
-    max_configuration_recoveries: number
-  }): Promise<boolean>
+  claimAttemptPolicyEscalations(input: {
+    max_attempt_count: number
+    max_total_attempt_count: number
+    /** Dolna granica okna (R-2.5-H1) — obowiązkowa, patrz implementacja. */
+    created_after: string
+    limit: number
+  }): Promise<EscalationClaimRow[]>
+  /** Story 4.6 (AC1) — zwrot zajęcia, gdy zdarzenie nie wyszło do nośnika. */
+  releaseEscalationClaims(input: {
+    dispatch_ids: readonly string[]
+  }): Promise<number>
   /**
    * Odparkuj historyczne wiersze, których pierwotna (niemutowalna) przyczyna
    * była globalną awarią konfiguracji. Licznik odzyskań jest zapisywany przy
@@ -434,6 +504,7 @@ export interface DeliveryGapScanPort {
    */
   releaseParkedConfigurationFailureBudgets(input: {
     max_attempt_count: number
+    max_total_attempt_count: number
     max_configuration_recoveries: number
     error_codes: readonly string[]
   }): Promise<number>
@@ -450,11 +521,44 @@ export class DispatchLedgerError extends Error {
 }
 
 const SELECT_COLUMNS = `
-  dispatch_id, entitlement_id, template_key, recipient_hash, market_id,
-  flow_id, locale, status, provider, provider_message_id, error_code, attempt_count,
+  dispatch_id, entitlement_id, template_key, recipient_hash, env, instance_id, market_id,
+  flow_id, locale, status, provider, provider_message_id, provider_attempted_at,
+  error_code, attempt_count,
   first_error_code, first_failed_at, configuration_recovery_count, queued_at,
-  provider_status_code, provider_message, provider_error_kind, correlation_token
+  provider_status_code, provider_message, provider_error_kind, correlation_token,
+  non_recipient_failure_count, escalated_at
 `
+
+/**
+ * JEDNA definicja „wiersz ZAPARKOWANY" w SQL-u (Story 4.6).
+ *
+ * Predykat żyje w czterech zapytaniach (wykluczenie ze skanu, licznik
+ * operatorski, zajęcie do eskalacji i — zanegowany — kwalifikacja kandydata).
+ * Rozpisany osobno w każdym z nich byłby czterema definicjami tego samego
+ * pojęcia: dokładnie ten rozjazd, przed którym broniła Story 4.4 („drugi
+ * wywołujący z innym progiem odparkowuje wiersze pierwszego").
+ *
+ * DWIE granice, rozłączne w znaczeniu i obie trwałe:
+ *   1. budżet ODBIORCY — `attempt_count - non_recipient_failure_count`
+ *      osiągnął `max_attempt_count` (FR-9g: voucher NIE DOSZEDŁ);
+ *   2. sufit prób ŁĄCZNIE — `attempt_count` osiągnął `max_total_attempt_count`
+ *      (ochrona przed pętlą: awaria dostawcy nie konsumuje budżetu odbiorcy,
+ *      więc bez tej granicy wiersz ponawiałby się bez końca).
+ */
+function parkedPredicateSql(
+  alias: string,
+  maxAttemptPlaceholder: string,
+  maxTotalPlaceholder: string,
+): string {
+  const c = alias ? `${alias}.` : ""
+  return `(
+        ${c}attempt_count - ${c}non_recipient_failure_count >= ${maxAttemptPlaceholder}
+     OR ${c}attempt_count >= ${maxTotalPlaceholder}
+  )`
+}
+
+/** Stany, w których wysyłka jest DOMKNIĘTA — wiersz nie podlega parkowaniu. */
+const DISPATCH_SETTLED_STATES_SQL = `('sent', 'delivered', 'degraded')`
 
 export interface PgDispatchLedgerOptions {
   now?: () => Date
@@ -487,6 +591,7 @@ export class PgDispatchLedger
     input: ReserveDispatchInput,
   ): Promise<ReserveDispatchResult> {
     assertRecipientHash(input.recipient_hash)
+    assertMeasurementContext(input)
     // AD-23 (Story 4.4): numer próby nadaje POLITYKA. Typ już go nie ma, ale
     // wejście bywa budowane dynamicznie (payload webhooka 4.2/4.3, `as`) —
     // ciche zignorowanie `attempt_no` wyglądałoby jak skuteczne nadanie numeru.
@@ -497,9 +602,9 @@ export class PgDispatchLedger
 
     const inserted = await this.queryRows<DispatchRow>(
       `INSERT INTO ${VOUCHER_DELIVERY_DISPATCH_TABLE} (
-         dispatch_id, entitlement_id, template_key, recipient_hash, market_id,
-         flow_id, locale, status, attempt_count, queued_at, created_at, updated_at
-       ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'queued', 1, $8, $9, $10)
+         dispatch_id, entitlement_id, template_key, recipient_hash, env, instance_id,
+         market_id, flow_id, locale, status, attempt_count, queued_at, created_at, updated_at
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'queued', 1, $10, $11, $12)
        ON CONFLICT (entitlement_id, template_key, recipient_hash) DO NOTHING
        RETURNING ${SELECT_COLUMNS}`,
       [
@@ -507,6 +612,8 @@ export class PgDispatchLedger
         input.entitlement_id,
         input.template_key,
         input.recipient_hash,
+        input.env,
+        input.instance_id,
         input.market_id,
         input.flow_id,
         input.locale,
@@ -544,6 +651,21 @@ export class PgDispatchLedger
       }
     }
 
+    const legacyUnattributed =
+      existing.env === "unattributed" && existing.instance_id === "unattributed"
+    if (
+      !legacyUnattributed &&
+      (existing.env !== input.env ||
+        existing.instance_id !== input.instance_id ||
+        existing.market_id !== input.market_id)
+    ) {
+      throw new DispatchLedgerError(
+        "istniejący wiersz dostawy ma inny env/instance_id/market_id — " +
+          "próba nie może mieszać środowisk (AD-25)",
+        "VOUCHER_DELIVERY_MEASUREMENT_CONTEXT_MISMATCH",
+      )
+    }
+
     if (DISPATCH_STATES_BLOCKING_RESEND.includes(existing.status)) {
       return {
         outcome: "blocked",
@@ -576,7 +698,7 @@ export class PgDispatchLedger
       // w `toKnexPositionalSql`).
       const retryStates = [...DISPATCH_STATES_ALLOWING_RETRY]
       const retryPlaceholders = retryStates
-        .map((_state, index) => `$${index + 7}`)
+        .map((_state, index) => `$${index + 9}`)
         .join(", ")
       const reclaimed = await this.queryRows<DispatchRow>(
         `UPDATE ${VOUCHER_DELIVERY_DISPATCH_TABLE}
@@ -595,8 +717,10 @@ export class PgDispatchLedger
                 updated_at = $2,
                 locale = $3,
                 market_id = $4,
-                flow_id = $5
-          WHERE dispatch_id = $6
+                flow_id = $5,
+                env = $6,
+                instance_id = $7
+          WHERE dispatch_id = $8
             AND status IN (${retryPlaceholders})
         RETURNING ${SELECT_COLUMNS}`,
         [
@@ -605,6 +729,8 @@ export class PgDispatchLedger
           input.locale,
           input.market_id,
           input.flow_id,
+          input.env,
+          input.instance_id,
           existing.dispatch_id,
           ...retryStates,
         ],
@@ -660,6 +786,7 @@ export class PgDispatchLedger
               -- udanej próbie. Zapisany token jest faktem o dostarczonej
               -- wiadomości, a nie o ostatnim wywołaniu.
               correlation_token = COALESCE($3, correlation_token),
+              provider_attempted_at = $4,
               error_code = NULL,
               -- Sukces kasuje diagnostyke porazki razem ze statusem bledu:
               -- wiersz 'sent' z HTTP 401 poprzedniej proby czytalby sie jak
@@ -689,9 +816,31 @@ export class PgDispatchLedger
     return true
   }
 
+  /**
+   * Tranzycja `queued → failed` — i JEDYNE miejsce, w którym atrybucja porażki
+   * przekłada się na budżet prób odbiorcy (Story 4.6, AC2).
+   *
+   * Do 4.6 flaga `consumes_recipient_attempt` z klasyfikatora 4.3 nie miała ANI
+   * JEDNEGO konsumenta decyzyjnego: `brevo-delivery-tracker.ts:544` przepisywał
+   * ją do pola koperty audytowej i na tym się kończyło. Budżet konsumował
+   * BEZWARUNKOWY `attempt_count + 1` w `reserveDispatch`, nie pytając o nic.
+   *
+   * Tutaj pytanie pada. Źródłem odpowiedzi jest klasyfikator — nie druga lista
+   * kodów obok niego: `consumesRecipientAttemptForErrorCode` czyta tablicę
+   * `REACTIONS`, więc dopisanie klasy odbicia w 4.3 przenosi się tu samo.
+   * `reserveDispatch` nadal inkrementuje `attempt_count` bezwarunkowo (AD-23 —
+   * numer próby jest faktem o próbie, nie o jej przyczynie); porażka
+   * nieprzypisywalna odbiorcy podnosi RÓWNOLEGLE `non_recipient_failure_count`,
+   * więc różnica — budżet odbiorcy — nie drgnie.
+   */
   async markFailed(input: MarkFailedInput): Promise<boolean> {
     const nowIso = this.now().toISOString()
     const providerResponse = normalizeProviderResponse(input)
+    const nonRecipientDelta = consumesRecipientAttemptForErrorCode(
+      input.error_code,
+    )
+      ? 0
+      : 1
     const rows = await this.queryRows<DispatchRow>(
       `UPDATE ${VOUCHER_DELIVERY_DISPATCH_TABLE}
           SET status = 'failed',
@@ -703,7 +852,10 @@ export class PgDispatchLedger
               updated_at = $4,
               provider_status_code = $6,
               provider_message = $7,
-              provider_error_kind = $8
+              provider_error_kind = $8,
+              provider_attempted_at = CASE WHEN provider IS NOT NULL THEN $3 ELSE provider_attempted_at END,
+              non_recipient_failure_count =
+                non_recipient_failure_count + $9
         WHERE dispatch_id = $5
           AND status = 'queued'
       RETURNING ${SELECT_COLUMNS}`,
@@ -716,6 +868,7 @@ export class PgDispatchLedger
         providerResponse.status_code,
         providerResponse.message,
         providerResponse.error_kind,
+        nonRecipientDelta,
       ],
     )
 
@@ -733,7 +886,9 @@ export class PgDispatchLedger
     return true
   }
 
-  async findByIdentity(identity: DispatchIdentity): Promise<DispatchRow | null> {
+  async findByIdentity(
+    identity: DispatchIdentity,
+  ): Promise<DispatchRow | null> {
     assertRecipientHash(identity.recipient_hash)
     const rows = await this.queryRows<DispatchRow>(
       `SELECT ${SELECT_COLUMNS}
@@ -802,6 +957,10 @@ export class PgDispatchLedger
     }
     assertGapScanWindow(input.created_after, input.created_before)
     assertMaxAttemptCount(input.max_attempt_count)
+    assertMaxTotalAttemptCount(
+      input.max_total_attempt_count,
+      input.max_attempt_count,
+    )
     if (!Number.isInteger(input.limit) || input.limit < 1) {
       throw new DispatchLedgerError(
         "scanDeliveryGaps wymaga limitu >= 1 — skan bez limitu może wystrzelić " +
@@ -822,7 +981,9 @@ export class PgDispatchLedger
     const templatePlaceholders = templateKeys
       .map(() => `($${++position})`)
       .join(", ")
-    const statePlaceholders = sourceStates.map(() => `$${++position}`).join(", ")
+    const statePlaceholders = sourceStates
+      .map(() => `$${++position}`)
+      .join(", ")
     const typePlaceholders = entitlementTypes
       .map(() => `$${++position}`)
       .join(", ")
@@ -831,6 +992,7 @@ export class PgDispatchLedger
     const staleQueuedPlaceholder = `$${++position}`
     const retryPlaceholders = retryStates.map(() => `$${++position}`).join(", ")
     const maxAttemptPlaceholder = `$${++position}`
+    const maxTotalPlaceholder = `$${++position}`
     const limitPlaceholder = `$${++position}`
 
     const rows = await this.queryRows<Record<string, unknown>>(
@@ -841,7 +1003,8 @@ export class PgDispatchLedger
               d.dispatch_id   AS dispatch_id,
               d.status        AS dispatch_status,
               d.queued_at     AS queued_at,
-              d.attempt_count AS attempt_count
+              d.attempt_count AS attempt_count,
+              d.non_recipient_failure_count AS non_recipient_failure_count
          FROM ${ENTITLEMENT_INSTANCE_TABLE} e
          CROSS JOIN (VALUES ${templatePlaceholders}) AS t(template_key)
          LEFT JOIN ${VOUCHER_DELIVERY_DISPATCH_TABLE} d
@@ -856,7 +1019,15 @@ export class PgDispatchLedger
              OR (d.status = 'queued' AND d.queued_at < ${staleQueuedPlaceholder})
              OR d.status IN (${retryPlaceholders})
           )
-          AND (d.dispatch_id IS NULL OR d.attempt_count < ${maxAttemptPlaceholder})
+          -- Story 4.6: kwalifikacja kandydata to DOKŁADNIE negacja parkowania,
+          -- nie osobny próg. Zapisana tu drugi raz „po swojemu" rozjechałaby
+          -- sie z wykluczeniem w listParkedDispatches przy pierwszej zmianie
+          -- polityki — i wtedy sweep dosyłałby wiersze, które sam uznaje za
+          -- zaparkowane.
+          AND (
+                d.dispatch_id IS NULL
+             OR NOT ${parkedPredicateSql("d", maxAttemptPlaceholder, maxTotalPlaceholder)}
+          )
         ORDER BY COALESCE(d.attempt_count, 0) ASC, e.created_at ASC, e.id ASC,
                  t.template_key ASC
         LIMIT ${limitPlaceholder}`,
@@ -869,6 +1040,7 @@ export class PgDispatchLedger
         input.stale_queued_before,
         ...retryStates,
         input.max_attempt_count,
+        input.max_total_attempt_count,
         // +1 wiersz sondujący: obecność `limit + 1` znaczy „reszta ISTNIEJE".
         input.limit + 1,
       ],
@@ -891,7 +1063,10 @@ export class PgDispatchLedger
   async scanStalledDispatches(
     input: ScanStalledDispatchesInput,
   ): Promise<DeliveryGapCandidate[]> {
-    if (input.source_states.length === 0 || input.entitlement_types.length === 0) {
+    if (
+      input.source_states.length === 0 ||
+      input.entitlement_types.length === 0
+    ) {
       throw new DispatchLedgerError(
         "scanStalledDispatches wymaga niepustych zbiorów source_states " +
           "i entitlement_types",
@@ -900,6 +1075,10 @@ export class PgDispatchLedger
     }
     assertGapScanWindow(input.created_after, input.created_before)
     assertMaxAttemptCount(input.max_attempt_count)
+    assertMaxTotalAttemptCount(
+      input.max_total_attempt_count,
+      input.max_attempt_count,
+    )
     if (!Number.isInteger(input.limit) || input.limit < 1) {
       throw new DispatchLedgerError(
         "scanStalledDispatches wymaga limitu >= 1",
@@ -914,7 +1093,10 @@ export class PgDispatchLedger
     let position = 0
     const retryPlaceholders = retryStates.map(() => `$${++position}`).join(", ")
     const maxAttemptPlaceholder = `$${++position}`
-    const statePlaceholders = sourceStates.map(() => `$${++position}`).join(", ")
+    const maxTotalPlaceholder = `$${++position}`
+    const statePlaceholders = sourceStates
+      .map(() => `$${++position}`)
+      .join(", ")
     const typePlaceholders = entitlementTypes
       .map(() => `$${++position}`)
       .join(", ")
@@ -930,11 +1112,13 @@ export class PgDispatchLedger
               d.dispatch_id   AS dispatch_id,
               d.status        AS dispatch_status,
               d.queued_at     AS queued_at,
-              d.attempt_count AS attempt_count
+              d.attempt_count AS attempt_count,
+              d.non_recipient_failure_count AS non_recipient_failure_count
          FROM ${VOUCHER_DELIVERY_DISPATCH_TABLE} d
          JOIN ${ENTITLEMENT_INSTANCE_TABLE} e ON e.id = d.entitlement_id
         WHERE d.status IN (${retryPlaceholders})
-          AND d.attempt_count < ${maxAttemptPlaceholder}
+          -- Story 4.6: ta sama negacja parkowania co w scanDeliveryGaps.
+          AND NOT ${parkedPredicateSql("d", maxAttemptPlaceholder, maxTotalPlaceholder)}
           AND e.state IN (${statePlaceholders})
           AND e.entitlement_type IN (${typePlaceholders})
           AND e.created_at < ${createdBeforePlaceholder}
@@ -945,6 +1129,7 @@ export class PgDispatchLedger
       [
         ...retryStates,
         input.max_attempt_count,
+        input.max_total_attempt_count,
         ...sourceStates,
         ...entitlementTypes,
         input.created_before,
@@ -960,25 +1145,29 @@ export class PgDispatchLedger
   async listParkedDispatches(input: {
     entitlement_ids: readonly string[]
     max_attempt_count: number
+    max_total_attempt_count: number
   }): Promise<ParkedDispatchRow[]> {
     assertMaxAttemptCount(input.max_attempt_count)
+    assertMaxTotalAttemptCount(
+      input.max_total_attempt_count,
+      input.max_attempt_count,
+    )
     const ids = [...input.entitlement_ids]
     if (ids.length === 0) return []
 
     let position = 0
     const maxAttemptPlaceholder = `$${++position}`
+    const maxTotalPlaceholder = `$${++position}`
     const idPlaceholders = ids.map(() => `$${++position}`).join(", ")
 
     const rows = await this.queryRows<Record<string, unknown>>(
       `SELECT dispatch_id, entitlement_id, market_id, template_key, attempt_count,
               first_error_code
          FROM ${VOUCHER_DELIVERY_DISPATCH_TABLE}
-        WHERE attempt_count >= ${maxAttemptPlaceholder}
-          AND status <> 'sent'
-          AND status <> 'delivered'
-          AND status <> 'degraded'
+        WHERE ${parkedPredicateSql("", maxAttemptPlaceholder, maxTotalPlaceholder)}
+          AND status NOT IN ${DISPATCH_SETTLED_STATES_SQL}
           AND entitlement_id IN (${idPlaceholders})`,
-      [input.max_attempt_count, ...ids],
+      [input.max_attempt_count, input.max_total_attempt_count, ...ids],
     )
 
     return rows.map((row) => ({
@@ -995,18 +1184,21 @@ export class PgDispatchLedger
   /** R-2.5-H3 — nośnik alertu dla wierszy, których sweep świadomie nie dosyła. */
   async countParkedDispatchesByMarket(input: {
     max_attempt_count: number
+    max_total_attempt_count: number
   }): Promise<ParkedDispatchMarketCount[]> {
     assertMaxAttemptCount(input.max_attempt_count)
+    assertMaxTotalAttemptCount(
+      input.max_total_attempt_count,
+      input.max_attempt_count,
+    )
 
     const rows = await this.queryRows<Record<string, unknown>>(
       `SELECT market_id, COUNT(*)::int AS parked
          FROM ${VOUCHER_DELIVERY_DISPATCH_TABLE}
-        WHERE attempt_count >= $1
-          AND status <> 'sent'
-          AND status <> 'delivered'
-          AND status <> 'degraded'
+        WHERE ${parkedPredicateSql("", "$1", "$2")}
+          AND status NOT IN ${DISPATCH_SETTLED_STATES_SQL}
         GROUP BY market_id`,
-      [input.max_attempt_count],
+      [input.max_attempt_count, input.max_total_attempt_count],
     )
 
     return rows.map((row) => ({
@@ -1015,53 +1207,208 @@ export class PgDispatchLedger
     }))
   }
 
-  /** R-2.5-H3 — awaria konfiguracyjna nie zużywa budżetu prób (odparkowanie). */
-  async releaseAttemptBudget(input: {
-    dispatch_id: string
-    error_code: string
-    max_configuration_recoveries: number
-  }): Promise<boolean> {
-    assertConfigurationRecoveryLimit(input.max_configuration_recoveries)
+  /**
+   * Story 4.6 (AC1) — ATOMOWE zajęcie wierszy, które wyczerpały politykę prób
+   * i jeszcze NIE eskalowały do człowieka.
+   *
+   * Jedno `UPDATE … RETURNING` zamiast pary SELECT-then-UPDATE: zwrócone są
+   * WYŁĄCZNIE wiersze, które to wywołanie realnie przestawiło z `escalated_at
+   * IS NULL`. Dwa równoległe skany dają więc dokładnie jedną eskalację na
+   * wiersz — a `FOR UPDATE SKIP LOCKED` w podzapytaniu sprawia, że drugi
+   * przebieg nie czeka na pierwszy, tylko bierze resztę.
+   *
+   * `LIMIT` jest obowiązkowy: pierwszy przebieg po wdrożeniu widzi CAŁĄ
+   * zastaną populację zaparkowanych wierszy naraz. Bez limitu jedno wdrożenie
+   * wysypałoby na człowieka tysiąc zdarzeń w jednej sekundzie — co jest tą samą
+   * ciszą, tylko przez zalanie. Reszta jedzie w kolejnych cyklach.
+   */
+  /**
+   * review-fix cyklu 1 (M4) — zajęcie ZNA okno skanu.
+   *
+   * Każde inne zapytanie skanu ma dolną granicę okna (R-2.5-H1, 7 dni) z
+   * zapisanym powodem: „pierwszy przebieg NIE dosyła historii sprzed istnienia
+   * ledgera; backfill jest osobną, świadomą decyzją PO". Zajęcie do eskalacji
+   * jej NIE miało, więc po wdrożeniu migracji człowiek zacząłby dostawać
+   * zdarzenia o zakupach sprzed dowolnie dawna — 50 na cykl, 200 na godzinę,
+   * aż populacja się wyczerpie. `SWEEP_ESCALATION_BATCH_LIMIT` ogranicza SZCZYT,
+   * nie SUMĘ. Alert o zakupie sprzed pół roku, na który nie da się już
+   * zareagować, uczy człowieka wyciszać kanał — czyli produkuje tę samą ciszę,
+   * przed którą broni NFR-3, tylko okrężną drogą.
+   *
+   * Granica jest TA SAMA co dla dosyłki (jedna stała `SWEEP_GAP_LOOKBACK_MS`),
+   * bo rozstrzygnięcie jest to samo: wiersz sprzed okna nie jest przedmiotem
+   * działania tego przebiegu. Backfill historii pozostaje osobną decyzją PO —
+   * i tak samo jak przy dosyłce wykonuje się go przesunięciem kotwicy
+   * `GP_VOUCHER_DELIVERY_SWEEP_EPOCH`, nie zdjęciem granicy w kodzie.
+   *
+   * Parametr jest OBOWIĄZKOWY (brak wartości domyślnej): domyślne „bez okna"
+   * jest dokładnie tym ubytkiem, który tu naprawiamy.
+   */
+  async claimAttemptPolicyEscalations(input: {
+    max_attempt_count: number
+    max_total_attempt_count: number
+    created_after: string
+    limit: number
+  }): Promise<EscalationClaimRow[]> {
+    assertMaxAttemptCount(input.max_attempt_count)
+    assertMaxTotalAttemptCount(
+      input.max_total_attempt_count,
+      input.max_attempt_count,
+    )
+    assertEscalationWindowStart(input.created_after)
+    if (!Number.isInteger(input.limit) || input.limit < 1) {
+      throw new DispatchLedgerError(
+        "claimAttemptPolicyEscalations wymaga limitu >= 1 — zajęcie bez limitu " +
+          "zamienia pierwszy przebieg po wdrożeniu w lawinę zdarzeń",
+        "VOUCHER_DELIVERY_ESCALATION_CLAIM_LIMIT_INVALID",
+      )
+    }
+
     const nowIso = this.now().toISOString()
-    const rows = await this.queryRows<DispatchRow>(
-      `UPDATE ${VOUCHER_DELIVERY_DISPATCH_TABLE}
-          SET attempt_count = GREATEST(attempt_count - 1, 1),
-              configuration_recovery_count = configuration_recovery_count + 1,
+    const rows = await this.queryRows<Record<string, unknown>>(
+      `UPDATE ${VOUCHER_DELIVERY_DISPATCH_TABLE} AS d
+          SET escalated_at = $1,
               updated_at = $1
-        WHERE dispatch_id = $2
-          AND status = 'failed'
-          AND error_code = $3
-          AND attempt_count > 0
-          AND configuration_recovery_count < $4
-      RETURNING ${SELECT_COLUMNS}`,
+        WHERE d.dispatch_id IN (
+                SELECT p.dispatch_id
+                  FROM ${VOUCHER_DELIVERY_DISPATCH_TABLE} AS p
+                 WHERE ${parkedPredicateSql("p", "$2", "$3")}
+                   AND p.status NOT IN ${DISPATCH_SETTLED_STATES_SQL}
+                   AND p.escalated_at IS NULL
+                   -- R-2.5-H1 (M4): dolna granica okna, ta sama co dosyłka.
+                   AND p.created_at >= $4
+                 ORDER BY p.first_failed_at ASC NULLS LAST, p.dispatch_id ASC
+                 LIMIT $5
+                   FOR UPDATE SKIP LOCKED
+              )
+      RETURNING d.dispatch_id, d.entitlement_id, d.template_key, d.market_id,
+                d.recipient_hash, d.attempt_count, d.non_recipient_failure_count,
+                d.error_code, d.first_error_code, d.first_failed_at`,
       [
         nowIso,
-        input.dispatch_id,
-        input.error_code,
-        input.max_configuration_recoveries,
+        input.max_attempt_count,
+        input.max_total_attempt_count,
+        input.created_after,
+        input.limit,
       ],
     )
 
-    return rows.length > 0
+    return rows.map((row) => ({
+      dispatch_id: String(row.dispatch_id ?? ""),
+      entitlement_id: String(row.entitlement_id ?? ""),
+      template_key: String(row.template_key ?? ""),
+      market_id: row.market_id == null ? null : String(row.market_id),
+      recipient_hash:
+        row.recipient_hash == null ? null : String(row.recipient_hash),
+      attempt_count: Number(row.attempt_count ?? 0),
+      non_recipient_failure_count: Number(row.non_recipient_failure_count ?? 0),
+      error_code: row.error_code == null ? null : String(row.error_code),
+      first_error_code:
+        row.first_error_code == null ? null : String(row.first_error_code),
+      first_failed_at: normalizeTimestamp(row.first_failed_at),
+    }))
   }
 
+  /**
+   * Story 4.6 (AC1) — ZWROT zajęcia, gdy zdarzenie nie wyszło do nośnika.
+   *
+   * Bez tego brak `POSTHOG_API_KEY` przez jeden przebieg kasowałby eskalację
+   * NA ZAWSZE: wiersz zostałby oznaczony jako zgłoszony, a nigdy zgłoszony nie
+   * był. Cisza wyglądałaby wtedy identycznie jak sukces — dokładnie ta pułapka,
+   * którą ta story zamyka.
+   */
+  async releaseEscalationClaims(input: {
+    dispatch_ids: readonly string[]
+  }): Promise<number> {
+    const ids = [...input.dispatch_ids]
+    if (ids.length === 0) return 0
+    const placeholders = ids.map((_id, index) => `$${index + 2}`).join(", ")
+    const nowIso = this.now().toISOString()
+    const rows = await this.queryRows<Record<string, unknown>>(
+      `UPDATE ${VOUCHER_DELIVERY_DISPATCH_TABLE}
+          SET escalated_at = NULL,
+              updated_at = $1
+        WHERE dispatch_id IN (${placeholders})
+          AND escalated_at IS NOT NULL
+      RETURNING dispatch_id`,
+      [nowIso, ...ids],
+    )
+    return rows.length
+  }
+
+  /**
+   * Odparkowanie HISTORYCZNYCH wierszy awarii konfiguracji.
+   *
+   * Story 4.6 — dlaczego to ZOSTAJE, choć atrybucja przejęła jego rolę na
+   * ścieżce bieżącej: od 4.6 awaria konfiguracji podnosi
+   * `non_recipient_failure_count` w `markFailed`, więc budżetu odbiorcy nie
+   * rusza i nowy wiersz nie ma czego odzyskiwać. Wiersze SPRZED migracji mają
+   * jednak `non_recipient_failure_count = 0` (backfill nie ma z czego
+   * zrekonstruować historii), więc dla nich ta ścieżka nadal jest jedyną drogą
+   * z parkingu. Zostaje jako naprawa POPULACJI ZASTANEJ — nie jako drugi,
+   * równoległy nośnik atrybucji.
+   *
+   * ── review-fix cyklu 1 (M1): PIĄTA kopia progu parkowania ──────────────────
+   * Ta metoda przeoczyła migrację 4.6 na dwa sposoby naraz i oba były realne
+   * dla wiersza POmigracyjnego, nie tylko zastanego:
+   *
+   *   1. używała progu `attempt_count >= max_attempt_count` — czyli STAREJ,
+   *      piątej definicji „zaparkowany", obok czterech zapytań korzystających
+   *      z `parkedPredicateSql`. Wiersz o `attempt_count = 5`,
+   *      `non_recipient_failure_count = 5` (pięć porażek NIEprzypisywalnych
+   *      odbiorcy, budżet odbiorcy nietknięty) zaparkowany NIE BYŁ, a mimo to
+   *      pasował do predykatu i był „odparkowywany" w każdym cyklu crona;
+   *   2. obniżała `attempt_count`, nie ruszając `non_recipient_failure_count` —
+   *      z `LEAST(5, 4) = 4` przy liczniku `5` robił się budżet odbiorcy `-1`,
+   *      czyli fantomowy kredyt. Przy okazji wypalała jedyny
+   *      `configuration_recovery_count` na wierszu, który odzysku nie
+   *      potrzebował, i kasowała `escalated_at`, przez co wiersz eskalował
+   *      DRUGI raz za tę samą awarię (wbrew AC1).
+   *
+   * Naprawa jest jedna dla obu: metoda operuje odtąd WYŁĄCZNIE na populacji
+   * zastanej, rozpoznawanej po `non_recipient_failure_count = 0` — bo wiersz
+   * POmigracyjny, którego wszystkie porażki są nieprzypisywalne odbiorcy, ma
+   * ten licznik równy `attempt_count` i odzysku nie potrzebuje z definicji.
+   * Próg parkowania pochodzi teraz z `parkedPredicateSql`, więc piątej kopii
+   * już nie ma. Niezmiennik `non_recipient_failure_count <= attempt_count`
+   * pilnuje dodatkowo `CHECK` z migracji `1779012000000`.
+   */
   async releaseParkedConfigurationFailureBudgets(input: {
     max_attempt_count: number
+    max_total_attempt_count: number
     max_configuration_recoveries: number
     error_codes: readonly string[]
   }): Promise<number> {
     assertMaxAttemptCount(input.max_attempt_count)
+    assertMaxTotalAttemptCount(
+      input.max_total_attempt_count,
+      input.max_attempt_count,
+    )
     assertConfigurationRecoveryLimit(input.max_configuration_recoveries)
     const codes = [...input.error_codes]
-    const codePlaceholders = codes.map((_code, index) => `$${index + 4}`).join(", ")
+    const codePlaceholders = codes
+      .map((_code, index) => `$${index + 5}`)
+      .join(", ")
     const nowIso = this.now().toISOString()
     const rows = await this.queryRows<DispatchRow>(
       `UPDATE ${VOUCHER_DELIVERY_DISPATCH_TABLE}
           SET attempt_count = LEAST(attempt_count, $1 - 1),
               configuration_recovery_count = configuration_recovery_count + 1,
+              -- Story 4.6 (AC1): wiersz WRACA z parkingu, więc jego eskalacja
+              -- przestaje opisywać stan bieżący. Zostawiony znacznik zamknąłby
+              -- drogę do PONOWNEJ eskalacji, gdyby wiersz wyczerpał budżet
+              -- drugi raz — a to jest NOWE zdarzenie dla człowieka, nie
+              -- powtórka tego samego.
+              escalated_at = NULL,
               updated_at = $2
         WHERE status = 'failed'
-          AND attempt_count >= $1
+          -- POPULACJA ZASTANA i tylko ona (M1). Wiersz zapisany po migracji
+          -- 4.6 ma atrybucję, więc jego budżet odbiorcy już jest chroniony;
+          -- obniżenie mu attempt_count dałoby budżet UJEMNY.
+          AND non_recipient_failure_count = 0
+          -- JEDNA definicja „zaparkowany", ta sama co w pozostałych czterech
+          -- zapytaniach. Poprzednio był tu rozpisany, piąty próg.
+          AND ${parkedPredicateSql("", "$1", "$4")}
           -- Tylko historyczny summary z utraconą diagnostyką. Stabilne ID
           -- notyfikacji chroni aktualny kod od następnej próby; ten fallback
           -- wolno wykonać ograniczoną liczbę razy, nie w każdym cyklu crona.
@@ -1077,6 +1424,7 @@ export class PgDispatchLedger
         input.max_attempt_count,
         nowIso,
         input.max_configuration_recoveries,
+        input.max_total_attempt_count,
         ...codes,
       ],
     )
@@ -1109,7 +1457,9 @@ export class PgDispatchLedger
     const entitlementTypes = [...input.entitlement_types]
 
     let position = 0
-    const statePlaceholders = sourceStates.map(() => `$${++position}`).join(", ")
+    const statePlaceholders = sourceStates
+      .map(() => `$${++position}`)
+      .join(", ")
     const typePlaceholders = entitlementTypes
       .map(() => `$${++position}`)
       .join(", ")
@@ -1182,7 +1532,13 @@ export class PgDispatchLedger
               -- które nigdy nie dotknęło providera.
               provider_status_code = NULL,
               provider_message = NULL,
-              provider_error_kind = NULL
+              provider_error_kind = NULL,
+              -- Story 4.6 (AC2): crash procesu wysyłającego to awaria NASZEJ
+              -- infrastruktury, nie sygnał o adresie odbiorcy. Ta sama reguła
+              -- co w markFailed: atrybucja pochodzi z klasyfikatora 4.3,
+              -- a nie z drugiej listy kodów obok niego.
+              non_recipient_failure_count =
+                non_recipient_failure_count + $6
         WHERE dispatch_id = $4
           AND status = 'queued'
           AND queued_at < $5
@@ -1193,6 +1549,7 @@ export class PgDispatchLedger
         nowIso,
         input.dispatch_id,
         input.stale_queued_before,
+        consumesRecipientAttemptForErrorCode(input.error_code) ? 0 : 1,
       ],
     )
 
@@ -1223,15 +1580,17 @@ export class PgDispatchLedger
   ): Promise<void> {
     await this.queryRows(
       `INSERT INTO ${VOUCHER_DELIVERY_DISPATCH_AUDIT_TABLE} (
-         dispatch_id, entitlement_id, template_key, recipient_hash, market_id,
+         dispatch_id, entitlement_id, template_key, recipient_hash, env, instance_id, market_id,
          from_status, to_status, error_code, attempt_count, occurred_at,
          provider_status_code, provider_message, provider_error_kind
-       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
       [
         row.dispatch_id,
         row.entitlement_id,
         row.template_key,
         row.recipient_hash,
+        row.env,
+        row.instance_id,
         row.market_id,
         fromStatus,
         toStatus,
@@ -1365,6 +1724,8 @@ function normalizeRow(raw: unknown): DispatchRow {
     entitlement_id: String(record.entitlement_id ?? ""),
     template_key: String(record.template_key ?? ""),
     recipient_hash: String(record.recipient_hash ?? ""),
+    env: String(record.env ?? ""),
+    instance_id: String(record.instance_id ?? ""),
     market_id: String(record.market_id ?? ""),
     flow_id: String(record.flow_id ?? ""),
     locale: String(record.locale ?? ""),
@@ -1374,11 +1735,14 @@ function normalizeRow(raw: unknown): DispatchRow {
       record.provider_message_id == null
         ? null
         : String(record.provider_message_id),
+    provider_attempted_at: normalizeTimestamp(record.provider_attempted_at),
     error_code: record.error_code == null ? null : String(record.error_code),
     first_error_code:
       record.first_error_code == null ? null : String(record.first_error_code),
     first_failed_at: normalizeTimestamp(record.first_failed_at),
-    configuration_recovery_count: Number(record.configuration_recovery_count ?? 0),
+    configuration_recovery_count: Number(
+      record.configuration_recovery_count ?? 0,
+    ),
     // `provider_status_code` jest `integer`, ale sterownik potrafi oddać go
     // jako string — ten sam kształt defektu co ADR-166 R-1 (`numeric` → string,
     // `typeof === "number"` cicho degradowało do fallbacku). Konwertujemy
@@ -1391,9 +1755,15 @@ function normalizeRow(raw: unknown): DispatchRow {
     // zna — `null` znaczy „nie rozpoznano" i to jest uczciwe.
     provider_error_kind: normalizeProviderErrorKind(record.provider_error_kind),
     correlation_token:
-      record.correlation_token == null ? null : String(record.correlation_token),
+      record.correlation_token == null
+        ? null
+        : String(record.correlation_token),
     attempt_count: Number(record.attempt_count ?? 0),
     queued_at: normalizeTimestamp(record.queued_at),
+    non_recipient_failure_count: Number(
+      record.non_recipient_failure_count ?? 0,
+    ),
+    escalated_at: normalizeTimestamp(record.escalated_at),
   }
 }
 
@@ -1420,12 +1790,31 @@ function normalizeGapCandidate(raw: unknown): DeliveryGapCandidate {
     market_id: record.market_id == null ? null : String(record.market_id),
     entitlement_state: String(record.entitlement_state ?? ""),
     template_key: String(record.template_key ?? ""),
-    dispatch_id:
-      record.dispatch_id == null ? null : String(record.dispatch_id),
+    dispatch_id: record.dispatch_id == null ? null : String(record.dispatch_id),
     dispatch_status: status == null ? null : status,
     queued_at: normalizeTimestamp(record.queued_at),
     attempt_count: Number(record.attempt_count ?? 0),
+    non_recipient_failure_count: Number(
+      record.non_recipient_failure_count ?? 0,
+    ),
   }
+}
+
+/**
+ * Story 4.6 — „czy wiersz jest ZAPARKOWANY", liczone w TypeScripcie.
+ *
+ * Musi dawać ten sam wynik co `parkedPredicateSql` — to jest jedno pojęcie
+ * w dwóch językach, nie dwa pojęcia. Parzystość mierzy test, nie założenie.
+ */
+export function isParkedDispatch(
+  row: { attempt_count: number; non_recipient_failure_count: number },
+  policy: { max_attempt_count: number; max_total_attempt_count: number },
+): boolean {
+  return (
+    row.attempt_count - row.non_recipient_failure_count >=
+      policy.max_attempt_count ||
+    row.attempt_count >= policy.max_total_attempt_count
+  )
 }
 
 /** `timestamptz` wraca ze sterownika jako `Date`; ledger operuje na ISO 8601. */
@@ -1443,7 +1832,29 @@ function normalizeTimestamp(value: unknown): string | null {
  * granicy nie jest „szerszym skanem", tylko dosyłką do całej historii sprzed
  * istnienia ledgera; odwrócone okno byłoby cichym no-opem.
  */
-function assertGapScanWindow(createdAfter: string, createdBefore: string): void {
+/**
+ * review-fix cyklu 1 (M4) — zajęcie do eskalacji też ma dolną granicę okna.
+ *
+ * Rzuca zamiast domyślać: pusty łańcuch albo data nie-ISO oznaczałaby zajęcie
+ * CAŁEJ historii ledgera przy pierwszym przebiegu po wdrożeniu, a to jest
+ * dokładnie ta lawina, którą `SWEEP_ESCALATION_BATCH_LIMIT` tylko rozkłada
+ * w czasie, zamiast jej zapobiegać.
+ */
+function assertEscalationWindowStart(createdAfter: string): void {
+  if (!createdAfter || Number.isNaN(new Date(createdAfter).getTime())) {
+    throw new DispatchLedgerError(
+      "zajęcie wierszy do eskalacji wymaga dolnej granicy okna " +
+        "(created_after, ISO 8601) — zajęcie bez okna wysypuje na człowieka " +
+        "historię sprzed istnienia ledgera",
+      "VOUCHER_DELIVERY_ESCALATION_WINDOW_INVALID",
+    )
+  }
+}
+
+function assertGapScanWindow(
+  createdAfter: string,
+  createdBefore: string,
+): void {
   if (!createdAfter || !createdBefore) {
     throw new DispatchLedgerError(
       "skan luk wymaga OBU granic okna (created_after, created_before) — skan " +
@@ -1466,6 +1877,28 @@ function assertMaxAttemptCount(value: number): void {
     throw new DispatchLedgerError(
       "max_attempt_count musi być liczbą całkowitą >= 1",
       "VOUCHER_DELIVERY_MAX_ATTEMPT_COUNT_INVALID",
+    )
+  }
+}
+
+/**
+ * Story 4.6 — sufit prób łącznie MUSI być ostro większy od budżetu odbiorcy.
+ *
+ * Równy albo mniejszy zamieniłby ochronę przed pętlą w drugi próg parkowania,
+ * który zjada budżet klientki zanim ten zdąży się wyczerpać — czyli przywracał
+ * defekt naprawiany przez AC2, tylko pod inną nazwą. Kształt liczby waliduje
+ * się TU, bo `assertMaxAttemptCount` waliduje kształt, nie relację (dokładnie
+ * ta luka, którą nazwał docstring `attempt-policy.ts`).
+ */
+function assertMaxTotalAttemptCount(
+  value: number,
+  maxAttemptCount: number,
+): void {
+  if (!Number.isInteger(value) || value <= maxAttemptCount) {
+    throw new DispatchLedgerError(
+      "max_total_attempt_count musi być liczbą całkowitą ostro większą niż " +
+        `max_attempt_count (dostałem ${String(value)} przy ${String(maxAttemptCount)})`,
+      "VOUCHER_DELIVERY_MAX_TOTAL_ATTEMPT_COUNT_INVALID",
     )
   }
 }
@@ -1498,6 +1931,25 @@ function assertNoCallerAttemptNumber(input: object): void {
       `numer próby nadaje polityka, nie wywołujący (AD-23) — wejście niesie: ${carried.join(", ")}`,
       "VOUCHER_DELIVERY_ATTEMPT_NUMBER_NOT_CALLER_OWNED",
     )
+  }
+}
+
+function assertMeasurementContext(
+  input: Pick<ReserveDispatchInput, "env" | "instance_id">,
+): void {
+  for (const field of ["env", "instance_id"] as const) {
+    const value = input[field]
+    if (
+      typeof value !== "string" ||
+      value.trim().length === 0 ||
+      value === "unattributed"
+    ) {
+      throw new DispatchLedgerError(
+        `${field} musi być jawną etykietą kontekstu pomiaru; brak i ` +
+          "unattributed są odmową rezerwacji (AD-25)",
+        "VOUCHER_DELIVERY_MEASUREMENT_CONTEXT_REQUIRED",
+      )
+    }
   }
 }
 

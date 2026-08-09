@@ -795,6 +795,24 @@ export async function buildLostCodeRecoveryWiring(
     appendAudit?: (audit: TransitionAuditEnvelope) => Promise<void>
     /** Best-effort emit eventu (post-COMMIT). Fail NIE blokuje (kompletność = reconciliation 2.6). */
     emitEvent?: (event: TransitionEventEnvelope) => Promise<void>
+    /**
+     * v1.15.0 Story 5.9 (FR-12, AD-17): producent stanu kodu vouchera,
+     * wołany w transakcji callera. Noga `void(old)` jest tranzycją
+     * UNIEWAŻNIAJĄCĄ, więc bez tej zależności okablowanie jest FAIL-CLOSED
+     * (`MissingVoucherCodeInvalidatorError`) — inaczej stary kod zostałby
+     * realizowalny obok uprawnienia, którego już nie ma.
+     */
+    invalidateVoucherCode?: TransitionWiringDeps["invalidateVoucherCode"]
+    /*
+     * GRANICA POMIARU (review-fix 5.9, INFO-3): `buildLostCodeRecoveryWiring`
+     * jest eksportowane i re-eksportowane z `modules/voucher/index.ts`, ale NIE
+     * MA produkcyjnego wołającego — odzysk zgubionego kodu biegnie przez
+     * `workflows/reissue-lost-code.ts`, wpięte osobno. Fail-closed powyżej jest
+     * więc dziś MECHANIZMEM BEZ REALNEJ ŚCIEŻKI: zadziała, gdy ten builder
+     * zostanie wpięty, i nie mierzy niczego, dopóki nie zostanie. Stan jest
+     * zastany (plik był taki przed 5.9); zapisany tutaj, żeby „7 call-site'ów"
+     * z opisu story nie czytało się jako „7 czynnych ścieżek".
+     */
   },
   input: BuildLostCodeWiringInput
 ): Promise<LostCodeRecoveryWiringResult> {
@@ -810,9 +828,18 @@ export async function buildLostCodeRecoveryWiring(
 
   const persistDeps: Pick<
     TransitionWiringDeps,
-    "appendAudit" | "ledgerWriter" | "postingActivation" | "clock"
+    | "appendAudit"
+    | "ledgerWriter"
+    | "postingActivation"
+    | "clock"
+    | "invalidateVoucherCode"
   > = {
     appendAudit: deps.appendAudit ?? (async () => {}),
+    // Brak DOMYŚLNEJ implementacji jest celowy: no-op byłby cichym zapisem
+    // uprawnienia bez zapisu kodu, czyli defektem, który 5.9 usuwa.
+    ...(deps.invalidateVoucherCode
+      ? { invalidateVoucherCode: deps.invalidateVoucherCode }
+      : {}),
     ...(deps.ledgerWriter ? { ledgerWriter: deps.ledgerWriter } : {}),
     ...(deps.postingActivation
       ? { postingActivation: deps.postingActivation }

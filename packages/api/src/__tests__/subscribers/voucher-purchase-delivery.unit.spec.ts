@@ -90,6 +90,8 @@ class FakeSql implements DispatchLedgerSql {
         entitlement_id,
         template_key,
         recipient_hash,
+        env,
+        instance_id,
         market_id,
         from_status,
         to_status,
@@ -106,6 +108,8 @@ class FakeSql implements DispatchLedgerSql {
         entitlement_id,
         template_key,
         recipient_hash,
+        env,
+        instance_id,
         market_id,
         from_status,
         to_status,
@@ -117,13 +121,15 @@ class FakeSql implements DispatchLedgerSql {
     }
 
     if (q.includes("INSERT INTO voucher_delivery_dispatch")) {
-      const [d, e, t, h, m, f, l, now] = bindings as string[]
+      const [d, e, t, h, env, instanceId, m, f, l, now] = bindings as string[]
       if (this.find(e, t, h)) return { rows: [] }
       const row: Row = {
         dispatch_id: d,
         entitlement_id: e,
         template_key: t,
         recipient_hash: h,
+        env,
+        instance_id: instanceId,
         market_id: m,
         flow_id: f,
         locale: l,
@@ -154,7 +160,8 @@ class FakeSql implements DispatchLedgerSql {
         // `[, , , , id]` trafiało w znacznik czasu, więc UPDATE NIGDY nie
         // znajdował wiersza i status zostawał `queued` — 8 asercji `sent` było
         // przez to CZERWONYCH na `main`.
-        const [provider, messageId, , , , id] = bindings as string[]
+        const [provider, messageId] = bindings as string[]
+        const id = bindings[bindings.length - 1] as string
         const row = this.byId(id)
         if (!row || row.status !== "queued") return { rows: [] }
         Object.assign(row, {
@@ -180,9 +187,13 @@ class FakeSql implements DispatchLedgerSql {
         // nowa kolumna SET przesuwa liste — to juz trzeci fake w repo z tym
         // sprzezeniem (patrz voucher-delivery-dispatch-ledger.unit.spec.ts).
         const id = bindings[bindings.length - 1] as string
-        const providerErrorKind = bindings[bindings.length - 2] ?? null
-        const providerMessage = bindings[bindings.length - 3] ?? null
-        const providerStatusCode = bindings[bindings.length - 4] ?? null
+        // Story 4.6 dolozyla `non_recipient_failure_count` jako OSTATNIA
+        // kolumne SET — i tak, to jest dokladnie to sprzezenie, ktore komentarz
+        // wyzej zapowiadal. Nadal liczymy OD KONCA.
+        const nonRecipientDelta = Number(bindings[bindings.length - 2] ?? 0)
+        const providerErrorKind = bindings[bindings.length - 4] ?? null
+        const providerMessage = bindings[bindings.length - 5] ?? null
+        const providerStatusCode = bindings[bindings.length - 6] ?? null
         const row = this.byId(id)
         if (!row || row.status !== "queued") return { rows: [] }
         Object.assign(row, {
@@ -191,11 +202,15 @@ class FakeSql implements DispatchLedgerSql {
           error_code: errorCode,
           provider_status_code: providerStatusCode,
           provider_message: providerMessage,
+          non_recipient_failure_count:
+            Number(row.non_recipient_failure_count ?? 0) + nonRecipientDelta,
           provider_error_kind: providerErrorKind,
+          provider_attempted_at: provider ? new Date().toISOString() : null,
         })
         return { rows: [{ ...row }] }
       }
-      const [now, , locale, market_id, flow_id, id, ...allowed] = bindings as string[]
+      const [now, , locale, market_id, flow_id, env, instance_id, id, ...allowed] =
+        bindings as string[]
       const row = this.byId(id)
       if (!row || !allowed.includes(row.status as string)) return { rows: [] }
       void now
@@ -209,6 +224,8 @@ class FakeSql implements DispatchLedgerSql {
         locale,
         market_id,
         flow_id,
+        env,
+        instance_id,
       })
       return { rows: [{ ...row }] }
     }
@@ -218,7 +235,10 @@ class FakeSql implements DispatchLedgerSql {
 
   private find(e: string, t: string, h: string): Row | undefined {
     return this.dispatch.find(
-      (r) => r.entitlement_id === e && r.template_key === t && r.recipient_hash === h,
+      (r) =>
+        r.entitlement_id === e &&
+        r.template_key === t &&
+        r.recipient_hash === h,
     )
   }
 
@@ -227,7 +247,11 @@ class FakeSql implements DispatchLedgerSql {
   }
 }
 
-type LogEntry = { level: "info" | "warn" | "error"; message: string; meta?: unknown }
+type LogEntry = {
+  level: "info" | "warn" | "error"
+  message: string
+  meta?: unknown
+}
 
 function makeLogger() {
   const entries: LogEntry[] = []
@@ -291,8 +315,10 @@ function makeDeps(overrides: {
     marketLocales: {
       async read() {
         return {
-          config:
-            overrides.locales ?? { default: "pl", supported: ["pl", "en", "ua", "de"] },
+          config: overrides.locales ?? {
+            default: "pl",
+            supported: ["pl", "en", "ua", "de"],
+          },
           degraded: overrides.localesDegraded ?? false,
         }
       },
@@ -309,7 +335,11 @@ function makeDeps(overrides: {
     logger,
     // Story 5.7 (AC6.2): baza deep-linku jest WYŁĄCZNIE per rynek — globalny
     // `STOREFRONT_URL` przestał być akceptowany.
-    env: overrides.env ?? { GP_STOREFRONT_URL_BONBEAUTY: "https://dev.bonbeauty.pl" },
+    env: overrides.env ?? {
+      GP_STOREFRONT_URL_BONBEAUTY: "https://dev.bonbeauty.pl",
+      GP_ENV: "dev",
+      GP_INSTANCE_ID: ENTITLEMENT_ID,
+    },
   }
 
   return { deps, sql, logger, dispatchCalls }
@@ -345,6 +375,7 @@ describe("extractPurchaseDeliveryTrigger", () => {
       entitlement_id: ENTITLEMENT_ID,
       to_state: "ISSUED",
       from_state: "__genesis__",
+      instance_id: ENTITLEMENT_ID,
       market_id: MARKET_ID,
       // Story 4.4: ścieżka ZDARZENIOWA nie niesie celu — pełna matryca AD-7.
       dispatch_target: null,
@@ -362,6 +393,7 @@ describe("extractPurchaseDeliveryTrigger", () => {
       entitlement_id: ENTITLEMENT_ID,
       to_state: "ACTIVE",
       from_state: "ISSUED",
+      instance_id: null,
       market_id: null,
       dispatch_target: null,
     })
@@ -372,9 +404,27 @@ describe("extractPurchaseDeliveryTrigger", () => {
       entitlement_id: null,
       to_state: null,
       from_state: null,
+      instance_id: null,
       market_id: null,
       dispatch_target: null,
     })
+  })
+
+  it("odmawia wysyłki bez jawnych env i instance_id zamiast zapisać unknown", async () => {
+    const { deps, dispatchCalls, sql } = makeDeps({
+      env: { GP_STOREFRONT_URL_BONBEAUTY: "https://dev.bonbeauty.pl" },
+    })
+    const withoutInstance = envelope("ISSUED")
+    delete (withoutInstance.scope as { instance_id?: string }).instance_id
+
+    const result = await handleVoucherPurchaseDelivery(withoutInstance, deps)
+
+    expect(result).toMatchObject({
+      outcome: "failed",
+      error_code: "VOUCHER_DELIVERY_MEASUREMENT_CONTEXT_REQUIRED",
+    })
+    expect(dispatchCalls).toHaveLength(0)
+    expect(sql.dispatch).toHaveLength(0)
   })
 
   it("Story 4.4 — czyta cel dosyłki z payloadu (oba człony klucza tożsamości)", () => {
@@ -586,7 +636,9 @@ describe("Review #5 — cel dosyłki bez zaufanego pochodzenia jest IGNOROWANY",
   }
 
   it("event z busa z `dispatch_target` ⇒ PEŁNA matryca AD-7, nie zawężenie", async () => {
-    const { deps, sql, dispatchCalls } = makeDeps({ source: { ...GIFT_SOURCE } })
+    const { deps, sql, dispatchCalls } = makeDeps({
+      source: { ...GIFT_SOURCE },
+    })
 
     const result = await handleVoucherPurchaseDelivery(
       untrustedTargetEnvelope(TEMPLATE_KEY),
@@ -713,7 +765,10 @@ describe("Review #1 — awaria konfiguracji przy celu = handoff zużywa budżet"
       runtimeConfig: { locales: null, support_email: null, market_url: null },
     })
 
-    await handleVoucherPurchaseDelivery(sweepTargeted(HANDOFF_TEMPLATE_KEY), deps)
+    await handleVoucherPurchaseDelivery(
+      sweepTargeted(HANDOFF_TEMPLATE_KEY),
+      deps,
+    )
 
     // AC2 zostaje spełnione: zapis jest W celu, nie obok niego.
     expect(
@@ -788,8 +843,12 @@ describe("Review #7 — para wyznacza `recipient_hash` jednoznacznie", () => {
     await handleVoucherPurchaseDelivery(envelope("ISSUED"), depsB)
 
     // Ten sam entitlement + ten sam szablon + ta sama projekcja ⇒ ten sam hash.
-    expect(sqlA.dispatch[0].recipient_hash).toBe(sqlB.dispatch[0].recipient_hash)
-    expect(sqlA.dispatch[0].entitlement_id).toBe(sqlB.dispatch[0].entitlement_id)
+    expect(sqlA.dispatch[0].recipient_hash).toBe(
+      sqlB.dispatch[0].recipient_hash,
+    )
+    expect(sqlA.dispatch[0].entitlement_id).toBe(
+      sqlB.dispatch[0].entitlement_id,
+    )
     expect(sqlA.dispatch[0].template_key).toBe(sqlB.dispatch[0].template_key)
   })
 
@@ -821,9 +880,9 @@ describe("AC2 — matryca normatywna AD-7 (stan → szablon)", () => {
     expect(result.outcome).toBe("sent")
     expect(dispatchCalls).toHaveLength(1)
     expect(dispatchCalls[0].template).toBe(TEMPLATE_KEY)
-    expect((dispatchCalls[0].data as Record<string, unknown>).template_key).toBe(
-      TEMPLATE_KEY,
-    )
+    expect(
+      (dispatchCalls[0].data as Record<string, unknown>).template_key,
+    ).toBe(TEMPLATE_KEY)
     expect(dispatchCalls[0].to).toBe(BUYER_EMAIL)
     expect(sql.dispatch).toHaveLength(1)
     expect(sql.dispatch[0].status).toBe("sent")
@@ -850,16 +909,22 @@ describe("AC2 — matryca normatywna AD-7 (stan → szablon)", () => {
     "VOIDED",
     "REFUNDED",
     "PENDING_VENDOR_DECISION",
-  ])("stan %s spoza matrycy → no-op BEZ błędu i bez wiersza w ledgerze", async (state) => {
-    const { deps, sql, dispatchCalls, logger } = makeDeps({})
+  ])(
+    "stan %s spoza matrycy → no-op BEZ błędu i bez wiersza w ledgerze",
+    async (state) => {
+      const { deps, sql, dispatchCalls, logger } = makeDeps({})
 
-    const result = await handleVoucherPurchaseDelivery(envelope(state, "ACTIVE"), deps)
+      const result = await handleVoucherPurchaseDelivery(
+        envelope(state, "ACTIVE"),
+        deps,
+      )
 
-    expect(result.outcome).toBe("skipped_state_out_of_matrix")
-    expect(dispatchCalls).toHaveLength(0)
-    expect(sql.dispatch).toHaveLength(0)
-    expect(logger.entries.filter((e) => e.level === "error")).toEqual([])
-  })
+      expect(result.outcome).toBe("skipped_state_out_of_matrix")
+      expect(dispatchCalls).toHaveLength(0)
+      expect(sql.dispatch).toHaveLength(0)
+      expect(logger.entries.filter((e) => e.level === "error")).toEqual([])
+    },
+  )
 
   it("NIE implementuje gift/handoff (`voucher_handoff_link` = Story 2.4)", async () => {
     const { deps, dispatchCalls } = makeDeps({})
@@ -940,7 +1005,9 @@ describe("AC5 — idempotencja end-to-end (NFR3)", () => {
       dispatchImpl: async () => {
         attempt += 1
         if (attempt === 1) {
-          const error = new Error("provider odrzucił") as Error & { code: string }
+          const error = new Error("provider odrzucił") as Error & {
+            code: string
+          }
           error.code = "BREVO_TEMPLATE_NOT_CONFIGURED"
           throw error
         }
@@ -953,7 +1020,10 @@ describe("AC5 — idempotencja end-to-end (NFR3)", () => {
     expect(first.error_code).toBe("BREVO_TEMPLATE_NOT_CONFIGURED")
     expect(sql.dispatch[0].status).toBe("failed")
 
-    const retry = await handleVoucherPurchaseDelivery(envelope("ACTIVE", "ISSUED"), deps)
+    const retry = await handleVoucherPurchaseDelivery(
+      envelope("ACTIVE", "ISSUED"),
+      deps,
+    )
     expect(retry.outcome).toBe("sent")
     expect(dispatchCalls).toHaveLength(2)
     // Nadal JEDEN wiersz — retry przejmuje rezerwację.
@@ -1038,7 +1108,9 @@ describe("AC5 — idempotencja end-to-end (NFR3)", () => {
     expect(dispatchCalls).toHaveLength(2)
     expect(dispatchCalls[0].id).toBe(sql.dispatch[0].dispatch_id)
     expect(dispatchCalls[1].id).toBe(sql.dispatch[0].dispatch_id)
-    expect(dispatchCalls[1].idempotency_key).toBe(dispatchCalls[0].idempotency_key)
+    expect(dispatchCalls[1].idempotency_key).toBe(
+      dispatchCalls[0].idempotency_key,
+    )
   })
 })
 
@@ -1149,7 +1221,9 @@ describe("AC4 — kod vouchera + link claim z prefiksem locale", () => {
   })
 
   it("brak base URL storefrontu → FAIL-LOUD z kodem błędu, nigdy link do localhost", async () => {
-    const { deps, sql, dispatchCalls, logger } = makeDeps({ env: {} })
+    const { deps, sql, dispatchCalls, logger } = makeDeps({
+      env: { GP_ENV: "dev", GP_INSTANCE_ID: ENTITLEMENT_ID },
+    })
 
     const result = await handleVoucherPurchaseDelivery(envelope("ISSUED"), deps)
 
@@ -1191,9 +1265,9 @@ describe("AC4 — kod vouchera + link claim z prefiksem locale", () => {
   })
 
   it("brak jakiejkolwiek konfiguracji base URL rzuca, a nie zwraca localhost", () => {
-    expect(() => resolveStorefrontBaseUrl({ marketId: "bonbeauty", env: {} })).toThrow(
-      StorefrontBaseUrlNotConfiguredError,
-    )
+    expect(() =>
+      resolveStorefrontBaseUrl({ marketId: "bonbeauty", env: {} }),
+    ).toThrow(StorefrontBaseUrlNotConfiguredError)
   })
 
   it("Story 5.7 AC6.3: loopback, URL względny i zły protokół są odrzucane", () => {
@@ -1226,7 +1300,8 @@ describe("AC4 — kod vouchera + link claim z prefiksem locale", () => {
   })
 
   it("adres LAN zostawia `warn` — sygnał, którego brakowało przy martwym linku PO", () => {
-    const warnings: Array<{ message: string; meta?: Record<string, unknown> }> = []
+    const warnings: Array<{ message: string; meta?: Record<string, unknown> }> =
+      []
     const logger = {
       warn: (message: string, meta?: Record<string, unknown>) =>
         warnings.push({ message, meta }),
@@ -1270,8 +1345,11 @@ describe("AC4 — kod vouchera + link claim z prefiksem locale", () => {
       "https://x.test/a",
     )
     expect(
-      (assertNonLoopbackAbsoluteUrl as unknown as { constructor: { name: string } })
-        .constructor.name,
+      (
+        assertNonLoopbackAbsoluteUrl as unknown as {
+          constructor: { name: string }
+        }
+      ).constructor.name,
     ).toBe("Function")
   })
 
@@ -1323,7 +1401,9 @@ describe("AC4 — kod vouchera + link claim z prefiksem locale", () => {
   })
 
   it("Story 5.7 AC2: brak wiersza market_runtime_config → `failed` przed wysyłką, z wierszem OGRANICZAJĄCYM", async () => {
-    const { deps, sql, dispatchCalls, logger } = makeDeps({ runtimeConfig: null })
+    const { deps, sql, dispatchCalls, logger } = makeDeps({
+      runtimeConfig: null,
+    })
 
     const result = await handleVoucherPurchaseDelivery(envelope("ISSUED"), deps)
 
@@ -1347,7 +1427,10 @@ describe("AC4 — kod vouchera + link claim z prefiksem locale", () => {
   })
 
   it("Story 5.7 AC2: nieudany odczyt tabeli ma WŁASNY kod (migracja vs sync)", async () => {
-    const { deps } = makeDeps({ runtimeConfig: null, runtimeConfigDegraded: true })
+    const { deps } = makeDeps({
+      runtimeConfig: null,
+      runtimeConfigDegraded: true,
+    })
 
     const result = await handleVoucherPurchaseDelivery(envelope("ISSUED"), deps)
 
@@ -1361,6 +1444,8 @@ describe("AC4 — kod vouchera + link claim z prefiksem locale", () => {
       runtimeConfig: { ...DEFAULT_RUNTIME_CONFIG, support_email: null },
       env: {
         GP_STOREFRONT_URL_BONBEAUTY: "https://dev.bonbeauty.pl",
+        GP_ENV: "dev",
+        GP_INSTANCE_ID: ENTITLEMENT_ID,
         SUPPORT_EMAIL: "z-env@bonbeauty.pl",
       },
     })
@@ -1407,7 +1492,11 @@ describe("AC2 — defensywność: graceful skip + log bez PII, nigdy rzucony wyj
 
   it("brak adresu odbiorcy → graceful skip, ZERO wierszy w ledgerze", async () => {
     const { deps, sql, dispatchCalls } = makeDeps({
-      source: { buyer_email: null, voucher_code: VOUCHER_CODE, market_id: MARKET_ID },
+      source: {
+        buyer_email: null,
+        voucher_code: VOUCHER_CODE,
+        market_id: MARKET_ID,
+      },
     })
 
     const result = await handleVoucherPurchaseDelivery(envelope("ISSUED"), deps)
@@ -1424,8 +1513,12 @@ describe("AC2 — defensywność: graceful skip + log bez PII, nigdy rzucony wyj
     // `VOUCHER_DELIVERY_STOREFRONT_URL_NOT_CONFIGURED` — fałszywy sygnał awarii
     // konfiguracji dla przypadku, w którym nie było w ogóle komu nic wysłać.
     const { deps, sql, dispatchCalls } = makeDeps({
-      source: { buyer_email: null, voucher_code: VOUCHER_CODE, market_id: MARKET_ID },
-      env: {},
+      source: {
+        buyer_email: null,
+        voucher_code: VOUCHER_CODE,
+        market_id: MARKET_ID,
+      },
+      env: { GP_ENV: "dev", GP_INSTANCE_ID: ENTITLEMENT_ID },
     })
 
     const result = await handleVoucherPurchaseDelivery(envelope("ISSUED"), deps)
@@ -1463,7 +1556,10 @@ describe("AC2 — defensywność: graceful skip + log bez PII, nigdy rzucony wyj
   it("awaria ledgera → NIE wysyłamy (wysyłka bez rezerwacji łamie NFR3)", async () => {
     const brokenLedger: PurchaseDeliveryDeps["ledger"] = {
       async reserveDispatch() {
-        throw new DispatchLedgerError("ledger down", "VOUCHER_DELIVERY_LEDGER_UNAVAILABLE")
+        throw new DispatchLedgerError(
+          "ledger down",
+          "VOUCHER_DELIVERY_LEDGER_UNAVAILABLE",
+        )
       },
       async markSent() {
         return false
@@ -1503,7 +1599,11 @@ describe("AC2 — defensywność: graceful skip + log bez PII, nigdy rzucony wyj
     expect(sql.dispatch[0].status).toBe("failed")
     expect(sql.dispatch[0].error_code).toBe("BREVO_TEMPLATE_NOT_CONFIGURED")
     // Treść odpowiedzi providera (z adresem!) NIE trafia do ledgera ani logów.
-    const trace = JSON.stringify({ d: sql.dispatch, a: sql.audit, l: logger.entries })
+    const trace = JSON.stringify({
+      d: sql.dispatch,
+      a: sql.audit,
+      l: logger.entries,
+    })
     expect(trace).not.toContain("Kupujaca@Example.Test")
     expect(trace).not.toContain("rejected")
   })
@@ -1513,7 +1613,11 @@ describe("AC2 — defensywność: graceful skip + log bez PII, nigdy rzucony wyj
 
     await handleVoucherPurchaseDelivery(envelope("ISSUED"), deps)
 
-    const trace = JSON.stringify({ d: sql.dispatch, a: sql.audit, l: logger.entries })
+    const trace = JSON.stringify({
+      d: sql.dispatch,
+      a: sql.audit,
+      l: logger.entries,
+    })
     expect(trace).not.toContain("Kupujaca")
     expect(trace.toLowerCase()).not.toContain("kupujaca@example.test")
     expect(trace).not.toContain("@example.test")
@@ -1542,15 +1646,24 @@ describe("AC6b — market_id z danych domenowych, nie z GP_DEFAULT_MARKET_ID", (
         market_id: null,
         purchase_locale: "pl",
       },
-      env: { GP_STOREFRONT_URL_BONBEAUTY: "https://dev.bonbeauty.pl", GP_DEFAULT_MARKET_ID: "zly-rynek" },
+      env: {
+        GP_STOREFRONT_URL_BONBEAUTY: "https://dev.bonbeauty.pl",
+        GP_DEFAULT_MARKET_ID: "zly-rynek",
+        GP_ENV: "dev",
+        GP_INSTANCE_ID: ENTITLEMENT_ID,
+      },
     })
 
     await handleVoucherPurchaseDelivery(envelope("ISSUED"), deps)
 
-    expect((dispatchCalls[0].data as Record<string, unknown>).market_id).toBe(MARKET_ID)
+    expect((dispatchCalls[0].data as Record<string, unknown>).market_id).toBe(
+      MARKET_ID,
+    )
     // Brak `warn` fallbacku na ścieżce produkcyjnej.
     expect(
-      logger.entries.some((e) => e.message.includes("[notification-market-context]")),
+      logger.entries.some((e) =>
+        e.message.includes("[notification-market-context]"),
+      ),
     ).toBe(false)
   })
 
@@ -1563,7 +1676,11 @@ describe("AC6b — market_id z danych domenowych, nie z GP_DEFAULT_MARKET_ID", (
       },
       // Baza deep-linku jest per rynek (5.7 AC6.2), więc rynek z projekcji
       // musi mieć własny klucz — brak globalnego fallbacku jest tu POINTĄ.
-      env: { GP_STOREFRONT_URL_BONGARDEN: "https://dev.bongarden.pl" },
+      env: {
+        GP_STOREFRONT_URL_BONGARDEN: "https://dev.bongarden.pl",
+        GP_ENV: "dev",
+        GP_INSTANCE_ID: ENTITLEMENT_ID,
+      },
     })
 
     await handleVoucherPurchaseDelivery(
@@ -1571,9 +1688,13 @@ describe("AC6b — market_id z danych domenowych, nie z GP_DEFAULT_MARKET_ID", (
       deps,
     )
 
-    expect((dispatchCalls[0].data as Record<string, unknown>).market_id).toBe("bongarden")
+    expect((dispatchCalls[0].data as Record<string, unknown>).market_id).toBe(
+      "bongarden",
+    )
     expect(
-      logger.entries.some((e) => e.message.includes("[notification-market-context]")),
+      logger.entries.some((e) =>
+        e.message.includes("[notification-market-context]"),
+      ),
     ).toBe(false)
   })
 
@@ -1587,6 +1708,8 @@ describe("AC6b — market_id z danych domenowych, nie z GP_DEFAULT_MARKET_ID", (
       env: {
         GP_STOREFRONT_URL_BONBEAUTY: "https://dev.bonbeauty.pl",
         GP_DEFAULT_MARKET_ID: "bonbeauty",
+        GP_ENV: "dev",
+        GP_INSTANCE_ID: ENTITLEMENT_ID,
       },
     })
 
@@ -1595,11 +1718,14 @@ describe("AC6b — market_id z danych domenowych, nie z GP_DEFAULT_MARKET_ID", (
       deps,
     )
 
-    expect((dispatchCalls[0].data as Record<string, unknown>).market_id).toBe("bonbeauty")
+    expect((dispatchCalls[0].data as Record<string, unknown>).market_id).toBe(
+      "bonbeauty",
+    )
     expect(
       logger.entries.some(
         (e) =>
-          e.level === "warn" && e.message.includes("[notification-market-context]"),
+          e.level === "warn" &&
+          e.message.includes("[notification-market-context]"),
       ),
     ).toBe(true)
   })
@@ -1644,7 +1770,9 @@ describe("R-2.3-M3 — kod błędu przeżywa przepakowanie przez moduł Notifica
         const providerError = new Error(
           `Brevo sender missing ${formatErrorCodeMarker("BREVO_SENDER_NOT_CONFIGURED")}`,
         )
-        const aggregate = new Error("Failed to send notification with id noti_01") as Error & {
+        const aggregate = new Error(
+          "Failed to send notification with id noti_01",
+        ) as Error & {
           cause?: Error
           errors?: Error[]
         }
@@ -1663,7 +1791,9 @@ describe("R-2.3-M3 — kod błędu przeżywa przepakowanie przez moduł Notifica
   it("odrzuca zagnieżdżony code poza taksonomią zamiast zapisać go dosłownie", async () => {
     const { deps, sql } = makeDeps({
       dispatchImpl: async () => {
-        throw Object.assign(new Error("provider rejected"), { code: "bad code with details" })
+        throw Object.assign(new Error("provider rejected"), {
+          code: "bad code with details",
+        })
       },
     })
 
@@ -1705,7 +1835,11 @@ describe("R-2.3-M3 — kod błędu przeżywa przepakowanie przez moduł Notifica
 
     await handleVoucherPurchaseDelivery(envelope("ISSUED"), deps)
 
-    const trace = JSON.stringify({ d: sql.dispatch, a: sql.audit, l: logger.entries })
+    const trace = JSON.stringify({
+      d: sql.dispatch,
+      a: sql.audit,
+      l: logger.entries,
+    })
     expect(sql.dispatch[0].error_code).toBe("BREVO_RECIPIENT_REJECTED")
     expect(trace).not.toContain("rejected")
     expect(trace).not.toContain("Kupujaca")
@@ -1758,10 +1892,14 @@ describe("odpowiedz providera w ledgerze (HTTP 401 z zywego zakupu)", () => {
     expect(sql.dispatch[0].error_code).toBe("BREVO_UNAUTHORIZED")
     // ...a operator widzi w ledgerze PRZYCZYNE, nie tylko fakt porazki.
     expect(sql.dispatch[0].provider_status_code).toBe(401)
-    expect(sql.dispatch[0].provider_message).toContain("unrecognised IP address")
+    expect(sql.dispatch[0].provider_message).toContain(
+      "unrecognised IP address",
+    )
     // Audyt append-only niesie to samo — retry skasuje podsumowanie, historia zostaje.
     expect(sql.audit.at(-1)?.provider_status_code).toBe(401)
-    expect(sql.audit.at(-1)?.provider_message).toContain("unrecognised IP address")
+    expect(sql.audit.at(-1)?.provider_message).toContain(
+      "unrecognised IP address",
+    )
   })
 
   it("nie zapisuje PII ani sekretu z odpowiedzi providera (D-70)", async () => {
@@ -1779,13 +1917,19 @@ describe("odpowiedz providera w ledgerze (HTTP 401 z zywego zakupu)", () => {
 
     await handleVoucherPurchaseDelivery(envelope("ISSUED"), deps)
 
-    const trace = JSON.stringify({ d: sql.dispatch, a: sql.audit, l: logger.entries })
+    const trace = JSON.stringify({
+      d: sql.dispatch,
+      a: sql.audit,
+      l: logger.entries,
+    })
     expect(sql.dispatch[0].provider_status_code).toBe(401)
     // Konsument redaguje PONOWNIE — nie ufa temu, ze ktos wyzej zrobil to dobrze.
     expect(trace).not.toContain(BUYER_EMAIL)
     expect(trace).not.toContain("37.31.141.48")
     expect(trace).not.toContain("xkeysib-0123456789abcdef0123456789abcdef")
-    expect(String(sql.dispatch[0].provider_message)).toContain("<redacted:email>")
+    expect(String(sql.dispatch[0].provider_message)).toContain(
+      "<redacted:email>",
+    )
     expect(String(sql.dispatch[0].provider_message)).toContain("<redacted:ip>")
   })
 
@@ -1830,9 +1974,7 @@ describe("odpowiedz providera w ledgerze (HTTP 401 z zywego zakupu)", () => {
     // "poszlo mimo bledu". Slad porazki zyje w tabeli audytu.
     expect(sql.dispatch[0].provider_status_code).toBeNull()
     expect(sql.dispatch[0].provider_message).toBeNull()
-    expect(
-      sql.audit.some((a) => a.provider_status_code === 401),
-    ).toBe(true)
+    expect(sql.audit.some((a) => a.provider_status_code === 401)).toBe(true)
   })
 })
 
@@ -1854,7 +1996,9 @@ describe("R-2.3-M4 — provider_message_id to identyfikator PROVIDERA, nie Medus
 
   it("czyta `external_id` (tam Medusa zapisuje ID providera), nie `id`", async () => {
     const { deps, sql } = makeDeps({
-      dispatchImpl: async () => [{ id: "noti_01JMEDUSA", external_id: "brevo-msg-77" }],
+      dispatchImpl: async () => [
+        { id: "noti_01JMEDUSA", external_id: "brevo-msg-77" },
+      ],
     })
 
     const result = await handleVoucherPurchaseDelivery(envelope("ISSUED"), deps)
@@ -1895,7 +2039,9 @@ describe("R-2.3-M6 — degradacja konfiguracji locale NIE degraduje maila do loc
     expect(dispatchCalls).toHaveLength(0)
     expect(sql.dispatch).toHaveLength(1)
     expect(sql.dispatch[0].status).toBe("failed")
-    expect(sql.dispatch[0].error_code).toBe(MARKET_LOCALES_UNAVAILABLE_ERROR_CODE)
+    expect(sql.dispatch[0].error_code).toBe(
+      MARKET_LOCALES_UNAVAILABLE_ERROR_CODE,
+    )
     expect(sql.dispatch[0].locale).toBe("ua")
     expect(logger.entries.some((e) => e.level === "error")).toBe(true)
   })
@@ -1936,7 +2082,9 @@ describe("R-2.3-M6 — degradacja konfiguracji locale NIE degraduje maila do loc
 })
 
 describe("R-2.3-L9 — porzucone `queued` jest widoczne jako `warn`, nie `info`", () => {
-  function ledgerInFlight(queuedAt: string | null): PurchaseDeliveryDeps["ledger"] {
+  function ledgerInFlight(
+    queuedAt: string | null,
+  ): PurchaseDeliveryDeps["ledger"] {
     return {
       async reserveDispatch() {
         return {
@@ -1964,7 +2112,9 @@ describe("R-2.3-L9 — porzucone `queued` jest widoczne jako `warn`, nie `info`"
   it("`queued` starsze niż próg → `warn` z odesłaniem do sweepa 2.5", async () => {
     const { deps, logger } = makeDeps({
       ledgerOverride: ledgerInFlight(
-        new Date(NOW.getTime() - STALE_QUEUED_THRESHOLD_MS - 1_000).toISOString(),
+        new Date(
+          NOW.getTime() - STALE_QUEUED_THRESHOLD_MS - 1_000,
+        ).toISOString(),
       ),
     })
     deps.now = () => NOW
@@ -1981,7 +2131,9 @@ describe("R-2.3-L9 — porzucone `queued` jest widoczne jako `warn`, nie `info`"
 
   it("świeże `queued` (realnie w locie) zostaje `info` — bez fałszywego alarmu", async () => {
     const { deps, logger } = makeDeps({
-      ledgerOverride: ledgerInFlight(new Date(NOW.getTime() - 1_000).toISOString()),
+      ledgerOverride: ledgerInFlight(
+        new Date(NOW.getTime() - 1_000).toISOString(),
+      ),
     })
     deps.now = () => NOW
 

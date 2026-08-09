@@ -51,6 +51,11 @@ import {
   type VoucherLedgerWriteRequest,
   type VoucherLedgerWriteResult,
 } from "./ledger-writer"
+import {
+  INVALIDATING_ENTITLEMENT_STATES,
+  isInvalidatingEntitlementState,
+  type VoucherCodeInvalidationResult,
+} from "./voucher-code-state"
 
 // ──────────────────────────────────────────────────────────────────────────
 // Geneza (creation) vs tranzycja grafu (AI-Review-1 — okablowanie ISSUED live)
@@ -84,6 +89,24 @@ export class EntitlementGenesisError extends Error {
         `Geneza (creation) dozwolona wyłącznie do ISSUED (Path Y live-issue).`
     )
     this.name = "EntitlementGenesisError"
+    this.to = to
+  }
+}
+
+/**
+ * Tranzycja unieważnia uprawnienie, a okablowanie nie dostało producenta stanu
+ * kodu (v1.15.0 Story 5.9). Rzucane PRZED jakimkolwiek efektem.
+ */
+export class MissingVoucherCodeInvalidatorError extends Error {
+  readonly to: EntitlementInstanceState
+  constructor(to: EntitlementInstanceState) {
+    super(
+      `Tranzycja → ${to} unieważnia uprawnienie, więc MUSI unieważnić także ` +
+        "stan kodu vouchera w tej samej transakcji (AD-17, Story 5.9), a " +
+        "okablowanie nie dostało `invalidateVoucherCode`. Stany unieważniające " +
+        `(z kontraktu): ${[...INVALIDATING_ENTITLEMENT_STATES].join(", ")}.`
+    )
+    this.name = "MissingVoucherCodeInvalidatorError"
     this.to = to
   }
 }
@@ -306,12 +329,35 @@ export type TransitionWiringDeps = {
   postingActivation?: PostingActivationGate
   /** Zegar (testowalność). Domyślnie `() => new Date()`. */
   clock?: () => Date
+  /**
+   * v1.15.0 Story 5.9 (FR-12, AD-17) — CZWARTY efekt tranzycji: unieważnienie
+   * STANU KODU vouchera dla tranzycji unieważniających uprawnienie.
+   *
+   * Kontrakt jest ten sam, co dla `appendAudit`: funkcja MUSI pisać na
+   * `client`-cie tej samej transakcji, w której caller zmienia stan
+   * uprawnienia. Wtedy zmiana stanu uprawnienia i zmiana stanu kodu są JEDNĄ
+   * operacją atomową — rollback callera cofa oba wiersze.
+   *
+   * Pole jest OPCJONALNE w typie, ale NIE jest opcjonalne w działaniu: gdy
+   * `input.to` jest stanem unieważniającym (zbiór derywowany z kontraktu przez
+   * `INVALIDATING_ENTITLEMENT_STATES`), jego brak jest FAIL-CLOSED —
+   * `MissingVoucherCodeInvalidatorError` PRZED jakimkolwiek efektem. Gdyby
+   * brak był no-opem, wróciłby dokładnie ten defekt, który 5.9 usuwa: stan
+   * uprawnienia schodzi, stan kodu zostaje.
+   */
+  invalidateVoucherCode?: (input: {
+    entitlement_id: string
+    to_state: EntitlementInstanceState
+    now: Date
+  }) => Promise<VoucherCodeInvalidationResult>
 }
 
 export type TransitionWiringResult = {
   event: TransitionEventEnvelope
   audit: TransitionAuditEnvelope
   posting: TransitionPostingResult
+  /** Wynik unieważnienia stanu kodu; `null` dla tranzycji nieunieważniających. */
+  invalidation?: VoucherCodeInvalidationResult | null
   /** true gdy 2× emit eventu zawiódł (best-effort) — kompletność = reconciliation 2.6. */
   emitFailed: boolean
 }
@@ -583,13 +629,18 @@ export async function runTransitionPostingHook(
 export async function wireEntitlementTransitionPersisted(
   deps: Pick<
     TransitionWiringDeps,
-    "appendAudit" | "ledgerWriter" | "postingActivation" | "clock"
+    | "appendAudit"
+    | "ledgerWriter"
+    | "postingActivation"
+    | "clock"
+    | "invalidateVoucherCode"
   >,
   input: TransitionInput
 ): Promise<{
   event: TransitionEventEnvelope
   audit: TransitionAuditEnvelope
   posting: TransitionPostingResult
+  invalidation: VoucherCodeInvalidationResult | null
 }> {
   const now = deps.clock?.() ?? new Date()
 
@@ -597,16 +648,39 @@ export async function wireEntitlementTransitionPersisted(
   //     niedozwolonej tranzycji / niedozwolonej genezie (AC2).
   assertWiringTransition(input.from, input.to)
 
+  // (0b) FAIL-CLOSED guard unieważnienia (v1.15.0 Story 5.9, AC2/AC3) —
+  //      SPRAWDZANY PRZED efektami, tak samo jak guard grafu. Tranzycja
+  //      unieważniająca uprawnienie BEZ producenta stanu kodu jest błędem
+  //      okablowania, nie stanem dopuszczalnym: przepuszczenie jej dałoby
+  //      uprawnienie zwrócone/wygasłe/wycofane przy kodzie, którym wciąż da
+  //      się zrealizować zabieg.
+  const invalidating = isInvalidatingEntitlementState(input.to)
+  if (invalidating && !deps.invalidateVoucherCode) {
+    throw new MissingVoucherCodeInvalidatorError(input.to)
+  }
+
   // (1) deterministyczne koperty.
   const { event, audit } = buildTransitionEnvelopes(input, now)
 
   // (2) AUDIT append-only — w obrębie tx callera (atomowy ze zmianą stanu).
   await deps.appendAudit(audit)
 
-  // (3) POSTING HOOK — bramkowany dwuwarstwowo; audit-only no-op gdy off.
+  // (3) UNIEWAŻNIENIE STANU KODU — w TEJ SAMEJ tx co zmiana stanu uprawnienia
+  //     (AD-17). Zbiór tranzycji unieważniających i docelowy stan kodu
+  //     pochodzą z kontraktu, nie z warunku wpisanego tutaj.
+  const invalidation =
+    invalidating && deps.invalidateVoucherCode
+      ? await deps.invalidateVoucherCode({
+          entitlement_id: input.entitlement_id,
+          to_state: input.to,
+          now,
+        })
+      : null
+
+  // (4) POSTING HOOK — bramkowany dwuwarstwowo; audit-only no-op gdy off.
   const posting = await runTransitionPostingHook(deps, input, now)
 
-  return { event, audit, posting }
+  return { event, audit, posting, invalidation }
 }
 
 /**
@@ -639,16 +713,14 @@ export async function wireEntitlementTransition(
   deps: TransitionWiringDeps,
   input: TransitionInput
 ): Promise<TransitionWiringResult> {
-  const { event, audit, posting } = await wireEntitlementTransitionPersisted(
-    deps,
-    input
-  )
+  const { event, audit, posting, invalidation } =
+    await wireEntitlementTransitionPersisted(deps, input)
 
-  // (4) EVENT best-effort — w tej kompozycji PRZED ewentualnym commitem callera
+  // (5) EVENT best-effort — w tej kompozycji PRZED ewentualnym commitem callera
   //     (patrz KONTRAKT ATOMOWOŚCI: ścieżki z DB-tx mają wołać emit PO commit).
   const emitFailed = await emitTransitionEventAfterCommit(deps.emitEvent, event)
 
-  return { event, audit, posting, emitFailed }
+  return { event, audit, posting, invalidation, emitFailed }
 }
 
 /**

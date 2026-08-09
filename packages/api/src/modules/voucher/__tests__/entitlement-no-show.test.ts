@@ -46,6 +46,29 @@ function makeMockPool(config: MockPoolConfig = {}): Pool {
           params: params ?? [],
         })
       }
+      // v1.15.0 Story 5.9: zapytania producenta stanu kodu są obsługiwane PO
+      // TREŚCI, a nie pozycją w skrypcie. Skrypt pozycyjny opisuje przebieg
+      // `mark_no_show`; wstawienie do niego trzech zapytań unieważnienia
+      // przesuwałoby wszystkie kolejne odpowiedzi i test mierzyłby numerację,
+      // nie zachowanie.
+      const text = String(sql)
+      if (/policy_snapshot->>'voucher_code'/.test(text)) {
+        return {
+          rows: [
+            {
+              voucher_code: "GP-TEST-NOSHOW-001",
+              entitlement_type: EntitlementType.VOUCHER_SERVICE,
+            },
+          ],
+          rowCount: 1,
+        }
+      }
+      if (/FROM voucher WHERE code/.test(text)) {
+        return { rows: [{ status: "idle" }], rowCount: 1 }
+      }
+      if (/UPDATE voucher SET status = \$2/.test(text)) {
+        return { rows: [], rowCount: 1 }
+      }
       const resp = clientResponses[cIdx] ?? { rows: [] }
       cIdx++
       return resp

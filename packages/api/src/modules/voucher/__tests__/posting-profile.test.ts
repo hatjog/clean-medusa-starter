@@ -691,3 +691,118 @@ describe("posting profile voucher_liability_only_v1", () => {
     }
   })
 })
+
+// ────────────────────────────────────────────────────────────────────────────
+// REFUNDED — symetria zaokrągleń VAT z realizacją (v1.15.0 review-fix 5.7)
+// ────────────────────────────────────────────────────────────────────────────
+
+describe("REFUNDED — VAT odwracany KUMULATYWNIE-MARGINALNIE, jak rozpoznany", () => {
+  // Voucher, na którym asymetria jest WIDOCZNA: brutto 1000, VAT 1 minor.
+  // Wprost proporcjonalne odwrócenie liczy `round(0.5) = 1` DLA KAŻDEJ z dwóch
+  // rat, więc Σ odwróconego VAT = 2, podczas gdy Σ rozpoznanego = 1 — konto
+  // `vat:output` schodzi PONIŻEJ ZERA przy ledgerze zbilansowanym per wpis
+  // (`assertBalanced` przechodzi, bo każdy wpis z osobna jest poprawny).
+  const R_NET = 999
+  const R_VAT = 1
+  const R_GROSS = R_NET + R_VAT
+
+  function vatOf(result: VoucherPostingResult, account: string, side: "debit_minor" | "credit_minor"): number {
+    if (!result.posted) return 0
+    return result.transaction.lines
+      .filter((l) => l.account === account)
+      .reduce((acc, l) => acc + l[side], 0)
+  }
+
+  function redeem(prior: number, portion: number): VoucherPostingResult {
+    return generateVoucherPosting(
+      baseInput({
+        lifecycle_event: "REDEEMED",
+        vat_classification: "MPV",
+        net_minor: R_NET,
+        vat_minor: R_VAT,
+        redeemed_gross_to_date_minor: prior,
+        redeemed_gross_minor: portion,
+      })
+    )
+  }
+
+  function reverse(priorReversed: number, portion: number): VoucherPostingResult {
+    return generateVoucherPosting(
+      baseInput({
+        lifecycle_event: "REFUNDED",
+        vat_classification: "MPV",
+        net_minor: R_NET,
+        vat_minor: R_VAT,
+        reversed_gross_to_date_minor: priorReversed,
+        reversed_gross_minor: portion,
+        redeemed_gross_total_minor: R_GROSS,
+      })
+    )
+  }
+
+  it("Σ odwróconego VAT == Σ rozpoznanego VAT dla dwóch rat po połowie brutto", () => {
+    const recognized =
+      vatOf(redeem(0, R_GROSS / 2), VOUCHER_LEDGER_ACCOUNTS.VAT_OUTPUT, "credit_minor") +
+      vatOf(redeem(R_GROSS / 2, R_GROSS / 2), VOUCHER_LEDGER_ACCOUNTS.VAT_OUTPUT, "credit_minor")
+    const reversed =
+      vatOf(reverse(0, R_GROSS / 2), VOUCHER_LEDGER_ACCOUNTS.VAT_OUTPUT, "debit_minor") +
+      vatOf(reverse(R_GROSS / 2, R_GROSS / 2), VOUCHER_LEDGER_ACCOUNTS.VAT_OUTPUT, "debit_minor")
+
+    // Ta asercja PĘKA po powrocie do formuły wprost proporcjonalnej: 2 ≠ 1.
+    expect(recognized).toBe(1)
+    expect(reversed).toBe(recognized)
+  })
+
+  it("pełne odwrócenie jednym wpisem zdejmuje DOKŁADNIE cały rozpoznany VAT", () => {
+    // Tu jedziemy voucherem 23% (NET/VAT/GROSS z góry pliku), nie R_*.
+    const fullRedeem = generateVoucherPosting(
+      baseInput({
+        lifecycle_event: "REDEEMED",
+        vat_classification: "MPV",
+        redeemed_gross_to_date_minor: 0,
+        redeemed_gross_minor: GROSS,
+      })
+    )
+    const recognized = vatOf(fullRedeem, VOUCHER_LEDGER_ACCOUNTS.VAT_OUTPUT, "credit_minor")
+    const result = generateVoucherPosting(
+      baseInput({
+        lifecycle_event: "REFUNDED",
+        vat_classification: "MPV",
+        reversed_gross_minor: GROSS,
+        reversed_gross_to_date_minor: 0,
+        redeemed_gross_total_minor: GROSS,
+      })
+    )
+    expect(vatOf(result, VOUCHER_LEDGER_ACCOUNTS.VAT_OUTPUT, "debit_minor")).toBe(recognized)
+    expect(recognized).toBe(VAT)
+  })
+
+  it("over-reversal KUMULATYWNY jest odrzucany (nie tylko pojedyncza rata)", () => {
+    expect(() =>
+      generateVoucherPosting(
+        baseInput({
+          lifecycle_event: "REFUNDED",
+          vat_classification: "MPV",
+          reversed_gross_minor: GROSS,
+          reversed_gross_to_date_minor: 1,
+        })
+      )
+    ).toThrow(VoucherPostingInvariantError)
+  })
+
+  it("odwrócenie ponad Σ ZREALIZOWANEGO brutto jest odrzucane, nawet w brutto vouchera", () => {
+    // Guard `reversedGross > totalGross` tego nie łapał: mieści się w brutto
+    // emisji, a mimo to odwraca więcej, niż kiedykolwiek zrealizowano.
+    expect(() =>
+      generateVoucherPosting(
+        baseInput({
+          lifecycle_event: "REFUNDED",
+          vat_classification: "MPV",
+          reversed_gross_minor: GROSS,
+          reversed_gross_to_date_minor: 0,
+          redeemed_gross_total_minor: GROSS / 2,
+        })
+      )
+    ).toThrow(VoucherPostingInvariantError)
+  })
+})

@@ -7,14 +7,22 @@
  * under /vendor/* but no implementation existed. C17 PASS was structurally
  * unreachable; the harness ran against a mocked Playwright route only.
  *
- * Auth model:
- *   - The /vendor/* matcher (Story 5.4) — HMAC x-vendor-signature only; the
- *     legacy x-vendor-token path was removed in cc-4 F-10. Returns 401 on
- *     missing/invalid BEFORE this handler is reached.
- *   - Market binding: the voucher.seller_id must match the authenticated
- *     seller_id (cross-vendor lookup attempts return 403). voucher.market_id
- *     is propagated into the response so the vendor-panel UI can surface
- *     it for audit narrative.
+ * Auth model (v1.15.0 Story 5.8, AC2 — ZMIANA):
+ *   - Ta trasa jest ZWOLNIONA z bramki HMAC wpisem
+ *     `/vendor/vouchers/:code/lookup` w `VENDOR_HMAC_EXEMPT_ROUTES`
+ *     (`lib/vendor-auth-matcher.ts`) z transportem `mercur-seller-context`.
+ *     Powód: wywołującym jest PRZEGLĄDARKA panelu, a przeglądarka nie może
+ *     trzymać materiału podpisującego S2S. Do 5.8 trasa stała za bramką HMAC,
+ *     panel wołał ją sesją sprzedawcy — i dostawał `401`.
+ *   - Uwierzytelnia łańcuch Mercura zamontowany na `/vendor/*`
+ *     (`authenticate("member", ["session","bearer"])` + `ensureSellerMiddleware`),
+ *     który wypełnia `req.seller_context.seller_id` ALBO odrzuca żądanie zanim
+ *     dotrze tutaj. To DOKŁADNIE JEDEN punkt uwierzytelnienia — drugi
+ *     (bramka HMAC) zgłosiłby roszczenie do tego samego klucza anty-replay
+ *     (Story 5.3) i każde legalne żądanie kończyłoby się `401`.
+ *   - Zakres najemcy rozstrzyga DOMENA: `VoucherService.getForSeller`
+ *     zwraca `null` dla kodu nieznanego I dla cudzego — jedną gałęzią, bo
+ *     rozróżnienie ich jest wyciekiem istnienia cudzych danych (UX-DR9).
  *
  * Response shape:
  *   { voucher: <AR45-projected view> } — public projection matches the
@@ -25,17 +33,18 @@
  * route does the state transition.
  */
 
-import type { MedusaRequest, MedusaResponse } from "@medusajs/framework/http"
-import type { VendorAuthContext } from "../../../../../lib/vendor-auth"
+import type { MedusaResponse } from "@medusajs/framework/http"
+import {
+  resolveVendorForSeller,
+  VendorSellerContextError,
+  type RequestWithSellerContext,
+} from "../../../../../lib/vendor-seller-context"
 import {
   VOUCHER_MODULE,
   type VoucherService,
   type VoucherWithEvents,
+  type VoucherStatus,
 } from "../../../../../modules/voucher"
-
-type RequestWithVendorAuth = MedusaRequest & {
-  vendorAuth?: VendorAuthContext
-}
 
 interface VendorVoucherView {
   code: string
@@ -45,7 +54,12 @@ interface VendorVoucherView {
   product_title: string
   value_minor: number
   currency_code: string
-  status: "idle" | "consent_pending" | "claimed" | "withdrawn"
+  /**
+   * v1.15.0 Story 5.8: `VoucherStatus`, nie lokalna unia. Lokalna kopia była
+   * WĘŻSZA od CHECK-a bazy (brakowało `expired`), więc projekcja obiecywała
+   * konsumentowi zbiór, którego domena nie gwarantuje.
+   */
+  status: VoucherStatus
   market_id: string | null
   expires_at: string | null
 }
@@ -73,8 +87,20 @@ function projectVendorView(
   }
 }
 
+/**
+ * JEDNO ciało odmowy dla „nieznany kod" i „nie twój voucher" — literał
+ * współdzielony, nie dwie kopie. Dwa identyczne literały w dwóch gałęziach
+ * rozjeżdżają się cicho w chwili, w której ktoś doda do jednej z nich pole
+ * diagnostyczne (UX-DR9). Test porównuje odpowiedzi obu przypadków
+ * bajt-w-bajt; ta stała sprawia, że test mierzy kod, a nie dyscyplinę.
+ */
+export const VOUCHER_NOT_FOUND_BODY = {
+  code: "VOUCHER_NOT_FOUND",
+  message: "Voucher not found",
+} as const
+
 export const GET = async (
-  req: RequestWithVendorAuth,
+  req: RequestWithSellerContext,
   res: MedusaResponse,
 ): Promise<void> => {
   const code = (req.params as { code?: string })?.code
@@ -86,21 +112,32 @@ export const GET = async (
     return
   }
 
-  const voucherService = req.scope.resolve(VOUCHER_MODULE) as VoucherService
-  const voucher = await voucherService.getByCode(code)
-
-  // 404 for unknown code (do NOT leak existence to non-owner vendors).
-  if (!voucher) {
-    res.status(404).json({ code: "VOUCHER_NOT_FOUND", message: "Voucher not found" })
-    return
+  let sellerId: string
+  try {
+    // Odczyt kontekstu sprzedawcy JEST TUTAJ, w module trasy — to jest dowód
+    // transportu, który czyta `assert_auth_transport.py` (patrz komentarz przy
+    // `resolveVendorForSeller`).
+    ;({ seller_id: sellerId } = await resolveVendorForSeller(
+      req.scope,
+      req.seller_context?.seller_id,
+    ))
+  } catch (error) {
+    if (error instanceof VendorSellerContextError) {
+      res.status(error.status).json({ code: error.code, message: error.message })
+      return
+    }
+    throw error
   }
 
-  // Cross-vendor isolation: only the issuing seller can lookup the voucher.
-  // The /vendor/* gate (Story 5.4) populated vendorAuth.seller_id from the
-  // HMAC signature before this handler was reached.
-  const { seller_id: authenticatedSellerId } = req.vendorAuth!
-  if (voucher.seller_id !== authenticatedSellerId) {
-    res.status(404).json({ code: "VOUCHER_NOT_FOUND", message: "Voucher not found" })
+  const voucherService = req.scope.resolve(VOUCHER_MODULE) as VoucherService
+
+  // JEDNA odpowiedź dla „nieznany" i dla „nie twój" — identyczna co do
+  // statusu, ciała i nagłówków. Predykat własności należy do domeny
+  // (`getForSeller`), więc ta trasa nie ma gałęzi, którą dałoby się rozjechać
+  // z gałęzią trasy realizacji.
+  const voucher = await voucherService.getForSeller(sellerId, code)
+  if (!voucher) {
+    res.status(404).json(VOUCHER_NOT_FOUND_BODY)
     return
   }
 

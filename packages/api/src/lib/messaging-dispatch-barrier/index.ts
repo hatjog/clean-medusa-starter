@@ -132,6 +132,20 @@ function parseDispatch(value: unknown): NotificationDispatch | null {
   return null
 }
 
+/**
+ * `claim_count` z `RETURNING`. Sterownik potrafi oddać `integer` jako string
+ * (NUMERIC/BIGINT przez `node-pg`), a `Number("")` daje `0` — czyli cichą
+ * degradację do „zajęcie pierwotne", która wyłączyłaby rozstrzyganie po stronie
+ * dostawcy bez jednego śladu. Nierozpoznany kształt oddaje więc `2`, czyli
+ * stronę BEZPIECZNĄ: „to mogło być przejęcie, zapytaj dostawcę".
+ */
+function readClaimCount(row: unknown): number {
+  const raw = (row as { claim_count?: unknown } | null)?.claim_count
+  const parsed =
+    typeof raw === "number" ? raw : typeof raw === "string" ? Number(raw) : NaN
+  return Number.isFinite(parsed) && parsed >= 1 ? parsed : 2
+}
+
 export class PgDispatchIdempotencyBarrier implements DispatchIdempotencyBarrier {
   constructor(private readonly db: DispatchBarrierDb) {}
 
@@ -156,15 +170,25 @@ export class PgDispatchIdempotencyBarrier implements DispatchIdempotencyBarrier 
              updated_at  = EXCLUDED.updated_at
        WHERE ${MESSAGING_DISPATCH_BARRIER_TABLE}.expires_at IS NOT NULL
          AND ${MESSAGING_DISPATCH_BARRIER_TABLE}.expires_at <= $3
-       RETURNING barrier_key`,
+       RETURNING barrier_key, claim_count`,
       [input.barrier_key, expiresIso, nowIso, input.claim_token],
     )
 
-    const claimed = returnedRows(await this.db.raw(text, bindings)).length > 0
-    if (claimed) {
+    // `claim_count` wraca z TEJ SAMEJ operacji, która zajmuje klucz (Story 4.5).
+    // Osobny `SELECT` po werdykcie byłby drugim spojrzeniem na stan, który mógł
+    // się w międzyczasie zmienić — czyli tym samym kształtem `odczyt → operacja`,
+    // który AD-23 nazywa defektem. `1` = zajęcie pierwotne, `> 1` = PRZEJĘTE po
+    // wygaśnięciu, czyli stan, w którym poprzedni przebieg mógł już dotknąć
+    // providera.
+    const rows = returnedRows(await this.db.raw(text, bindings))
+    if (rows.length > 0) {
       // Wiersz niesie teraz token TEGO przebiegu (`EXCLUDED.claim_token` na
       // obu gałęziach), więc domknięcie wołającego trafi we własne zajęcie.
-      return { outcome: "claimed", dispatch: null }
+      return {
+        outcome: "claimed",
+        dispatch: null,
+        claim_count: readClaimCount(rows[0]),
+      }
     }
 
     // PO werdykcie: odtworzenie wyniku poprzedniego przebiegu. `null` znaczy
@@ -172,6 +196,7 @@ export class PgDispatchIdempotencyBarrier implements DispatchIdempotencyBarrier 
     return {
       outcome: "blocked",
       dispatch: await this.findSettledDispatch(input.barrier_key),
+      claim_count: 0,
     }
   }
 
@@ -343,6 +368,23 @@ export async function purgeExpiredDispatchBarrierRows(
     { origin: options?.origin, logger: options?.logger },
   )
 
+  // ── HIGIENA NIE MA PRAWA ZMIENIĆ WERDYKTU (R-4.5-H1, konsekwencja) ────────
+  // Wiersz niesie `claim_count` — sygnał „ten klucz mógł już dotknąć dostawcy",
+  // po którym gateway wie, że ma zapytać dostawcę zamiast wysyłać. Skasowanie
+  // wiersza, do którego ponowienie MOŻE JESZCZE LEGALNIE WRÓCIĆ, zeruje ten
+  // sygnał — i wtedy ponowienie zajmuje klucz od zera, rozstrzygania nie woła
+  // i wysyła drugi mail. Dokładnie ten defekt Story 4.5 zamknęła w gatewayu
+  // (odmowa przestała kasować wiersz); zostawienie go tutaj przywracałoby go
+  // tylnymi drzwiami, i to w mechanizmie, który z założenia jest wyłącznie
+  // higieną.
+  //
+  // Kasujemy więc dopiero POZA HORYZONTEM PONOWIEŃ: wiersz wygasły co najmniej
+  // `BARRIER_AMBIGUOUS_WINDOW_MS` temu jest wierszem, po który żaden sweep już
+  // nie wróci, więc jego usunięcie nie może zmienić żadnego werdyktu.
+  // Przetrzymanie wiersza dłużej kosztuje wyłącznie miejsce w tabeli — ta sama
+  // asymetria, która wyznaczyła samą wartość okna.
+  const purgeBefore = new Date(now.getTime() - BARRIER_AMBIGUOUS_WINDOW_MS)
+
   const { text, bindings } = toKnexPositionalSql(
     `DELETE FROM ${MESSAGING_DISPATCH_BARRIER_TABLE}
       WHERE expires_at IS NOT NULL
@@ -351,7 +393,7 @@ export async function purgeExpiredDispatchBarrierRows(
     // `split_part`, a nie `LIKE '<market>|%'`: identyfikator rynku jest danymi,
     // a `%`/`_` w danych zamieniłyby zawężenie w dopasowanie szersze, niż
     // deklaruje kontekst — czyli kasowanie cudzych wierszy.
-    [now.toISOString(), marketId],
+    [purgeBefore.toISOString(), marketId],
   )
   const result = await db.raw(text, bindings)
   if (result && typeof result === "object") {

@@ -99,7 +99,9 @@ function makeEntitlement(
     entitlement_type: EntitlementType.VOUCHER_AMOUNT,
     state: EntitlementInstanceState.ACTIVE,
     remaining_amount: 12300,
-    policy_snapshot: { transferability: "bearer" },
+    // v1.15.0 Story 5.9: `voucher_code` jest mostem kod → uprawnienie
+    // (wpisywany do snapshotu przy wystawieniu od Story 5.3).
+    policy_snapshot: { transferability: "bearer", voucher_code: "GP-TEST-EXPIRE-001" },
     vat_classification: "MPV",
     issued_amount_currency: null,
     expires_at: PAST_EXPIRY,
@@ -436,6 +438,9 @@ describe("Story 4.2 AI-Review-5 — cross-walidacja net+vat vs issued_gross", ()
             getEntitlementForUpdate: tx.getEntitlementForUpdate.bind(tx),
             updateEntitlementState: tx.updateEntitlementState.bind(tx),
             appendAudit: tx.appendAudit.bind(tx),
+            // v1.15.0 Story 5.9: `Tx` niesie też producenta stanu kodu —
+            // przekazujemy oryginał, bo nadpisujemy WYŁĄCZNIE `findIssuedGross`.
+            invalidateVoucherCode: tx.invalidateVoucherCode.bind(tx),
             findIssuedGross: async (_id: string) => issuedGross,
           }
           return fn(patched)

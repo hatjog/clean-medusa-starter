@@ -7,6 +7,8 @@
 import { MessagingProviderError } from "../errors";
 import {
   BREVO_DEFAULT_ENDPOINT,
+  BREVO_LOOKUP_MAX_ROWS,
+  BREVO_LOOKUP_PAGE_SIZE,
   BrevoHttpClient,
   NotConfiguredBrevoClient,
 } from "../providers/brevo-http-client";
@@ -96,5 +98,81 @@ describe("NotConfiguredBrevoClient", () => {
 
     expect(error).toBeInstanceOf(MessagingProviderError);
     expect(error.error_code).toBe("BREVO_API_KEY_NOT_CONFIGURED");
+  });
+});
+
+/**
+ * ODCZYT u dostawcy — R-4.5-M2 (stronicowanie) i R-4.5-L2 (górny brzeg okna).
+ *
+ * Obie kontrole PĘKAJĄ na kodzie sprzed poprawki: pierwsza dostawała jedną
+ * stronę i milcząco uznawała okno za przejrzane, druga wysyłała `endDate`
+ * obcięty do bieżącej doby UTC.
+ */
+describe("BrevoHttpClient.findTransactionalMessages — kompletność okna", () => {
+  const WINDOW = {
+    email: "buyer@example.test",
+    startDate: new Date("2026-08-01T00:00:00.000Z"),
+    endDate: new Date("2026-08-08T23:30:00.000Z"),
+  };
+
+  /** Strona `n` pełna, ostatnia niepełna — jak realny `limit`/`offset`. */
+  function pagingFetch(totalRows: number, urls: string[]) {
+    return async (url: string) => {
+      urls.push(url);
+      const offset = Number(new URL(url).searchParams.get("offset"));
+      const limit = Number(new URL(url).searchParams.get("limit"));
+      const rows = Array.from(
+        { length: Math.max(0, Math.min(limit, totalRows - offset)) },
+        (_unused, index) => ({ messageId: `<msg-${offset + index}>` }),
+      );
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({ transactionalEmails: rows }),
+      };
+    };
+  }
+
+  it("STRONICUJE do wyczerpania okna — jedna strona nie jest dowodem nieobecności", async () => {
+    const urls: string[] = [];
+    const client = new BrevoHttpClient({
+      apiKey: "k",
+      fetchImpl: pagingFetch(BREVO_LOOKUP_PAGE_SIZE * 2 + 7, urls),
+    });
+
+    const rows = await client.findTransactionalMessages(WINDOW);
+
+    expect(rows).toHaveLength(BREVO_LOOKUP_PAGE_SIZE * 2 + 7);
+    expect(urls).toHaveLength(3);
+    expect(new URL(urls[1]).searchParams.get("offset")).toBe(
+      String(BREVO_LOOKUP_PAGE_SIZE),
+    );
+  });
+
+  it("okno NIEWYCZERPANE ⇒ RZUCA, a nie oddaje niepełnej listy (zgoda na wysyłkę)", async () => {
+    const urls: string[] = [];
+    const client = new BrevoHttpClient({
+      apiKey: "k",
+      // Adres wysokoobrotowy: w oknie 8 dni jest więcej wierszy, niż sufit.
+      fetchImpl: pagingFetch(BREVO_LOOKUP_MAX_ROWS * 3, urls),
+    });
+
+    await expect(client.findTransactionalMessages(WINDOW)).rejects.toMatchObject({
+      error_code: "BREVO_LOOKUP_WINDOW_TRUNCATED",
+    });
+  });
+
+  it("wysyła endDate bieżącej doby: provider wymaga brzegu, ale odrzuca datę z przyszłości", async () => {
+    const urls: string[] = [];
+    const client = new BrevoHttpClient({ apiKey: "k", fetchImpl: pagingFetch(0, urls) });
+
+    await client.findTransactionalMessages(WINDOW);
+
+    const params = new URL(urls[0]).searchParams;
+    expect(params.get("startDate")).toBe("2026-08-01");
+    // Obcięcie do „2026-08-08" ukryłoby wiadomość wysłaną przed chwilą, gdyby
+    // konto dostawcy liczyło doby w strefie za UTC — a `not_found` z tego
+    // powodu jest zgodą na wysyłkę.
+    expect(params.get("endDate")).toBe("2026-08-08");
   });
 });

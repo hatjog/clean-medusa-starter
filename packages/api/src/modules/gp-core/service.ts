@@ -49,6 +49,30 @@ export class NotImplementedError extends Error {
   }
 }
 
+/**
+ * Sprzedawca Mercura bez mapowania na vendora GP (v1.15.0 Story 5.8, AC1).
+ *
+ * To jest ODMOWA AUTORYZACYJNA, nie brak implementacji: żądanie jest poprawnie
+ * uwierzytelnione, ale tożsamość, na którą się powołuje, nie istnieje po
+ * stronie GP. `501` był tu podwójnie mylący — sugerował, że wina leży po
+ * stronie serwera i że wystarczy poczekać na dopisanie kodu.
+ */
+export class VendorNotMappedError extends Error {
+  readonly code = "VENDOR_NOT_MAPPED"
+  readonly mercur_seller_id: string
+  readonly instance_id: string
+
+  constructor(mercurSellerId: string, instanceId: string) {
+    super(
+      `sprzedawca Mercura '${mercurSellerId}' nie ma mapowania na vendora GP ` +
+        `w zakresie instance_id='${instanceId}' (gp_core.vendor_seller_mappings)`
+    )
+    this.name = "VendorNotMappedError"
+    this.mercur_seller_id = mercurSellerId
+    this.instance_id = instanceId
+  }
+}
+
 export class MarketContextRequiredError extends Error {
   readonly code = "MARKET_CONTEXT_REQUIRED"
 
@@ -171,6 +195,45 @@ export function resolveGpCoreRlsEnforced(raw = process.env.GP_CORE_RLS_ENFORCED)
   return raw === "true" || raw === "1"
 }
 
+/**
+ * Zakres `instance_id` dla zapytań do `gp_core.*` (v1.15.0 Story 5.8).
+ *
+ * Domyślka `gp-dev` NIE jest tu zgadywaniem tożsamości — jest tą samą
+ * domyślką, której używa CAŁA rodzina skryptów `gp-config-sync-*`
+ * (`process.env.GP_INSTANCE_ID ?? "gp-dev"`). Drugi, inny domyślny zakres
+ * oznaczałby, że rezolucja vendora patrzy w inny wycinek bazy niż zasiew.
+ */
+export function resolveGpCoreInstanceId(explicit?: string): string {
+  return resolveGpCoreInstanceIdWithSource(explicit).value
+}
+
+/** Skąd realnie pochodzi zakres — nośnik, nie tylko wartość. */
+export type GpCoreInstanceIdSource = "option" | "env" | "default"
+
+/**
+ * Ta sama rezolucja co {@link resolveGpCoreInstanceId}, ale zwraca też NOŚNIK
+ * (review-fix cyklu 1, LOW).
+ *
+ * Po co: w środowisku bez `GP_INSTANCE_ID` i bez opcji modułu zakres schodzi
+ * na `gp-dev`, w którym poza devem NIE MA żadnego mapowania — więc CAŁA
+ * powierzchnia `/vendor/*` odmawia `403 VENDOR_NOT_MAPPED` komunikatem
+ * wskazującym na DANE („to konto nie jest powiązane z salonem"), podczas gdy
+ * realną przyczyną jest KONFIGURACJA. Zachowanie zostaje fail-closed; zmienia
+ * się to, że przyczyna przestaje być niewidoczna dla operatora.
+ */
+export function resolveGpCoreInstanceIdWithSource(explicit?: string): {
+  value: string
+  source: GpCoreInstanceIdSource
+} {
+  const fromOption = typeof explicit === "string" ? explicit.trim() : ""
+  if (fromOption.length > 0) return { value: fromOption, source: "option" }
+
+  const fromEnv = (process.env.GP_INSTANCE_ID ?? "").trim()
+  if (fromEnv.length > 0) return { value: fromEnv, source: "env" }
+
+  return { value: "gp-dev", source: "default" }
+}
+
 export default class GpCoreService {
   private readonly container_: Record<string, any>
   private readonly moduleOptions_: GpCoreModuleOptions
@@ -187,6 +250,11 @@ export default class GpCoreService {
       ...(moduleDeclaration?.options ?? {}),
       ...(moduleOptions ?? {}),
     }
+  }
+
+  /** Zakres `instance_id` — z opcji modułu albo z `GP_INSTANCE_ID`. */
+  private get instanceId_(): string {
+    return resolveGpCoreInstanceId(this.moduleOptions_.instanceId)
   }
 
   private get logger_(): LoggerLike {
@@ -864,8 +932,65 @@ export default class GpCoreService {
     throw new NotImplementedError("Story 1.3")
   }
 
-  async resolveVendorId(_mercurSellerId: string): Promise<string> {
-    throw new NotImplementedError("Story 1.3")
+  /**
+   * `mercur_seller_id` → `vendor_id` (v1.15.0 Story 5.8, AC1, FR-10a).
+   *
+   * == Dlaczego to NIE JEST operacja objęta blokadą ADR-052 ==
+   * Sąsiednie stuby (`claimVoucher`, `verifyVoucher`, `redeemVoucher`,
+   * `searchVouchers`, `voidEntitlement`) są oznaczone `@deprecated ADR-052`,
+   * bo są operacjami UPRAWNIENIOWYMI — te mają żyć w apps/web. Ta metoda nie
+   * jest operacją uprawnieniową, tylko REZOLUCJĄ TOŻSAMOŚCI, i dlatego jako
+   * jedyna z tej grupy adnotacji ADR-052 nigdy nie miała. Do tej story rzucała
+   * `NotImplementedError("Story 1.3")`, a `lib/vendor-auth.ts` zamieniał ten
+   * wyjątek na `501` — czyli KAŻDE uwierzytelnione żądanie `/vendor/*`
+   * odbijało się o „not implemented", zanim dotarło do handlera.
+   *
+   * Mapowanie istnieje w bazie od początku:
+   * `gp_core.vendor_seller_mappings (instance_id, vendor_id, mercur_seller_id)`
+   * z unikalnością `(instance_id, mercur_seller_id)` — zakres `instance_id`
+   * jest więc częścią klucza, a nie ozdobnikiem.
+   *
+   * == Brak mapowania jest ODMOWĄ ==
+   * Nie `501` (to nie jest brak implementacji) i nie zgadywany identyfikator
+   * (fallback na wartość współdzieloną zniknął w Story 5.4 i nie wraca).
+   * „Vendor nieznany" jest stanem AUTORYZACYJNYM, więc wychodzi nazwanym
+   * wyjątkiem {@link VendorNotMappedError}.
+   */
+  async resolveVendorId(mercurSellerId: string, client?: Queryable): Promise<string> {
+    const sellerId = typeof mercurSellerId === "string" ? mercurSellerId.trim() : ""
+    if (!sellerId) {
+      throw new VendorNotMappedError("", this.instanceId_)
+    }
+
+    const instanceId = this.instanceId_
+    const row = await this.queryOne<{ vendor_id: string }>(
+      client ?? this.getCorePool(),
+      `SELECT vendor_id
+         FROM gp_core.vendor_seller_mappings
+        WHERE instance_id = $1 AND mercur_seller_id = $2`,
+      [instanceId, sellerId]
+    )
+
+    if (!row) {
+      // Odmowa zostaje fail-closed, ale operator ma zobaczyć, że zakres mógł
+      // zejść na DOMYŚLKĘ — bo wtedy „brak mapowania" jest objawem braku
+      // `GP_INSTANCE_ID`, a nie braku danych (review-fix cyklu 1, LOW).
+      const { source } = resolveGpCoreInstanceIdWithSource(
+        this.moduleOptions_.instanceId
+      )
+      if (source === "default") {
+        this.logger_.warn?.(
+          `gp_core.resolveVendorId: brak mapowania dla sellera ${sellerId} ` +
+            `w zakresie instance_id="${instanceId}" pochodzącym z DOMYŚLKI ` +
+            `(ani opcja modułu \`instanceId\`, ani GP_INSTANCE_ID nie są ustawione). ` +
+            `Poza dev to najczęstsza przyczyna 403 VENDOR_NOT_MAPPED na CAŁEJ ` +
+            `powierzchni /vendor/* — sprawdź konfigurację, zanim zaczniesz szukać danych.`
+        )
+      }
+      throw new VendorNotMappedError(sellerId, instanceId)
+    }
+
+    return row.vendor_id
   }
 
   /**

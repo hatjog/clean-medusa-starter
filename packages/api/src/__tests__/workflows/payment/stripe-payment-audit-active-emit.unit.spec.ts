@@ -54,6 +54,29 @@ class FakeClient {
         rowCount: 1,
       }
     }
+    // v1.15.0 Story 5.9 review-fix cyklu 2 (C2-HIGH-1): ścieżka
+    // `payment.captured` WYDAJE kod vouchera przy wystawieniu (most
+    // `policy_snapshot.voucher_code` + wiersz `voucher`), więc czyta dane
+    // sprzedawcy tym samym zestawem kolumn, co Path Y. Fake musi je modelować —
+    // inaczej mierzyłby lukę atrapy, a nie zachowanie.
+    if (sql.includes("FROM order_item oi")) {
+      return {
+        rows: [
+          {
+            line_item_id: "line_1",
+            metadata: null,
+            line_title: "Zabieg testowy",
+            seller_id: "sel_test",
+            seller_name: "Salon Testowy",
+            seller_handle: "salon-testowy",
+          },
+        ] as unknown as T[],
+        rowCount: 1,
+      }
+    }
+    if (sql.includes("INSERT INTO voucher")) {
+      return { rows: [] as T[], rowCount: 1 }
+    }
     if (sql.includes("INSERT INTO entitlement_instance")) {
       this.rows.set(params[0] as string, { id: params[0] })
       return { rows: [] as T[], rowCount: 1 }

@@ -45,6 +45,12 @@ export type GpCoreMarketDetail = GpCoreMarket & {
 export type GpCoreModuleOptions = {
   databaseUrl?: string
   mercurDatabaseUrl?: string
+  /**
+   * Zakres `instance_id` dla zapytań `gp_core.*` (v1.15.0 Story 5.8).
+   * Bez wartości rozstrzyga `GP_INSTANCE_ID`, a bez niej `gp-dev` — ta sama
+   * domyślka co w rodzinie skryptów `gp-config-sync-*`.
+   */
+  instanceId?: string
 }
 
 export type CreateMarketInput = {

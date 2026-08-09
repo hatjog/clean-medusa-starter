@@ -75,6 +75,27 @@ if (process.env.TEST_TYPE === "integration:http") {
   module.exports.testMatch = [
     "**/packages/api/src/__tests__/rls/voucher-module-rls.integration.spec.[jt]s",
   ];
+} else if (process.env.TEST_TYPE === "voucher-redemption-pg") {
+  // v1.15.0 Story 5.7 (FR-12a/b/c, AI-2.2) — kanoniczna `voucher_redemption`
+  // OŻYWIONA, na REALNYM Postgresie: DDL wykonany z plików migracji, ruch rolą
+  // BEZ superusera i BEZ własności tabeli, kontrola negatywna grantów jako
+  // realna próba zapisu. Profil istnieje, bo suita, której nie odpala żaden
+  // profil, jest mechanizmem martwym — dokładnie ten defekt znalazła 2.6
+  // w `packages/api/src/__tests__/rls/**` (`No tests found`).
+  // DATABASE_URL musi wskazywać IZOLOWANĄ DB: suita DROP-uje tabele modułu.
+  module.exports.testMatch = [
+    "**/packages/api/src/__tests__/rls/voucher-redemption.integration.spec.[jt]s",
+  ];
+} else if (process.env.TEST_TYPE === "redeem-for-seller-pg") {
+  // v1.15.0 Story 5.8 (FR-10a/d/e/f, AD-17, AD-20, ADR-199) — `redeemForSeller`
+  // na REALNYM Postgresie: allow-lista stanow z dowodem czerwieni wykonanym
+  // w suicie, kontrola TOCTOU ROWNOLEGLA (sekwencyjna nie zlapalaby defektu),
+  // idempotencja liczona wierszami kanonicznej. Suita bez profilu jest
+  // mechanizmem martwym — dokladnie ten defekt znalazla 2.6.
+  // DATABASE_URL musi wskazywac IZOLOWANA DB: suita DROP-uje tabele modulu.
+  module.exports.testMatch = [
+    "**/packages/api/src/__tests__/rls/voucher-redeem-for-seller.integration.spec.[jt]s",
+  ];
 } else if (process.env.TEST_TYPE === "compensation-failure-pg") {
   // v1.15.0 Story 3.5 (FR-6c, NFR-3, AD-22) — rejestr nieudanych kompensacji
   // sciezki pieniadza wykonany przez sam modul na realnym Postgresie
@@ -91,6 +112,14 @@ if (process.env.TEST_TYPE === "integration:http") {
   // `voucher_delivery_dispatch`.
   module.exports.testMatch = [
     "**/packages/api/src/__tests__/integration/messaging-dispatch-barrier-pg.integration.test.[jt]s",
+  ];
+} else if (process.env.TEST_TYPE === "dispatch-window-provider") {
+  // v1.15.0 Story 4.5 (AC4) — DOWOD PO STRONIE DOSTAWCY. Wysyla REALNE maile
+  // przez `BrevoHttpClient` i liczy je odczytem z konta Brevo. Bez
+  // `BREVO_API_KEY` / `BREVO_LIVE_PROOF_RECIPIENT` suita jest `describe.skip` —
+  // nigdy nie klamie zielenia.
+  module.exports.testMatch = [
+    "**/packages/api/src/__tests__/integration/dispatch-window-provider.integration.test.[jt]s",
   ];
 } else if (process.env.TEST_TYPE === "unit") {
   module.exports.testMatch = [

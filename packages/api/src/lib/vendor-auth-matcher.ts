@@ -69,6 +69,31 @@ export const VENDOR_HMAC_EXEMPT_ROUTES: readonly VendorHmacExemption[] = [
       "Mercur `ensureSeller` populates req.seller_context; identity comes from the " +
       "upstream seller session, not from a GP signature",
   },
+  // v1.15.0 Story 5.8 (AC2, FR-10a, UX-DR8/UX-DR9): ekran realizacji vouchera
+  // w panelu salonu. Do tej story obie trasy szły przez bramkę HMAC, a panel
+  // wołał je `fetchQuery`-em niosącym sesję sprzedawcy Mercura — czyli
+  // KAŻDE żądanie z panelu kończyło się `401`. Alternatywą było wstrzyknięcie
+  // materiału podpisującego S2S do przeglądarki; jest ona ODRZUCONA (sekret
+  // S2S w kliencie to sekret opublikowany), a zapowiedź „a future iteration
+  // will inject the HMAC signer inside fetchQuery" z nagłówka
+  // `voucher-redeem.tsx` przestaje obowiązywać.
+  {
+    matcher: "/vendor/vouchers/:code/lookup",
+    transport: "mercur-seller-context",
+    reason:
+      "vendor-panel voucher lookup — browser-initiated; Mercur `ensureSellerMiddleware` " +
+      "(mounted by upstream on /vendor/*) populates req.seller_context.seller_id and " +
+      "rejects unauthenticated requests before the handler. The browser must never hold " +
+      "the S2S signing key, so the signature transport is unavailable here by design.",
+  },
+  {
+    matcher: "/vendor/vouchers/:code/redeem",
+    transport: "mercur-seller-context",
+    reason:
+      "vendor-panel voucher redeem — same browser transport as the lookup above; the " +
+      "redeem route resolves the tenant from req.seller_context and hands it to " +
+      "VoucherService.redeemForSeller (AD-20: one tenant-taking domain operation).",
+  },
 ]
 
 function exemptionToRegExp(matcher: string): RegExp {

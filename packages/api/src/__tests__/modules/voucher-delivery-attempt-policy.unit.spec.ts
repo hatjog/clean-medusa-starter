@@ -99,6 +99,21 @@ function makeCountingSql(): DispatchLedgerSql & { statements: string[] } {
   } as unknown as DispatchLedgerSql & { statements: string[] }
 }
 
+/**
+ * Odcina OGON DEKLARACJI TYPU od przechwyconego tokenu.
+ *
+ * `policy: { max_attempt_count: number; max_total_attempt_count: number }` jest
+ * jedną linią, więc `[^,\n]+` łapie całą resztę pola. Bez tego cięcia KSZTAŁT
+ * (`number`) byłby raportowany jako nielegalna WARTOŚĆ — czyli bramka
+ * czerwieniłaby się na deklaracji typu, a to nie jest drugi próg.
+ */
+function normalizeToken(raw: string): string {
+  return raw
+    .split(";")[0]
+    .replace(/[}\s]+$/, "")
+    .trim()
+}
+
 describe("AC4 — budżet prób ma JEDEN nośnik po stronie polityki", () => {
   it("polityka jest źródłem wartości, a stałe sweepa są jej re-eksportem", () => {
     expect(SWEEP_MAX_ATTEMPT_COUNT).toBe(VOUCHER_DELIVERY_MAX_ATTEMPT_COUNT)
@@ -128,16 +143,31 @@ describe("AC4 — budżet prób ma JEDEN nośnik po stronie polityki", () => {
     // wartości — w JAKIMKOLWIEK pliku produkcyjnym — świeci na czerwono.
     const injectedBudgets: { file: string; value: string }[] = []
     const injectedRecoveries: { file: string; value: string }[] = []
+    const injectedCeilings: { file: string; value: string }[] = []
 
     for (const file of BUDGET_SCANNED_SOURCES) {
       const source = readFileSync(file, "utf8")
-      for (const match of source.matchAll(/max_attempt_count:\s*([^,\n]+)/g)) {
-        injectedBudgets.push({ file, value: match[1].trim() })
+      // `max_attempt_count` jest PODCIĄGIEM `max_total_attempt_count`, więc bez
+      // kotwicy na granicy słowa sufit wpadałby także do zbioru budżetów i oba
+      // pomiary mówiłyby o jednym polu. Kotwica jest częścią pomiaru, nie
+      // kosmetyką.
+      for (const match of source.matchAll(
+        /(?<![\w.])max_attempt_count:\s*([^,\n]+)/g,
+      )) {
+        injectedBudgets.push({ file, value: normalizeToken(match[1]) })
       }
       for (const match of source.matchAll(
-        /max_configuration_recoveries:\s*([^,\n]+)/g,
+        /(?<![\w.])max_configuration_recoveries:\s*([^,\n]+)/g,
       )) {
-        injectedRecoveries.push({ file, value: match[1].trim() })
+        injectedRecoveries.push({ file, value: normalizeToken(match[1]) })
+      }
+      // Story 4.6 — sufit prób łącznie jest DRUGĄ liczbą polityki, więc dostaje
+      // TĘ SAMĄ bramkę. Dołożenie progu bez bramki byłoby dokładnie tym
+      // rozjazdem, przed którym broniła 4.4, tylko pod nową nazwą.
+      for (const match of source.matchAll(
+        /(?<![\w.])max_total_attempt_count:\s*([^,\n]+)/g,
+      )) {
+        injectedCeilings.push({ file, value: normalizeToken(match[1]) })
       }
     }
 
@@ -154,20 +184,41 @@ describe("AC4 — budżet prób ma JEDEN nośnik po stronie polityki", () => {
       "VOUCHER_DELIVERY_MAX_CONFIGURATION_RECOVERIES",
       "number",
     ])
+    const ALLOWED_CEILING_TOKENS = new Set([
+      "SWEEP_MAX_TOTAL_ATTEMPT_COUNT",
+      "VOUCHER_DELIVERY_MAX_TOTAL_ATTEMPT_COUNT",
+      "number",
+      // Przekazanie DALEJ wartości, którą wywołujący dostał w polityce, nie
+      // jest drugim źródłem — to ta sama liczba o jeden poziom niżej.
+      "policy.max_total_attempt_count",
+    ])
+    ALLOWED_BUDGET_TOKENS.add("policy.max_attempt_count")
 
     expect(injectedBudgets.length).toBeGreaterThan(0)
+    expect(injectedCeilings.length).toBeGreaterThan(0)
 
     // Raportujemy PLIK przy naruszeniu — inaczej czerwień nie mówi, gdzie
     // powstał drugi próg.
     const budgetOffenders = injectedBudgets
       .filter((entry) => !ALLOWED_BUDGET_TOKENS.has(entry.value))
-      .map((entry) => `${entry.file.replace(API_SRC_ROOT, "src")}: ${entry.value}`)
+      .map(
+        (entry) => `${entry.file.replace(API_SRC_ROOT, "src")}: ${entry.value}`,
+      )
     const recoveryOffenders = injectedRecoveries
       .filter((entry) => !ALLOWED_RECOVERY_TOKENS.has(entry.value))
-      .map((entry) => `${entry.file.replace(API_SRC_ROOT, "src")}: ${entry.value}`)
+      .map(
+        (entry) => `${entry.file.replace(API_SRC_ROOT, "src")}: ${entry.value}`,
+      )
+
+    const ceilingOffenders = injectedCeilings
+      .filter((entry) => !ALLOWED_CEILING_TOKENS.has(entry.value))
+      .map(
+        (entry) => `${entry.file.replace(API_SRC_ROOT, "src")}: ${entry.value}`,
+      )
 
     expect(budgetOffenders).toEqual([])
     expect(recoveryOffenders).toEqual([])
+    expect(ceilingOffenders).toEqual([])
   })
 
   it("kontrola kontroli: literał progu w INNYM pliku produkcyjnym jest wykrywany", () => {
@@ -188,9 +239,11 @@ describe("AC4 — budżet prób ma JEDEN nośnik po stronie polityki", () => {
     expect(injected).toEqual(["3"])
     expect(
       injected.every((value) =>
-        ["SWEEP_MAX_ATTEMPT_COUNT", "VOUCHER_DELIVERY_MAX_ATTEMPT_COUNT", "number"].includes(
-          value,
-        ),
+        [
+          "SWEEP_MAX_ATTEMPT_COUNT",
+          "VOUCHER_DELIVERY_MAX_ATTEMPT_COUNT",
+          "number",
+        ].includes(value),
       ),
     ).toBe(false)
   })
@@ -199,7 +252,9 @@ describe("AC4 — budżet prób ma JEDEN nośnik po stronie polityki", () => {
     // Bez tej asercji pomyłka w ścieżce zamieniłaby bramkę w zawsze-zieloną.
     expect(PRODUCTION_SOURCES.length).toBeGreaterThan(50)
     expect(PRODUCTION_SOURCES).toContain(SWEEP_SOURCE_PATH)
-    expect(PRODUCTION_SOURCES.every((file) => !file.includes("__tests__"))).toBe(true)
+    expect(
+      PRODUCTION_SOURCES.every((file) => !file.includes("__tests__")),
+    ).toBe(true)
   })
 
   it("job nie definiuje progu — przypisanie literału do stałej progu jest RED", () => {
@@ -220,6 +275,8 @@ describe("AC4 — numer próby nadaje ledger, nie wywołujący (dowód z wykonan
     entitlement_id: "entinst_4_4_policy",
     template_key: "voucher_purchase_confirmation",
     recipient_hash: RECIPIENT_HASH as never,
+    env: "test",
+    instance_id: "gp-test",
     market_id: "bonbeauty",
     flow_id: "voucher-purchase-delivery",
     locale: "pl",

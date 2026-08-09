@@ -23,6 +23,7 @@ import {
   issueEntitlementsForAllLineItems,
   MissingEntitlementProfileError,
   revokeEntitlementsOnRefund,
+  VoucherIssuanceBlockedError,
   type IssueEntitlementResult,
   type MultiLineEntitlementResult,
   type RefundEntitlementRevocationResult,
@@ -106,10 +107,43 @@ export type PaymentAuditEnvelope = {
    * re-issue entitlement once the order materializes. Durable + queryable.
    */
   entitlement_issue_deferred_reason?: string
+  /**
+   * v1.15.0 Story 5.9 review-fix cyklu 3 (REG-HIGH-2): stabilny dyskryminator
+   * powodu, dla którego wystawienie kodu zostało ZABLOKOWANE danymi
+   * (`missing_market` / `missing_line_context` / `ambiguous_line`).
+   *
+   * `entitlement_issue_failed_reason` niesie pełny komunikat — czytelny dla
+   * człowieka, bezużyteczny dla zapytania. Ten klucz jest po to, żeby dało się
+   * policzyć, ILE przechwyceń odpadło na brakującym dowiązaniu salonu, bez
+   * parsowania tekstu wyjątku.
+   */
+  entitlement_issue_blocked_reason?: string
   /** v1.9.0 wf5 H-3: count of entitlement rows transitioned ACTIVE→REFUNDED on payment.refunded. */
   revoked_entitlement_count?: number
   /** v1.9.0 wf5 H-3: count of already-terminal rows skipped during refund. */
   already_terminal_entitlement_count?: number
+  /**
+   * v1.15.0 Story 5.9 review-fix cyklu 3 (COR-LOW-1): liczba wierszy
+   * zwróconych, dla których producenta stanu kodu NIE wołano, bo typ
+   * uprawnienia nie jest wsparty kodem.
+   *
+   * Cykl 2 wprowadził `code_invalidation_skipped_entitlement_ids` i opisał je
+   * jako „NIE cichy no-op, bo fakt pominięcia jest zwracany i asertowany".
+   * Pomiar pokazał, że w PRODUKCJI był przemilczany: asercja żyła wyłącznie
+   * w teście jednostkowym, a jedyny wołający przepisywał do koperty tylko dwa
+   * pozostałe liczniki. Ten klucz zamyka różnicę między „zwracany" a „widoczny".
+   */
+  code_invalidation_skipped_count?: number
+  /**
+   * v1.15.0 Story 5.9 review-fix cyklu 3 (REG-LOW-1): wiersze, dla których
+   * producent stanu kodu zwrócił wynik INNY niż `invalidated`
+   * (`<entitlement_id>:<outcome>`).
+   *
+   * Nieobecność klucza = wszystkie kody zeszły tą tranzycją. Obecność =
+   * rozjazd „uprawnienie zwrócone, kod w innym stanie" wart obejrzenia przed
+   * rozliczeniem z salonem.
+   */
+  code_invalidation_anomalies?: string[]
 }
 
 // Reconcile-only result. There is no provider mutation on this path, so there
@@ -304,14 +338,32 @@ export class StripePaymentAuditWorkflow {
             transitionEvents.push(event)
           }
         } catch (err) {
-          if (!(err instanceof MissingEntitlementProfileError)) {
+          // v1.15.0 Story 5.9 review-fix cyklu 3 (REG-HIGH-2):
+          // `VoucherIssuanceBlockedError` obsługiwany TAK SAMO jak brak
+          // profilu — nazwany powód w kopercie audytu zamiast wywrócenia całej
+          // transakcji webhooka.
+          //
+          // Bez tego rzut z nowej kontroli danych salonu (dołożonej w cyklu 2)
+          // wywracał transakcję razem z wierszem dedupe, więc Stripe ponawiał
+          // webhook w kółko, a każde ponowienie wywracało się identycznie —
+          // ścieżka, która PRZED cyklem 2 przechodziła. Uprawnienie nadal NIE
+          // powstaje (fail-closed zostaje, SM-7 nie rośnie); zmienia się to,
+          // że odmowa jest utrwalona i jednorazowa zamiast być pętlą.
+          if (
+            !(err instanceof MissingEntitlementProfileError) &&
+            !(err instanceof VoucherIssuanceBlockedError)
+          ) {
             throw err
           }
           envelope.entitlement_issue_failed_reason = err.message
+          if (err instanceof VoucherIssuanceBlockedError) {
+            envelope.entitlement_issue_blocked_reason = err.reason
+          }
           await persistAuditFailureKey(
             client,
             payload.event_id as string,
-            err.message
+            err.message,
+            err instanceof VoucherIssuanceBlockedError ? err.reason : undefined
           )
           this.logger?.error?.(
             `[stripe-payment-audit] ${eventType} order_id=${payload.order_id} ` +
@@ -339,6 +391,30 @@ export class StripePaymentAuditWorkflow {
           refundRevocation.revoked_entitlement_ids.length
         envelope.already_terminal_entitlement_count =
           refundRevocation.already_terminal_entitlement_ids.length
+        envelope.code_invalidation_skipped_count =
+          refundRevocation.code_invalidation_skipped_entitlement_ids.length
+        // v1.15.0 Story 5.9 review-fix cyklu 3 (REG-LOW-1): wyniki producenta
+        // stanu kodu INNE niż `invalidated` są rozjazdem operacyjnym —
+        // uprawnienie zwrócone, a kod nie zszedł tą tranzycją. Najczęstszy
+        // przypadek to `already_redeemed_code` (kod `claimed`): SM-7 nie rośnie,
+        // bo `claimed` jest poza allow-listą wejściową realizacji, ale bez tego
+        // sygnału rozjazd jest niewidoczny dla kogokolwiek poza testem
+        // jednostkowym producenta.
+        const anomalies = refundRevocation.code_invalidation_outcomes.filter(
+          (o) => o.outcome !== "invalidated"
+        )
+        if (anomalies.length > 0) {
+          envelope.code_invalidation_anomalies = anomalies.map(
+            (o) => `${o.entitlement_id}:${o.outcome}`
+          )
+          this.logger?.warn?.(
+            `[stripe-payment-audit] payment.refunded order_id=${payload.order_id} ` +
+              `code_invalidation_anomalies=${anomalies.length} ` +
+              `(${envelope.code_invalidation_anomalies.join(", ")}) — uprawnienie ` +
+              `zwrócone, ale stan kodu NIE zszedł tą tranzycją; sprawdź rozjazd ` +
+              `uprawnienie↔kod przed rozliczeniem z salonem`
+          )
+        }
         // Persist the revocation summary onto the dedup row so the admin
         // refund-history view (F-CC1-018) can join it.
         await persistAuditRevocationKey(
@@ -349,7 +425,8 @@ export class StripePaymentAuditWorkflow {
         this.logger?.info?.(
           `[stripe-payment-audit] payment.refunded order_id=${payload.order_id} ` +
             `revoked=${refundRevocation.revoked_entitlement_ids.length} ` +
-            `already_terminal=${refundRevocation.already_terminal_entitlement_ids.length}`
+            `already_terminal=${refundRevocation.already_terminal_entitlement_ids.length} ` +
+            `code_invalidation_skipped=${refundRevocation.code_invalidation_skipped_entitlement_ids.length}`
         )
       }
 
@@ -628,15 +705,22 @@ async function insertDedupRow(
 async function persistAuditFailureKey(
   client: PgClient,
   eventId: string,
-  reason: string
+  reason: string,
+  // v1.15.0 Story 5.9 review-fix cyklu 3 (REG-HIGH-2): stabilny dyskryminator
+  // obok pełnego komunikatu. Utrwalany W TYM SAMYM `UPDATE`-cie, bo dwa osobne
+  // zapisy mogłyby rozejść się przy replayu i zostawić powód bez kategorii.
+  blockedReason?: string
 ): Promise<void> {
   await client.query(
     `UPDATE webhook_event_processed
-        SET envelope = envelope || jsonb_build_object('entitlement_issue_failed_reason', $2::text)
+        SET envelope = envelope
+              || jsonb_build_object('entitlement_issue_failed_reason', $2::text)
+              || CASE WHEN $3::text IS NULL THEN '{}'::jsonb
+                      ELSE jsonb_build_object('entitlement_issue_blocked_reason', $3::text) END
       WHERE event_id = $1
         AND provider = 'stripe'
         AND NOT (envelope ? 'entitlement_issue_failed_reason')`,
-    [eventId, reason]
+    [eventId, reason, blockedReason ?? null]
   )
 }
 
@@ -677,7 +761,17 @@ async function persistAuditRevocationKey(
               'revoked_entitlement_ids', $2::jsonb,
               'revoked_entitlement_count', $3::int,
               'already_terminal_entitlement_ids', $4::jsonb,
-              'already_terminal_entitlement_count', $5::int
+              'already_terminal_entitlement_count', $5::int,
+              -- v1.15.0 Story 5.9 review-fix cyklu 3 (COR-LOW-1): trzeci licznik.
+              -- Cykl 2 zwracal code_invalidation_skipped_entitlement_ids
+              -- z komentarzem "fakt pominiecia jest zwracany i asertowany, nie
+              -- przemilczany" -- a jedyny produkcyjny wolajacy przepisywal do
+              -- koperty tylko dwa pozostale pola. Asercja zyla w tescie, nie na
+              -- sciezce. Dzis zwezenie isVoucherBackedType (np. nowy typ
+              -- voucherowy dopisany jako false) zostawia slad w tabeli
+              -- webhook_event_processed, a nie tylko w pamieci procesu.
+              'code_invalidation_skipped_entitlement_ids', $6::jsonb,
+              'code_invalidation_skipped_count', $7::int
             )
       WHERE event_id = $1 AND provider = 'stripe'`,
     [
@@ -686,6 +780,8 @@ async function persistAuditRevocationKey(
       revocation.revoked_entitlement_ids.length,
       JSON.stringify(revocation.already_terminal_entitlement_ids),
       revocation.already_terminal_entitlement_ids.length,
+      JSON.stringify(revocation.code_invalidation_skipped_entitlement_ids),
+      revocation.code_invalidation_skipped_entitlement_ids.length,
     ]
   )
 }

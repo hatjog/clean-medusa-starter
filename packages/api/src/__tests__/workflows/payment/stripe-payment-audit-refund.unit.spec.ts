@@ -94,6 +94,9 @@ class RefundFakeClient {
     })
   }
 
+  /** v1.15.0 Story 5.9 review-fix: stan kodu jest STANEM fake'a, nie stałą. */
+  voucherStatus = "idle"
+
   async query<T = Record<string, unknown>>(
     sql: string,
     params: ReadonlyArray<unknown> = []
@@ -129,13 +132,53 @@ class RefundFakeClient {
       return { rows: [] as T[], rowCount: 1 }
     }
 
-    if (sql.includes("SELECT id, state FROM entitlement_instance")) {
+    // v1.15.0 Story 5.9 (FR-12, SM-7): zwrot unieważnia TAKŻE stan kodu
+    // vouchera, w tej samej transakcji. Fake musi znać most kod → uprawnienie
+    // i wiersz `voucher`, inaczej producent fail-closuje na braku mostu —
+    // słusznie, tylko z powodu luki fake'a, nie zachowania.
+    if (sql.includes("policy_snapshot->>'voucher_code'")) {
+      const id = params[0] as string
+      return {
+        rows: [
+          {
+            voucher_code: `GP-TEST-${id}`,
+            entitlement_type: "VOUCHER_AMOUNT",
+          },
+        ] as unknown as T[],
+        rowCount: 1,
+      }
+    }
+    if (sql.includes("FROM voucher WHERE code")) {
+      return {
+        rows: [{ status: this.voucherStatus }] as unknown as T[],
+        rowCount: 1,
+      }
+    }
+    if (sql.includes("UPDATE voucher SET status")) {
+      // review-fix 5.9: fake NIE udaje sukcesu w oderwaniu od stanu — WHERE
+      // producenta wiąże `status = prior`, więc rowCount zależy od tego, co
+      // fake właśnie zwrócił jako stan bieżący. Bez tego test „przechodzi",
+      // choćby producent pisał do wiersza, którego nie zablokował.
+      const prior = params[3] as string
+      if (prior !== this.voucherStatus) return { rows: [] as T[], rowCount: 0 }
+      this.voucherStatus = params[1] as string
+      return { rows: [] as T[], rowCount: 1 }
+    }
+
+    // v1.15.0 Story 5.9 review-fix cyklu 2 (C2-HIGH-1): `revokeEntitlementsOnRefund`
+    // dociąga `entitlement_type`, bo decyzja „czy jest co unieważniać" należy do
+    // wołającego, nie do producenta.
+    if (sql.includes("SELECT id, state, entitlement_type FROM entitlement_instance")) {
       const orderId = params[0] as string
       const matches = Array.from(this.entitlementRows.values()).filter(
         (r) => r.order_id === orderId
       )
       return {
-        rows: matches.map((r) => ({ id: r.id, state: r.state })) as T[],
+        rows: matches.map((r) => ({
+          id: r.id,
+          state: r.state,
+          entitlement_type: "VOUCHER_AMOUNT",
+        })) as T[],
         rowCount: matches.length,
       }
     }
@@ -154,6 +197,14 @@ class RefundFakeClient {
           row.state = newState
         }
       }
+      if (sql.includes("RETURNING entitlement_type")) {
+        return {
+          rows: (row
+            ? [{ entitlement_type: "VOUCHER_AMOUNT" }]
+            : []) as unknown as T[],
+          rowCount: row ? 1 : 0,
+        }
+      }
       return { rows: [] as T[], rowCount: row ? 1 : 0 }
     }
 
@@ -167,6 +218,27 @@ class RefundFakeClient {
         rows: match ? ([{ id: match.id }] as T[]) : ([] as T[]),
         rowCount: match ? 1 : 0,
       }
+    }
+
+    // review-fix cyklu 2 (C2-HIGH-1): produkcyjne zapytanie linii niesie dane
+    // sprzedawcy — captured-path wydaje kod przy wystawieniu.
+    if (sql.includes("FROM order_item oi")) {
+      return {
+        rows: [
+          {
+            line_item_id: "line_1",
+            metadata: null,
+            line_title: "Zabieg testowy",
+            seller_id: "sel_test",
+            seller_name: "Salon Testowy",
+            seller_handle: "salon-testowy",
+          },
+        ] as unknown as T[],
+        rowCount: 1,
+      }
+    }
+    if (sql.includes("INSERT INTO voucher")) {
+      return { rows: [] as T[], rowCount: 1 }
     }
 
     if (sql.includes("INSERT INTO entitlement_instance")) {
@@ -268,6 +340,51 @@ describe("v1.9.0 wf5 H-3 / F-CC1-002 — refund path → entitlement REFUNDED", 
     expect(result.refundRevocation?.already_terminal_entitlement_ids.length).toBe(2)
     expect(client.entitlementRows.get("ent_already_refunded")?.state).toBe("REFUNDED")
     expect(client.entitlementRows.get("ent_voided")?.state).toBe("VOIDED")
+  })
+
+  it("zwrot kodu JUŻ `expired` przechodzi i schodzi na `refunded` (review-fix 5.9)", async () => {
+    // Regresja: przed fixem producent rzucał `VoucherCodeNotInvalidatableError`
+    // na stanie kodu spoza allow-listy, a leżąc w transakcji wołającego
+    // przewracał CAŁY zwrot. Stan `expired` przy uprawnieniu ACTIVE jest realny
+    // na danych zastanych — usunięty w 5.9 bulk-sweeper gasił kody niezależnie
+    // od stanu uprawnienia.
+    const client = new RefundFakeClient()
+    client.voucherStatus = "expired"
+    client.seedEntitlement({
+      id: "ent_expired_code",
+      order_id: "ord_refund_1",
+      state: "ACTIVE",
+    })
+    const workflow = new StripePaymentAuditWorkflow({
+      connect: async () => client,
+    })
+
+    const result = await workflow.process("payment.refunded", refundPayload())
+
+    expect(result.refundRevocation?.revoked_entitlement_ids).toEqual([
+      "ent_expired_code",
+    ])
+    expect(client.entitlementRows.get("ent_expired_code")?.state).toBe("REFUNDED")
+    // Stan kodu NADPISANY: „pieniądze wróciły" jest faktem mocniejszym niż
+    // „minęła data" — i tylko on daje powód odmowy rozróżnialny od „wygasł".
+    expect(client.voucherStatus).toBe("refunded")
+  })
+
+  it("`refunded` NIE jest cofane przez późniejsze unieważnienie (kontrola przeciwna)", async () => {
+    const client = new RefundFakeClient()
+    client.voucherStatus = "refunded"
+    client.seedEntitlement({
+      id: "ent_refund_twice",
+      order_id: "ord_refund_1",
+      state: "ACTIVE",
+    })
+    const workflow = new StripePaymentAuditWorkflow({
+      connect: async () => client,
+    })
+
+    await workflow.process("payment.refunded", refundPayload())
+
+    expect(client.voucherStatus).toBe("refunded")
   })
 
   it("REFUNDED voucher cannot be 'redeemed' — state machine rejects ACTIVE re-entry", async () => {

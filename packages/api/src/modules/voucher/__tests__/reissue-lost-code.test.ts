@@ -33,6 +33,8 @@ function entitlement(
       validity_months: 12,
       refund_channel: "original_payment",
       extension: { enabled: true, fee_pct: 10 },
+      // v1.15.0 Story 5.9: most kod → uprawnienie.
+      voucher_code: "GP-TEST-REISSUE-001",
     }),
     created_at: issuedAt,
     updated_at: issuedAt,
@@ -90,11 +92,15 @@ describe("ReissueLostCodeWorkflow", () => {
     expect(next?.state).toBe(EntitlementInstanceState.ACTIVE)
     expect(next?.id).toBe(result.new_code)
     expect(next?.id).not.toBe(old.id)
-    expect(next?.policy_snapshot).toEqual(old.policy_snapshot)
+    // v1.15.0 Story 5.9 review-fix (MEDIUM-1): snapshot następcy jest verbatim
+    // WE WSZYSTKIM POZA `voucher_code` — następca dostaje własny, świeżo wydany
+    // kod. Poprzednia asercja („deep-equal") betonowała stan, w którym klientka
+    // dostawała kod przed chwilą unieważniony przez tę samą transakcję.
+    expect(next?.policy_snapshot).toEqual({
+      ...(old.policy_snapshot as Record<string, unknown>),
+      voucher_code: next?.id,
+    })
     expect(next?.policy_snapshot).not.toBe(old.policy_snapshot)
-    expect((next?.policy_snapshot as EntitlementPolicySnapshot)).toEqual(
-      old.policy_snapshot
-    )
     expect(next?.expires_at?.toISOString()).toBe(
       old.expires_at?.toISOString()
     )
@@ -260,6 +266,9 @@ describe("ReissueLostCodeWorkflow", () => {
       validity_months: 12,
       refund_channel: "original_payment",
       extension: { enabled: true, fee_pct: 10 },
+      // v1.15.0 Story 5.9: most kod → uprawnienie (odzysk zgubionego kodu
+      // unieważnia STARY kod razem z uprawnieniem).
+      voucher_code: "GP-TEST-REISSUE-001",
     })
 
     // 1. Start with an ACTIVE entitlement (post-ISSUED lifecycle step)
@@ -289,7 +298,14 @@ describe("ReissueLostCodeWorkflow", () => {
     // New is ACTIVE with policy_snapshot deep-equal and expires_at preserved
     const newEnt = store.get(first.new_entitlement_id)
     expect(newEnt?.state).toBe(EntitlementInstanceState.ACTIVE)
-    expect(newEnt?.policy_snapshot).toEqual(originalPolicy)
+    // v1.15.0 Story 5.9 review-fix (MEDIUM-1): snapshot następcy jest verbatim
+    // WE WSZYSTKIM POZA `voucher_code` — następca dostaje własny, świeżo wydany
+    // kod. Poprzednia asercja („deep-equal") betonowała stan, w którym klientka
+    // dostawała kod przed chwilą unieważniony przez tę samą transakcję.
+    expect(newEnt?.policy_snapshot).toEqual({
+      ...(originalPolicy as Record<string, unknown>),
+      voucher_code: newEnt?.id,
+    })
     expect(newEnt?.policy_snapshot).not.toBe(originalPolicy) // deep copy, not same ref
     expect(newEnt?.expires_at?.toISOString()).toBe(originalExpiresAt.toISOString())
 

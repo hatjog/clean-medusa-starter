@@ -16,7 +16,7 @@
 import { describe, it, expect, jest, beforeEach, afterEach } from "@jest/globals"
 
 import { config as subscriberConfig } from "../subscribers/on-order-completed.js"
-import { NotImplementedError } from "../modules/gp-core/service"
+import { NotImplementedError, VendorNotMappedError } from "../modules/gp-core/service"
 import { vendorAuthMiddleware } from "../lib/vendor-auth"
 import { withVendorGate } from "./helpers/vendor-auth-chain"
 import { buildVendorSignatureHeader } from "../lib/vendor-hmac"
@@ -175,12 +175,15 @@ describe("/vendor/* gate", () => {
     expect(capturedAuth!.seller_id).toBe(SMOKE_SELLER)
   })
 
-  it("returns 501 when resolveVendorId is stub (NotImplementedError)", async () => {
+  // v1.15.0 Story 5.8 (AC1): przypadek PRZEPISANY, nie usunięty. `501` znikło
+  // ze ścieżki realizacji, bo `resolveVendorId` przestał być stubem; brak
+  // mapowania jest teraz ODMOWĄ AUTORYZACYJNĄ `403 VENDOR_NOT_MAPPED`.
+  it("returns 403 VENDOR_NOT_MAPPED when the seller has no GP vendor mapping", async () => {
     const handler = jest.fn()
     const wrapped = withVendorGate(handler as any)
     const req = buildMockReq({ "x-vendor-signature": makeSignedHeader() })
 
-    // Override gp_core to throw NotImplementedError
+    // Override gp_core to throw VendorNotMappedError (Story 5.8, AC1)
     req.scope.resolve = jest.fn((key: string) => {
       // Story 5.3: this override replaces the whole resolver, so it must keep
       // carrying the anti-replay barrier — otherwise the case measures a 503
@@ -194,7 +197,7 @@ describe("/vendor/* gate", () => {
       if (key === "gp_core") {
         return {
           resolveVendorId: (jest.fn() as any).mockRejectedValue(
-            new NotImplementedError("Story 1.3")
+            new VendorNotMappedError(SMOKE_SELLER, "gp-dev")
           ),
         }
       }
@@ -206,10 +209,13 @@ describe("/vendor/* gate", () => {
 
     await wrapped(req, res, next)
 
-    expect(res.status).toHaveBeenCalledWith(501)
+    expect(res.status).toHaveBeenCalledWith(403)
     expect(res.body).toEqual(
-      expect.objectContaining({ stub: true, story: "1.3" })
+      expect.objectContaining({ code: "VENDOR_NOT_MAPPED" })
     )
+    // `501` sugerowałoby „serwer tego nie umie" i że wystarczy poczekać na
+    // dopisanie kodu. Serwer umie — to tożsamość nie istnieje.
+    expect(res.status).not.toHaveBeenCalledWith(501)
     expect(handler).not.toHaveBeenCalled()
   })
 
@@ -299,7 +305,7 @@ describe("vendorAuthMiddleware", () => {
     expect((req as any).vendorAuth.vendor_id).toBe("vendor-uuid-123")
   })
 
-  it("returns 501 on NotImplementedError (stub-safe)", async () => {
+  it("returns 403 VENDOR_NOT_MAPPED (odmowa autoryzacyjna, nie 501)", async () => {
     const req = buildMockReq({ "x-vendor-signature": makeSignedHeader("seller-xyz") })
     req.scope.resolve = jest.fn((key: string) => {
       // Story 5.3: this override replaces the whole resolver, so it must keep
@@ -314,7 +320,7 @@ describe("vendorAuthMiddleware", () => {
       if (key === "gp_core") {
         return {
           resolveVendorId: (jest.fn() as any).mockRejectedValue(
-            new NotImplementedError("Story 1.3")
+            new VendorNotMappedError("seller-xyz", "gp-dev")
           ),
         }
       }
@@ -325,8 +331,11 @@ describe("vendorAuthMiddleware", () => {
 
     await vendorAuthMiddleware(req, res, next)
 
-    expect(res.status).toHaveBeenCalledWith(501)
-    expect(res.body).toEqual(expect.objectContaining({ stub: true }))
+    expect(res.status).toHaveBeenCalledWith(403)
+    expect(res.body).toEqual(
+      expect.objectContaining({ code: "VENDOR_NOT_MAPPED" })
+    )
+    expect(res.status).not.toHaveBeenCalledWith(501)
     expect(next).not.toHaveBeenCalled()
   })
 })

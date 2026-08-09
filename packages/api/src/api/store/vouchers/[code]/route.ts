@@ -15,7 +15,12 @@
 
 import type { MedusaRequest, MedusaResponse } from "@medusajs/framework/http"
 import { marketContextStorage } from "../../../../lib/market-context"
-import { VOUCHER_MODULE, type VoucherService, type VoucherWithEvents } from "../../../../modules/voucher"
+import {
+  VOUCHER_MODULE,
+  type VoucherService,
+  type VoucherStatus,
+  type VoucherWithEvents,
+} from "../../../../modules/voucher"
 
 // Disable Medusa's default admin auth — this is a public store endpoint
 // gated by publishable-api-key middleware (handled upstream).
@@ -29,7 +34,12 @@ interface VoucherPublicView {
   product_title: string
   value_minor: number
   currency_code: string
-  status: "idle" | "consent_pending" | "claimed" | "withdrawn"
+  /**
+   * v1.15.0 Story 5.8: `VoucherStatus`, nie lokalna unia. Lokalna kopia była
+   * WĘŻSZA od CHECK-a bazy (brakowało `expired`), więc projekcja obiecywała
+   * konsumentowi zbiór, którego domena nie gwarantuje.
+   */
+  status: VoucherStatus
   expires_at: string | null
 }
 

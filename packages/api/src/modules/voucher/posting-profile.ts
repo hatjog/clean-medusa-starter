@@ -178,7 +178,18 @@ export type VoucherEntryType =
   | "ENTITLEMENT_REDEEMED"
   | "ENTITLEMENT_BREAKAGE"
 
-export type VoucherLifecycleEvent = "ISSUED" | "REDEEMED" | "EXPIRED"
+/**
+ * v1.15.0 Story 5.7 (ADR-178 §2.3): `REFUNDED` dołożone jako lifecycle
+ * ODWRÓCENIA realizacji. Bez tego członu posting odwracający jest niewykonalny,
+ * a licznik prowizji nie schodzi — `ledger-writer` dostawałby dyskryminator
+ * `REDEEMED`, `ledger_posting_applied` wchłonąłby wpis jako replay realizacji
+ * i wpis odwracający nigdy by nie powstał.
+ */
+export type VoucherLifecycleEvent =
+  | "ISSUED"
+  | "REDEEMED"
+  | "EXPIRED"
+  | "REFUNDED"
 
 export type LedgerTransactionV1 = {
   transaction_id: string
@@ -233,6 +244,35 @@ export type VoucherPostingInput = {
   redeemed_gross_to_date_minor?: number
   /** EXPIRED: niewykorzystane brutto na moment wygaśnięcia (breakage), minor units. */
   remaining_gross_minor?: number
+  /**
+   * REFUNDED (v1.15.0 Story 5.7, ADR-178 §2.3): brutto ODWRACANEJ realizacji,
+   * minor units. ZAWSZE DODATNIE — znak niesie `kind` wiersza kanonicznego,
+   * nie liczba (ADR-178 A7: ujemne kwoty w tabeli kwotowej to klasa błędów,
+   * w której każdy konsument musi pamiętać o znaku).
+   */
+  reversed_gross_minor?: number
+  /**
+   * REFUNDED: brutto odwrócone WCZEŚNIEJSZYMI odwróceniami tego uprawnienia
+   * (bez bieżącego), minor units.
+   *
+   * Istnieje z tego samego powodu co `redeemed_gross_to_date_minor` i musi być
+   * podawane symetrycznie do niego. `proportionalVat` zaokrągla, więc VAT
+   * liczony wprost proporcjonalnie od pojedynczej raty NIE sumuje się do VAT-u
+   * rozpoznanego kumulatywnie-marginalnie przy realizacji. Zmierzony przykład:
+   * `net=999, vat=1, gross=1000`, dwie raty po 500 ⇒ Σ rozpoznanego VAT = 1
+   * (`round(0.5) − 0 = 1`, potem `1 − 1 = 0`), a dwa odwrócenia liczone wprost
+   * dałyby Σ = 2 (`round(0.5)` dwa razy). `vat:output` zszedłby wtedy PONIŻEJ
+   * ZERA przy zbilansowanym per-wpis ledgerze — `assertBalanced` tego nie łapie,
+   * bo każdy wpis z osobna jest poprawny.
+   */
+  reversed_gross_to_date_minor?: number
+  /**
+   * REFUNDED: brutto zrealizowane do tej pory (Σ REDEMPTION), minor units.
+   * Sufit odwrócenia: Σ odwróceń nie może przekroczyć Σ realizacji — ledger
+   * dopuszczałby inaczej over-reversal strukturalnie, bo jedynym guardem było
+   * porównanie z brutto vouchera.
+   */
+  redeemed_gross_total_minor?: number
   // koperta `ledger-transaction.v1`
   transaction_id: string
   occurred_at: string
@@ -575,6 +615,111 @@ function generateRedeemed(input: VoucherPostingInput, profile: VoucherPostingPro
 }
 
 /**
+ * REFUNDED → ODWRÓCENIE derecognition realizacji (v1.15.0 Story 5.7, ADR-178 §2.3).
+ *
+ * Ledger jest append-only: odwrócenie NIE kasuje wpisu realizacji, tylko dokłada
+ * wpis o przeciwnych stronach. Dla MPV oznacza to zawieszenie z powrotem VAT-u
+ * rozpoznanego przy realizacji (`vat:output` D / `vat:output:suspense` C) —
+ * dokładnie lustro `generateRedeemed`.
+ *
+ * `entry_type` pozostaje `ENTITLEMENT_REDEEMED`: allow-lista `entry_type`
+ * w migracji `1778927000000` jest zamrożona, a odwrócenie należy do TEJ SAMEJ
+ * klasy wpisów co realizacja. Rozróżnia je `metadata.lifecycle_event = REFUNDED`
+ * i — co ważniejsze dla dedupe — inny `transaction_id`, bo dyskryminatorem jest
+ * `redemption_id` wiersza odwracającego.
+ *
+ * SPV: przy realizacji nie było legu VAT w entitlement-ledgerze (VAT rozpoznano
+ * przy emisji), więc nie ma czego odwracać — udokumentowany no-op, nie milczenie.
+ */
+function generateRedemptionReversal(
+  input: VoucherPostingInput,
+  profile: VoucherPostingProfile
+): VoucherPostingResult {
+  assertNonNegativeInteger(input.vat_minor, "vat_minor")
+  assertNonNegativeInteger(input.net_minor, "net_minor")
+  const reversedGross = input.reversed_gross_minor ?? 0
+  assertNonNegativeInteger(reversedGross, "reversed_gross_minor")
+  const priorReversedGross = input.reversed_gross_to_date_minor ?? 0
+  assertNonNegativeInteger(priorReversedGross, "reversed_gross_to_date_minor")
+
+  const totalGross = input.net_minor + input.vat_minor
+  const cumulativeReversedGross = priorReversedGross + reversedGross
+  if (cumulativeReversedGross > totalGross) {
+    throw new VoucherPostingInvariantError(
+      `over-reverse: reversed-to-date (${priorReversedGross}) + reversed_gross_minor (${reversedGross}) = ${cumulativeReversedGross} > brutto vouchera (${totalGross})`
+    )
+  }
+
+  // Sufit odwrócenia to Σ REALIZACJI, nie brutto vouchera. Bez tego guardu
+  // over-reversal był dopuszczony strukturalnie: można było odwrócić więcej,
+  // niż kiedykolwiek zrealizowano, byle mieścić się w brutto emisji.
+  if (input.redeemed_gross_total_minor !== undefined) {
+    assertNonNegativeInteger(
+      input.redeemed_gross_total_minor,
+      "redeemed_gross_total_minor"
+    )
+    if (cumulativeReversedGross > input.redeemed_gross_total_minor) {
+      throw new VoucherPostingInvariantError(
+        `over-reverse: reversed-to-date + reversed_gross_minor = ${cumulativeReversedGross} > zrealizowane brutto (${input.redeemed_gross_total_minor})`
+      )
+    }
+  }
+
+  if (input.vat_classification === "SPV") {
+    return {
+      posted: false,
+      reason:
+        "SPV REFUNDED: przy realizacji nie powstał leg VAT w entitlement-ledgerze (VAT rozpoznany przy emisji), więc odwrócenie nie ma czego odwracać",
+    }
+  }
+
+  // KUMULATYWNIE-MARGINALNIE, symetrycznie do `generateRedeemed`. Wprost
+  // proporcjonalny VAT od pojedynczej raty rozjeżdża się z rozpoznanym na
+  // resztach zaokrągleń i pozwala zdjąć z `vat:output` więcej, niż tam
+  // kiedykolwiek trafiło (patrz `reversed_gross_to_date_minor`).
+  const vatReversed =
+    proportionalVat(input.vat_minor, cumulativeReversedGross, totalGross) -
+    proportionalVat(input.vat_minor, priorReversedGross, totalGross)
+  if (vatReversed === 0) {
+    return {
+      posted: false,
+      reason:
+        "MPV REFUNDED bez VAT do odwrócenia (vatReversed=0): brak legu VAT w entitlement-ledgerze",
+    }
+  }
+
+  const lines: LedgerLine[] = [
+    line(
+      input,
+      "reversal-vat-output",
+      VOUCHER_LEDGER_ACCOUNTS.VAT_OUTPUT,
+      "debit",
+      vatReversed,
+      "MPV: cofnięcie rozpoznanego output VAT przy odwróceniu realizacji"
+    ),
+    line(
+      input,
+      "reversal-vat-suspense",
+      VOUCHER_LEDGER_ACCOUNTS.VAT_OUTPUT_SUSPENSE,
+      "credit",
+      vatReversed,
+      "MPV: powrót VAT do zawieszenia (vat:output:suspense)"
+    ),
+  ]
+
+  return {
+    posted: true,
+    transaction: buildEnvelope(
+      input,
+      profile,
+      "ENTITLEMENT_REDEEMED",
+      "REFUNDED",
+      lines
+    ),
+  }
+}
+
+/**
  * EXPIRED z niewykorzystanym saldem → BREAKAGE (jeden wpis
  * `ENTITLEMENT_BREAKAGE`, `lifecycle_event=EXPIRED`; ADR-133 §Decyzja pkt 2b).
  *   - SPV: VAT rozpoznany przy emisji → breakage tylko z części netto
@@ -727,6 +872,8 @@ export function generateVoucherPosting(
       return generateIssued(input, profile)
     case "REDEEMED":
       return generateRedeemed(input, profile)
+    case "REFUNDED":
+      return generateRedemptionReversal(input, profile)
     case "EXPIRED":
       return generateBreakage(input, profile)
     default: {

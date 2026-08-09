@@ -21,7 +21,10 @@
 import { knex, type Knex } from "knex"
 
 import { createMarketLocalesReader } from "../../lib/read-market-locales"
-import { toKnexPositionalSql, SqlDialectError } from "../../lib/knex-positional-sql"
+import {
+  toKnexPositionalSql,
+  SqlDialectError,
+} from "../../lib/knex-positional-sql"
 import {
   PgDispatchLedger,
   VOUCHER_DELIVERY_DISPATCH_TABLE,
@@ -39,6 +42,8 @@ function baseRow(status: string): Record<string, unknown> {
     entitlement_id: "ent_1",
     template_key: "voucher_purchase_confirmation",
     recipient_hash: RECIPIENT_HASH,
+    env: "test",
+    instance_id: "gp-test",
     market_id: "bonbeauty",
     flow_id: "voucher_purchase_delivery",
     locale: "pl",
@@ -93,6 +98,8 @@ async function recordLedgerCalls(): Promise<Call[]> {
     entitlement_id: "ent_1",
     template_key: "voucher_purchase_confirmation",
     recipient_hash: RECIPIENT_HASH,
+    env: "test",
+    instance_id: "gp-test",
     market_id: "bonbeauty",
     flow_id: "voucher_purchase_delivery",
     locale: "pl",
@@ -190,6 +197,7 @@ async function recordSweepScanCalls(): Promise<Call[]> {
     created_after: "2026-07-19T12:00:00.000Z",
     stale_queued_before: "2026-07-26T11:45:00.000Z",
     max_attempt_count: 5,
+    max_total_attempt_count: 40,
     limit: 200,
   })
   calls.push(...scan.calls)
@@ -201,6 +209,7 @@ async function recordSweepScanCalls(): Promise<Call[]> {
     created_before: "2026-07-26T11:30:00.000Z",
     created_after: "2026-07-19T12:00:00.000Z",
     max_attempt_count: 5,
+    max_total_attempt_count: 40,
     limit: 200,
   })
   calls.push(...stalled.calls)
@@ -209,26 +218,46 @@ async function recordSweepScanCalls(): Promise<Call[]> {
   await new PgDispatchLedger(parked).listParkedDispatches({
     entitlement_ids: ["ent_1", "ent_2"],
     max_attempt_count: 5,
+    max_total_attempt_count: 40,
   })
   calls.push(...parked.calls)
 
-  const parkedCount = new RecordingSql(() => [{ market_id: "bonbeauty", parked: 1 }])
+  const parkedCount = new RecordingSql(() => [
+    { market_id: "bonbeauty", parked: 1 },
+  ])
   await new PgDispatchLedger(parkedCount).countParkedDispatchesByMarket({
     max_attempt_count: 5,
+    max_total_attempt_count: 40,
   })
   calls.push(...parkedCount.calls)
 
-  const release = new RecordingSql(() => [])
-  await new PgDispatchLedger(release).releaseAttemptBudget({
-    dispatch_id: "dispatch-1",
-    error_code: "FLOW_DISABLED",
-    max_configuration_recoveries: 1,
+  // Story 4.6: `releaseAttemptBudget` USUNIETY (atrybucja w `markFailed`
+  // przejela jego role). W jego miejsce dialekt musi pokryc dwa NOWE
+  // zapytania eskalacji — inaczej `UPDATE … FOR UPDATE SKIP LOCKED` nie
+  // przeszedlby przez zaden test dialektu.
+  const claim = new RecordingSql(() => [])
+  await new PgDispatchLedger(claim).claimAttemptPolicyEscalations({
+    max_attempt_count: 5,
+    max_total_attempt_count: 40,
+    // review-fix cyklu 1 (M4): zajecie zna dolna granice okna skanu.
+    created_after: "2026-07-19T12:00:00.000Z",
+    limit: 50,
   })
-  calls.push(...release.calls)
+  calls.push(...claim.calls)
+
+  const releaseClaims = new RecordingSql(() => [])
+  await new PgDispatchLedger(releaseClaims).releaseEscalationClaims({
+    dispatch_ids: ["dispatch-1", "dispatch-2"],
+  })
+  calls.push(...releaseClaims.calls)
 
   const historicalRelease = new RecordingSql(() => [])
-  await new PgDispatchLedger(historicalRelease).releaseParkedConfigurationFailureBudgets({
+  await new PgDispatchLedger(
+    historicalRelease,
+  ).releaseParkedConfigurationFailureBudgets({
     max_attempt_count: 5,
+    // review-fix cyklu 1 (M1): odparkowanie zna OBIE granice parkowania.
+    max_total_attempt_count: 40,
     max_configuration_recoveries: 1,
     error_codes: ["FLOW_DISABLED", "MARKET_LOCALES_UNAVAILABLE"],
   })
@@ -315,7 +344,13 @@ describe("Story 2.5 — SQL sweepa jest wykonywalny przez REALNY formatter Knexa
 
     it("gałąź `queued` wymaga staleness, a wiersze zaparkowane są wykluczone", () => {
       expect(scanSql()).toContain("d.status = 'queued' AND d.queued_at < ?")
-      expect(scanSql()).toContain("d.attempt_count < ?")
+      // Story 4.6: kwalifikacja kandydata to NEGACJA predykatu parkowania,
+      // a ten ma dwa człony (budżet odbiorcy ALBO sufit prób łącznie).
+      expect(scanSql()).toContain(
+        "d.attempt_count - d.non_recipient_failure_count >= ?",
+      )
+      expect(scanSql()).toContain("OR d.attempt_count >= ?")
+      expect(scanSql()).toContain("OR NOT (")
     })
 
     it("sortowanie stawia najmniej próbowane wiersze PIERWSZE (anty-starvation)", () => {
@@ -326,36 +361,70 @@ describe("Story 2.5 — SQL sweepa jest wykonywalny przez REALNY formatter Knexa
 
     it("skan stalled wchodzi przez LEDGER i respektuje próg prób", () => {
       const stalled = calls.find((call) =>
-        call.sql.includes("JOIN entitlement_instance e ON e.id = d.entitlement_id"),
+        call.sql.includes(
+          "JOIN entitlement_instance e ON e.id = d.entitlement_id",
+        ),
       )
       expect(stalled).toBeDefined()
       const sql = (stalled as Call).sql.replace(/\s+/g, " ")
       expect(sql).toMatch(/d\.status IN \(\?, \?\)/)
-      expect(sql).toContain("d.attempt_count < ?")
+      expect(sql).toContain(
+        "d.attempt_count - d.non_recipient_failure_count >= ?",
+      )
+      expect(sql).toContain("AND NOT (")
       expect(sql).not.toMatch(/\b(INSERT|UPDATE|DELETE)\b/i)
     })
 
-    it("zwrot budżetu prób ma guard statusu i kodu błędu", () => {
-      const release = calls.find((call) =>
-        call.sql.includes("SET attempt_count = GREATEST"),
+    it("zajęcie do eskalacji jest ATOMOWE i bierze tylko jeszcze niezgłoszone", () => {
+      // Story 4.6 zastąpiła `releaseAttemptBudget` (guard statusu i kodu błędu)
+      // atrybucją w `markFailed`. Tamto zapytanie nie istnieje; w jego miejsce
+      // dialekt musi udźwignąć `UPDATE … FOR UPDATE SKIP LOCKED`, bo to na nim
+      // stoi niepowtarzalność eskalacji przy dwóch instancjach.
+      expect(
+        calls.find((call) => call.sql.includes("SET attempt_count = GREATEST")),
+      ).toBeUndefined()
+
+      const claim = calls.find((call) =>
+        call.sql.includes("SET escalated_at ="),
       )
-      expect(release).toBeDefined()
-      const sql = (release as Call).sql.replace(/\s+/g, " ")
-      expect(sql).toContain("AND status = 'failed'")
-      expect(sql).toContain("AND error_code = ?")
-      expect(sql).toContain("AND attempt_count > 0")
-      expect(sql).toContain("AND configuration_recovery_count < ?")
+      expect(claim).toBeDefined()
+      const sql = (claim as Call).sql.replace(/\s+/g, " ")
+      expect(sql).toContain("AND p.escalated_at IS NULL")
+      expect(sql).toContain("FOR UPDATE SKIP LOCKED")
+      // review-fix cyklu 1 (M4): granica R-2.5-H1 obowiązuje TAKŻE tutaj —
+      // zajęcie bez okna wysypuje na człowieka historię sprzed ledgera.
+      expect(sql).toContain("AND p.created_at >= ?")
+      expect(sql).toContain(
+        "p.attempt_count - p.non_recipient_failure_count >= ?",
+      )
+      // Tożsamość wiersza wraca w RETURNING — inaczej eskalacja nie miałaby
+      // czego nieść i znów byłaby licznikiem.
+      expect(sql).toContain("RETURNING d.dispatch_id")
+      expect(sql).toContain("d.recipient_hash")
     })
 
     it("odparkowanie historycznej awarii używa trwałej pierwszej przyczyny", () => {
-      const release = calls.find((call) => call.sql.includes("SET attempt_count = LEAST"))
+      const release = calls.find((call) =>
+        call.sql.includes("SET attempt_count = LEAST"),
+      )
       expect(release).toBeDefined()
       const sql = (release as Call).sql.replace(/\s+/g, " ")
-      expect(sql).toContain("AND error_code = 'VOUCHER_DELIVERY_DISPATCH_FAILED'")
+      expect(sql).toContain(
+        "AND error_code = 'VOUCHER_DELIVERY_DISPATCH_FAILED'",
+      )
       expect(sql).toContain("AND first_error_code IS NOT NULL")
       expect(sql).toContain("first_error_code LIKE '%\\_NOT\\_CONFIGURED'")
-      expect(sql).toContain("AND attempt_count >= ?")
       expect(sql).toContain("AND configuration_recovery_count < ?")
+      // review-fix cyklu 1 (M1) — dwie rzeczy naraz i obie muszą tu pęknąć,
+      // gdyby ktoś je cofnął:
+      //  1. metoda operuje WYŁĄCZNIE na populacji zastanej (wiersz
+      //     pomigracyjny ma atrybucję, więc odzysku nie potrzebuje, a
+      //     obniżenie mu attempt_count dałoby budżet UJEMNY);
+      //  2. próg parkowania pochodzi ze WSPÓLNEJ definicji, nie z piątej,
+      //     rozpisanej tu kopii `attempt_count >= max_attempt_count`.
+      expect(sql).toContain("AND non_recipient_failure_count = 0")
+      expect(sql).toContain("attempt_count - non_recipient_failure_count >= ?")
+      expect(sql).not.toMatch(/AND attempt_count >= \?/)
     })
   })
 
@@ -373,7 +442,9 @@ describe("Story 2.5 — SQL sweepa jest wykonywalny przez REALNY formatter Knexa
 
 describe("R-2.3-H1 — reader locale rynku używa tego samego dialektu", () => {
   it("SELECT z `market_runtime_config` przechodzi przez formatter Knexa", async () => {
-    const recorder = new RecordingSql(() => [{ locales: { default: "pl", supported: ["pl"] } }])
+    const recorder = new RecordingSql(() => [
+      { locales: { default: "pl", supported: ["pl"] } },
+    ])
     const read = await createMarketLocalesReader(recorder).read("bonbeauty")
 
     expect(read.degraded).toBe(false)
@@ -385,18 +456,18 @@ describe("R-2.3-H1 — reader locale rynku używa tego samego dialektu", () => {
 
 describe("toKnexPositionalSql — guardy kształtów, które Knex cicho przekłamuje", () => {
   it("zamienia `$N` na `?` w kolejności WYSTĄPIEŃ (powtórzony `$8` = trzy bindingi)", () => {
-    const { text, bindings } = toKnexPositionalSql(
-      "VALUES ($1, $2, $2, $2)",
-      ["a", "b"],
-    )
+    const { text, bindings } = toKnexPositionalSql("VALUES ($1, $2, $2, $2)", [
+      "a",
+      "b",
+    ])
     expect(text).toBe("VALUES (?, ?, ?, ?)")
     expect(bindings).toEqual(["a", "b", "b", "b"])
   })
 
   it("odrzuca binding tablicowy (Knex rozwinąłby go w listę `?, ?`)", () => {
-    expect(() => toKnexPositionalSql("WHERE status = ANY($1)", [["failed"]])).toThrow(
-      SqlDialectError,
-    )
+    expect(() =>
+      toKnexPositionalSql("WHERE status = ANY($1)", [["failed"]]),
+    ).toThrow(SqlDialectError)
   })
 
   it("odrzuca mieszanie dialektów (`?` w wejściowym SQL-u)", () => {
@@ -406,6 +477,8 @@ describe("toKnexPositionalSql — guardy kształtów, które Knex cicho przekła
   })
 
   it("odrzuca placeholder bez wartości (literówka `$7` przy 6 wartościach)", () => {
-    expect(() => toKnexPositionalSql("VALUES ($1, $7)", ["a"])).toThrow(SqlDialectError)
+    expect(() => toKnexPositionalSql("VALUES ($1, $7)", ["a"])).toThrow(
+      SqlDialectError,
+    )
   })
 })

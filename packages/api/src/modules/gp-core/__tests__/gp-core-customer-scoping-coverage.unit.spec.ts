@@ -213,9 +213,9 @@ const COVERED_PATHS: ReadonlyArray<CoveragePath> = [
     file: "api/vendor/vouchers/[code]/lookup/route.ts",
     result: "out-of-scope",
     scope: ["vendor-seller"],
-    guardLiterals: ["req.vendorAuth!", "voucher.seller_id !== authenticatedSellerId"],
+    guardLiterals: ["req.seller_context?.seller_id", "getForSeller("],
     rationale:
-      "Vendor surface: the /vendor/* HMAC gate (Story 5.4; `withVendorAuth` was deleted) binds the authenticated seller_id into `req.vendorAuth`, and the route compares it; cross-vendor lookups return 403. A vendor is not a customer, so customer-scoping does not apply — listed explicitly per AC1 (no silent exclusion).",
+      "Vendor surface. v1.15.0 Story 5.8 (AC2/AC4) ZMIENIŁA nośnik obu strażników: trasa jest ZWOLNIONA z bramki HMAC (`VENDOR_HMAC_EXEMPT_ROUTES`, transport `mercur-seller-context`), więc tożsamość pochodzi z `req.seller_context`, a nie z `req.vendorAuth`; predykat własności zszedł z warstwy HTTP do DOMENY (`VoucherService.getForSeller`), która zwraca `null` dla kodu nieznanego I cudzego — jedną gałęzią, bo rozróżnienie ich jest wyciekiem istnienia cudzych danych (UX-DR9, `404` zamiast `403`). A vendor is not a customer, so customer-scoping does not apply — listed explicitly per AC1 (no silent exclusion).",
   },
   {
     id: "vendor.voucher.redeem",
@@ -224,9 +224,9 @@ const COVERED_PATHS: ReadonlyArray<CoveragePath> = [
     file: "api/vendor/vouchers/[code]/redeem/route.ts",
     result: "out-of-scope",
     scope: ["vendor-seller"],
-    guardLiterals: ["req.vendorAuth!", "existing.seller_id !== authenticatedSellerId"],
+    guardLiterals: ["req.seller_context?.seller_id", "redeemForSeller("],
     rationale:
-      "Vendor redeem (create + read entitlement_instance state) bound to authenticated seller_id via HMAC; cross-vendor attempts 403. Vendor ≠ customer — out-of-scope for customer-scoping, listed explicitly.",
+      "Vendor redeem (create + read entitlement_instance state). v1.15.0 Story 5.8 (AC2/AC4, AD-20): tożsamość z `req.seller_context` (transport `mercur-seller-context`), a WIĄŻĄCY predykat najemcy siedzi POD BLOKADĄ w `VoucherService.redeemForSeller` — `seller_id`, `status` i `expires_at` pochodzą z tego samego `SELECT … FOR UPDATE`, co mutacja. Porównanie w warstwie trasy (`existing.seller_id !== authenticatedSellerId`) było obserwacją z INNEGO snapshotu niż mutacja i zostało usunięte; cross-vendor kończy się `404` nieodróżnialnym od nieznanego kodu. Vendor ≠ customer — out-of-scope for customer-scoping, listed explicitly.",
   },
   // ── import (explicit no-path) ────────────────────────────────────────────
   {
