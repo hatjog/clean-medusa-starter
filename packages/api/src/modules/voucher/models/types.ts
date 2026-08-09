@@ -11,7 +11,7 @@
  * v1.15.0 Story 5.8 (AD-17): dopisane `expired`. Do tej story unia była
  * WĘŻSZA niż CHECK obowiązujący w bazie
  * (`1778926100000_add_voucher_expired_status_and_recipient_columns.ts`) i niż
- * słownik `specs/contracts/redemption/voucher-state-vocabulary.v1.yaml` —
+ * słownik `specs/contracts/redemption/voucher-state-vocabulary.v3.yaml` —
  * a to jest dokładnie rozjazd, przez który allow-lista wyrażona w TypeScripcie
  * mogłaby nie znać stanu, który baza zapisze. Nośnikiem zbioru jest CHECK
  * migracji; ta unia go LUSTRZE i walidator `validate_voucher_state_vocabulary`
@@ -103,24 +103,15 @@ export type ClaimResult =
  * voucher" mają być NIEODRÓŻNIALNE, więc oba wychodzą jedną gałęzią
  * `redeem_for_seller` → `not_found`, a nie powodem odmowy.
  */
-export type RedeemRefusalReason =
-  | "already_redeemed"
-  | "withdrawn"
-  | "expired"
-  /**
-   * v1.15.0 Story 5.9 (FR-12, SM-7): voucher ZWRÓCONY. Rozłączny z
-   * „zrealizowany" i „wygasły" — pieniądze wróciły do klientki, więc salon
-   * nie ma za co wykonać zabiegu, a kosmetolożka ma prawo wiedzieć, dlaczego
-   * odmowa nie jest tym samym co „już zrealizowany".
-   */
-  | "refunded"
-  /**
-   * Stan spoza allow-listy, który NIE jest żadnym z trzech nazwanych — czyli
-   * stan dopisany do CHECK-a bazy bez dopisania go do allow-listy. Nazwanie go
-   * „wycofany" byłoby kłamstwem wobec kosmetolożki, a przepuszczenie —
-   * dziurą; ta gałąź jest fail-closed z uczciwą etykietą.
-   */
-  | "not_redeemable"
+export const REDEEM_REFUSALS = {
+  already_redeemed: { api_code: "VOUCHER_ALREADY_REDEEMED", http_status: 409 },
+  withdrawn: { api_code: "VOUCHER_WITHDRAWN", http_status: 409 },
+  expired: { api_code: "VOUCHER_EXPIRED", http_status: 410 },
+  refunded: { api_code: "VOUCHER_REFUNDED", http_status: 409 },
+  not_redeemable: { api_code: "VOUCHER_NOT_REDEEMABLE", http_status: 409 },
+} as const
+
+export type RedeemRefusalReason = keyof typeof REDEEM_REFUSALS
 
 /**
  * Wynik JEDNEJ operacji domenowej przyjmującej najemcę
