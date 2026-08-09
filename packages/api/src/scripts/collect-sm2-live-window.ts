@@ -16,8 +16,24 @@ import { hashRecipientEmail } from "../modules/voucher-delivery/recipient-hash"
 
 const { Client } = require("pg") as typeof import("pg")
 
-const AUTHORIZED_RECIPIENT_DIGEST =
-  "a70e5795905f1bd5f0939d9b1066ccc0ab98d986cf3561b4abef179a2497b790"
+// Allow-lista adresatow jako digesty SHA-256 adresu (trim + lowercase). Adresy nie stoja
+// w repo otwartym tekstem, ale digest jest deterministyczny, wiec autoryzacja jest
+// sprawdzalna bez ujawniania listy.
+//
+// CYKL 3 (decyzja Robert/PO, 2026-08-09): cykl 2 lecial na JEDEN adres i domknal okno jako
+// `address_count: 1`, histogram `{30: 1}`. To dowodzilo toru wysylki, nie dostarczalnosci.
+// Cykl 3 rozklada wysylki na CZTERY adresy PO; pierwszy z nich jest tym samym adresem,
+// ktorego uzyl cykl 2, wiec porownanie miedzy cyklami zostaje mozliwe.
+const AUTHORIZED_RECIPIENT_DIGESTS = new Set([
+  "a70e5795905f1bd5f0939d9b1066ccc0ab98d986cf3561b4abef179a2497b790", // adresat cyklu 2
+  "dcccde91d98f31dbcf2dec600f3a70eb62f6d7844786121b79205dbb2f3ded78",
+  "3b908123559f505b2b61e25d8c2228d3c3d8bf9a45cad889efbe7b4ebb462b5a",
+  "bc210bb87e91ef2b864bf4184c406709586f4181e776867d1b749a96bea7bf47",
+])
+// Prefiks identyfikatorow wysylki. Cykl 2 uzywal `sm2c2_`; artefakt cyklu 2 jest write-once
+// i zostaje nietkniety, wiec cykl 3 MUSI miec wlasny prefiks — inaczej zapytania rozliczeniowe
+// (`dispatch_id LIKE ...`) zmieszalyby dwa okna w jedno.
+const DISPATCH_PREFIX = "sm2c3"
 const TEMPLATE_KEY = "voucher_purchase_confirmation"
 const ENV = "dev"
 const INSTANCE_ID = "gp-dev"
@@ -35,15 +51,40 @@ function required(name: string): string {
   return value
 }
 
-function authorizedRecipient(): string {
-  const recipient = required("BREVO_LIVE_PROOF_RECIPIENT")
-  const digest = createHash("sha256")
-    .update(recipient.trim().toLowerCase(), "utf8")
-    .digest("hex")
-  if (digest !== AUTHORIZED_RECIPIENT_DIGEST) {
-    throw new Error("recipient_not_authorized_for_story_4_8")
+function authorizedRecipients(): string[] {
+  // `BREVO_LIVE_PROOF_RECIPIENTS` (lista po przecinku) z fallbackiem na jednoadresowe
+  // `BREVO_LIVE_PROOF_RECIPIENT` z cyklu 2 — zeby stara komenda nie przestala dzialac.
+  const raw =
+    process.env.BREVO_LIVE_PROOF_RECIPIENTS?.trim() ||
+    process.env.BREVO_LIVE_PROOF_RECIPIENT?.trim()
+  if (!raw) {
+    throw new Error("missing_required_env:BREVO_LIVE_PROOF_RECIPIENTS")
   }
-  return recipient
+  const seen = new Set<string>()
+  const recipients: string[] = []
+  for (const candidate of raw.split(",")) {
+    const address = candidate.trim()
+    if (!address) {
+      continue
+    }
+    const normalized = address.toLowerCase()
+    const digest = createHash("sha256").update(normalized, "utf8").digest("hex")
+    if (!AUTHORIZED_RECIPIENT_DIGESTS.has(digest)) {
+      // Nie logujemy adresu — komunikat niesie pozycje, nie tresc.
+      throw new Error(`recipient_not_authorized_for_story_4_8:${recipients.length + 1}`)
+    }
+    // Deduplikacja PO NORMALIZACJI: ta sama skrzynka podana dwa razy zawyzalaby
+    // `address_count`, czyli dokladnie ten agregat, ktory prog skladu ma egzekwowac.
+    if (seen.has(normalized)) {
+      throw new Error("duplicate_recipient_in_list")
+    }
+    seen.add(normalized)
+    recipients.push(address)
+  }
+  if (recipients.length === 0) {
+    throw new Error("empty_recipient_list")
+  }
+  return recipients
 }
 
 function safeRunId(): string {
@@ -76,7 +117,7 @@ function errorCode(error: unknown): string {
 }
 
 async function main(): Promise<void> {
-  const recipient = authorizedRecipient()
+  const recipients = authorizedRecipients()
   const runId = safeRunId()
   const apiKey = required("BREVO_API_KEY")
   const senders = JSON.parse(required("BREVO_SENDERS")) as Record<
@@ -99,8 +140,12 @@ async function main(): Promise<void> {
     templates: { [TEMPLATE_KEY]: templateId },
   })
   const databaseClient = new Client({ connectionString: databaseUrl })
-  const recipientHash = hashRecipientEmail(recipient)
-  const tags: string[] = []
+  // Przydzial round-robin: ordinal 1..N po kolei na adresy z listy. Dla N=30 i czterech
+  // adresow daje 8/8/7/7 — najrowniejszy mozliwy rozklad, wiec `max_dispatches_per_address`
+  // jest minimalne, jakie da sie osiagnac przy tej liczbie adresatow.
+  const recipientFor = (ordinal: number): string => recipients[(ordinal - 1) % recipients.length]
+  const recipientHashes = new Map(recipients.map((address) => [address, hashRecipientEmail(address)]))
+  const tagsByRecipient = new Map<string, string[]>(recipients.map((address) => [address, []]))
   const startedAt = new Date()
   let sent = 0
   let resumed = 0
@@ -121,11 +166,13 @@ async function main(): Promise<void> {
 
     for (let ordinal = 1; ordinal <= TARGET_COUNT; ordinal += 1) {
       const suffix = String(ordinal).padStart(2, "0")
-      const dispatchId = `sm2c2_${runId}_${suffix}`
-      const entitlementId = `sm2c2_ent_${runId}_${suffix}`
+      const dispatchId = `${DISPATCH_PREFIX}_${runId}_${suffix}`
+      const entitlementId = `${DISPATCH_PREFIX}_ent_${runId}_${suffix}`
+      const recipient = recipientFor(ordinal)
+      const recipientHash = recipientHashes.get(recipient)!
       const intent = makeIntent(recipient, runId, ordinal)
       const tag = buildDispatchIdentityTag(buildBarrierKey(intent), recipient)
-      tags.push(tag)
+      tagsByRecipient.get(recipient)!.push(tag)
 
       const existing = await databaseClient.query(
         `SELECT status FROM voucher_delivery_dispatch WHERE dispatch_id = $1`,
@@ -188,27 +235,44 @@ async function main(): Promise<void> {
 
     const lookupEnd = new Date()
     const lookupStart = new Date(lookupEnd.getTime() - DISPATCH_RESOLUTION_LOOKBACK_MS)
-    const lookupRecipient = recipient.toLowerCase()
     const deadline = Date.now() + INDEXING_BUDGET_MS
-    let rows = await brevoClient.findTransactionalMessages({
-      email: lookupRecipient,
-      templateId,
-      startDate: lookupStart,
-      endDate: lookupEnd,
-      limit: PAGE_SIZE,
-    })
-    let counts = tags.map((tag) => rows.filter((row) => (row.tags ?? []).includes(tag)).length)
-    while (counts.some((count) => count < 1) && Date.now() < deadline) {
-      await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS))
-      rows = await brevoClient.findTransactionalMessages({
-        email: lookupRecipient,
+    // Brevo filtruje po JEDNYM adresie, wiec odczyt jest per adresat, a wyniki sumujemy.
+    // Zliczanie zostaje ZAKOTWICZONE W ADRESIE: tag szukamy wylacznie wsrod wiadomosci tego
+    // adresata, ktoremu ten tag przypisano. Zliczanie po zlanej liscie ukryloby przypadek,
+    // w ktorym wiadomosc trafila do niewlasciwego adresata — a to jest defekt dostarczalnosci,
+    // czyli dokladnie to, co SM-2 ma mierzyc.
+    const fetchRows = async (address: string, endDate: Date) =>
+      brevoClient.findTransactionalMessages({
+        email: address.toLowerCase(),
         templateId,
         startDate: lookupStart,
-        endDate: new Date(),
+        endDate,
         limit: PAGE_SIZE,
       })
-      counts = tags.map((tag) => rows.filter((row) => (row.tags ?? []).includes(tag)).length)
+
+    let rowsByRecipient = new Map<string, Awaited<ReturnType<typeof fetchRows>>>()
+    for (const address of recipients) {
+      rowsByRecipient.set(address, await fetchRows(address, lookupEnd))
     }
+    const countTags = () =>
+      recipients.flatMap((address) => {
+        const rowsForAddress = rowsByRecipient.get(address) ?? []
+        return (tagsByRecipient.get(address) ?? []).map(
+          (tag) => rowsForAddress.filter((row) => (row.tags ?? []).includes(tag)).length,
+        )
+      })
+    let counts = countTags()
+    while (counts.some((count) => count < 1) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS))
+      const refreshed = new Map<string, Awaited<ReturnType<typeof fetchRows>>>()
+      const now = new Date()
+      for (const address of recipients) {
+        refreshed.set(address, await fetchRows(address, now))
+      }
+      rowsByRecipient = refreshed
+      counts = countTags()
+    }
+    const rows = recipients.flatMap((address) => rowsByRecipient.get(address) ?? [])
 
     const duplicateCount = counts.reduce((total, count) => total + Math.max(count - 1, 0), 0)
     const missingAtProvider = counts.filter((count) => count === 0).length
@@ -221,13 +285,13 @@ async function main(): Promise<void> {
         WHERE dispatch_id LIKE $1
         GROUP BY status
         ORDER BY status`,
-      [`sm2c2_${runId}_%`],
+      [`${DISPATCH_PREFIX}_${runId}_%`],
     )
     const ledgerAttempted = await databaseClient.query(
       `SELECT count(*) FILTER (WHERE provider_attempted_at IS NOT NULL)::int AS count
          FROM voucher_delivery_dispatch
         WHERE dispatch_id LIKE $1`,
-      [`sm2c2_${runId}_%`],
+      [`${DISPATCH_PREFIX}_${runId}_%`],
     )
     const providerEvidenceRef =
       `_bmad-output/releases/v1.15.0/implementation-artifacts/evidence/4-8/` +
@@ -239,7 +303,27 @@ async function main(): Promise<void> {
       provider_evidence_ref: providerEvidenceRef,
       run_id: runId,
       scope: { env: ENV, instance_id: INSTANCE_ID, market_id: MARKET_ID },
-      authorized_sink: { address_count: 1, alias: "sink_01" },
+      // SKLAD PROBY — mierzony, nie zadeklarowany. Cykl 2 mial tu zaszyte
+      // `{ address_count: 1, alias: "sink_01" }`, czyli stala, ktora nie mogla sie nie zgadzac
+      // z rzeczywistoscia, bo jej nie czytala. Ponizsze wartosci pochodza z faktycznego
+      // przydzialu wysylek i sa tym, co prog skladu w `validate_sm2_delivery_window.py`
+      // egzekwuje. Adresy nie ida do artefaktu — tylko ich liczba, rozklad i domeny.
+      authorized_sink: {
+        address_count: recipients.length,
+        dispatches_per_address: Object.fromEntries(
+          recipients.map((address, index) => [
+            `addr_${String(index + 1).padStart(2, "0")}`,
+            (tagsByRecipient.get(address) ?? []).length,
+          ]),
+        ),
+        max_dispatches_per_address: Math.max(
+          ...recipients.map((address) => (tagsByRecipient.get(address) ?? []).length),
+        ),
+        domain_count: new Set(
+          recipients.map((address) => address.toLowerCase().split("@")[1] ?? ""),
+        ).size,
+        allocation: "round-robin",
+      },
       requested_dispatches: TARGET_COUNT,
       current_process_new_sends: sent,
       resumed_existing_sent_rows: resumed,
