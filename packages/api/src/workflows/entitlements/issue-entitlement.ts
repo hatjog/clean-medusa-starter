@@ -20,6 +20,8 @@ import {
   invalidateVoucherCode,
   type VoucherCodeInvalidationOutcome,
 } from "../../modules/voucher/voucher-code-state"
+import type { TransitionEventEnvelope } from "../../modules/voucher/entitlement-transition-wiring"
+import { createRedeemPartialOperationFromTransaction } from "../../modules/voucher/workflows/redeem-partial-entitlement"
 // v1.15.0 Story 5.9 review-fix cyklu 2 (C2-HIGH-1): most kod → uprawnienie
 // POWSTAJE przy wystawieniu, także na ścieżce `payment.captured`. Nośnik kodu
 // i wiersza `voucher` jest WSPÓLNY z Path Y — dwa wyrażenia budujące ten sam
@@ -911,6 +913,8 @@ export async function compensateIssuedEntitlement(
 export type RefundEntitlementRevocationResult = {
   revoked_entitlement_ids: string[]
   already_terminal_entitlement_ids: string[]
+  reversal_redemption_ids: string[]
+  transition_events: TransitionEventEnvelope[]
   /**
    * v1.15.0 Story 5.9 review-fix cyklu 2 (C2-HIGH-1): wiersze zwrócone, dla
    * których producenta stanu kodu NIE wołano, bo typ uprawnienia nie jest
@@ -966,6 +970,18 @@ export async function revokeEntitlementsOnRefund(
     entitlement_id: string
     outcome: VoucherCodeInvalidationOutcome
   }[] = []
+  const reversalRedemptionIds: string[] = []
+  const transitionEvents: TransitionEventEnvelope[] = []
+  const reversalOperation = createRedeemPartialOperationFromTransaction(
+    client as Parameters<typeof createRedeemPartialOperationFromTransaction>[0],
+    {
+      events: {
+        async emit(event) {
+          transitionEvents.push(event)
+        },
+      },
+    }
+  )
 
   for (const row of rows.rows) {
     const currentState = row.state as EntitlementInstanceState
@@ -976,6 +992,54 @@ export async function revokeEntitlementsOnRefund(
       currentState === EntitlementInstanceState.CLOSED
     ) {
       alreadyTerminal.push(row.id)
+      continue
+    }
+
+    const redemptionRows = await client.query<{
+      redemption_id: string
+      already_reversed: boolean
+    }>(
+      `SELECT redemption.redemption_id,
+              EXISTS (
+                SELECT 1
+                  FROM voucher_redemption reversal
+                 WHERE reversal.reverses_redemption_id = redemption.redemption_id
+                   AND reversal.kind = 'REVERSAL'
+              ) AS already_reversed
+         FROM voucher_redemption redemption
+        WHERE redemption.entitlement_id = $1
+          AND redemption.kind = 'REDEMPTION'
+        ORDER BY redemption.created_at, redemption.redemption_id
+        FOR UPDATE OF redemption`,
+      [row.id]
+    )
+
+    if (redemptionRows.rows.length > 0) {
+      const outstandingRedemptions = redemptionRows.rows.filter(
+        (redemption) => !redemption.already_reversed
+      )
+      if (outstandingRedemptions.length === 0) {
+        throw new Error(
+          `revokeEntitlementsOnRefund: entitlement ${row.id} has only reversed ` +
+            `redemptions but remains in non-terminal state ${currentState}`
+        )
+      }
+      for (const redemption of outstandingRedemptions) {
+        const reversed = await reversalOperation.reverse({
+          reverses_redemption_id: redemption.redemption_id,
+          actor: "system",
+          actor_hint: "workflow:stripe-payment-audit:payment-refunded",
+          now: refundedAt,
+        })
+        reversalRedemptionIds.push(reversed.redemption_id)
+        if (reversed.code_invalidation_outcome) {
+          codeInvalidationOutcomes.push({
+            entitlement_id: row.id,
+            outcome: reversed.code_invalidation_outcome,
+          })
+        }
+      }
+      revoked.push(row.id)
       continue
     }
 
@@ -1148,6 +1212,8 @@ export async function revokeEntitlementsOnRefund(
   return {
     revoked_entitlement_ids: revoked,
     already_terminal_entitlement_ids: alreadyTerminal,
+    reversal_redemption_ids: reversalRedemptionIds,
+    transition_events: transitionEvents,
     code_invalidation_skipped_entitlement_ids: codeInvalidationSkipped,
     code_invalidation_outcomes: codeInvalidationOutcomes,
   }

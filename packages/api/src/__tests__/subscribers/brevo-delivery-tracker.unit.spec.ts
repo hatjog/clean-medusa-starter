@@ -11,6 +11,7 @@ type AuditEvent = Record<string, unknown>
 function makeContainer(options: {
   auditEvents?: AuditEvent[]
   dispatch?: Record<string, unknown> | null
+  brakeState?: "engaged" | "released"
 } = {}) {
   const auditEvents = options.auditEvents ?? []
   const logger = {
@@ -26,20 +27,33 @@ function makeContainer(options: {
       auditEvents.push(auditEvent)
     }),
   }
+  const db = {
+    raw: jest.fn(async () => ({
+      rows: [
+        {
+          money_path_brakes: {
+            fr_9_delivery_idempotency: options.brakeState ?? "released",
+          },
+        },
+      ],
+    })),
+  }
   const resolve = jest.fn((key: string) => {
     if (key === "logger") return logger
     if (key === "notification_dispatches") return dispatches
     if (key === "notification_delivery_audit_sink") return sink
+    if (key === "__pg_connection__") return db
     throw new Error(`Unknown container key: ${key}`)
   })
 
   return {
     auditEvents,
+    db,
     dispatches,
     logger,
     resolve,
     sink,
-    container: { resolve },
+    container: { resolve, __brakeDb: db },
   }
 }
 
@@ -48,12 +62,46 @@ async function handleDelivery(
   container: unknown,
   eventName = "notification.delivered",
 ) {
+  const supplied = container as {
+    resolve?: (key: string) => unknown
+    __brakeDb?: { raw: (...args: unknown[]) => Promise<unknown> }
+  }
+  const originalResolve = supplied.resolve
+  const releasedDb = supplied.__brakeDb ?? {
+    async raw() {
+      return {
+        rows: [
+          {
+            money_path_brakes: { fr_9_delivery_idempotency: "released" },
+          },
+        ],
+      }
+    },
+  }
+  const runtimeContainer = {
+    ...supplied,
+    resolve(key: string) {
+      if (key === "__pg_connection__") {
+        if (supplied.__brakeDb) return supplied.__brakeDb
+        if (originalResolve) {
+          try {
+            return originalResolve(key)
+          } catch {
+            return releasedDb
+          }
+        }
+        return releasedDb
+      }
+      if (originalResolve) return originalResolve(key)
+      throw new Error(`Unknown container key: ${key}`)
+    },
+  }
   await brevoDeliveryTracker({
     event: {
       name: eventName,
       data,
     },
-    container,
+    container: runtimeContainer,
   } as never)
 }
 
@@ -116,6 +164,27 @@ describe("brevoDeliveryTracker", () => {
       flow_id: "voucher_delivery",
       market_id: "pl",
     })
+  })
+
+  it("zaciagniety hamulec zachowuje zastana sciezke bez zapisu audytu", async () => {
+    const ctx = makeContainer({ brakeState: "engaged" })
+
+    await handleDelivery(
+      {
+        provider_id: "brevo",
+        provider_event_id: "brevo-braked-1",
+        dispatch_id: "dispatch-braked-1",
+        event_type: "delivered",
+        market_id: "pl",
+      },
+      ctx.container,
+    )
+
+    expect(ctx.db.raw).toHaveBeenCalled()
+    expect(ctx.auditEvents).toHaveLength(0)
+    expect(ctx.logger.info).toHaveBeenCalledWith(
+      expect.stringContaining("brake=fr_9_delivery_idempotency"),
+    )
   })
 
   it("hard_bounce mapuje outcome failed i HARD_BOUNCE", async () => {
@@ -547,7 +616,18 @@ describe("brevoDeliveryTracker", () => {
       if (key === "logger") return logger
       if (key === "__pg_connection__") {
         return {
-          raw: jest.fn(async () => {
+          raw: jest.fn(async (sql: string) => {
+            if (sql.includes("market_runtime_config")) {
+              return {
+                rows: [
+                  {
+                    money_path_brakes: {
+                      fr_9_delivery_idempotency: "released",
+                    },
+                  },
+                ],
+              }
+            }
             const err = new Error("connection refused") as Error & { code?: string }
             err.code = "ECONNREFUSED"
             throw err
@@ -597,7 +677,18 @@ describe("brevoDeliveryTracker", () => {
       if (key === "logger") return logger
       if (key === "__pg_connection__") {
         return {
-          raw: jest.fn(async () => {
+          raw: jest.fn(async (sql: string) => {
+            if (sql.includes("market_runtime_config")) {
+              return {
+                rows: [
+                  {
+                    money_path_brakes: {
+                      fr_9_delivery_idempotency: "released",
+                    },
+                  },
+                ],
+              }
+            }
             const err = new Error('relation "notification_dispatches" does not exist') as Error & { code?: string }
             err.code = "42P01"
             throw err
@@ -644,7 +735,18 @@ describe("brevoDeliveryTracker", () => {
       if (key === "logger") return logger
       if (key === "__pg_connection__") {
         return {
-          raw: jest.fn(async () => {
+          raw: jest.fn(async (sql: string) => {
+            if (sql.includes("market_runtime_config")) {
+              return {
+                rows: [
+                  {
+                    money_path_brakes: {
+                      fr_9_delivery_idempotency: "released",
+                    },
+                  },
+                ],
+              }
+            }
             const err = new Error('relation "notification_dispatches" does not exist') as Error & { code?: string }
             err.code = "42P01"
             throw err

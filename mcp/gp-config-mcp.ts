@@ -60,7 +60,7 @@ const CHANNEL_ASSIGNMENT_TABLES = [
 ];
 
 const SCHEMAS = {
-  market: "market-runtime-config.v1.schema.json",
+  market: "market-runtime-config.v2.schema.json",
   products: "products-catalog.v1.schema.json",
   vendorProducts: "vendor-products-catalog.v1.schema.json",
 };
@@ -699,7 +699,7 @@ async function executeExport(client: PoolClient, args: CliArgs, repoRoot: string
   const exportPayload = {
     meta: {
       generated_at: new Date().toISOString(),
-      schema_version: "market-runtime-config.v1",
+      schema_version: "market-runtime-config.v2",
       instance_id: args.instanceId,
       market_id: args.marketId,
     },

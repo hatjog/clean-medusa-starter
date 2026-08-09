@@ -36,6 +36,7 @@ Po globalnym chainie dokładane są middleware specyficzne dla wybranych ścież
 | `/store/orders*` `ALL` | `customerResponseSanitizerMiddleware` | Ten sam cel co wyżej dla odpowiedzi order/customer. |
 | `/store/carts*` `ALL` | `cartMarketGuardMiddleware` -> `customerResponseSanitizerMiddleware` | Domyka read-path cartów po `sales_channel_id` i dalej sanitizuje payload customer-related. |
 | `/store/products` `GET` | `productListMarketScopeMiddleware` -> `vendorMetaMiddleware` | Zawęża listing do rynku **dwiema niezależnymi bramami**: wejściową (`request.query.id` / `filterableFields.id` zawężone do produktów kanału sprzedaży, zanim core Medusy spaginuje) i wyjściową (nadpisany `res.json` odrzuca pozycje o obcym `gp.market_id`). Fail-closed od Story 2.3 (FR-14a, AD-19): kontekst **niepełny** (brak `market_id` albo `sales_channel_id`) to **odmowa `403 { message: "Market scope unresolvable", reason }`** na **obu** bramach — nie „pominięty scoping”. `reason` ∈ `context_missing` / `market_id_missing` / `sales_channel_id_missing`. |
+| `/store/products/:id` `GET` | `productListMarketScopeMiddleware` -> `vendorMetaMiddleware` | Detal używa tej samej odmowy `403` i tej samej kolejności co listing. Scope musi wykonać się przed `vendorMetaMiddleware`, ponieważ przy wyłączonym `multi_vendor_pdp` middleware metadanych kończy się przez `next()` bez instalacji interceptora odpowiedzi. |
 
 ## Webhook security overlays
 

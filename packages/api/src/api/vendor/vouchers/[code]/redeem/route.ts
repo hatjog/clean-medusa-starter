@@ -79,6 +79,7 @@ import {
   type VoucherStatus,
   resolveRedeemRefusalReason,
 } from "../../../../../modules/voucher"
+import { REDEEM_REFUSALS } from "../../../../../modules/voucher/models/types"
 import { VOUCHER_NOT_FOUND_BODY } from "../lookup/route"
 import {
   buildAuditLogIdFromIdempotencyKey,
@@ -542,40 +543,20 @@ class VoucherRefusedDuringRedeemError extends Error {
     super(`voucher '${code}': ${REFUSAL_MESSAGES[reason]}`)
     this.name = "VoucherRefusedDuringRedeemError"
     this.reason = reason
-    this.error_code = REFUSAL_CODES[reason]
-    this.http_status = REFUSAL_STATUSES[reason]
+    this.error_code = REDEEM_REFUSALS[reason].api_code
+    this.http_status = REDEEM_REFUSALS[reason].http_status
   }
 }
 
 /**
- * Powód → kod maszynowy / status / opis diagnostyczny.
+ * Opis diagnostyczny per powód. Kod maszynowy i status HTTP pochodzą z
+ * `REDEEM_REFUSALS`, jednego nośnika parity z kontraktem ADR-209.
  *
  * `expired` zostaje przy `410 Gone` (zachowanie zastane, semantycznie trafne).
  * `already_redeemed` i `withdrawn` to `409 Conflict`: żądanie jest poprawne,
  * ale stan zasobu je wyklucza. `422` byłoby tu gorsze — sugerowałoby błąd
  * w treści żądania, którego nie ma.
  */
-const REFUSAL_CODES: Record<RedeemRefusalReason, string> = {
-  already_redeemed: "VOUCHER_ALREADY_REDEEMED",
-  withdrawn: "VOUCHER_WITHDRAWN",
-  expired: "VOUCHER_EXPIRED",
-  not_redeemable: "VOUCHER_NOT_REDEEMABLE",
-  // v1.15.0 Story 5.9 (FR-12/SM-7): powód ROZŁĄCZNY z „zrealizowany"
-  // i „wygasły" — pieniądze wróciły do klientki.
-  refunded: "VOUCHER_REFUNDED",
-}
-
-const REFUSAL_STATUSES: Record<RedeemRefusalReason, number> = {
-  already_redeemed: 409,
-  withdrawn: 409,
-  expired: 410,
-  not_redeemable: 409,
-  // 409 Conflict, tak jak `already_redeemed`/`withdrawn`: żądanie jest
-  // poprawne, wyklucza je STAN zasobu. 410 byłoby kłamstwem (kod nie zniknął),
-  // 422 sugerowałoby błąd w treści żądania, którego nie ma.
-  refunded: 409,
-}
-
 const REFUSAL_MESSAGES: Record<RedeemRefusalReason, string> = {
   already_redeemed: "ten voucher został już zrealizowany",
   withdrawn: "ten voucher został wycofany i nie może zostać zrealizowany",
