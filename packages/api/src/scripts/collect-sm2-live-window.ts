@@ -222,6 +222,12 @@ async function main(): Promise<void> {
         ORDER BY status`,
       [`sm2c2_${runId}_%`],
     )
+    const ledgerAttempted = await pool.query(
+      `SELECT count(*) FILTER (WHERE provider_attempted_at IS NOT NULL)::int AS count
+         FROM voucher_delivery_dispatch
+        WHERE dispatch_id LIKE $1`,
+      [`sm2c2_${runId}_%`],
+    )
     const providerEvidenceRef =
       `_bmad-output/releases/v1.15.0/implementation-artifacts/evidence/4-8/` +
       `brevo-counter-${runId}.json`
@@ -234,8 +240,9 @@ async function main(): Promise<void> {
       scope: { env: ENV, instance_id: INSTANCE_ID, market_id: MARKET_ID },
       authorized_sink: { address_count: 1, alias: "sink_01" },
       requested_dispatches: TARGET_COUNT,
-      sent_in_this_process: sent,
-      resumed_sent_rows: resumed,
+      current_process_new_sends: sent,
+      resumed_existing_sent_rows: resumed,
+      ledger_provider_attempted_rows: ledgerAttempted.rows[0]?.count ?? 0,
       ledger_status_distribution: Object.fromEntries(
         ledger.rows.map((row: { status: string; count: number }) => [row.status, row.count]),
       ),
