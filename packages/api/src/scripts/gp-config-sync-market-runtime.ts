@@ -53,6 +53,18 @@ import path from "node:path"
 
 import * as yaml from "js-yaml"
 
+import {
+  MONEY_PATH_BRAKE_SAFE_STATE,
+  MONEY_PATH_BRAKE_STATES,
+  MONEY_PATH_BRAKE_SWITCHES,
+} from "../lib/money-path-brakes"
+
+export {
+  MONEY_PATH_BRAKE_SAFE_STATE,
+  MONEY_PATH_BRAKE_STATES,
+  MONEY_PATH_BRAKE_SWITCHES,
+} from "../lib/money-path-brakes"
+
 export type MarketRuntimeSyncArgs = {
   instanceId: string
   marketId: string
@@ -218,19 +230,6 @@ export function normalizeLocalesBlock(raw: unknown): Record<string, unknown> {
  * probowal zwolnic hamulec i mu sie nie udalo, a on sam bylby przekonany, ze
  * sie udalo. Dlatego niepoprawna wartosc zatrzymuje sync PRZED zapisem.
  */
-export const MONEY_PATH_BRAKE_SWITCHES = [
-  "fr_6_7_multi_seller_purchase_return",
-  "fr_9_delivery_idempotency",
-  "fr_10_panel_redemption",
-  "fr_12_redemption_ledger",
-  "fr_14_market_isolation",
-] as const
-
-export const MONEY_PATH_BRAKE_STATES = ["engaged", "released"] as const
-
-/** Wartosc bezpieczna z ADR-177 — fail-closed dla sciezki pieniadza. */
-export const MONEY_PATH_BRAKE_SAFE_STATE = "engaged"
-
 export function normalizeMoneyPathBrakes(raw: unknown): Record<string, string> {
   const declared =
     raw && typeof raw === "object" && !Array.isArray(raw)

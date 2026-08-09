@@ -21,6 +21,7 @@ import {
   UNRECOGNIZED_DELIVERY_EVENT_METRIC,
   type DeliveryEventReaction,
 } from "../lib/delivery-event-classification"
+import { createMoneyPathBrakeReader } from "../lib/money-path-brakes"
 import { runInSystemMarketContext } from "../lib/system-market-context"
 
 /**
@@ -246,6 +247,26 @@ export default async function brevoDeliveryTracker({
     // wykonanie musi niesc jawny kontekst rynku. Jego BRAK jest ODMOWA
     // (`SystemMarketContextError`), a nie zapisem dla wszystkich rynkow.
     const marketId = resolveMarketIdForContext(normalized, lookup, logger)
+    const db = resolvePgConnection(runtimeContainer)
+    const brakeReader = createMoneyPathBrakeReader(
+      db ?? {
+        async raw() {
+          throw new Error("PG_CONNECTION unavailable")
+        },
+      },
+      logger,
+    )
+    const deliveryPathReleased = await brakeReader.isReleased(
+      marketId ?? "",
+      "fr_9_delivery_idempotency",
+    )
+    if (!deliveryPathReleased) {
+      seenProviderEventIds.delete(normalized.provider_event_id)
+      logger.info?.(
+        `[brevo-delivery-tracker] money path brake engaged market_id=${marketId ?? "missing"} brake=fr_9_delivery_idempotency`,
+      )
+      return
+    }
 
     await runInSystemMarketContext(
       {

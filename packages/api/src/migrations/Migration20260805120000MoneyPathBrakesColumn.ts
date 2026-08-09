@@ -18,7 +18,7 @@ import { Migration } from "@medusajs/framework/mikro-orm/migrations"
  *     -> GP/config/** (RUNTIME, byte-verbatim)
  *     -> gp-config-sync-market-runtime --apply
  *     -> market_runtime_config.money_path_brakes
- *     -> readMoneyPathBrake() (lib/money-path-brakes.ts)
+ *     -> createMoneyPathBrakeReader() (lib/money-path-brakes.ts)
  *
  * Rejestr numeracji: znacznik `20260805120000` pochodzi z
  * `specs/releases/v1.15.0/migration-registry.yaml` (story 2.1), nie z

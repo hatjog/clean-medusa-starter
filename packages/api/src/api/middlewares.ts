@@ -783,7 +783,8 @@ function denyMarketScope(
  * i ta story go zamyka.
  *
  * NIE mylic ze scenariuszem "brak kontekstu rynku" — ten rozstrzyga
- * `failWithMarketContext()` (401, mandat Story 4.4 AC3/F7) i story 2.3.
+ * `denyMarketScope()` (403, Story 2.3). 401 dotyczy wyłącznie brakującego
+ * albo nieważnego klucza publishable.
  * Brak kontekstu != kontekst obcego rynku.
  */
 export const CROSS_MARKET_PRODUCT_STATUS = 403;
