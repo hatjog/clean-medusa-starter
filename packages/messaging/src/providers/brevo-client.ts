@@ -60,9 +60,23 @@ export interface BrevoTransactionalMessage {
 export interface BrevoTransactionalMessageQuery {
   email: string;
   templateId?: number;
-  /** Dolny brzeg okna ważności — patrz `DISPATCH_RESOLUTION_LOOKBACK_MS`. */
-  startDate: Date;
-  endDate: Date;
+  /**
+   * Dolny brzeg okna ważności — patrz `DISPATCH_RESOLUTION_LOOKBACK_MS`.
+   *
+   * Para dat jest OPCJONALNA i musi być podana w całości albo wcale (Brevo odrzuca
+   * `startDate` bez `endDate` komunikatem `End date is mandatory with start date`).
+   *
+   * Kiedy WOLNO pominąć okno — i dlaczego czasem TRZEBA (zmierzone 2026-08-10):
+   * Brevo waliduje `endDate` względem daty **UTC** (`Start/End date should not be greater
+   * than current date`), ale daty wiadomości zwraca w strefie **konta**. Dla konta na
+   * `+02:00` wiadomość wysłana o 22:22 UTC ma datę konta o dobę późniejszą, a takiego
+   * `endDate` API nie przyjmie. Powstaje codzienne, dwugodzinne okno, w którym świeża
+   * wiadomość jest NIEOSIĄGALNA żadnym zapytaniem z filtrem dat. Pominięcie pary dat jest
+   * jedynym sposobem, żeby ją zobaczyć; filtr `email` + `templateId` pozostaje wymagany
+   * przez API, a dopasowanie po tagu jest i tak dokładne.
+   */
+  startDate?: Date;
+  endDate?: Date;
   /**
    * Rozmiar STRONY, nie sufit wyniku (R-4.5-M2). Implementacja stronicuje do
    * wyczerpania okna; jedna strona nie jest dowodem nieobecności wiadomości.

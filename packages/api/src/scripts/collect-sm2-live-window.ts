@@ -40,7 +40,13 @@ const INSTANCE_ID = "gp-dev"
 const MARKET_ID = "bonbeauty"
 const TARGET_COUNT = 30
 const PAGE_SIZE = 100
-const INDEXING_BUDGET_MS = 90_000
+// Budzet czekania na zaindeksowanie u dostawcy. Cykl 2 mial 90 s przy JEDNYM adresacie
+// i jednym wywolaniu na runde. Przy odczycie per adresat jedna runda to N wywolan plus
+// odstepy, a backoff na 429 potrafi zjesc 30 s na sam jeden adres — staly budzet wygasalby
+// zanim zdazylby cokolwiek zmierzyc i zglaszalby to jako BRAK wiadomosci u dostawcy,
+// czyli awarie pomiaru w przebraniu wyniku. Budzet skaluje sie z liczba adresatow.
+const INDEXING_BUDGET_BASE_MS = 90_000
+const INDEXING_BUDGET_PER_RECIPIENT_MS = 45_000
 const POLL_INTERVAL_MS = 6_000
 
 function required(name: string): string {
@@ -235,25 +241,64 @@ async function main(): Promise<void> {
 
     const lookupEnd = new Date()
     const lookupStart = new Date(lookupEnd.getTime() - DISPATCH_RESOLUTION_LOOKBACK_MS)
-    const deadline = Date.now() + INDEXING_BUDGET_MS
+    const deadline =
+      Date.now() + INDEXING_BUDGET_BASE_MS + INDEXING_BUDGET_PER_RECIPIENT_MS * recipients.length
     // Brevo filtruje po JEDNYM adresie, wiec odczyt jest per adresat, a wyniki sumujemy.
     // Zliczanie zostaje ZAKOTWICZONE W ADRESIE: tag szukamy wylacznie wsrod wiadomosci tego
     // adresata, ktoremu ten tag przypisano. Zliczanie po zlanej liscie ukryloby przypadek,
     // w ktorym wiadomosc trafila do niewlasciwego adresata — a to jest defekt dostarczalnosci,
     // czyli dokladnie to, co SM-2 ma mierzyc.
-    const fetchRows = async (address: string, endDate: Date) =>
-      brevoClient.findTransactionalMessages({
-        email: address.toLowerCase(),
-        templateId,
-        startDate: lookupStart,
-        endDate,
-        limit: PAGE_SIZE,
-      })
+    // BACKOFF NA LIMIT ZAPYTAN (zmierzone 2026-08-10, cykl 3): odczyt per adresat mnozy
+    // liczbe wywolan przez liczbe adresatow, a plan `free` Brevo odpowiada wtedy HTTP 429.
+    // Cykl 2 tego nie zobaczyl, bo mial JEDEN adres i jedno wywolanie na runde. Bez obslugi
+    // 429 wraca do gory jako "Brevo API returned an error response" — komunikat
+    // nieodrozninalny od awarii merytorycznej, choc wysylki juz sie odbyly i sa w ledgerze.
+    const LOOKUP_SPACING_MS = 1_500
+    const LOOKUP_MAX_ATTEMPTS = 5
+    const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
-    let rowsByRecipient = new Map<string, Awaited<ReturnType<typeof fetchRows>>>()
-    for (const address of recipients) {
-      rowsByRecipient.set(address, await fetchRows(address, lookupEnd))
+    const fetchRows = async (address: string, endDate: Date) => {
+      let lastError: unknown
+      for (let attempt = 1; attempt <= LOOKUP_MAX_ATTEMPTS; attempt += 1) {
+        try {
+          // BEZ OKNA DAT — swiadomie. Wysylki cyklu 3 poszly o 22:22 UTC, czyli 00:22
+          // czasu konta juz nastepnej doby. Brevo waliduje `endDate` po UTC (odrzuca
+          // date jutrzejsza), a filtruje po dacie konta — wiec te wiadomosci nie sa
+          // osiagalne ZADNYM zapytaniem z filtrem dat. Zmierzone: z oknem 0 z 30 tagow,
+          // bez okna wszystkie 8 wysylek na adres widoczne z tagami.
+          // Poprawnosc nie na tym stala: tag jest unikalny per wysylka, wiec okno bylo
+          // zaweznikiem zakresu, nie warunkiem dopasowania.
+          return await brevoClient.findTransactionalMessages({
+            email: address.toLowerCase(),
+            templateId,
+            limit: PAGE_SIZE,
+          })
+        } catch (error) {
+          lastError = error
+          if (attempt === LOOKUP_MAX_ATTEMPTS) {
+            break
+          }
+          // Rosnaco 2s/4s/8s/16s. Limit u dostawcy jest okienkowy, wiec czekanie jest
+          // jedyna skuteczna reakcja — ponowienie natychmiastowe tylko go przedluza.
+          await sleep(2_000 * 2 ** (attempt - 1))
+        }
+      }
+      throw lastError
     }
+
+    // Odstep miedzy adresatami w JEDNEJ rundzie — tanszy niz wpadniecie w 429 i backoff.
+    const fetchAllRecipients = async (endDate: Date) => {
+      const collected = new Map<string, Awaited<ReturnType<typeof fetchRows>>>()
+      for (const [index, address] of recipients.entries()) {
+        if (index > 0) {
+          await sleep(LOOKUP_SPACING_MS)
+        }
+        collected.set(address, await fetchRows(address, endDate))
+      }
+      return collected
+    }
+
+    let rowsByRecipient = await fetchAllRecipients(lookupEnd)
     const countTags = () =>
       recipients.flatMap((address) => {
         const rowsForAddress = rowsByRecipient.get(address) ?? []
@@ -263,13 +308,8 @@ async function main(): Promise<void> {
       })
     let counts = countTags()
     while (counts.some((count) => count < 1) && Date.now() < deadline) {
-      await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS))
-      const refreshed = new Map<string, Awaited<ReturnType<typeof fetchRows>>>()
-      const now = new Date()
-      for (const address of recipients) {
-        refreshed.set(address, await fetchRows(address, now))
-      }
-      rowsByRecipient = refreshed
+      await sleep(POLL_INTERVAL_MS)
+      rowsByRecipient = await fetchAllRecipients(new Date())
       counts = countTags()
     }
     const rows = recipients.flatMap((address) => rowsByRecipient.get(address) ?? [])
@@ -332,9 +372,15 @@ async function main(): Promise<void> {
         ledger.rows.map((row: { status: string; count: number }) => [row.status, row.count]),
       ),
       provider_lookup: {
-        lookback_days: 8,
-        start_date: lookupStart.toISOString().slice(0, 10),
-        end_date: lookupEnd.toISOString().slice(0, 10),
+        // Okno dat NIE zostalo uzyte — i artefakt musi o tym mowic wprost, bo poprzednia
+        // wersja zapisywala tu `lookback_days: 8` wraz z datami, czyli deklaracje zakresu,
+        // ktorego zapytanie nie mialo. Zapis rozminiety z wykonaniem jest gorszy niz brak
+        // zapisu: czyta sie go jako dowod.
+        date_window: "not_applied",
+        date_window_reason:
+          "Brevo waliduje endDate wzgledem daty UTC, a filtruje po dacie konta (+02:00); " +
+          "wysylki z okna 22:00-00:00 UTC sa nieosiagalne kazdym zapytaniem z filtrem dat. " +
+          "Dopasowanie idzie po unikalnym tagu per wysylka, wiec okno nie bylo warunkiem poprawnosci.",
         limit: PAGE_SIZE,
         offset: 0,
         rows_returned: rows.length,

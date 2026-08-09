@@ -136,11 +136,17 @@ export class BrevoHttpClient implements IBrevoClient {
     for (let offset = 0; ; offset += pageSize) {
       const params = new URLSearchParams({
         email: query.email,
-        startDate: toBrevoDate(query.startDate),
-        endDate: toBrevoDate(query.endDate),
         limit: String(pageSize),
         offset: String(offset),
       });
+      // Para dat jest opcjonalna i idzie w CALOSCI albo wcale — Brevo odrzuca `startDate`
+      // bez `endDate`. Powod, dla ktorego wolno ja pominac, opisuje
+      // `BrevoTransactionalMessageQuery` (niespojnosc strefy: walidacja `endDate` po UTC,
+      // daty wiadomosci po strefie konta).
+      if (query.startDate && query.endDate) {
+        params.set("startDate", toBrevoDate(query.startDate));
+        params.set("endDate", toBrevoDate(query.endDate));
+      }
       if (typeof query.templateId === "number") {
         params.set("templateId", String(query.templateId));
       }
