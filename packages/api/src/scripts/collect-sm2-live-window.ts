@@ -14,7 +14,7 @@ import {
 
 import { hashRecipientEmail } from "../modules/voucher-delivery/recipient-hash"
 
-const { Pool } = require("pg") as typeof import("pg")
+const { Client } = require("pg") as typeof import("pg")
 
 const AUTHORIZED_RECIPIENT_DIGEST =
   "a70e5795905f1bd5f0939d9b1066ccc0ab98d986cf3561b4abef179a2497b790"
@@ -93,12 +93,12 @@ async function main(): Promise<void> {
     throw new Error("missing_sender_for_market")
   }
 
-  const client = new BrevoHttpClient({ apiKey, timeoutMs: 20_000 })
-  const adapter = new BrevoAdapter(client, {
+  const brevoClient = new BrevoHttpClient({ apiKey, timeoutMs: 20_000 })
+  const adapter = new BrevoAdapter(brevoClient, {
     senders,
     templates: { [TEMPLATE_KEY]: templateId },
   })
-  const pool = new Pool({ connectionString: databaseUrl, max: 2 })
+  const databaseClient = new Client({ connectionString: databaseUrl })
   const recipientHash = hashRecipientEmail(recipient)
   const tags: string[] = []
   const startedAt = new Date()
@@ -106,7 +106,8 @@ async function main(): Promise<void> {
   let resumed = 0
 
   try {
-    const schema = await pool.query(
+    await databaseClient.connect()
+    const schema = await databaseClient.query(
       `SELECT column_name, is_nullable
          FROM information_schema.columns
         WHERE table_schema = 'public'
@@ -126,7 +127,7 @@ async function main(): Promise<void> {
       const tag = buildDispatchIdentityTag(buildBarrierKey(intent), recipient)
       tags.push(tag)
 
-      const existing = await pool.query(
+      const existing = await databaseClient.query(
         `SELECT status FROM voucher_delivery_dispatch WHERE dispatch_id = $1`,
         [dispatchId],
       )
@@ -138,7 +139,7 @@ async function main(): Promise<void> {
         throw new Error(`ambiguous_existing_dispatch:${suffix}`)
       }
 
-      await pool.query(
+      await databaseClient.query(
         `INSERT INTO voucher_delivery_dispatch (
            dispatch_id, entitlement_id, template_key, recipient_hash, market_id,
            flow_id, locale, status, attempt_count, queued_at, env, instance_id
@@ -155,7 +156,7 @@ async function main(): Promise<void> {
           INSTANCE_ID,
         ],
       )
-      await pool.query(
+      await databaseClient.query(
         `UPDATE voucher_delivery_dispatch
             SET provider = 'brevo', provider_attempted_at = now(), updated_at = now()
           WHERE dispatch_id = $1`,
@@ -164,7 +165,7 @@ async function main(): Promise<void> {
 
       try {
         const response = await adapter.send(intent)
-        await pool.query(
+        await databaseClient.query(
           `UPDATE voucher_delivery_dispatch
               SET status = 'sent', provider_message_id = $2, sent_at = now(),
                   error_code = NULL, failed_at = NULL, updated_at = now()
@@ -175,7 +176,7 @@ async function main(): Promise<void> {
         console.log(`dispatch=${suffix} status=sent`)
       } catch (error) {
         const code = errorCode(error)
-        await pool.query(
+        await databaseClient.query(
           `UPDATE voucher_delivery_dispatch
               SET status = 'failed', error_code = $2, failed_at = now(), updated_at = now()
             WHERE dispatch_id = $1`,
@@ -189,7 +190,7 @@ async function main(): Promise<void> {
     const lookupStart = new Date(lookupEnd.getTime() - DISPATCH_RESOLUTION_LOOKBACK_MS)
     const lookupRecipient = recipient.toLowerCase()
     const deadline = Date.now() + INDEXING_BUDGET_MS
-    let rows = await client.findTransactionalMessages({
+    let rows = await brevoClient.findTransactionalMessages({
       email: lookupRecipient,
       templateId,
       startDate: lookupStart,
@@ -199,7 +200,7 @@ async function main(): Promise<void> {
     let counts = tags.map((tag) => rows.filter((row) => (row.tags ?? []).includes(tag)).length)
     while (counts.some((count) => count < 1) && Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS))
-      rows = await client.findTransactionalMessages({
+      rows = await brevoClient.findTransactionalMessages({
         email: lookupRecipient,
         templateId,
         startDate: lookupStart,
@@ -214,7 +215,7 @@ async function main(): Promise<void> {
     if (missingAtProvider > 0) {
       throw new Error(`provider_measurement_incomplete:${missingAtProvider}`)
     }
-    const ledger = await pool.query(
+    const ledger = await databaseClient.query(
       `SELECT status, count(*)::int AS count
          FROM voucher_delivery_dispatch
         WHERE dispatch_id LIKE $1
@@ -222,7 +223,7 @@ async function main(): Promise<void> {
         ORDER BY status`,
       [`sm2c2_${runId}_%`],
     )
-    const ledgerAttempted = await pool.query(
+    const ledgerAttempted = await databaseClient.query(
       `SELECT count(*) FILTER (WHERE provider_attempted_at IS NOT NULL)::int AS count
          FROM voucher_delivery_dispatch
         WHERE dispatch_id LIKE $1`,
@@ -285,7 +286,7 @@ async function main(): Promise<void> {
       process.exitCode = 1
     }
   } finally {
-    await pool.end()
+    await databaseClient.end()
   }
 }
 
