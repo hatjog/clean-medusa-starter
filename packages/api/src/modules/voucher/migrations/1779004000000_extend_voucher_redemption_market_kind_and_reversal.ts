@@ -284,9 +284,9 @@ export class Migration1779004000000 extends Migration {
     `)
 
     // ── (6) GRANTY: egzekucja jednego producenta w warstwie bazy (AC4/Z-17) ──
-    // Do dziś rejestr `specs/contracts/redemption/redemption-producers.v1.yaml`
-    // deklarował `db_grant_status: declared_not_enforced`. Deklaracja grantu nie
-    // jest grantem — od tej migracji jedyną rolą z `INSERT` na kanonicznej jest
+    // Ta migracja jest nośnikiem `db_grant_status: enforced` w aktywnym rejestrze
+    // `specs/contracts/redemption/redemption-producers.v2.yaml`. Deklaracja grantu
+    // nie jest grantem — od tej migracji jedyną rolą z `INSERT` na kanonicznej jest
     // rola producenta, a `UPDATE`/`DELETE` nie ma ŻADNA rola ruchu. Append-only
     // z ADR-178 §2.3 przestaje zależeć od dyscypliny autora kodu.
     //

@@ -262,7 +262,306 @@ class RefundFakeClient {
   }
 }
 
+type FakeRedemption = {
+  redemption_id: string
+  entitlement_id: string
+  redemption_kind: "REDEMPTION" | "REVERSAL"
+  reverses_redemption_id: string | null
+  idempotency_key: string
+  amount_minor: number
+  issued_gross_minor: number
+  resulting_state: "REDEEMED_PARTIAL" | "REDEEMED_FULL"
+  remaining_after_minor: number
+  created_at: number
+  market_id: string
+  purchase_market_id: string
+  redemption_market_id: string
+}
+
+/** Fake rozszerzony o ledger realizacji, aby refund testował prawdziwe odwrócenie. */
+class RedemptionRefundFakeClient extends RefundFakeClient {
+  redemptions: FakeRedemption[] = []
+
+  seedRedemption(opts: {
+    redemption_id: string
+    entitlement_id: string
+    gross_amount_minor: number
+    issued_gross_amount_minor?: number
+    commission_amount_minor?: number
+  }) {
+    this.redemptions.push({
+      redemption_id: opts.redemption_id,
+      entitlement_id: opts.entitlement_id,
+      redemption_kind: "REDEMPTION",
+      reverses_redemption_id: null,
+      idempotency_key: `redeem:${opts.redemption_id}`,
+      amount_minor: opts.gross_amount_minor,
+      issued_gross_minor:
+        opts.issued_gross_amount_minor ?? opts.gross_amount_minor,
+      resulting_state: "REDEEMED_FULL",
+      remaining_after_minor: 0,
+      created_at: new Date("2026-08-01T10:00:00.000Z").getTime(),
+      market_id: "bonbeauty",
+      purchase_market_id: "bonbeauty",
+      redemption_market_id: "bonbeauty",
+    })
+  }
+
+  override async query<T = Record<string, unknown>>(
+    sql: string,
+    params: ReadonlyArray<unknown> = []
+  ): Promise<{ rows: T[]; rowCount?: number | null }> {
+    if (
+      sql.includes("FROM voucher_redemption redemption") &&
+      sql.includes("already_reversed")
+    ) {
+      const entitlementId = params[0] as string
+      const rows = this.redemptions
+        .filter(
+          (row) =>
+            row.entitlement_id === entitlementId &&
+            row.redemption_kind === "REDEMPTION"
+        )
+        .map((row) => ({
+          redemption_id: row.redemption_id,
+          already_reversed: this.redemptions.some(
+            (candidate) =>
+              candidate.redemption_kind === "REVERSAL" &&
+              candidate.reverses_redemption_id === row.redemption_id
+          ),
+        }))
+      return { rows: rows as T[], rowCount: rows.length }
+    }
+
+    if (
+      sql.includes("FROM voucher_redemption") &&
+      sql.includes("redemption_id = $1")
+    ) {
+      const row = this.redemptions.find(
+        (candidate) => candidate.redemption_id === params[0]
+      )
+      return { rows: row ? ([row] as T[]) : ([] as T[]), rowCount: row ? 1 : 0 }
+    }
+
+    if (
+      sql.includes("FROM voucher_redemption") &&
+      sql.includes("entitlement_id = $1") &&
+      sql.includes("idempotency_key = $2")
+    ) {
+      const row = this.redemptions.find(
+        (candidate) =>
+          candidate.entitlement_id === params[0] &&
+          candidate.idempotency_key === params[1] &&
+          candidate.redemption_kind === params[2]
+      )
+      return { rows: row ? ([row] as T[]) : ([] as T[]), rowCount: row ? 1 : 0 }
+    }
+
+    if (sql.includes("AS commission_base_minor")) {
+      const entitlementId = params[0] as string
+      const commissionBase = this.redemptions
+        .filter((row) => row.entitlement_id === entitlementId)
+        .reduce(
+          (sum, row) =>
+            sum +
+            (row.redemption_kind === "REDEMPTION"
+              ? row.amount_minor
+              : -row.amount_minor),
+          0
+        )
+      return {
+        rows: [{ commission_base_minor: commissionBase }] as unknown as T[],
+        rowCount: 1,
+      }
+    }
+
+    if (sql.includes("AS redeemed_minor")) {
+      const entitlementId = params[0] as string
+      const matching = this.redemptions.filter(
+        (row) => row.entitlement_id === entitlementId
+      )
+      return {
+        rows: [
+          {
+            redeemed_minor: matching.reduce(
+              (sum, row) =>
+                sum +
+                (row.redemption_kind === "REDEMPTION" ? row.amount_minor : 0),
+              0
+            ),
+            reversed_minor: matching.reduce(
+              (sum, row) =>
+                sum +
+                (row.redemption_kind === "REVERSAL" ? row.amount_minor : 0),
+              0
+            ),
+          },
+        ] as unknown as T[],
+        rowCount: 1,
+      }
+    }
+
+    if (
+      sql.includes("FROM entitlement_instance") &&
+      sql.includes("remaining_amount")
+    ) {
+      const row = this.entitlementRows.get(params[0] as string)
+      return {
+        rows: row
+          ? ([
+              {
+                id: row.id,
+                entitlement_type: "VOUCHER_AMOUNT",
+                state: row.state,
+                remaining_amount: 0,
+                policy_snapshot: {
+                  amount_minor: 19900,
+                  currency_code: "PLN",
+                  voucher_code: `GP-TEST-${row.id}`,
+                },
+                voucher_qualification: "MPV",
+                market_id: "bonbeauty",
+              },
+            ] as unknown as T[])
+          : ([] as T[]),
+        rowCount: row ? 1 : 0,
+      }
+    }
+
+    if (sql.includes("INSERT INTO voucher_redemption")) {
+      const idempotencyKey = params[1] as string
+      const existing = this.redemptions.find(
+        (row) =>
+          row.entitlement_id === params[0] &&
+          row.idempotency_key === idempotencyKey &&
+          row.redemption_kind === params[8]
+      )
+      if (existing) return { rows: [] as T[], rowCount: 0 }
+
+      this.redemptions.push({
+        redemption_id: params[2] as string,
+        entitlement_id: params[0] as string,
+        redemption_kind: params[8] as "REDEMPTION" | "REVERSAL",
+        reverses_redemption_id: params[9] as string | null,
+        idempotency_key: idempotencyKey,
+        amount_minor: params[3] as number,
+        issued_gross_minor: params[6] as number,
+        resulting_state: params[4] as "REDEEMED_PARTIAL" | "REDEEMED_FULL",
+        remaining_after_minor: params[5] as number,
+        created_at: params[7] as number,
+        market_id: params[10] as string,
+        purchase_market_id: params[11] as string,
+        redemption_market_id: params[12] as string,
+      })
+      return { rows: [] as T[], rowCount: 1 }
+    }
+
+    if (
+      sql.includes("UPDATE entitlement_instance") &&
+      sql.includes("WHERE id = $1 AND state = $2")
+    ) {
+      const row = this.entitlementRows.get(params[0] as string)
+      if (!row || row.state !== params[1]) {
+        return { rows: [] as T[], rowCount: 0 }
+      }
+      row.state = params[2] as string
+      return { rows: [] as T[], rowCount: 1 }
+    }
+
+    return super.query<T>(sql, params)
+  }
+}
+
 describe("v1.9.0 wf5 H-3 / F-CC1-002 — refund path → entitlement REFUNDED", () => {
+  it("payment.refunded odwraca kanoniczną realizację i zeruje podstawę prowizji", async () => {
+    const client = new RedemptionRefundFakeClient()
+    client.seedEntitlement({
+      id: "ent_redeemed",
+      order_id: "ord_refund_1",
+      state: "REDEEMED_FULL",
+    })
+    client.seedRedemption({
+      redemption_id: "red_original",
+      entitlement_id: "ent_redeemed",
+      gross_amount_minor: 19900,
+      commission_amount_minor: 2500,
+    })
+    const eventBus = { emit: jest.fn().mockResolvedValue(undefined) }
+    const workflow = new StripePaymentAuditWorkflow(
+      { connect: async () => client },
+      eventBus
+    )
+
+    const result = await workflow.process("payment.refunded", refundPayload())
+
+    const reversals = client.redemptions.filter(
+      (row) => row.redemption_kind === "REVERSAL"
+    )
+    expect(reversals).toHaveLength(1)
+    expect(reversals[0]?.reverses_redemption_id).toBe("red_original")
+    expect(
+      client.redemptions.reduce(
+        (sum, row) =>
+          sum +
+          (row.redemption_kind === "REDEMPTION"
+            ? row.amount_minor
+            : -row.amount_minor),
+        0
+      )
+    ).toBe(0)
+    expect(result.refundRevocation?.reversal_redemption_ids).toEqual([
+      reversals[0]?.redemption_id,
+    ])
+    expect(client.entitlementRows.get("ent_redeemed")?.state).toBe("REFUNDED")
+    expect(client.voucherStatus).toBe("refunded")
+    expect(eventBus.emit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        name: "gp.entitlements.entitlement_state_changed.v1",
+        data: expect.objectContaining({
+          payload: expect.objectContaining({ entitlement_id: "ent_redeemed" }),
+        }),
+      })
+    )
+  })
+
+  it("odwraca wszystkie raty raz i zachowuje idempotencję replayu webhooka", async () => {
+    const client = new RedemptionRefundFakeClient()
+    client.seedEntitlement({
+      id: "ent_installments",
+      order_id: "ord_refund_1",
+      state: "REDEEMED_FULL",
+    })
+    client.seedRedemption({
+      redemption_id: "red_installment_1",
+      entitlement_id: "ent_installments",
+      gross_amount_minor: 7000,
+      issued_gross_amount_minor: 19900,
+    })
+    client.seedRedemption({
+      redemption_id: "red_installment_2",
+      entitlement_id: "ent_installments",
+      gross_amount_minor: 12900,
+      issued_gross_amount_minor: 19900,
+    })
+    const eventBus = { emit: jest.fn().mockResolvedValue(undefined) }
+    const workflow = new StripePaymentAuditWorkflow(
+      { connect: async () => client },
+      eventBus
+    )
+
+    const first = await workflow.process("payment.refunded", refundPayload())
+    const replay = await workflow.process("payment.refunded", refundPayload())
+
+    const reversals = client.redemptions.filter(
+      (row) => row.redemption_kind === "REVERSAL"
+    )
+    expect(reversals).toHaveLength(2)
+    expect(first.refundRevocation?.reversal_redemption_ids).toHaveLength(2)
+    expect(client.entitlementRows.get("ent_installments")?.state).toBe("REFUNDED")
+    expect(replay.deduplicated).toBe(true)
+    expect(replay.refundRevocation).toBeUndefined()
+  })
+
   it("transitions a single ACTIVE entitlement to REFUNDED on payment.refunded", async () => {
     const client = new RefundFakeClient()
     client.seedEntitlement({

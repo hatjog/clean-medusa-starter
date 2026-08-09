@@ -52,7 +52,6 @@ import {
 // v1.15.0 Story 5.9 (FR-12, AD-17): JEDYNY producent `UPDATE voucher SET status`.
 import {
   claimVoucherCode,
-  renderVoucherStatusInClause,
   invalidateVoucherCode,
 } from "./voucher-code-state"
 
@@ -443,45 +442,16 @@ function readGiftContract(value: unknown): {
  * nie dopisze.
  *
  * Ten zbiór jest NOŚNIKIEM allow-listy dla kontraktu
- * `specs/contracts/redemption/voucher-state-vocabulary.v1.yaml`
+ * `specs/contracts/redemption/voucher-state-vocabulary.v3.yaml`
  * (`voucher_status_redemption_input_allowlist`), a parity egzekwuje
  * `_grow/tools/validate_voucher_state_vocabulary.py`. Klauzula `WHERE` jest
- * GENEROWANA z tego zbioru ({@link redemptionInputStatusInClause}), a nie
+ * generowana bezpośrednio z tego zbioru przez producenta stanu kodu, a nie
  * pisana obok niego — dwie kopie tej samej listy rozjeżdżają się cicho.
  */
 export const VOUCHER_REDEMPTION_INPUT_STATES: ReadonlySet<VoucherStatus> = new Set<VoucherStatus>([
   "idle",
   "consent_pending",
 ])
-
-/**
- * `status IN ('idle','consent_pending')` — WYGENEROWANE z allow-listy.
- *
- * Literały są bezpieczne, bo pochodzą z domkniętej unii `VoucherStatus`,
- * a nie z wejścia użytkownika; parametryzacja `= ANY($n)` byłaby możliwa, ale
- * wtedy zbiór nie byłby CZYTELNY w logu zapytań, a bramka statyczna nie miałaby
- * czego porównać z kontraktem.
- *
- * ── GRANICA POMIARU (review-fix cyklu 3, SEC-3) ────────────────────────────
- * Ta funkcja NIE MA dziś wołającego produkcyjnego. Do cyklu 3 miała dwóch
- * (`service.ts:1998` i `:2153`), które przekazywały jej wynik — gotowy SQL —
- * do producenta stanu kodu. Producent przyjmuje teraz ZBIÓR stanów zamiast
- * `string`-a, bo klauzula w parametrze typu `string` była kanałem, przez który
- * dowolny wołający mógł wkleić własny warunek do `UPDATE voucher SET
- * status = 'claimed'` i przestawić kod `refunded` na realizowalny.
- *
- * Zostaje tutaj mimo braku wołającego i jest to decyzja, nie przeoczenie:
- * `redemptionInputStatusInClause()` jest symbolem NAZWANYM w ADR-199 §2.2
- * i w nocie kontraktu `voucher-state-vocabulary.v1.yaml`, a oba należą do
- * SIOSTRZANEJ Story 5.8 — review-fix 5.9 nie przepisuje cudzych decyzji.
- * Żeby brak wołającego nie oznaczał drugiej kopii renderera (czyli dokładnie
- * tego rozjazdu, przed którym ADR-199 §2.2 ostrzega), funkcja DELEGUJE do
- * jedynego renderera w producencie. Usunięcie jej należy do story, która
- * dotknie ADR-199 i kontraktu 5.8.
- */
-export function redemptionInputStatusInClause(column = "status"): string {
-  return renderVoucherStatusInClause(VOUCHER_REDEMPTION_INPUT_STATES, column)
-}
 
 /**
  * POWÓD odmowy dla stanu spoza allow-listy (UX-DR9).

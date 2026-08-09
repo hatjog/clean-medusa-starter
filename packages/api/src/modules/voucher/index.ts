@@ -25,9 +25,8 @@ export {
   EntitlementExtensionError,
   EntitlementRefundError,
   // v1.15.0 Story 5.8 (AD-17): allow-lista stanów wejściowych realizacji
-  // dla warstwy `voucher_status` + jej generator klauzuli `WHERE`.
+  // dla warstwy `voucher_status`.
   VOUCHER_REDEMPTION_INPUT_STATES,
-  redemptionInputStatusInClause,
   resolveRedeemRefusalReason,
 } from "./service"
 export type {

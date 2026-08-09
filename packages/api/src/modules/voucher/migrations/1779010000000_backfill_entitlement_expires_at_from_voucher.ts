@@ -51,7 +51,7 @@ import { Migration } from "@medusajs/framework/mikro-orm/migrations"
  * rejestr — nie zostawia po sobie powierzchni.
  *
  * Rejestr jest artefaktem MIGRACJI, nie powierzchnią zapisu domeny: nie ma
- * producenta w `redemption-producers.v1.yaml`, nie ma trasy, nie ma polityki
+ * producenta w `redemption-producers.v2.yaml`, nie ma trasy, nie ma polityki
  * RLS, i znika razem z `down()`. Trzyma wyłącznie identyfikator uprawnienia
  * i znacznik czasu — bez PII i bez danych finansowych.
  *

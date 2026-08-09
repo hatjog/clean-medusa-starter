@@ -371,6 +371,31 @@ describe("Story 2.6 AC3 — reconciliation inwariant kompletności (ADR-139 D2)"
     expect(report.noop).toBe(1)
   })
 
+  it("DW-15-112: REFUNDED bez REVERSAL, ale z utrwalonym postingiem nie alarmuje", async () => {
+    const log = logger()
+    const deps: ReconciliationDeps = {
+      expected: { scanExpectedEventsWithoutPosting: async () => [] },
+      refunded: {
+        scanRefundedTerminal: async () => [
+          {
+            entitlement_id: "ent_legacy_remediated",
+            market_id: "pl",
+            has_reversal_row: false,
+            has_refund_posting: true,
+          },
+        ],
+      },
+      snapshots: { loadSnapshot: async () => null },
+      writer: { write: jest.fn() as ReconciliationDeps["writer"]["write"] },
+      logger: log,
+      ...ENABLED,
+    }
+    const report = await runVoucherLedgerReconciliation(deps)
+    expect(report.alarms).toEqual([])
+    expect(report.noop).toBe(1)
+    expect(log.error).not.toHaveBeenCalled()
+  })
+
   // ── L1 — market_id NULL ⇒ alarm null_market_id (+ dosyłka via snapshot) ───────
   it("L1: market_id NULL dla oczekiwanego zdarzenia ⇒ alarm null_market_id, dosyłka nadal działa", async () => {
     const { ref, snapshot } = expiredMpvRefAndSnapshot("ent_nullmkt", null)
@@ -461,6 +486,7 @@ function makeFakeScannerPool(opts: {
     market_id: string | null
     /** v1.15.0 Story 5.7: czy uprawnienie ma wiersz `kind='REVERSAL'`. */
     has_reversal_row?: boolean
+    has_refund_posting?: boolean
   }[]
 }): LedgerPgPool {
   const query = (async (sql: string) => {
@@ -477,11 +503,16 @@ function makeFakeScannerPool(opts: {
       // z realnego zapytania — inaczej kontrola mierzyłaby atrapę, nie skaner.
       const selectsReversal =
         s.includes("voucher_redemption") && s.includes("REVERSAL")
+      const selectsRefundPosting =
+        s.includes("ledger_posting_applied") && s.includes("REFUNDED")
       const rows = opts.refunded.map((r) => ({
         id: r.id,
         market_id: r.market_id,
         ...(selectsReversal
           ? { has_reversal_row: r.has_reversal_row === true }
+          : {}),
+        ...(selectsRefundPosting
+          ? { has_refund_posting: r.has_refund_posting === true }
           : {}),
       }))
       return { rows, rowCount: rows.length }
@@ -541,8 +572,8 @@ describe("Story 2.6 AC3 — skaner PG (createPgExpectedEventScanner / createPgRe
     })
     const out = await createPgRefundedScanner(pool).scanRefundedTerminal()
     expect(out).toEqual([
-      { entitlement_id: "ent_r1", market_id: "pl", has_reversal_row: false },
-      { entitlement_id: "ent_r2", market_id: null, has_reversal_row: false },
+      { entitlement_id: "ent_r1", market_id: "pl", has_reversal_row: false, has_refund_posting: false },
+      { entitlement_id: "ent_r2", market_id: null, has_reversal_row: false, has_refund_posting: false },
     ])
   })
 
@@ -559,8 +590,25 @@ describe("Story 2.6 AC3 — skaner PG (createPgExpectedEventScanner / createPgRe
     })
     const out = await createPgRefundedScanner(pool).scanRefundedTerminal()
     expect(out).toEqual([
-      { entitlement_id: "ent_57", market_id: "pl", has_reversal_row: true },
-      { entitlement_id: "ent_legacy", market_id: "pl", has_reversal_row: false },
+      { entitlement_id: "ent_57", market_id: "pl", has_reversal_row: true, has_refund_posting: false },
+      { entitlement_id: "ent_legacy", market_id: "pl", has_reversal_row: false, has_refund_posting: false },
+    ])
+  })
+
+  it("createPgRefundedScanner: mierzy posting REFUNDED dla zastanej remediacji", async () => {
+    const pool = makeFakeScannerPool({
+      projection: [],
+      appliedTxIds: new Set(),
+      refunded: [{ id: "ent_legacy_remediated", market_id: "pl", has_refund_posting: true }],
+    })
+    const out = await createPgRefundedScanner(pool).scanRefundedTerminal()
+    expect(out).toEqual([
+      {
+        entitlement_id: "ent_legacy_remediated",
+        market_id: "pl",
+        has_reversal_row: false,
+        has_refund_posting: true,
+      },
     ])
   })
 })

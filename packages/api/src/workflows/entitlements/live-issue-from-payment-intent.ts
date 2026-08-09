@@ -980,7 +980,7 @@ function readVatClassification(value: unknown): VatClassification | undefined {
  * i wołana także przez ścieżkę `payment.captured`
  * (`workflows/entitlements/issue-entitlement.ts`). Powód jest pomiarem, nie
  * estetyką: gdyby tamta ścieżka dostała WŁASNY `INSERT INTO voucher`, rejestr
- * producentów (`redemption-producers.v1.yaml`) musiałby dostać drugi nazwany
+ * producentów (`redemption-producers.v2.yaml`) musiałby dostać drugi nazwany
  * wyjątek dla tabeli `voucher`, a dwa wyrażenia budujące ten sam wiersz
  * rozjechałyby się cicho — dokładnie ta klasa, którą 5.9 zamyka. `context`
  * zastąpił `payload`, bo wołający spoza Path Y nie ma `PaymentIntentSucceeded`.
