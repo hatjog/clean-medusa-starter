@@ -349,15 +349,54 @@ export function resolvePaymentProviderId(
   )
 }
 
-async function syncRegionPaymentProviders(container: any, regionId: string, providerId: string) {
+/**
+ * Dopisuje providera tego rynku do zbioru regionu — NIE podmienia zbioru.
+ *
+ * ZMIERZONE 2026-08-10 na gp-dev: region `Poland` jest WSPOLDZIELONY przez piec rynkow
+ * (mercur, bonbeauty, bonevent, bongarden, testmarketb), a orkiestrator uruchamia ten
+ * skrypt per rynek. Przy zapisie `payment_providers: [providerId]` kazdy kolejny rynek
+ * KASOWAL wklad poprzedniego — wygrywal ostatni w kolejce:
+ *
+ *   10:16:03  bonbeauty  psp_provider_id: pp_stripe            -> link Stripe utworzony
+ *   10:16:09  bonevent   psp_provider_id: pp_system_default    -> link Stripe SKASOWANY
+ *   10:16:14  bongarden  psp_provider_id: pp_system_default    -> utrwalone
+ *
+ * Skutek na realnej sciezce: `GET /store/payment-providers` zwracalo wylacznie
+ * `pp_system_default`, wiec w checkoucie NIE BYLO Stripe'a — a wiersz w
+ * `region_payment_provider` istnial (z `deleted_at` szesc sekund po utworzeniu), wiec
+ * baza wygladala na poprawnie skonfigurowana. Bramka wartosci Epiku 6 wymaga 3DS, wiec
+ * ten defekt zatrzymuje cale wydanie, a nie jeden checkout.
+ *
+ * Usuwanie providera z regionu NIE nalezy do tego skryptu: nie da sie odroznic „ten
+ * rynek juz go nie chce" od „inny rynek go potrzebuje" bez odczytu konfiguracji
+ * wszystkich rynkow dzielacych region. Zwezanie zbioru jest swiadoma operacja
+ * operatorska, tak jak `--prune` dla pozostalych reconcile'ow.
+ */
+export async function syncRegionPaymentProviders(
+  container: any,
+  db: Knex,
+  regionId: string,
+  providerId: string
+): Promise<{ providers: string[]; added: boolean }> {
+  const existing: string[] = await db("region_payment_provider")
+    .where({ region_id: regionId })
+    .whereNull("deleted_at")
+    .pluck("payment_provider_id")
+
+  if (existing.includes(providerId)) {
+    return { providers: [...existing].sort(), added: false }
+  }
+
+  const providers = [...new Set([...existing, providerId])].sort()
   await updateRegionsWorkflow(container).run({
     input: {
       selector: { id: regionId },
       update: {
-        payment_providers: [providerId],
+        payment_providers: providers,
       },
     },
   })
+  return { providers, added: true }
 }
 
 export default async function gpConfigSyncPayments({ container, args }: ExecArgs) {
@@ -412,7 +451,12 @@ export default async function gpConfigSyncPayments({ container, args }: ExecArgs
     return
   }
 
-  await syncRegionPaymentProviders(container, region.id, resolution.providerId)
+  const regionProviders = await syncRegionPaymentProviders(
+    container,
+    db,
+    region.id,
+    resolution.providerId
+  )
 
   console.log(
     JSON.stringify(
@@ -428,6 +472,10 @@ export default async function gpConfigSyncPayments({ container, args }: ExecArgs
         effective_provider_id: resolution.providerId,
         fallback_applied: resolution.fallbackApplied,
         available_provider_ids: availableProviderIds,
+        // Zbior PO scaleniu — widoczny w logu, zeby zabranie providera przez kolejny
+        // rynek bylo policzalne, a nie odkrywane w checkoucie.
+        region_payment_provider_ids: regionProviders.providers,
+        region_provider_added: regionProviders.added,
       },
       null,
       2
