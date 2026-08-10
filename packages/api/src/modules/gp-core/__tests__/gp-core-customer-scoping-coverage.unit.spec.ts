@@ -193,6 +193,18 @@ const COVERED_PATHS: ReadonlyArray<CoveragePath> = [
     scope: ["market_id", "bearer-token"],
     guardLiterals: ["marketContextStorage.getStore()?.market_id", "voucher.market_id !== market_id"],
   },
+  {
+    // v1.15.0 DW-15-132 — odczyt uprawnień zamówienia na ekranie potwierdzenia.
+    id: "social-attribution.store-entitlements.by-order",
+    category: "social-attribution",
+    operation: "read",
+    file: "api/store/entitlements/route.ts",
+    result: "covered",
+    scope: ["customer_id", "market_id", "bearer-token"],
+    guardLiterals: ["assertOrderAccess(", "isWithinMarketScope(marketContext?.sales_channel_id"],
+    rationale:
+      "Trasa przyjmuje ruch nieuwierzytelniony (checkout gościa), więc dostęp rozstrzyga jeden punkt decyzyjny: sesja klientki (order.customer_id === auth_context.actor_id) ALBO dowód posiadania koszyka zweryfikowany w order_cart (assertOrderAccess / cartProducedOrder). Zakres rynkowy jest osobno fail-closed przez isWithinMarketScope; brak którejkolwiek strony to odmowa 404, nie zgoda.",
+  },
   // ── psp-webhook (out-of-scope: PSP-authenticated, no customer principal) ──
   {
     id: "psp-webhook.stripe.payment-intent",

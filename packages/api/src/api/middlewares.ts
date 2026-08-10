@@ -19,6 +19,7 @@ import {
   brevoWebhookRateLimitMiddleware,
 } from "./middlewares/brevo-hmac-validator";
 import { paymentStatusRateLimitMiddleware } from "./middlewares/payment-status-rate-limit";
+import { storeEntitlementsRateLimitMiddleware } from "./middlewares/store-entitlements-rate-limit";
 import { upstreamOrderAccessGuardMiddleware } from "./middlewares/upstream-order-access-guard";
 import { cartCompletionAuthorizationGuardMiddleware } from "./middlewares/cart-completion-authorization-guard";
 import {
@@ -1013,6 +1014,31 @@ export default defineMiddlewares({
       // zgadywania byłby liczony dopiero po przejściu przez auth.
       middlewares: [
         paymentStatusRateLimitMiddleware,
+        authenticate("customer", ["session", "bearer"], { allowUnauthenticated: true }),
+      ],
+    },
+    {
+      method: ["GET"],
+      matcher: "/store/entitlements",
+      // v1.15.0 DW-15-132: TEN wpis montuje uwierzytelnienie klientki na trasie
+      // odczytu uprawnien zamowienia. `AUTHENTICATE = false` w route.ts wypisuje
+      // ja z GLOBALNEGO middleware `/store` (framework montuje tam
+      // `authenticate("customer", ["bearer","session"], { allowUnauthenticated: true })`),
+      // wiec bez tego wpisu zalogowana klientka nie mialaby `auth_context`.
+      // Zadnej „domyslnej semantyki auth admina" nie ma — admin ma wlasny
+      // middleware pod `/admin`. Powodem jawnego wpisu jest KOLEJNOSC: limiter
+      // musi stac przed uwierzytelnieniem.
+      //
+      // `allowUnauthenticated`, bo checkout goscia nie zaklada konta: dostep
+      // rozstrzyga sama trasa przez `lib/orders/guest-order-access.ts` (sesja
+      // ALBO dowod koszyka). Twarde `authenticate` oznaczaloby 401 dla kazdego
+      // zakupu bez konta — czyli ekran „nie udalo sie odczytac zakupu" dla
+      // wiekszosci kupujacych.
+      //
+      // Rate-limit stoi PRZED `authenticate`: dlawimy proby DOWODU, wiec licznik
+      // musi widziec rowniez zadania, ktore uwierzytelnienie odrzuci.
+      middlewares: [
+        storeEntitlementsRateLimitMiddleware,
         authenticate("customer", ["session", "bearer"], { allowUnauthenticated: true }),
       ],
     },
