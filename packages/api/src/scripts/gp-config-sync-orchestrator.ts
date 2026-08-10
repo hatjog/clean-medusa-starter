@@ -726,8 +726,14 @@ export default async function gpConfigSyncOrchestrator({ container, args }: Exec
         // Story 5.7 (AC2.6) — PIERWSZY etap: `market_runtime_config` jest
         // źródłem `locales`/`support_email`/`market_url` dla runtime'u, więc
         // musi być aktualne zanim cokolwiek zacznie z niego czytać.
+        // Decyzja PO 2026-08-11 — etap OPCJONALNY: brak nie blokuje zakupu (locales/support_email).
+        // `required: true` tutaj nie znaczylo "wazny", tylko "rzuc i przerwij"
+        // (patrz `runStage`), wiec porazka tego etapu zabierala ze soba
+        // `sync-payments` i `sync-shipping` — czyli dokladnie te, bez ktorych
+        // zakup jest niewykonalny. Jako `false` etap konczy sie `warning`,
+        // petla dobiega do konca i raport etapow powstaje.
         name: "sync-market-runtime",
-        required: true,
+        required: false,
         execute: async () => {
           const summary = await withStageEnv(orchestratorArgs, async () => {
             return await invokeStageEntrypoint(
@@ -761,8 +767,14 @@ export default async function gpConfigSyncOrchestrator({ container, args }: Exec
         },
       },
       {
+        // Decyzja PO 2026-08-11 — etap OPCJONALNY: brak nie blokuje zakupu (teksty).
+        // `required: true` tutaj nie znaczylo "wazny", tylko "rzuc i przerwij"
+        // (patrz `runStage`), wiec porazka tego etapu zabierala ze soba
+        // `sync-payments` i `sync-shipping` — czyli dokladnie te, bez ktorych
+        // zakup jest niewykonalny. Jako `false` etap konczy sie `warning`,
+        // petla dobiega do konca i raport etapow powstaje.
         name: "sync-translations",
-        required: true,
+        required: false,
         execute: async () => {
           const result = await withStageEnv(orchestratorArgs, async () => {
             return await invokeStageEntrypoint(gpConfigSyncTranslations, container, stageArgs, {
@@ -841,8 +853,14 @@ export default async function gpConfigSyncOrchestrator({ container, args }: Exec
         },
       },
       {
+        // Decyzja PO 2026-08-11 — etap OPCJONALNY: brak nie blokuje zakupu (tresci i18n).
+        // `required: true` tutaj nie znaczylo "wazny", tylko "rzuc i przerwij"
+        // (patrz `runStage`), wiec porazka tego etapu zabierala ze soba
+        // `sync-payments` i `sync-shipping` — czyli dokladnie te, bez ktorych
+        // zakup jest niewykonalny. Jako `false` etap konczy sie `warning`,
+        // petla dobiega do konca i raport etapow powstaje.
         name: "sync-i18n-content",
-        required: true,
+        required: false,
         execute: async () => {
           const result = await withStageEnv(orchestratorArgs, async () => {
             return await invokeStageEntrypoint(gpConfigSyncI18nContent, container, stageArgs, {
@@ -899,8 +917,14 @@ export default async function gpConfigSyncOrchestrator({ container, args }: Exec
         },
       },
       {
+        // Decyzja PO 2026-08-11 — etap OPCJONALNY: brak nie blokuje zakupu (konta operatorskie).
+        // `required: true` tutaj nie znaczylo "wazny", tylko "rzuc i przerwij"
+        // (patrz `runStage`), wiec porazka tego etapu zabierala ze soba
+        // `sync-payments` i `sync-shipping` — czyli dokladnie te, bez ktorych
+        // zakup jest niewykonalny. Jako `false` etap konczy sie `warning`,
+        // petla dobiega do konca i raport etapow powstaje.
         name: "sync-accounts",
-        required: true,
+        required: false,
         execute: async () => {
           await withStageEnv(orchestratorArgs, async () => {
             await invokeStageEntrypoint(gpConfigSyncAccounts, container, stageArgs, {
