@@ -31,17 +31,17 @@
  * Klucze są hashowane (`sha256`). Ani adres IP (dane osobowe wg RODO), ani
  * `cart_id` (dowód typu bearer) nie leżą w pamięci procesu w postaci jawnej i
  * nie trafiają do logu — log niesie wyłącznie rodzaj przekroczonego limitu.
+ *
+ * ── DW-15-132: polityka wyprowadzona do `proof-rate-limit.ts` ───────────────
+ * `GET /store/entitlements` ma DOKŁADNIE tę samą charakterystykę (ten sam
+ * aktor, ten sam dowód, ten sam kształt odmowy), więc reguła przestała być
+ * własnością tej jednej trasy. Ten plik zostaje ZAŁOŻENIEM POLITYKI dla
+ * `payment-status`: pojemności, okno i licznik. Zachowanie bramki się nie
+ * zmienia — klucz globalny to nadal `route:payment-status`, a licznik jest
+ * osobną instancją, więc dwa strumienie pollingu nie zjadają sobie budżetu.
  */
 
-import * as crypto from "node:crypto"
-
-import type {
-  MedusaNextFunction,
-  MedusaRequest,
-  MedusaResponse,
-} from "@medusajs/framework/http"
-
-import { parseCartProof } from "../../lib/orders/guest-order-access"
+import { createProofRateLimitMiddleware } from "./proof-rate-limit"
 import { SlidingWindowRateLimiter } from "./sliding-window-rate-limit"
 
 /** Okno licznika — 10 minut, zgodnie z budżetem z decyzji PO. */
@@ -63,103 +63,16 @@ export const PAYMENT_STATUS_CART_CAPACITY = 10
  */
 export const PAYMENT_STATUS_GLOBAL_CAPACITY = 600
 
-const GLOBAL_KEY = "route:payment-status"
-const UNKNOWN_IP_SENTINEL = "unknown"
-
 export const paymentStatusRateLimiter = new SlidingWindowRateLimiter(
   PAYMENT_STATUS_RATE_LIMIT_WINDOW_MS,
 )
 
-type RequestWithNetwork = MedusaRequest & {
-  ip?: string
-  socket?: { remoteAddress?: string }
-  connection?: { remoteAddress?: string }
-}
-
-type LoggerLike = {
-  warn?: (message: string, metadata?: Record<string, unknown>) => void
-}
-
-export async function paymentStatusRateLimitMiddleware(
-  req: MedusaRequest,
-  res: MedusaResponse,
-  next: MedusaNextFunction,
-): Promise<void> {
-  const buckets = [
-    { key: GLOBAL_KEY, capacity: PAYMENT_STATUS_GLOBAL_CAPACITY },
-    { key: `ip:${hash(resolveSourceIp(req))}`, capacity: PAYMENT_STATUS_IP_CAPACITY },
-    ...resolveCartBuckets(req),
-  ]
-
-  const decision = paymentStatusRateLimiter.consume(buckets)
-  if (decision.allowed) {
-    next()
-    return
-  }
-
-  // FAIL-CLOSED: przekroczenie kończy żądanie, nie przepuszcza go „na wszelki
-  // wypadek". Limit, który przy przekroczeniu woła `next()`, jest dokładnie tą
-  // klasą martwej bramki, którą ta zmiana zamyka.
-  res.setHeader("Retry-After", String(decision.retryAfterSeconds))
-  resolveLogger(req)?.warn?.(
-    JSON.stringify({
-      scope: "payment-status",
-      outcome: "rate_limited",
-      // Sam RODZAJ limitu, nigdy wartość klucza — inaczej log stawałby się
-      // rejestrem adresów IP i dowodów koszyka.
-      limit: describeLimit(decision.exceededKey),
-      retry_after_seconds: decision.retryAfterSeconds,
-    }),
-  )
-  res.status(429).json({
-    type: "too_many_requests",
-    message: "Too many attempts. Try again later.",
-  })
-}
-
-/**
- * Koszyki dla dowodu. Gdy dowodu nie ma, nie zgadujemy klucza — takie żądanie
- * jest już objęte licznikiem per-IP i globalnym.
- */
-function resolveCartBuckets(req: MedusaRequest): { key: string; capacity: number }[] {
-  const proof = parseCartProof((req.query as Record<string, unknown> | undefined)?.cart_id)
-  if (!proof || proof.values.length === 0) return []
-  // Każdy podany `cart_id` ma WŁASNY licznik. Bez tego jedno żądanie z listą
-  // wielu identyfikatorów mieściłoby się w jednym budżecie i pozwalało testować
-  // dowody hurtem.
-  return proof.values.map((value) => ({
-    key: `cart:${hash(value)}`,
-    capacity: PAYMENT_STATUS_CART_CAPACITY,
-  }))
-}
-
-function describeLimit(key: string): string {
-  if (key === GLOBAL_KEY) return "route"
-  if (key.startsWith("ip:")) return "per_ip"
-  if (key.startsWith("cart:")) return "per_cart_proof"
-  return "unknown"
-}
-
-function resolveSourceIp(req: MedusaRequest): string {
-  const request = req as RequestWithNetwork
-  const direct =
-    request.ip ?? request.socket?.remoteAddress ?? request.connection?.remoteAddress
-  if (direct?.trim()) return direct.trim()
-
-  const forwarded = req.headers?.["x-forwarded-for"]
-  const raw = Array.isArray(forwarded) ? forwarded[0] : forwarded
-  const first = typeof raw === "string" ? raw.split(",")[0]?.trim() : undefined
-  return first || UNKNOWN_IP_SENTINEL
-}
-
-function resolveLogger(req: MedusaRequest): LoggerLike | undefined {
-  try {
-    return req.scope?.resolve("logger") as LoggerLike | undefined
-  } catch {
-    return undefined
-  }
-}
-
-function hash(value: string): string {
-  return crypto.createHash("sha256").update(value).digest("hex").slice(0, 32)
-}
+export const paymentStatusRateLimitMiddleware = createProofRateLimitMiddleware({
+  // Nazwa bramki daje klucz globalny `route:payment-status` — dokładnie ten,
+  // który ta trasa miała przed wyprowadzeniem polityki.
+  scope: "payment-status",
+  limiter: paymentStatusRateLimiter,
+  globalCapacity: PAYMENT_STATUS_GLOBAL_CAPACITY,
+  ipCapacity: PAYMENT_STATUS_IP_CAPACITY,
+  cartCapacity: PAYMENT_STATUS_CART_CAPACITY,
+})
