@@ -1,7 +1,13 @@
+const updateRegionsRun = jest.fn().mockResolvedValue({})
+jest.mock("@medusajs/core-flows", () => ({
+  updateRegionsWorkflow: jest.fn(() => ({ run: updateRegionsRun })),
+}))
+
 import {
   parseArgs,
   resolvePaymentProviderId,
   selectRegionForMarket,
+  syncRegionPaymentProviders,
 } from "../../scripts/gp-config-sync-payments"
 
 describe("gp-config-sync-payments.parseArgs", () => {
@@ -127,5 +133,70 @@ describe("gp-config-sync-payments.resolvePaymentProviderId", () => {
     expect(() =>
       resolvePaymentProviderId("pp_stripe", [])
     ).toThrow(/Available providers: none/)
+  })
+})
+
+describe("gp-config-sync-payments.syncRegionPaymentProviders", () => {
+  /**
+   * Region `Poland` jest wspoldzielony przez piec rynkow, a orkiestrator uruchamia sync
+   * per rynek. Do 2026-08-10 zapis szedl jako `payment_providers: [providerId]`, wiec
+   * kolejny rynek KASOWAL wklad poprzedniego — zmierzone na gp-dev: bonbeauty dolozylo
+   * Stripe o 10:16:03, bonevent skasowalo go o 10:16:09, a checkout zostal z samym
+   * `pp_system_default`.
+   */
+  const makeDb = (existing: string[]) => {
+    const chain = {
+      where: jest.fn().mockReturnThis(),
+      whereNull: jest.fn().mockReturnThis(),
+      pluck: jest.fn().mockResolvedValue(existing),
+    }
+    const db = jest.fn(() => chain) as unknown as Parameters<
+      typeof syncRegionPaymentProviders
+    >[1]
+    return { db, chain }
+  }
+
+  const container = {} as any
+
+  beforeEach(() => {
+    updateRegionsRun.mockClear()
+  })
+
+  it("dokłada providera rynku, nie kasując wkładu innego rynku dzielącego region", async () => {
+    const { db } = makeDb(["pp_system_default"])
+    const result = await syncRegionPaymentProviders(container, db, "reg_1", "pp_stripe_stripe")
+
+    expect(result.added).toBe(true)
+    expect(result.providers).toEqual(["pp_stripe_stripe", "pp_system_default"])
+    // Kontrola dodatnia: `pp_system_default` MUSI przetrwac dopisanie Stripe'a.
+    expect(updateRegionsRun.mock.calls[0][0].input.update.payment_providers).toEqual([
+      "pp_stripe_stripe",
+      "pp_system_default",
+    ])
+  })
+
+  it("nie zapisuje niczego, gdy provider rynku jest już na regionie", async () => {
+    const { db } = makeDb(["pp_stripe_stripe", "pp_system_default"])
+    const result = await syncRegionPaymentProviders(container, db, "reg_1", "pp_system_default")
+
+    expect(result.added).toBe(false)
+    expect(updateRegionsRun).not.toHaveBeenCalled()
+  })
+
+  it("odtwarza zmierzoną sekwencję pięciu rynków — Stripe zostaje na końcu", async () => {
+    let state: string[] = []
+    for (const provider of [
+      "pp_system_default", // mercur
+      "pp_stripe_stripe", // bonbeauty
+      "pp_system_default", // bonevent
+      "pp_system_default", // bongarden
+      "pp_system_default", // testmarketb
+    ]) {
+      const { db } = makeDb(state)
+      state = (await syncRegionPaymentProviders(container, db, "reg_1", provider)).providers
+    }
+
+    // Przed naprawa konczylo sie na `["pp_system_default"]` i checkout nie mial Stripe'a.
+    expect(state).toEqual(["pp_stripe_stripe", "pp_system_default"])
   })
 })
