@@ -64,6 +64,7 @@ import {
 } from "../../../../lib/payment/stripe-payment-intent-link"
 import { stampPaymentIntentOrderFacts } from "../../../../lib/payment/stripe-payment-intent-metadata-stamp"
 import {
+  persistDeferredIssuanceMarker,
   releaseWebhookDelivery,
   reserveWebhookDelivery,
   resolveWebhookPgHandle,
@@ -260,6 +261,49 @@ export async function POST(
         `[stripe/payment-intent] ${resolution.reason}: ${resolution.detail}; ` +
           `event_age_seconds=${eventAgeSeconds ?? "unknown"}; retryable_link_race=${retryableLinkRace}`,
       )
+      // Ślad deferral TYLKO dla wyścigu przejściowego. `link_ambiguous` i reszta
+      // są trwałe — ponowienie ich nie naprawi, a ślad zamieniłby się w pętlę
+      // odzysku wołaną przy każdym `order.placed` tego zamówienia.
+      //
+      // Kluczem śladu jest `deliveryEventId` — TA SAMA wartość, którą rezerwuje
+      // transport, razem z jej świadomym fallbackiem `stripe:pi:<pi>` dla
+      // zdarzenia bez `id`. Bramka na `stripeEvent.id` zostawiała takie
+      // zdarzenia zupełnie bez śladu, choć dedupe dawno przestał od tego pola
+      // zależeć. `paymentIntentId` NIE jest tu członem bramki: kilkadziesiąt
+      // linii wyżej wartość falszywa kończy się `400`, więc w tym punkcie
+      // z definicji jest niepusta — warunek był martwy.
+      if (retryableLinkRace) {
+        try {
+          const marked = await persistDeferredIssuanceMarker(handle.client, {
+            event_id: deliveryEventId,
+            payment_intent_id: paymentIntentId,
+            market_id: identifiers.market_id ?? null,
+          })
+          logger.info?.(
+            `[stripe/payment-intent] slad deferral ${marked ? "zapisany" : "juz istnial"} ` +
+              `dla ${paymentIntentId}; odzysk domknie wystawienie na order.placed`
+          )
+        } catch (markerError) {
+          // Porażka śladu NIE zmienia klasy odrzucenia: `503` zostaje, bo retry
+          // Stripe'a jest niezależną drogą. Cisza byłaby gorsza od obu.
+          logger.warn?.(
+            `[stripe/payment-intent] nie udalo sie zapisac sladu deferral dla ` +
+              `${paymentIntentId}: ${(markerError as Error).message}`
+          )
+        }
+      } else {
+        // Pominięcie MUSI zostawiać ślad w logu. Wcześniej jedyny sygnał
+        // (`logger.info`) leżał WEWNĄTRZ gałęzi zapisu, więc brak śladu był
+        // nieodróżnialny od awarii zapisu — operator szukający, czemu odzysk
+        // nic nie znalazł, nie miał czego czytać.
+        logger.warn(
+          `[stripe/payment-intent] slad deferral POMINIETY dla ${paymentIntentId}: ` +
+            `reason=${resolution.reason}, retryable_link_race=false ` +
+            "— odrzucenie jest TRWALE, odzysk na order.placed NIE domknie tego " +
+            "wystawienia"
+        )
+      }
+
       res.status(retryableLinkRace ? 503 : 400).json({
         type: "unresolved_link",
         reason: resolution.reason,

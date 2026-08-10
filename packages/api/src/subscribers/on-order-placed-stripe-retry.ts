@@ -1,47 +1,215 @@
 /**
- * v1.9.0 wf5 (H-2 / F-CC1-003 / ra-E1) — webhook-before-order race recovery.
+ * on-order-placed-stripe-retry.ts — ODZYSK wystawienia po przegranym wyścigu
+ * `payment_intent.succeeded` × `completeCart`.
  *
- * Problem (closes Epic-1 HIGH H-2 + CC-1 F-CC1-003 + ra-E1 P1):
- *   For instant payment methods (BLIK, P24, Apple Pay, Google Pay), Stripe
- *   often delivers `payment_intent.succeeded` → our Path Y subscriber sees
- *   `payment.captured` BEFORE the storefront calls `/store/carts/:id/complete`
- *   to finalize the order. At that moment `payload.order_id` is missing and
- *   the audit subscriber persists the dedup row but cannot issue entitlement.
- *   Pre-fix this was a silent no-op (customer paid, no voucher, no signal).
+ * ── Co odzyskujemy ──────────────────────────────────────────────────────────
+ * Przy natychmiastowych metodach płatności (BLIK, P24, Apple/Google Pay) Stripe
+ * potrafi dostarczyć `payment_intent.succeeded` ZANIM storefront domknie
+ * `/store/carts/:id/complete`. W tym momencie zamówienia jeszcze nie ma, więc
+ * ścieżka wystawienia nie ma czego wystawić. Bez odzysku klientka płaci, widzi
+ * potwierdzenie i nie dostaje vouchera — cisza po stronie systemu.
  *
- *   v1.9.0 wf5 stripePaymentAuditWorkflow.processMutation now writes
- *   `envelope.entitlement_issue_deferred_reason="webhook_before_order"` onto
- *   the dedup row when the race fires. This subscriber listens to
- *   `order.placed`, scans `webhook_event_processed` rows that match the new
- *   order's payment_intent and have the deferred-reason key set, and
- *   re-invokes `issueEntitlementsForAllLineItems` retroactively.
+ * ── DWA pokolenia piszą ślad; oba tu obsługujemy ────────────────────────────
+ *  1. v1.9.0 — `workflows/payment/stripe-payment-audit.ts` (natywny hook
+ *     `payment.captured`) stempluje wiersz dedupu
+ *     `envelope.entitlement_issue_deferred_reason = 'webhook_before_order'`,
+ *     `provider = 'stripe'`.
+ *  2. v1.15.0 — cienki route Path Y
+ *     (`api/webhooks/stripe/payment-intent/route.ts`) przy przegranym wyścigu
+ *     odpowiada `503` i zostawia WŁASNY ślad przez
+ *     `persistDeferredIssuanceMarker`, z `provider =
+ *     STRIPE_PATH_Y_WEBHOOK_PROVIDER` i kluczem `<event_id>#deferred-issuance`.
+ *     Ta wartość `provider` jest celowo różna: kompensacja ścieżki natywnej
+ *     kasuje po `provider = 'stripe'` i nie wolno jej dosięgnąć wierszy Path Y.
  *
- * Design (per ADR-107 §Etap-2):
- *   - Joint gate: entitlement issuance requires BOTH `payment.captured` AND
- *     `order.placed` to have fired. Either order is acceptable; this
- *     subscriber implements the captured-first path.
- *   - Idempotent: the per-(order_id, line_item_id) UNIQUE index on
- *     entitlement_instance guarantees re-issue is a no-op if the captured
- *     event-side already created the row.
- *   - On success the deferred-reason key is replaced with
- *     `entitlement_issue_resolved_at` so an operator query can confirm
- *     recovery (and so we don't repeatedly retry on subsequent
- *     `order.placed` events for the same order).
+ * Ten subscriber słucha `order.placed`, znajduje ślady dopięte do płatności
+ * TEGO zamówienia i retroaktywnie woła `issueEntitlementsForAllLineItems`.
  *
- * NOTE: this subscriber operates on the Mercur Medusa `order.placed` event
- * which the standard `on-order-completed.ts` subscriber also listens to. They
- * coexist: this one is the Stripe-specific recovery path; the other is a
- * no-op breadcrumb post-Wave-B revert (H-8 fix).
+ * ── Niezmienniki, których nie wolno stracić ─────────────────────────────────
+ *  - Wspólna brama (ADR-107 §Etap-2): wystawienie wymaga OBU faktów
+ *    (`payment.captured` + `order.placed`); ten plik realizuje wariant
+ *    „captured pierwszy".
+ *  - Idempotencja: UNIQUE per `(order_id, line_item_id)` na
+ *    `entitlement_instance` czyni ponowne wystawienie no-opem.
+ *  - `market_id` NIE jest zgadywany. Ślad Path Y niesie `wep.market_id = NULL`,
+ *    bo metadata PaymentIntenta w wyścigu mają tylko `session_id`. Rynek
+ *    wyprowadzamy z zamówienia w TEJ SAMEJ kolejności pierwszeństwa co
+ *    `lib/payment/stripe-payment-intent-link.ts`: `order.metadata->gp->market_id`
+ *    → `order.metadata->market_id` → `sales_channel.metadata->>'gp_market_id'`.
+ *    Bez tego konsument (fail-closed) rzucał `MissingVoucherIssuanceMarketError`
+ *    przy KAŻDYM przebiegu i ślad nigdy nie był domykany.
+ *  - Domknięcie jest PER PARA `(event_id, order_id)`. Jeden PaymentIntent może
+ *    dać N zamówień (Mercur dzieli checkout per seller, ADR-166), a ślad jest
+ *    JEDEN — skalarne domknięcie zabierało wystawienie drugiemu i każdemu
+ *    kolejnemu sprzedawcy.
+ *  - Odzysk NIE wystawia kodu bez pokrycia: płatność musi być nieusunięta,
+ *    nieanulowana i bez zwrotu.
+ *
+ * NOTE: `order.placed` słucha także `on-order-completed.ts`. Współistnieją:
+ * tutaj jest ścieżka odzysku Stripe, tam no-op breadcrumb po rewersie Wave-B
+ * (H-8).
  */
 import type { SubscriberArgs, SubscriberConfig } from "@medusajs/framework"
 import { ContainerRegistrationKeys } from "@medusajs/framework/utils"
 
 import { toKnexPositionalSql } from "../lib/knex-positional-sql"
+import { STRIPE_PATH_Y_WEBHOOK_PROVIDER } from "../lib/payment/stripe-payment-intent-transport"
 import {
   issueEntitlementsForAllLineItems,
   MissingEntitlementProfileError,
   VoucherIssuanceBlockedError,
 } from "../workflows/entitlements/issue-entitlement"
+
+/**
+ * Wartości `webhook_event_processed.provider`, które mogą nieść ślad deferral.
+ *
+ * DWA POKOLENIA mechanizmu piszą ten ślad i każde ma własną wartość — celowo,
+ * bo kompensacja ścieżki natywnej kasuje po `provider = 'stripe'` i nie wolno
+ * jej dosięgnąć wierszy Path Y (patrz nagłówek `stripe-payment-intent-transport.ts`):
+ *
+ *   - `stripe`                        — `workflows/payment/stripe-payment-audit.ts` (v1.9.0),
+ *   - `stripe_payment_intent_webhook` — route Path Y przy przegranym wyścigu (v1.15.0).
+ *
+ * Do 2026-08-10 ten subscriber znał tylko pierwszą, a produkcję ruchu przejęła
+ * druga — więc odzysk nie miał czego dopasować i przegrany wyścig zostawał
+ * nieodwracalny mimo istniejącej maszynerii. SELECT i UPDATE MUSZĄ używać TEJ
+ * SAMEJ listy: gdyby UPDATE został przy węższej, ślad byłby odzyskiwany i nigdy
+ * oznaczany, więc każdy kolejny `order.placed` wołałby wystawienie ponownie.
+ *
+ * Stała leży w bloku na GÓRZE pliku, bo oba zapytania generują z jej DŁUGOŚCI
+ * listę placeholderów w czasie inicjalizacji modułu — deklaracja między
+ * funkcjami dawałaby TDZ.
+ */
+export const DEFERRAL_MARKER_PROVIDERS = ["stripe", STRIPE_PATH_Y_WEBHOOK_PROVIDER]
+
+/**
+ * Lista JAWNYCH placeholderów `$n, $n+1, …` o długości `DEFERRAL_MARKER_PROVIDERS`.
+ *
+ * Dlaczego nie `= ANY($n)` z bindingiem tablicowym: produkcyjną gałęzią dostępu
+ * do PG jest Knex (`__pg_pool__` nie jest w tym repo nigdzie rejestrowany), a
+ * `lib/knex-positional-sql.ts` RZUCA `SqlDialectError` na każdym bindingu będącym
+ * tablicą — Knex rozwinąłby ją w `?, ?` i rozjechał licznik bindingów. Wariant
+ * `ANY(...)` rzucał więc ZAWSZE, wywracając także odzysk pokolenia v1.9.0, który
+ * wcześniej działał.
+ */
+function providerPlaceholders(firstIndex: number): string {
+  return DEFERRAL_MARKER_PROVIDERS.map(
+    (_provider, offset) => `$${firstIndex + offset}`
+  ).join(", ")
+}
+
+/**
+ * Ślady deferral dopięte do płatności TEGO zamówienia.
+ *
+ * Bindingi: `$1` = order_id, `$2..` = `DEFERRAL_MARKER_PROVIDERS` (spread, każda
+ * wartość skalarnie). Buduje je `buildFindDeferredCapturesBindings`.
+ *
+ * Trzy własności, których utrata jest cicha i kosztowna:
+ *  1. `market_id` z COALESCE po zamówieniu — ślad Path Y niesie NULL, a konsument
+ *     jest fail-closed. Kolejność pierwszeństwa JEST TA SAMA co w
+ *     `lib/payment/stripe-payment-intent-link.ts` (`order.metadata->gp->market_id`,
+ *     `order.metadata->market_id`, `sales_channel.metadata->>'gp_market_id'`),
+ *     żeby odzysk nigdy nie wystawił na innym rynku niż ścieżka główna.
+ *  2. Płatność musi być realizowalna: nieusunięta, NIEANULOWANA i BEZ zwrotu.
+ *     Bez tego odzysk wystawia kod bez pokrycia.
+ *  3. Wykluczenie domkniętych jest PER PARA `(event_id, order_id)` — patrz
+ *     `MARK_DEFERRED_RESOLVED_SQL`. Ostatni człon (`resolved_at` bez
+ *     `resolved_orders`) trzyma zgodność wstecz ze śladami domkniętymi pod
+ *     starą, skalarną semantyką.
+ *
+ * `jsonb_exists(...)` zamiast operatora `?`: znak zapytania jest placeholderem
+ * bindingu Knexa, więc wersja operatorowa nigdy nie doszła do bazy
+ * (`Expected 1 bindings, saw 3`).
+ */
+export const FIND_DEFERRED_CAPTURES_SQL = `
+      SELECT
+        wep.event_id,
+        COALESCE(
+          wep.market_id,
+          o.metadata->'gp'->>'market_id',
+          o.metadata->>'market_id',
+          sc.metadata->>'gp_market_id'
+        ) AS market_id,
+        wep.envelope,
+        p.amount,
+        p.currency_code,
+        p.id AS payment_id,
+        SUBSTRING(wep.envelope->>'scope' FROM 'payment_intent:(.+)') AS payment_intent_id
+      FROM webhook_event_processed wep
+      JOIN payment p
+        ON wep.envelope->>'scope' = 'payment_intent:' || (p.data->>'id')
+        AND p.deleted_at IS NULL
+        AND p.canceled_at IS NULL
+        AND NOT EXISTS (
+          SELECT 1 FROM refund r
+           WHERE r.payment_id = p.id
+             AND r.deleted_at IS NULL
+        )
+      JOIN order_payment_collection opc
+        ON opc.payment_collection_id = p.payment_collection_id
+        AND opc.deleted_at IS NULL
+      LEFT JOIN "order" o
+        ON o.id = opc.order_id
+        AND o.deleted_at IS NULL
+      LEFT JOIN sales_channel sc
+        ON sc.id = o.sales_channel_id
+        AND sc.deleted_at IS NULL
+      WHERE opc.order_id = $1
+        AND wep.provider IN (${providerPlaceholders(2)})
+        AND wep.envelope->>'event_type' = 'payment.captured'
+        AND jsonb_exists(wep.envelope, 'entitlement_issue_deferred_reason')
+        AND NOT jsonb_exists(
+          COALESCE(wep.envelope->'entitlement_issue_resolved_orders', '[]'::jsonb),
+          $1
+        )
+        AND NOT (
+          jsonb_exists(wep.envelope, 'entitlement_issue_resolved_at')
+          AND NOT jsonb_exists(wep.envelope, 'entitlement_issue_resolved_orders')
+        )
+    `
+
+/**
+ * Domknięcie śladu PER PARA `(event_id, order_id)`.
+ *
+ * Bindingi: `$1` = event_id, `$2` = znacznik czasu, `$3` = order_id,
+ * `$4..` = `DEFERRAL_MARKER_PROVIDERS`. Buduje je
+ * `buildMarkDeferredResolvedBindings`.
+ *
+ *  - `entitlement_issue_resolved_orders` (TABLICA) jest nośnikiem domknięcia.
+ *    Skalarny stempel gubił wystawienie drugiemu i każdemu kolejnemu sprzedawcy:
+ *    jeden PaymentIntent → N zamówień, ale ślad jest JEDEN (ADR-166).
+ *  - Skalarne `entitlement_issue_resolved_at` / `_reason` ZOSTAJĄ (ostatnie
+ *    domknięcie) dla zgodności wstecz z zapytaniami operatorskimi.
+ *  - `jsonb_exists(envelope, 'entitlement_issue_deferred_reason')` w WHERE jest
+ *    warunkiem poprawności, nie ozdobą: rezerwacja transportu Path Y ma TO SAMO
+ *    `event_id` i tę samą wartość `provider`, więc bez tego predykatu UPDATE
+ *    stemplował CUDZY wiersz.
+ */
+export const MARK_DEFERRED_RESOLVED_SQL = `UPDATE webhook_event_processed
+        SET envelope = envelope || jsonb_build_object(
+              'entitlement_issue_resolved_at', $2::text,
+              'entitlement_issue_resolved_reason', 'order.placed_retry',
+              'entitlement_issue_resolved_orders',
+                COALESCE(envelope->'entitlement_issue_resolved_orders', '[]'::jsonb)
+                  || to_jsonb($3::text)
+            )
+      WHERE event_id = $1
+        AND provider IN (${providerPlaceholders(4)})
+        AND jsonb_exists(envelope, 'entitlement_issue_deferred_reason')`
+
+/** Bindingi `FIND_DEFERRED_CAPTURES_SQL` — spread, żadna wartość nie jest tablicą. */
+export function buildFindDeferredCapturesBindings(orderId: string): unknown[] {
+  return [orderId, ...DEFERRAL_MARKER_PROVIDERS]
+}
+
+/** Bindingi `MARK_DEFERRED_RESOLVED_SQL` — spread, żadna wartość nie jest tablicą. */
+export function buildMarkDeferredResolvedBindings(
+  eventId: string,
+  resolvedAtIso: string,
+  orderId: string
+): unknown[] {
+  return [eventId, resolvedAtIso, orderId, ...DEFERRAL_MARKER_PROVIDERS]
+}
 
 type LoggerLike = {
   info?: (message: string) => void
@@ -173,14 +341,15 @@ type DeferredCaptureRow = {
 }
 
 /**
- * Scan webhook_event_processed for `payment.captured` rows that:
- *   - were marked `entitlement_issue_deferred_reason="webhook_before_order"`
- *     by the audit workflow,
- *   - have NOT been resolved yet (no `entitlement_issue_resolved_at` key),
- *   - whose payment_intent_id matches a payment belonging to this order.
+ * Ślady deferral do odzyskania dla TEGO zamówienia — wiersze
+ * `webhook_event_processed`, które:
+ *   - noszą `entitlement_issue_deferred_reason` (dowolne z dwóch pokoleń),
+ *   - NIE zostały jeszcze domknięte dla tego `order_id`,
+ *   - są dopięte przez `envelope->>'scope'` do REALIZOWALNEJ płatności tego
+ *     zamówienia (nieusuniętej, nieanulowanej, bez zwrotu).
  *
- * Returns the matching captured-rows. Multiple match is possible (one PI per
- * order is the norm, but we don't constrain).
+ * Kontrakt zapytania (SQL, bindingi, powody) trzyma `FIND_DEFERRED_CAPTURES_SQL`.
+ * Wiele dopasowań jest dopuszczalne.
  */
 async function findDeferredCapturesForOrder(
   client: PgClient,
@@ -195,32 +364,8 @@ async function findDeferredCapturesForOrder(
     payment_id: string | null
     payment_intent_id: string | null
   }>(
-    `
-      SELECT
-        wep.event_id,
-        wep.market_id,
-        wep.envelope,
-        p.amount,
-        p.currency_code,
-        p.id AS payment_id,
-        SUBSTRING(wep.envelope->>'scope' FROM 'payment_intent:(.+)') AS payment_intent_id
-      FROM webhook_event_processed wep
-      JOIN payment p
-        ON wep.envelope->>'scope' = 'payment_intent:' || (p.data->>'id')
-        AND p.deleted_at IS NULL
-      JOIN order_payment_collection opc
-        ON opc.payment_collection_id = p.payment_collection_id
-        AND opc.deleted_at IS NULL
-      WHERE opc.order_id = $1
-        AND wep.provider = 'stripe'
-        AND wep.envelope->>'event_type' = 'payment.captured'
-        -- jsonb_exists() zamiast operatora istnienia klucza: znak zapytania jest
-        -- jednocześnie placeholderem bindingu Knexa, więc wersja operatorowa
-        -- nigdy nie doszła do bazy (Expected 1 bindings, saw 3).
-        AND jsonb_exists(wep.envelope, 'entitlement_issue_deferred_reason')
-        AND NOT jsonb_exists(wep.envelope, 'entitlement_issue_resolved_at')
-    `,
-    [orderId]
+    FIND_DEFERRED_CAPTURES_SQL,
+    buildFindDeferredCapturesBindings(orderId)
   )
 
   return result.rows.map((r) => ({
@@ -234,19 +379,19 @@ async function findDeferredCapturesForOrder(
   }))
 }
 
+/**
+ * Domyka ślad dla PARY `(event_id, order_id)`. Kontrakt zapytania trzyma
+ * `MARK_DEFERRED_RESOLVED_SQL`.
+ */
 async function markDeferredResolved(
   client: PgClient,
   eventId: string,
+  orderId: string,
   resolvedAt: Date
 ): Promise<void> {
   await client.query(
-    `UPDATE webhook_event_processed
-        SET envelope = envelope || jsonb_build_object(
-              'entitlement_issue_resolved_at', $2::text,
-              'entitlement_issue_resolved_reason', 'order.placed_retry'
-            )
-      WHERE event_id = $1 AND provider = 'stripe'`,
-    [eventId, resolvedAt.toISOString()]
+    MARK_DEFERRED_RESOLVED_SQL,
+    buildMarkDeferredResolvedBindings(eventId, resolvedAt.toISOString(), orderId)
   )
 }
 
@@ -287,7 +432,7 @@ export default async function onOrderPlacedStripeRetry({
               },
               new Date()
             )
-            await markDeferredResolved(client, row.event_id, new Date())
+            await markDeferredResolved(client, row.event_id, orderId, new Date())
             logger.info?.(
               `[on-order-placed-stripe-retry] order_id=${orderId} ` +
                 `event_id=${row.event_id} retroactively issued ` +
