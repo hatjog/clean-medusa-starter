@@ -61,6 +61,87 @@ export async function reserveWebhookDelivery(
   return (result.rowCount ?? 0) === 1
 }
 
+/** Sufiks klucza śladu deferral — patrz `persistDeferredIssuanceMarker`. */
+export const DEFERRED_ISSUANCE_EVENT_SUFFIX = "#deferred-issuance"
+
+/** Powód deferral, którego szuka `on-order-placed-stripe-retry`. */
+export const DEFERRED_ISSUANCE_REASON = "webhook_before_order"
+
+/**
+ * Zostawia ślad, po którym `subscribers/on-order-placed-stripe-retry.ts` odzyska
+ * wystawienie, gdy `payment_intent.succeeded` wyprzedził `completeCart`.
+ *
+ * ── Po co, skoro route i tak zwraca 503 ────────────────────────────────────
+ * `503` jest kontraktem z retry Stripe'a i ZOSTAJE. Ale retry przychodzi tylko
+ * do skonfigurowanego endpointu — forwarder `stripe listen` (stack deweloperski,
+ * także sesja bramkowa Epiku 6) NIE ponawia. Zmierzone 2026-08-10: klient
+ * zapłacił kartą, `pi_3U2vWG…` pojawił się w logu DOKŁADNIE RAZ, uprawnienie
+ * nie powstało, `voucher_delivery_dispatch` pusty. Przegrany wyścig był
+ * nieodwracalny. Ślad czyni go odwracalnym, nie zmieniając odpowiedzi.
+ *
+ * ── Dlaczego WŁASNY `event_id`, a nie ten od Stripe'a ──────────────────────
+ * Klucz tabeli to `(event_id, provider)`, a `reserveWebhookDelivery` wstawia
+ * `ON CONFLICT DO NOTHING` i czyta wynik jako „czy rezerwacja jest nasza".
+ * Gdyby ślad zajął ten sam klucz, PÓŹNIEJSZE ponowienie Stripe'a dostałoby
+ * `false` = „już przyjęte", route pominąłby emisję i voucher nie powstałby
+ * nigdy — naprawa zamieniłaby się w swoje przeciwieństwo. Sufiks trzyma ślad
+ * i rezerwację w rozłącznych kluczach.
+ *
+ * ── Kształt koperty jest kontraktem KONSUMENTA ─────────────────────────────
+ * `scope` jako STRING `payment_intent:<pi>` oraz `event_type: 'payment.captured'`
+ * to dokładnie to, po czym łączy zapytanie odzysku (JOIN po
+ * `envelope->>'scope' = 'payment_intent:' || payment.data->>'id'`). Koperty
+ * Path Y noszą `scope` jako OBIEKT, więc ślad ma własny kształt — celowo.
+ * Wartość `provider` zostaje nasza (`STRIPE_PATH_Y_WEBHOOK_PROVIDER`), bo
+ * kompensacja ścieżki natywnej kasuje po `provider = 'stripe'` i nie wolno jej
+ * dosięgnąć naszych wierszy (patrz nagłówek pliku).
+ *
+ * ── RZUCA. Gwarancję „cicho" realizuje WOŁAJĄCY ────────────────────────────
+ * Ta funkcja NIE ma `try/catch`: `client.query` propaguje błąd bazy, a guard
+ * kolizji kluczy (niżej) rzuca celowo. Wymaganie „porażka śladu nie zmienia
+ * klasy odrzucenia" jest kontraktem TRASY, nie tej funkcji — route opakowuje
+ * wywołanie i loguje `warn`, zachowując `503`. Docblock deklarował wcześniej
+ * „nigdy nie rzuca", czego kod nie realizował; czytający miał więc gwarancję,
+ * której nie było, i mógł wołać tę funkcję bez opakowania.
+ *
+ * KAŻDY nowy wołający MUSI ją opakować albo świadomie przyjąć wyjątek.
+ */
+export async function persistDeferredIssuanceMarker(
+  client: PaymentLinkQueryClient,
+  input: { event_id: string; payment_intent_id: string; market_id: string | null }
+): Promise<boolean> {
+  // Rozłączność przestrzeni kluczy (ślad vs rezerwacja) była do tej pory samą
+  // KONWENCJĄ. Gdyby `event_id` już niósł sufiks, ślad wylądowałby pod kluczem
+  // rezerwacji: `reserveWebhookDelivery` dostałby później `false` = „już
+  // przyjęte", route pominąłby emisję i voucher nie powstałby NIGDY. Naprawa
+  // zamieniłaby się w ciszę, więc kolizja musi być głośna.
+  if (input.event_id.endsWith(DEFERRED_ISSUANCE_EVENT_SUFFIX)) {
+    throw new Error(
+      `[deferred-issuance-marker] event_id "${input.event_id}" juz konczy sie ` +
+        `sufiksem "${DEFERRED_ISSUANCE_EVENT_SUFFIX}" — przestrzenie kluczy sladu ` +
+        "i rezerwacji dostawy musza byc ROZLACZNE, inaczej slad zajmuje klucz " +
+        "rezerwacji i wycisza emisje na zawsze"
+    )
+  }
+
+  const envelope = {
+    scope: `payment_intent:${input.payment_intent_id}`,
+    event_type: "payment.captured",
+    entitlement_issue_deferred_reason: DEFERRED_ISSUANCE_REASON,
+    deferred_by: "path-y-webhook-link-race",
+    payment_intent_id: input.payment_intent_id,
+  }
+
+  const result = await client.query(RESERVE_WEBHOOK_DELIVERY_SQL, [
+    `${input.event_id}${DEFERRED_ISSUANCE_EVENT_SUFFIX}`,
+    STRIPE_PATH_Y_WEBHOOK_PROVIDER,
+    input.market_id,
+    JSON.stringify(envelope),
+  ])
+
+  return (result.rowCount ?? 0) === 1
+}
+
 /**
  * Zwalnia rezerwację, gdy emisja NIE doszła do skutku.
  *
