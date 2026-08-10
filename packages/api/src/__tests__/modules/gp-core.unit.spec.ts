@@ -31,10 +31,40 @@ function replaceDatabaseName(databaseUrl: string, databaseName: string): string 
   return parsed.toString()
 }
 
-const BASE_DATABASE_URL =
-  process.env.DATABASE_URL || "postgres://postgres:postgres@localhost:5432/gp_mercur"
-const TEST_DATABASE_URL = replaceDatabaseName(BASE_DATABASE_URL, "gp_core_test")
-const ADMIN_DATABASE_URL = replaceDatabaseName(BASE_DATABASE_URL, "postgres")
+/**
+ * IZOLACJA BAZY — adres bierze się WYŁĄCZNIE z dedykowanej zmiennej.
+ *
+ * Do 2026-08-10 stało tu `process.env.DATABASE_URL || "postgres://…/gp_mercur"`.
+ * Ten kształt jest cichym sięgnięciem po SERWER deweloperski: nazwa bazy była
+ * co prawda podmieniana na `gp_core_test`, ale host, port i poświadczenia
+ * pochodziły z bazy roboczej, a `ensureTestDatabase()` zakładało tam bazę bez
+ * pytania — przy pustym środowisku suita łączyła się z lokalnym Postgresem
+ * DEWELOPERA i wykonywała `DROP SCHEMA` / `DROP TABLE`. Odległość między
+ * „skasowało cudzą bazę na tym serwerze" a „skasowało swoją" to jedna literówka
+ * w `replaceDatabaseName`, a bramka `integration-tests/setup.js` tego nie
+ * widziała, bo jej nośnikiem był sufiks `TEST_TYPE` (`unit` go nie ma).
+ *
+ * Wzorzec jest ten sam, co w siostrzanych suitach `modules/gp-core/__tests__/`
+ * (`gp-core-rls-endpoint-coverage`, `gp-core-customer-scoping-coverage`): jedna
+ * dedykowana zmienna, a jej brak = `describe.skip` z komunikatem, NIGDY
+ * połączenie z czymkolwiek.
+ */
+const BASE_DATABASE_URL = process.env.GP_CORE_RLS_TEST_DATABASE_URL
+const maybeDescribe = BASE_DATABASE_URL ? describe : describe.skip
+
+if (!BASE_DATABASE_URL) {
+  console.warn(
+    "NEEDS-LIVE-RUN: gp_core schema/service suite skipped; set GP_CORE_RLS_TEST_DATABASE_URL " +
+      "to an ISOLATED Postgres (the suite recreates the `gp_core` schema and the `gp_core_test` database)."
+  )
+}
+
+const TEST_DATABASE_URL = BASE_DATABASE_URL
+  ? replaceDatabaseName(BASE_DATABASE_URL, "gp_core_test")
+  : ""
+const ADMIN_DATABASE_URL = BASE_DATABASE_URL
+  ? replaceDatabaseName(BASE_DATABASE_URL, "postgres")
+  : ""
 
 let adminPool: Pool
 let testPool: Pool
@@ -88,7 +118,7 @@ async function resetDatabase() {
   )
 }
 
-describe("gp_core schema and service", () => {
+maybeDescribe("gp_core schema and service", () => {
   beforeAll(async () => {
     adminPool = new Pool({ connectionString: ADMIN_DATABASE_URL })
     await ensureTestDatabase()

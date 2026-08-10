@@ -39,10 +39,31 @@ function replaceDatabaseName(databaseUrl: string, databaseName: string): string 
   return parsed.toString()
 }
 
-const BASE_DATABASE_URL =
-  process.env.DATABASE_URL || "postgres://postgres:postgres@localhost:5432/gp_mercur"
-const TEST_DATABASE_URL = replaceDatabaseName(BASE_DATABASE_URL, "gp_core_test")
-const ADMIN_DATABASE_URL = replaceDatabaseName(BASE_DATABASE_URL, "postgres")
+/**
+ * IZOLACJA BAZY — adres bierze sie WYLACZNIE z dedykowanej zmiennej.
+ *
+ * Patrz `modules/gp-core.unit.spec.ts`: fallback `process.env.DATABASE_URL ||
+ * "postgres://…/gp_mercur"` byl cichym siegnieciem po SERWER deweloperski
+ * (host/port/poswiadczenia bazy roboczej), a suita wykonuje `DROP SCHEMA` i
+ * zaklada baze przez `CREATE DATABASE`. Brak zmiennej = `describe.skip`
+ * z komunikatem, nigdy polaczenie z czymkolwiek.
+ */
+const BASE_DATABASE_URL = process.env.GP_CORE_RLS_TEST_DATABASE_URL
+const maybeDescribe = BASE_DATABASE_URL ? describe : describe.skip
+
+if (!BASE_DATABASE_URL) {
+  console.warn(
+    "NEEDS-LIVE-RUN: gp_core market lifecycle eventing suite skipped; set GP_CORE_RLS_TEST_DATABASE_URL " +
+      "to an ISOLATED Postgres (the suite recreates the `gp_core` schema and the `gp_core_test` database)."
+  )
+}
+
+const TEST_DATABASE_URL = BASE_DATABASE_URL
+  ? replaceDatabaseName(BASE_DATABASE_URL, "gp_core_test")
+  : ""
+const ADMIN_DATABASE_URL = BASE_DATABASE_URL
+  ? replaceDatabaseName(BASE_DATABASE_URL, "postgres")
+  : ""
 
 let adminPool: Pool
 let testPool: Pool
@@ -75,7 +96,7 @@ async function resetDatabase() {
   await testPool.query(sql)
 }
 
-describe("gp_core market lifecycle eventing", () => {
+maybeDescribe("gp_core market lifecycle eventing", () => {
   beforeAll(async () => {
     adminPool = new Pool({ connectionString: ADMIN_DATABASE_URL })
     await ensureTestDatabase()
