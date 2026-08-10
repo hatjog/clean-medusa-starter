@@ -245,15 +245,21 @@ maybeDescribe("AD-4 — metryka baru i materializacja czytają to samo body", ()
 // ---------------------------------------------------------------------------
 
 /**
- * `.env.test` backendu ustawia `DATABASE_URL=` (puste), więc pusta wartość
- * musi znaczyć „brak DB", nie „połącz się z niczym". `GP_CONTENT_PARITY_DATABASE_URL`
- * jest jawnym wejściem dla przebiegu po materializacji.
+ * ADRES BAZY TYLKO Z DEDYKOWANEJ ZMIENNEJ (DW-15-138).
+ *
+ * Do 2026-08-10 stało tu `GP_CONTENT_PARITY_DATABASE_URL || DATABASE_URL || ""`
+ * z komentarzem „`.env.test` backendu ustawia `DATABASE_URL=` (puste)". Pomiar
+ * z tej daty pokazał, że TO NIEPRAWDA: w zwykłym `pnpm test:unit` `DATABASE_URL`
+ * JEST ustawione (na bazę deweloperską `gp_mercur`), więc ta gałąź łączyła się
+ * z bazą roboczą dewelopera przy KAŻDYM przebiegu testów jednostkowych — cicho,
+ * bo nikt jej tej bazy nie wskazał. Odczyt jest read-only, więc nie kasował
+ * danych, ale nośnik jest tej samej klasy co ten, który dwa razy skasował dane
+ * z `gp_mercur` (incydenty 2026-08-09 i 2026-08-10).
+ *
+ * `GP_CONTENT_PARITY_DATABASE_URL` jest jedynym wejściem dla przebiegu po
+ * materializacji; jego brak = `describe.skip`, nigdy połączenie z czymkolwiek.
  */
-const parityDbUrl = (
-  process.env.GP_CONTENT_PARITY_DATABASE_URL ||
-  process.env.DATABASE_URL ||
-  ""
-).trim()
+const parityDbUrl = (process.env.GP_CONTENT_PARITY_DATABASE_URL || "").trim()
 
 const maybeDbDescribe = marketI18nDir && fs.existsSync(marketI18nDir) && parityDbUrl
   ? describe

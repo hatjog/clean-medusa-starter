@@ -10,33 +10,101 @@ if (process.env.DATABASE_URL) {
 }
 
 /**
- * BRAMKA IZOLACJI BAZY — reguła przestaje być komentarzem.
+ * BRAMKA IZOLACJI BAZY — DWIE WARSTWY, DWA NIEZALEŻNE NOŚNIKI.
  *
- * Siedem suit PG (`*-pg`) oraz `stripe-multi-order` ZAKŁADAJĄ I KASUJĄ tabele:
- * `vendor_replay_guard`, `messaging_dispatch_barrier`,
- * `money_path_compensation_failure`, tabele modułu voucher. Każda z nich niesie
- * w `jest.config.js` zdanie „DATABASE_URL musi wskazywać IZOLOWANĄ DB testową".
+ * Historia: suity PG (`*-pg`) oraz `stripe-multi-order` ZAKŁADAJĄ I KASUJĄ
+ * tabele (`vendor_replay_guard`, `messaging_dispatch_barrier`,
+ * `money_path_compensation_failure`, tabele modułu voucher). Każda niesie
+ * w `jest.config.js` zdanie „DATABASE_URL musi wskazywać IZOLOWANĄ DB testową",
+ * a do 2026-08-09 było to zdanie i nic więcej. Skutek zmierzony na maszynie PO:
+ * przebiegi z domyślnym `DATABASE_URL` skasowały z `gp_mercur` cztery tabele
+ * (dwie z nich to nośniki ścieżki pieniędzy) i wyczyściły `entitlement_instance`
+ * (15 → 0) oraz `seller` (9 → 2). Rejestr migracji nadal twierdził, że tabele
+ * istnieją, więc żadne `db:migrate` ich nie przywracało.
  *
- * Do 2026-08-09 było to zdanie i nic więcej — żaden kod tego nie sprawdzał.
- * Skutek zmierzony na maszynie PO: przebiegi odpalone z domyślnym
- * `DATABASE_URL` skasowały z `gp_mercur` cztery tabele (dwie z nich to nośniki
- * ścieżki pieniędzy: rejestr alarmów kompensacji i bariera dostawy), a przy
- * okazji wyczyściły `entitlement_instance` (15 → 0) i `seller` (9 → 2).
- * Rejestr migracji nadal twierdził, że tabele istnieją, więc żadne
- * `db:migrate` ich nie przywracało — odtwarzanie szło ręcznie, cztery razy.
+ * ── WARSTWA A (nazwa profilu, `TEST_TYPE`) ────────────────────────────────────
+ * Zachowana bez zmian: `-pg` / `stripe-multi-order` + `DATABASE_URL` = twarde
+ * sprawdzenie nazwy bazy PRZED jakimkolwiek połączeniem. Broni suit, które
+ * deklarują w profilu, że kasują tabele.
  *
- * DLACZEGO KONWENCJA `-pg`, A NIE LISTA: przepisana lista typów byłaby DRUGĄ
- * KOPIĄ zakresu obok `jest.config.js` i rozjechałaby się przy pierwszej nowej
- * suicie. Sufiks `-pg` niosą dziś WSZYSTKIE siedem suit kasujących tabele,
- * więc nowa suita PG jest objęta bramką automatycznie, bez edycji tego pliku.
- * `stripe-multi-order` jest jedynym wyjątkiem spoza konwencji (gate ADR-166).
+ * ── DLACZEGO WARSTWA A NIE WYSTARCZA (incydent 2026-08-10) ───────────────────
+ * Poprzednia wersja tego komentarza twierdziła: „sufiks `-pg` niosą dziś
+ * WSZYSTKIE siedem suit kasujących tabele". TO BYŁO NIEPRAWDĄ i kosztowało
+ * drugi incydent. Pod profilem `TEST_TYPE=unit` biegły suity, które łączyły się
+ * z realnym Postgresem i wykonywały `DROP SCHEMA` / `DROP TABLE`
+ * (`packages/api/src/__tests__/modules/gp-core.unit.spec.ts` i `…gp-core-events…`).
+ * Brały adres z `process.env.DATABASE_URL || "postgres://…/gp_mercur"`. Pomiar
+ * 2026-08-10: w zwykłym `pnpm test:unit` `DATABASE_URL` JEST ustawione i wskazuje
+ * bazę roboczą `gp_mercur` (plik `.env.test` istnieje, ale jest PUSTY, więc
+ * `loadEnv("test")` nie przesłania niczego) — a gdyby było puste, wchodziłby
+ * hardkodowany fallback na ten sam serwer. Obie drogi kończyły się połączeniem
+ * z Postgresem dewelopera, na którym suita zakładała bazę przez `CREATE DATABASE`
+ * i wykonywała `DROP`. Nazwa profilu nie jest więc nośnikiem faktu „ta suita
+ * sięga po bazę"; nośnikiem jest DOPIERO REALNE POŁĄCZENIE.
  *
- * Bramka jest TWARDA (rzuca przed jakimkolwiek połączeniem), bo cichy przebieg
- * na złej bazie kasuje dane bez śladu. Jedyne przejście to JAWNY opt-out.
+ * Ta sama klasa, zmierzona przy okazji: `scripts/__tests__/`
+ * `content-bar-metric-truth-parity.unit.spec.ts` miała fallback
+ * `GP_CONTENT_PARITY_DATABASE_URL || DATABASE_URL` i przy KAŻDYM `pnpm test:unit`
+ * czytała z `gp_mercur`. Odczyt był read-only, więc nic nie skasował — ale nośnik
+ * był ten sam. Naprawiony razem z tą bramką.
+ *
+ * ── WARSTWA B (realne połączenie, niezależna od `TEST_TYPE`) ─────────────────
+ * Bramka nie może rzucać na starcie każdego przebiegu, bo `test:unit` jest
+ * w większości bezbazowy i zieleń bezbazowych suit ma zostać zielenią. Dlatego
+ * warstwa B nie sprawdza NICZEGO przy starcie — instaluje kontrolę w
+ * `Client.prototype.connect` sterownika `pg`. To jedyne miejsce, przez które
+ * przechodzi KAŻDE połączenie: `new Client(...)`, `new Pool(...)` (pula tworzy
+ * klientów) oraz `knex({ client: "pg" })` (dialekt pg używa tego samego
+ * sterownika). Warunek jest sprawdzany dokładnie wtedy, gdy coś REALNIE sięga
+ * po połączenie — bezbazowa suita nigdy go nie dotyka.
+ *
+ * Reguła warstwy B: baza docelowa musi WYGLĄDAĆ NA TESTOWĄ (człon `test`
+ * w nazwie), być bazą utrzymaniową (`postgres` — bez niej nie da się założyć
+ * izolowanej bazy testowej), być wymieniona w `GP_TEST_DATABASE_NAMES` albo
+ * przebieg musi nieść JAWNY opt-out `GP_ALLOW_NON_TEST_DB=1`. Wszystko inne
+ * (w tym `gp_mercur`, `gp_core`, `gp_portal`) jest odmową Z NAZWANĄ BAZĄ.
+ *
+ * Obie warstwy są TWARDE (rzucają), bo cichy przebieg na złej bazie kasuje dane
+ * bez śladu, a jedyny ślad w logu — zielona suita — wygląda identycznie jak
+ * przebieg poprawny.
  */
 const TEST_TYPE = process.env.TEST_TYPE ?? ""
 const requiresIsolatedDb = /-pg$/.test(TEST_TYPE) || TEST_TYPE === "stripe-multi-order"
 
+/** Nazwy dopuszczone jawnie przez środowisko (np. baza szablonowa CI). */
+function extraAllowedDatabaseNames() {
+	return (process.env.GP_TEST_DATABASE_NAMES ?? "")
+		.split(",")
+		.map((entry) => entry.trim())
+		.filter(Boolean)
+}
+
+/**
+ * Czy nazwa bazy deklaruje, że baza jest do skasowania?
+ *
+ * Człon `test` musi być ODDZIELNYM członem nazwy (`gp_core_test`, `test`,
+ * `test-db`), a nie podciągiem — inaczej `contest_prod` przechodziłby bramkę.
+ */
+function looksLikeTestDatabase(dbName) {
+	return (
+		/(^|[_.-])test([_.-]|$)/i.test(dbName) ||
+		EPHEMERAL_MEDUSA_DB.test(dbName) ||
+		extraAllowedDatabaseNames().includes(dbName)
+	)
+}
+
+/**
+ * Baza jednorazowa `@medusajs/test-utils`. `medusaIntegrationTestRunner` /
+ * `moduleIntegrationTestRunner` budują nazwę jako
+ * `medusa-<modul>-integration-<JEST_WORKER_ID>` (patrz `medusa-test-runner.js`),
+ * zakładają ją i kasują w obrębie przebiegu. Nazwa nie niesie członu `test`,
+ * więc bez tego wyjątku warstwa B zablokowałaby `test:integration:http`
+ * i `test:integration:modules` — czyli bramka zabijałaby izolację zamiast jej
+ * bronić. Wzorzec jest WĄSKI i przypięty do generatora nazw z test-utils.
+ */
+const EPHEMERAL_MEDUSA_DB = /^medusa-[a-z0-9._-]*integration-\d+$/i
+
+// ── WARSTWA A ────────────────────────────────────────────────────────────────
 if (requiresIsolatedDb && process.env.DATABASE_URL) {
 	if (process.env.GP_ALLOW_NON_TEST_DB === "1") {
 		// Pominięcie ZADEKLAROWANE jest dopuszczalne; ciche nie jest.
@@ -48,11 +116,7 @@ if (requiresIsolatedDb && process.env.DATABASE_URL) {
 		// Nazwa bazy jest jedynym nośnikiem, jaki mamy przed połączeniem.
 		// Dodatkowe nazwy (np. baza szablonowa CI) idą przez zmienną, żeby nie
 		// trzeba było ruszać tego pliku.
-		const extraAllowed = (process.env.GP_TEST_DATABASE_NAMES ?? "")
-			.split(",")
-			.map((entry) => entry.trim())
-			.filter(Boolean)
-		const isTestDb = /_test$/.test(dbName) || extraAllowed.includes(dbName)
+		const isTestDb = /_test$/.test(dbName) || extraAllowedDatabaseNames().includes(dbName)
 
 		if (!isTestDb) {
 			throw new Error(
@@ -65,6 +129,63 @@ if (requiresIsolatedDb && process.env.DATABASE_URL) {
 					`Swiadome pominiecie (wiesz, ze ta baza jest do skasowania): GP_ALLOW_NON_TEST_DB=1`
 			)
 		}
+	}
+}
+
+// ── WARSTWA B ────────────────────────────────────────────────────────────────
+/**
+ * Bazy utrzymaniowe: połączenie do `postgres` jest JEDYNYM sposobem, w jaki
+ * suita może założyć albo skasować izolowaną bazę testową. Zablokowanie jej
+ * zablokowałoby sam mechanizm izolacji, którego ta bramka broni.
+ */
+const MAINTENANCE_DATABASES = new Set(["postgres", "template1"])
+
+function assertConnectionTargetIsIsolated(dbName, host) {
+	if (process.env.GP_ALLOW_NON_TEST_DB === "1") {
+		return
+	}
+	if (!dbName || MAINTENANCE_DATABASES.has(dbName) || looksLikeTestDatabase(dbName)) {
+		return
+	}
+
+	throw new Error(
+		`[test-db-guard] SUITA TESTOWA PROBUJE SIE POLACZYC Z BAZA '${dbName}' (host: ${host || "?"}), ` +
+			`ktora nie wyglada na testowa.\n` +
+			`Bramka nie patrzy juz na TEST_TYPE (=${TEST_TYPE || "<pusty>"}) — nazwa profilu NIE jest nosnikiem ` +
+			`faktu, ze suita siega po baze. 2026-08-09 i 2026-08-10 dwa razy skonczylo sie to skasowaniem ` +
+			`danych z bazy deweloperskiej przez suity biegnace pod profilem, ktory tego nie deklarowal.\n` +
+			`Testy dotykajace Postgresa maja brac adres z DEDYKOWANEJ zmiennej (wzorzec: ` +
+			`GP_CORE_RLS_TEST_DATABASE_URL) i POMIJAC sie, gdy jej nie ma — nigdy z fallbacku na DATABASE_URL.\n` +
+			`Wskaz izolowana baze (czlon 'test' w nazwie), dopisz nazwe do GP_TEST_DATABASE_NAMES ` +
+			`albo — jesli SWIADOMIE godzisz sie na utrate danych z '${dbName}' — ustaw GP_ALLOW_NON_TEST_DB=1.`
+	)
+}
+
+/**
+ * Punkt przechwycenia: `Client.prototype.connect`. Świadomie NIE opakowujemy
+ * konstruktorów `Pool`/`Client` — test może zbudować pulę i nigdy jej nie użyć
+ * (wtedy nie ma czego bronić), a `Pool` i tak schodzi do `Client.connect`.
+ * Dzięki temu jeden hak pokrywa `pg.Client`, `pg.Pool` i `knex({client:"pg"})`.
+ */
+try {
+	// eslint-disable-next-line @typescript-eslint/no-var-requires
+	const pg = require("pg")
+	if (pg && pg.Client && pg.Client.prototype && !pg.Client.prototype.__gpTestDbGuard) {
+		const originalConnect = pg.Client.prototype.connect
+		function guardedConnect(...args) {
+			const params = this.connectionParameters || {}
+			assertConnectionTargetIsIsolated(params.database, params.host)
+			return originalConnect.apply(this, args)
+		}
+		guardedConnect.__gpTestDbGuard = true
+		pg.Client.prototype.connect = guardedConnect
+		pg.Client.prototype.__gpTestDbGuard = true
+	}
+} catch (error) {
+	// Brak sterownika `pg` w tym workspace = nie ma czego przechwytywać. To NIE
+	// jest ciche pominięcie bramki: bez `pg` żadne połączenie i tak nie powstanie.
+	if (!error || error.code !== "MODULE_NOT_FOUND") {
+		throw error
 	}
 }
 
