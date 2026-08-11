@@ -689,6 +689,57 @@ export default class GpCoreService {
     )
   }
 
+  /**
+   * Producent mapowania `sprzedawca Mercura -> vendor GP` (v1.15.0, DW-15-173).
+   *
+   * == Dlaczego to musialo powstac ==
+   * `resolveVendorId` czytal `gp_core.vendor_seller_mappings` od Story 5.x, a jego
+   * wlasny komentarz twierdzil, ze „mapowanie istnieje w bazie od poczatku". Nie
+   * istnialo: jedyne `INSERT`-y do tej tabeli w calym repo lezaly w PLIKU TESTOWYM,
+   * ktory zaklada sobie wlasne wiersze. Zmierzone 2026-08-11 na zywym stacku —
+   * tabela PUSTA, a `GET /vendor/vouchers/<kod>/lookup` z panelu konczyl sie
+   * `403 VENDOR_NOT_MAPPED` dla KAZDEGO sprzedawcy. Uprzaz dostarczala dokladnie
+   * to, czego brakowalo produkcji, i przez to ukrywala brak.
+   *
+   * == Skad bierze sie `vendor_id` ==
+   * NIE z nowej kolumny i NIE z nazwy wyswietlanej. Identyfikator vendora GP jest
+   * DETERMINISTYCZNA funkcja klucza konfiguracyjnego (`buildSeedVendorId`), a tym
+   * kluczem jest slug salonu — ta sama wartosc, ktora niesie `vendors[].vendor_id`
+   * w konfiguracji rynku i `handle` sprzedawcy w Mercurze. Lacznik wiec juz
+   * istnial; brakowalo wylacznie zapisu relacji.
+   *
+   * Klucz `(instance_id, mercur_seller_id)` jest unikalny, wiec ponowny przebieg
+   * synchronizacji jest idempotentny, a przepiecie sprzedawcy na innego vendora
+   * jest AKTUALIZACJA, nie duplikatem.
+   */
+  // market_id = admin-cross-market: mapowanie vendor<->seller jest konfiguracja cross-market (AR44 §admin-exclusion)
+  async upsertVendorSellerMapping(
+    input: { instance_id: string; vendor_key: string; mercur_seller_id: string },
+    client?: Queryable
+  ): Promise<{ vendor_id: string; action: "created" | "updated" }> {
+    const vendorId = this.buildSeedVendorId(input.instance_id, input.vendor_key)
+    const row = await this.queryOne<{ vendor_id: string; inserted: boolean }>(
+      client ?? this.getCorePool(),
+      `
+        INSERT INTO gp_core.vendor_seller_mappings (instance_id, vendor_id, mercur_seller_id, sync_status, synced_at)
+        VALUES ($1, $2, $3, 'SYNCED', now())
+        ON CONFLICT (instance_id, mercur_seller_id)
+        DO UPDATE
+        SET vendor_id = EXCLUDED.vendor_id,
+            sync_status = 'SYNCED',
+            synced_at = now()
+        RETURNING vendor_id, (xmax = 0) AS inserted
+      `,
+      [input.instance_id, vendorId, input.mercur_seller_id]
+    )
+    if (!row) {
+      throw new Error(
+        `Failed to upsert vendor-seller mapping for '${input.vendor_key}' -> '${input.mercur_seller_id}'`
+      )
+    }
+    return { vendor_id: row.vendor_id, action: row.inserted ? "created" : "updated" }
+  }
+
   buildSeedVendorId(instanceId: string, vendorKey: string): string {
     return deterministicUuid(`vendor:${instanceId}:${vendorKey}`)
   }
