@@ -47,6 +47,13 @@ export type CanaryMetricName = (typeof CANARY_METRIC_NAMES)[number];
 export interface CanaryEnvelope {
   request_id: string;
   market_id: string;
+  /**
+   * v1.15.0 Story 6.2 (AC2, AD-25): srodowisko i instancja pomiaru.
+   * Bez nich metryka z `gp-dev` i metryka z `gp-test` sa w odbiorze nieodroznialne,
+   * a AD-25 mowi wprost, ze artefakt jednego srodowiska nie jest dowodem dla innego.
+   */
+  env: string;
+  instance_id: string;
   /** Masked via `maskActorId()` — SHA-256 + per-env salt, truncated to 16 hex. */
   actor_id: string;
   event_type: string;
@@ -150,6 +157,8 @@ export const emitCanaryMetric = (event: CanaryMetricEvent): void => {
     properties: {
       request_id: event.request_id,
       market_id: event.market_id,
+      env: event.env,
+      instance_id: event.instance_id,
       actor_id: event.actor_id,
       event_type: event.event_type,
       outcome: event.outcome,
@@ -250,6 +259,8 @@ export const emitForensicEvent = (event: ForensicEvent): void => {
     properties: {
       request_id: event.request_id,
       market_id: event.market_id,
+      env: event.env,
+      instance_id: event.instance_id,
       actor_id: event.actor_id,
       event_type: event.event_type,
       outcome: event.outcome,

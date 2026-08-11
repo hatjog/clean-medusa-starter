@@ -88,9 +88,23 @@ beforeEach(() => {
   __resetSentryMirrorForTests();
 });
 
-describe("CANARY_METRIC_NAMES — 7 metrics declared", () => {
-  test("exactly 7 canonical metrics", () => {
-    expect(CANARY_METRIC_NAMES).toHaveLength(7);
+describe("CANARY_METRIC_NAMES — kanoniczny ZBIOR metryk", () => {
+  // v1.15.0 Story 6.2: asercja szla po LICZNIKU (`toHaveLength(7)`), wiec dolozenie serii
+  // czerwienilo ja bez powiedzenia KTOREJ. Licznik przepuszcza tez podmiane nazwy przy
+  // zachowanej liczbie. Porownanie ZBIORAMI NAZW mowi wprost, co doszlo i co znikło —
+  // to jest ta sama zasada, ktora repo stosuje do pomiaru regresji testow.
+  test("zbior nazw jest dokladnie taki, jak zadeklarowany", () => {
+    expect([...CANARY_METRIC_NAMES].sort()).toEqual(
+      [
+        "audit_log_write_rate",
+        "cart_settlement_rate",
+        "flag_state_transition_counter",
+        "mor_policy_evaluation_latency_p95",
+        "vendor_offer_capacity_utilization",
+        "voucher_dispatch_success_rate",
+        "voucher_pii_consent_completion_rate",
+      ].sort(),
+    );
   });
 
   test("includes all required metric names per Story 1.4 scope #2", () => {
@@ -146,6 +160,8 @@ describe("emitCanaryMetric — AR-25 envelope (AC-CANARY-1.4-01)", () => {
     emitCanaryMetric({
       request_id: "req-1",
       market_id: "bonbeauty",
+      env: "test",
+      instance_id: "gp-test",
       actor_id: maskActorId("user-1"),
       event_type: "canary.metric",
       outcome: "pass",
@@ -157,6 +173,8 @@ describe("emitCanaryMetric — AR-25 envelope (AC-CANARY-1.4-01)", () => {
     expect(stub.calls[0].properties).toMatchObject({
       request_id: "req-1",
       market_id: "bonbeauty",
+      env: "test",
+      instance_id: "gp-test",
       event_type: "canary.metric",
       outcome: "pass",
       metric_name: "voucher_dispatch_success_rate",
@@ -169,6 +187,8 @@ describe("emitCanaryMetric — AR-25 envelope (AC-CANARY-1.4-01)", () => {
       emitCanaryMetric({
         request_id: "req-1",
         market_id: "bonbeauty",
+        env: "test",
+        instance_id: "gp-test",
         actor_id: "abc",
         event_type: "canary.metric",
         outcome: "pass",
@@ -191,6 +211,8 @@ describe("emitCanaryAlert — Sentry mirror + suppression (AC-CANARY-1.4-03 + 04
     const alert: CanaryAlertEvent = {
       request_id: "req-2",
       market_id: "bonbeauty",
+      env: "test",
+      instance_id: "gp-test",
       actor_id: "abc",
       event_type: "canary.alert",
       outcome: "fail",
@@ -222,6 +244,8 @@ describe("emitCanaryAlert — Sentry mirror + suppression (AC-CANARY-1.4-03 + 04
     emitCanaryAlert({
       request_id: "req-3",
       market_id: "bonbeauty",
+      env: "test",
+      instance_id: "gp-test",
       actor_id: "abc",
       event_type: "canary.alert",
       outcome: "fail",
@@ -248,6 +272,8 @@ describe("emitCanaryAlert — Sentry mirror + suppression (AC-CANARY-1.4-03 + 04
     emitCanaryAlert({
       request_id: "req-4",
       market_id: "bonbeauty",
+      env: "test",
+      instance_id: "gp-test",
       actor_id: "abc",
       event_type: "canary.alert",
       outcome: "fail",
@@ -274,6 +300,8 @@ describe("emitCanaryAlert — Sentry mirror + suppression (AC-CANARY-1.4-03 + 04
     const result = emitCanaryAlert({
       request_id: "req-5",
       market_id: "bonbeauty",
+      env: "test",
+      instance_id: "gp-test",
       actor_id: "abc",
       event_type: "canary.alert",
       outcome: "fail",
@@ -303,6 +331,8 @@ describe("emitForensicEvent — 3 NEW events (AC-CANARY-1.4-05)", () => {
   const baseEnvelope = {
     request_id: "req-f-1",
     market_id: "bonbeauty",
+    env: "test",
+    instance_id: "gp-test",
     actor_id: maskActorId("user-z"),
     event_type: "forensic.replay",
     outcome: "pass" as const,
@@ -325,6 +355,8 @@ describe("emitForensicEvent — 3 NEW events (AC-CANARY-1.4-05)", () => {
     expect(stub.calls[0].properties).toMatchObject({
       request_id: "req-f-1",
       market_id: "bonbeauty",
+      env: "test",
+      instance_id: "gp-test",
       event_type: "forensic.replay",
       outcome: "pass",
       recipient_id: "rec-123",
@@ -383,6 +415,8 @@ describe("track() — PII refusal at runtime (Risk #3)", () => {
       trackMetric({
         request_id: "req-1",
         market_id: "bonbeauty",
+        env: "test",
+        instance_id: "gp-test",
         actor_id: "abc",
         event_type: "canary.metric",
         outcome: "pass",
@@ -399,6 +433,8 @@ describe("track() — PII refusal at runtime (Risk #3)", () => {
       trackMetric({
         request_id: "req-1",
         market_id: "bonbeauty",
+        env: "test",
+        instance_id: "gp-test",
         actor_id: "abc",
         event_type: "canary.metric",
         outcome: "pass",
@@ -415,6 +451,8 @@ describe("track() — PII refusal at runtime (Risk #3)", () => {
       trackMetric({
         request_id: "req-1",
         market_id: "bonbeauty",
+        env: "test",
+        instance_id: "gp-test",
         actor_id: "abc",
         event_type: "canary.metric",
         outcome: "pass",
@@ -431,6 +469,8 @@ describe("track() — PII refusal at runtime (Risk #3)", () => {
       trackMetric({
         request_id: "req-1",
         market_id: "bonbeauty",
+        env: "test",
+        instance_id: "gp-test",
         event_type: "canary.metric",
         outcome: "pass",
         metric_name: "voucher_dispatch_success_rate",
@@ -444,6 +484,8 @@ describe("track() — PII refusal at runtime (Risk #3)", () => {
       trackForensic({
         request_id: "req-1",
         market_id: "bonbeauty",
+        env: "test",
+        instance_id: "gp-test",
         actor_id: "abc",
         event_type: "forensic.replay",
         outcome: "pass",
@@ -458,6 +500,8 @@ describe("track() — PII refusal at runtime (Risk #3)", () => {
       trackMetric({
         request_id: "req-1",
         market_id: "bonbeauty",
+        env: "test",
+        instance_id: "gp-test",
         actor_id: maskActorId("u-1"),
         event_type: "canary.metric",
         outcome: "pass",
@@ -491,6 +535,8 @@ describe("trackAlert returns suppressed for low sample", () => {
     const result = trackAlert({
       request_id: "req-1",
       market_id: "bonbeauty",
+      env: "test",
+      instance_id: "gp-test",
       actor_id: "abc",
       event_type: "canary.alert",
       outcome: "fail",
@@ -510,15 +556,20 @@ describe("trackAlert returns suppressed for low sample", () => {
 
 describe("buildEnvelope helper", () => {
   test("masks actor_id automatically", () => {
+    // Story 6.2: `env`/`instance_id` NIE sa wejsciem — koperta rozwiazuje je sama,
+    // zeby nie dalo sie ich pominac. Tu podajemy jawny kontekst wykonania.
     const env = buildEnvelope({
       request_id: "req-1",
       market_id: "bonbeauty",
       raw_actor_id: "user-12345",
       event_type: "canary.metric",
       outcome: "pass",
+      measurement_env: { GP_ENV: "test", GP_INSTANCE_ID: "gp-test" } as NodeJS.ProcessEnv,
     });
     expect(env.actor_id).toMatch(/^[0-9a-f]{16}$/);
     expect(env.actor_id).not.toBe("user-12345");
+    expect(env.env).toBe("test");
+    expect(env.instance_id).toBe("gp-test");
   });
 });
 
@@ -604,6 +655,8 @@ describe("integration: full alert flow with Sentry sink wired", () => {
     emitCanaryAlert({
       request_id: "req-int-1",
       market_id: "bonbeauty",
+      env: "test",
+      instance_id: "gp-test",
       actor_id: maskActorId("user-1"),
       event_type: "canary.alert",
       outcome: "fail",
@@ -641,6 +694,8 @@ describe("integration: full alert flow with Sentry sink wired", () => {
     emitCanaryAlert({
       request_id: "req-1",
       market_id: "bonbeauty",
+      env: "test",
+      instance_id: "gp-test",
       actor_id: "abc",
       event_type: "canary.alert",
       outcome: "fail",
