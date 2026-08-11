@@ -1689,6 +1689,22 @@ export default async function voucherDeliveryReconciliationSweepJob(
       },
       marketLocales: createMarketLocalesReader(sql, logger),
       logger,
+      // AD-25 — kontekst pomiaru. Bez tego pola `reserveDispatch` ODMAWIA
+      // rezerwacji (`VOUCHER_DELIVERY_MEASUREMENT_CONTEXT_REQUIRED`), więc sweep
+      // wykrywał lukę, meldował „dosyłka przez ścieżkę subscribera" i za każdym
+      // razem odbijał się od własnego braku kontekstu — czyli siatka gwarancji
+      // nie działała DOKŁADNIE w przypadku, dla którego istnieje.
+      //
+      // Zmierzone 2026-08-11 na `gp_mercur`: zakup opłacony (490 zł
+      // przechwycone), dwa vouchery wystawione, `voucher_delivery_dispatch`
+      // PUSTE, a w logu dwa razy `error_code:
+      // VOUCHER_DELIVERY_MEASUREMENT_CONTEXT_REQUIRED` — po jednym na
+      // entitlement. Kupująca nie dostała maila z kodami.
+      //
+      // Ścieżka subscribera przekazywała `env: process.env` od początku; różniły
+      // się więc DWA miejsca budujące te same zależności, a pole było
+      // opcjonalne, więc kompilator nie miał czego pilnować. Jest już wymagane.
+      env: process.env,
     }
 
     await runVoucherDeliveryReconciliationSweep({

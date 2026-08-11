@@ -12,6 +12,7 @@
 import { Modules } from "@medusajs/framework/utils"
 
 import {
+  CART_PROOF_HEADER,
   extractOrderId,
   upstreamOrderAccessGuardMiddleware,
 } from "../../api/middlewares/upstream-order-access-guard"
@@ -23,6 +24,8 @@ function makeReq(options: {
   path?: string
   customerId?: string | null
   cartId?: string
+  /** Dowód podany NAGŁÓWKIEM — jedyny kanał drożny na trasie core. */
+  cartProofHeader?: string
   orderCustomerId?: string | null
   orderMissing?: boolean
   cartProducedOrder?: boolean
@@ -31,6 +34,7 @@ function makeReq(options: {
     orderId = "ord_1",
     customerId = null,
     cartId,
+    cartProofHeader,
     orderCustomerId = null,
     orderMissing = false,
     cartProducedOrder = false,
@@ -40,6 +44,8 @@ function makeReq(options: {
     params: { id: orderId },
     path: options.path ?? `/store/orders/${orderId}`,
     query: cartId === undefined ? {} : { cart_id: cartId },
+    headers:
+      cartProofHeader === undefined ? {} : { [CART_PROOF_HEADER]: cartProofHeader },
     auth_context: customerId ? { actor_id: customerId } : undefined,
     scope: {
       resolve: (key: string) => {
@@ -107,6 +113,43 @@ describe("upstreamOrderAccessGuardMiddleware", () => {
     const out = await run(makeReq({ cartId: "cart_obcy", cartProducedOrder: false }))
     expect(out.passed).toBe(false)
     expect(out.status).toBe(401)
+  })
+
+  // ── Kanal NAGLOWKOWY (2026-08-11) ────────────────────────────────────────
+  //
+  // UWAGA co do zasiegu tych trzech testow: budują `req` w pamieci, wiec
+  // mierza PARSOWANIE dowodu, a NIE jego drozność. Poprzednia wersja bramki
+  // przechodzila te same testy na zielono, bedac martwa w dzialaniu:
+  // `/store/orders/:id` to trasa core, a jej `validateAndTransformQuery`
+  // odrzucalo `?cart_id=` kodem 400, zanim middleware cokolwiek zobaczylo.
+  // Dowodem drozności jest pomiar na zywym stacku, nie ten plik.
+  it("gosc z dowodem w NAGLOWKU przechodzi (kanal drozny na trasie core)", async () => {
+    const out = await run(
+      makeReq({ cartProofHeader: "cart_1", cartProducedOrder: true }),
+    )
+    expect(out.passed).toBe(true)
+  })
+
+  it("naglowek z CUDZYM koszykiem nadal daje 401 — kanal nie jest fail-open", async () => {
+    const out = await run(
+      makeReq({ cartProofHeader: "cart_obcy", cartProducedOrder: false }),
+    )
+    expect(out.passed).toBe(false)
+    expect(out.status).toBe(401)
+  })
+
+  it("naglowek przyjmuje LISTE koszykow — cookie trzyma do trzech ostatnich", async () => {
+    // `setCompletedCartId` po stronie storefrontu dopisuje kolejne zakupy zamiast
+    // nadpisywac, wiec po drugim zakupie w tej samej przegladarce dowod jest
+    // lista. Obciecie jej do pierwszego wpisu odbieraloby dostep do zamowienia
+    // poprzedniego — realny scenariusz przy platnosci asynchronicznej.
+    const out = await run(
+      makeReq({
+        cartProofHeader: "cart_poprzedni,cart_1",
+        cartProducedOrder: true,
+      }),
+    )
+    expect(out.passed).toBe(true)
   })
 
   it("zalogowana z CUDZYM zamowieniem dostaje 404, nie 403", async () => {
