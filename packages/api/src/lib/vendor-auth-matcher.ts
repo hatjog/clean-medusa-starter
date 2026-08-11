@@ -48,6 +48,35 @@ export type VendorHmacExemption = {
  * does not hold (and must never hold) a server-to-server signing secret. Each
  * entry still names a transport, so an exemption can never mean "unauthenticated".
  */
+/**
+ * Trasy `/vendor/*` NALEZACE DO GP — jedyne, ktore ta bramka ma prawo strzec.
+ *
+ * == Dlaczego ta lista w ogole powstala (v1.15.0, DW-15-171) ==
+ * Do tej zmiany bramka stala przed KAZDYM `/vendor/*`, czyli takze przed calym
+ * upstreamowym API Mercura. Zmierzone 2026-08-11: GP ma tu SZESC wlasnych tras,
+ * z czego piec bylo juz zwolnionych — bramka strzegla wiec realnie JEDNEJ trasy
+ * (`/vendor/training-cert/upload`), a przy okazji odrzucala 21 roznych tras
+ * potrzebnych panelowi do wyrenderowania jednego ekranu. Upstream ma WLASNE
+ * uwierzytelnienie (`authenticate("member", [session, bearer])` + `ensureSellerMiddleware`
+ * weryfikujacy czlonkostwo w `seller_member`), wiec podpis S2S nic tam nie dodawal
+ * poza wylaczeniem panelu.
+ *
+ * == Co ZOSTAJE z niezmiennika ADR-194 ==
+ * „Nowa trasa GP nie jest cicho otwarta" obowiazuje dalej i jest MOCNIEJSZE niz
+ * przedtem: ta lista jest LUSTREM systemu plikow (`api/vendor/**\/route.ts`), a
+ * `assert_auth_transport.py` czerwieni sie w OBIE strony — trasa GP spoza listy
+ * jest bledem, wpis bez pliku jest bledem. Wczesniej domyslnosc brala sie
+ * z prefiksu sciezki, wiec obejmowala tez cudze trasy i nikt tego nie mierzyl.
+ */
+export const VENDOR_GP_OWNED_ROUTES: readonly string[] = [
+  "/vendor/auth/sessions",
+  "/vendor/competitive-insights",
+  "/vendor/magic-links/:jti/revoke",
+  "/vendor/training-cert/upload",
+  "/vendor/vouchers/:code/lookup",
+  "/vendor/vouchers/:code/redeem",
+]
+
 export const VENDOR_HMAC_EXEMPT_ROUTES: readonly VendorHmacExemption[] = [
   {
     matcher: "/vendor/auth/sessions",
@@ -122,6 +151,15 @@ export function vendorRequestPath(req: Pick<MedusaRequest, "originalUrl"> & { ur
   return withoutQuery.length > 1 ? withoutQuery.replace(/\/+$/, "") : withoutQuery
 }
 
+const GP_OWNED_PATTERNS: readonly RegExp[] = VENDOR_GP_OWNED_ROUTES.map((matcher) =>
+  exemptionToRegExp(matcher)
+)
+
+/** True when the path is a route THIS repo owns (and therefore may gate). */
+export function isVendorGpOwnedRoute(path: string): boolean {
+  return GP_OWNED_PATTERNS.some((pattern) => pattern.test(path))
+}
+
 /** True when the path is on the named exemption list (browser transports). */
 export function isVendorHmacExempt(path: string): boolean {
   return EXEMPT_PATTERNS.some((pattern) => pattern.test(path))
@@ -139,7 +177,13 @@ export async function vendorHmacGateMiddleware(
   res: MedusaResponse,
   next: MedusaNextFunction
 ): Promise<void> {
-  if (isVendorHmacExempt(vendorRequestPath(req))) {
+  const path = vendorRequestPath(req)
+
+  // Trasa spoza wlasnosci GP nie jest tu bramkowana — uwierzytelnia ja upstream.
+  // Bramkowanie cudzej powierzchni nie dodawalo ochrony, tylko wylaczalo panel
+  // (DW-15-171). Trasa GP z nazwanym transportem przegladarkowym idzie dalej
+  // z tego samego powodu co przedtem.
+  if (!isVendorGpOwnedRoute(path) || isVendorHmacExempt(path)) {
     next()
     return
   }

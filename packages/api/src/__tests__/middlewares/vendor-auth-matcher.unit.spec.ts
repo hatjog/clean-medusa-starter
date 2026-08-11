@@ -17,7 +17,9 @@ import { describe, it, expect, jest, beforeEach, afterEach } from "@jest/globals
 import { buildVendorSignatureHeader } from "../../lib/vendor-hmac"
 import {
   VENDOR_HMAC_EXEMPT_ROUTES,
+  VENDOR_GP_OWNED_ROUTES,
   VENDOR_HMAC_MATCHER,
+  isVendorGpOwnedRoute,
   isVendorHmacExempt,
   vendorHmacGateMiddleware,
   vendorRequestPath,
@@ -32,7 +34,10 @@ const SELLER_ID = "seller-matcher-uuid"
 const SECRET = "per-seller-secret-for-the-matcher-suite"
 
 /** A path that appears in NO inventory and NO exemption list. */
-const NEW_ROUTE = "/vendor/payouts"
+// DW-15-171: bramka strzeze WLASNOSCI GP, nie prefiksu. `/vendor/payouts` jest
+// trasa UPSTREAMU i od tej zmiany nie jest przez GP bramkowana — jako przyklad
+// trasy bramkowanej sluzy jedyna realna trasa S2S tego repo.
+const NEW_ROUTE = "/vendor/training-cert/upload"
 
 let guardDb: ReturnType<typeof createReplayGuardTestDb>
 
@@ -151,11 +156,18 @@ describe("AC4 — a NEW /vendor/* route is unreachable without a signature", () 
     expect(req.vendorAuth?.vendor_id).toBe(`vendor-of-${SELLER_ID}`)
   })
 
-  it("a nested path under the new route is covered too, not just its root", async () => {
+  it("sciezka spoza listy tras GP NIE jest bramkowana — nosnikiem domyslnosci jest walidator", async () => {
+    // Zmiana wzgledem ADR-194 sprzed amendmentu i jedyny jej koszt: runtime nie
+    // odroznia NOWEJ trasy GP od trasy upstreamu po samej sciezce, wiec sciezka
+    // nieznana przechodzi. Niezmiennik „nowa trasa GP nie jest cicho otwarta"
+    // egzekwuje `assert_auth_transport.py` (severity: blocking, profil pre-push),
+    // porownujac `VENDOR_GP_OWNED_ROUTES` z plikami `api/vendor/**\/route.ts`
+    // w OBIE strony. Ta asercja pinuje wlasnie te granice, zeby nikt jej nie
+    // przekroczyl przez przypadek.
     const { res, handler } = await throughGate(buildReq(`${NEW_ROUTE}/2026-08/export`))
 
-    expect(res.statusCode).toBe(401)
-    expect(handler).toHaveBeenCalledTimes(0)
+    expect(res.statusCode).toBe(200)
+    expect(handler).toHaveBeenCalledTimes(1)
   })
 
   it("refusal carries no new oracle: the body names a code and nothing else", async () => {
@@ -181,13 +193,15 @@ describe("AC3 — exempt routes are named, and they do not regress", () => {
     }
   })
 
-  it("exemptions are matched on the FULL path, not on a prefix", async () => {
-    // `/vendor/auth/sessions/steal` must not inherit the exemption of
-    // `/vendor/auth/sessions`. Prefix matching is how exemption lists rot open.
-    const { res, handler } = await throughGate(buildReq("/vendor/auth/sessions/steal"))
-
-    expect(res.statusCode).toBe(401)
-    expect(handler).toHaveBeenCalledTimes(0)
+  it("exemptions are matched on the FULL path, not on a prefix", () => {
+    // `/vendor/auth/sessions/steal` nie moze dziedziczyc zwolnienia
+    // `/vendor/auth/sessions` — dopasowanie po prefiksie jest sposobem, w jaki
+    // listy zwolnien gnija na otwarto. Po DW-15-171 asercja idzie po PREDYKATACH,
+    // a nie po przebiegu przez bramke: taka sciezka nie jest trasa GP w ogole,
+    // wiec bramka nie jest tu obronca — obronca jest router, ktory zwraca 404.
+    expect(isVendorHmacExempt("/vendor/auth/sessions")).toBe(true)
+    expect(isVendorHmacExempt("/vendor/auth/sessions/steal")).toBe(false)
+    expect(isVendorGpOwnedRoute("/vendor/auth/sessions/steal")).toBe(false)
   })
 
   it("the exemption decision reads the ORIGINAL url, not a mounted-relative path", async () => {
@@ -198,6 +212,33 @@ describe("AC3 — exempt routes are named, and they do not regress", () => {
     )
     expect(isVendorHmacExempt("/vendor/auth/sessions")).toBe(true)
     expect(isVendorHmacExempt(NEW_ROUTE)).toBe(false)
+  })
+
+  // DW-15-171: bramka strzeze WLASNOSCI GP, nie prefiksu sciezki. Upstreamowa
+  // powierzchnia Mercura ma wlasne uwierzytelnienie; bramkowanie jej odrzucalo
+  // 21 roznych tras potrzebnych panelowi do wyrenderowania jednego ekranu.
+  it("trasy upstreamu NIE sa bramkowane przez GP", () => {
+    expect(isVendorGpOwnedRoute("/vendor/sellers")).toBe(false)
+    expect(isVendorGpOwnedRoute("/vendor/sellers/me")).toBe(false)
+    expect(isVendorGpOwnedRoute("/vendor/orders")).toBe(false)
+    expect(isVendorGpOwnedRoute("/vendor/products")).toBe(false)
+  })
+
+  // Kontrola przeciwna: niezmiennik ADR-194 zostaje. Trasa NALEZACA DO GP bez
+  // nazwanego transportu przegladarkowego jest bramkowana — takze taka, ktorej
+  // nikt jeszcze nie widzial (NEW_ROUTE lezy pod `/vendor/`, ale nie jest nasza,
+  // wiec osobno pinujemy realna trase GP).
+  it("trasa GP bez zwolnienia pozostaje bramkowana", () => {
+    expect(isVendorGpOwnedRoute("/vendor/training-cert/upload")).toBe(true)
+    expect(isVendorHmacExempt("/vendor/training-cert/upload")).toBe(false)
+  })
+
+  it("kazde zwolnienie dotyczy trasy NALEZACEJ DO GP", () => {
+    // Zwolnienie cudzej trasy jest niewyrazalne z definicji: nie ma czego
+    // zwalniac, skoro bramka jej nie dotyka. Ta asercja trzyma obie listy w zgodzie.
+    for (const exemption of VENDOR_HMAC_EXEMPT_ROUTES) {
+      expect(VENDOR_GP_OWNED_ROUTES).toContain(exemption.matcher)
+    }
   })
 
   it("the matcher constant still covers /vendor/*", () => {
