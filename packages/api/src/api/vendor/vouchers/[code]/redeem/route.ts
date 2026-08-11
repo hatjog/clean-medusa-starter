@@ -79,6 +79,12 @@ import {
   type VoucherStatus,
   resolveRedeemRefusalReason,
 } from "../../../../../modules/voucher"
+import {
+  emitRedemptionHotPathMetrics,
+  type RedemptionMetricsSink,
+} from "../../../../../lib/instrumentation/redemption-hot-path"
+import { maskActorId } from "../../../../../lib/instrumentation/posthog-canary"
+import { resolveMeasurementContext } from "../../../../../lib/instrumentation/track"
 import { REDEEM_REFUSALS } from "../../../../../modules/voucher/models/types"
 import { VOUCHER_NOT_FOUND_BODY } from "../lookup/route"
 import {
@@ -201,6 +207,74 @@ function earliestClaimedAt(
 }
 
 export const POST = async (
+  req: RequestWithSellerContext,
+  res: MedusaResponse,
+): Promise<void> => {
+  // v1.15.0 Story 6.2 (AC1, NFR-11): GRANICA POMIARU jest zdefiniowana TUTAJ
+  // i jest jedna: `t0` = wejscie handlera, `t1` = moment, w ktorym zadanie ma
+  // stan terminalny (odpowiedz wyslana). Bez zapisanej granicy „czas realizacji"
+  // da sie policzyc na cztery sposoby, a kazdy dalby inny percentyl.
+  //
+  // Emisja siedzi w `finally`, wiec obejmuje KAZDE z wyjsc tej trasy — takze
+  // odmowy i wyjatki. Instrumentacja NIE zmienia logiki decyzyjnej: nie czyta
+  // niczego, co wplywa na wynik, i nie moze go wywrocic (brak nosnika jest
+  // stanem `carrier_unavailable`, nie wyjatkiem).
+  const hotPathStartedAt = Date.now()
+  try {
+    await handleRedeemRequest(req, res)
+  } finally {
+    emitHotPathMetrics(req, res, hotPathStartedAt)
+  }
+}
+
+/**
+ * Emisja metryk sciezki goracej. Zadna jej porazka nie moze zepsuc realizacji
+ * vouchera — telemetria jest obserwacja, nie czescia sciezki pieniadza.
+ */
+const emitHotPathMetrics = (
+  req: RequestWithSellerContext,
+  res: MedusaResponse,
+  startedAt: number,
+): void => {
+  try {
+    const sink = (() => {
+      try {
+        return req.scope.resolve("posthog") as RedemptionMetricsSink
+      } catch {
+        return null
+      }
+    })()
+
+    const context = resolveMeasurementContext()
+    const status = res.statusCode
+
+    emitRedemptionHotPathMetrics({
+      sink,
+      labels: {
+        request_id: readIdempotencyKeyHeader(req) ?? "unknown",
+        market_id: (req as { gp_market_id?: string }).gp_market_id ?? "unknown",
+        env: context.env,
+        instance_id: context.instance_id,
+        actor_id: maskActorId(req.seller_context?.seller_id ?? "anonymous"),
+      },
+      outcome: {
+        duration_ms: Date.now() - startedAt,
+        succeeded: status >= 200 && status < 300,
+        http_status: status,
+        refusal_code:
+          status >= 200 && status < 300
+            ? null
+            : ((res as unknown as { gp_refusal_code?: string }).gp_refusal_code ?? null),
+      },
+    })
+  } catch {
+    // Swiadomie polkniete: metryka, ktora wywraca realizacje vouchera, jest
+    // gorsza niz brak metryki. Brak kontekstu pomiaru (AD-25) jest tu jedynym
+    // realnym zrodlem wyjatku i zostaje zglosony przez brak serii, nie przez 500.
+  }
+}
+
+const handleRedeemRequest = async (
   req: RequestWithSellerContext,
   res: MedusaResponse,
 ): Promise<void> => {

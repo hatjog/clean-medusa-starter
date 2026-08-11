@@ -105,7 +105,18 @@ const _assertEnvelope = (
   payload: Record<string, unknown>,
   origin: string
 ): void => {
-  const required = ["request_id", "market_id", "actor_id", "event_type", "outcome"];
+  // v1.15.0 Story 6.2 (AC2, AD-25): `env` i `instance_id` sa czescia KONTRAKTU koperty,
+  // nie dodatkiem. Runtime guard stoi obok typu, bo typ nie chroni granicy modulu —
+  // zdarzenie zlozone recznie w innym pakiecie przeszloby `tsc` i doleciało bez etykiet.
+  const required = [
+    "request_id",
+    "market_id",
+    "env",
+    "instance_id",
+    "actor_id",
+    "event_type",
+    "outcome",
+  ];
   for (const field of required) {
     const value = payload[field];
     if (typeof value !== "string" || value.length === 0) {
@@ -180,8 +191,66 @@ export const trackForensic = <T extends ForensicEvent>(event: Track<T>): void =>
 };
 
 /**
+ * Blad kontekstu pomiaru (v1.15.0 Story 6.2 / AC2, AD-25).
+ *
+ * Nazwany, bo brak `env`/`instance_id` NIE JEST usterka techniczna do zalogowania —
+ * jest stanem, w ktorym metryka nie da sie przypisac do srodowiska, a AD-25 mowi
+ * wprost, ze artefakt jednego srodowiska nie jest dowodem dla innego.
+ */
+export class MeasurementContextError extends Error {
+  readonly error_code = "INSTRUMENTATION_MEASUREMENT_CONTEXT_REQUIRED";
+}
+
+/**
+ * Kontekst pomiaru dla koperty (AD-25): `env` + `instance_id`.
+ *
+ * == Dlaczego to NIE MA wartosci domyslnej ==
+ * Domyslka zamienilaby „nie wiadomo, z jakiego srodowiska" na „z tego, co akurat
+ * czyta konsument" — czyli wyprodukowalaby metryke wygladajaca na przypisana.
+ * Odmowa jest glosna (AC2, kontrola negatywna).
+ *
+ * == Dlaczego ten sam ksztalt co w Story 4.8 ==
+ * `resolveDeliveryMeasurementContext` (`subscribers/voucher-purchase-delivery.ts`)
+ * rozstrzyga dokladnie to samo dla sciezki dostawy — z ta sama normalizacja
+ * (`development` -> `dev`, `production` -> `prod`) i ta sama zasada fail-closed.
+ * Drugi ksztalt na to samo pytanie bylby drugim zrodlem prawdy.
+ */
+export const resolveMeasurementContext = (
+  env: NodeJS.ProcessEnv | undefined = process.env,
+): { env: string; instance_id: string } => {
+  const nonEmpty = (value: string | undefined): string | undefined => {
+    const trimmed = typeof value === "string" ? value.trim() : "";
+    return trimmed.length > 0 ? trimmed : undefined;
+  };
+
+  const instanceId = nonEmpty(env?.GP_INSTANCE_ID);
+  const rawEnvironment = nonEmpty(env?.GP_ENV) ?? nonEmpty(env?.NODE_ENV);
+  const normalizedEnvironment =
+    rawEnvironment === "development"
+      ? "dev"
+      : rawEnvironment === "production"
+        ? "prod"
+        : rawEnvironment;
+
+  if (!instanceId || !normalizedEnvironment) {
+    throw new MeasurementContextError(
+      "env i instance_id musza pochodzic z jawnego kontekstu wykonania (AD-25); " +
+        "metryka bez nich nie da sie przypisac do srodowiska",
+    );
+  }
+
+  return { env: normalizedEnvironment, instance_id: instanceId };
+};
+
+/**
  * Convenience helper: build an envelope with a freshly masked actor_id.
  * Callers should prefer this over manually constructing the envelope.
+ *
+ * v1.15.0 Story 6.2 (AC2, AD-25): koperta niesie ROWNIEZ `env` i `instance_id`.
+ * Zmierzone przed ta story: nie niosla ich wcale, wiec metryka z `gp-dev` i metryka
+ * z `gp-test` byly w odbiorze nieodroznialne. Pola sa rozwiazywane TUTAJ, a nie
+ * przekazywane przez wywolujacego — inaczej byloby to pole opcjonalne, ktorego nikt
+ * nie podaje, czyli nosnik bez konsumenta (ta sama klasa co AI-15-2.1).
  */
 export const buildEnvelope = (input: {
   request_id: string;
@@ -189,19 +258,28 @@ export const buildEnvelope = (input: {
   raw_actor_id: string;
   event_type: string;
   outcome: "pass" | "fail" | "skipped" | "suppressed" | "info";
+  /** Wylacznie do testow / jawnego kontekstu; produkcyjnie czytane z `process.env`. */
+  measurement_env?: NodeJS.ProcessEnv;
 }): {
   request_id: string;
   market_id: string;
   actor_id: string;
   event_type: string;
   outcome: "pass" | "fail" | "skipped" | "suppressed" | "info";
-} => ({
-  request_id: input.request_id,
-  market_id: input.market_id,
-  actor_id: maskActorId(input.raw_actor_id),
-  event_type: input.event_type,
-  outcome: input.outcome,
-});
+  env: string;
+  instance_id: string;
+} => {
+  const context = resolveMeasurementContext(input.measurement_env);
+  return {
+    request_id: input.request_id,
+    market_id: input.market_id,
+    actor_id: maskActorId(input.raw_actor_id),
+    event_type: input.event_type,
+    outcome: input.outcome,
+    env: context.env,
+    instance_id: context.instance_id,
+  };
+};
 
 /** Re-export for callers building forensic events. */
 export type { ForensicEventName };
