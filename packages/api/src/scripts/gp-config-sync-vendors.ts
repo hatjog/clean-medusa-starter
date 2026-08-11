@@ -14,6 +14,8 @@ import path from "node:path"
 
 import * as yaml from "js-yaml"
 
+import { GP_CORE_MODULE } from "../modules/gp-core"
+
 import {
   computeFieldDiffs,
   DryRunCollector,
@@ -165,6 +167,8 @@ export type SyncSummary = {
   instance_id: string
   market_id: string
   vendors: { created: number; updated: number; skipped: number }
+  vendor_seller_mappings: { created: number; updated: number; failed: number }
+  vendor_seller_mapping_failures: Array<{ vendor_id: string; seller_id: string; reason: string }>
   spl: { created: number; skipped: number; missing_products: number; pruned: number }
   stale_sellers: { inactivated: number; skipped: number }
   spl_details: SplDetail[]
@@ -1302,6 +1306,17 @@ export default async function gpConfigSyncVendors({ container, args }: ExecArgs)
   ])
   const productListFn = resolveProductListFn(productModuleService)
   const db = container.resolve(ContainerRegistrationKeys.PG_CONNECTION)
+  // DW-15-173: `db` to polaczenie do bazy Mercura; mapowanie zyje w OSOBNEJ bazie
+  // (`gp_core`), wiec producent idzie przez modul, ktory jest jej wlascicielem.
+  let gpCoreService: any = null
+  let gpCoreResolveError: string | null = null
+  if (!dryRun) {
+    try {
+      gpCoreService = container.resolve(GP_CORE_MODULE)
+    } catch (error) {
+      gpCoreResolveError = error instanceof Error ? error.message : String(error)
+    }
+  }
 
   let splService: any = null
   let splServiceResolveError: string | null = null
@@ -1336,6 +1351,11 @@ export default async function gpConfigSyncVendors({ container, args }: ExecArgs)
   const vendorOverwritten: VendorContentOverwrite[] = []
 
   const vendorCounts = { created: 0, updated: 0, skipped: 0 }
+  // DW-15-173: mapowanie sprzedawca Mercura -> vendor GP. Liczone OSOBNO od
+  // sprzedawcow, bo „sprzedawca zsynchronizowany" i „sprzedawca zmapowany" to
+  // dwa rozne stany — a przez cale wydanie mylily sie w jeden.
+  const mappingCounts = { created: 0, updated: 0, failed: 0 }
+  const mappingFailures: Array<{ vendor_id: string; seller_id: string; reason: string }> = []
   const splCounts = { created: 0, skipped: 0, missing_products: 0, pruned: 0 }
   const staleSellerCounts = { inactivated: 0, skipped: 0 }
   const splDetails: SplDetail[] = []
@@ -1445,6 +1465,41 @@ export default async function gpConfigSyncVendors({ container, args }: ExecArgs)
       if (result.action === "created") vendorCounts.created++
       else if (result.action === "updated") vendorCounts.updated++
       else vendorCounts.skipped++
+
+      // DW-15-173: relacja sprzedawca->vendor zapisywana TU, bo to jedyne miejsce
+      // znajace jednoczesnie klucz konfiguracyjny (`vendor.vendor_id`) i identyfikator
+      // sprzedawcy nadany przez Mercura (`result.sellerId`). Bez tego zapisu kazde
+      // zadanie `/vendor/*` konczy sie `403 VENDOR_NOT_MAPPED` — dla WSZYSTKICH.
+      if (!dryRun && result.sellerId) {
+        if (!gpCoreService) {
+          mappingCounts.failed++
+          mappingFailures.push({
+            vendor_id: vendor.vendor_id,
+            seller_id: result.sellerId,
+            reason: `gp_core module unavailable: ${gpCoreResolveError ?? "unknown"}`,
+          })
+        } else {
+          try {
+            const mapping = await gpCoreService.upsertVendorSellerMapping({
+              instance_id: instanceId,
+              vendor_key: vendor.vendor_id,
+              mercur_seller_id: result.sellerId,
+            })
+            if (mapping.action === "created") mappingCounts.created++
+            else mappingCounts.updated++
+          } catch (error) {
+            // Odmowa NIE jest cicha i NIE wywraca calej synchronizacji: brak wiersza
+            // w `gp_core.vendors` dla tego klucza jest naruszeniem klucza obcego i ma
+            // byc NAZWANY, a nie zamieniony w brakujace mapowanie odkryte w dniu bramki.
+            mappingCounts.failed++
+            mappingFailures.push({
+              vendor_id: vendor.vendor_id,
+              seller_id: result.sellerId,
+              reason: error instanceof Error ? error.message : String(error),
+            })
+          }
+        }
+      }
 
       if (dryRun && collector) {
         collector.add({
@@ -1777,6 +1832,11 @@ export default async function gpConfigSyncVendors({ container, args }: ExecArgs)
     instance_id: instanceId,
     market_id: marketId,
     vendors: vendorCounts,
+    // DW-15-173: mapowanie jest OSOBNYM kanalem wyniku, nie przypisem do sprzedawcow.
+    // „Zsynchronizowany sprzedawca bez mapowania" jest stanem, ktory przez cale
+    // wydanie wygladal na sukces, a konczyl sie `403` przy pierwszym zadaniu z panelu.
+    vendor_seller_mappings: mappingCounts,
+    vendor_seller_mapping_failures: mappingFailures,
     spl: splCounts,
     stale_sellers: staleSellerCounts,
     spl_details: splDetails,
