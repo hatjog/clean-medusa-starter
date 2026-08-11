@@ -50,10 +50,18 @@
  * (H-8).
  */
 import type { SubscriberArgs, SubscriberConfig } from "@medusajs/framework"
-import { ContainerRegistrationKeys } from "@medusajs/framework/utils"
+import { ContainerRegistrationKeys, Modules } from "@medusajs/framework/utils"
 
 import { toKnexPositionalSql } from "../lib/knex-positional-sql"
 import { STRIPE_PATH_Y_WEBHOOK_PROVIDER } from "../lib/payment/stripe-payment-intent-transport"
+import {
+  buildGenesisActiveTransition,
+  emitTransitionEventAfterCommit,
+  wireEntitlementTransitionPersisted,
+  ENTITLEMENT_STATE_CHANGED_EVENT_TYPE,
+  type TransitionAuditEnvelope,
+  type TransitionEventEnvelope,
+} from "../modules/voucher/entitlement-transition-wiring"
 import {
   issueEntitlementsForAllLineItems,
   MissingEntitlementProfileError,
@@ -408,7 +416,13 @@ export default async function onOrderPlacedStripeRetry({
   const scope = container as unknown as { resolve: (key: string) => unknown }
   const db = resolveDb(scope)
 
+  const eventBus = resolveEventBus(scope)
+
   for (const orderId of orderIds) {
+    // Zdarzenia zbierane W transakcji, emitowane DOPIERO po commicie —
+    // wewnętrzny emit zostawiłby phantom-event przy rollbacku (KONTRAKT
+    // ATOMOWOŚCI w `entitlement-transition-wiring`).
+    const transitionEvents: TransitionEventEnvelope[] = []
     try {
       await withTransaction(db, async (client) => {
         const deferred = await findDeferredCapturesForOrder(client, orderId)
@@ -433,6 +447,47 @@ export default async function onOrderPlacedStripeRetry({
               new Date()
             )
             await markDeferredResolved(client, row.event_id, orderId, new Date())
+
+            // AD-7 — geneza ACTIVE przez TEN SAM punkt okablowania co ścieżka
+            // webhooka (`stripe-payment-audit`). Bez tego odzysk wystawiał
+            // uprawnienia i NIE ZAWIADAMIAŁ nikogo: `voucher-purchase-delivery`
+            // słucha wyłącznie `entitlement_state_changed`, więc mail czekał na
+            // sweep rekonsyliacyjny — 30 min karencji plus kwadransowa kadencja.
+            //
+            // A ta ścieżka NIE jest wyjątkiem: webhook Stripe'a kończy się 503
+            // (`link_unresolved` — payment intent nie niesie `order_id`
+            // w metadanych) przy KAŻDYM zakupie kartą, zmierzone dwa razy
+            // 2026-08-11. Odzysk jest więc ścieżką normalną, a nie awaryjną.
+            //
+            // Wiring wołany WYŁĄCZNIE dla nowo utworzonych wierszy
+            // (`idempotent=false`) — powtórka nie re-audytuje i nie re-emituje.
+            const appendAudit = makeTransitionAuditSink(logger)
+            const issuedAt = new Date()
+            for (const issued of result.results) {
+              if (issued.idempotent) continue
+              const { event } = await wireEntitlementTransitionPersisted(
+                { appendAudit, clock: () => issuedAt },
+                buildGenesisActiveTransition({
+                  entitlement_id: issued.entitlement_id,
+                  scope: {
+                    instance_id: issued.entitlement_id,
+                    // Ten sam precedens defensywny co w ścieżce webhooka: brak
+                    // market_id nie może wywrócić transakcji biznesowej.
+                    market_id: row.market_id ?? "unknown",
+                    sales_channel_id: null,
+                    vendor_id: null,
+                    location_id: null,
+                  },
+                  actor: "system",
+                  actor_hint:
+                    "subscriber:on-order-placed-stripe-retry:deferred-issuance",
+                  occurred_at: issuedAt.toISOString(),
+                  transition_seq: issued.entitlement_id,
+                })
+              )
+              transitionEvents.push(event)
+            }
+
             logger.info?.(
               `[on-order-placed-stripe-retry] order_id=${orderId} ` +
                 `event_id=${row.event_id} retroactively issued ` +
@@ -485,7 +540,62 @@ export default async function onOrderPlacedStripeRetry({
       // Do NOT re-throw: a recovery-side failure must not crash the order.placed
       // event delivery and block other subscribers. The deferred row stays
       // marked, an operator can investigate via the audit envelope.
+      continue
     }
+
+    // POST-COMMIT. Emit jest best-effort i NIGDY nie failuje transakcji
+    // biznesowej (AD-7) — kompletność domyka sweep rekonsyliacyjny. Zysk jest
+    // w CZASIE: mail idzie od razu, zamiast czekać do ~45 minut na siatkę.
+    if (transitionEvents.length === 0) continue
+    let emitFailures = 0
+    for (const event of transitionEvents) {
+      const failed = await emitTransitionEventAfterCommit(async (envelope) => {
+        if (!eventBus) {
+          throw new Error(
+            "event bus niedostępny (emit best-effort — dogonienie: reconciliation sweep)"
+          )
+        }
+        await eventBus.emit({
+          name: ENTITLEMENT_STATE_CHANGED_EVENT_TYPE,
+          data: envelope,
+        })
+      }, event)
+      if (failed) emitFailures += 1
+    }
+    if (emitFailures > 0) {
+      logger.warn?.(
+        `[on-order-placed-stripe-retry] order_id=${orderId} ` +
+          `entitlement_state_changed emit_failed=${emitFailures}/${transitionEvents.length} ` +
+          `(best-effort; dogonienie = reconciliation sweep)`
+      )
+    }
+  }
+}
+
+type EventBusLike = {
+  emit: (event: { name: string; data: unknown }) => Promise<unknown>
+}
+
+/** Szyna zdarzeń (best-effort); `null`, gdy niedostępna — emit staje się no-opem. */
+function resolveEventBus(
+  scope: { resolve: (key: string) => unknown } | undefined
+): EventBusLike | null {
+  const resolver = scope?.resolve
+  if (typeof resolver !== "function") return null
+  try {
+    const bus = resolver.call(scope, Modules.EVENT_BUS) as EventBusLike | undefined
+    return bus && typeof bus.emit === "function" ? bus : null
+  } catch {
+    return null
+  }
+}
+
+/** Append-only sink audytu tranzycji — ten sam kształt co w `stripe-payment-audit`. */
+function makeTransitionAuditSink(
+  logger: LoggerLike
+): (audit: TransitionAuditEnvelope) => Promise<void> {
+  return async (audit) => {
+    logger.info?.(`[entitlement-transition-audit] ${JSON.stringify(audit)}`)
   }
 }
 
