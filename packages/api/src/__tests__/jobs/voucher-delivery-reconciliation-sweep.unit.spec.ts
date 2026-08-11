@@ -841,7 +841,20 @@ function makeHarness(options: HarnessOptions = {}) {
       },
     },
     logger,
-    env: { GP_STOREFRONT_URL_BONBEAUTY: "https://dev.bonbeauty.test" },
+    // Kontekst pomiaru (AD-25) — bez `GP_INSTANCE_ID` i `GP_ENV`
+    // `reserveDispatch` ODMAWIA rezerwacji wiersza
+    // (`VOUCHER_DELIVERY_MEASUREMENT_CONTEXT_REQUIRED`), więc uprząż odtwarzała
+    // produkcyjną awarię zamiast ją wykrywać: czterdzieści testów tego pliku —
+    // w tym „entitlement ISSUED bez wiersza dispatch → dokładnie jeden mail
+    // i jeden wiersz `sent`" — stało na czerwono, bo dosyłka nie mogła powstać.
+    // Zmierzone 2026-08-11: te same 40 czerwonych na czystym HEAD, przed
+    // jakąkolwiek zmianą w kodzie produkcyjnym. Czerwony pakiet przestał być
+    // czytany jako sygnał i defekt pojechał na żywy stack.
+    env: {
+      GP_STOREFRONT_URL_BONBEAUTY: "https://dev.bonbeauty.test",
+      GP_INSTANCE_ID: "gp-test",
+      GP_ENV: "test",
+    },
   }
 
   const deps: SweepDeps = {

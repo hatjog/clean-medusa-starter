@@ -389,7 +389,22 @@ export interface PurchaseDeliveryDeps {
   dispatcher: PurchaseDeliveryDispatcher
   marketLocales: MarketLocalesReader
   logger?: LoggerLike
-  env?: NodeJS.ProcessEnv
+  /**
+   * Kontekst pomiaru (AD-25) — WYMAGANY, nie opcjonalny.
+   *
+   * Z niego pochodzą `env` i `instance_id`, bez których `reserveDispatch`
+   * odmawia rezerwacji wiersza. Dopóki pole było opcjonalne, dwa miejsca
+   * budujące te same zależności różniły się w milczeniu: subscriber podawał
+   * `process.env`, a sweep rekonsyliacyjny nie podawał nic — i wysyłka padała
+   * na `VOUCHER_DELIVERY_MEASUREMENT_CONTEXT_REQUIRED` przy KAŻDEJ dosyłce,
+   * czyli siatka gwarancji nie działała w jedynym przypadku, dla którego
+   * istnieje (zmierzone 2026-08-11: zakup opłacony, vouchery wystawione,
+   * `voucher_delivery_dispatch` puste, mail niewysłany).
+   *
+   * Wymagalność jest tu BRAMKĄ: trzecie miejsce budujące te zależności nie
+   * skompiluje się bez jawnego kontekstu.
+   */
+  env: NodeJS.ProcessEnv
   /** Provider zapisywany do ledgera (audit korelacji), domyślnie `brevo`. */
   provider?: string
   /** Zegar — wstrzykiwalny dla testów progu staleness (`STALE_QUEUED_THRESHOLD_MS`). */

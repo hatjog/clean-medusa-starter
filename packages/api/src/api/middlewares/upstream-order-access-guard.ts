@@ -90,6 +90,44 @@ export function extractOrderId(req: MedusaRequest): string | null {
   return raw ? decodeURIComponent(raw).trim() || null : null
 }
 
+/**
+ * Nagłówek niosący dowód koszyka — JEDYNY kanał, który realnie dolatuje.
+ *
+ * Do 2026-08-11 dowód czytany był z `req.query.cart_id`. Ta bramka była przez to
+ * MARTWA na realnej ścieżce: `/store/orders/:id` jest trasą core, a jej
+ * `validateAndTransformQuery` odrzuca nieznane pola ZANIM middleware zdąży
+ * cokolwiek przeczytać. Zmierzone `curl`-em na żywym stacku 2026-08-11:
+ * `?cart_id=<poprawny>` i `?cart_id=<falszywy>` dają IDENTYCZNE `400
+ * Unrecognized fields: 'cart_id'`, a w logu backendu nie ma ani jednego
+ * `guest_order_access_granted`. Skutek: gość NIGDY nie odczytał swojego
+ * zamówienia — po zakupie kartą strona potwierdzenia pokazywała „Nie udało nam
+ * się teraz odczytać całego zakupu".
+ *
+ * Nagłówek zamiast query, bo walidator core nie dotyka nagłówków, więc kanał
+ * nie zależy od tego, którą wersję Medusy mamy zainstalowaną. Testy tej bramki
+ * budowały `req` wprost w pamięci (`query: { cart_id }`), więc nie mierzyły
+ * osiągalności ani przed zmianą, ani po niej — dowód reachability jest
+ * `curl`-em na żywym stacku i tak ma zostać.
+ */
+export const CART_PROOF_HEADER = "x-gp-cart-proof"
+
+/**
+ * Dowód koszyka z nagłówka, z zachowaniem `?cart_id=` jako kanału zapasowego.
+ *
+ * Query zostaje wyłącznie dla tras, na których działa (GP-owe
+ * `payment-status` i `entitlements` mają własną walidację i przyjmują je bez
+ * problemu) oraz dla testów jednostkowych. Na `/store/orders/:id` ten człon
+ * jest nieosiągalny i pozostaje tu jako jawny zapis tego faktu.
+ */
+function readCartProof(req: MedusaRequest): ReturnType<typeof parseCartProof> {
+  const header = req.headers?.[CART_PROOF_HEADER]
+  const raw = Array.isArray(header) ? header[0] : header
+  return (
+    parseCartProof(raw) ??
+    parseCartProof((req.query as Record<string, unknown> | undefined)?.cart_id)
+  )
+}
+
 export async function upstreamOrderAccessGuardMiddleware(
   req: MedusaRequest,
   res: MedusaResponse,
@@ -105,7 +143,7 @@ export async function upstreamOrderAccessGuardMiddleware(
 
   const logger = resolveLogger(req)
   const customerId = (req as AuthenticatedMedusaRequest).auth_context?.actor_id ?? null
-  const proof = parseCartProof((req.query as Record<string, unknown> | undefined)?.cart_id)
+  const proof = readCartProof(req)
 
   // Bez sesji I bez dowodu nie ma czego sprawdzać — odmawiamy ZANIM dotkniemy
   // bazy. To takze granica kosztu: nieuwierzytelniony ruch nie generuje zapytań.

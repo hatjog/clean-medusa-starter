@@ -9,6 +9,7 @@ import * as yaml from "js-yaml"
 
 import {
   FORCE_VENDOR_OVERWRITE_FLAG,
+  parseCliBooleanFlag,
   parseDryRunFlag,
   parseOverwriteFlag,
   parsePruneFlag,
@@ -146,7 +147,20 @@ export function parseOrchestratorArgs(args: string[] | undefined): OrchestratorA
   const prune = parsePruneFlag(args)
   const forceVendorOverwriteDecision = resolveForceVendorOverwriteRelay(args)
   const allowSkip = args?.includes("--allow-skip") === true
-  const apply = args?.includes("--apply") === true
+  // Intencja zapisu MUSI mieć kanał środowiskowy, tak jak `--dry-run`,
+  // `--overwrite` i `--prune` (wszystkie idą przez `parseCliBooleanFlag`).
+  //
+  // `medusa exec` gubi argumenty z myślnikiem, więc każde wywołanie przez tę
+  // powierzchnię — w tym `gp config sync` — miało `apply: false` NA STAŁE.
+  // `buildStageArgs` nie dokładał wtedy `--apply`, a etapy zależne od intencji
+  // (`sync-market-runtime`, `sync-reviews`) biegły w trybie próbnym i meldowały
+  // `ok`. Zmierzone 2026-08-11: pełna synchronizacja `gp config sync gp-dev
+  // bonbeauty` zwróciła `sync-market-runtime: ok` i `mutated: true`, a tabela
+  // `market_runtime_config` została PUSTA — przez co dostawa vouchera padała na
+  // `VOUCHER_DELIVERY_MARKET_RUNTIME_CONFIG_INCOMPLETE` i kupująca nie dostała
+  // maila z kodami. Cichy sukces etapu jest dokładnie tym trybem awarii, który
+  // ta rodzina zmian zamyka.
+  const apply = parseCliBooleanFlag(args, "--apply", "GP_SYNC_APPLY")
 
   if (!instanceId) throw new Error("instanceId is required (args[0] or GP_INSTANCE_ID)")
   if (!marketId) throw new Error("marketId is required (args[1] or GP_MARKET_ID)")
