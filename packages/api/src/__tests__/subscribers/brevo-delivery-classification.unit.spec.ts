@@ -8,6 +8,8 @@
  * do sinka), a nie nazwa zwrocona przez funkcje czysta.
  */
 
+import { ContainerRegistrationKeys } from "@medusajs/framework/utils"
+
 import brevoDeliveryTracker, {
   __resetBrevoDeliveryTrackerForTests,
 } from "../../subscribers/brevo-delivery-tracker"
@@ -31,9 +33,51 @@ import {
 
 type AuditEvent = Record<string, any>
 
-function makeContainer(dispatch: Record<string, unknown> | null = null) {
+/**
+ * DLACZEGO uprzaz modeluje hamulec sciezki pieniadza: commit `57de7b0` dolozyl w
+ * `brevo-delivery-tracker.ts` odczyt hamulca `fr_9_delivery_idempotency` z
+ * kontenera (klucz `__pg_connection__` = `ContainerRegistrationKeys.PG_CONNECTION`)
+ * i zaktualizowal SIOSTRZANA uprzaz `brevo-delivery-tracker.unit.spec.ts`, a tej
+ * nie ruszyl. Kontener, ktory rzuca na tym kluczu, daje czytnikowi zaslepke
+ * rzucajaca -> odczyt jest fail-closed -> hamulec `engaged` -> subscriber robi
+ * `return` PRZED `emitAuditEvent` i sink audytu zostaje pusty. Zaslepka ponizej
+ * jest wziete 1:1 z tamtej uprzezy (`brevo-delivery-tracker.unit.spec.ts:30-40`)
+ * — swiadomie JEDEN ksztalt atrapy, bo dwa rozjada sie przy nastepnej zmianie
+ * produkcyjnej.
+ */
+function makeBrakeDb(brakeState: "engaged" | "released" = "released") {
+  return {
+    // Rozgalezienie po TRESCI zapytania, nie catch-all — tak samo jak siostrzana
+    // uprzaz (`brevo-delivery-tracker.unit.spec.ts:617-633`). Catch-all zwracalby
+    // wiersz konfiguracji hamulca TAKZE na fallbackowe zapytanie o wiersz dostawy
+    // (`lookupDispatch`), a ono zrzutowaloby `{ money_path_brakes: ... }` na
+    // `DispatchRecord` — koperta dostalaby `dispatch_id: undefined`, a test
+    // przeszedlby na sfabrykowanym wierszu. Drut pulapkowy „nieznane zapytanie
+    // rzuca" zostaje wiec zachowany dla wszystkiego poza odczytem hamulca.
+    raw: jest.fn(async (sql: string) => {
+      if (typeof sql === "string" && sql.includes("market_runtime_config")) {
+        return {
+          rows: [
+            {
+              money_path_brakes: {
+                fr_9_delivery_idempotency: brakeState,
+              },
+            },
+          ],
+        }
+      }
+      throw new Error(`Unexpected SQL in brake stub: ${String(sql).slice(0, 80)}`)
+    }),
+  }
+}
+
+function makeContainer(
+  dispatch: Record<string, unknown> | null = null,
+  brakeState: "engaged" | "released" = "released",
+) {
   const auditEvents: AuditEvent[] = []
   const logger = { info: jest.fn(), warn: jest.fn(), error: jest.fn() }
+  const db = makeBrakeDb(brakeState)
   const resolve = jest.fn((key: string) => {
     if (key === "logger") return logger
     if (key === "notification_dispatches") {
@@ -46,9 +90,11 @@ function makeContainer(dispatch: Record<string, unknown> | null = null) {
         }),
       }
     }
+    // Hamulec ZWOLNIONY — inaczej sciezka konczy sie cichym `return` przed sinkiem.
+    if (key === ContainerRegistrationKeys.PG_CONNECTION) return db
     throw new Error(`Unknown container key: ${key}`)
   })
-  return { auditEvents, logger, container: { resolve } }
+  return { auditEvents, logger, db, container: { resolve } }
 }
 
 /** Realne wejscie subscribera — jedyna droga, ktora ten plik uznaje za dowod. */
@@ -553,6 +599,7 @@ describe("cykl 1 review — granica zaufania do ladunku dostawcy i sufity", () =
     const auditEvents: AuditEvent[] = []
     const logger = { info: jest.fn(), warn: jest.fn(), error: jest.fn() }
     const findByProviderMessageId = jest.fn(async () => dispatch)
+    const db = makeBrakeDb()
     const resolve = jest.fn((key: string) => {
       if (key === "logger") return logger
       if (key === "notification_dispatches") return { findByProviderMessageId }
@@ -563,9 +610,11 @@ describe("cykl 1 review — granica zaufania do ladunku dostawcy i sufity", () =
           }),
         }
       }
+      // Ta sama zaslepka hamulca co w `makeContainer` — druga fabryka miala te sama luke.
+      if (key === ContainerRegistrationKeys.PG_CONNECTION) return db
       throw new Error(`Unknown container key: ${key}`)
     })
-    return { auditEvents, logger, findByProviderMessageId, container: { resolve } }
+    return { auditEvents, logger, db, findByProviderMessageId, container: { resolve } }
   }
 
   it("AD-23 — `dispatch_id` z ladunku NIE zastepuje odczytu liczby prob z systemu", async () => {
@@ -677,5 +726,59 @@ describe("cykl 1 review — granica zaufania do ladunku dostawcy i sufity", () =
     expect(Number.isFinite(backoffDelayMs("blocked", 5_000)!)).toBe(true)
     // Ponizej sufitu polityka nadal rzadzi wartoscia.
     expect(backoffDelayMs("bounced_transient", 1)).toBe(120_000)
+  })
+})
+
+/**
+ * Hamulec ZACIAGNIETY — jedyny stan, jaki wystepuje w realnej konfiguracji.
+ *
+ * Zmierzone 2026-08-11: `fr_9_delivery_idempotency: engaged` w 10/10 plikow
+ * `GP/config/**\/markets/*\/market.yaml` (gp-dev i gp-test, wszystkie piec
+ * rynkow). Reszta tego pakietu modeluje `released`, czyli swiat, ktorego dzis
+ * nigdzie nie ma — bez ponizszego przypadku zaciagniety hamulec nie zapalilby
+ * w tym pliku ani jednej czerwieni, a to on rzadzi produkcja.
+ */
+describe("hamulec sciezki pieniadza — stan ZACIAGNIETY", () => {
+  it("engaged: zdarzenie NIE trafia do sinka audytu, a odczyt hamulca faktycznie nastapil", async () => {
+    const ctx = makeContainer(null, "engaged")
+
+    await run(
+      {
+        provider_id: "brevo",
+        provider_event_id: "pe-brake-engaged",
+        market_id: "pl",
+        dispatch_id: "dispatch-brake-engaged",
+        event_type: "hard_bounce",
+        occurred_at: "2026-08-06T10:00:00.000Z",
+        recipient_hash: "recipient-hash",
+      },
+      ctx.container,
+    )
+
+    // Cichy `return` PRZED `emitAuditEvent` — to jest zamierzone fail-closed.
+    expect(ctx.auditEvents).toHaveLength(0)
+    // ...ale odczyt hamulca MUSIAL sie odbyc. Bez tej asercji zniknieciecie
+    // odczytu z produkcji zostawiloby ten test zielony na pustym sinku.
+    expect(ctx.db.raw).toHaveBeenCalled()
+  })
+
+  it("KONTROLA DODATNIA: ten sam ladunek przy hamulcu ZWOLNIONYM trafia do sinka", async () => {
+    // Bez tej pary „pusty sink" nie odroznia hamulca od dowolnej innej awarii.
+    const ctx = makeContainer(null, "released")
+
+    await run(
+      {
+        provider_id: "brevo",
+        provider_event_id: "pe-brake-released",
+        market_id: "pl",
+        dispatch_id: "dispatch-brake-released",
+        event_type: "hard_bounce",
+        occurred_at: "2026-08-06T10:00:00.000Z",
+        recipient_hash: "recipient-hash",
+      },
+      ctx.container,
+    )
+
+    expect(ctx.auditEvents).toHaveLength(1)
   })
 })
