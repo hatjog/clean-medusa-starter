@@ -60,6 +60,7 @@
 import type { MedusaRequest, MedusaResponse } from "@medusajs/framework/http"
 import { ContainerRegistrationKeys } from "@medusajs/framework/utils"
 import type { Knex } from "knex"
+import { randomUUID } from "node:crypto"
 import {
   HttpMarketContextError,
   resolveSellerMarketId,
@@ -80,9 +81,13 @@ import {
   resolveRedeemRefusalReason,
 } from "../../../../../modules/voucher"
 import {
+  createRedemptionPosthogSink,
   emitRedemptionHotPathMetrics,
-  type RedemptionMetricsSink,
 } from "../../../../../lib/instrumentation/redemption-hot-path"
+import {
+  POSTHOG_CONTAINER_KEY,
+  type PosthogCaptureClient,
+} from "../../../../../lib/instrumentation/posthog-metrics-client"
 import { maskActorId } from "../../../../../lib/instrumentation/posthog-canary"
 import { resolveMeasurementContext } from "../../../../../lib/instrumentation/track"
 import { REDEEM_REFUSALS } from "../../../../../modules/voucher/models/types"
@@ -159,6 +164,13 @@ type VendorRedeemResponse = {
 const IDEMPOTENCY_KEY_HEADER = "idempotency-key"
 const IDEMPOTENCY_KEY_SHAPE = /^[A-Za-z0-9._:-]{8,200}$/
 
+/**
+ * Kod odmowy dla wyjatku, ktorego trasa NIE zmapowala na status (v1.15.0
+ * Story 6.2, review cyklu 1 F-2). Osobny literal, bo taka porazka nie jest
+ * odmowa domeny — jest awaria i ma byc rozroznialna w metryce.
+ */
+export const HOT_PATH_UNHANDLED_REFUSAL_CODE = "UNHANDLED_EXCEPTION" as const
+
 function readIdempotencyKeyHeader(req: MedusaRequest): string | null {
   const raw = (req.headers as Record<string, unknown> | undefined)?.[
     IDEMPOTENCY_KEY_HEADER
@@ -220,58 +232,186 @@ export const POST = async (
   // niczego, co wplywa na wynik, i nie moze go wywrocic (brak nosnika jest
   // stanem `carrier_unavailable`, nie wyjatkiem).
   const hotPathStartedAt = Date.now()
+  // review cyklu 1 (F-5): kod odmowy ma PRODUCENTA. Poprzednia wersja czytala
+  // `res.gp_refusal_code`, pole, ktorego w calym repo nikt nie ustawial — wiec
+  // etykieta `refusal_code` byla ZAWSZE `null`, takze przy odmowach (ta sama
+  // klasa co `DW-15-173`: czytelnik bez producenta). Zrodlem kodu jest cialo
+  // odpowiedzi, ktore trasa i tak wysyla: `{ code, ... }`. Podgladamy je na
+  // szwie `res.json`, wiec zrodlo jest jedno i obejmuje WSZYSTKIE osiem wyjsc
+  // (takze te spoza mapera bledow), bez rozsiewania zapisow po handlerze.
+  const refusal = observeRefusalCode(res)
+  // review cyklu 1 (F-2): wyjatek z handlera nie moze byc liczony jako SUKCES.
+  // `res.statusCode` ma w tym momencie domyslne 200 (status ustawia middleware
+  // bledow Medusy PO naszym `finally`), wiec pomiar bez tej flagi emitowal serie
+  // `success` z `http_status: 200` dla kazdej nieobsluzonej awarii — czyli byl
+  // slepy dokladnie na te klase porazek, ktora NFR-11 najbardziej ma widziec.
+  let handlerThrew = false
   try {
     await handleRedeemRequest(req, res)
+  } catch (error) {
+    handlerThrew = true
+    throw error
   } finally {
-    emitHotPathMetrics(req, res, hotPathStartedAt)
+    emitHotPathMetrics(req, res, hotPathStartedAt, {
+      handlerThrew,
+      refusalCode: refusal.code(),
+    })
   }
+}
+
+/** Kod odmowy z ciala odpowiedzi — jedno zrodlo dla wszystkich wyjsc trasy. */
+const observeRefusalCode = (res: MedusaResponse): { code: () => string | null } => {
+  let observed: string | null = null
+  const target = res as unknown as {
+    json?: (payload: unknown) => unknown
+  }
+  const original = target.json
+  if (typeof original === "function") {
+    target.json = function patchedJson(this: unknown, payload: unknown) {
+      const code = (payload as { code?: unknown } | null | undefined)?.code
+      if (typeof code === "string" && code.length > 0) observed = code
+      return original.call(this, payload)
+    }
+  }
+  return { code: () => observed }
+}
+
+/** JEDEN warn na proces — brak nosnika ma byc glosny, ale nie spamujacy. */
+let hotPathCarrierWarned = false
+let hotPathEmitFailureWarned = false
+
+const warnOnce = (
+  req: RequestWithSellerContext,
+  alreadyWarned: boolean,
+  message: string,
+  meta: Record<string, unknown>,
+): boolean => {
+  if (alreadyWarned) return true
+  let logger: { warn?: (message: string, meta?: unknown) => void } | undefined
+  try {
+    logger = req.scope.resolve(ContainerRegistrationKeys.LOGGER) as {
+      warn?: (message: string, meta?: unknown) => void
+    }
+  } catch {
+    logger = undefined
+  }
+  if (typeof logger?.warn === "function") logger.warn(message, meta)
+  // eslint-disable-next-line no-console
+  else console.warn(message, meta)
+  return true
 }
 
 /**
  * Emisja metryk sciezki goracej. Zadna jej porazka nie moze zepsuc realizacji
  * vouchera — telemetria jest obserwacja, nie czescia sciezki pieniadza.
+ *
+ * ALE cisza tez nie jest dopuszczalna (review cyklu 1, F-3): puste `catch {}`
+ * zamienialo „glosna odmowe" z AC2 w brak sladu, a brak serii jest
+ * NIEODROZNIALNY od braku ruchu. Kazda porazka emisji i kazdy brak nosnika
+ * zostawiaja `warn` (jeden na proces, wzorzec z `posthog-metrics-client`).
  */
 const emitHotPathMetrics = (
   req: RequestWithSellerContext,
   res: MedusaResponse,
   startedAt: number,
+  observed: { handlerThrew: boolean; refusalCode: string | null },
 ): void => {
   try {
-    const sink = (() => {
+    const client = (() => {
       try {
-        return req.scope.resolve("posthog") as RedemptionMetricsSink
+        return req.scope.resolve(POSTHOG_CONTAINER_KEY) as PosthogCaptureClient | null
       } catch {
         return null
       }
     })()
 
     const context = resolveMeasurementContext()
-    const status = res.statusCode
+    const actorId = maskActorId(req.seller_context?.seller_id ?? "anonymous")
+    // review cyklu 1 (F-1): klient z kontenera ma ksztalt `PosthogCaptureClient`
+    // (jeden obiekt z `distinctId`), a port nosnika bierze dwa argumenty.
+    // Adapter jest tu obowiazkowy — bez niego trasa nie emituje NICZEGO.
+    const sink = createRedemptionPosthogSink(client, actorId)
+    const succeeded =
+      !observed.handlerThrew && res.statusCode >= 200 && res.statusCode < 300
+    // Przy wyjatku `res.statusCode` klamie (domyslne 200) — miara musi wtedy
+    // powiedziec `500`, bo tyle wysle middleware bledow.
+    const status = observed.handlerThrew ? 500 : res.statusCode
 
-    emitRedemptionHotPathMetrics({
+    const result = emitRedemptionHotPathMetrics({
       sink,
       labels: {
-        request_id: readIdempotencyKeyHeader(req) ?? "unknown",
+        request_id: resolveHotPathRequestId(req),
+        idempotency_key: readIdempotencyKeyHeader(req),
         market_id: (req as { gp_market_id?: string }).gp_market_id ?? "unknown",
         env: context.env,
         instance_id: context.instance_id,
-        actor_id: maskActorId(req.seller_context?.seller_id ?? "anonymous"),
+        actor_id: actorId,
       },
       outcome: {
         duration_ms: Date.now() - startedAt,
-        succeeded: status >= 200 && status < 300,
+        succeeded,
         http_status: status,
-        refusal_code:
-          status >= 200 && status < 300
-            ? null
-            : ((res as unknown as { gp_refusal_code?: string }).gp_refusal_code ?? null),
+        refusal_code: succeeded
+          ? null
+          : observed.handlerThrew
+            ? HOT_PATH_UNHANDLED_REFUSAL_CODE
+            : observed.refusalCode,
       },
     })
-  } catch {
-    // Swiadomie polkniete: metryka, ktora wywraca realizacje vouchera, jest
-    // gorsza niz brak metryki. Brak kontekstu pomiaru (AD-25) jest tu jedynym
-    // realnym zrodlem wyjatku i zostaje zglosony przez brak serii, nie przez 500.
+
+    if (result === "carrier_unavailable") {
+      hotPathCarrierWarned = warnOnce(
+        req,
+        hotPathCarrierWarned,
+        "[redemption-hot-path] nosnik metryk (kontener: 'posthog') jest " +
+          "niedostepny — serie NFR-11 NIE powstaja; brak serii nie jest " +
+          "dowodem braku ruchu",
+        { container_key: POSTHOG_CONTAINER_KEY },
+      )
+    }
+  } catch (error) {
+    // Metryka, ktora wywraca realizacje vouchera, jest gorsza niz brak metryki —
+    // dlatego lykamy wyjatek. Ale zostawiamy slad, bo cisza jest najgorszym
+    // mozliwym zachowaniem nosnika (AC2: odmowa ma byc GLOSNA).
+    hotPathEmitFailureWarned = warnOnce(
+      req,
+      hotPathEmitFailureWarned,
+      "[redemption-hot-path] emisja metryk NFR-11 zakonczyla sie wyjatkiem — " +
+        "serie nie powstaly; realizacja vouchera przebiegla bez zmian",
+      {
+        error_class: error instanceof Error ? error.constructor.name : typeof error,
+        error_message: error instanceof Error ? error.message : String(error),
+      },
+    )
   }
+}
+
+/** Wylacznie dla testow — resetuje jednorazowe tlumienie `warn`. */
+export const __resetHotPathWarnStateForTests = (): void => {
+  hotPathCarrierWarned = false
+  hotPathEmitFailureWarned = false
+}
+
+/**
+ * Identyfikator zadania z warstwy TRANSPORTOWEJ (review cyklu 1, F-10).
+ * Kolejnosc jest ta sama co w `store/voucher-pii-consent` (Story 4.4, F9):
+ * naglowek trace'a, potem korelacja, a na koncu wygenerowany identyfikator —
+ * nigdy stala `"unknown"`, bo etykieta o zerowej mocy korelacyjnej jest gorsza
+ * niz wartosc losowa: ta druga przynajmniej rozdziela zadania.
+ */
+const resolveHotPathRequestId = (req: RequestWithSellerContext): string => {
+  const headers =
+    (req as unknown as { headers?: Record<string, unknown> }).headers ?? {}
+  for (const name of ["x-request-id", "x-correlation-id"]) {
+    const raw = headers[name]
+    const value = Array.isArray(raw) ? raw[0] : raw
+    if (typeof value === "string" && value.length > 0 && value.length <= 200) {
+      return value
+    }
+  }
+  const framework = (req as unknown as { requestId?: unknown }).requestId
+  if (typeof framework === "string" && framework.length > 0) return framework
+  return randomUUID()
 }
 
 const handleRedeemRequest = async (
