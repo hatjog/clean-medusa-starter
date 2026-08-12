@@ -47,6 +47,7 @@ import {
   REDEMPTION_DURATION_EVENT,
   REDEMPTION_SUCCESS_EVENT,
 } from "../../../lib/instrumentation/redemption-hot-path"
+import { maskActorId } from "../../../lib/instrumentation/posthog-canary"
 import { withVendorGate } from "../../helpers/vendor-auth-chain"
 
 // v1.15.0 Story 5.8: trasy są ZWOLNIONE z bramki HMAC, więc `withVendorGate`
@@ -799,16 +800,25 @@ describe("Story 6.2 — wpiecie nosnika NFR-11 w POST /vendor/vouchers/:code/red
       REDEMPTION_SUCCESS_EVENT,
       REDEMPTION_DURATION_EVENT,
     ])
+    // `expect.any(String)` NIE JEST kontrola dla pola, ktore ma NIE zawierac
+    // PII (weryfikacja cyklu 4 §4): przyjmuje mase, surowy `seller_id` i pusty
+    // string tak samo. Slot jest tu przypiety na ZMIERZONA wartosc, a pelna
+    // kontrola uzycia `maskActorId` na trasie siedzi w H7/H7b/H7c.
+    const expectedActorId = maskActorId(SELLER_ID)
     for (const call of calls) {
-      expect(call.distinctId).toEqual(expect.any(String))
-      expect(call.distinctId.length).toBeGreaterThan(0)
+      expect(call.distinctId).toBe(expectedActorId)
+      expect(call.distinctId).not.toBe(SELLER_ID)
       // Komplet etykiet AD-25 na KAZDEJ serii.
       expect(call.properties).toEqual(
         expect.objectContaining({
           env: "dev",
           instance_id: "gp-dev-unit",
-          market_id: expect.any(String),
-          actor_id: expect.any(String),
+          // Zmierzone, nie „dowolny string": `req.gp_market_id` NIE MA
+          // w tym repo zadnego producenta (`[B5-c3][regression][MEDIUM]`),
+          // wiec trasa emituje stala `"unknown"`. Pelna kontrola uzycia
+          // — razem z kontrola przeciwna — siedzi w H8.
+          market_id: "unknown",
+          actor_id: expectedActorId,
           // F-10: `request_id` pochodzi z warstwy TRANSPORTOWEJ, a klucz
           // idempotencji jedzie jako OSOBNA etykieta.
           request_id: "trace-abc-123",
@@ -995,6 +1005,174 @@ describe("Story 6.2 — wpiecie nosnika NFR-11 w POST /vendor/vouchers/:code/red
     expect(calls).toHaveLength(3)
     for (const call of calls) {
       expect(call.properties?.idempotency_key).toBe("panel-unit-key-9999")
+    }
+  })
+
+  // ── UZYCIE `maskActorId` NA REALNEJ TRASIE (weryfikacja cyklu 4 §4, ──────
+  // `[B5-c4][regression][MEDIUM]`). TRZECIA instancja tej samej klasy, co H2e
+  // i kontrole emisji: mechanizm chroniony w izolacji
+  // (`canary-instrumentation.test.ts`), jego UZYCIE — niczym.
+  //
+  // Zmierzone przed ta kontrola: mutant zdejmujacy maskowanie z `route.ts:329`
+  // (`const actorId = req.seller_context?.seller_id ?? "anonymous"`) przechodzil
+  // ZIELONO na calej populacji 4008 testow. Surowy `seller_id` mogl wjechac na
+  // nosnik telemetrii jako etykieta `actor_id` I jako `distinctId`, a suita nie
+  // powiedzialaby nic — bo jedyna asercja brzmiala `actor_id: expect.any(String)`,
+  // czyli przyjmowala takze surowe PII.
+  //
+  // Bramka PII nosnika tego NIE lapie: `CLIENT_SOURCED_LABELS` skanuje wartosci
+  // wylacznie dla `request_id` i `idempotency_key`, a po kluczach `actor_id`
+  // jest DOZWOLONY. Jedyna ochrona tego slotu jest wywolanie maski na trasie —
+  // wiec to wywolanie musi byc przypiete kontrola, nie komentarzem.
+  //
+  // Sterownikiem jest `redeemPOST`, nie `maskActorId` wolane wprost.
+  it("H7 — `actor_id` I `distinctId` niosa MASKE seller_id, nie surowy identyfikator", async () => {
+    const { client, calls } = makePosthogClient()
+    const req = makeRequest({ voucherService: successMock(), posthogClient: client })
+    const res = makeRes()
+
+    await redeemPOST(req as never, res as never)
+
+    expect(res.statusCode).toBe(200)
+    expect(calls).toHaveLength(3)
+    const masked = maskActorId(SELLER_ID)
+    // Kontrola przeciwna do samej siebie: maska MUSI byc czyms innym niz
+    // wejscie, inaczej ponizsze rownosci bylyby zielone takze dla `x => x`.
+    expect(masked).not.toBe(SELLER_ID)
+    for (const call of calls) {
+      // Slot 1 — etykieta serii.
+      expect(call.properties?.actor_id).toBe(masked)
+      expect(call.properties?.actor_id).not.toBe(SELLER_ID)
+      // Slot 2 — tozsamosc nosnika (`createRedemptionPosthogSink(client, actorId)`).
+      // Mutant C zatruwal OBA; kontrola pilnujaca jednego przepuscilaby drugi.
+      expect(call.distinctId).toBe(masked)
+      expect(call.distinctId).not.toBe(SELLER_ID)
+    }
+  })
+
+  // H7 sam nie wystarcza: `seller_test_001` mieści się w alfabecie
+  // `CLIENT_SOURCED_LABEL_SHAPE`, wiec nie pokazuje, ze granica trzyma dla
+  // wartosci, ktora NAPRAWDE jest PII. Tozsamosc sprzedawcy w Mercurze jest
+  // ustawiana przez lancuch upstream i nic nie gwarantuje, ze nie niesie
+  // adresu ani nazwiska — a bramka nosnika `actor_id` nie oglada wcale.
+  it.each([
+    ["adres e-mail", "jan.kowalski@example.com"],
+    ["imie i nazwisko", "Jan Kowalski"],
+    ["telefon z prefiksem", "+48 600 100 200"],
+    ["identyfikator z domena", "seller_jan.kowalski.bonbeauty.pl"],
+  ])(
+    "H7b — seller_id o ksztalcie PII (%s) NIE wychodzi z procesu ani jako etykieta, ani jako distinctId",
+    async (_label, rawSellerId) => {
+      const { client, calls } = makePosthogClient()
+      const req = makeRequest({
+        voucherService: voucherMock(makeVoucher({ seller_id: rawSellerId }), {
+          status: "redeemed",
+          prior_status: "idle",
+          voucher: makeVoucher({
+            seller_id: rawSellerId,
+            status: "claimed",
+            events: [
+              { event_type: "claimed", occurred_at: new Date("2026-05-24T10:00:00Z") },
+            ],
+          }),
+        }),
+        sellerContext: { seller_id: rawSellerId },
+        posthogClient: client,
+      })
+      const res = makeRes()
+
+      await redeemPOST(req as never, res as never)
+
+      // Odrzucenie PII nie moze kasowac pomiaru — maska jest przeksztalceniem
+      // etykiety, nie powodem do ciszy (ta sama zasada co H2c).
+      expect(calls).toHaveLength(3)
+      const masked = maskActorId(rawSellerId)
+      for (const call of calls) {
+        const actorId = String(call.properties?.actor_id)
+        expect(actorId).toBe(masked)
+        expect(actorId).not.toBe(rawSellerId)
+        expect(actorId).not.toContain("kowalski")
+        expect(actorId).not.toContain("Kowalski")
+        expect(actorId).not.toContain("@")
+        expect(actorId).not.toContain("600")
+        // Ksztalt maski: 16 znakow hex (SHA-256 + sol, `posthog-canary.ts`).
+        expect(actorId).toMatch(/^[0-9a-f]{16}$/)
+        expect(call.distinctId).toBe(masked)
+        expect(call.distinctId).not.toBe(rawSellerId)
+      }
+    },
+  )
+
+  // Fallback `?? "anonymous"` jest drugim wejsciem tego samego uzycia i tez
+  // musi isc przez maske — inaczej mutant zdejmujacy maskowanie zostawialby
+  // zielona sciezke tam, gdzie kontekstu sprzedawcy nie ma (401, L11).
+  it("H7c — bez kontekstu sprzedawcy etykieta jest MASKA stalej, nie sama stala", async () => {
+    const { client, calls } = makePosthogClient()
+    const req = makeRequest({
+      voucherService: voucherMock(makeVoucher()),
+      sellerContext: null,
+      posthogClient: client,
+    })
+    const res = makeRes()
+
+    await redeemPOST(req as never, res as never)
+
+    expect(res.statusCode).toBe(401)
+    expect(calls.length).toBeGreaterThan(0)
+    const masked = maskActorId("anonymous")
+    for (const call of calls) {
+      expect(call.properties?.actor_id).toBe(masked)
+      expect(call.properties?.actor_id).not.toBe("anonymous")
+      expect(call.distinctId).toBe(masked)
+    }
+  })
+
+  // ── CZWARTA instancja tej samej klasy, znaleziona i zmierzona w cyklu 5 ──
+  // Ta sama metoda, co dla `maskActorId`: mutant podmieniajacy etykiete
+  // `market_id` na trasie (`route.ts:345`) na DOWOLNA stala przechodzil
+  // ZIELONO na calej populacji 4014 testow. Jedyna asercja brzmiala
+  // `market_id: expect.any(String)`, wiec slot nie mial zadnej kontroli.
+  //
+  // Etykieta `market_id` NIE JEST polem PII — jej wartosc jest tu przypieta
+  // z innego powodu: AD-25 stawia ja po to, zeby dalo sie zejsc z metryki do
+  // rynku, a `req.gp_market_id` NIE MA W TYM REPO ZADNEGO PRODUCENTA
+  // (`[B5-c3][regression][MEDIUM]`, nadal otwarte i NIE zamykane ta kontrola).
+  // Roznica jest w widocznosci: `expect.any(String)` UKRYWAL stan zerowego
+  // producenta za zielenia, a ponizsza kontrola go NAZYWA i sczerwienieje
+  // w dniu, w ktorym producent powstanie — czyli wymusi swiadoma aktualizacje
+  // zamiast cichego przejscia.
+  it("H8 — `market_id` niesie wartosc z zadania, a bez producenta jest jawnym „unknown\"", async () => {
+    // (a) STAN FAKTYCZNY: zaden producent nie ustawia `req.gp_market_id`.
+    {
+      const { client, calls } = makePosthogClient()
+      const req = makeRequest({ voucherService: successMock(), posthogClient: client })
+      const res = makeRes()
+
+      await redeemPOST(req as never, res as never)
+
+      expect(calls).toHaveLength(3)
+      for (const call of calls) {
+        expect(call.properties?.market_id).toBe("unknown")
+      }
+    }
+
+    // (b) KONTROLA PRZECIWNA — bez niej (a) bylby zielony takze dla
+    // `market_id: "unknown"` wpisanego na sztywno, czyli dla trasy, ktora
+    // producenta juz ma i mimo to go ignoruje.
+    {
+      const { client, calls } = makePosthogClient()
+      const req = makeRequest({ voucherService: successMock(), posthogClient: client })
+      // Kanal, ktorym wartosc dotarlaby z middleware rynku — ten sam idiom,
+      // co `req.requestId` w H2c: atrapa niesie pole doslownie.
+      ;(req as unknown as { gp_market_id: string }).gp_market_id = "bonbeauty"
+      const res = makeRes()
+
+      await redeemPOST(req as never, res as never)
+
+      expect(calls).toHaveLength(3)
+      for (const call of calls) {
+        expect(call.properties?.market_id).toBe("bonbeauty")
+      }
     }
   })
 
