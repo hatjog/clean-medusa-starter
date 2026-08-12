@@ -171,6 +171,9 @@ const IDEMPOTENCY_KEY_SHAPE = /^[A-Za-z0-9._:-]{8,200}$/
  */
 export const HOT_PATH_UNHANDLED_REFUSAL_CODE = "UNHANDLED_EXCEPTION" as const
 
+/** Etykieta rynku dla wyjsc PRZED rozstrzygnieciem rynku — jawne „nie wiem". */
+export const HOT_PATH_UNKNOWN_MARKET = "unknown" as const
+
 function readIdempotencyKeyHeader(req: MedusaRequest): string | null {
   const raw = (req.headers as Record<string, unknown> | undefined)?.[
     IDEMPOTENCY_KEY_HEADER
@@ -245,9 +248,21 @@ export const POST = async (
   // bledow Medusy PO naszym `finally`), wiec pomiar bez tej flagi emitowal serie
   // `success` z `http_status: 200` dla kazdej nieobsluzonej awarii — czyli byl
   // slepy dokladnie na te klase porazek, ktora NFR-11 najbardziej ma widziec.
+  // review cyklu 5 (`[B5-c3][regression]`): etykieta `market_id` ma PRODUCENTA.
+  // Poprzednia wersja czytala `req.gp_market_id` — pole, ktorego w calym repo
+  // nikt nie ustawial (`app.gp_market_id` to zmienna sesyjna Postgresa do RLS,
+  // INNY BYT), wiec produkcja emitowala stala `"unknown"`, a zielen brala sie
+  // z testu, ktory sam sobie to pole wpisywal. To ta sama klasa co `DW-15-173`
+  // i co `refusal_code` wyzej: czytelnik bez producenta.
+  //
+  // Rynek rozstrzyga `handleRedeemRequest` (`resolveSellerMarketId`), ale
+  // `sellerMarketId` jest lokalna w handlerze — poza zasiegiem tej owijki.
+  // Nosnik jest wiec JEDEN i jawny: handler publikuje rozstrzygniety rynek
+  // w chwili, w ktorej go poznaje, a owijka odczytuje go przy emisji.
+  const market = observeResolvedMarket()
   let handlerThrew = false
   try {
-    await handleRedeemRequest(req, res)
+    await handleRedeemRequest(req, res, market.publish)
   } catch (error) {
     handlerThrew = true
     throw error
@@ -255,7 +270,30 @@ export const POST = async (
     emitHotPathMetrics(req, res, hotPathStartedAt, {
       handlerThrew,
       refusalCode: refusal.code(),
+      marketId: market.id(),
     })
+  }
+}
+
+/**
+ * Rozstrzygniety rynek zadania — jedno zrodlo dla emisji metryk.
+ *
+ * `null` (⇒ etykieta `"unknown"`) jest UCZCIWYM stanem dla wyjsc PRZED
+ * rozstrzygnieciem rynku: odmowa na auth, brak sprzedawcy, wyjatek przed
+ * `resolveSellerMarketId`. Nie podstawiamy tu wartosci domyslnej z konfiguracji
+ * ani nie zgadujemy — „nie wiem" ma zostac odrozniane od konkretnego rynku,
+ * inaczej percentyle NFR-11 przypisalyby cudze odmowy do realnego rynku.
+ */
+const observeResolvedMarket = (): {
+  publish: (marketId: string) => void
+  id: () => string | null
+} => {
+  let resolved: string | null = null
+  return {
+    publish: (marketId: string) => {
+      if (typeof marketId === "string" && marketId.length > 0) resolved = marketId
+    },
+    id: () => resolved,
   }
 }
 
@@ -314,7 +352,11 @@ const emitHotPathMetrics = (
   req: RequestWithSellerContext,
   res: MedusaResponse,
   startedAt: number,
-  observed: { handlerThrew: boolean; refusalCode: string | null },
+  observed: {
+    handlerThrew: boolean
+    refusalCode: string | null
+    marketId: string | null
+  },
 ): void => {
   try {
     const client = (() => {
@@ -342,7 +384,7 @@ const emitHotPathMetrics = (
       labels: {
         request_id: resolveHotPathRequestId(req),
         idempotency_key: readIdempotencyKeyHeader(req),
-        market_id: (req as { gp_market_id?: string }).gp_market_id ?? "unknown",
+        market_id: observed.marketId ?? HOT_PATH_UNKNOWN_MARKET,
         env: context.env,
         instance_id: context.instance_id,
         actor_id: actorId,
@@ -446,6 +488,12 @@ const resolveHotPathRequestId = (req: RequestWithSellerContext): string => {
 const handleRedeemRequest = async (
   req: RequestWithSellerContext,
   res: MedusaResponse,
+  /**
+   * Publikacja rozstrzygnietego rynku do owijki `POST`, ktora emituje metryki.
+   * Wywolanie jest OBOWIAZKOWE zaraz po `resolveSellerMarketId` — bez niego
+   * etykieta `market_id` wraca do stanu „stala `unknown` na produkcji".
+   */
+  publishMarketId: (marketId: string) => void,
 ): Promise<void> => {
   const code = (req.params as { code?: string })?.code
   if (!code || code.length < 3) {
@@ -508,6 +556,8 @@ const handleRedeemRequest = async (
     }
     throw error
   }
+  // Rynek jest znany DOPIERO tutaj — to jedyne miejsce, w ktorym go publikujemy.
+  publishMarketId(sellerMarketId)
 
   await runInHttpMarketContext(sellerMarketId, async () => {
     await redeemInSellerMarket(req, res, {

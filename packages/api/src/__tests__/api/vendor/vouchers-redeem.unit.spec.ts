@@ -813,11 +813,12 @@ describe("Story 6.2 — wpiecie nosnika NFR-11 w POST /vendor/vouchers/:code/red
         expect.objectContaining({
           env: "dev",
           instance_id: "gp-dev-unit",
-          // Zmierzone, nie „dowolny string": `req.gp_market_id` NIE MA
-          // w tym repo zadnego producenta (`[B5-c3][regression][MEDIUM]`),
-          // wiec trasa emituje stala `"unknown"`. Pelna kontrola uzycia
-          // — razem z kontrola przeciwna — siedzi w H8.
-          market_id: "unknown",
+          // Zmierzone, nie „dowolny string": po fixie `[B5-c3][regression]`
+          // etykieta niesie rynek ROZSTRZYGNIETY na trasie przez
+          // `resolveSellerMarketId` — atrapa `seller` w tej suicie zwraca
+          // `market_id: "bonbeauty"`. Pelna kontrola uzycia producenta
+          // — razem z kontrola przeciwna — siedzi w H8/H8b.
+          market_id: "bonbeauty",
           actor_id: expectedActorId,
           // F-10: `request_id` pochodzi z warstwy TRANSPORTOWEJ, a klucz
           // idempotencji jedzie jako OSOBNA etykieta.
@@ -1135,14 +1136,19 @@ describe("Story 6.2 — wpiecie nosnika NFR-11 w POST /vendor/vouchers/:code/red
   //
   // Etykieta `market_id` NIE JEST polem PII — jej wartosc jest tu przypieta
   // z innego powodu: AD-25 stawia ja po to, zeby dalo sie zejsc z metryki do
-  // rynku, a `req.gp_market_id` NIE MA W TYM REPO ZADNEGO PRODUCENTA
-  // (`[B5-c3][regression][MEDIUM]`, nadal otwarte i NIE zamykane ta kontrola).
-  // Roznica jest w widocznosci: `expect.any(String)` UKRYWAL stan zerowego
-  // producenta za zielenia, a ponizsza kontrola go NAZYWA i sczerwienieje
-  // w dniu, w ktorym producent powstanie — czyli wymusi swiadoma aktualizacje
-  // zamiast cichego przejscia.
-  it("H8 — `market_id` niesie wartosc z zadania, a bez producenta jest jawnym „unknown\"", async () => {
-    // (a) STAN FAKTYCZNY: zaden producent nie ustawia `req.gp_market_id`.
+  // rynku.
+  //
+  // STAN ZMIERZONY PO FIXIE `[B5-c3][regression][MEDIUM]` (cykl 6): etykieta
+  // ma PRODUCENTA. Do cyklu 5 trasa czytala `req.gp_market_id` — pole bez
+  // ani jednego producenta w repo (`app.gp_market_id` to zmienna sesyjna
+  // Postgresa do RLS, INNY BYT), wiec produkcja emitowala stala `"unknown"`.
+  // Poprzednia wersja tej kontroli USTAWIALA to pole RECZNIE na `req` i przez
+  // to zielenila atrape zamiast trasy — dokladnie ten wzorzec ukryl blad.
+  // Ponizsze kontrole jada REALNA trasa: rynek pochodzi z uwierzytelnionego
+  // sprzedawcy (`resolveSellerMarketId`), a roznicujacym wejsciem jest atrapa
+  // tabeli `seller`, nie zadne pole dopisane do zadania.
+  it("H8 — `market_id` niesie rynek ROZSTRZYGNIETY na trasie, nie stala", async () => {
+    // (a) Rynek sprzedawcy domyslnej atrapy.
     {
       const { client, calls } = makePosthogClient()
       const req = makeRequest({ voucherService: successMock(), posthogClient: client })
@@ -1150,29 +1156,79 @@ describe("Story 6.2 — wpiecie nosnika NFR-11 w POST /vendor/vouchers/:code/red
 
       await redeemPOST(req as never, res as never)
 
-      expect(calls).toHaveLength(3)
-      for (const call of calls) {
-        expect(call.properties?.market_id).toBe("unknown")
-      }
-    }
-
-    // (b) KONTROLA PRZECIWNA — bez niej (a) bylby zielony takze dla
-    // `market_id: "unknown"` wpisanego na sztywno, czyli dla trasy, ktora
-    // producenta juz ma i mimo to go ignoruje.
-    {
-      const { client, calls } = makePosthogClient()
-      const req = makeRequest({ voucherService: successMock(), posthogClient: client })
-      // Kanal, ktorym wartosc dotarlaby z middleware rynku — ten sam idiom,
-      // co `req.requestId` w H2c: atrapa niesie pole doslownie.
-      ;(req as unknown as { gp_market_id: string }).gp_market_id = "bonbeauty"
-      const res = makeRes()
-
-      await redeemPOST(req as never, res as never)
-
+      expect(res.statusCode).toBe(200)
       expect(calls).toHaveLength(3)
       for (const call of calls) {
         expect(call.properties?.market_id).toBe("bonbeauty")
       }
+    }
+
+    // (b) KONTROLA PRZECIWNA — INNY sprzedawca, INNY rynek. Bez niej (a) bylby
+    // zielony takze dla dowolnej stalej wpisanej na sztywno w trasie. Roznica
+    // wchodzi TA SAMA droga co na produkcji: przez rekord sprzedawcy.
+    {
+      const { client, calls } = makePosthogClient()
+      const req = makeRequest({
+        voucherService: successMock(),
+        posthogClient: client,
+        sellerMarketId: "mkt_ua",
+      })
+      const res = makeRes()
+
+      await redeemPOST(req as never, res as never)
+
+      expect(res.statusCode).toBe(200)
+      expect(calls).toHaveLength(3)
+      for (const call of calls) {
+        expect(call.properties?.market_id).toBe("mkt_ua")
+      }
+    }
+  })
+
+  // `"unknown"` zostaje UCZCIWYM stanem — ale TYLKO dla wyjsc PRZED
+  // rozstrzygnieciem rynku. Bez tej kontroli producent mogl by podstawiac
+  // wartosc domyslna (np. z konfiguracji) i przypisywac cudze odmowy do
+  // realnego rynku; „nie wiem" ma zostac odrozniane od konkretnego rynku.
+  it("H8b — odmowa PRZED rozstrzygnieciem rynku emituje jawne „unknown\"", async () => {
+    const { client, calls } = makePosthogClient()
+    // Brak kontekstu sprzedawcy ⇒ trasa konczy sie na `resolveVendorForSeller`,
+    // czyli PRZED `resolveSellerMarketId`. Rynku naprawde nie znamy.
+    const req = makeRequest({
+      voucherService: successMock(),
+      posthogClient: client,
+      sellerContext: null,
+    })
+    const res = makeRes()
+
+    await redeemPOST(req as never, res as never)
+
+    expect(res.statusCode).toBe(401)
+    expect(calls).toHaveLength(2)
+    for (const call of calls) {
+      expect(call.properties?.market_id).toBe("unknown")
+      // Kontrola przeciwna do samego „unknown": to NIE jest rynek sprzedawcy
+      // podstawiony domyslnie mimo braku rozstrzygniecia.
+      expect(call.properties?.market_id).not.toBe("bonbeauty")
+    }
+  })
+
+  // Martwy czytelnik nie moze wrocic bocznymi drzwiami: gdyby ktos przywrocil
+  // `req.gp_market_id ?? …`, ta kontrola zostalaby zielona TYLKO dlatego, ze
+  // wartosc z pola-atrapy zgadza sie z rynkiem sprzedawcy. Dlatego pole niesie
+  // tu wartosc INNA niz rozstrzygniety rynek i ma zostac ZIGNOROWANE.
+  it("H8c — `req.gp_market_id` (pole bez producenta) NIE jest zrodlem etykiety", async () => {
+    const { client, calls } = makePosthogClient()
+    const req = makeRequest({ voucherService: successMock(), posthogClient: client })
+    ;(req as unknown as { gp_market_id: string }).gp_market_id = "mkt_podstawione"
+    const res = makeRes()
+
+    await redeemPOST(req as never, res as never)
+
+    expect(res.statusCode).toBe(200)
+    expect(calls).toHaveLength(3)
+    for (const call of calls) {
+      expect(call.properties?.market_id).toBe("bonbeauty")
+      expect(call.properties?.market_id).not.toBe("mkt_podstawione")
     }
   })
 
