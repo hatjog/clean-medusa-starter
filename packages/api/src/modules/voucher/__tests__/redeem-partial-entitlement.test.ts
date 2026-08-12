@@ -1177,6 +1177,14 @@ describe("C2-M-1/C2-M-4 — VOUCHER_SERVICE: posting i odwrót (ADR-212)", () =>
     )
     expect(store.getVoucherStatus(SVC_CODE)).toBe("idle")
 
+    // Odczyt SPRZED odwrotu. Bez niego „0" po odwrocie nie odróżnia „saldo nie
+    // wróciło" od „salda nigdy nie było": wiersz `VOUCHER_SERVICE` startuje
+    // z `remaining_amount: null` (brutto siedzi w `policy_snapshot`), więc
+    // dopiero realizacja ustawia tu liczbę. Zapamiętujemy ją, żeby porównanie
+    // po odwrocie miało z czym być porównane.
+    const remainingPoRealizacji = store.get("ent_amount_1")!.remaining_amount
+    expect(remainingPoRealizacji).toBe(0)
+
     const res = await op.reverse({
       reverses_redemption_id: redeemed.redemption_id,
       voucher_net_minor: SVC_NET,
@@ -1190,12 +1198,13 @@ describe("C2-M-1/C2-M-4 — VOUCHER_SERVICE: posting i odwrót (ADR-212)", () =>
     expect(res.entitlement_state_after).toBe("REFUNDED")
     expect(store.get("ent_amount_1")!.state).toBe("REFUNDED")
     expect(store.getVoucherStatus(SVC_CODE)).toBe("refunded")
-    // ADR-197 §2.5/A4: zwrot NIE jest odblokowaniem — saldo zostaje takie,
-    // jakie jest po realizacji (dla tego typu: zero), a NIE wraca do brutta
-    // emisji. Asercja jest podwójna, bo „0" samo w sobie nie odróżnia „nie
-    // wróciło" od „nigdy nie było".
-    expect(store.get("ent_amount_1")!.remaining_amount).toBe(0)
-    expect(store.get("ent_amount_1")!.remaining_amount).not.toBe(SVC_GROSS)
+    // ADR-197 §2.5/A4: zwrot NIE jest odblokowaniem — saldo zostaje DOKŁADNIE
+    // TĄ SAMĄ liczbą co po realizacji i nie wraca do brutta emisji. Nośnikiem
+    // jest równość z wartością sprzed odwrotu, a nie sama stała `0`: gdyby
+    // odwrót podniósł saldo do `SVC_GROSS`, ta asercja upadnie.
+    expect(store.get("ent_amount_1")!.remaining_amount).toBe(
+      remainingPoRealizacji
+    )
     expect(res.commission_base_after_minor).toBe(0)
   })
 
