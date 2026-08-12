@@ -39,6 +39,7 @@ type EntitlementRow = {
   sales_channel_id: string | null
   vat_classification: string
   reference_price_minor: number | null
+  claim_token: string | null
   entitlement_dedupe_key: string
   recipient_index: number
   recipient_customer_id: string | null
@@ -125,6 +126,7 @@ function makeFakeClient(order: OrderFixture, lines: LineFixture[]) {
           sales_channel_id: (values[8] as string | null) ?? null,
           vat_classification: values[9] as string,
           reference_price_minor: (values[10] as number | null) ?? null,
+          claim_token: (values[14] as string | null) ?? null,
           entitlement_dedupe_key: dedupeKey,
           recipient_index: values[12] as number,
           recipient_customer_id: (values[13] as string | null) ?? null,
@@ -212,6 +214,20 @@ describe("Story 3.3 AC2 — live-issue → L4 ISSUED ze snapshotem (policy + VAT
     const snap = JSON.parse(row.policy_snapshot)
     expect(snap.source_payment_intent_id).toBe("pi_3Pabc1234567890")
     expect(snap.line_item_id).toBe("li_voucher_1")
+  })
+
+  it("nadaje token aktywacyjny każdemu nowo wystawionemu uprawnieniu ISSUED", async () => {
+    const { client, entitlements } = makeFakeClient(
+      { sales_channel_id: "sc_bonbeauty", metadata: { gp: { market_id: "bonbeauty" } } },
+      [singleVoucherLine()]
+    )
+
+    await liveIssueEntitlementsWithinTx(client, baseInput(), NOW)
+
+    const row = [...entitlements.values()][0]
+    expect(row.claim_token).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+    )
   })
 
   it("fail-loud gdy order_id pusty (order_id non-nullable na ścieżce live)", async () => {

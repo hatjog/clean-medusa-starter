@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto"
+import { createHash, randomUUID } from "node:crypto"
 
 import {
   EntitlementInstanceState,
@@ -562,6 +562,7 @@ async function issueSingleIssuedRow(
 
   const entitlementId = buildIssuedEntitlementId(dedupeKey)
   const validityEnd = computeValidityEnd(now, readNumber(snapshot.validity_months))
+  const claimToken = randomUUID()
 
   // INSERT ISSUED `ON CONFLICT (entitlement_dedupe_key) DO NOTHING` — barriera
   // per-entitlement. Zwraca id przy faktycznym INSERT; brak wiersza ⇒ no-op
@@ -571,8 +572,8 @@ async function issueSingleIssuedRow(
        (id, entitlement_profile_id, entitlement_type, order_id, line_item_id,
         state, policy_snapshot, market_id, sales_channel_id, vat_classification,
         reference_price_minor, entitlement_dedupe_key, recipient_index, recipient_customer_id,
-        expires_at, created_at, updated_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11, $12, $13, $14, $16, $15, $15)
+        claim_token, expires_at, created_at, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11, $12, $13, $14, $15, $17, $16, $16)
      ${ENTITLEMENT_DEDUPE_ON_CONFLICT_CLAUSE}
      RETURNING id`,
     [
@@ -590,6 +591,7 @@ async function issueSingleIssuedRow(
       dedupeKey,
       recipient.recipient_index,
       recipient.recipient_customer_id,
+      claimToken,
       now,
       // v1.15.0 Story 5.9 review-fix (HIGH-2): termin ważności zapisany TAKŻE
       // na uprawnieniu — to on steruje sweeperem wygaszeń, a więc i zejściem
