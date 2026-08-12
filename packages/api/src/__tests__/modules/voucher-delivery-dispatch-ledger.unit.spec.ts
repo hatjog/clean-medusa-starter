@@ -162,6 +162,43 @@ class FakeDispatchSql implements DispatchLedgerSql {
       return { rows: [{ ...row }] }
     }
 
+    if (
+      normalized.includes(`WHERE provider_message_id = ?`) &&
+      normalized.includes(`UPDATE ${VOUCHER_DELIVERY_DISPATCH_TABLE}`)
+    ) {
+      const values = bindings as (string | null)[]
+      // `$1` and `$4` occur more than once in the SQL; Knex receives the
+      // expanded binding list in occurrence order.
+      const status = values[0]
+      const provider = values[1]
+      const error_code = values[3]
+      const occurred_at = values[4]
+      const provider_message_id = values.find((value) => value === "brevo-event-1")
+      const row = this.dispatch.find(
+        (candidate) => candidate.provider_message_id === provider_message_id,
+      )
+      if (!row || row.status === status) return { rows: [] }
+      Object.assign(row, {
+        status,
+        provider: provider ?? row.provider,
+        error_code: status === "failed" ? error_code : row.error_code,
+        failed_at: status === "failed" ? occurred_at : row.failed_at,
+        updated_at: occurred_at,
+      })
+      return { rows: [{ ...row }] }
+    }
+
+    if (
+      normalized.includes(`WHERE provider_message_id = ?`) &&
+      normalized.startsWith("SELECT")
+    ) {
+      const [provider_message_id] = bindings as string[]
+      const row = this.dispatch.find(
+        (candidate) => candidate.provider_message_id === provider_message_id,
+      )
+      return { rows: row ? [{ ...row }] : [] }
+    }
+
     if (normalized.startsWith(`SELECT`)) {
       const [entitlement_id, template_key, recipient_hash] =
         bindings as string[]
@@ -337,7 +374,7 @@ describe("PgDispatchLedger — etykiety środowiska (Story 4.8, AC1)", () => {
     const ledger = makeLedger(sql)
     await ledger.reserveDispatch(identity())
     await ledger.markFailed({
-      dispatch_id: sql.dispatch[0].dispatch_id,
+      dispatch_id: String(sql.dispatch[0].dispatch_id),
       error_code: "BREVO_TEMPLATE_NOT_CONFIGURED",
     })
     Object.assign(sql.dispatch[0], {
@@ -595,6 +632,48 @@ describe("AC5 — ponowienie legalne jest ODRÓŻNIALNE od duplikatu (z DANYCH)"
     expect(sql.dispatch).toHaveLength(2)
     expect(Number(sql.dispatch[0].attempt_count)).toBe(buyerAttempts)
     expect(sql.dispatch[0].status).toBe("failed")
+  })
+})
+
+describe("Story 4.2 — atomowa bariera stanu callbacku providera", () => {
+  it("zmienia stan raz, a replay tego samego provider_message_id jest duplikatem", async () => {
+    const sql = new FakeDispatchSql()
+    const ledger = makeLedger(sql)
+    const reservation = await ledger.reserveDispatch(identity())
+    await ledger.markSent({
+      dispatch_id: reservation.dispatch_id!,
+      provider: "brevo",
+      provider_message_id: "brevo-event-1",
+    })
+
+    const first = await ledger.applyProviderDeliveryState({
+      provider_event_id: "brevo-event-1",
+      status: "delivered",
+      provider: "brevo",
+    })
+    const replay = await ledger.applyProviderDeliveryState({
+      provider_event_id: "brevo-event-1",
+      status: "delivered",
+      provider: "brevo",
+    })
+
+    expect(first.outcome).toBe("updated")
+    expect(replay.outcome).toBe("duplicate")
+    expect(sql.dispatch[0].status).toBe("delivered")
+    expect(
+      sql.audit.filter((row) => row.to_status === "delivered"),
+    ).toHaveLength(1)
+  })
+
+  it("nazywa brak wiersza jako orphan", async () => {
+    const ledger = makeLedger(new FakeDispatchSql())
+
+    await expect(
+      ledger.applyProviderDeliveryState({
+        provider_event_id: "missing-provider-event",
+        status: "delivered",
+      }),
+    ).resolves.toMatchObject({ outcome: "orphan" })
   })
 })
 
