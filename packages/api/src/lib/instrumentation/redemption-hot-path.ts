@@ -118,6 +118,41 @@ function findForbiddenKeyPath(
 }
 
 /**
+ * Etykiety, ktorych wartosc pochodzi SPOZA tego procesu — dzis oba zrodla to
+ * naglowki HTTP wolajacego. Lista jest jawna, bo bramka wartosci ma byc waska:
+ * pilnuje wejscia klienta, a nie tresci produkowanej przez ten proces.
+ */
+const CLIENT_SOURCED_LABELS = ["request_id", "idempotency_key"] as const
+
+/**
+ * Ten sam ksztalt, co dyscyplina klucza idempotencji na trasie
+ * (`api/vendor/vouchers/[code]/redeem/route.ts`). Zbior znakow bez `@`, spacji
+ * i cyfr w formacie telefonu-z-plusem: wartosc typu `jan.kowalski@example.com`
+ * NIE przechodzi.
+ */
+const CLIENT_SOURCED_LABEL_SHAPE = /^[A-Za-z0-9._:-]{1,200}$/
+
+/**
+ * Druga warstwa bramki: KSZTALT wartosci etykiet o zrodle klienckim. Trasa
+ * waliduje naglowek na granicy, ale bramka na nosniku nie moze na to liczyc —
+ * dokladnie tak samo, jak bramka kluczy nie liczy na dyscypline producenta.
+ * Zwraca nazwe pierwszej wadliwej etykiety albo `null`.
+ */
+function findMalformedClientSourcedLabel(
+  properties: Record<string, unknown>,
+): string | null {
+  for (const label of CLIENT_SOURCED_LABELS) {
+    if (!(label in properties)) continue
+    const value = properties[label]
+    if (value === null || value === undefined) continue
+    if (typeof value !== "string" || !CLIENT_SOURCED_LABEL_SHAPE.test(value)) {
+      return label
+    }
+  }
+  return null
+}
+
+/**
  * Bramka PII na NOSNIKU, nie przy jednym producencie (review-fix cyklu 1 w 4.6).
  * Bramka przy producencie chroni producenta; bramka na nosniku chroni nosnik.
  * Rzuca, nie strippuje — cicha redakcja zostawilaby producenta wysylajacego
@@ -128,9 +163,16 @@ function findForbiddenKeyPath(
  * enumerowalne, wiec metody prototypu (`shutdown`, `flush`) znikaly, a typ
  * twierdzil, ze sa. Kontrakt zwracany jest teraz tym, co obiekt naprawde ma.
  *
- * Zakres bramki: KLUCZE (w glab). Wartosci nie sa skanowane swiadomie — skan
- * wartosci po regexie dalby falszywe trafienia na kodach odmowy i identyfikatorach,
- * a producent ladunku jest w tym samym repo.
+ * Zakres bramki (review fali B5, `[B5][security][MEDIUM]` — poprzednia wersja
+ * tego komentarza twierdzila, ze „producent ladunku jest w tym samym repo",
+ * co przestalo byc prawda w chwili, gdy `request_id` zaczal pochodzic z
+ * naglowka HTTP):
+ *   1. KLUCZE — skanowane w glab, cala mapa wlasciwosci;
+ *   2. WARTOSCI — skanowane WYLACZNIE dla etykiet o zrodle KLIENCKIM
+ *      ({@link CLIENT_SOURCED_LABELS}) i wylacznie po KSZTALCIE
+ *      ({@link CLIENT_SOURCED_LABEL_SHAPE}), nie po regexie „wyglada jak PII".
+ * Pozostale wartosci swiadomie nie sa skanowane: produkuje je ten proces,
+ * a skan po tresci dalby falszywe trafienia na kodach odmowy i identyfikatorach.
  */
 export function withRedemptionPiiGuard(
   sink: RedemptionMetricsSink | null | undefined,
@@ -145,6 +187,14 @@ export function withRedemptionPiiGuard(
           `${origin}:${event}: metryka sciezki goracej nie moze niesc PII — ` +
             `pole '${forbiddenPath}' jest zakazane (wspolna lista PII_FORBIDDEN_FIELDS ` +
             `z lib/instrumentation/track.ts)`,
+        )
+      }
+      const malformed = findMalformedClientSourcedLabel(properties)
+      if (malformed) {
+        throw new Error(
+          `${origin}:${event}: etykieta '${malformed}' pochodzi od klienta i musi ` +
+            `miec ksztalt ${CLIENT_SOURCED_LABEL_SHAPE.source} — wartosc spoza tego ` +
+            `zbioru znakow moze niesc PII, ktorego bramka kluczy nie widzi`,
         )
       }
       sink.capture(event, properties)

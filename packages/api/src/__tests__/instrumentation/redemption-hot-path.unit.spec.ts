@@ -117,6 +117,50 @@ describe("AC1 — dwa liczniki i czas jako OSOBNE serie", () => {
     ).toThrow(/context\.customer\.email/)
     expect(sink.events).toHaveLength(0)
   })
+
+  // review fali B5 `[B5][security][MEDIUM]`: `request_id` pochodzi od klienta
+  // (naglowek HTTP), a bramka kluczy z definicji NIE patrzy na wartosci — wiec
+  // adres e-mail w wartosci przechodzil na nosnik nietkniety.
+  it("bramka odrzuca WARTOSC etykiety o zrodle klienckim spoza ksztaltu", () => {
+    const sink = makeSink()
+    const guarded = withRedemptionPiiGuard(sink, "test")
+    expect(() =>
+      guarded?.capture(REDEMPTION_ATTEMPT_EVENT, {
+        ...LABELS,
+        request_id: "jan.kowalski@example.com",
+      }),
+    ).toThrow(/request_id/)
+    expect(sink.events).toHaveLength(0)
+  })
+
+  it("bramka wartosci obejmuje takze `idempotency_key`, a `null` przepuszcza", () => {
+    const sink = makeSink()
+    const guarded = withRedemptionPiiGuard(sink, "test")
+    expect(() =>
+      guarded?.capture(REDEMPTION_ATTEMPT_EVENT, {
+        ...LABELS,
+        idempotency_key: "+48 600 100 200",
+      }),
+    ).toThrow(/idempotency_key/)
+    expect(() =>
+      guarded?.capture(REDEMPTION_ATTEMPT_EVENT, {
+        ...LABELS,
+        idempotency_key: null,
+      }),
+    ).not.toThrow()
+    expect(sink.events).toHaveLength(1)
+  })
+
+  // KONTROLA PRZECIWNA: bramka wartosci nie moze czerwienic poprawnej emisji —
+  // inaczej „zawsze czerwona" jest nieodrozninalna od dzialajacej.
+  it("KONTROLA: poprawne etykiety klienckie przechodza bramke wartosci", () => {
+    const sink = makeSink()
+    const guarded = withRedemptionPiiGuard(sink, "test")
+    expect(() =>
+      guarded?.capture(REDEMPTION_ATTEMPT_EVENT, { ...LABELS }),
+    ).not.toThrow()
+    expect(sink.events).toHaveLength(1)
+  })
 })
 
 describe("F-1 — adapter na ksztalt klienta z kontenera", () => {

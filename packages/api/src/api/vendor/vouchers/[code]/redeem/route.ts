@@ -398,15 +398,24 @@ export const __resetHotPathWarnStateForTests = (): void => {
  * naglowek trace'a, potem korelacja, a na koncu wygenerowany identyfikator —
  * nigdy stala `"unknown"`, bo etykieta o zerowej mocy korelacyjnej jest gorsza
  * niz wartosc losowa: ta druga przynajmniej rozdziela zadania.
+ *
+ * Naglowek jest WEJSCIEM KLIENTA, wiec przechodzi ten sam ksztalt co klucz
+ * idempotencji ({@link IDEMPOTENCY_KEY_SHAPE}) — review fali B5 (`[B5][security]
+ * [MEDIUM]`): bez tego `x-request-id: jan.kowalski@example.com` wjezdzalby na
+ * nosnik telemetrii, ktorego bramka PII skanuje KLUCZE, nie wartosci. Wartosc
+ * niepasujaca jest ODRZUCANA (zejscie do zrodla serwerowego), nie przycinana —
+ * przyciecie dalej przepuszczaloby znaki adresu e-mail.
  */
+const HOT_PATH_REQUEST_ID_SHAPE = IDEMPOTENCY_KEY_SHAPE
+
 const resolveHotPathRequestId = (req: RequestWithSellerContext): string => {
   const headers =
     (req as unknown as { headers?: Record<string, unknown> }).headers ?? {}
   for (const name of ["x-request-id", "x-correlation-id"]) {
     const raw = headers[name]
     const value = Array.isArray(raw) ? raw[0] : raw
-    if (typeof value === "string" && value.length > 0 && value.length <= 200) {
-      return value
+    if (typeof value === "string" && HOT_PATH_REQUEST_ID_SHAPE.test(value.trim())) {
+      return value.trim()
     }
   }
   const framework = (req as unknown as { requestId?: unknown }).requestId

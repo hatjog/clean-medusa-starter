@@ -827,6 +827,35 @@ describe("Story 6.2 — wpiecie nosnika NFR-11 w POST /vendor/vouchers/:code/red
     expect(String(calls[0]?.properties?.request_id).length).toBeGreaterThan(8)
   })
 
+  // TEST-THE-TEST fali B5 (`[B5][security][MEDIUM]`): naglowek `x-request-id`
+  // jest wejsciem KLIENTA, a bramka PII nosnika skanuje klucze, nie wartosci.
+  // Przed poprawka ten przypadek byl ZIELONY z adresem e-mail na telemetrii —
+  // czyli fix bylby nieodrozninalny od jego braku.
+  it("H2b — `x-request-id` z adresem e-mail NIE trafia na telemetrie", async () => {
+    const { client, calls } = makePosthogClient()
+    const req = makeRequest({
+      voucherService: successMock(),
+      posthogClient: client,
+      requestId: "jan.kowalski@example.com",
+    })
+    const res = makeRes()
+
+    await redeemPOST(req as never, res as never)
+
+    expect(calls.length).toBeGreaterThan(0)
+    for (const call of calls) {
+      const requestId = String(call.properties?.request_id)
+      expect(requestId).not.toBe("jan.kowalski@example.com")
+      expect(requestId).not.toContain("@")
+      expect(requestId).not.toContain("example.com")
+      // Zejscie do zrodla SERWEROWEGO, nie przyciecie wartosci klienta.
+      expect(requestId).toMatch(/^[A-Za-z0-9._:-]{8,200}$/)
+    }
+    // Cala emisja musi byc nienaruszona — odrzucenie naglowka nie moze
+    // zabijac pomiaru (odmowa jest po stronie ETYKIETY, nie serii).
+    expect(calls).toHaveLength(3)
+  })
+
   // KONTROLA PRZECIWNA F-2: wyjatek z handlera nie moze byc liczony jako sukces.
   // Przed poprawka `res.statusCode` mial domyslne 200 (status ustawia middleware
   // bledow Medusy PO naszym `finally`), wiec ta sciezka emitowala serie `success`.
