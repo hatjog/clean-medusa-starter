@@ -930,6 +930,74 @@ describe("Story 6.2 — wpiecie nosnika NFR-11 w POST /vendor/vouchers/:code/red
     }
   })
 
+  // KONTROLA fali B5 cyklu 3 (`[B5-c3][correctness][LOW]`): STALA BYLA
+  // CHRONIONA, UZYCIE NIE. Mutant zdejmujacy test ksztaltu w
+  // `readIdempotencyKeyHeader` (`return trimmed.length > 0 ? trimmed : null`)
+  // zostawial CALY pakiet story zielony — `IDEMPOTENCY_KEY_SHAPE` pilnowaly
+  // wylacznie kontrole `request_id` (wspoldzielona stala), a zadna kontrola nie
+  // pilnowala obu wywolan tej funkcji: bramki 400 na wejsciu trasy
+  // (`route.ts:461`) ani etykiety `idempotency_key` na nosniku (`route.ts:344`).
+  // Zastane przypadki dotykaly wylacznie BRAKU naglowka (L9, H4), nigdy
+  // naglowka WADLIWEGO.
+  //
+  // Sterownikiem jest `redeemPOST`, nie sama funkcja — pytanie brzmi „czy
+  // odpala na realnej trasie", nie „czy istnieje".
+  it.each([
+    ["adres e-mail", "jan.kowalski@example.com"],
+    ["klucz ze spacjami", "panel key 0001"],
+    ["telefon z prefiksem", "+48 600 100 200"],
+    ["wartosc krotsza niz minimum ksztaltu", "abc"],
+    ["wartosc dluzsza niz 200 znakow", "a".repeat(201)],
+    ["znaki sterujace", "panel\nkey\t0001"],
+  ])(
+    "H2e — wadliwy `Idempotency-Key` (%s) ⇒ 400 i BRAK wartosci klienta na nosniku",
+    async (_label, hostile) => {
+      const { client, calls } = makePosthogClient()
+      const req = makeRequest({
+        voucherService: successMock(),
+        posthogClient: client,
+        idempotencyKey: hostile,
+      })
+      const res = makeRes()
+
+      await redeemPOST(req as never, res as never)
+
+      // Uzycie 1 — bramka wejscia: naglowek spoza ksztaltu jest ODMOWA,
+      // dokladnie jak jego brak (ADR-178 §2.2 M4 pkt 2).
+      expect(res.statusCode).toBe(400)
+      expect((res.body as { code: string }).code).toBe("IDEMPOTENCY_KEY_REQUIRED")
+      // Uzycie 2 — etykieta nosnika: emisja zyje, a wartosc klienta na nia
+      // nie wchodzi (inaczej bramka wartosci wywrocilaby CALA emisje).
+      const attempt = calls.find((c) => c.event === REDEMPTION_ATTEMPT_EVENT)
+      expect(attempt?.properties?.idempotency_key).toBeNull()
+      for (const call of calls) {
+        expect(call.properties?.idempotency_key).not.toBe(hostile)
+      }
+      expect(calls.length).toBeGreaterThan(0)
+    },
+  )
+
+  // KONTROLA PRZECIWNA do H2e — bramka nie moze byc „zawsze odrzucajaca":
+  // klucz zgodny z ksztaltem musi przejsc trase i trafic na nosnik DOSLOWNIE.
+  // Bez tego H2e bylby zielony takze dla implementacji `return null`.
+  it("H2f — zgodny `Idempotency-Key` przechodzi trase i laduje na nosniku doslownie", async () => {
+    const { client, calls } = makePosthogClient()
+    const req = makeRequest({
+      voucherService: successMock(),
+      posthogClient: client,
+      idempotencyKey: "panel-unit-key-9999",
+    })
+    const res = makeRes()
+
+    await redeemPOST(req as never, res as never)
+
+    expect(res.statusCode).toBe(200)
+    expect(calls).toHaveLength(3)
+    for (const call of calls) {
+      expect(call.properties?.idempotency_key).toBe("panel-unit-key-9999")
+    }
+  })
+
   // KONTROLA PRZECIWNA F-2: wyjatek z handlera nie moze byc liczony jako sukces.
   // Przed poprawka `res.statusCode` mial domyslne 200 (status ustawia middleware
   // bledow Medusy PO naszym `finally`), wiec ta sciezka emitowala serie `success`.

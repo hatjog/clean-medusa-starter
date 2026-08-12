@@ -100,6 +100,37 @@ describe("AC1 — dwa liczniki i czas jako OSOBNE serie", () => {
     ).toBe("carrier_unavailable")
   })
 
+  // TA SAMA KLASA, DRUGI SLOT (`[B5-c3][correctness][LOW]`): mechanizm
+  // chroniony, UZYCIE nie. Wszystkie pozostale kontrole bramki wolaja
+  // `withRedemptionPiiGuard` BEZPOSREDNIO, wiec mutant zdejmujacy owiniecie
+  // w `emitRedemptionHotPathMetrics` (`const guarded = args.sink ?? undefined`)
+  // zostawial caly pakiet story zielony — a to jest JEDYNA droga, ktora chodzi
+  // produkcja (trasa woła `emitRedemptionHotPathMetrics`, nie bramke).
+  // Sterownikiem jest wiec funkcja emisji, nie bramka.
+  it("emisja WOLA bramke: wartosc etykiety spoza ksztaltu nie dociera do nosnika", () => {
+    const sink = makeSink()
+    expect(() =>
+      emitRedemptionHotPathMetrics({
+        sink,
+        labels: { ...LABELS, request_id: "jan.kowalski@example.com" },
+        outcome: { duration_ms: 10, succeeded: true, http_status: 200 },
+      }),
+    ).toThrow(/request_id/)
+    expect(sink.events).toHaveLength(0)
+  })
+
+  it("emisja WOLA bramke: zakazany KLUCZ nie dociera do nosnika", () => {
+    const sink = makeSink()
+    expect(() =>
+      emitRedemptionHotPathMetrics({
+        sink,
+        labels: { ...LABELS, email: "a@b.c" } as never,
+        outcome: { duration_ms: 10, succeeded: true, http_status: 200 },
+      }),
+    ).toThrow(/PII/)
+    expect(sink.events).toHaveLength(0)
+  })
+
   it("bramka PII siedzi na NOSNIKU i rzuca, nie strippuje", () => {
     const sink = makeSink()
     const guarded = withRedemptionPiiGuard(sink, "test")
