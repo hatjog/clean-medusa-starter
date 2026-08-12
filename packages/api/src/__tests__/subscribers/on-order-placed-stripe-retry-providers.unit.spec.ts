@@ -30,6 +30,8 @@
 import { readFileSync } from "node:fs"
 import { join } from "node:path"
 
+import { Modules } from "@medusajs/framework/utils"
+
 import { toKnexPositionalSql } from "../../lib/knex-positional-sql"
 import { STRIPE_PATH_Y_WEBHOOK_PROVIDER } from "../../lib/payment/stripe-payment-intent-transport"
 
@@ -47,6 +49,12 @@ jest.mock("../../workflows/entitlements/issue-entitlement", () => {
   }
 })
 
+jest.mock("../../workflows/entitlements/live-issue-from-payment-intent", () => ({
+  __esModule: true,
+  liveIssueEntitlementsWithinTx: jest.fn(),
+}))
+
+import { liveIssueEntitlementsWithinTx } from "../../workflows/entitlements/live-issue-from-payment-intent"
 import onOrderPlacedStripeRetry, {
   buildFindDeferredCapturesBindings,
   buildMarkDeferredResolvedBindings,
@@ -197,6 +205,7 @@ type SentQuery = { sql: string; values: unknown[] }
 
 type DeferredRow = {
   event_id: string
+  provider: string
   market_id: string | null
   envelope: Record<string, unknown>
   amount: number | null
@@ -208,6 +217,7 @@ type DeferredRow = {
 function makeRow(overrides: Partial<DeferredRow> = {}): DeferredRow {
   return {
     event_id: "evt_1#deferred-issuance",
+    provider: "stripe",
     market_id: "bonbeauty",
     envelope: { entitlement_issue_deferred_reason: "webhook_before_order" },
     amount: 25000,
@@ -231,15 +241,17 @@ function makeHarness(rows: DeferredRow[]) {
     release: jest.fn(),
   }
   const logger = { info: jest.fn(), warn: jest.fn(), error: jest.fn() }
+  const eventBus = { emit: jest.fn().mockResolvedValue(undefined) }
   const container = {
     logger,
     resolve: (key: string) => {
       if (key === "__pg_pool__") return { connect: async () => client }
       if (key === "logger") return logger
+      if (key === Modules.EVENT_BUS) return eventBus
       throw new Error(`unexpected resolve(${key})`)
     },
   }
-  return { sent, client, logger, container }
+  return { sent, client, logger, eventBus, container }
 }
 
 async function run(container: unknown, data: Record<string, unknown>) {
@@ -329,5 +341,54 @@ describe("odzysk wystawienia — zachowanie na mockowanym kliencie", () => {
     const h = makeHarness([])
     await run(h.container, { id: "order_1" })
     expect(h.sent.some((q) => q.sql === MARK_DEFERRED_RESOLVED_SQL)).toBe(false)
+  })
+
+  it("dla markera Path Y wraca do ISSUED i emituje genezę Path Y, nie captured ACTIVE", async () => {
+    const liveIssue = liveIssueEntitlementsWithinTx as jest.Mock
+    liveIssue.mockResolvedValueOnce({
+      event_processed: true,
+      issued: [
+        {
+          entitlement_id: `ent_${"a".repeat(64)}`,
+          entitlement_dedupe_key: "a".repeat(64),
+          created: true,
+        },
+      ],
+    })
+    const h = makeHarness([
+      makeRow({
+        provider: STRIPE_PATH_Y_WEBHOOK_PROVIDER,
+        envelope: {
+          entitlement_issue_deferred_reason: "webhook_before_order",
+          psp_occurred_at: "2026-08-12T12:34:56.000Z",
+        },
+      }),
+    ])
+
+    await run(h.container, { id: "order_1" })
+
+    expect(liveIssue).toHaveBeenCalledWith(
+      h.client,
+      {
+        event_type: "gp.stripe.payment_intent_succeeded.v1",
+        payload: {
+          payment_intent_id: "pi_1",
+          order_id: "order_1",
+          currency: "PLN",
+          amount_minor: 25000,
+          psp_occurred_at: "2026-08-12T12:34:56.000Z",
+        },
+        scope: { market_id: "bonbeauty" },
+      },
+      expect.any(Date),
+    )
+    expect(h.eventBus.emit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        name: "gp.entitlements.entitlement_state_changed.v1",
+        data: expect.objectContaining({
+          payload: expect.objectContaining({ to_state: "ISSUED" }),
+        }),
+      }),
+    )
   })
 })

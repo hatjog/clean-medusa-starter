@@ -427,6 +427,23 @@ describe("extractPurchaseDeliveryTrigger", () => {
     expect(sql.dispatch).toHaveLength(0)
   })
 
+  it("zapisuje runtime instance_id, nawet gdy koperta niesie ID entitlementu", async () => {
+    const { deps, dispatchCalls, sql } = makeDeps({
+      env: {
+        GP_STOREFRONT_URL_BONBEAUTY: "https://dev.bonbeauty.pl",
+        GP_ENV: "dev",
+        GP_INSTANCE_ID: "gp-dev",
+      },
+    })
+
+    const result = await handleVoucherPurchaseDelivery(envelope("ISSUED"), deps)
+
+    expect(result.outcome).toBe("sent")
+    expect(dispatchCalls).toHaveLength(1)
+    expect(sql.dispatch).toHaveLength(1)
+    expect(sql.dispatch[0].instance_id).toBe("gp-dev")
+  })
+
   it("Story 4.4 — czyta cel dosyłki z payloadu (oba człony klucza tożsamości)", () => {
     const trigger = extractPurchaseDeliveryTrigger({
       entitlement_id: ENTITLEMENT_ID,

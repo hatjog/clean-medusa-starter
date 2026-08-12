@@ -108,7 +108,12 @@ export const DEFERRED_ISSUANCE_REASON = "webhook_before_order"
  */
 export async function persistDeferredIssuanceMarker(
   client: PaymentLinkQueryClient,
-  input: { event_id: string; payment_intent_id: string; market_id: string | null }
+  input: {
+    event_id: string
+    payment_intent_id: string
+    market_id: string | null
+    psp_occurred_at: string
+  }
 ): Promise<boolean> {
   // Rozłączność przestrzeni kluczy (ślad vs rezerwacja) była do tej pory samą
   // KONWENCJĄ. Gdyby `event_id` już niósł sufiks, ślad wylądowałby pod kluczem
@@ -130,6 +135,7 @@ export async function persistDeferredIssuanceMarker(
     entitlement_issue_deferred_reason: DEFERRED_ISSUANCE_REASON,
     deferred_by: "path-y-webhook-link-race",
     payment_intent_id: input.payment_intent_id,
+    psp_occurred_at: input.psp_occurred_at,
   }
 
   const result = await client.query(RESERVE_WEBHOOK_DELIVERY_SQL, [

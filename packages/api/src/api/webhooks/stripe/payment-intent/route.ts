@@ -147,6 +147,16 @@ function headerValue(
   return Array.isArray(value) ? value[0] : value
 }
 
+function readDeferredPspOccurredAt(event: StripePaymentIntentEvent): string {
+  const created = event.data?.object?.created ?? event.created
+  if (typeof created !== "number" || !Number.isFinite(created)) {
+    throw new StripeEventMappingError(
+      "payment_intent.succeeded bez czasu faktu PSP — marker recovery Path Y odrzucony"
+    )
+  }
+  return new Date(created * 1000).toISOString()
+}
+
 export async function POST(
   req: MedusaRequest,
   res: MedusaResponse
@@ -278,6 +288,7 @@ export async function POST(
             event_id: deliveryEventId,
             payment_intent_id: paymentIntentId,
             market_id: identifiers.market_id ?? null,
+            psp_occurred_at: readDeferredPspOccurredAt(stripeEvent),
           })
           logger.info?.(
             `[stripe/payment-intent] slad deferral ${marked ? "zapisany" : "juz istnial"} ` +

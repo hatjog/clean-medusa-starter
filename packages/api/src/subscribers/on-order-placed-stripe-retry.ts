@@ -53,9 +53,11 @@ import type { SubscriberArgs, SubscriberConfig } from "@medusajs/framework"
 import { ContainerRegistrationKeys, Modules } from "@medusajs/framework/utils"
 
 import { toKnexPositionalSql } from "../lib/knex-positional-sql"
+import { PAYMENT_INTENT_SUCCEEDED_EVENT } from "../lib/payment/stripe-payment-intent-event"
 import { STRIPE_PATH_Y_WEBHOOK_PROVIDER } from "../lib/payment/stripe-payment-intent-transport"
 import {
   buildGenesisActiveTransition,
+  buildGenesisIssuedTransition,
   emitTransitionEventAfterCommit,
   wireEntitlementTransitionPersisted,
   ENTITLEMENT_STATE_CHANGED_EVENT_TYPE,
@@ -67,6 +69,7 @@ import {
   MissingEntitlementProfileError,
   VoucherIssuanceBlockedError,
 } from "../workflows/entitlements/issue-entitlement"
+import { liveIssueEntitlementsWithinTx } from "../workflows/entitlements/live-issue-from-payment-intent"
 
 /**
  * Wartości `webhook_event_processed.provider`, które mogą nieść ślad deferral.
@@ -132,6 +135,7 @@ function providerPlaceholders(firstIndex: number): string {
 export const FIND_DEFERRED_CAPTURES_SQL = `
       SELECT
         wep.event_id,
+        wep.provider,
         COALESCE(
           wep.market_id,
           o.metadata->'gp'->>'market_id',
@@ -340,6 +344,7 @@ async function withTransaction<T>(
 
 type DeferredCaptureRow = {
   event_id: string
+  provider: string
   market_id: string | null
   payment_intent_id: string | null
   envelope: Record<string, unknown>
@@ -365,6 +370,7 @@ async function findDeferredCapturesForOrder(
 ): Promise<DeferredCaptureRow[]> {
   const result = await client.query<{
     event_id: string
+    provider: string
     market_id: string | null
     envelope: Record<string, unknown>
     amount: number | null
@@ -378,6 +384,7 @@ async function findDeferredCapturesForOrder(
 
   return result.rows.map((r) => ({
     event_id: r.event_id,
+    provider: r.provider,
     market_id: r.market_id,
     payment_intent_id: r.payment_intent_id,
     envelope: r.envelope,
@@ -401,6 +408,51 @@ async function markDeferredResolved(
     MARK_DEFERRED_RESOLVED_SQL,
     buildMarkDeferredResolvedBindings(eventId, resolvedAt.toISOString(), orderId)
   )
+}
+
+function buildPathYRecoveryInput(
+  row: DeferredCaptureRow,
+  orderId: string
+) {
+  const pspOccurredAt = row.envelope.psp_occurred_at
+  const amountMinor = row.amount_minor
+  if (typeof pspOccurredAt !== "string" || !pspOccurredAt.trim()) {
+    throw new Error(
+      `[on-order-placed-stripe-retry] Path Y marker ${row.event_id} nie niesie psp_occurred_at`
+    )
+  }
+  if (!row.payment_intent_id) {
+    throw new Error(
+      `[on-order-placed-stripe-retry] Path Y marker ${row.event_id} nie niesie payment_intent_id`
+    )
+  }
+  if (!row.market_id) {
+    throw new Error(
+      `[on-order-placed-stripe-retry] Path Y marker ${row.event_id} nie ma market_id po rezolucji zamówienia`
+    )
+  }
+  if (!row.currency) {
+    throw new Error(
+      `[on-order-placed-stripe-retry] Path Y marker ${row.event_id} nie ma currency płatności`
+    )
+  }
+  if (amountMinor === null || !Number.isInteger(amountMinor) || amountMinor < 0) {
+    throw new Error(
+      `[on-order-placed-stripe-retry] Path Y marker ${row.event_id} ma nieprawidłowe amount_minor`
+    )
+  }
+
+  return {
+    event_type: PAYMENT_INTENT_SUCCEEDED_EVENT,
+    payload: {
+      payment_intent_id: row.payment_intent_id,
+      order_id: orderId,
+      currency: row.currency,
+      amount_minor: amountMinor,
+      psp_occurred_at: pspOccurredAt,
+    },
+    scope: { market_id: row.market_id },
+  }
 }
 
 export default async function onOrderPlacedStripeRetry({
@@ -432,6 +484,48 @@ export default async function onOrderPlacedStripeRetry({
 
         for (const row of deferred) {
           try {
+            if (row.provider === STRIPE_PATH_Y_WEBHOOK_PROVIDER) {
+              const input = buildPathYRecoveryInput(row, orderId)
+              const result = await liveIssueEntitlementsWithinTx(
+                client,
+                input,
+                new Date()
+              )
+              await markDeferredResolved(client, row.event_id, orderId, new Date())
+
+              const appendAudit = makeTransitionAuditSink(logger)
+              const issuedAt = new Date()
+              for (const issued of result.issued) {
+                if (!issued.created) continue
+                const { event } = await wireEntitlementTransitionPersisted(
+                  { appendAudit, clock: () => issuedAt },
+                  buildGenesisIssuedTransition({
+                    entitlement_id: issued.entitlement_id,
+                    scope: {
+                      instance_id: issued.entitlement_id,
+                      market_id: input.scope.market_id,
+                      sales_channel_id: null,
+                      vendor_id: null,
+                      location_id: null,
+                    },
+                    actor: "system",
+                    actor_hint:
+                      "subscriber:on-order-placed-stripe-retry:path-y-deferred-issuance",
+                    occurred_at: input.payload.psp_occurred_at,
+                    transition_seq: issued.entitlement_dedupe_key,
+                  })
+                )
+                transitionEvents.push(event)
+              }
+
+              logger.info?.(
+                `[on-order-placed-stripe-retry] order_id=${orderId} ` +
+                  `event_id=${row.event_id} Path Y ISSUED ` +
+                  `${result.issued.length} entitlement(s)`
+              )
+              continue
+            }
+
             const result = await issueEntitlementsForAllLineItems(
               client,
               {
