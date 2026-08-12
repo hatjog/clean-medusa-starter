@@ -70,3 +70,11 @@ packages/api/src/lib/instrumentation/posthog-canary.ts text eol=lf
 packages/api/src/lib/instrumentation/redemption-hot-path.ts text eol=lf
 packages/api/src/__tests__/canary-instrumentation.test.ts text eol=lf
 packages/api/src/__tests__/instrumentation/redemption-hot-path.unit.spec.ts text eol=lf
+
+# v1.15.0 Story 6.3 review-fix cyklu 2 (C2-L-2) — pliki realizacji uprawnienia,
+# ktorych konce linii przewrocil commit F-0 tej story (edycja z Linuksa na
+# plikach lezacych w indeksie jako CRLF; pomiar z recenzji: 2738 linii CRLF
+# w `redeem-partial-entitlement.ts`). Pin + `git add --renormalize` w TYM
+# SAMYM commicie, zgodnie z precedensem wpisow wyzej.
+packages/api/src/modules/voucher/workflows/redeem-partial-entitlement.ts text eol=lf
+packages/api/src/modules/voucher/__tests__/redeem-partial-entitlement.test.ts text eol=lf

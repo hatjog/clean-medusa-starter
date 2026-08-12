@@ -388,7 +388,16 @@ async function findDeferredCapturesForOrder(
     market_id: r.market_id,
     payment_intent_id: r.payment_intent_id,
     envelope: r.envelope,
-    amount_minor: typeof r.amount === "number" ? r.amount : Number(r.amount ?? 0),
+    // C2-L-3: `?? 0` czyniło gałąź `null` w `buildPathYRecoveryInput` MARTWĄ —
+    // brak kwoty stawał się kwotą zerową już tutaj, o jeden poziom przed
+    // walidacją. Brak wartości zostaje `null` i jest odrzucany tam, gdzie
+    // odrzucane są pozostałe nieczytelne pola.
+    amount_minor:
+      typeof r.amount === "number"
+        ? r.amount
+        : r.amount === null || r.amount === undefined
+          ? null
+          : Number(r.amount),
     currency: r.currency_code?.toUpperCase() ?? null,
     payment_id: r.payment_id,
   }))
@@ -487,10 +496,26 @@ function buildPathYRecoveryInput(
   // tylko wiersz płatności, którego nie umiemy przeczytać. Wartość
   // niecałkowita jest normalizowana w dół do grosza, bo taką właśnie
   // precyzję niesie jednostka minor.
-  const normalizedAmountMinor =
-    amountMinor === null || !Number.isFinite(amountMinor)
-      ? 0
-      : Math.trunc(amountMinor)
+  //
+  // C2-L-3 (review cyklu 2): `null`/`NaN` NIE schodzi już po cichu do `0`.
+  // Bezpieczeństwo tamtej linii opierało się na fakcie ZEWNĘTRZNYM wobec tego
+  // pliku — `live-issue-from-payment-intent.ts` dziś nie czyta
+  // `payload.amount_minor` (jedyne odczyty payloadu to identyfikatory
+  // i `payload.currency`). Pierwszy konsument, który zacznie tę wartość
+  // czytać, dostałby wtedy wyzerowaną kwotę bez żadnego śladu. `0` jest
+  // legalną kwotą, więc cicha domyślna jest tu nieodróżnialna od pomiaru;
+  // odmowa jest odróżnialna i ląduje w tym samym kanale, co pozostałe pola
+  // (wiersz zostaje NIEROZWIĄZANY, `logger.warn` niesie `field`).
+  if (amountMinor === null || !Number.isFinite(amountMinor)) {
+    throw new PathYRecoveryInputError(
+      row.event_id,
+      "amount_minor",
+      `[on-order-placed-stripe-retry] Path Y marker ${row.event_id} nie niesie ` +
+        `czytelnego amount_minor (${String(amountMinor)}) — odmowa fail-closed ` +
+        "zamiast cichego zera"
+    )
+  }
+  const normalizedAmountMinor = Math.trunc(amountMinor)
   if (normalizedAmountMinor < 0) {
     throw new PathYRecoveryInputError(
       row.event_id,

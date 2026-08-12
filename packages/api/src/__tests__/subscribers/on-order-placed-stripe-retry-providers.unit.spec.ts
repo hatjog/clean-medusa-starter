@@ -504,6 +504,51 @@ describe("odzysk Path Y — paczka mieszana, domknięcie i replay", () => {
     expect(liveIssue.mock.calls[0][1].payload.amount_minor).toBe(25000)
   })
 
+  it("C2-L-3: marker BEZ amount_minor jest odmową, nie cichym zerem", async () => {
+    // Do review cyklu 2 `null`/`NaN` schodziło tu do `0` w dwóch miejscach
+    // naraz (`Number(r.amount ?? 0)` w mapperze i `? 0 :` w walidacji), więc
+    // brak kwoty stawał się kwotą — wartością legalną i nieodróżnialną od
+    // pomiaru. Bezpieczeństwo tej linii opierało się WYŁĄCZNIE na fakcie
+    // zewnętrznym: dziś `live-issue-from-payment-intent.ts` tego pola nie
+    // czyta. Kontrola przypina odmowę do tego samego kanału, co pozostałe
+    // nieczytelne pola: wiersz zostaje nierozwiązany, paczka żyje.
+    const liveIssue = liveIssueEntitlementsWithinTx as jest.Mock
+    liveIssue.mockReset()
+    liveIssue.mockResolvedValueOnce(issuedOnce())
+    const h = makeHarness([
+      pathYRow({ event_id: "evt_noamount#deferred-issuance", amount: null }),
+      pathYRow({ event_id: "evt_ok#deferred-issuance" }),
+    ])
+
+    await run(h.container, { id: "order_1" })
+
+    // Poprawny marker paczki wystawiony i domknięty; wadliwy — NIE.
+    expect(liveIssue).toHaveBeenCalledTimes(1)
+    const updates = h.sent.filter((q) => q.sql === MARK_DEFERRED_RESOLVED_SQL)
+    expect(updates.map((q) => q.values[0])).toEqual(["evt_ok#deferred-issuance"])
+    expect(h.logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining("marker Path Y nieodtwarzalny")
+    )
+    expect(h.logger.error).not.toHaveBeenCalled()
+  })
+
+  it("C2-L-3: amount nieczytelny (NaN po konwersji) też jest odmową", async () => {
+    const liveIssue = liveIssueEntitlementsWithinTx as jest.Mock
+    liveIssue.mockReset()
+    const h = makeHarness([
+      pathYRow({
+        event_id: "evt_nan#deferred-issuance",
+        amount: "nie-liczba" as unknown as number,
+      }),
+    ])
+
+    await run(h.container, { id: "order_1" })
+
+    expect(liveIssue).not.toHaveBeenCalled()
+    expect(h.sent.some((q) => q.sql === MARK_DEFERRED_RESOLVED_SQL)).toBe(false)
+    expect(h.logger.error).not.toHaveBeenCalled()
+  })
+
   it("marker bez market_id jest pomijany, a nie wywraca paczki", async () => {
     const liveIssue = liveIssueEntitlementsWithinTx as jest.Mock
     liveIssue.mockReset()

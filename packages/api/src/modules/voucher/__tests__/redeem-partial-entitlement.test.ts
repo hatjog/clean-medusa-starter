@@ -39,6 +39,8 @@ import {
   RedeemNotRedeemableError,
   RedeemChoiceSetItemError,
   RedeemEntitlementNotFoundError,
+  RedemptionBalanceError,
+  REDEMPTION_KIND_REVERSAL,
   isWithdrawalRightExtinguished,
   buildRedemptionId,
   type RedeemableAmountEntitlement,
@@ -1077,5 +1079,185 @@ describe("C2-HIGH-2 — odwrócenie realizacji domyka też stan kodu vouchera", 
     expect(res.entitlement_state_after).toBe("REDEEMED_PARTIAL")
     // Uprawnienie nie zeszło do stanu unieważniającego ⇒ kod zostaje realizowalny.
     expect(store.getVoucherStatus(CODE)).toBe("idle")
+  })
+})
+
+// ===========================================================================
+// v1.15.0 Story 6.3 review-fix cyklu 2 (C2-M-1, C2-M-4) — POSTING i ODWRÓT
+// dla `VOUCHER_SERVICE`.
+//
+// Cykl 2 zmierzył dwa braki KONTROLI (nie domysły, mutanty):
+//   C2-M-1 — `priorRedeemedGross: 0 → totalGross` i `remainingBefore:
+//            totalGross → 0` przechodziły z pakietem 51/51 zielonym, mimo że
+//            obie wartości wypływają na zewnątrz (baza derecognition
+//            i `remaining_before_minor` koperty).
+//   C2-M-4 — bloki testów odwrotu nie zawierały ANI JEDNEGO wystąpienia
+//            `VOUCHER_SERVICE`; komentarz w kodzie deklarował agnostyczność
+//            typową, a żaden test tego dla nowego typu nie wykonywał
+//            (`feedback_martwy_mechanizm_na_realnej_sciezce`).
+// ===========================================================================
+
+describe("C2-M-1/C2-M-4 — VOUCHER_SERVICE: posting i odwrót (ADR-212)", () => {
+  const SVC_NET = 27642
+  const SVC_VAT = 6358 // totalGross = 34000
+  const SVC_GROSS = SVC_NET + SVC_VAT
+  const SVC_CODE = "GP-SVC-0001"
+
+  const serviceRow = (overrides: Record<string, unknown> = {}) =>
+    makeEntitlement({
+      entitlement_type: EntitlementType.VOUCHER_SERVICE,
+      // Tak wygląda wiersz na realnej bazie: brak salda, brutto w snapshocie.
+      remaining_amount: null,
+      policy_snapshot: {
+        transferability: "bearer",
+        amount_minor: SVC_GROSS,
+        voucher_code: SVC_CODE,
+      },
+      ...overrides,
+    })
+
+  /** Wejście z rozbiciem net/VAT — inaczej VAT jest zerem i posting jest no-opem. */
+  const svcVatInput = (
+    overrides: Partial<RedeemPartialInput> = {}
+  ): RedeemPartialInput =>
+    baseInput({
+      amount_minor: undefined,
+      redeem_full: true,
+      voucher_net_minor: SVC_NET,
+      voucher_vat_minor: SVC_VAT,
+      idempotency_key: "svc-posting-1",
+      ...overrides,
+    })
+
+  it("C2-M-1: POSTING niesie redeemed_gross_to_date = 0 — cały VAT rozpoznany JEDNYM zdarzeniem", async () => {
+    const { op, fake } = makeOp({
+      rows: [serviceRow()],
+      gate: GATE_BOTH_ON,
+      wireWriter: true,
+    })
+
+    const res = await op.redeem(svcVatInput())
+
+    expect(res.posting.activated).toBe(true)
+    expect(res.posting.persisted).toBe(true)
+    expect(fake.txRows).toHaveLength(1)
+    // Asercja czyta POSTING, nie zwrotkę `resolveRedeemSpend`. Rozpoznany VAT
+    // = proporcja(vat, prior+amount, gross) − proporcja(vat, prior, gross).
+    // Wartość CAŁEGO VAT-u jest osiągalna WYŁĄCZNIE przy `prior = 0`: każde
+    // inne `redeemed_gross_to_date` albo pomniejsza tę liczbę, albo wywraca
+    // generator na Σ-guardzie over-redeem.
+    const outputCredits = fake.entryRows
+      .filter((p) => p[2] === "vat:output")
+      .reduce((s, p) => s + Number(p[4]), 0)
+    expect(outputCredits).toBe(SVC_VAT)
+    const suspenseDebits = fake.entryRows
+      .filter((p) => p[2] === "vat:output:suspense")
+      .reduce((s, p) => s + Number(p[3]), 0)
+    expect(suspenseDebits).toBe(SVC_VAT)
+  })
+
+  it("C2-M-1: koperta niesie remaining_before = całe brutto emisji, remaining_after = 0", async () => {
+    const { op } = makeOp({ rows: [serviceRow()] })
+
+    const res = await op.redeem(svcVatInput({ idempotency_key: "svc-remain" }))
+
+    // `remaining_before_minor` wypływa na zewnątrz (`:1573`) i jest liczbą,
+    // którą panel pokazuje kosmetolożce. Dla uprawnienia NIEPODZIELNEGO to
+    // całe brutto emisji — przed realizacją cała jednostka, po niej zero.
+    expect(res.remaining_before_minor).toBe(SVC_GROSS)
+    expect(res.amount_minor).toBe(SVC_GROSS)
+    expect(res.remaining_after_minor).toBe(0)
+    expect(res.outcome).toBe("REDEEMED_FULL")
+  })
+
+  it("C2-M-4: odwrót PEŁNY ⇒ REFUNDED, kod `refunded`, saldo NIE wraca", async () => {
+    const { op, store } = makeOp({ rows: [serviceRow()] })
+    const redeemed = await op.redeem(
+      svcVatInput({ idempotency_key: "svc-rev-full" })
+    )
+    expect(store.getVoucherStatus(SVC_CODE)).toBe("idle")
+
+    const res = await op.reverse({
+      reverses_redemption_id: redeemed.redemption_id,
+      voucher_net_minor: SVC_NET,
+      voucher_vat_minor: SVC_VAT,
+      currency: "PLN",
+    })
+
+    // Dla typu NIEPODZIELNEGO istnieje DOKŁADNIE jedna realizacja, więc jej
+    // odwrócenie zawsze domyka `Σ REVERSAL == Σ REDEMPTION` (ADR-198).
+    expect(res.fully_reversed).toBe(true)
+    expect(res.entitlement_state_after).toBe("REFUNDED")
+    expect(store.get("ent_amount_1")!.state).toBe("REFUNDED")
+    expect(store.getVoucherStatus(SVC_CODE)).toBe("refunded")
+    // ADR-197 §2.5/A4: zwrot NIE jest odblokowaniem — saldo zostaje takie,
+    // jakie jest po realizacji (dla tego typu: zero), a NIE wraca do brutta
+    // emisji. Asercja jest podwójna, bo „0" samo w sobie nie odróżnia „nie
+    // wróciło" od „nigdy nie było".
+    expect(store.get("ent_amount_1")!.remaining_amount).toBe(0)
+    expect(store.get("ent_amount_1")!.remaining_amount).not.toBe(SVC_GROSS)
+    expect(res.commission_base_after_minor).toBe(0)
+  })
+
+  it("C2-M-4: odwrót CZĘŚCIOWY jednostki usługi jest ODMOWĄ (podstawa musi być całym brutto)", async () => {
+    const { op, store } = makeOp({ rows: [serviceRow()] })
+    const redeemed = await op.redeem(
+      svcVatInput({ idempotency_key: "svc-rev-part" })
+    )
+
+    // „Pół zabiegu" nie istnieje po żadnej ze stron: realizacja częściowa jest
+    // odmawiana w `resolveRedeemSpend`, a odwrót częściowy — tutaj. Odwrócenie
+    // cofa DOKŁADNIE tę podstawę, którą rozpoznała realizacja.
+    await expect(
+      op.reverse({
+        reverses_redemption_id: redeemed.redemption_id,
+        voucher_net_minor: 20000,
+        voucher_vat_minor: 0,
+        currency: "PLN",
+      })
+    ).rejects.toBeInstanceOf(RedemptionBalanceError)
+
+    // Odmowa jest fail-closed: ZERO skutku ubocznego.
+    expect(store.get("ent_amount_1")!.state).toBe("REDEEMED_FULL")
+    expect(store.getVoucherStatus(SVC_CODE)).toBe("idle")
+  })
+
+  it("C2-M-4: reguła bilansu ADR-178 §2.3 pilnuje odwrotu — podstawa prowizji nie schodzi < 0", async () => {
+    const { op, store } = makeOp({ rows: [serviceRow()] })
+    const redeemed = await op.redeem(
+      svcVatInput({ idempotency_key: "svc-rev-bounds" })
+    )
+
+    // Wiersz odwracający SPOZA tej operacji (inny `idempotency_key`, więc nie
+    // wchodzi w dedupe) sprowadza podstawę prowizji do zera. Kolejne odwrócenie
+    // zeszłoby na −34000 i musi być odmową — to jest drugi zamek ADR-178 §2.3,
+    // ten sam dla typu kwotowego i niepodzielnego.
+    await store.withTransaction(async (tx) =>
+      tx.insertRedemption({
+        entitlement_id: "ent_amount_1",
+        idempotency_key: "svc-rev-bounds-obcy",
+        redemption_id: "rdm_obcy_reversal",
+        amount_minor: SVC_GROSS,
+        resulting_state: "REDEEMED_FULL",
+        remaining_after_minor: 0,
+        issued_gross_minor: SVC_GROSS,
+        created_at: FIXED_NOW.getTime(),
+        kind: REDEMPTION_KIND_REVERSAL,
+        reverses_redemption_id: redeemed.redemption_id,
+        market_id: "bonbeauty",
+        purchase_market_id: "bonbeauty",
+        redemption_market_id: "bonbeauty",
+      })
+    )
+
+    await expect(
+      op.reverse({
+        reverses_redemption_id: redeemed.redemption_id,
+        voucher_net_minor: SVC_NET,
+        voucher_vat_minor: SVC_VAT,
+        currency: "PLN",
+      })
+    ).rejects.toBeInstanceOf(RedemptionBalanceError)
+    expect(store.get("ent_amount_1")!.state).toBe("REDEEMED_FULL")
   })
 })
