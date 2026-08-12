@@ -323,11 +323,9 @@ class DeliveryMeasurementContextError extends Error {
 }
 
 function resolveDeliveryMeasurementContext(
-  trigger: Pick<PurchaseDeliveryTrigger, "instance_id">,
   env: NodeJS.ProcessEnv | undefined,
 ): DeliveryMeasurementContext {
-  const configuredInstanceId = nonEmpty(env?.GP_INSTANCE_ID)
-  const instanceId = trigger.instance_id ?? configuredInstanceId
+  const instanceId = nonEmpty(env?.GP_INSTANCE_ID)
   const rawEnvironment = nonEmpty(env?.GP_ENV) ?? nonEmpty(env?.NODE_ENV)
   const normalizedEnvironment =
     rawEnvironment === "development"
@@ -339,15 +337,6 @@ function resolveDeliveryMeasurementContext(
   if (!instanceId || !normalizedEnvironment) {
     throw new DeliveryMeasurementContextError(
       "env i instance_id muszą pochodzić z jawnego kontekstu wykonania (AD-25)",
-    )
-  }
-  if (
-    configuredInstanceId &&
-    trigger.instance_id !== null &&
-    configuredInstanceId !== trigger.instance_id
-  ) {
-    throw new DeliveryMeasurementContextError(
-      "instance_id koperty nie zgadza się z instancją runtime",
     )
   }
   if (["unknown", "unattributed"].includes(normalizedEnvironment)) {
@@ -605,7 +594,7 @@ export async function handleVoucherPurchaseDelivery(
 
   let measurementContext: DeliveryMeasurementContext
   try {
-    measurementContext = resolveDeliveryMeasurementContext(trigger, deps.env)
+    measurementContext = resolveDeliveryMeasurementContext(deps.env)
   } catch (error) {
     const errorCode = readErrorCode(
       error,
