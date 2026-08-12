@@ -12,6 +12,9 @@ function makeContainer(options: {
   auditEvents?: AuditEvent[]
   dispatch?: Record<string, unknown> | null
   brakeState?: "engaged" | "released"
+  deliveryLedger?: {
+    applyProviderDeliveryState: jest.Mock
+  }
 } = {}) {
   const auditEvents = options.auditEvents ?? []
   const logger = {
@@ -27,6 +30,14 @@ function makeContainer(options: {
       auditEvents.push(auditEvent)
     }),
   }
+  const deliveryLedger = options.deliveryLedger ?? {
+    applyProviderDeliveryState: jest.fn(async () => ({
+      outcome: options.dispatch ? "updated" : "orphan",
+      dispatch_id: options.dispatch?.dispatch_id ?? null,
+      previous_status: null,
+      status: options.dispatch ? "delivered" : null,
+    })),
+  }
   const db = {
     raw: jest.fn(async () => ({
       rows: [
@@ -41,6 +52,7 @@ function makeContainer(options: {
   const resolve = jest.fn((key: string) => {
     if (key === "logger") return logger
     if (key === "notification_dispatches") return dispatches
+    if (key === "voucher_delivery_dispatch_ledger") return deliveryLedger
     if (key === "notification_delivery_audit_sink") return sink
     if (key === "__pg_connection__") return db
     throw new Error(`Unknown container key: ${key}`)
@@ -53,6 +65,7 @@ function makeContainer(options: {
     logger,
     resolve,
     sink,
+    deliveryLedger,
     container: { resolve, __brakeDb: db },
   }
 }
@@ -91,6 +104,18 @@ async function handleDelivery(
           }
         }
         return releasedDb
+      }
+      if (key === "notification_dispatches") {
+        try {
+          return originalResolve?.(key)
+        } catch {
+          try {
+            originalResolve?.("__pg_connection__")
+            return undefined
+          } catch {
+            return { findByProviderMessageId: async () => null }
+          }
+        }
       }
       if (originalResolve) return originalResolve(key)
       throw new Error(`Unknown container key: ${key}`)
@@ -164,6 +189,31 @@ describe("brevoDeliveryTracker", () => {
       flow_id: "voucher_delivery",
       market_id: "pl",
     })
+  })
+
+  it("przekazuje realny callback do trwałego ledgera pod kontekstem rynku", async () => {
+    const ctx = makeContainer({
+      dispatch: { dispatch_id: "dispatch-state", market_id: "pl" },
+    })
+
+    await handleDelivery(
+      {
+        provider_id: "brevo",
+        provider_event_id: "brevo-state-1",
+        dispatch_id: "dispatch-state",
+        event_type: "delivered",
+        market_id: "pl",
+      },
+      ctx.container,
+    )
+
+    expect(ctx.deliveryLedger.applyProviderDeliveryState).toHaveBeenCalledWith(
+      expect.objectContaining({
+        provider_event_id: "brevo-state-1",
+        provider: "brevo",
+        status: "delivered",
+      }),
+    )
   })
 
   it("zaciagniety hamulec zachowuje zastana sciezke bez zapisu audytu", async () => {
@@ -308,7 +358,7 @@ describe("brevoDeliveryTracker", () => {
     )
   })
 
-  it("deduplikuje powtórzony provider_event_id bez drugiego audit entry", async () => {
+  it("nie używa mapy procesu; replay ma ten sam deterministyczny audit_id", async () => {
     const ctx = makeContainer()
     const payload = {
       provider_id: "brevo",
@@ -323,10 +373,8 @@ describe("brevoDeliveryTracker", () => {
     await handleDelivery(payload, ctx.container)
     await handleDelivery(payload, ctx.container)
 
-    expect(ctx.auditEvents).toHaveLength(1)
-    expect(ctx.logger.info).toHaveBeenCalledWith(
-      expect.stringContaining("duplicate delivery event skipped"),
-    )
+    expect(ctx.auditEvents).toHaveLength(2)
+    expect(ctx.auditEvents[0].audit_id).toBe(ctx.auditEvents[1].audit_id)
   })
 
   it("haszuje raw email i nie przenosi go do audit envelope", async () => {
@@ -526,7 +574,7 @@ describe("brevoDeliveryTracker", () => {
     )
   })
 
-  it("deduplikuje concurrent handle() calls przez mark-before-emit ordering (F-03 race)", async () => {
+  it("dwa równoległe callbacki nie mają bariery w pamięci procesu", async () => {
     const ctx = makeContainer()
     const payload = {
       provider_id: "brevo",
@@ -543,7 +591,8 @@ describe("brevoDeliveryTracker", () => {
       handleDelivery(payload, ctx.container),
     ])
 
-    expect(ctx.auditEvents).toHaveLength(1)
+    expect(ctx.auditEvents).toHaveLength(2)
+    expect(ctx.auditEvents[0].audit_id).toBe(ctx.auditEvents[1].audit_id)
   })
 
   it("przywraca dedupe entry gdy sink rzuca — Medusa retry przejdzie jak fresh (F-07 rollback)", async () => {
@@ -662,7 +711,7 @@ describe("brevoDeliveryTracker", () => {
       error_code: "DISPATCH_LOOKUP_FAILED",
     })
     expect(logger.error).toHaveBeenCalledWith(
-      expect.stringContaining("notification_dispatches lookup failed"),
+      expect.stringContaining("DISPATCH_LOOKUP_FAILED"),
     )
   })
 

@@ -22,23 +22,26 @@ import {
   type DeliveryEventReaction,
 } from "../lib/delivery-event-classification"
 import { createMoneyPathBrakeReader } from "../lib/money-path-brakes"
-import { runInSystemMarketContext } from "../lib/system-market-context"
+import {
+  requireMarketContext,
+  runInSystemMarketContext,
+} from "../lib/system-market-context"
+import {
+  PgDispatchLedger,
+  type ApplyProviderDeliveryStateResult,
+} from "../modules/voucher-delivery/dispatch-ledger"
+import { DELIVERY_DISPATCH_STATES } from "../modules/voucher-delivery/delivery-state"
 
 /**
  * Path Y Brevo delivery subscriber.
  *
- * Limitations (Story 5.5 — follow-up scoped do v1.11.0+ messaging persistence story):
- * - Dedupe cache jest module-level Map → single-process semantics. Multi-instance
- *   deployment (N replicas) NIE deduplikuje cross-replica; cold restart traci
- *   cache → Brevo retry replay (do 7 dni) może wygenerować duplicate audit
- *   envelopes. Pełna idempotency wymaga persistencji w
- *   `notification_delivery_events` z UNIQUE constraint na `provider_event_id`
- *   (follow-up story: v1.11.0-messaging-delivery-persistence — utworzyć w
- *   Sprint 5 backlog).
- * - Race-safety: `mark-before-emit` ordering eliminuje in-process race między
- *   dwoma concurrent handle() calls dla tego samego `provider_event_id`, oraz
- *   eliminuje double-emit gdy `emitAuditEvent` propaguje błąd sinka (rollback
- *   dedupe entry w catch → next Medusa retry przejdzie jak fresh event).
+ * Idempotencja callbacku nie jest stanem procesu. Powtórzenia i wyścigi dwóch
+ * instancji rozstrzyga atomowy UPDATE w `voucher_delivery_dispatch`, a trwały
+ * wiersz jest źródłem prawdy dla provider_event_id.
+ *
+ * - Audit sink nadal może ponownie zobaczyć deterministyczną kopertę po replayu;
+ *   deduplikacja faktu odbywa się po stronie trwałego sinka, nie przez cache
+ *   procesu.
  * - Multi-event subscription (Medusa 2.14.2 `config.event: string[]`):
  *   weryfikacja runtime live w follow-up smoke test (Story 5.9 lub Sprint 3
  *   integration suite). Jeśli array form NIE supported → split do 6 plików
@@ -129,6 +132,8 @@ type DispatchRecord = {
   idempotency_key?: string
   /** Liczba prob zarejestrowanych po stronie SYSTEMU (AD-23), nie z ladunku. */
   attempts?: number
+  status?: (typeof DELIVERY_DISPATCH_STATES)[number]
+  provider_message_id?: string | null
 }
 
 type DispatchLookup = {
@@ -173,9 +178,12 @@ type CorrelatedDispatch = {
   lookup_error_code?: string
 }
 
-const DELIVERY_DEDUP_TTL_MS = 24 * 60 * 60 * 1000
-const DELIVERY_DEDUP_MAX = 10000
-const seenProviderEventIds = new Map<string, number>()
+export const DELIVERY_ORPHAN_METRIC = "gp_brevo_delivery_orphan_total"
+export const DELIVERY_LOOKUP_FAILED_METRIC = "gp_brevo_delivery_lookup_failed_total"
+export const DELIVERY_STATE_TRANSITION_METRIC =
+  "gp_brevo_delivery_state_transition_total"
+export const DELIVERY_STATE_NOT_APPLICABLE_METRIC =
+  "gp_brevo_delivery_state_not_applicable_total"
 
 export default async function brevoDeliveryTracker({
   event,
@@ -219,19 +227,6 @@ export default async function brevoDeliveryTracker({
     )
   }
 
-  pruneSeenProviderEventIds()
-  if (seenProviderEventIds.has(normalized.provider_event_id)) {
-    logger.info?.(
-      `[brevo-delivery-tracker] duplicate delivery event skipped provider_event_id=${normalized.provider_event_id}`,
-    )
-    return
-  }
-
-  // F-03/F-07: mark BEFORE await — eliminuje in-process race + double-emit
-  // przy sink failure (compensating rollback w catch przywraca eligibility
-  // dla Medusa retry).
-  markProviderEventSeen(normalized.provider_event_id)
-
   try {
     // JEDEN odczyt wiersza dispatchu na zdarzenie. Do cyklu 1 review byly DWA
     // (raz dla rynku, raz dla korelacji) — podwojny round-trip do bazy i podwojny
@@ -261,7 +256,6 @@ export default async function brevoDeliveryTracker({
       "fr_9_delivery_idempotency",
     )
     if (!deliveryPathReleased) {
-      seenProviderEventIds.delete(normalized.provider_event_id)
       logger.info?.(
         `[brevo-delivery-tracker] money path brake engaged market_id=${marketId ?? "missing"} brake=fr_9_delivery_idempotency`,
       )
@@ -275,14 +269,26 @@ export default async function brevoDeliveryTracker({
         logger: logger as never,
       },
       async () => {
+        const context = requireMarketContext("brevo delivery state write", {
+          origin: { surface: "subscriber", name: "brevo-delivery-tracker" },
+          logger: logger as never,
+        })
         const correlated = correlateDispatch(normalized!, lookup, logger)
+        const stateResult = await applyDeliveryState(
+          runtimeContainer,
+          normalized!,
+          correlated,
+          db,
+          context.market_id,
+          logger,
+        )
+        logDeliveryStateResult(normalized!, stateResult, logger)
         const auditEvent = buildAuditEnvelope(normalized!, correlated)
 
         await emitAuditEvent(runtimeContainer, auditEvent, logger)
       },
     )
   } catch (error) {
-    seenProviderEventIds.delete(normalized.provider_event_id)
     throw error
   }
 }
@@ -323,13 +329,162 @@ function resolveMarketIdForContext(
   return systemMarketId ?? payloadMarketId
 }
 
+type DeliveryStateResult = ApplyProviderDeliveryStateResult | {
+  outcome: "state_not_applicable" | "state_writer_unavailable"
+  dispatch_id: string | null
+  previous_status: null
+  status: null
+}
+
+function deliveryStateForEvent(
+  eventType: NotificationDeliveryEventType,
+): (typeof DELIVERY_DISPATCH_STATES)[number] | null {
+  switch (eventType) {
+    case "delivered":
+      return DELIVERY_DISPATCH_STATES.find((state) => state === "delivered") ?? null
+    case "bounced_permanent":
+    case "bounced_transient":
+    case "blocked":
+    case "invalid_address":
+    case "failed":
+      return DELIVERY_DISPATCH_STATES.find((state) => state === "failed") ?? null
+    case "deferred":
+      return DELIVERY_DISPATCH_STATES.find((state) => state === "retrying") ?? null
+    default:
+      return null
+  }
+}
+
+type DeliveryStateWriter = {
+  applyProviderDeliveryState: (
+    input: Parameters<PgDispatchLedger["applyProviderDeliveryState"]>[0],
+  ) => Promise<ApplyProviderDeliveryStateResult>
+}
+
+function resolveDeliveryStateWriter(
+  container: ResolveContainer,
+  db: KnexLike | undefined,
+): DeliveryStateWriter | null {
+  const configured = resolveOptional<DeliveryStateWriter>(
+    container,
+    [
+      "voucher_delivery_dispatch_ledger",
+      "voucherDeliveryDispatchLedger",
+      "deliveryDispatchLedger",
+    ],
+  )
+  if (configured?.applyProviderDeliveryState) return configured
+
+  // Test doubles and legacy lookup adapters may expose only a read port. Do
+  // not accidentally treat those as the production writer.
+  const legacyLookup = resolveOptional<DispatchLookup>(container, [
+    "notification_dispatches",
+    "notificationDispatches",
+    "notification_dispatch_repository",
+    "notificationDispatchRepository",
+  ])
+  return !legacyLookup && db
+    ? new PgDispatchLedger(db)
+    : null
+}
+
+async function applyDeliveryState(
+  container: ResolveContainer,
+  normalized: NormalizedBrevoDeliveryEvent,
+  correlated: CorrelatedDispatch,
+  db: KnexLike | undefined,
+  marketId: string,
+  logger: LoggerLike,
+): Promise<DeliveryStateResult> {
+  const status = deliveryStateForEvent(normalized.event_type)
+  if (!status) {
+    return {
+      outcome: "state_not_applicable",
+      dispatch_id: correlated.dispatch_id ?? null,
+      previous_status: null,
+      status: null,
+    }
+  }
+
+  const writer = resolveDeliveryStateWriter(container, db)
+  if (!writer) {
+    logger.error?.(
+      `[brevo-delivery-tracker] error_code=DELIVERY_STATE_WRITER_UNAVAILABLE ` +
+        `metric=${DELIVERY_STATE_TRANSITION_METRIC} market_id=${marketId}`,
+    )
+    return {
+      outcome: "state_writer_unavailable",
+      dispatch_id: correlated.dispatch_id ?? null,
+      previous_status: null,
+      status: null,
+    }
+  }
+
+  return writer.applyProviderDeliveryState({
+    provider_event_id: normalized.provider_event_id,
+    status,
+    provider: "brevo",
+    error_code: normalized.error_code ?? null,
+    occurred_at: normalized.occurred_at,
+  })
+}
+
+function logDeliveryStateResult(
+  normalized: NormalizedBrevoDeliveryEvent,
+  result: DeliveryStateResult,
+  logger: LoggerLike,
+): void {
+  switch (result.outcome) {
+    case "updated":
+      logger.info?.(
+        `[brevo-delivery-tracker] outcome=state_updated metric=${DELIVERY_STATE_TRANSITION_METRIC} ` +
+          `provider_event_id=${normalized.provider_event_id} dispatch_id=${result.dispatch_id}`,
+      )
+      return
+    case "duplicate":
+      logger.info?.(
+        `[brevo-delivery-tracker] outcome=duplicate metric=${DELIVERY_STATE_TRANSITION_METRIC} ` +
+          `provider_event_id=${normalized.provider_event_id}`,
+      )
+      return
+    case "orphan":
+      logger.error?.(
+        `[brevo-delivery-tracker] error_code=DELIVERY_DISPATCH_ORPHAN outcome=orphan ` +
+          `metric=${DELIVERY_ORPHAN_METRIC} provider_event_id=${normalized.provider_event_id}`,
+      )
+      return
+    case "state_transition_rejected":
+      logger.error?.(
+        `[brevo-delivery-tracker] error_code=DELIVERY_STATE_TRANSITION_REJECTED ` +
+          `outcome=state_transition_rejected metric=${DELIVERY_STATE_TRANSITION_METRIC} ` +
+          `provider_event_id=${normalized.provider_event_id}`,
+      )
+      return
+    case "state_not_applicable":
+      logger.info?.(
+        `[brevo-delivery-tracker] outcome=state_not_applicable ` +
+          `metric=${DELIVERY_STATE_NOT_APPLICABLE_METRIC} provider_event_id=${normalized.provider_event_id}`,
+      )
+      return
+    case "state_writer_unavailable":
+      return
+    default:
+      return assertNeverDeliveryStateResult(result)
+  }
+}
+
+function assertNeverDeliveryStateResult(value: never): never {
+  throw new Error(`nieobsluzony wynik zapisu stanu dostawy: ${String(value)}`)
+}
+
 export const config: SubscriberConfig = {
   event: [...BREVO_NOTIFICATION_EVENTS],
   context: { subscriberId: "brevo-delivery-tracker" },
 }
 
 export function __resetBrevoDeliveryTrackerForTests(): void {
-  seenProviderEventIds.clear()
+  // Zachowane jako kompatybilny punkt resetu testów. Idempotencja nie jest już
+  // stanem procesu — rozstrzyga ją trwały ledger.
 }
 
 function normalizeDeliveryEvent(
@@ -477,7 +632,7 @@ async function lookupDispatch(
           -- kolumny w projekcji attempts bylo zawsze undefined, wiec drabina
           -- ponowien startowala od nowa przy kazdym zdarzeniu.
           attempts
-        FROM notification_dispatches
+        FROM voucher_delivery_dispatch
         WHERE provider_message_id = ?
         LIMIT 1
       `,
@@ -497,7 +652,9 @@ async function lookupDispatch(
     }
     const err = error as Error
     logger.error?.(
-      `[brevo-delivery-tracker] notification_dispatches lookup failed provider_event_id=${providerEventId} code=${pgCode ?? "unknown"}: ${err.message}`,
+      `[brevo-delivery-tracker] error_code=${DISPATCH_LOOKUP_FAILED_CODE} ` +
+        `metric=${DELIVERY_LOOKUP_FAILED_METRIC} provider_event_id=${providerEventId} ` +
+        `code=${pgCode ?? "unknown"}: ${err.message}`,
     )
     return { dispatch: null, error_code: DISPATCH_LOOKUP_FAILED_CODE }
   }
@@ -807,27 +964,6 @@ function resolvePgConnection(container: ResolveContainer): KnexLike | undefined 
   } catch {
     return undefined
   }
-}
-
-function pruneSeenProviderEventIds(): void {
-  const cutoff = Date.now() - DELIVERY_DEDUP_TTL_MS
-  for (const [providerEventId, seenAt] of seenProviderEventIds) {
-    if (seenAt < cutoff) {
-      seenProviderEventIds.delete(providerEventId)
-    }
-  }
-
-  while (seenProviderEventIds.size > DELIVERY_DEDUP_MAX) {
-    const oldestKey = seenProviderEventIds.keys().next().value
-    if (oldestKey === undefined) {
-      break
-    }
-    seenProviderEventIds.delete(oldestKey)
-  }
-}
-
-function markProviderEventSeen(providerEventId: string): void {
-  seenProviderEventIds.set(providerEventId, Date.now())
 }
 
 function readString(value: unknown): string | undefined {
