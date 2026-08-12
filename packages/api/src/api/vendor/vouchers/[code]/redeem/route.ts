@@ -314,17 +314,52 @@ const observeRefusalCode = (res: MedusaResponse): { code: () => string | null } 
   return { code: () => observed }
 }
 
-/** JEDEN warn na proces — brak nosnika ma byc glosny, ale nie spamujacy. */
-let hotPathCarrierWarned = false
-let hotPathEmitFailureWarned = false
+/**
+ * Tlumienie sladu diagnostycznego — PER KLASA PRZYCZYNY, nie „raz na proces"
+ * (review fali B5, `[B5][security][LOW]`, rozstrzygniete w cyklu 7 wariantem (a)).
+ *
+ * ZMIERZONY STAN PRZED: dwa booleany (`hotPathCarrierWarned`,
+ * `hotPathEmitFailureWarned`) rozdzielaly tlumienie po MIEJSCU W KODZIE, a nie
+ * po PRZYCZYNIE. Przy dlugo zyjacym procesie pierwszy wyjatek emisji zjadal
+ * sygnal dla wszystkich nastepnych — takze dla NOWEJ klasy przyczyny (inny typ
+ * bledu, inna awaria nosnika). Operator widzial `TypeError` z pierwszej minuty
+ * zycia procesu i nigdy nie dowiadywal sie o `RangeError` z trzeciej godziny.
+ *
+ * ROZSTRZYGNIECIE: kluczem tlumienia jest KLASA PRZYCZYNY, wiec kazda nowa
+ * klasa dostaje wlasny pierwszy `warn`. Co operator NADAL traci: LICZNIK
+ * powtorzen w obrebie jednej klasy — drugie i kolejne wystapienia tej samej
+ * przyczyny sa ciche. To jest cena swiadoma: powtorzenia tej samej przyczyny
+ * niosa zero nowej informacji diagnostycznej, a nosnikiem WOLUMENU sa serie
+ * NFR-11, nie log.
+ *
+ * DLACZEGO TEGO NIE DA SIE WYWOLAC Z ZEWNATRZ W PETLI — dwie niezalezne
+ * bariery:
+ *   1. klucze klas pochodzą WYLACZNIE z tego procesu (literaly w tym pliku plus
+ *      nazwa klasy wyjatku ze stosu), nigdy z wejscia klienta — klient nie ma
+ *      czym wyprodukowac nowego klucza;
+ *   2. BUDZET {@link HOT_PATH_WARN_CLASS_BUDGET} domyka zbior twardo, wiec nawet
+ *      gdyby ktos w przyszlosci wpuscil do klucza wartosc sterowana z zewnatrz,
+ *      log nie da sie zalac.
+ */
+export const HOT_PATH_WARN_CLASS_BUDGET = 16
+const hotPathWarnedCauseClasses = new Set<string>()
 
-const warnOnce = (
+/** Nosnika metryk nie ma w kontenerze — jedna, niepodzielna przyczyna. */
+const HOT_PATH_CARRIER_UNAVAILABLE_CAUSE = "carrier_unavailable" as const
+/** Emisja rzucila; czlon po dwukropku niesie TYP wyjatku (nie jego tresc). */
+const HOT_PATH_EMIT_FAILURE_CAUSE_PREFIX = "emit_failure:" as const
+/** Zaden kandydat na `request_id` nie przeszedl bramki ksztaltu. */
+const HOT_PATH_REQUEST_ID_FALLBACK_CAUSE_PREFIX = "request_id_fallback:" as const
+
+const warnOncePerCauseClass = (
   req: RequestWithSellerContext,
-  alreadyWarned: boolean,
+  causeClass: string,
   message: string,
   meta: Record<string, unknown>,
-): boolean => {
-  if (alreadyWarned) return true
+): void => {
+  if (hotPathWarnedCauseClasses.has(causeClass)) return
+  if (hotPathWarnedCauseClasses.size >= HOT_PATH_WARN_CLASS_BUDGET) return
+  hotPathWarnedCauseClasses.add(causeClass)
   let logger: { warn?: (message: string, meta?: unknown) => void } | undefined
   try {
     logger = req.scope.resolve(ContainerRegistrationKeys.LOGGER) as {
@@ -333,10 +368,10 @@ const warnOnce = (
   } catch {
     logger = undefined
   }
-  if (typeof logger?.warn === "function") logger.warn(message, meta)
+  const payload = { ...meta, cause_class: causeClass }
+  if (typeof logger?.warn === "function") logger.warn(message, payload)
   // eslint-disable-next-line no-console
-  else console.warn(message, meta)
-  return true
+  else console.warn(message, payload)
 }
 
 /**
@@ -346,7 +381,8 @@ const warnOnce = (
  * ALE cisza tez nie jest dopuszczalna (review cyklu 1, F-3): puste `catch {}`
  * zamienialo „glosna odmowe" z AC2 w brak sladu, a brak serii jest
  * NIEODROZNIALNY od braku ruchu. Kazda porazka emisji i kazdy brak nosnika
- * zostawiaja `warn` (jeden na proces, wzorzec z `posthog-metrics-client`).
+ * zostawiaja `warn` — jeden na KLASE PRZYCZYNY, nie jeden na proces
+ * ({@link warnOncePerCauseClass}, cykl 7).
  */
 const emitHotPathMetrics = (
   req: RequestWithSellerContext,
@@ -402,9 +438,9 @@ const emitHotPathMetrics = (
     })
 
     if (result === "carrier_unavailable") {
-      hotPathCarrierWarned = warnOnce(
+      warnOncePerCauseClass(
         req,
-        hotPathCarrierWarned,
+        HOT_PATH_CARRIER_UNAVAILABLE_CAUSE,
         "[redemption-hot-path] nosnik metryk (kontener: 'posthog') jest " +
           "niedostepny — serie NFR-11 NIE powstaja; brak serii nie jest " +
           "dowodem braku ruchu",
@@ -415,23 +451,29 @@ const emitHotPathMetrics = (
     // Metryka, ktora wywraca realizacje vouchera, jest gorsza niz brak metryki —
     // dlatego lykamy wyjatek. Ale zostawiamy slad, bo cisza jest najgorszym
     // mozliwym zachowaniem nosnika (AC2: odmowa ma byc GLOSNA).
-    hotPathEmitFailureWarned = warnOnce(
+    //
+    // Klasa przyczyny niesie TYP wyjatku, wiec DRUGI, INNY typ awarii emisji
+    // dostaje wlasny pierwszy `warn` zamiast wpadac w tlumienie po pierwszym
+    // (`[B5][security][LOW]`, cykl 7). Typ pochodzi ze stosu tego procesu —
+    // klient nie ma czym go wyprodukowac, wiec nie da sie tym zalac logow.
+    const errorClass =
+      error instanceof Error ? error.constructor.name : typeof error
+    warnOncePerCauseClass(
       req,
-      hotPathEmitFailureWarned,
+      `${HOT_PATH_EMIT_FAILURE_CAUSE_PREFIX}${errorClass}`,
       "[redemption-hot-path] emisja metryk NFR-11 zakonczyla sie wyjatkiem — " +
         "serie nie powstaly; realizacja vouchera przebiegla bez zmian",
       {
-        error_class: error instanceof Error ? error.constructor.name : typeof error,
+        error_class: errorClass,
         error_message: error instanceof Error ? error.message : String(error),
       },
     )
   }
 }
 
-/** Wylacznie dla testow — resetuje jednorazowe tlumienie `warn`. */
+/** Wylacznie dla testow — resetuje tlumienie sladu per klasa przyczyny. */
 export const __resetHotPathWarnStateForTests = (): void => {
-  hotPathCarrierWarned = false
-  hotPathEmitFailureWarned = false
+  hotPathWarnedCauseClasses.clear()
 }
 
 /**
@@ -462,26 +504,91 @@ export const __resetHotPathWarnStateForTests = (): void => {
  * (`withRedemptionPiiGuard`) nie moze zostac wywolana rzutem sterowanym
  * z zewnatrz. Bez tego klient jednym naglowkiem kasowal WSZYSTKIE TRZY serie
  * NFR-11 dla swojego zadania (bramka rzuca przy pierwszym `capture`, rzut lyka
- * `catch` w `emitHotPathMetrics`, a slad gasnie po jednym `warnOnce` na proces).
+ * `catch` w `emitHotPathMetrics`, a slad gasnie po pierwszym wystapieniu tej
+ * klasy przyczyny — {@link warnOncePerCauseClass}).
+ *
+ * Odrzucenie WSZYSTKICH kandydatow nie jest juz ciche (cykl 7): zostawia slad
+ * diagnostyczny, ktory niesie FAKT i KLASE, a nie odrzucona wartosc — patrz
+ * komentarz w ciele {@link resolveHotPathRequestId}.
  */
 const HOT_PATH_REQUEST_ID_SHAPE = IDEMPOTENCY_KEY_SHAPE
+
+/**
+ * Naglowki korelacyjne czytane W TEJ KOLEJNOSCI. Kolejnosc jest CZESCIA
+ * kontraktu, nie szczegolem: `x-request-id` jest naglowkiem trace'a tego
+ * zadania, a `x-correlation-id` — identyfikatorem calej operacji rozproszonej,
+ * ktora to zadanie moze byc tylko jednym krokiem. Zamiana ich miejscami
+ * skleilaby w metryce zadania, ktore AD-25 ma rozdzielac. Oba sloty (i ich
+ * pierwszenstwo wzgledem pola frameworka) sa przypiete kontrolami `H2g`/`H2h` —
+ * przed cyklem 7 caly slot `x-correlation-id` dawal sie usunac bez jednej
+ * czerwonej (`[B5-c3][regression][LOW]`, mutant M6).
+ */
+const HOT_PATH_CORRELATION_HEADERS = ["x-request-id", "x-correlation-id"] as const
+
+/** Nazwa slotu pola frameworka — do sladu diagnostycznego, nie do etykiety. */
+const HOT_PATH_FRAMEWORK_REQUEST_ID_SLOT = "req.requestId" as const
 
 const resolveHotPathRequestId = (req: RequestWithSellerContext): string => {
   const headers =
     (req as unknown as { headers?: Record<string, unknown> }).headers ?? {}
-  const candidates: unknown[] = []
-  for (const name of ["x-request-id", "x-correlation-id"]) {
+  const candidates: Array<{ slot: string; value: unknown }> = []
+  for (const name of HOT_PATH_CORRELATION_HEADERS) {
     const raw = headers[name]
-    candidates.push(Array.isArray(raw) ? raw[0] : raw)
+    candidates.push({ slot: name, value: Array.isArray(raw) ? raw[0] : raw })
   }
   // Pole frameworka jest OSTATNIM kandydatem, ale nie ma taryfy ulgowej —
   // to ten sam naglowek klienta, tylko przepisany przez loader Medusy.
-  candidates.push((req as unknown as { requestId?: unknown }).requestId)
+  candidates.push({
+    slot: HOT_PATH_FRAMEWORK_REQUEST_ID_SLOT,
+    value: (req as unknown as { requestId?: unknown }).requestId,
+  })
+  const rejectedSlots: string[] = []
   for (const candidate of candidates) {
-    if (typeof candidate !== "string") continue
-    const value = candidate.trim()
+    if (typeof candidate.value !== "string") continue
+    const value = candidate.value.trim()
     if (HOT_PATH_REQUEST_ID_SHAPE.test(value)) return value
+    rejectedSlots.push(candidate.slot)
   }
+
+  // ── SLAD ZEJSCIA DO WYGENEROWANEGO IDENTYFIKATORA ────────────────────────
+  // (`[B5-c3][regression][LOW]`, cykl 7). Zdjecie taryfy ulgowej z
+  // `req.requestId` w cyklu 3 ROZSZERZYLO zbior wartosci, ktore znikaja: dzis
+  // odpada takze AWS X-Ray (`Root=1-…;Sampled=1`), base64 i kazdy ciag krotszy
+  // niz 8 znakow. Zejscie jest POPRAWNE (etykieta nie moze niesc wartosci
+  // odrzuconej), ale bylo CICHE — a cisza znaczy, ze operator patrzacy na
+  // metryke bez korelacji do logu nie wie, ze korelacja zostala zerwana
+  // i DLACZEGO. Ta sama trasa zostawia slad przy `carrier_unavailable`
+  // i przy wyjatku emisji; ten slot byl trzecim, ktory go nie mial.
+  //
+  // TRZY twarde ograniczenia tresci sladu:
+  //   1. NIE niesie odrzuconej wartosci ani jej fragmentu — to jest dokladnie
+  //      ta wartosc, ktora bramka odrzucila jako podejrzana o PII (zmierzone:
+  //      `jan.kowalski@example.com` trafia w ten slot). Logujemy FAKT
+  //      i KLASE: nazwy slotow, ktore odpadly, i powod klasowy;
+  //   2. NIE da sie go wywolac w petli z zewnatrz — tlumienie per klasa
+  //      przyczyny ({@link warnOncePerCauseClass}), a klasa nalezy do
+  //      dwuelementowego zbioru zamknietego w tym pliku;
+  //   3. NIE zmienia etykiety — `randomUUID()` zostaje, bo identyfikator losowy
+  //      przynajmniej rozdziela zadania.
+  const reasonClass = rejectedSlots.length > 0 ? "shape_mismatch" : "absent"
+  warnOncePerCauseClass(
+    req,
+    `${HOT_PATH_REQUEST_ID_FALLBACK_CAUSE_PREFIX}${reasonClass}`,
+    "[redemption-hot-path] zaden kandydat na etykiete request_id nie przeszedl " +
+      "bramki ksztaltu — etykieta niesie identyfikator WYGENEROWANY, wiec " +
+      "korelacja metryka→log dla tego zadania nie istnieje; odrzuconej wartosci " +
+      "NIE logujemy, bo to wlasnie ona jest podejrzana o PII",
+    {
+      // NAZWY slotow, nigdy ich wartosci.
+      slots_checked: [
+        ...HOT_PATH_CORRELATION_HEADERS,
+        HOT_PATH_FRAMEWORK_REQUEST_ID_SLOT,
+      ],
+      slots_rejected: rejectedSlots,
+      shape: HOT_PATH_REQUEST_ID_SHAPE.source,
+      fallback: "randomUUID",
+    },
+  )
   return randomUUID()
 }
 
