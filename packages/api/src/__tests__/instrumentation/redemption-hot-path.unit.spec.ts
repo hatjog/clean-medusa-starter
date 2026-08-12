@@ -161,6 +161,43 @@ describe("AC1 — dwa liczniki i czas jako OSOBNE serie", () => {
     ).not.toThrow()
     expect(sink.events).toHaveLength(1)
   })
+
+  // GRANICA BRAMKI, PRZYPIETA POMIAREM (review fali B5 cyklu 2, `[B5-c2][MEDIUM]`).
+  //
+  // Ten przypadek jest ZIELONY, kiedy dane osobowe PRZECHODZA — i to jest jego
+  // cel. Bramka wartosci jest bramka ZBIORU ZNAKOW, nie bramka PII: odrzuca
+  // `@`, spacje i `+`, wiec zatrzymuje e-mail zapisany kanonicznie i telefon
+  // z prefiksem, ale `jan.kowalski` (imie i nazwisko) oraz `48600100200`
+  // (MSISDN bez `+`) miesza sie w dozwolonym alfabecie i laduja na nosniku.
+  //
+  // Cykl 2 deklarowal ten finding jako domkniety, choc mechanizm jedynie zwezil
+  // alfabet. Deklaracja nie moze byc szersza niz mechanizm, wiec granica jest
+  // tu PRZYPIETA: kazde przyszle zwezenie bramki czerwieni ten przypadek
+  // i zmusza autora do poprawienia deklaracji razem z kodem.
+  //
+  // Czlon rezydualny — czy wartosc korelacyjna sterowana przez wolajacego ma
+  // w ogole trafiac na nosnik zewnetrzny, skoro kazde przeksztalcenie
+  // odporne na PII (digest, HMAC) zrywa korelacje metryka→log wymagana przez
+  // AD-25 — jest DEFEROWANY jako architektoniczny: ADR-211 / DW-15-182.
+  it.each([
+    ["imie i nazwisko", "jan.kowalski"],
+    ["MSISDN bez prefiksu", "48600100200"],
+    ["imie i nazwisko z sufiksem", "jan.kowalski_1"],
+  ])(
+    "GRANICA: bramka jest bramka ZBIORU ZNAKOW — %s PRZECHODZI (ADR-211/DW-15-182)",
+    (_label, personalData) => {
+      const sink = makeSink()
+      const guarded = withRedemptionPiiGuard(sink, "test")
+      expect(() =>
+        guarded?.capture(REDEMPTION_ATTEMPT_EVENT, {
+          ...LABELS,
+          request_id: personalData,
+        }),
+      ).not.toThrow()
+      expect(sink.events).toHaveLength(1)
+      expect(sink.events[0]?.properties?.request_id).toBe(personalData)
+    },
+  )
 })
 
 describe("F-1 — adapter na ksztalt klienta z kontenera", () => {

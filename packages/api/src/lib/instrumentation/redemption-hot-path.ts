@@ -126,9 +126,21 @@ const CLIENT_SOURCED_LABELS = ["request_id", "idempotency_key"] as const
 
 /**
  * Ten sam ksztalt, co dyscyplina klucza idempotencji na trasie
- * (`api/vendor/vouchers/[code]/redeem/route.ts`). Zbior znakow bez `@`, spacji
- * i cyfr w formacie telefonu-z-plusem: wartosc typu `jan.kowalski@example.com`
- * NIE przechodzi.
+ * (`api/vendor/vouchers/[code]/redeem/route.ts`).
+ *
+ * CZEGO TA BRAMKA NIE MIERZY (review fali B5 cyklu 2, `[B5-c2][MEDIUM]` —
+ * poprzednia wersja tego komentarza deklarowala wiecej, niz mechanizm robi).
+ * To jest bramka ZBIORU ZNAKOW, nie bramka PII. Odrzuca `@`, spacje i `+`,
+ * wiec zatrzymuje e-mail zapisany kanonicznie i telefon z prefiksem. NIE
+ * zatrzymuje danych osobowych mieszczacych sie w dozwolonym alfabecie:
+ * `jan.kowalski` i `48600100200` przechodza i laduja na nosniku — zmierzone
+ * i PRZYPIETE kontrola `GRANICA: bramka jest bramka ZBIORU ZNAKOW`
+ * w `__tests__/instrumentation/redemption-hot-path.unit.spec.ts`.
+ *
+ * Czlon rezydualny (czy wartosc korelacyjna sterowana przez wolajacego ma
+ * w ogole trafiac na nosnik zewnetrzny, skoro kazde przeksztalcenie odporne
+ * na PII zrywa korelacje metryka→log wymagana przez AD-25) jest deferowany
+ * jako architektoniczny: ADR-211 / DW-15-182.
  */
 const CLIENT_SOURCED_LABEL_SHAPE = /^[A-Za-z0-9._:-]{1,200}$/
 
@@ -170,7 +182,9 @@ function findMalformedClientSourcedLabel(
  *   1. KLUCZE — skanowane w glab, cala mapa wlasciwosci;
  *   2. WARTOSCI — skanowane WYLACZNIE dla etykiet o zrodle KLIENCKIM
  *      ({@link CLIENT_SOURCED_LABELS}) i wylacznie po KSZTALCIE
- *      ({@link CLIENT_SOURCED_LABEL_SHAPE}), nie po regexie „wyglada jak PII".
+ *      ({@link CLIENT_SOURCED_LABEL_SHAPE}), nie po regexie „wyglada jak PII" —
+ *      czyli po ZBIORZE ZNAKOW, a nie po tresci; granice tego czlonu opisuje
+ *      komentarz przy {@link CLIENT_SOURCED_LABEL_SHAPE}.
  * Pozostale wartosci swiadomie nie sa skanowane: produkuje je ten proces,
  * a skan po tresci dalby falszywe trafienia na kodach odmowy i identyfikatorach.
  */

@@ -403,23 +403,43 @@ export const __resetHotPathWarnStateForTests = (): void => {
  * idempotencji ({@link IDEMPOTENCY_KEY_SHAPE}) — review fali B5 (`[B5][security]
  * [MEDIUM]`): bez tego `x-request-id: jan.kowalski@example.com` wjezdzalby na
  * nosnik telemetrii, ktorego bramka PII skanuje KLUCZE, nie wartosci. Wartosc
- * niepasujaca jest ODRZUCANA (zejscie do zrodla serwerowego), nie przycinana —
- * przyciecie dalej przepuszczaloby znaki adresu e-mail.
+ * niepasujaca jest ODRZUCANA, nie przycinana — przyciecie dalej przepuszczaloby
+ * znaki adresu e-mail.
+ *
+ * `req.requestId` NIE JEST ZRODLEM SERWEROWYM (review fali B5 cyklu 2,
+ * `[B5-c2][HIGH]`). Medusa 2.14.2 ustawia je w PIERWSZYM middleware kazdego
+ * zadania jako `req.headers["x-request-id"] ?? uuid()`
+ * (`@medusajs/medusa/dist/loaders/index.js:62`) — bez zadnej walidacji. Cykl 2
+ * traktowal je jako fallback „na serwer" i tym samym wstawial przed
+ * `randomUUID()` ogniwo KLIENCKIE: wartosc odrzucona w petli wyzej wracala
+ * linie nizej tym samym kanalem. Dlatego przechodzi tu przez DOKLADNIE ten sam
+ * ksztalt co naglowek, a niepasujaca schodzi do `randomUUID()`.
+ *
+ * Konsekwencja jest kontraktowa, nie kosmetyczna: zwracana wartosc ZAWSZE
+ * pasuje do {@link HOT_PATH_REQUEST_ID_SHAPE}, wiec bramka wartosci na nosniku
+ * (`withRedemptionPiiGuard`) nie moze zostac wywolana rzutem sterowanym
+ * z zewnatrz. Bez tego klient jednym naglowkiem kasowal WSZYSTKIE TRZY serie
+ * NFR-11 dla swojego zadania (bramka rzuca przy pierwszym `capture`, rzut lyka
+ * `catch` w `emitHotPathMetrics`, a slad gasnie po jednym `warnOnce` na proces).
  */
 const HOT_PATH_REQUEST_ID_SHAPE = IDEMPOTENCY_KEY_SHAPE
 
 const resolveHotPathRequestId = (req: RequestWithSellerContext): string => {
   const headers =
     (req as unknown as { headers?: Record<string, unknown> }).headers ?? {}
+  const candidates: unknown[] = []
   for (const name of ["x-request-id", "x-correlation-id"]) {
     const raw = headers[name]
-    const value = Array.isArray(raw) ? raw[0] : raw
-    if (typeof value === "string" && HOT_PATH_REQUEST_ID_SHAPE.test(value.trim())) {
-      return value.trim()
-    }
+    candidates.push(Array.isArray(raw) ? raw[0] : raw)
   }
-  const framework = (req as unknown as { requestId?: unknown }).requestId
-  if (typeof framework === "string" && framework.length > 0) return framework
+  // Pole frameworka jest OSTATNIM kandydatem, ale nie ma taryfy ulgowej —
+  // to ten sam naglowek klienta, tylko przepisany przez loader Medusy.
+  candidates.push((req as unknown as { requestId?: unknown }).requestId)
+  for (const candidate of candidates) {
+    if (typeof candidate !== "string") continue
+    const value = candidate.trim()
+    if (HOT_PATH_REQUEST_ID_SHAPE.test(value)) return value
+  }
   return randomUUID()
 }
 

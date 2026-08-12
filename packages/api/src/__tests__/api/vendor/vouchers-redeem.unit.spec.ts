@@ -25,6 +25,7 @@
  * `container.resolve`.
  */
 import { describe, it, expect, beforeEach, afterEach, jest } from "@jest/globals"
+import { randomUUID } from "node:crypto"
 import { buildVendorSignatureHeader } from "../../../lib/vendor-hmac"
 import { createReplayGuardTestDb } from "../../helpers/replay-guard-test-db"
 import {
@@ -312,6 +313,14 @@ function makeRequest(opts: {
       ...(idempotencyKey ? { "idempotency-key": idempotencyKey } : {}),
       ...(opts.requestId ? { "x-request-id": opts.requestId } : {}),
     },
+    // KSZTALT PRODUKCYJNY, nie wygodny (review fali B5 cyklu 2, `[B5-c2][HIGH]`).
+    // Medusa 2.14.2 ustawia to pole w PIERWSZYM middleware kazdego zadania:
+    // `req.requestId = req.headers["x-request-id"] ?? uuid()`
+    // (`@medusajs/medusa/dist/loaders/index.js:62`). Atrapa bez tego pola
+    // zielenila `H2b` z powodu, ktorego produkcja nie ma — dokladnie ta sama
+    // klasa co F-4 z cyklu 1 („suita, ktora nie zna klucza `posthog`, mierzy
+    // trase z martwym nosnikiem"), przeniesiona na `req.requestId`.
+    requestId: opts.requestId ?? randomUUID(),
     scope: {
       resolve: (key: string) => {
         if (key === "voucher") return opts.voucherService
@@ -854,6 +863,71 @@ describe("Story 6.2 — wpiecie nosnika NFR-11 w POST /vendor/vouchers/:code/red
     // Cala emisja musi byc nienaruszona — odrzucenie naglowka nie moze
     // zabijac pomiaru (odmowa jest po stronie ETYKIETY, nie serii).
     expect(calls).toHaveLength(3)
+  })
+
+  // KONTROLA fali B5 cyklu 2 (`[B5-c2][HIGH]`): EMISJA NIE MOZE ZALEZEC OD
+  // TEGO, CO KLIENT PRZYSLE W NAGLOWKU. Cykl 2 zostawil sciezke, na ktorej
+  // dowolna wartosc spoza ksztaltu wracala fallbackiem przez `req.requestId`,
+  // rzucala bramka wartosci na nosniku przy PIERWSZYM `capture` i kasowala
+  // WSZYSTKIE TRZY serie NFR-11 — takze dla wartosci bez cienia PII
+  // (zmierzone: legalny `trace/abc 123` dawal 0 serii zamiast 3).
+  //
+  // Ten przypadek zamiata realna trase, nie sam resolver: sterownikiem jest
+  // `redeemPOST`, a atrapa ma ksztalt produkcyjny (`req.requestId` ustawione
+  // tak, jak robi to loader Medusy). Mutant przywracajacy
+  // `if (typeof framework === "string" && framework.length > 0) return framework`
+  // czerwieni go na kazdej pozycji listy.
+  it.each([
+    ["adres e-mail", "jan.kowalski@example.com"],
+    ["legalny trace ze spacja i ukosnikiem", "trace/abc 123"],
+    ["telefon z prefiksem", "+48 600 100 200"],
+    ["wartosc krotsza niz minimum ksztaltu", "abc"],
+    ["pusty naglowek", ""],
+    ["wartosc dluzsza niz 200 znakow", "a".repeat(201)],
+    ["znaki sterujace", "trace\n\tinjected"],
+  ])(
+    "H2c — `x-request-id` (%s) NIE kasuje emisji NFR-11: nadal TRZY serie",
+    async (_label, hostile) => {
+      const { client, calls } = makePosthogClient()
+      const req = makeRequest({
+        voucherService: successMock(),
+        posthogClient: client,
+        requestId: hostile,
+      })
+      // Kanal, ktorym wartosc wracala: loader Medusy przepisuje naglowek na
+      // `req.requestId` BEZ walidacji, wiec atrapa musi go niesc doslownie.
+      ;(req as unknown as { requestId: string }).requestId = hostile
+      const res = makeRes()
+
+      await redeemPOST(req as never, res as never)
+
+      expect(res.statusCode).toBe(200)
+      expect(calls).toHaveLength(3)
+      for (const call of calls) {
+        const requestId = String(call.properties?.request_id)
+        expect(requestId).not.toBe(hostile)
+        expect(requestId).toMatch(/^[A-Za-z0-9._:-]{8,200}$/)
+      }
+    },
+  )
+
+  // KONTROLA PRZECIWNA do H2c — bramka nie moze byc „zawsze odrzucajaca":
+  // wartosc zgodna z ksztaltem, podana WYLACZNIE przez `req.requestId`
+  // (czyli kanalem loadera, bez wlasnego naglowka w atrapie), musi przejsc
+  // na nosnik doslownie. Bez tego H2c bylby zielony takze dla implementacji
+  // `return randomUUID()` bez zadnego czytania wejscia.
+  it("H2d — zgodne z ksztaltem `req.requestId` przechodzi doslownie", async () => {
+    const { client, calls } = makePosthogClient()
+    const req = makeRequest({ voucherService: successMock(), posthogClient: client })
+    ;(req as unknown as { requestId: string }).requestId = "medusa-trace-0007"
+    const res = makeRes()
+
+    await redeemPOST(req as never, res as never)
+
+    expect(calls).toHaveLength(3)
+    for (const call of calls) {
+      expect(call.properties?.request_id).toBe("medusa-trace-0007")
+    }
   })
 
   // KONTROLA PRZECIWNA F-2: wyjatek z handlera nie moze byc liczony jako sukces.
