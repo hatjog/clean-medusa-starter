@@ -32,7 +32,20 @@ import {
   resetVendorSecretCryptoCore,
 } from "../../../lib/vendor-secret/crypto-core"
 import { GET as lookupHandler } from "../../../api/vendor/vouchers/[code]/lookup/route"
-import { POST as redeemHandler } from "../../../api/vendor/vouchers/[code]/redeem/route"
+import {
+  HOT_PATH_UNHANDLED_REFUSAL_CODE,
+  POST as redeemHandler,
+  __resetHotPathWarnStateForTests,
+} from "../../../api/vendor/vouchers/[code]/redeem/route"
+import {
+  POSTHOG_CONTAINER_KEY,
+  type PosthogCaptureClient,
+} from "../../../lib/instrumentation/posthog-metrics-client"
+import {
+  REDEMPTION_ATTEMPT_EVENT,
+  REDEMPTION_DURATION_EVENT,
+  REDEMPTION_SUCCESS_EVENT,
+} from "../../../lib/instrumentation/redemption-hot-path"
 import { withVendorGate } from "../../helpers/vendor-auth-chain"
 
 // v1.15.0 Story 5.8: trasy są ZWOLNIONE z bramki HMAC, więc `withVendorGate`
@@ -264,6 +277,16 @@ function makeRequest(opts: {
    * handlerem.
    */
   sellerContext?: { seller_id: string } | null
+  /**
+   * v1.15.0 Story 6.2 review cyklu 1 (F-4): atrapa nosnika metryk o ksztalcie
+   * KLIENTA Z KONTENERA (`PosthogCaptureClient`), nie o ksztalcie portu.
+   * `undefined` = klucz `posthog` nieznany (zastane zachowanie tej suity).
+   */
+  posthogClient?: PosthogCaptureClient | null
+  /** Atrapa loggera — do pomiaru `warn` przy braku nosnika. */
+  logger?: { info: unknown; warn: unknown; error: unknown }
+  /** Naglowek trace'a warstwy transportowej (F-10). */
+  requestId?: string
 }) {
   const sigHeader = buildVendorSignatureHeader(
     SELLER_ID,
@@ -287,6 +310,7 @@ function makeRequest(opts: {
     headers: {
       "x-vendor-signature": sigHeader,
       ...(idempotencyKey ? { "idempotency-key": idempotencyKey } : {}),
+      ...(opts.requestId ? { "x-request-id": opts.requestId } : {}),
     },
     scope: {
       resolve: (key: string) => {
@@ -295,8 +319,18 @@ function makeRequest(opts: {
           return {
             resolveVendorId: opts.resolveVendor ?? (async (s: string) => `vendor_for_${s}`),
           }
+        // v1.15.0 Story 6.2 review cyklu 1 (F-4): klucz `posthog` istnieje w
+        // kontenerze produkcyjnym (rejestruje go `loaders/posthog.ts`). Suita,
+        // ktora go NIE zna, mierzy trase z martwym nosnikiem — i dokladnie
+        // dlatego 9/9 zielonych nie wykrylo niezgodnosci ksztaltu sterownika.
+        if (key === POSTHOG_CONTAINER_KEY) {
+          if (!("posthogClient" in opts)) throw new Error("unknown key: posthog")
+          return opts.posthogClient
+        }
         if (key === "logger")
-          return { info: jest.fn(), warn: jest.fn(), error: jest.fn() }
+          return (
+            opts.logger ?? { info: jest.fn(), warn: jest.fn(), error: jest.fn() }
+          )
         // PG_CONNECTION used by appendNotificationLog — return a knex-like
         // stub that fails so the route logs and continues (best-effort audit).
         //
@@ -679,5 +713,201 @@ describe("cc-4 F-05 — POST /vendor/vouchers/:code/redeem", () => {
     // Odmowa jest PRZED dotknięciem vouchera — żadnego odczytu ani mutacji.
     expect(mock.getForSeller).not.toHaveBeenCalled()
     expect(mock.redeemForSeller).not.toHaveBeenCalled()
+  })
+})
+
+/**
+ * v1.15.0 Story 6.2 — WPIECIE nosnika NFR-11 w trase (review cyklu 1, F-1..F-5).
+ *
+ * Dlaczego ta suita musiala powstac: pakiet nosnika byl zielony, bo podawal
+ * atrape o ksztalcie PORTU wymyslonego w tej story. Kontener rejestruje klienta
+ * o INNYM ksztalcie (`PosthogCaptureClient`, jeden obiekt z `distinctId`), wiec
+ * na realnej trasie nie powstawala ani jedna seria. Kazdy przypadek nizej pyta
+ * „czy nosnik ODPALA", a nie „czy nosnik ISTNIEJE".
+ */
+describe("Story 6.2 — wpiecie nosnika NFR-11 w POST /vendor/vouchers/:code/redeem", () => {
+  const savedMeasurementEnv: Record<string, string | undefined> = {}
+
+  /** Atrapa o ksztalcie KLIENTA Z KONTENERA, nie o ksztalcie portu. */
+  function makePosthogClient() {
+    const calls: Array<{
+      distinctId: string
+      event: string
+      properties?: Record<string, unknown>
+    }> = []
+    const client: PosthogCaptureClient = {
+      capture: (args) => calls.push(args),
+    }
+    return { client, calls }
+  }
+
+  beforeEach(() => {
+    savedMeasurementEnv.GP_ENV = process.env.GP_ENV
+    savedMeasurementEnv.GP_INSTANCE_ID = process.env.GP_INSTANCE_ID
+    process.env.GP_ENV = "dev"
+    process.env.GP_INSTANCE_ID = "gp-dev-unit"
+    __resetHotPathWarnStateForTests()
+  })
+
+  afterEach(() => {
+    for (const [k, v] of Object.entries(savedMeasurementEnv)) {
+      if (v === undefined) delete process.env[k]
+      else process.env[k] = v
+    }
+  })
+
+  function successMock() {
+    const claimEvent = {
+      event_type: "claimed",
+      occurred_at: new Date("2026-05-24T10:00:00Z"),
+    }
+    return voucherMock(makeVoucher(), {
+      status: "redeemed",
+      prior_status: "idle",
+      voucher: makeVoucher({ status: "claimed", events: [claimEvent] }),
+    })
+  }
+
+  // KONTROLA MUTANTA F-1: usuniecie adaptera `createRedemptionPosthogSink`
+  // z trasy sprawia, ze klient dostaje `capture("gp.voucher_redemption.attempt",
+  // {...})`, czyli string zamiast obiektu komunikatu — `event` jest wtedy
+  // `undefined`, a `distinctId` nie istnieje. Ten przypadek czerwieni sie
+  // na obu asercjach.
+  it("H1 — udana realizacja emituje TRZY serie do klienta z kontenera", async () => {
+    const { client, calls } = makePosthogClient()
+    const req = makeRequest({
+      voucherService: successMock(),
+      posthogClient: client,
+      requestId: "trace-abc-123",
+    })
+    const res = makeRes()
+
+    await redeemPOST(req as never, res as never)
+
+    expect(res.statusCode).toBe(200)
+    expect(calls.map((c) => c.event)).toEqual([
+      REDEMPTION_ATTEMPT_EVENT,
+      REDEMPTION_SUCCESS_EVENT,
+      REDEMPTION_DURATION_EVENT,
+    ])
+    for (const call of calls) {
+      expect(call.distinctId).toEqual(expect.any(String))
+      expect(call.distinctId.length).toBeGreaterThan(0)
+      // Komplet etykiet AD-25 na KAZDEJ serii.
+      expect(call.properties).toEqual(
+        expect.objectContaining({
+          env: "dev",
+          instance_id: "gp-dev-unit",
+          market_id: expect.any(String),
+          actor_id: expect.any(String),
+          // F-10: `request_id` pochodzi z warstwy TRANSPORTOWEJ, a klucz
+          // idempotencji jedzie jako OSOBNA etykieta.
+          request_id: "trace-abc-123",
+          idempotency_key: "panel-unit-key-0001",
+          http_status: 200,
+          outcome: "pass",
+        }),
+      )
+    }
+    expect(calls[2]?.properties?.duration_ms).toEqual(expect.any(Number))
+  })
+
+  // F-10: brak naglowka trace'a NIE degraduje etykiety do stalej „unknown" —
+  // identyfikator losowy przynajmniej rozdziela zadania.
+  it("H2 — bez naglowka trace'a request_id jest wygenerowany, nie „unknown\"", async () => {
+    const { client, calls } = makePosthogClient()
+    const req = makeRequest({ voucherService: successMock(), posthogClient: client })
+    const res = makeRes()
+
+    await redeemPOST(req as never, res as never)
+
+    expect(calls.length).toBeGreaterThan(0)
+    expect(calls[0]?.distinctId).toEqual(expect.any(String))
+    expect(calls[0]?.properties?.request_id).not.toBe("unknown")
+    expect(String(calls[0]?.properties?.request_id).length).toBeGreaterThan(8)
+  })
+
+  // KONTROLA PRZECIWNA F-2: wyjatek z handlera nie moze byc liczony jako sukces.
+  // Przed poprawka `res.statusCode` mial domyslne 200 (status ustawia middleware
+  // bledow Medusy PO naszym `finally`), wiec ta sciezka emitowala serie `success`.
+  it("H3 — wyjatek z handlera ⇒ BRAK serii success, status 500 w metryce", async () => {
+    const { client, calls } = makePosthogClient()
+    const boom = new Error("awaria nizej w stosie")
+    const mock = voucherMock(makeVoucher())
+    mock.getForSeller = jest.fn(async () => {
+      throw boom
+    })
+    const req = makeRequest({ voucherService: mock, posthogClient: client })
+    const res = makeRes()
+
+    await expect(redeemPOST(req as never, res as never)).rejects.toThrow(boom)
+
+    const names = calls.map((c) => c.event)
+    expect(names).toContain(REDEMPTION_ATTEMPT_EVENT)
+    expect(names).toContain(REDEMPTION_DURATION_EVENT)
+    expect(names).not.toContain(REDEMPTION_SUCCESS_EVENT)
+    expect(calls[0]?.properties?.http_status).toBe(500)
+    expect(calls[0]?.properties?.outcome).toBe("fail")
+    expect(calls[0]?.properties?.refusal_code).toBe(HOT_PATH_UNHANDLED_REFUSAL_CODE)
+  })
+
+  // F-5: kod odmowy ma PRODUCENTA — pochodzi z ciala odpowiedzi, ktore trasa
+  // i tak wysyla. Przed poprawka etykieta byla zawsze `null`.
+  it("H4 — odmowa niesie refusal_code z ciala odpowiedzi", async () => {
+    const { client, calls } = makePosthogClient()
+    const req = makeRequest({
+      voucherService: voucherMock(makeVoucher()),
+      posthogClient: client,
+      idempotencyKey: null,
+    })
+    const res = makeRes()
+
+    await redeemPOST(req as never, res as never)
+
+    expect(res.statusCode).toBe(400)
+    const attempt = calls.find((c) => c.event === REDEMPTION_ATTEMPT_EVENT)
+    expect(attempt?.properties?.refusal_code).toBe("IDEMPOTENCY_KEY_REQUIRED")
+    expect(attempt?.properties?.http_status).toBe(400)
+    expect(attempt?.properties?.idempotency_key).toBeNull()
+    expect(calls.map((c) => c.event)).not.toContain(REDEMPTION_SUCCESS_EVENT)
+  })
+
+  // F-3: brak nosnika jest GLOSNY. Brak serii jest nieodrozniallny od braku
+  // ruchu, wiec cisza nie jest dopuszczalnym zachowaniem.
+  it("H5 — brak klienta w kontenerze zostawia warn, nie cisze", async () => {
+    const warn = jest.fn()
+    const req = makeRequest({
+      voucherService: successMock(),
+      posthogClient: null,
+      logger: { info: jest.fn(), warn, error: jest.fn() },
+    })
+    const res = makeRes()
+
+    await redeemPOST(req as never, res as never)
+
+    expect(res.statusCode).toBe(200)
+    expect(warn).toHaveBeenCalledTimes(1)
+    expect(String(warn.mock.calls[0]?.[0])).toContain("redemption-hot-path")
+  })
+
+  // F-3: porazka emisji (tu: brak kontekstu pomiaru AD-25) tez zostawia slad,
+  // a realizacja vouchera przebiega bez zmian.
+  it("H6 — brak kontekstu AD-25 ⇒ warn + realizacja nienaruszona", async () => {
+    delete process.env.GP_INSTANCE_ID
+    const warn = jest.fn()
+    const { client, calls } = makePosthogClient()
+    const req = makeRequest({
+      voucherService: successMock(),
+      posthogClient: client,
+      logger: { info: jest.fn(), warn, error: jest.fn() },
+    })
+    const res = makeRes()
+
+    await redeemPOST(req as never, res as never)
+
+    expect(res.statusCode).toBe(200)
+    expect(calls).toHaveLength(0)
+    expect(warn).toHaveBeenCalledTimes(1)
+    expect(String(warn.mock.calls[0]?.[0])).toContain("NFR-11")
   })
 })

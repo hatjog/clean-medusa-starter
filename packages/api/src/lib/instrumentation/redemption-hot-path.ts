@@ -28,10 +28,36 @@
  * na pomiar. Licznik prob i licznik sukcesow sa wiec OSOBNE.
  */
 import { PII_FORBIDDEN_FIELDS } from "./track"
+import type { PosthogCaptureClient } from "./posthog-metrics-client"
 
 /** Sterownik nosnika — ten sam ksztalt co `EscalationSink` ze Story 4.6. */
 export type RedemptionMetricsSink = {
   capture: (event: string, properties: Record<string, unknown>) => void
+}
+
+/**
+ * ADAPTER portu na ksztalt SDK (review cyklu 1, F-1).
+ *
+ * Port `RedemptionMetricsSink` bierze DWA argumenty pozycyjne, a klient
+ * zarejestrowany w kontenerze pod kluczem `posthog` (`PosthogCaptureClient`,
+ * surowy `posthog-node`) bierze JEDEN obiekt z `distinctId`. Wolanie klienta
+ * kontraktem portu wysylalo `event: undefined` albo rzucalo — czyli nosnik byl
+ * w repo, ale na realnej trasie nie emitowal NICZEGO. Rzutowanie `as` bylo tym,
+ * co uciszalo `tsc`; tutaj rzutowania nie ma i kompilator pilnuje ksztaltu.
+ *
+ * To jest ten sam adapter, ktory dziala juz w sweepie
+ * (`createPosthogSweepMetrics`, `jobs/voucher-delivery-reconciliation-sweep.ts`).
+ */
+export function createRedemptionPosthogSink(
+  client: PosthogCaptureClient | null | undefined,
+  distinctId: string,
+): RedemptionMetricsSink | null {
+  if (!client || typeof client.capture !== "function") return null
+  return {
+    capture(event: string, properties: Record<string, unknown>) {
+      client.capture({ distinctId, event, properties })
+    },
+  }
 }
 
 /** Przestrzen nazw zdarzen; jedna rodzina, trzy serie. */
@@ -44,34 +70,82 @@ export const REDEMPTION_DURATION_EVENT = "gp.voucher_redemption.duration_ms" as 
  * Nie dlatego, ze 30 jest magiczne, tylko dlatego, ze drugi prog na to samo
  * pytanie („czy proba wystarcza, zeby liczyc odsetek i percentyl") bylby drugim
  * zrodlem prawdy. Zmiana progu jest decyzja, nie szczegolem implementacji.
+ *
+ * Ta wartosc jest ZDUPLIKOWANA wzgledem `SM2_MIN_WINDOW_POPULATION`
+ * w `_grow/tools/sm2_delivery_window.py` (inny jezyk, inny proces — importu nie
+ * ma jak zrobic). Zeby duplikat nie byl „stala-lustrem bez bramki porownania"
+ * (review cyklu 1, F-7), rozjazd wykrywa BRAMKA:
+ *   `python3 _grow/tools/validate_nfr11_population_threshold_parity.py`
+ * (exit 0 = zgodne, 2 = rozjazd, 3 = brak nosnika po ktorejs stronie).
+ * Zmieniajac te liczbe, zmien obie strony — inaczej bramka czerwieni.
  */
 export const NFR11_MIN_POPULATION = 30
+
+/** Maksymalna glebokosc skanu PII; ladunek serii jest dzis plaski. */
+const PII_SCAN_MAX_DEPTH = 4
+
+/**
+ * Skan kluczy w GLAB (review cyklu 1, F-11 pkt 1). Wersja pierwsza skanowala
+ * wylacznie klucze najwyzszego poziomu, wiec `{ context: { email } }` mijalo
+ * bramke bokiem — komentarz obiecywal mocniejsza gwarancje niz kod dawal.
+ * Zwraca sciezke do pierwszego zakazanego klucza albo `null`.
+ */
+function findForbiddenKeyPath(
+  value: unknown,
+  path: string,
+  depth: number,
+): string | null {
+  if (depth > PII_SCAN_MAX_DEPTH || value === null || typeof value !== "object") {
+    return null
+  }
+  if (Array.isArray(value)) {
+    for (const [index, item] of value.entries()) {
+      const hit = findForbiddenKeyPath(item, `${path}[${index}]`, depth + 1)
+      if (hit) return hit
+    }
+    return null
+  }
+  for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
+    const lower = key.toLowerCase()
+    const here = path ? `${path}.${key}` : key
+    for (const forbidden of PII_FORBIDDEN_FIELDS) {
+      if (lower.includes(forbidden)) return here
+    }
+    const hit = findForbiddenKeyPath(nested, here, depth + 1)
+    if (hit) return hit
+  }
+  return null
+}
 
 /**
  * Bramka PII na NOSNIKU, nie przy jednym producencie (review-fix cyklu 1 w 4.6).
  * Bramka przy producencie chroni producenta; bramka na nosniku chroni nosnik.
  * Rzuca, nie strippuje — cicha redakcja zostawilaby producenta wysylajacego
  * dane wrazliwe i nikogo, kto o tym wie.
+ *
+ * Zwraca WASKI port, nie `S` (review cyklu 1, F-11 pkt 2): dla instancji klasy
+ * — a taki jest klient `posthog-node` — spread kopiowal wylacznie wlasne pola
+ * enumerowalne, wiec metody prototypu (`shutdown`, `flush`) znikaly, a typ
+ * twierdzil, ze sa. Kontrakt zwracany jest teraz tym, co obiekt naprawde ma.
+ *
+ * Zakres bramki: KLUCZE (w glab). Wartosci nie sa skanowane swiadomie — skan
+ * wartosci po regexie dalby falszywe trafienia na kodach odmowy i identyfikatorach,
+ * a producent ladunku jest w tym samym repo.
  */
-export function withRedemptionPiiGuard<S extends RedemptionMetricsSink>(
-  sink: S | null | undefined,
+export function withRedemptionPiiGuard(
+  sink: RedemptionMetricsSink | null | undefined,
   origin: string,
-): S | undefined {
+): RedemptionMetricsSink | undefined {
   if (!sink) return undefined
   return {
-    ...sink,
     capture(event: string, properties: Record<string, unknown>) {
-      for (const key of Object.keys(properties)) {
-        const lower = key.toLowerCase()
-        for (const forbidden of PII_FORBIDDEN_FIELDS) {
-          if (lower.includes(forbidden)) {
-            throw new Error(
-              `${origin}:${event}: metryka sciezki goracej nie moze niesc PII — ` +
-                `pole '${key}' jest zakazane (wspolna lista PII_FORBIDDEN_FIELDS ` +
-                `z lib/instrumentation/track.ts)`,
-            )
-          }
-        }
+      const forbiddenPath = findForbiddenKeyPath(properties, "", 0)
+      if (forbiddenPath) {
+        throw new Error(
+          `${origin}:${event}: metryka sciezki goracej nie moze niesc PII — ` +
+            `pole '${forbiddenPath}' jest zakazane (wspolna lista PII_FORBIDDEN_FIELDS ` +
+            `z lib/instrumentation/track.ts)`,
+        )
       }
       sink.capture(event, properties)
     },
@@ -80,7 +154,17 @@ export function withRedemptionPiiGuard<S extends RedemptionMetricsSink>(
 
 /** Etykiety AD-25 towarzyszace kazdej serii. */
 export type RedemptionMetricLabels = {
+  /**
+   * Identyfikator ZADANIA z warstwy transportowej (ten sam, ktory idzie do
+   * logow). Review cyklu 1 (F-10): wczesniej siedzial tu klucz idempotencji —
+   * naglowek opcjonalny i sterowany przez klienta — wiec kazde wywolanie bez
+   * niego dostawalo `request_id: "unknown"`, czyli etykiete o zerowej mocy
+   * korelacyjnej dokladnie tam, gdzie AD-25 stawia ja po to, zeby dalo sie
+   * zejsc z metryki do logu.
+   */
   request_id: string
+  /** Klucz idempotencji jako OSOBNA etykieta; `null`, gdy klient go nie podal. */
+  idempotency_key: string | null
   market_id: string
   env: string
   instance_id: string
@@ -140,9 +224,17 @@ export function emitRedemptionHotPathMetrics(args: {
 }
 
 export type Nfr11Verdict = {
+  /** Okno populacji SKUTECZNOSCI — caly ruch trasy. */
   window_status: "open" | "closed"
   n: number
   missing_to_threshold: number
+  /**
+   * Okno populacji CZASU — WYLACZNIE realizacje, ktore faktycznie zaszly.
+   * Osobne, bo populacja jest inna i domyka sie w innym momencie (F-6).
+   */
+  duration_window_status: "open" | "closed"
+  duration_n: number
+  duration_missing_to_threshold: number
   /** `pass` / `fail` DOPIERO przy domknietej probie; inaczej `not_computable`. */
   success_rate_verdict: "pass" | "fail" | "not_computable"
   duration_p95_verdict: "pass" | "fail" | "not_computable"
@@ -156,6 +248,20 @@ export type Nfr11Verdict = {
  *
  * Przy `n < NFR11_MIN_POPULATION` odsetek i percentyl sa NIEMIERZALNE i wynik
  * jest `not_computable` — nie `pass` i nie liczba udajaca percentyl.
+ *
+ * ── DWIE populacje, nie jedna (review cyklu 1, F-6) ───────────────────────
+ * Modul od poczatku argumentuje, ze czas i skutecznosc licza sie na roznych
+ * populacjach — ale werdykt liczyl OBA czlony z tej samej tablicy. Skutek byl
+ * mierzalny: szybkie odmowy (401/404 na walidacji kodu kosztuja milisekundy)
+ * rozcienczaly percentyl, wiec `p95` calego ruchu mieszcil sie pod 20 s takze
+ * wtedy, gdy p95 REALIZACJI, ktore faktycznie zaszly, byl wielokrotnie wyzszy.
+ * To ten sam wzorzec co `AI-15-4.1` (prog na sklad proby, nie tylko na jej sume).
+ *
+ * ROZSTRZYGNIECIE: „czas realizacji" z NFR-11 liczy sie na podpopulacji
+ * `succeeded === true`. Odmowa nie jest realizacja, wiec jej czas nie opisuje
+ * czasu realizacji. Kazde okno ma WLASNY `window_status` i wlasne
+ * `missing_to_threshold` — okno czasu domyka sie pozniej niz okno skutecznosci
+ * i to jest wlasciwosc, nie usterka.
  */
 export function computeNfr11Verdict(
   samples: ReadonlyArray<{ duration_ms: number; succeeded: boolean }>,
@@ -166,31 +272,36 @@ export function computeNfr11Verdict(
   const n = samples.length
   const closed = n >= NFR11_MIN_POPULATION
 
-  if (!closed) {
-    return {
-      window_status: "open",
-      n,
-      missing_to_threshold: Math.max(NFR11_MIN_POPULATION - n, 0),
-      success_rate_verdict: "not_computable",
-      duration_p95_verdict: "not_computable",
-      success_rate: null,
-      duration_p95_ms: null,
-    }
-  }
+  const durations = samples.filter((s) => s.succeeded).map((s) => s.duration_ms)
+  const durationN = durations.length
+  const durationClosed = durationN >= NFR11_MIN_POPULATION
 
   const successes = samples.filter((s) => s.succeeded).length
-  const successRate = successes / n
-  const sorted = [...samples].map((s) => s.duration_ms).sort((a, b) => a - b)
-  // Percentyl metoda nearest-rank — jedna, nazwana metoda zamiast czterech
-  // mozliwych interpretacji „p95".
-  const p95 = sorted[Math.min(Math.ceil(0.95 * n) - 1, n - 1)]
+  const successRate = closed ? successes / n : null
+
+  let p95: number | null = null
+  if (durationClosed) {
+    const sorted = [...durations].sort((a, b) => a - b)
+    // Percentyl metoda nearest-rank — jedna, nazwana metoda zamiast czterech
+    // mozliwych interpretacji „p95".
+    p95 = sorted[Math.min(Math.ceil(0.95 * durationN) - 1, durationN - 1)]
+  }
 
   return {
-    window_status: "closed",
+    window_status: closed ? "closed" : "open",
     n,
-    missing_to_threshold: 0,
-    success_rate_verdict: successRate >= minSuccessRate ? "pass" : "fail",
-    duration_p95_verdict: p95 < maxP95 ? "pass" : "fail",
+    missing_to_threshold: Math.max(NFR11_MIN_POPULATION - n, 0),
+    duration_window_status: durationClosed ? "closed" : "open",
+    duration_n: durationN,
+    duration_missing_to_threshold: Math.max(NFR11_MIN_POPULATION - durationN, 0),
+    success_rate_verdict:
+      successRate === null
+        ? "not_computable"
+        : successRate >= minSuccessRate
+          ? "pass"
+          : "fail",
+    duration_p95_verdict:
+      p95 === null ? "not_computable" : p95 < maxP95 ? "pass" : "fail",
     success_rate: successRate,
     duration_p95_ms: p95,
   }
