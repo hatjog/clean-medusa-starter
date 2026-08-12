@@ -410,6 +410,35 @@ async function markDeferredResolved(
   )
 }
 
+/**
+ * Marker Path Y nie nadaje się do odtworzenia — WŁASNA klasa, nie goły `Error`
+ * (v1.15.0 Story 6.3, review-fix cyklu 1, F-1).
+ *
+ * Klasa istnieje po to, żeby `catch` pętli mógł ją odróżnić od awarii
+ * nieznanego pochodzenia. Goły `Error` uciekał z `for (const row of deferred)`,
+ * uciekał z `withTransaction`, a ROLLBACK obejmował CAŁY wsad zamówienia —
+ * łącznie z markerami, które dały się odzyskać. Skutek na produkcji: opłacony
+ * zakup bez ani jednego vouchera, `markDeferredResolved` niewykonane, jedyny
+ * sygnał to jedna linia `logger.error`.
+ *
+ * ZMIERZONE na `gp_mercur` 2026-08-12: 19 markerów Path Y, z czego tylko 2
+ * niosą `psp_occurred_at` (pole doszło dopiero z `99039ae`, bez backfillu),
+ * a 4 są wciąż nierozwiązane. To nie jest hipoteza — to policzone wejście.
+ *
+ * To jest DOKŁADNIE ten regres, który review-fix cyklu 3 story 5.9 usunął dla
+ * `VoucherIssuanceBlockedError` (patrz komentarz przy `catch` niżej).
+ */
+export class PathYRecoveryInputError extends Error {
+  constructor(
+    readonly event_id: string,
+    readonly field: string,
+    message: string
+  ) {
+    super(message)
+    this.name = "PathYRecoveryInputError"
+  }
+}
+
 function buildPathYRecoveryInput(
   row: DeferredCaptureRow,
   orderId: string
@@ -417,28 +446,57 @@ function buildPathYRecoveryInput(
   const pspOccurredAt = row.envelope.psp_occurred_at
   const amountMinor = row.amount_minor
   if (typeof pspOccurredAt !== "string" || !pspOccurredAt.trim()) {
-    throw new Error(
+    throw new PathYRecoveryInputError(
+      row.event_id,
+      "psp_occurred_at",
       `[on-order-placed-stripe-retry] Path Y marker ${row.event_id} nie niesie psp_occurred_at`
     )
   }
   if (!row.payment_intent_id) {
-    throw new Error(
+    throw new PathYRecoveryInputError(
+      row.event_id,
+      "payment_intent_id",
       `[on-order-placed-stripe-retry] Path Y marker ${row.event_id} nie niesie payment_intent_id`
     )
   }
   if (!row.market_id) {
-    throw new Error(
+    throw new PathYRecoveryInputError(
+      row.event_id,
+      "market_id",
       `[on-order-placed-stripe-retry] Path Y marker ${row.event_id} nie ma market_id po rezolucji zamówienia`
     )
   }
   if (!row.currency) {
-    throw new Error(
+    throw new PathYRecoveryInputError(
+      row.event_id,
+      "currency",
       `[on-order-placed-stripe-retry] Path Y marker ${row.event_id} nie ma currency płatności`
     )
   }
-  if (amountMinor === null || !Number.isInteger(amountMinor) || amountMinor < 0) {
-    throw new Error(
-      `[on-order-placed-stripe-retry] Path Y marker ${row.event_id} ma nieprawidłowe amount_minor`
+  // L-1 (review cyklu 1): `amount_minor` NIE jest czytane przez
+  // `liveIssueEntitlementsWithinTx` — kwota entitlementu bierze się ze
+  // snapshotu linii, co `live-issue-from-payment-intent.ts` deklaruje wprost
+  // („`amount_minor` jest wartością finansową entitlementu, nie faktem PSP").
+  // Jedyne użycie payloadu poza identyfikatorami to `profile.currency ??
+  // payload.currency`. Fail-closed na tym polu odmawiał więc odzysku
+  // z powodu wartości, która nie wpływa na wystawiony voucher — a kolumna
+  // `payment.amount` jest `numeric`, więc pierwszy wiersz z częścią ułamkową
+  // (`Number(r.amount)`) blokowałby wystawienie. Ryzyko bez zysku.
+  //
+  // Zostaje granica, która COŚ znaczy: kwota ujemna to nie zaokrąglenie,
+  // tylko wiersz płatności, którego nie umiemy przeczytać. Wartość
+  // niecałkowita jest normalizowana w dół do grosza, bo taką właśnie
+  // precyzję niesie jednostka minor.
+  const normalizedAmountMinor =
+    amountMinor === null || !Number.isFinite(amountMinor)
+      ? 0
+      : Math.trunc(amountMinor)
+  if (normalizedAmountMinor < 0) {
+    throw new PathYRecoveryInputError(
+      row.event_id,
+      "amount_minor",
+      `[on-order-placed-stripe-retry] Path Y marker ${row.event_id} ma ujemne ` +
+        `amount_minor (${amountMinor})`
     )
   }
 
@@ -448,7 +506,7 @@ function buildPathYRecoveryInput(
       payment_intent_id: row.payment_intent_id,
       order_id: orderId,
       currency: row.currency,
-      amount_minor: amountMinor,
+      amount_minor: normalizedAmountMinor,
       psp_occurred_at: pspOccurredAt,
     },
     scope: { market_id: row.market_id },
@@ -618,6 +676,26 @@ export default async function onOrderPlacedStripeRetry({
                   `(reason=${err.reason}, line_item_id=${err.line_item_id ?? "brak"}) ` +
                   `— uprawnienie NIE wystawione (fail-closed, SM-7), wiersz odroczony ` +
                   `zostaje do ponowienia po naprawie danych: ${err.message}`
+              )
+              continue
+            }
+            // F-1 (review-fix cyklu 1 story 6.3): marker Path Y, którego NIE DA
+            // SIĘ przeczytać, jest odmową TEGO WIERSZA — nie awarią paczki.
+            //
+            // Wiersz ZOSTAJE nierozwiązany celowo (nie wołamy
+            // `markDeferredResolved`), dokładnie jak przy
+            // `VoucherIssuanceBlockedError`: marker legacy może dostać backfill,
+            // a wtedy kolejny `order.placed` go odzyska. Zmienia się to, że
+            // pozostałe markery tej samej paczki — w tym markery pokolenia
+            // v1.9.0, które odzyskują się poprawnie — są przetwarzane dalej,
+            // zamiast wywracać się razem z tym jednym.
+            if (err instanceof PathYRecoveryInputError) {
+              logger.warn?.(
+                `[on-order-placed-stripe-retry] order_id=${orderId} ` +
+                  `event_id=${row.event_id} marker Path Y nieodtwarzalny ` +
+                  `(brakujące/niepoprawne pole: ${err.field}) — ten marker ` +
+                  `POMINIĘTY, pozostałe wiersze paczki przetwarzane dalej; ` +
+                  `wiersz zostaje nierozwiązany do ponowienia: ${err.message}`
               )
               continue
             }

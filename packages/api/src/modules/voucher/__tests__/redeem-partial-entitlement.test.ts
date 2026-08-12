@@ -261,13 +261,126 @@ describe("Story 4.1 AC1 — redeem partial obniża remaining (ten sam entitlemen
     expect(store.get("ent_amount_1")!.state).toBe("REDEEMED_FULL")
   })
 
-  it("entitlement nie-kwotowy (VOUCHER_SERVICE) ⇒ fail-closed", async () => {
-    const { op } = makeOp({
-      rows: [makeEntitlement({ entitlement_type: EntitlementType.VOUCHER_SERVICE })],
+  /**
+   * F-0 (review-fix cyklu 1 story 6.3). Do tej pory stał tu test „VOUCHER_SERVICE
+   * ⇒ fail-closed", który UTRWALAŁ defekt: trasa panelu
+   * (`vendor/vouchers/[code]/redeem`) jest okablowana do tej operacji, a
+   * ZMIERZONE na `gp_mercur` 2026-08-12 — KAŻDY produkt katalogu BonBeauty
+   * wystawia `VOUCHER_SERVICE` (`entitlement_type='VOUCHER_AMOUNT'` → 0 wierszy).
+   * Ekran realizacji w salonie odmawiał więc `422 REDEMPTION_REFUSED` całemu
+   * asortymentowi sklepu.
+   *
+   * Voucher serwisowy nie ma salda — ma JEDNĄ jednostkę usługi. Realizacja jest
+   * niepodzielna i kończy się `REDEEMED_FULL`.
+   */
+  /**
+   * Trasa panelu nie podaje `voucher_net_minor`/`voucher_vat_minor` — brutto
+   * emisji czytane jest z `policy_snapshot.amount_minor`, tak jak na żywej bazie.
+   */
+  const svcInput = (
+    overrides: Partial<RedeemPartialInput> = {}
+  ): RedeemPartialInput =>
+    baseInput({
+      amount_minor: undefined,
+      voucher_net_minor: undefined,
+      voucher_vat_minor: undefined,
+      ...overrides,
     })
-    await expect(op.redeem(baseInput())).rejects.toBeInstanceOf(
-      RedeemNotRedeemableError
+
+  const serviceRows = () => [
+    makeEntitlement({
+      entitlement_type: EntitlementType.VOUCHER_SERVICE,
+      // Tak wygląda wiersz na realnej bazie: brak salda, brutto w snapshocie.
+      remaining_amount: null,
+      policy_snapshot: { transferability: "bearer", amount_minor: 34000 },
+    }),
+  ]
+
+  it("VOUCHER_SERVICE realizuje się jako CAŁA jednostka usługi ⇒ REDEEMED_FULL", async () => {
+    const { op, store, events } = makeOp({ rows: serviceRows() })
+
+    const res = await op.redeem(
+      svcInput({ redeem_full: true, idempotency_key: "svc-1" })
     )
+
+    expect(res.outcome).toBe("REDEEMED_FULL")
+    expect(res.amount_minor).toBe(34000)
+    expect(res.remaining_after_minor).toBe(0)
+    expect(res.withdrawal_right_extinguished).toBe(true)
+    expect(store.get("ent_amount_1")!.state).toBe("REDEEMED_FULL")
+    // Oba kroki grafu idą TYM SAMYM punktem okablowania co typy kwotowe —
+    // nie ma tu drugiego, równoległego mechanizmu przejścia.
+    expect(events.map((e) => e.payload.to_state)).toEqual([
+      "REDEMPTION_REQUESTED",
+      "REDEEMED_FULL",
+    ])
+  })
+
+  it("VOUCHER_SERVICE jest NIEPODZIELNY — kwota inna niż brutto to odmowa", async () => {
+    const { op } = makeOp({ rows: serviceRows() })
+
+    await expect(
+      op.redeem(svcInput({ amount_minor: 180, idempotency_key: "svc-part" }))
+    ).rejects.toBeInstanceOf(RedeemAmountError)
+  })
+
+  it("VOUCHER_SERVICE bez redeem_full i bez kwoty ⇒ odmowa, nie cicha całość", async () => {
+    const { op } = makeOp({ rows: serviceRows() })
+
+    await expect(
+      op.redeem(
+        svcInput({ idempotency_key: "svc-noflag" })
+      )
+    ).rejects.toBeInstanceOf(RedeemAmountError)
+  })
+
+  it("VOUCHER_SERVICE: replay po tym samym idempotency-key nie realizuje drugi raz", async () => {
+    const { op, events } = makeOp({ rows: serviceRows() })
+    const input = svcInput({
+      redeem_full: true,
+      idempotency_key: "svc-replay",
+    })
+
+    const first = await op.redeem(input)
+    const emittedAfterFirst = events.length
+    const second = await op.redeem(input)
+
+    expect(second.redemption_id).toBe(first.redemption_id)
+    expect(second.outcome).toBe("REDEEMED_FULL")
+    expect(second.posting.deduped).toBe(true)
+    expect(events).toHaveLength(emittedAfterFirst)
+  })
+
+  it("VOUCHER_SERVICE bez brutto w snapshocie ⇒ fail-closed (nie ma czego realizować)", async () => {
+    const { op } = makeOp({
+      rows: [
+        makeEntitlement({
+          entitlement_type: EntitlementType.VOUCHER_SERVICE,
+          remaining_amount: null,
+          policy_snapshot: { transferability: "bearer" },
+        }),
+      ],
+    })
+
+    await expect(
+      op.redeem(
+        svcInput({ redeem_full: true, idempotency_key: "svc-nogross" })
+      )
+    ).rejects.toBeInstanceOf(RedeemAmountError)
+  })
+
+  it("typ spoza allow-listy nadal jest odmową", async () => {
+    const { op } = makeOp({
+      rows: [
+        makeEntitlement({
+          entitlement_type: "SUBSCRIPTION" as unknown as EntitlementType,
+          policy_snapshot: { transferability: "bearer", amount_minor: 34000 },
+        }),
+      ],
+    })
+    await expect(
+      op.redeem(svcInput({ redeem_full: true }))
+    ).rejects.toBeInstanceOf(RedeemNotRedeemableError)
   })
 
   it("CREDIT_PACK używa tej samej semantyki salda: partial, multi-installment i FULL", async () => {
