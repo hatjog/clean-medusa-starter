@@ -228,13 +228,29 @@ function makeRow(overrides: Partial<DeferredRow> = {}): DeferredRow {
   }
 }
 
-function makeHarness(rows: DeferredRow[]) {
+/** SQL podnoszący ISSUED → ACTIVE po odzysku Path Y (guard w predykacie). */
+const ACTIVATION_SQL_MARKER = "SET state = 'ACTIVE'"
+
+/**
+ * `activation: "noop"` odwzorowuje wiersz, którego UPDATE NIE dotknął (replay
+ * `order.placed` po redempcji) — 0 wierszy w `RETURNING`.
+ */
+function makeHarness(
+  rows: DeferredRow[],
+  options: { activation?: "applied" | "noop" } = {}
+) {
   const sent: SentQuery[] = []
   const client = {
     query: jest.fn(async (sql: string, values: unknown[] = []) => {
       sent.push({ sql, values })
       if (sql === FIND_DEFERRED_CAPTURES_SQL) {
         return { rows, rowCount: rows.length }
+      }
+      if (sql.includes(ACTIVATION_SQL_MARKER)) {
+        const applied = (options.activation ?? "applied") === "applied"
+        return applied
+          ? { rows: [{ id: values[0] }], rowCount: 1 }
+          : { rows: [], rowCount: 0 }
       }
       return { rows: [], rowCount: 0 }
     }),
@@ -390,6 +406,97 @@ describe("odzysk wystawienia — zachowanie na mockowanym kliencie", () => {
         }),
       }),
     )
+  })
+
+  it("odzysk Path Y KOŃCZY w ACTIVE — inaczej voucher jest nie do wykorzystania", async () => {
+    // ZMIERZONE na gp_mercur 2026-08-13: 3 entitlementy z zakupów tego dnia
+    // stały w ISSUED, `POST /vendor/vouchers/<kod>/redeem` → 422, a dziennik
+    // tranzycji po `__genesis__ → ISSUED` nie miał żadnej krawędzi dalej.
+    // `redeem-partial-entitlement.ts` przyjmuje wyłącznie
+    // `{ACTIVE, REDEEMED_PARTIAL}`, więc gałąź natywna (wiersz od razu ACTIVE)
+    // i gałąź Path Y MUSZĄ zbiegać się w tym samym stanie terminalnym.
+    const liveIssue = liveIssueEntitlementsWithinTx as jest.Mock
+    liveIssue.mockReset()
+    liveIssue.mockResolvedValueOnce({
+      event_processed: true,
+      issued: [
+        {
+          entitlement_id: `ent_${"a".repeat(64)}`,
+          entitlement_dedupe_key: "a".repeat(64),
+          created: true,
+        },
+      ],
+    })
+    const h = makeHarness([
+      makeRow({
+        provider: STRIPE_PATH_Y_WEBHOOK_PROVIDER,
+        envelope: {
+          entitlement_issue_deferred_reason: "webhook_before_order",
+          psp_occurred_at: "2026-08-12T12:34:56.000Z",
+        },
+      }),
+    ])
+
+    await run(h.container, { id: "order_1" })
+
+    const activation = h.sent.find((q) => q.sql.includes(ACTIVATION_SQL_MARKER))
+    expect(activation).toBeDefined()
+    expect(activation!.values).toEqual([`ent_${"a".repeat(64)}`])
+    // Guard trzyma idempotencję: replay nie cofa stanu po redempcji.
+    expect(activation!.sql).toContain("AND state = 'ISSUED'")
+
+    // Krawędź ISSUED → ACTIVE ląduje w dzienniku i na szynie (AD-7: subscriber
+    // dostawy deduplikuje po `template_key` + `recipient_hash`, więc drugi
+    // event NIE wysyła drugiego maila).
+    expect(h.eventBus.emit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        name: "gp.entitlements.entitlement_state_changed.v1",
+        data: expect.objectContaining({
+          payload: expect.objectContaining({
+            from_state: "ISSUED",
+            to_state: "ACTIVE",
+          }),
+        }),
+      }),
+    )
+  })
+
+  it("gdy UPDATE nie dotknął wiersza, NIE emituje eventu ACTIVE", async () => {
+    // Event bez zmiany stanu byłby fałszywym śladem w dzienniku tranzycji —
+    // ta kontrola upada, gdy emit przestanie zależeć od wyniku `RETURNING`.
+    const liveIssue = liveIssueEntitlementsWithinTx as jest.Mock
+    liveIssue.mockReset()
+    liveIssue.mockResolvedValueOnce({
+      event_processed: true,
+      issued: [
+        {
+          entitlement_id: `ent_${"b".repeat(64)}`,
+          entitlement_dedupe_key: "b".repeat(64),
+          created: true,
+        },
+      ],
+    })
+    const h = makeHarness(
+      [
+        makeRow({
+          provider: STRIPE_PATH_Y_WEBHOOK_PROVIDER,
+          envelope: {
+            entitlement_issue_deferred_reason: "webhook_before_order",
+            psp_occurred_at: "2026-08-12T12:34:56.000Z",
+          },
+        }),
+      ],
+      { activation: "noop" }
+    )
+
+    await run(h.container, { id: "order_1" })
+
+    const emitted = h.eventBus.emit.mock.calls.map(
+      (call) =>
+        (call[0] as { data: { payload: { to_state: string } } }).data.payload
+          .to_state
+    )
+    expect(emitted).toEqual(["ISSUED"])
   })
 })
 
