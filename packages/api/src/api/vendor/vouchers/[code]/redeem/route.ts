@@ -60,6 +60,7 @@
 import type { MedusaRequest, MedusaResponse } from "@medusajs/framework/http"
 import { ContainerRegistrationKeys } from "@medusajs/framework/utils"
 import type { Knex } from "knex"
+import { randomUUID } from "node:crypto"
 import {
   HttpMarketContextError,
   resolveSellerMarketId,
@@ -80,9 +81,13 @@ import {
   resolveRedeemRefusalReason,
 } from "../../../../../modules/voucher"
 import {
+  createRedemptionPosthogSink,
   emitRedemptionHotPathMetrics,
-  type RedemptionMetricsSink,
 } from "../../../../../lib/instrumentation/redemption-hot-path"
+import {
+  POSTHOG_CONTAINER_KEY,
+  type PosthogCaptureClient,
+} from "../../../../../lib/instrumentation/posthog-metrics-client"
 import { maskActorId } from "../../../../../lib/instrumentation/posthog-canary"
 import { resolveMeasurementContext } from "../../../../../lib/instrumentation/track"
 import { REDEEM_REFUSALS } from "../../../../../modules/voucher/models/types"
@@ -159,6 +164,16 @@ type VendorRedeemResponse = {
 const IDEMPOTENCY_KEY_HEADER = "idempotency-key"
 const IDEMPOTENCY_KEY_SHAPE = /^[A-Za-z0-9._:-]{8,200}$/
 
+/**
+ * Kod odmowy dla wyjatku, ktorego trasa NIE zmapowala na status (v1.15.0
+ * Story 6.2, review cyklu 1 F-2). Osobny literal, bo taka porazka nie jest
+ * odmowa domeny — jest awaria i ma byc rozroznialna w metryce.
+ */
+export const HOT_PATH_UNHANDLED_REFUSAL_CODE = "UNHANDLED_EXCEPTION" as const
+
+/** Etykieta rynku dla wyjsc PRZED rozstrzygnieciem rynku — jawne „nie wiem". */
+export const HOT_PATH_UNKNOWN_MARKET = "unknown" as const
+
 function readIdempotencyKeyHeader(req: MedusaRequest): string | null {
   const raw = (req.headers as Record<string, unknown> | undefined)?.[
     IDEMPOTENCY_KEY_HEADER
@@ -220,63 +235,372 @@ export const POST = async (
   // niczego, co wplywa na wynik, i nie moze go wywrocic (brak nosnika jest
   // stanem `carrier_unavailable`, nie wyjatkiem).
   const hotPathStartedAt = Date.now()
+  // review cyklu 1 (F-5): kod odmowy ma PRODUCENTA. Poprzednia wersja czytala
+  // `res.gp_refusal_code`, pole, ktorego w calym repo nikt nie ustawial — wiec
+  // etykieta `refusal_code` byla ZAWSZE `null`, takze przy odmowach (ta sama
+  // klasa co `DW-15-173`: czytelnik bez producenta). Zrodlem kodu jest cialo
+  // odpowiedzi, ktore trasa i tak wysyla: `{ code, ... }`. Podgladamy je na
+  // szwie `res.json`, wiec zrodlo jest jedno i obejmuje WSZYSTKIE osiem wyjsc
+  // (takze te spoza mapera bledow), bez rozsiewania zapisow po handlerze.
+  const refusal = observeRefusalCode(res)
+  // review cyklu 1 (F-2): wyjatek z handlera nie moze byc liczony jako SUKCES.
+  // `res.statusCode` ma w tym momencie domyslne 200 (status ustawia middleware
+  // bledow Medusy PO naszym `finally`), wiec pomiar bez tej flagi emitowal serie
+  // `success` z `http_status: 200` dla kazdej nieobsluzonej awarii — czyli byl
+  // slepy dokladnie na te klase porazek, ktora NFR-11 najbardziej ma widziec.
+  // review cyklu 5 (`[B5-c3][regression]`): etykieta `market_id` ma PRODUCENTA.
+  // Poprzednia wersja czytala `req.gp_market_id` — pole, ktorego w calym repo
+  // nikt nie ustawial (`app.gp_market_id` to zmienna sesyjna Postgresa do RLS,
+  // INNY BYT), wiec produkcja emitowala stala `"unknown"`, a zielen brala sie
+  // z testu, ktory sam sobie to pole wpisywal. To ta sama klasa co `DW-15-173`
+  // i co `refusal_code` wyzej: czytelnik bez producenta.
+  //
+  // Rynek rozstrzyga `handleRedeemRequest` (`resolveSellerMarketId`), ale
+  // `sellerMarketId` jest lokalna w handlerze — poza zasiegiem tej owijki.
+  // Nosnik jest wiec JEDEN i jawny: handler publikuje rozstrzygniety rynek
+  // w chwili, w ktorej go poznaje, a owijka odczytuje go przy emisji.
+  const market = observeResolvedMarket()
+  let handlerThrew = false
   try {
-    await handleRedeemRequest(req, res)
+    await handleRedeemRequest(req, res, market.publish)
+  } catch (error) {
+    handlerThrew = true
+    throw error
   } finally {
-    emitHotPathMetrics(req, res, hotPathStartedAt)
+    emitHotPathMetrics(req, res, hotPathStartedAt, {
+      handlerThrew,
+      refusalCode: refusal.code(),
+      marketId: market.id(),
+    })
   }
+}
+
+/**
+ * Rozstrzygniety rynek zadania — jedno zrodlo dla emisji metryk.
+ *
+ * `null` (⇒ etykieta `"unknown"`) jest UCZCIWYM stanem dla wyjsc PRZED
+ * rozstrzygnieciem rynku: odmowa na auth, brak sprzedawcy, wyjatek przed
+ * `resolveSellerMarketId`. Nie podstawiamy tu wartosci domyslnej z konfiguracji
+ * ani nie zgadujemy — „nie wiem" ma zostac odrozniane od konkretnego rynku,
+ * inaczej percentyle NFR-11 przypisalyby cudze odmowy do realnego rynku.
+ */
+const observeResolvedMarket = (): {
+  publish: (marketId: string) => void
+  id: () => string | null
+} => {
+  let resolved: string | null = null
+  return {
+    publish: (marketId: string) => {
+      if (typeof marketId === "string" && marketId.length > 0) resolved = marketId
+    },
+    id: () => resolved,
+  }
+}
+
+/** Kod odmowy z ciala odpowiedzi — jedno zrodlo dla wszystkich wyjsc trasy. */
+const observeRefusalCode = (res: MedusaResponse): { code: () => string | null } => {
+  let observed: string | null = null
+  const target = res as unknown as {
+    json?: (payload: unknown) => unknown
+  }
+  const original = target.json
+  if (typeof original === "function") {
+    target.json = function patchedJson(this: unknown, payload: unknown) {
+      const code = (payload as { code?: unknown } | null | undefined)?.code
+      if (typeof code === "string" && code.length > 0) observed = code
+      return original.call(this, payload)
+    }
+  }
+  return { code: () => observed }
+}
+
+/**
+ * Tlumienie sladu diagnostycznego — PER KLASA PRZYCZYNY, nie „raz na proces"
+ * (review fali B5, `[B5][security][LOW]`, rozstrzygniete w cyklu 7 wariantem (a)).
+ *
+ * ZMIERZONY STAN PRZED: dwa booleany (`hotPathCarrierWarned`,
+ * `hotPathEmitFailureWarned`) rozdzielaly tlumienie po MIEJSCU W KODZIE, a nie
+ * po PRZYCZYNIE. Przy dlugo zyjacym procesie pierwszy wyjatek emisji zjadal
+ * sygnal dla wszystkich nastepnych — takze dla NOWEJ klasy przyczyny (inny typ
+ * bledu, inna awaria nosnika). Operator widzial `TypeError` z pierwszej minuty
+ * zycia procesu i nigdy nie dowiadywal sie o `RangeError` z trzeciej godziny.
+ *
+ * ROZSTRZYGNIECIE: kluczem tlumienia jest KLASA PRZYCZYNY, wiec kazda nowa
+ * klasa dostaje wlasny pierwszy `warn`. Co operator NADAL traci: LICZNIK
+ * powtorzen w obrebie jednej klasy — drugie i kolejne wystapienia tej samej
+ * przyczyny sa ciche. To jest cena swiadoma: powtorzenia tej samej przyczyny
+ * niosa zero nowej informacji diagnostycznej, a nosnikiem WOLUMENU sa serie
+ * NFR-11, nie log.
+ *
+ * DLACZEGO TEGO NIE DA SIE WYWOLAC Z ZEWNATRZ W PETLI — dwie niezalezne
+ * bariery:
+ *   1. klucze klas pochodzą WYLACZNIE z tego procesu (literaly w tym pliku plus
+ *      nazwa klasy wyjatku ze stosu), nigdy z wejscia klienta — klient nie ma
+ *      czym wyprodukowac nowego klucza;
+ *   2. BUDZET {@link HOT_PATH_WARN_CLASS_BUDGET} domyka zbior twardo, wiec nawet
+ *      gdyby ktos w przyszlosci wpuscil do klucza wartosc sterowana z zewnatrz,
+ *      log nie da sie zalac.
+ */
+export const HOT_PATH_WARN_CLASS_BUDGET = 16
+const hotPathWarnedCauseClasses = new Set<string>()
+
+/** Nosnika metryk nie ma w kontenerze — jedna, niepodzielna przyczyna. */
+const HOT_PATH_CARRIER_UNAVAILABLE_CAUSE = "carrier_unavailable" as const
+/** Emisja rzucila; czlon po dwukropku niesie TYP wyjatku (nie jego tresc). */
+const HOT_PATH_EMIT_FAILURE_CAUSE_PREFIX = "emit_failure:" as const
+/** Zaden kandydat na `request_id` nie przeszedl bramki ksztaltu. */
+const HOT_PATH_REQUEST_ID_FALLBACK_CAUSE_PREFIX = "request_id_fallback:" as const
+
+const warnOncePerCauseClass = (
+  req: RequestWithSellerContext,
+  causeClass: string,
+  message: string,
+  meta: Record<string, unknown>,
+): void => {
+  if (hotPathWarnedCauseClasses.has(causeClass)) return
+  if (hotPathWarnedCauseClasses.size >= HOT_PATH_WARN_CLASS_BUDGET) return
+  hotPathWarnedCauseClasses.add(causeClass)
+  let logger: { warn?: (message: string, meta?: unknown) => void } | undefined
+  try {
+    logger = req.scope.resolve(ContainerRegistrationKeys.LOGGER) as {
+      warn?: (message: string, meta?: unknown) => void
+    }
+  } catch {
+    logger = undefined
+  }
+  const payload = { ...meta, cause_class: causeClass }
+  if (typeof logger?.warn === "function") logger.warn(message, payload)
+  // eslint-disable-next-line no-console
+  else console.warn(message, payload)
 }
 
 /**
  * Emisja metryk sciezki goracej. Zadna jej porazka nie moze zepsuc realizacji
  * vouchera — telemetria jest obserwacja, nie czescia sciezki pieniadza.
+ *
+ * ALE cisza tez nie jest dopuszczalna (review cyklu 1, F-3): puste `catch {}`
+ * zamienialo „glosna odmowe" z AC2 w brak sladu, a brak serii jest
+ * NIEODROZNIALNY od braku ruchu. Kazda porazka emisji i kazdy brak nosnika
+ * zostawiaja `warn` — jeden na KLASE PRZYCZYNY, nie jeden na proces
+ * ({@link warnOncePerCauseClass}, cykl 7).
  */
 const emitHotPathMetrics = (
   req: RequestWithSellerContext,
   res: MedusaResponse,
   startedAt: number,
+  observed: {
+    handlerThrew: boolean
+    refusalCode: string | null
+    marketId: string | null
+  },
 ): void => {
   try {
-    const sink = (() => {
+    const client = (() => {
       try {
-        return req.scope.resolve("posthog") as RedemptionMetricsSink
+        return req.scope.resolve(POSTHOG_CONTAINER_KEY) as PosthogCaptureClient | null
       } catch {
         return null
       }
     })()
 
     const context = resolveMeasurementContext()
-    const status = res.statusCode
+    const actorId = maskActorId(req.seller_context?.seller_id ?? "anonymous")
+    // review cyklu 1 (F-1): klient z kontenera ma ksztalt `PosthogCaptureClient`
+    // (jeden obiekt z `distinctId`), a port nosnika bierze dwa argumenty.
+    // Adapter jest tu obowiazkowy — bez niego trasa nie emituje NICZEGO.
+    const sink = createRedemptionPosthogSink(client, actorId)
+    const succeeded =
+      !observed.handlerThrew && res.statusCode >= 200 && res.statusCode < 300
+    // Przy wyjatku `res.statusCode` klamie (domyslne 200) — miara musi wtedy
+    // powiedziec `500`, bo tyle wysle middleware bledow.
+    const status = observed.handlerThrew ? 500 : res.statusCode
 
-    emitRedemptionHotPathMetrics({
+    const result = emitRedemptionHotPathMetrics({
       sink,
       labels: {
-        request_id: readIdempotencyKeyHeader(req) ?? "unknown",
-        market_id: (req as { gp_market_id?: string }).gp_market_id ?? "unknown",
+        request_id: resolveHotPathRequestId(req),
+        idempotency_key: readIdempotencyKeyHeader(req),
+        market_id: observed.marketId ?? HOT_PATH_UNKNOWN_MARKET,
         env: context.env,
         instance_id: context.instance_id,
-        actor_id: maskActorId(req.seller_context?.seller_id ?? "anonymous"),
+        actor_id: actorId,
       },
       outcome: {
         duration_ms: Date.now() - startedAt,
-        succeeded: status >= 200 && status < 300,
+        succeeded,
         http_status: status,
-        refusal_code:
-          status >= 200 && status < 300
-            ? null
-            : ((res as unknown as { gp_refusal_code?: string }).gp_refusal_code ?? null),
+        refusal_code: succeeded
+          ? null
+          : observed.handlerThrew
+            ? HOT_PATH_UNHANDLED_REFUSAL_CODE
+            : observed.refusalCode,
       },
     })
-  } catch {
-    // Swiadomie polkniete: metryka, ktora wywraca realizacje vouchera, jest
-    // gorsza niz brak metryki. Brak kontekstu pomiaru (AD-25) jest tu jedynym
-    // realnym zrodlem wyjatku i zostaje zglosony przez brak serii, nie przez 500.
+
+    if (result === "carrier_unavailable") {
+      warnOncePerCauseClass(
+        req,
+        HOT_PATH_CARRIER_UNAVAILABLE_CAUSE,
+        "[redemption-hot-path] nosnik metryk (kontener: 'posthog') jest " +
+          "niedostepny — serie NFR-11 NIE powstaja; brak serii nie jest " +
+          "dowodem braku ruchu",
+        { container_key: POSTHOG_CONTAINER_KEY },
+      )
+    }
+  } catch (error) {
+    // Metryka, ktora wywraca realizacje vouchera, jest gorsza niz brak metryki —
+    // dlatego lykamy wyjatek. Ale zostawiamy slad, bo cisza jest najgorszym
+    // mozliwym zachowaniem nosnika (AC2: odmowa ma byc GLOSNA).
+    //
+    // Klasa przyczyny niesie TYP wyjatku, wiec DRUGI, INNY typ awarii emisji
+    // dostaje wlasny pierwszy `warn` zamiast wpadac w tlumienie po pierwszym
+    // (`[B5][security][LOW]`, cykl 7). Typ pochodzi ze stosu tego procesu —
+    // klient nie ma czym go wyprodukowac, wiec nie da sie tym zalac logow.
+    const errorClass =
+      error instanceof Error ? error.constructor.name : typeof error
+    warnOncePerCauseClass(
+      req,
+      `${HOT_PATH_EMIT_FAILURE_CAUSE_PREFIX}${errorClass}`,
+      "[redemption-hot-path] emisja metryk NFR-11 zakonczyla sie wyjatkiem — " +
+        "serie nie powstaly; realizacja vouchera przebiegla bez zmian",
+      {
+        error_class: errorClass,
+        error_message: error instanceof Error ? error.message : String(error),
+      },
+    )
   }
+}
+
+/** Wylacznie dla testow — resetuje tlumienie sladu per klasa przyczyny. */
+export const __resetHotPathWarnStateForTests = (): void => {
+  hotPathWarnedCauseClasses.clear()
+}
+
+/**
+ * Identyfikator zadania z warstwy TRANSPORTOWEJ (review cyklu 1, F-10).
+ * Kolejnosc jest ta sama co w `store/voucher-pii-consent` (Story 4.4, F9):
+ * naglowek trace'a, potem korelacja, a na koncu wygenerowany identyfikator —
+ * nigdy stala `"unknown"`, bo etykieta o zerowej mocy korelacyjnej jest gorsza
+ * niz wartosc losowa: ta druga przynajmniej rozdziela zadania.
+ *
+ * Naglowek jest WEJSCIEM KLIENTA, wiec przechodzi ten sam ksztalt co klucz
+ * idempotencji ({@link IDEMPOTENCY_KEY_SHAPE}) — review fali B5 (`[B5][security]
+ * [MEDIUM]`): bez tego `x-request-id: jan.kowalski@example.com` wjezdzalby na
+ * nosnik telemetrii, ktorego bramka PII skanuje KLUCZE, nie wartosci. Wartosc
+ * niepasujaca jest ODRZUCANA, nie przycinana — przyciecie dalej przepuszczaloby
+ * znaki adresu e-mail.
+ *
+ * `req.requestId` NIE JEST ZRODLEM SERWEROWYM (review fali B5 cyklu 2,
+ * `[B5-c2][HIGH]`). Medusa 2.14.2 ustawia je w PIERWSZYM middleware kazdego
+ * zadania jako `req.headers["x-request-id"] ?? uuid()`
+ * (`@medusajs/medusa/dist/loaders/index.js:62`) — bez zadnej walidacji. Cykl 2
+ * traktowal je jako fallback „na serwer" i tym samym wstawial przed
+ * `randomUUID()` ogniwo KLIENCKIE: wartosc odrzucona w petli wyzej wracala
+ * linie nizej tym samym kanalem. Dlatego przechodzi tu przez DOKLADNIE ten sam
+ * ksztalt co naglowek, a niepasujaca schodzi do `randomUUID()`.
+ *
+ * Konsekwencja jest kontraktowa, nie kosmetyczna: zwracana wartosc ZAWSZE
+ * pasuje do {@link HOT_PATH_REQUEST_ID_SHAPE}, wiec bramka wartosci na nosniku
+ * (`withRedemptionPiiGuard`) nie moze zostac wywolana rzutem sterowanym
+ * z zewnatrz. Bez tego klient jednym naglowkiem kasowal WSZYSTKIE TRZY serie
+ * NFR-11 dla swojego zadania (bramka rzuca przy pierwszym `capture`, rzut lyka
+ * `catch` w `emitHotPathMetrics`, a slad gasnie po pierwszym wystapieniu tej
+ * klasy przyczyny — {@link warnOncePerCauseClass}).
+ *
+ * Odrzucenie WSZYSTKICH kandydatow nie jest juz ciche (cykl 7): zostawia slad
+ * diagnostyczny, ktory niesie FAKT i KLASE, a nie odrzucona wartosc — patrz
+ * komentarz w ciele {@link resolveHotPathRequestId}.
+ */
+const HOT_PATH_REQUEST_ID_SHAPE = IDEMPOTENCY_KEY_SHAPE
+
+/**
+ * Naglowki korelacyjne czytane W TEJ KOLEJNOSCI. Kolejnosc jest CZESCIA
+ * kontraktu, nie szczegolem: `x-request-id` jest naglowkiem trace'a tego
+ * zadania, a `x-correlation-id` — identyfikatorem calej operacji rozproszonej,
+ * ktora to zadanie moze byc tylko jednym krokiem. Zamiana ich miejscami
+ * skleilaby w metryce zadania, ktore AD-25 ma rozdzielac. Oba sloty (i ich
+ * pierwszenstwo wzgledem pola frameworka) sa przypiete kontrolami `H2g`/`H2h` —
+ * przed cyklem 7 caly slot `x-correlation-id` dawal sie usunac bez jednej
+ * czerwonej (`[B5-c3][regression][LOW]`, mutant M6).
+ */
+const HOT_PATH_CORRELATION_HEADERS = ["x-request-id", "x-correlation-id"] as const
+
+/** Nazwa slotu pola frameworka — do sladu diagnostycznego, nie do etykiety. */
+const HOT_PATH_FRAMEWORK_REQUEST_ID_SLOT = "req.requestId" as const
+
+const resolveHotPathRequestId = (req: RequestWithSellerContext): string => {
+  const headers =
+    (req as unknown as { headers?: Record<string, unknown> }).headers ?? {}
+  const candidates: Array<{ slot: string; value: unknown }> = []
+  for (const name of HOT_PATH_CORRELATION_HEADERS) {
+    const raw = headers[name]
+    candidates.push({ slot: name, value: Array.isArray(raw) ? raw[0] : raw })
+  }
+  // Pole frameworka jest OSTATNIM kandydatem, ale nie ma taryfy ulgowej —
+  // to ten sam naglowek klienta, tylko przepisany przez loader Medusy.
+  candidates.push({
+    slot: HOT_PATH_FRAMEWORK_REQUEST_ID_SLOT,
+    value: (req as unknown as { requestId?: unknown }).requestId,
+  })
+  const rejectedSlots: string[] = []
+  for (const candidate of candidates) {
+    if (typeof candidate.value !== "string") continue
+    const value = candidate.value.trim()
+    if (HOT_PATH_REQUEST_ID_SHAPE.test(value)) return value
+    rejectedSlots.push(candidate.slot)
+  }
+
+  // ── SLAD ZEJSCIA DO WYGENEROWANEGO IDENTYFIKATORA ────────────────────────
+  // (`[B5-c3][regression][LOW]`, cykl 7). Zdjecie taryfy ulgowej z
+  // `req.requestId` w cyklu 3 ROZSZERZYLO zbior wartosci, ktore znikaja: dzis
+  // odpada takze AWS X-Ray (`Root=1-…;Sampled=1`), base64 i kazdy ciag krotszy
+  // niz 8 znakow. Zejscie jest POPRAWNE (etykieta nie moze niesc wartosci
+  // odrzuconej), ale bylo CICHE — a cisza znaczy, ze operator patrzacy na
+  // metryke bez korelacji do logu nie wie, ze korelacja zostala zerwana
+  // i DLACZEGO. Ta sama trasa zostawia slad przy `carrier_unavailable`
+  // i przy wyjatku emisji; ten slot byl trzecim, ktory go nie mial.
+  //
+  // TRZY twarde ograniczenia tresci sladu:
+  //   1. NIE niesie odrzuconej wartosci ani jej fragmentu — to jest dokladnie
+  //      ta wartosc, ktora bramka odrzucila jako podejrzana o PII (zmierzone:
+  //      `jan.kowalski@example.com` trafia w ten slot). Logujemy FAKT
+  //      i KLASE: nazwy slotow, ktore odpadly, i powod klasowy;
+  //   2. NIE da sie go wywolac w petli z zewnatrz — tlumienie per klasa
+  //      przyczyny ({@link warnOncePerCauseClass}), a klasa nalezy do
+  //      dwuelementowego zbioru zamknietego w tym pliku;
+  //   3. NIE zmienia etykiety — `randomUUID()` zostaje, bo identyfikator losowy
+  //      przynajmniej rozdziela zadania.
+  const reasonClass = rejectedSlots.length > 0 ? "shape_mismatch" : "absent"
+  warnOncePerCauseClass(
+    req,
+    `${HOT_PATH_REQUEST_ID_FALLBACK_CAUSE_PREFIX}${reasonClass}`,
+    "[redemption-hot-path] zaden kandydat na etykiete request_id nie przeszedl " +
+      "bramki ksztaltu — etykieta niesie identyfikator WYGENEROWANY, wiec " +
+      "korelacja metryka→log dla tego zadania nie istnieje; odrzuconej wartosci " +
+      "NIE logujemy, bo to wlasnie ona jest podejrzana o PII",
+    {
+      // NAZWY slotow, nigdy ich wartosci.
+      slots_checked: [
+        ...HOT_PATH_CORRELATION_HEADERS,
+        HOT_PATH_FRAMEWORK_REQUEST_ID_SLOT,
+      ],
+      slots_rejected: rejectedSlots,
+      shape: HOT_PATH_REQUEST_ID_SHAPE.source,
+      fallback: "randomUUID",
+    },
+  )
+  return randomUUID()
 }
 
 const handleRedeemRequest = async (
   req: RequestWithSellerContext,
   res: MedusaResponse,
+  /**
+   * Publikacja rozstrzygnietego rynku do owijki `POST`, ktora emituje metryki.
+   * Wywolanie jest OBOWIAZKOWE zaraz po `resolveSellerMarketId` — bez niego
+   * etykieta `market_id` wraca do stanu „stala `unknown` na produkcji".
+   */
+  publishMarketId: (marketId: string) => void,
 ): Promise<void> => {
   const code = (req.params as { code?: string })?.code
   if (!code || code.length < 3) {
@@ -339,6 +663,8 @@ const handleRedeemRequest = async (
     }
     throw error
   }
+  // Rynek jest znany DOPIERO tutaj — to jedyne miejsce, w ktorym go publikujemy.
+  publishMarketId(sellerMarketId)
 
   await runInHttpMarketContext(sellerMarketId, async () => {
     await redeemInSellerMarket(req, res, {

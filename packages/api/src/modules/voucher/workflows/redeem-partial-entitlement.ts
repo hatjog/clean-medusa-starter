@@ -93,6 +93,36 @@ const AMOUNT_REDEEMABLE_TYPES: ReadonlySet<EntitlementType> = new Set([
 
 const BUNDLE_REDEEMABLE_TYPE = EntitlementType.BUNDLE
 
+/**
+ * Typ realizowany JEDNOSTKOWO, nie kwotowo (v1.15.0 Story 6.3, review-fix
+ * cyklu 1, F-0).
+ *
+ * ZMIERZONE na `gp_mercur` 2026-08-12: KAŻDY produkt katalogu BonBeauty
+ * wystawia `VOUCHER_SERVICE` (`select count(*) … entitlement_type='VOUCHER_AMOUNT'`
+ * → `0`), a `remaining_amount` i `reference_price_minor` są dla tych uprawnień
+ * `NULL` — i to jest zgodne z projektem: `computeReferencePriceMinor`
+ * (`live-issue-from-payment-intent.ts`) liczy je WYŁĄCZNIE dla CREDIT_PACK
+ * i BUNDLE. Skutek: trasa panelu (`vendor/vouchers/[code]/redeem`) odmawiała
+ * `422 REDEMPTION_REFUSED` realizacji CAŁEGO asortymentu — ekran w salonie nie
+ * mógł zrealizować żadnego vouchera, który ten sklep sprzedaje.
+ *
+ * Gałąź kwotowa NIE jest tu właściwą drogą (nie ma salda do obniżania).
+ * Voucher serwisowy jest NIEPODZIELNY: jedna realizacja konsumuje całą
+ * jednostkę usługi, więc stanem wyjściowym jest zawsze `REDEEMED_FULL`.
+ * Podstawą prowizji i derecognition jest CAŁE brutto emisji — to ta sama
+ * wartość, którą `resolveIssuedNetVat` czyta z `policy_snapshot.amount_minor`,
+ * więc reguła bilansu ADR-178 §2.3 (`Σ ≤ issued_gross_minor`) trzyma bez
+ * zmiany licznika.
+ *
+ * Wszystko poza rozpoznaniem WYDATKU zostaje wspólne z gałęzią kwotową:
+ * `wireEntitlementTransitionPersisted` (oba kroki), posting `REDEEMED`
+ * (profil `VOUCHER_SERVICE` istnieje — `posting-profile.ts:151`), zdarzenie
+ * odwracające (5.7 — `reverseRedemption` jest agnostyczne typowo, bo operuje
+ * na wierszu kanonicznym), idempotencja po `idempotency-key`, allow-lista
+ * stanów kodu (5.8) i granica najemcy pod TĄ SAMĄ blokadą wiersza.
+ */
+const UNIT_REDEEMABLE_TYPE = EntitlementType.VOUCHER_SERVICE
+
 /** Wynik dyskryminacji redeemu: pełny (`remaining`→0) vs partial (saldo > 0). */
 export type RedeemOutcome =
   | EntitlementInstanceState.REDEEMED_PARTIAL
@@ -865,6 +895,49 @@ async function resolveRedeemSpend(
     }
   }
 
+  if (ent.entitlement_type === UNIT_REDEEMABLE_TYPE) {
+    // Voucher serwisowy nie ma salda — ma JEDNĄ jednostkę usługi. `totalGross`
+    // jest tu notionalną „resztą": przed realizacją cała, po realizacji zero.
+    // Dzięki temu wiersz kanoniczny, licznik prowizji i posting mówią o tej
+    // samej podstawie co emisja, a `priorRedeemedGross` wychodzi 0 — czyli
+    // prawda, bo pierwsza realizacja jest zarazem ostatnią.
+    if (totalGross <= 0) {
+      throw new RedeemNotRedeemableError(
+        `redeem: entitlement ${ent.id} (${UNIT_REDEEMABLE_TYPE}) nie niesie ` +
+          `brutto emisji (${totalGross}) — nie ma czego zrealizować`
+      )
+    }
+
+    // Realizacja CZĘŚCIOWA jednostki usługi nie istnieje. Kwota inna niż całe
+    // brutto to nie „mniej usługi", tylko sprzeczne żądanie — odmawiamy
+    // fail-closed zamiast po cichu realizować całość.
+    if (input.amount_minor != null && input.amount_minor !== totalGross) {
+      throw new RedeemAmountError(
+        `redeem: entitlement ${ent.id} (${UNIT_REDEEMABLE_TYPE}) jest ` +
+          `NIEPODZIELNY — realizacja obejmuje całą jednostkę usługi ` +
+          `(brutto ${totalGross}), a zażądano ${input.amount_minor}`,
+        input.amount_minor,
+        totalGross
+      )
+    }
+    if (input.amount_minor == null && !input.redeem_full) {
+      throw new RedeemAmountError(
+        `redeem: entitlement ${ent.id} (${UNIT_REDEEMABLE_TYPE}) wymaga ` +
+          "jawnego redeem_full — jednostki usługi nie da się realizować częściowo",
+        0,
+        totalGross
+      )
+    }
+
+    return {
+      amount: totalGross,
+      remainingBefore: totalGross,
+      remainingAfter: 0,
+      priorRedeemedGross: 0,
+      outcome: EntitlementInstanceState.REDEEMED_FULL,
+    }
+  }
+
   if (ent.entitlement_type === BUNDLE_REDEEMABLE_TYPE) {
     const choiceSetItemId = input.choice_set_item_id
     if (!choiceSetItemId) {
@@ -953,7 +1026,8 @@ async function resolveRedeemSpend(
 
   throw new RedeemNotRedeemableError(
     `redeem: entitlement ${ent.id} ma typ ${ent.entitlement_type}; redeem ` +
-      `dozwolony tylko dla VOUCHER_AMOUNT, CREDIT_PACK i BUNDLE`
+      `dozwolony tylko dla VOUCHER_AMOUNT, CREDIT_PACK, BUNDLE ` +
+      `i VOUCHER_SERVICE`
   )
 }
 

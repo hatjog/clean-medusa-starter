@@ -113,6 +113,13 @@ if (process.env.TEST_TYPE === "integration:http") {
   module.exports.testMatch = [
     "**/packages/api/src/__tests__/integration/messaging-dispatch-barrier-pg.integration.test.[jt]s",
   ];
+} else if (process.env.TEST_TYPE === "delivery-state-pg") {
+  // v1.15.0 Story 4.2 — Brevo webhook state transition on REAL PostgreSQL.
+  // DATABASE_URL must point at an isolated database; the suite creates and
+  // removes only its voucher delivery tables.
+  module.exports.testMatch = [
+    "**/packages/api/src/__tests__/integration/brevo-delivery-state-pg.integration.test.[jt]s",
+  ];
 } else if (process.env.TEST_TYPE === "dispatch-window-provider") {
   // v1.15.0 Story 4.5 (AC4) — DOWOD PO STRONIE DOSTAWCY. Wysyla REALNE maile
   // przez `BrevoHttpClient` i liczy je odczytem z konta Brevo. Bez

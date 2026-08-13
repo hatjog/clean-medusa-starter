@@ -25,6 +25,7 @@
  * `container.resolve`.
  */
 import { describe, it, expect, beforeEach, afterEach, jest } from "@jest/globals"
+import { randomUUID } from "node:crypto"
 import { buildVendorSignatureHeader } from "../../../lib/vendor-hmac"
 import { createReplayGuardTestDb } from "../../helpers/replay-guard-test-db"
 import {
@@ -32,7 +33,22 @@ import {
   resetVendorSecretCryptoCore,
 } from "../../../lib/vendor-secret/crypto-core"
 import { GET as lookupHandler } from "../../../api/vendor/vouchers/[code]/lookup/route"
-import { POST as redeemHandler } from "../../../api/vendor/vouchers/[code]/redeem/route"
+import {
+  HOT_PATH_UNHANDLED_REFUSAL_CODE,
+  HOT_PATH_WARN_CLASS_BUDGET,
+  POST as redeemHandler,
+  __resetHotPathWarnStateForTests,
+} from "../../../api/vendor/vouchers/[code]/redeem/route"
+import {
+  POSTHOG_CONTAINER_KEY,
+  type PosthogCaptureClient,
+} from "../../../lib/instrumentation/posthog-metrics-client"
+import {
+  REDEMPTION_ATTEMPT_EVENT,
+  REDEMPTION_DURATION_EVENT,
+  REDEMPTION_SUCCESS_EVENT,
+} from "../../../lib/instrumentation/redemption-hot-path"
+import { maskActorId } from "../../../lib/instrumentation/posthog-canary"
 import { withVendorGate } from "../../helpers/vendor-auth-chain"
 
 // v1.15.0 Story 5.8: trasy są ZWOLNIONE z bramki HMAC, więc `withVendorGate`
@@ -264,6 +280,32 @@ function makeRequest(opts: {
    * handlerem.
    */
   sellerContext?: { seller_id: string } | null
+  /**
+   * v1.15.0 Story 6.2 review cyklu 1 (F-4): atrapa nosnika metryk o ksztalcie
+   * KLIENTA Z KONTENERA (`PosthogCaptureClient`), nie o ksztalcie portu.
+   * `undefined` = klucz `posthog` nieznany (zastane zachowanie tej suity).
+   */
+  posthogClient?: PosthogCaptureClient | null
+  /** Atrapa loggera — do pomiaru `warn` przy braku nosnika. */
+  logger?: { info: unknown; warn: unknown; error: unknown }
+  /** Naglowek trace'a warstwy transportowej (F-10) — `x-request-id`. */
+  requestId?: string
+  /**
+   * DRUGI slot korelacyjny — naglowek `x-correlation-id` (cykl 7,
+   * `[B5-c3][regression][LOW]`). Osobna opcja, bo pierwszenstwo slotow jest
+   * czescia kontraktu i kontrola musi umiec podac KAZDY slot niezaleznie.
+   */
+  correlationId?: string
+  /**
+   * TRZECI slot — pole `req.requestId` przepisane przez loader Medusy.
+   * Opcja istnieje, zeby kontrole pierwszenstwa nie musialy dopisywac pola do
+   * zadania PO jego zbudowaniu: kanal jest ten sam co produkcyjny, tylko
+   * podany wprost. Domyslnie (jak w produkcji) lustro `x-request-id`.
+   *
+   * `null` = pole NIEOBECNE (loader Medusy nie przebiegl — tak wyglada trasa
+   * wolana poza lancuchem HTTP). Kontrola negatywna dla klasy `absent`.
+   */
+  frameworkRequestId?: string | null
 }) {
   const sigHeader = buildVendorSignatureHeader(
     SELLER_ID,
@@ -287,7 +329,22 @@ function makeRequest(opts: {
     headers: {
       "x-vendor-signature": sigHeader,
       ...(idempotencyKey ? { "idempotency-key": idempotencyKey } : {}),
+      ...(opts.requestId ? { "x-request-id": opts.requestId } : {}),
+      ...(opts.correlationId
+        ? { "x-correlation-id": opts.correlationId }
+        : {}),
     },
+    // KSZTALT PRODUKCYJNY, nie wygodny (review fali B5 cyklu 2, `[B5-c2][HIGH]`).
+    // Medusa 2.14.2 ustawia to pole w PIERWSZYM middleware kazdego zadania:
+    // `req.requestId = req.headers["x-request-id"] ?? uuid()`
+    // (`@medusajs/medusa/dist/loaders/index.js:62`). Atrapa bez tego pola
+    // zielenila `H2b` z powodu, ktorego produkcja nie ma — dokladnie ta sama
+    // klasa co F-4 z cyklu 1 („suita, ktora nie zna klucza `posthog`, mierzy
+    // trase z martwym nosnikiem"), przeniesiona na `req.requestId`.
+    requestId:
+      "frameworkRequestId" in opts
+        ? (opts.frameworkRequestId ?? undefined)
+        : (opts.requestId ?? randomUUID()),
     scope: {
       resolve: (key: string) => {
         if (key === "voucher") return opts.voucherService
@@ -295,8 +352,18 @@ function makeRequest(opts: {
           return {
             resolveVendorId: opts.resolveVendor ?? (async (s: string) => `vendor_for_${s}`),
           }
+        // v1.15.0 Story 6.2 review cyklu 1 (F-4): klucz `posthog` istnieje w
+        // kontenerze produkcyjnym (rejestruje go `loaders/posthog.ts`). Suita,
+        // ktora go NIE zna, mierzy trase z martwym nosnikiem — i dokladnie
+        // dlatego 9/9 zielonych nie wykrylo niezgodnosci ksztaltu sterownika.
+        if (key === POSTHOG_CONTAINER_KEY) {
+          if (!("posthogClient" in opts)) throw new Error("unknown key: posthog")
+          return opts.posthogClient
+        }
         if (key === "logger")
-          return { info: jest.fn(), warn: jest.fn(), error: jest.fn() }
+          return (
+            opts.logger ?? { info: jest.fn(), warn: jest.fn(), error: jest.fn() }
+          )
         // PG_CONNECTION used by appendNotificationLog — return a knex-like
         // stub that fails so the route logs and continues (best-effort audit).
         //
@@ -679,5 +746,928 @@ describe("cc-4 F-05 — POST /vendor/vouchers/:code/redeem", () => {
     // Odmowa jest PRZED dotknięciem vouchera — żadnego odczytu ani mutacji.
     expect(mock.getForSeller).not.toHaveBeenCalled()
     expect(mock.redeemForSeller).not.toHaveBeenCalled()
+  })
+})
+
+/**
+ * v1.15.0 Story 6.2 — WPIECIE nosnika NFR-11 w trase (review cyklu 1, F-1..F-5).
+ *
+ * Dlaczego ta suita musiala powstac: pakiet nosnika byl zielony, bo podawal
+ * atrape o ksztalcie PORTU wymyslonego w tej story. Kontener rejestruje klienta
+ * o INNYM ksztalcie (`PosthogCaptureClient`, jeden obiekt z `distinctId`), wiec
+ * na realnej trasie nie powstawala ani jedna seria. Kazdy przypadek nizej pyta
+ * „czy nosnik ODPALA", a nie „czy nosnik ISTNIEJE".
+ */
+describe("Story 6.2 — wpiecie nosnika NFR-11 w POST /vendor/vouchers/:code/redeem", () => {
+  const savedMeasurementEnv: Record<string, string | undefined> = {}
+
+  /** Atrapa o ksztalcie KLIENTA Z KONTENERA, nie o ksztalcie portu. */
+  function makePosthogClient() {
+    const calls: Array<{
+      distinctId: string
+      event: string
+      properties?: Record<string, unknown>
+    }> = []
+    const client: PosthogCaptureClient = {
+      capture: (args) => calls.push(args),
+    }
+    return { client, calls }
+  }
+
+  beforeEach(() => {
+    savedMeasurementEnv.GP_ENV = process.env.GP_ENV
+    savedMeasurementEnv.GP_INSTANCE_ID = process.env.GP_INSTANCE_ID
+    process.env.GP_ENV = "dev"
+    process.env.GP_INSTANCE_ID = "gp-dev-unit"
+    __resetHotPathWarnStateForTests()
+  })
+
+  afterEach(() => {
+    for (const [k, v] of Object.entries(savedMeasurementEnv)) {
+      if (v === undefined) delete process.env[k]
+      else process.env[k] = v
+    }
+  })
+
+  function successMock() {
+    const claimEvent = {
+      event_type: "claimed",
+      occurred_at: new Date("2026-05-24T10:00:00Z"),
+    }
+    return voucherMock(makeVoucher(), {
+      status: "redeemed",
+      prior_status: "idle",
+      voucher: makeVoucher({ status: "claimed", events: [claimEvent] }),
+    })
+  }
+
+  // KONTROLA MUTANTA F-1: usuniecie adaptera `createRedemptionPosthogSink`
+  // z trasy sprawia, ze klient dostaje `capture("gp.voucher_redemption.attempt",
+  // {...})`, czyli string zamiast obiektu komunikatu — `event` jest wtedy
+  // `undefined`, a `distinctId` nie istnieje. Ten przypadek czerwieni sie
+  // na obu asercjach.
+  it("H1 — udana realizacja emituje TRZY serie do klienta z kontenera", async () => {
+    const { client, calls } = makePosthogClient()
+    const req = makeRequest({
+      voucherService: successMock(),
+      posthogClient: client,
+      requestId: "trace-abc-123",
+    })
+    const res = makeRes()
+
+    await redeemPOST(req as never, res as never)
+
+    expect(res.statusCode).toBe(200)
+    expect(calls.map((c) => c.event)).toEqual([
+      REDEMPTION_ATTEMPT_EVENT,
+      REDEMPTION_SUCCESS_EVENT,
+      REDEMPTION_DURATION_EVENT,
+    ])
+    // `expect.any(String)` NIE JEST kontrola dla pola, ktore ma NIE zawierac
+    // PII (weryfikacja cyklu 4 §4): przyjmuje mase, surowy `seller_id` i pusty
+    // string tak samo. Slot jest tu przypiety na ZMIERZONA wartosc, a pelna
+    // kontrola uzycia `maskActorId` na trasie siedzi w H7/H7b/H7c.
+    const expectedActorId = maskActorId(SELLER_ID)
+    for (const call of calls) {
+      expect(call.distinctId).toBe(expectedActorId)
+      expect(call.distinctId).not.toBe(SELLER_ID)
+      // Komplet etykiet AD-25 na KAZDEJ serii.
+      expect(call.properties).toEqual(
+        expect.objectContaining({
+          env: "dev",
+          instance_id: "gp-dev-unit",
+          // Zmierzone, nie „dowolny string": po fixie `[B5-c3][regression]`
+          // etykieta niesie rynek ROZSTRZYGNIETY na trasie przez
+          // `resolveSellerMarketId` — atrapa `seller` w tej suicie zwraca
+          // `market_id: "bonbeauty"`. Pelna kontrola uzycia producenta
+          // — razem z kontrola przeciwna — siedzi w H8/H8b.
+          market_id: "bonbeauty",
+          actor_id: expectedActorId,
+          // F-10: `request_id` pochodzi z warstwy TRANSPORTOWEJ, a klucz
+          // idempotencji jedzie jako OSOBNA etykieta.
+          request_id: "trace-abc-123",
+          idempotency_key: "panel-unit-key-0001",
+          http_status: 200,
+          outcome: "pass",
+        }),
+      )
+    }
+    expect(calls[2]?.properties?.duration_ms).toEqual(expect.any(Number))
+  })
+
+  // F-10: brak naglowka trace'a NIE degraduje etykiety do stalej „unknown" —
+  // identyfikator losowy przynajmniej rozdziela zadania.
+  it("H2 — bez naglowka trace'a request_id jest wygenerowany, nie „unknown\"", async () => {
+    const { client, calls } = makePosthogClient()
+    const req = makeRequest({ voucherService: successMock(), posthogClient: client })
+    const res = makeRes()
+
+    await redeemPOST(req as never, res as never)
+
+    expect(calls.length).toBeGreaterThan(0)
+    expect(calls[0]?.distinctId).toEqual(expect.any(String))
+    expect(calls[0]?.properties?.request_id).not.toBe("unknown")
+    expect(String(calls[0]?.properties?.request_id).length).toBeGreaterThan(8)
+  })
+
+  // TEST-THE-TEST fali B5 (`[B5][security][MEDIUM]`): naglowek `x-request-id`
+  // jest wejsciem KLIENTA, a bramka PII nosnika skanuje klucze, nie wartosci.
+  // Przed poprawka ten przypadek byl ZIELONY z adresem e-mail na telemetrii —
+  // czyli fix bylby nieodrozninalny od jego braku.
+  it("H2b — `x-request-id` z adresem e-mail NIE trafia na telemetrie", async () => {
+    const { client, calls } = makePosthogClient()
+    const req = makeRequest({
+      voucherService: successMock(),
+      posthogClient: client,
+      requestId: "jan.kowalski@example.com",
+    })
+    const res = makeRes()
+
+    await redeemPOST(req as never, res as never)
+
+    expect(calls.length).toBeGreaterThan(0)
+    for (const call of calls) {
+      const requestId = String(call.properties?.request_id)
+      expect(requestId).not.toBe("jan.kowalski@example.com")
+      expect(requestId).not.toContain("@")
+      expect(requestId).not.toContain("example.com")
+      // Zejscie do zrodla SERWEROWEGO, nie przyciecie wartosci klienta.
+      expect(requestId).toMatch(/^[A-Za-z0-9._:-]{8,200}$/)
+    }
+    // Cala emisja musi byc nienaruszona — odrzucenie naglowka nie moze
+    // zabijac pomiaru (odmowa jest po stronie ETYKIETY, nie serii).
+    expect(calls).toHaveLength(3)
+  })
+
+  // KONTROLA fali B5 cyklu 2 (`[B5-c2][HIGH]`): EMISJA NIE MOZE ZALEZEC OD
+  // TEGO, CO KLIENT PRZYSLE W NAGLOWKU. Cykl 2 zostawil sciezke, na ktorej
+  // dowolna wartosc spoza ksztaltu wracala fallbackiem przez `req.requestId`,
+  // rzucala bramka wartosci na nosniku przy PIERWSZYM `capture` i kasowala
+  // WSZYSTKIE TRZY serie NFR-11 — takze dla wartosci bez cienia PII
+  // (zmierzone: legalny `trace/abc 123` dawal 0 serii zamiast 3).
+  //
+  // Ten przypadek zamiata realna trase, nie sam resolver: sterownikiem jest
+  // `redeemPOST`, a atrapa ma ksztalt produkcyjny (`req.requestId` ustawione
+  // tak, jak robi to loader Medusy). Mutant przywracajacy
+  // `if (typeof framework === "string" && framework.length > 0) return framework`
+  // czerwieni go na kazdej pozycji listy.
+  it.each([
+    ["adres e-mail", "jan.kowalski@example.com"],
+    ["legalny trace ze spacja i ukosnikiem", "trace/abc 123"],
+    ["telefon z prefiksem", "+48 600 100 200"],
+    ["wartosc krotsza niz minimum ksztaltu", "abc"],
+    ["pusty naglowek", ""],
+    ["wartosc dluzsza niz 200 znakow", "a".repeat(201)],
+    ["znaki sterujace", "trace\n\tinjected"],
+  ])(
+    "H2c — `x-request-id` (%s) NIE kasuje emisji NFR-11: nadal TRZY serie",
+    async (_label, hostile) => {
+      const { client, calls } = makePosthogClient()
+      const req = makeRequest({
+        voucherService: successMock(),
+        posthogClient: client,
+        requestId: hostile,
+      })
+      // Kanal, ktorym wartosc wracala: loader Medusy przepisuje naglowek na
+      // `req.requestId` BEZ walidacji, wiec atrapa musi go niesc doslownie.
+      ;(req as unknown as { requestId: string }).requestId = hostile
+      const res = makeRes()
+
+      await redeemPOST(req as never, res as never)
+
+      expect(res.statusCode).toBe(200)
+      expect(calls).toHaveLength(3)
+      for (const call of calls) {
+        const requestId = String(call.properties?.request_id)
+        expect(requestId).not.toBe(hostile)
+        expect(requestId).toMatch(/^[A-Za-z0-9._:-]{8,200}$/)
+      }
+    },
+  )
+
+  // KONTROLA PRZECIWNA do H2c — bramka nie moze byc „zawsze odrzucajaca":
+  // wartosc zgodna z ksztaltem, podana WYLACZNIE przez `req.requestId`
+  // (czyli kanalem loadera, bez wlasnego naglowka w atrapie), musi przejsc
+  // na nosnik doslownie. Bez tego H2c bylby zielony takze dla implementacji
+  // `return randomUUID()` bez zadnego czytania wejscia.
+  it("H2d — zgodne z ksztaltem `req.requestId` przechodzi doslownie", async () => {
+    const { client, calls } = makePosthogClient()
+    const req = makeRequest({ voucherService: successMock(), posthogClient: client })
+    ;(req as unknown as { requestId: string }).requestId = "medusa-trace-0007"
+    const res = makeRes()
+
+    await redeemPOST(req as never, res as never)
+
+    expect(calls).toHaveLength(3)
+    for (const call of calls) {
+      expect(call.properties?.request_id).toBe("medusa-trace-0007")
+    }
+  })
+
+  // ── TRZECI SLOT KORELACYJNY (cykl 7, `[B5-c3][regression][LOW]`) ──────────
+  // ZMIERZONE PRZED: mutant M6 — usuniecie `"x-correlation-id"` z listy nazw
+  // naglowkow — dawal `failed 0 passed 50`. CALY slot dawal sie skasowac bez
+  // jednej czerwonej: `x-request-id` pilnowaly `H2b`/`H2c`, `req.requestId` —
+  // `H2d`, a trzeci slot NIC. To ta sama klasa co „martwy mechanizm na realnej
+  // sciezce": pytanie brzmi „czy odpala", nie „czy jest w liscie".
+  //
+  // Sterownikiem jest `redeemPOST`, a slot wchodzi NAGLOWKIEM — ta sama droga
+  // co na produkcji. Roznicujaca jest wartosc pola frameworka: gdyby slot
+  // korelacyjny zniknal z listy, etykieta zjechalaby na `req.requestId`.
+  it("H2g — `x-correlation-id` JEST czytanym slotem, gdy `x-request-id` nie ma", async () => {
+    const { client, calls } = makePosthogClient()
+    const req = makeRequest({
+      voucherService: successMock(),
+      posthogClient: client,
+      correlationId: "korelacja-0001",
+      frameworkRequestId: "medusa-trace-0007",
+    })
+    const res = makeRes()
+
+    await redeemPOST(req as never, res as never)
+
+    expect(res.statusCode).toBe(200)
+    expect(calls).toHaveLength(3)
+    for (const call of calls) {
+      expect(call.properties?.request_id).toBe("korelacja-0001")
+      // Bez tej asercji przypadek bylby zielony takze wtedy, gdyby slot
+      // korelacyjny zostal usuniety, a etykieta zjechala na pole frameworka.
+      expect(call.properties?.request_id).not.toBe("medusa-trace-0007")
+    }
+  })
+
+  // Sam fakt „slot jest w liscie" nie mowi, czy jest czytany we WLASCIWEJ
+  // KOLEJNOSCI. Kolejnosc jest czescia kontraktu AD-25: `x-request-id` opisuje
+  // TO zadanie, `x-correlation-id` — cala operacje rozproszona, ktorej to
+  // zadanie jest jednym krokiem. Zamiana miejscami skleilaby w metryce zadania,
+  // ktore maja byc rozdzielone — i zadna kontrola by tego nie zauwazyla.
+  //
+  // Drabina jest zbudowana z TRZECH slotow o TRZECH roznych, poprawnych
+  // ksztaltem wartosciach; kazde zdjecie najwyzszego slotu ma ODSLONIC dokladnie
+  // nastepny. Zamiana dowolnych dwoch sasiednich pozycji czerwieni ten przypadek.
+  it("H2h — pierwszenstwo slotow: `x-request-id` > `x-correlation-id` > `req.requestId`", async () => {
+    // (a) wszystkie trzy sloty obecne ⇒ wygrywa naglowek trace'a.
+    {
+      const { client, calls } = makePosthogClient()
+      const req = makeRequest({
+        voucherService: successMock(),
+        posthogClient: client,
+        requestId: "naglowek-trace-0001",
+        correlationId: "korelacja-0002",
+        frameworkRequestId: "medusa-trace-0003",
+      })
+      const res = makeRes()
+
+      await redeemPOST(req as never, res as never)
+
+      expect(calls).toHaveLength(3)
+      for (const call of calls) {
+        expect(call.properties?.request_id).toBe("naglowek-trace-0001")
+      }
+    }
+
+    // (b) bez `x-request-id` ⇒ wygrywa korelacja, NIE pole frameworka.
+    {
+      const { client, calls } = makePosthogClient()
+      const req = makeRequest({
+        voucherService: successMock(),
+        posthogClient: client,
+        correlationId: "korelacja-0002",
+        frameworkRequestId: "medusa-trace-0003",
+      })
+      const res = makeRes()
+
+      await redeemPOST(req as never, res as never)
+
+      expect(calls).toHaveLength(3)
+      for (const call of calls) {
+        expect(call.properties?.request_id).toBe("korelacja-0002")
+      }
+    }
+
+    // (c) bez oba naglowkow ⇒ zostaje pole frameworka (a nie `randomUUID()`).
+    {
+      const { client, calls } = makePosthogClient()
+      const req = makeRequest({
+        voucherService: successMock(),
+        posthogClient: client,
+        frameworkRequestId: "medusa-trace-0003",
+      })
+      const res = makeRes()
+
+      await redeemPOST(req as never, res as never)
+
+      expect(calls).toHaveLength(3)
+      for (const call of calls) {
+        expect(call.properties?.request_id).toBe("medusa-trace-0003")
+      }
+    }
+  })
+
+  // Trzeci slot jest wejsciem KLIENTA dokladnie tak samo jak `x-request-id`,
+  // wiec przechodzi TEN SAM ksztalt. Bez tej kontroli dodanie slotu do listy
+  // moglo obejsc bramke bokiem — i adres e-mail wjechalby na nosnik kanalem,
+  // ktorego `H2b`/`H2c` nie zamiataja.
+  it("H2i — `x-correlation-id` z adresem e-mail jest ODRZUCANY jak kazdy naglowek", async () => {
+    const { client, calls } = makePosthogClient()
+    const req = makeRequest({
+      voucherService: successMock(),
+      posthogClient: client,
+      correlationId: "jan.kowalski@example.com",
+      frameworkRequestId: "medusa-trace-0007",
+    })
+    const res = makeRes()
+
+    await redeemPOST(req as never, res as never)
+
+    expect(calls).toHaveLength(3)
+    for (const call of calls) {
+      const requestId = String(call.properties?.request_id)
+      expect(requestId).not.toContain("@")
+      expect(requestId).not.toContain("example.com")
+      // Odrzucenie schodzi na NASTEPNY slot, nie na `randomUUID()` — inaczej
+      // korelacja gubi sie takze wtedy, gdy poprawne zrodlo bylo dostepne.
+      expect(requestId).toBe("medusa-trace-0007")
+    }
+  })
+
+  // KONTROLA fali B5 cyklu 3 (`[B5-c3][correctness][LOW]`): STALA BYLA
+  // CHRONIONA, UZYCIE NIE. Mutant zdejmujacy test ksztaltu w
+  // `readIdempotencyKeyHeader` (`return trimmed.length > 0 ? trimmed : null`)
+  // zostawial CALY pakiet story zielony — `IDEMPOTENCY_KEY_SHAPE` pilnowaly
+  // wylacznie kontrole `request_id` (wspoldzielona stala), a zadna kontrola nie
+  // pilnowala obu wywolan tej funkcji: bramki 400 na wejsciu trasy
+  // (`route.ts:461`) ani etykiety `idempotency_key` na nosniku (`route.ts:344`).
+  // Zastane przypadki dotykaly wylacznie BRAKU naglowka (L9, H4), nigdy
+  // naglowka WADLIWEGO.
+  //
+  // Sterownikiem jest `redeemPOST`, nie sama funkcja — pytanie brzmi „czy
+  // odpala na realnej trasie", nie „czy istnieje".
+  it.each([
+    ["adres e-mail", "jan.kowalski@example.com"],
+    ["klucz ze spacjami", "panel key 0001"],
+    ["telefon z prefiksem", "+48 600 100 200"],
+    ["wartosc krotsza niz minimum ksztaltu", "abc"],
+    ["wartosc dluzsza niz 200 znakow", "a".repeat(201)],
+    ["znaki sterujace", "panel\nkey\t0001"],
+  ])(
+    "H2e — wadliwy `Idempotency-Key` (%s) ⇒ 400 i BRAK wartosci klienta na nosniku",
+    async (_label, hostile) => {
+      const { client, calls } = makePosthogClient()
+      const req = makeRequest({
+        voucherService: successMock(),
+        posthogClient: client,
+        idempotencyKey: hostile,
+      })
+      const res = makeRes()
+
+      await redeemPOST(req as never, res as never)
+
+      // Uzycie 1 — bramka wejscia: naglowek spoza ksztaltu jest ODMOWA,
+      // dokladnie jak jego brak (ADR-178 §2.2 M4 pkt 2).
+      expect(res.statusCode).toBe(400)
+      expect((res.body as { code: string }).code).toBe("IDEMPOTENCY_KEY_REQUIRED")
+      // Uzycie 2 — etykieta nosnika: emisja zyje, a wartosc klienta na nia
+      // nie wchodzi (inaczej bramka wartosci wywrocilaby CALA emisje).
+      const attempt = calls.find((c) => c.event === REDEMPTION_ATTEMPT_EVENT)
+      expect(attempt?.properties?.idempotency_key).toBeNull()
+      for (const call of calls) {
+        expect(call.properties?.idempotency_key).not.toBe(hostile)
+      }
+      expect(calls.length).toBeGreaterThan(0)
+    },
+  )
+
+  // KONTROLA PRZECIWNA do H2e — bramka nie moze byc „zawsze odrzucajaca":
+  // klucz zgodny z ksztaltem musi przejsc trase i trafic na nosnik DOSLOWNIE.
+  // Bez tego H2e bylby zielony takze dla implementacji `return null`.
+  it("H2f — zgodny `Idempotency-Key` przechodzi trase i laduje na nosniku doslownie", async () => {
+    const { client, calls } = makePosthogClient()
+    const req = makeRequest({
+      voucherService: successMock(),
+      posthogClient: client,
+      idempotencyKey: "panel-unit-key-9999",
+    })
+    const res = makeRes()
+
+    await redeemPOST(req as never, res as never)
+
+    expect(res.statusCode).toBe(200)
+    expect(calls).toHaveLength(3)
+    for (const call of calls) {
+      expect(call.properties?.idempotency_key).toBe("panel-unit-key-9999")
+    }
+  })
+
+  // ── UZYCIE `maskActorId` NA REALNEJ TRASIE (weryfikacja cyklu 4 §4, ──────
+  // `[B5-c4][regression][MEDIUM]`). TRZECIA instancja tej samej klasy, co H2e
+  // i kontrole emisji: mechanizm chroniony w izolacji
+  // (`canary-instrumentation.test.ts`), jego UZYCIE — niczym.
+  //
+  // Zmierzone przed ta kontrola: mutant zdejmujacy maskowanie z `route.ts:329`
+  // (`const actorId = req.seller_context?.seller_id ?? "anonymous"`) przechodzil
+  // ZIELONO na calej populacji 4008 testow. Surowy `seller_id` mogl wjechac na
+  // nosnik telemetrii jako etykieta `actor_id` I jako `distinctId`, a suita nie
+  // powiedzialaby nic — bo jedyna asercja brzmiala `actor_id: expect.any(String)`,
+  // czyli przyjmowala takze surowe PII.
+  //
+  // Bramka PII nosnika tego NIE lapie: `CLIENT_SOURCED_LABELS` skanuje wartosci
+  // wylacznie dla `request_id` i `idempotency_key`, a po kluczach `actor_id`
+  // jest DOZWOLONY. Jedyna ochrona tego slotu jest wywolanie maski na trasie —
+  // wiec to wywolanie musi byc przypiete kontrola, nie komentarzem.
+  //
+  // Sterownikiem jest `redeemPOST`, nie `maskActorId` wolane wprost.
+  it("H7 — `actor_id` I `distinctId` niosa MASKE seller_id, nie surowy identyfikator", async () => {
+    const { client, calls } = makePosthogClient()
+    const req = makeRequest({ voucherService: successMock(), posthogClient: client })
+    const res = makeRes()
+
+    await redeemPOST(req as never, res as never)
+
+    expect(res.statusCode).toBe(200)
+    expect(calls).toHaveLength(3)
+    const masked = maskActorId(SELLER_ID)
+    // Kontrola przeciwna do samej siebie: maska MUSI byc czyms innym niz
+    // wejscie, inaczej ponizsze rownosci bylyby zielone takze dla `x => x`.
+    expect(masked).not.toBe(SELLER_ID)
+    for (const call of calls) {
+      // Slot 1 — etykieta serii.
+      expect(call.properties?.actor_id).toBe(masked)
+      expect(call.properties?.actor_id).not.toBe(SELLER_ID)
+      // Slot 2 — tozsamosc nosnika (`createRedemptionPosthogSink(client, actorId)`).
+      // Mutant C zatruwal OBA; kontrola pilnujaca jednego przepuscilaby drugi.
+      expect(call.distinctId).toBe(masked)
+      expect(call.distinctId).not.toBe(SELLER_ID)
+    }
+  })
+
+  // H7 sam nie wystarcza: `seller_test_001` mieści się w alfabecie
+  // `CLIENT_SOURCED_LABEL_SHAPE`, wiec nie pokazuje, ze granica trzyma dla
+  // wartosci, ktora NAPRAWDE jest PII. Tozsamosc sprzedawcy w Mercurze jest
+  // ustawiana przez lancuch upstream i nic nie gwarantuje, ze nie niesie
+  // adresu ani nazwiska — a bramka nosnika `actor_id` nie oglada wcale.
+  it.each([
+    ["adres e-mail", "jan.kowalski@example.com"],
+    ["imie i nazwisko", "Jan Kowalski"],
+    ["telefon z prefiksem", "+48 600 100 200"],
+    ["identyfikator z domena", "seller_jan.kowalski.bonbeauty.pl"],
+  ])(
+    "H7b — seller_id o ksztalcie PII (%s) NIE wychodzi z procesu ani jako etykieta, ani jako distinctId",
+    async (_label, rawSellerId) => {
+      const { client, calls } = makePosthogClient()
+      const req = makeRequest({
+        voucherService: voucherMock(makeVoucher({ seller_id: rawSellerId }), {
+          status: "redeemed",
+          prior_status: "idle",
+          voucher: makeVoucher({
+            seller_id: rawSellerId,
+            status: "claimed",
+            events: [
+              { event_type: "claimed", occurred_at: new Date("2026-05-24T10:00:00Z") },
+            ],
+          }),
+        }),
+        sellerContext: { seller_id: rawSellerId },
+        posthogClient: client,
+      })
+      const res = makeRes()
+
+      await redeemPOST(req as never, res as never)
+
+      // Odrzucenie PII nie moze kasowac pomiaru — maska jest przeksztalceniem
+      // etykiety, nie powodem do ciszy (ta sama zasada co H2c).
+      expect(calls).toHaveLength(3)
+      const masked = maskActorId(rawSellerId)
+      for (const call of calls) {
+        const actorId = String(call.properties?.actor_id)
+        expect(actorId).toBe(masked)
+        expect(actorId).not.toBe(rawSellerId)
+        expect(actorId).not.toContain("kowalski")
+        expect(actorId).not.toContain("Kowalski")
+        expect(actorId).not.toContain("@")
+        expect(actorId).not.toContain("600")
+        // Ksztalt maski: 16 znakow hex (SHA-256 + sol, `posthog-canary.ts`).
+        expect(actorId).toMatch(/^[0-9a-f]{16}$/)
+        expect(call.distinctId).toBe(masked)
+        expect(call.distinctId).not.toBe(rawSellerId)
+      }
+    },
+  )
+
+  // Fallback `?? "anonymous"` jest drugim wejsciem tego samego uzycia i tez
+  // musi isc przez maske — inaczej mutant zdejmujacy maskowanie zostawialby
+  // zielona sciezke tam, gdzie kontekstu sprzedawcy nie ma (401, L11).
+  it("H7c — bez kontekstu sprzedawcy etykieta jest MASKA stalej, nie sama stala", async () => {
+    const { client, calls } = makePosthogClient()
+    const req = makeRequest({
+      voucherService: voucherMock(makeVoucher()),
+      sellerContext: null,
+      posthogClient: client,
+    })
+    const res = makeRes()
+
+    await redeemPOST(req as never, res as never)
+
+    expect(res.statusCode).toBe(401)
+    expect(calls.length).toBeGreaterThan(0)
+    const masked = maskActorId("anonymous")
+    for (const call of calls) {
+      expect(call.properties?.actor_id).toBe(masked)
+      expect(call.properties?.actor_id).not.toBe("anonymous")
+      expect(call.distinctId).toBe(masked)
+    }
+  })
+
+  // ── CZWARTA instancja tej samej klasy, znaleziona i zmierzona w cyklu 5 ──
+  // Ta sama metoda, co dla `maskActorId`: mutant podmieniajacy etykiete
+  // `market_id` na trasie (`route.ts:345`) na DOWOLNA stala przechodzil
+  // ZIELONO na calej populacji 4014 testow. Jedyna asercja brzmiala
+  // `market_id: expect.any(String)`, wiec slot nie mial zadnej kontroli.
+  //
+  // Etykieta `market_id` NIE JEST polem PII — jej wartosc jest tu przypieta
+  // z innego powodu: AD-25 stawia ja po to, zeby dalo sie zejsc z metryki do
+  // rynku.
+  //
+  // STAN ZMIERZONY PO FIXIE `[B5-c3][regression][MEDIUM]` (cykl 6): etykieta
+  // ma PRODUCENTA. Do cyklu 5 trasa czytala `req.gp_market_id` — pole bez
+  // ani jednego producenta w repo (`app.gp_market_id` to zmienna sesyjna
+  // Postgresa do RLS, INNY BYT), wiec produkcja emitowala stala `"unknown"`.
+  // Poprzednia wersja tej kontroli USTAWIALA to pole RECZNIE na `req` i przez
+  // to zielenila atrape zamiast trasy — dokladnie ten wzorzec ukryl blad.
+  // Ponizsze kontrole jada REALNA trasa: rynek pochodzi z uwierzytelnionego
+  // sprzedawcy (`resolveSellerMarketId`), a roznicujacym wejsciem jest atrapa
+  // tabeli `seller`, nie zadne pole dopisane do zadania.
+  it("H8 — `market_id` niesie rynek ROZSTRZYGNIETY na trasie, nie stala", async () => {
+    // (a) Rynek sprzedawcy domyslnej atrapy.
+    {
+      const { client, calls } = makePosthogClient()
+      const req = makeRequest({ voucherService: successMock(), posthogClient: client })
+      const res = makeRes()
+
+      await redeemPOST(req as never, res as never)
+
+      expect(res.statusCode).toBe(200)
+      expect(calls).toHaveLength(3)
+      for (const call of calls) {
+        expect(call.properties?.market_id).toBe("bonbeauty")
+      }
+    }
+
+    // (b) KONTROLA PRZECIWNA — INNY sprzedawca, INNY rynek. Bez niej (a) bylby
+    // zielony takze dla dowolnej stalej wpisanej na sztywno w trasie. Roznica
+    // wchodzi TA SAMA droga co na produkcji: przez rekord sprzedawcy.
+    {
+      const { client, calls } = makePosthogClient()
+      const req = makeRequest({
+        voucherService: successMock(),
+        posthogClient: client,
+        sellerMarketId: "mkt_ua",
+      })
+      const res = makeRes()
+
+      await redeemPOST(req as never, res as never)
+
+      expect(res.statusCode).toBe(200)
+      expect(calls).toHaveLength(3)
+      for (const call of calls) {
+        expect(call.properties?.market_id).toBe("mkt_ua")
+      }
+    }
+  })
+
+  // `"unknown"` zostaje UCZCIWYM stanem — ale TYLKO dla wyjsc PRZED
+  // rozstrzygnieciem rynku. Bez tej kontroli producent mogl by podstawiac
+  // wartosc domyslna (np. z konfiguracji) i przypisywac cudze odmowy do
+  // realnego rynku; „nie wiem" ma zostac odrozniane od konkretnego rynku.
+  it("H8b — odmowa PRZED rozstrzygnieciem rynku emituje jawne „unknown\"", async () => {
+    const { client, calls } = makePosthogClient()
+    // Brak kontekstu sprzedawcy ⇒ trasa konczy sie na `resolveVendorForSeller`,
+    // czyli PRZED `resolveSellerMarketId`. Rynku naprawde nie znamy.
+    const req = makeRequest({
+      voucherService: successMock(),
+      posthogClient: client,
+      sellerContext: null,
+    })
+    const res = makeRes()
+
+    await redeemPOST(req as never, res as never)
+
+    expect(res.statusCode).toBe(401)
+    expect(calls).toHaveLength(2)
+    for (const call of calls) {
+      expect(call.properties?.market_id).toBe("unknown")
+      // Kontrola przeciwna do samego „unknown": to NIE jest rynek sprzedawcy
+      // podstawiony domyslnie mimo braku rozstrzygniecia.
+      expect(call.properties?.market_id).not.toBe("bonbeauty")
+    }
+  })
+
+  // Martwy czytelnik nie moze wrocic bocznymi drzwiami: gdyby ktos przywrocil
+  // `req.gp_market_id ?? …`, ta kontrola zostalaby zielona TYLKO dlatego, ze
+  // wartosc z pola-atrapy zgadza sie z rynkiem sprzedawcy. Dlatego pole niesie
+  // tu wartosc INNA niz rozstrzygniety rynek i ma zostac ZIGNOROWANE.
+  it("H8c — `req.gp_market_id` (pole bez producenta) NIE jest zrodlem etykiety", async () => {
+    const { client, calls } = makePosthogClient()
+    const req = makeRequest({ voucherService: successMock(), posthogClient: client })
+    ;(req as unknown as { gp_market_id: string }).gp_market_id = "mkt_podstawione"
+    const res = makeRes()
+
+    await redeemPOST(req as never, res as never)
+
+    expect(res.statusCode).toBe(200)
+    expect(calls).toHaveLength(3)
+    for (const call of calls) {
+      expect(call.properties?.market_id).toBe("bonbeauty")
+      expect(call.properties?.market_id).not.toBe("mkt_podstawione")
+    }
+  })
+
+  // KONTROLA PRZECIWNA F-2: wyjatek z handlera nie moze byc liczony jako sukces.
+  // Przed poprawka `res.statusCode` mial domyslne 200 (status ustawia middleware
+  // bledow Medusy PO naszym `finally`), wiec ta sciezka emitowala serie `success`.
+  it("H3 — wyjatek z handlera ⇒ BRAK serii success, status 500 w metryce", async () => {
+    const { client, calls } = makePosthogClient()
+    const boom = new Error("awaria nizej w stosie")
+    const mock = voucherMock(makeVoucher())
+    mock.getForSeller = jest.fn(async () => {
+      throw boom
+    })
+    const req = makeRequest({ voucherService: mock, posthogClient: client })
+    const res = makeRes()
+
+    await expect(redeemPOST(req as never, res as never)).rejects.toThrow(boom)
+
+    const names = calls.map((c) => c.event)
+    expect(names).toContain(REDEMPTION_ATTEMPT_EVENT)
+    expect(names).toContain(REDEMPTION_DURATION_EVENT)
+    expect(names).not.toContain(REDEMPTION_SUCCESS_EVENT)
+    expect(calls[0]?.properties?.http_status).toBe(500)
+    expect(calls[0]?.properties?.outcome).toBe("fail")
+    expect(calls[0]?.properties?.refusal_code).toBe(HOT_PATH_UNHANDLED_REFUSAL_CODE)
+  })
+
+  // F-5: kod odmowy ma PRODUCENTA — pochodzi z ciala odpowiedzi, ktore trasa
+  // i tak wysyla. Przed poprawka etykieta byla zawsze `null`.
+  it("H4 — odmowa niesie refusal_code z ciala odpowiedzi", async () => {
+    const { client, calls } = makePosthogClient()
+    const req = makeRequest({
+      voucherService: voucherMock(makeVoucher()),
+      posthogClient: client,
+      idempotencyKey: null,
+    })
+    const res = makeRes()
+
+    await redeemPOST(req as never, res as never)
+
+    expect(res.statusCode).toBe(400)
+    const attempt = calls.find((c) => c.event === REDEMPTION_ATTEMPT_EVENT)
+    expect(attempt?.properties?.refusal_code).toBe("IDEMPOTENCY_KEY_REQUIRED")
+    expect(attempt?.properties?.http_status).toBe(400)
+    expect(attempt?.properties?.idempotency_key).toBeNull()
+    expect(calls.map((c) => c.event)).not.toContain(REDEMPTION_SUCCESS_EVENT)
+  })
+
+  // F-3: brak nosnika jest GLOSNY. Brak serii jest nieodrozniallny od braku
+  // ruchu, wiec cisza nie jest dopuszczalnym zachowaniem.
+  it("H5 — brak klienta w kontenerze zostawia warn, nie cisze", async () => {
+    const warn = jest.fn()
+    const req = makeRequest({
+      voucherService: successMock(),
+      posthogClient: null,
+      logger: { info: jest.fn(), warn, error: jest.fn() },
+    })
+    const res = makeRes()
+
+    await redeemPOST(req as never, res as never)
+
+    expect(res.statusCode).toBe(200)
+    expect(warn).toHaveBeenCalledTimes(1)
+    expect(String(warn.mock.calls[0]?.[0])).toContain("redemption-hot-path")
+  })
+
+  // F-3: porazka emisji (tu: brak kontekstu pomiaru AD-25) tez zostawia slad,
+  // a realizacja vouchera przebiega bez zmian.
+  it("H6 — brak kontekstu AD-25 ⇒ warn + realizacja nienaruszona", async () => {
+    delete process.env.GP_INSTANCE_ID
+    const warn = jest.fn()
+    const { client, calls } = makePosthogClient()
+    const req = makeRequest({
+      voucherService: successMock(),
+      posthogClient: client,
+      logger: { info: jest.fn(), warn, error: jest.fn() },
+    })
+    const res = makeRes()
+
+    await redeemPOST(req as never, res as never)
+
+    expect(res.statusCode).toBe(200)
+    expect(calls).toHaveLength(0)
+    expect(warn).toHaveBeenCalledTimes(1)
+    expect(String(warn.mock.calls[0]?.[0])).toContain("NFR-11")
+  })
+
+  // ── SLAD PRZY ZEJSCIU DO WYGENEROWANEGO `request_id` ─────────────────────
+  // (cykl 7, `[B5-c3][regression][LOW]`). ZMIERZONE PRZED:
+  // `grep -c "warn"` w ciele `resolveHotPathRequestId` → `0`, podczas gdy TA SAMA
+  // trasa zostawia slad przy `carrier_unavailable` (H5) i przy wyjatku emisji
+  // (H6). Zdjecie taryfy ulgowej z `req.requestId` w cyklu 3 ROZSZERZYLO zbior
+  // wartosci, ktore cicho znikaja (odpada m.in. AWS X-Ray, base64, ciagi <8
+  // znakow), wiec cisza kosztuje coraz wiecej korelacji metryka→log.
+  //
+  // Sterownikiem jest `redeemPOST`: wartosc wchodzi naglowkiem i polem loadera,
+  // dokladnie jak na produkcji.
+  it("H9 — odrzucenie WSZYSTKICH kandydatow zostawia slad diagnostyczny", async () => {
+    const { client, calls } = makePosthogClient()
+    const warn = jest.fn()
+    const req = makeRequest({
+      voucherService: successMock(),
+      posthogClient: client,
+      logger: { info: jest.fn(), warn, error: jest.fn() },
+      requestId: "jan.kowalski@example.com",
+      frameworkRequestId: "jan.kowalski@example.com",
+    })
+    const res = makeRes()
+
+    await redeemPOST(req as never, res as never)
+
+    // Emisja NIENARUSZONA — slad jest dodatkiem, nie zamiennikiem serii.
+    expect(res.statusCode).toBe(200)
+    expect(calls).toHaveLength(3)
+    // Dokladnie JEDEN slad: ten. Nosnik dziala, emisja nie rzucila.
+    expect(warn).toHaveBeenCalledTimes(1)
+    const [message, meta] = warn.mock.calls[0] as [string, Record<string, unknown>]
+    expect(String(message)).toContain("request_id")
+    // FAKT i KLASA, nie dane: klasa przyczyny, nazwy odrzuconych slotow.
+    expect(meta.cause_class).toBe("request_id_fallback:shape_mismatch")
+    expect(meta.slots_rejected).toEqual(["x-request-id", "req.requestId"])
+    expect(meta.fallback).toBe("randomUUID")
+  })
+
+  // KLASA `absent` — zaden slot nie niesie stringa (trasa wolana poza lancuchem
+  // HTTP loadera). Osobna klasa, bo to INNA diagnoza niz „klient przyslal
+  // wartosc spoza ksztaltu": tu nikt nic nie przyslal.
+  it("H9b — brak KAZDEGO kandydata zostawia slad klasy `absent`", async () => {
+    const { client, calls } = makePosthogClient()
+    const warn = jest.fn()
+    const req = makeRequest({
+      voucherService: successMock(),
+      posthogClient: client,
+      logger: { info: jest.fn(), warn, error: jest.fn() },
+      frameworkRequestId: null,
+    })
+    const res = makeRes()
+
+    await redeemPOST(req as never, res as never)
+
+    expect(calls).toHaveLength(3)
+    expect(warn).toHaveBeenCalledTimes(1)
+    const meta = warn.mock.calls[0]?.[1] as Record<string, unknown>
+    expect(meta.cause_class).toBe("request_id_fallback:absent")
+    expect(meta.slots_rejected).toEqual([])
+  })
+
+  // TWARDE OGRANICZENIE 1: slad NIE MOZE niesc odrzuconej wartosci ani jej
+  // fragmentu. To jest dokladnie ta wartosc, ktora bramka odrzucila jako
+  // podejrzana o PII — wpisanie jej do logu przenosiloby problem z nosnika
+  // telemetrii do logow aplikacji, czyli nie rozwiazywalo go, a przenosilo.
+  //
+  // Kontrola skanuje CALA tresc wywolania (`message` + `meta`), nie sam
+  // `message` — meta jest tym miejscem, w ktorym „na wszelki wypadek" wpisuje
+  // sie wartosc diagnostyczna.
+  it.each([
+    ["adres e-mail", "jan.kowalski@example.com", ["jan.kowalski", "example.com", "@"]],
+    ["telefon z prefiksem", "+48 600 100 200", ["48 600", "600 100 200"]],
+    ["legalny trace ze spacja", "trace/abc 123", ["trace/abc", "abc 123"]],
+    ["AWS X-Ray", "Root=1-63441c4a-abcdef012345678912345678;Sampled=1", ["Root=1-", "63441c4a", "Sampled"]],
+  ])(
+    "H9c — slad NIE niesie odrzuconej wartosci (%s) ani jej fragmentu",
+    async (_label, hostile, fragments) => {
+      const { client } = makePosthogClient()
+      const warn = jest.fn()
+      const req = makeRequest({
+        voucherService: successMock(),
+        posthogClient: client,
+        logger: { info: jest.fn(), warn, error: jest.fn() },
+        requestId: hostile,
+        frameworkRequestId: hostile,
+      })
+      const res = makeRes()
+
+      await redeemPOST(req as never, res as never)
+
+      expect(warn).toHaveBeenCalledTimes(1)
+      const serialized = warn.mock.calls
+        .map((call) => call.map((arg) => JSON.stringify(arg)).join(" "))
+        .join("\n")
+      expect(serialized).not.toContain(hostile)
+      for (const fragment of fragments as string[]) {
+        expect(serialized).not.toContain(fragment)
+      }
+      // Kontrola przeciwna do „nie zawiera": slad w ogole ISTNIEJE i nazywa
+      // slot, ktory odpadl — inaczej pusty log przechodzilby te asercje.
+      const meta = warn.mock.calls[0]?.[1] as Record<string, unknown>
+      expect(meta.slots_rejected).toContain("x-request-id")
+    },
+  )
+
+  // TWARDE OGRANICZENIE 2: sladu NIE DA SIE wywolac z zewnatrz w petli. Klient
+  // wysylajacy N zlych naglowkow nie moze zalac logow — to jest cala racja
+  // istnienia tlumienia. Klasa przyczyny nalezy do zbioru zamknietego w kodzie,
+  // wiec klient nie ma czym wyprodukowac nowego klucza.
+  it("H9d — piec zadan z tym samym zlym naglowkiem daje JEDEN slad", async () => {
+    const warn = jest.fn()
+    for (let i = 0; i < 5; i += 1) {
+      const { client } = makePosthogClient()
+      const req = makeRequest({
+        voucherService: successMock(),
+        posthogClient: client,
+        logger: { info: jest.fn(), warn, error: jest.fn() },
+        requestId: `zly-naglowek-${i}@example.com`,
+        frameworkRequestId: `zly-naglowek-${i}@example.com`,
+      })
+      await redeemPOST(req as never, makeRes() as never)
+    }
+    expect(warn).toHaveBeenCalledTimes(1)
+  })
+
+  // ── TLUMIENIE PER KLASA PRZYCZYNY (cykl 7, `[B5][security][LOW]`) ─────────
+  // ZMIERZONE PRZED: `warnOnce(req, flag, …)` na dwoch booleanach dawalo JEDEN
+  // `warn` na proces i na MIEJSCE W KODZIE — nie na przyczyne. Przy dlugo
+  // zyjacym procesie pierwszy wyjatek emisji zjadal sygnal dla wszystkich
+  // nastepnych, w tym dla NOWYCH klas przyczyn. Rozstrzygniete wariantem (a):
+  // kluczem tlumienia jest klasa przyczyny, wiec kazda klasa ma wlasny pierwszy
+  // `warn`; budzet klas domyka zbior twardo.
+  //
+  // Fabryka klas wyjatkow: `constructor.name` jest tym, co trasa wpisuje do
+  // klucza, wiec musi byc rozny per klasa.
+  function makeThrowingClient(errorClassName: string) {
+    const ErrorClass = class extends Error {}
+    Object.defineProperty(ErrorClass, "name", { value: errorClassName })
+    const client: PosthogCaptureClient = {
+      capture: () => {
+        throw new ErrorClass(`awaria nosnika: ${errorClassName}`)
+      },
+    }
+    return client
+  }
+
+  it("H10 — DWIE rozne klasy wyjatku emisji zostawiaja DWA slady", async () => {
+    const warn = jest.fn()
+    for (const errorClassName of ["PosthogTransportError", "PosthogQuotaError"]) {
+      const req = makeRequest({
+        voucherService: successMock(),
+        posthogClient: makeThrowingClient(errorClassName),
+        logger: { info: jest.fn(), warn, error: jest.fn() },
+      })
+      const res = makeRes()
+
+      await redeemPOST(req as never, res as never)
+
+      // Realizacja vouchera przebiega bez zmian — telemetria nie wywraca
+      // sciezki pieniadza (to samo, co mierzy H6).
+      expect(res.statusCode).toBe(200)
+    }
+
+    // Przed fixem: JEDEN warn (drugi zjadal boolean `hotPathEmitFailureWarned`).
+    expect(warn).toHaveBeenCalledTimes(2)
+    expect(warn.mock.calls.map((c) => (c[1] as Record<string, unknown>).cause_class))
+      .toEqual([
+        "emit_failure:PosthogTransportError",
+        "emit_failure:PosthogQuotaError",
+      ])
+  })
+
+  // KONTROLA PRZECIWNA do H10 — tlumienie nadal DZIALA. Bez niej H10 bylby
+  // zielony takze dla implementacji „warn zawsze", czyli dla logu, ktory da sie
+  // zalac powtarzajac to samo zadanie.
+  it("H10b — TA SAMA klasa wyjatku emisji piec razy daje JEDEN slad", async () => {
+    const warn = jest.fn()
+    for (let i = 0; i < 5; i += 1) {
+      const req = makeRequest({
+        voucherService: successMock(),
+        posthogClient: makeThrowingClient("PosthogTransportError"),
+        logger: { info: jest.fn(), warn, error: jest.fn() },
+      })
+      await redeemPOST(req as never, makeRes() as never)
+    }
+    expect(warn).toHaveBeenCalledTimes(1)
+  })
+
+  // BUDZET KLAS — druga bariera przeciw zalaniu logu. Nawet gdyby ktos
+  // w przyszlosci wpuscil do klucza wartosc sterowana z zewnatrz, liczba sladow
+  // jest ograniczona z gory stala, nie liczba zadan.
+  it("H10c — liczba klas sladu jest ograniczona budzetem, nie liczba zadan", async () => {
+    const warn = jest.fn()
+    const attempts = HOT_PATH_WARN_CLASS_BUDGET + 8
+    for (let i = 0; i < attempts; i += 1) {
+      const req = makeRequest({
+        voucherService: successMock(),
+        posthogClient: makeThrowingClient(`PosthogError${i}`),
+        logger: { info: jest.fn(), warn, error: jest.fn() },
+      })
+      await redeemPOST(req as never, makeRes() as never)
+    }
+    expect(attempts).toBeGreaterThan(HOT_PATH_WARN_CLASS_BUDGET)
+    expect(warn).toHaveBeenCalledTimes(HOT_PATH_WARN_CLASS_BUDGET)
   })
 })

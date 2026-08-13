@@ -147,6 +147,36 @@ function headerValue(
   return Array.isArray(value) ? value[0] : value
 }
 
+/**
+ * Znacznik faktu PSP dla markera Path Y — TĄ SAMĄ regułą pierwszeństwa, co
+ * kanoniczne mapowanie envelope'u (`lib/payment/stripe-payment-intent-event.ts`:
+ * `pi.created ?? event.created`). Dwie trasy nie mogą rozjechać się w semantyce
+ * znacznika PSP.
+ *
+ * L-2 (review cyklu 1): poprzedni kształt sprawdzał `pi.created ?? event.created`
+ * JAKO CAŁOŚĆ, więc dla zdarzenia z poprawnym `event.created` rzut był
+ * nieosiągalny — wywołanie wchodzi wyłącznie pod `retryableLinkRace`, a ten
+ * warunek już wymaga `Number.isFinite(stripeEvent.created)`. Martwy strażnik
+ * udający kontrolę. Teraz każdy kandydat jest oceniany OSOBNO: `pi.created`
+ * niebędące skończoną liczbą jest odrzucane i pierwszeństwo przechodzi na
+ * `event.created` — to jest gałąź, która naprawdę biegnie. Rzut zostaje
+ * WYŁĄCZNIE dla przypadku, w którym oba kandydaty są nieczytelne, i wtedy jest
+ * osiągalny.
+ */
+function readDeferredPspOccurredAt(event: StripePaymentIntentEvent): string {
+  const candidates = [event.data?.object?.created, event.created]
+  const created = candidates.find(
+    (value): value is number =>
+      typeof value === "number" && Number.isFinite(value)
+  )
+  if (created === undefined) {
+    throw new StripeEventMappingError(
+      "payment_intent.succeeded bez czasu faktu PSP — marker recovery Path Y odrzucony"
+    )
+  }
+  return new Date(created * 1000).toISOString()
+}
+
 export async function POST(
   req: MedusaRequest,
   res: MedusaResponse
@@ -278,6 +308,7 @@ export async function POST(
             event_id: deliveryEventId,
             payment_intent_id: paymentIntentId,
             market_id: identifiers.market_id ?? null,
+            psp_occurred_at: readDeferredPspOccurredAt(stripeEvent),
           })
           logger.info?.(
             `[stripe/payment-intent] slad deferral ${marked ? "zapisany" : "juz istnial"} ` +

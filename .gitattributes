@@ -56,3 +56,25 @@ packages/api/src/__tests__/workflows/payment/stripe-payment-audit-refund-live-br
 packages/api/src/__tests__/integration/entitlement-instance-creation.test.ts text eol=lf
 packages/api/src/__tests__/workflows/payment/stripe-payment-audit.unit.spec.ts text eol=lf
 packages/api/src/__tests__/workflows/payment/stripe-payment-audit-active-emit.unit.spec.ts text eol=lf
+
+# v1.15.0 Story 6.2 review-fix cyklu 1 (F-9) — pliki instrumentacji, ktorych
+# konce linii przewrocil commit tej story (edycja z Linuksa na plikach lezacych
+# w indeksie jako CRLF). Pomiar z review: `git diff --stat` pokazal 1788/1133
+# linii, a z `--ignore-all-space` realne 661/6 — czyli ~1100 linii szumu
+# i `git blame` utracony dla trzech plikow. Przewrot JUZ jest w indeksie
+# (`git ls-files --eol` => i/lf), wiec `--renormalize` jest tu no-opem;
+# brakowalo wylacznie pinu, ktory powstrzyma nastepna edycje z Windows przed
+# przewroceniem ich z powrotem. Zakres CELOWO waski, jak wpisy wyzej.
+packages/api/src/lib/instrumentation/track.ts text eol=lf
+packages/api/src/lib/instrumentation/posthog-canary.ts text eol=lf
+packages/api/src/lib/instrumentation/redemption-hot-path.ts text eol=lf
+packages/api/src/__tests__/canary-instrumentation.test.ts text eol=lf
+packages/api/src/__tests__/instrumentation/redemption-hot-path.unit.spec.ts text eol=lf
+
+# v1.15.0 Story 6.3 review-fix cyklu 2 (C2-L-2) — pliki realizacji uprawnienia,
+# ktorych konce linii przewrocil commit F-0 tej story (edycja z Linuksa na
+# plikach lezacych w indeksie jako CRLF; pomiar z recenzji: 2738 linii CRLF
+# w `redeem-partial-entitlement.ts`). Pin + `git add --renormalize` w TYM
+# SAMYM commicie, zgodnie z precedensem wpisow wyzej.
+packages/api/src/modules/voucher/workflows/redeem-partial-entitlement.ts text eol=lf
+packages/api/src/modules/voucher/__tests__/redeem-partial-entitlement.test.ts text eol=lf

@@ -30,6 +30,8 @@
 import { readFileSync } from "node:fs"
 import { join } from "node:path"
 
+import { Modules } from "@medusajs/framework/utils"
+
 import { toKnexPositionalSql } from "../../lib/knex-positional-sql"
 import { STRIPE_PATH_Y_WEBHOOK_PROVIDER } from "../../lib/payment/stripe-payment-intent-transport"
 
@@ -47,6 +49,12 @@ jest.mock("../../workflows/entitlements/issue-entitlement", () => {
   }
 })
 
+jest.mock("../../workflows/entitlements/live-issue-from-payment-intent", () => ({
+  __esModule: true,
+  liveIssueEntitlementsWithinTx: jest.fn(),
+}))
+
+import { liveIssueEntitlementsWithinTx } from "../../workflows/entitlements/live-issue-from-payment-intent"
 import onOrderPlacedStripeRetry, {
   buildFindDeferredCapturesBindings,
   buildMarkDeferredResolvedBindings,
@@ -197,6 +205,7 @@ type SentQuery = { sql: string; values: unknown[] }
 
 type DeferredRow = {
   event_id: string
+  provider: string
   market_id: string | null
   envelope: Record<string, unknown>
   amount: number | null
@@ -208,6 +217,7 @@ type DeferredRow = {
 function makeRow(overrides: Partial<DeferredRow> = {}): DeferredRow {
   return {
     event_id: "evt_1#deferred-issuance",
+    provider: "stripe",
     market_id: "bonbeauty",
     envelope: { entitlement_issue_deferred_reason: "webhook_before_order" },
     amount: 25000,
@@ -231,15 +241,17 @@ function makeHarness(rows: DeferredRow[]) {
     release: jest.fn(),
   }
   const logger = { info: jest.fn(), warn: jest.fn(), error: jest.fn() }
+  const eventBus = { emit: jest.fn().mockResolvedValue(undefined) }
   const container = {
     logger,
     resolve: (key: string) => {
       if (key === "__pg_pool__") return { connect: async () => client }
       if (key === "logger") return logger
+      if (key === Modules.EVENT_BUS) return eventBus
       throw new Error(`unexpected resolve(${key})`)
     },
   }
-  return { sent, client, logger, container }
+  return { sent, client, logger, eventBus, container }
 }
 
 async function run(container: unknown, data: Record<string, unknown>) {
@@ -329,5 +341,227 @@ describe("odzysk wystawienia — zachowanie na mockowanym kliencie", () => {
     const h = makeHarness([])
     await run(h.container, { id: "order_1" })
     expect(h.sent.some((q) => q.sql === MARK_DEFERRED_RESOLVED_SQL)).toBe(false)
+  })
+
+  it("dla markera Path Y wraca do ISSUED i emituje genezę Path Y, nie captured ACTIVE", async () => {
+    const liveIssue = liveIssueEntitlementsWithinTx as jest.Mock
+    liveIssue.mockResolvedValueOnce({
+      event_processed: true,
+      issued: [
+        {
+          entitlement_id: `ent_${"a".repeat(64)}`,
+          entitlement_dedupe_key: "a".repeat(64),
+          created: true,
+        },
+      ],
+    })
+    const h = makeHarness([
+      makeRow({
+        provider: STRIPE_PATH_Y_WEBHOOK_PROVIDER,
+        envelope: {
+          entitlement_issue_deferred_reason: "webhook_before_order",
+          psp_occurred_at: "2026-08-12T12:34:56.000Z",
+        },
+      }),
+    ])
+
+    await run(h.container, { id: "order_1" })
+
+    expect(liveIssue).toHaveBeenCalledWith(
+      h.client,
+      {
+        event_type: "gp.stripe.payment_intent_succeeded.v1",
+        payload: {
+          payment_intent_id: "pi_1",
+          order_id: "order_1",
+          currency: "PLN",
+          amount_minor: 25000,
+          psp_occurred_at: "2026-08-12T12:34:56.000Z",
+        },
+        scope: { market_id: "bonbeauty" },
+      },
+      expect.any(Date),
+    )
+    expect(h.eventBus.emit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        name: "gp.entitlements.entitlement_state_changed.v1",
+        data: expect.objectContaining({
+          payload: expect.objectContaining({ to_state: "ISSUED" }),
+        }),
+      }),
+    )
+  })
+})
+
+/**
+ * F-1 i L-6 (review-fix cyklu 1 story 6.3). Jedyny test nowej gałęzi Path Y
+ * pokrywał wyłącznie ścieżkę szczęśliwą. Poniżej brakujące osie: paczka
+ * mieszana (to jest test, który łapie F-1), domknięcie markera i replay.
+ */
+describe("odzysk Path Y — paczka mieszana, domknięcie i replay", () => {
+  const pathYRow = (overrides: Partial<DeferredRow> = {}) =>
+    makeRow({
+      event_id: "evt_pathy#deferred-issuance",
+      provider: STRIPE_PATH_Y_WEBHOOK_PROVIDER,
+      envelope: {
+        entitlement_issue_deferred_reason: "webhook_before_order",
+        psp_occurred_at: "2026-08-12T12:34:56.000Z",
+      },
+      ...overrides,
+    })
+
+  const issuedOnce = () => ({
+    event_processed: true,
+    issued: [
+      {
+        entitlement_id: `ent_${"a".repeat(64)}`,
+        entitlement_dedupe_key: "a".repeat(64),
+        created: true,
+      },
+    ],
+  })
+
+  it("marker legacy BEZ psp_occurred_at nie wywraca poprawnego markera z tej samej paczki", async () => {
+    // ZMIERZONE na gp_mercur 2026-08-12: 19 markerów Path Y, tylko 2 niosą
+    // `psp_occurred_at`, 4 są nierozwiązane. Przed poprawką goły `Error`
+    // uciekał z `withTransaction` i ROLLBACK zabierał CAŁĄ paczkę zamówienia —
+    // opłacony zakup kończył się zerem voucherów.
+    const liveIssue = liveIssueEntitlementsWithinTx as jest.Mock
+    liveIssue.mockReset()
+    liveIssue.mockResolvedValueOnce(issuedOnce())
+    const h = makeHarness([
+      pathYRow({
+        event_id: "evt_legacy#deferred-issuance",
+        envelope: { entitlement_issue_deferred_reason: "webhook_before_order" },
+      }),
+      pathYRow({ event_id: "evt_ok#deferred-issuance" }),
+    ])
+
+    await run(h.container, { id: "order_1" })
+
+    // Poprawny marker ZOSTAŁ wystawiony...
+    expect(liveIssue).toHaveBeenCalledTimes(1)
+    // ...a domknięty jest WYŁĄCZNIE on. Marker legacy zostaje nierozwiązany
+    // celowo — po backfillu kolejny `order.placed` go odzyska.
+    const updates = h.sent.filter((q) => q.sql === MARK_DEFERRED_RESOLVED_SQL)
+    expect(updates).toHaveLength(1)
+    expect(updates[0].values[0]).toBe("evt_ok#deferred-issuance")
+    // Nazwana odmowa TEGO wiersza, nie awaria paczki.
+    expect(h.logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining("marker Path Y nieodtwarzalny")
+    )
+    expect(h.logger.error).not.toHaveBeenCalled()
+  })
+
+  it("wystawienie Path Y domyka marker — inaczej byłby odzyskiwany w kółko", async () => {
+    const liveIssue = liveIssueEntitlementsWithinTx as jest.Mock
+    liveIssue.mockReset()
+    liveIssue.mockResolvedValueOnce(issuedOnce())
+    const h = makeHarness([pathYRow()])
+
+    await run(h.container, { id: "order_1" })
+
+    const update = h.sent.find((q) => q.sql === MARK_DEFERRED_RESOLVED_SQL)
+    expect(update).toBeDefined()
+    expect(update!.values[0]).toBe("evt_pathy#deferred-issuance")
+    expect(update!.values[2]).toBe("order_1")
+  })
+
+  it("created:false (replay) NIE re-emituje zdarzenia przejścia", async () => {
+    const liveIssue = liveIssueEntitlementsWithinTx as jest.Mock
+    liveIssue.mockReset()
+    liveIssue.mockResolvedValueOnce({
+      event_processed: true,
+      issued: [
+        {
+          entitlement_id: `ent_${"b".repeat(64)}`,
+          entitlement_dedupe_key: "b".repeat(64),
+          created: false,
+        },
+      ],
+    })
+    const h = makeHarness([pathYRow()])
+
+    await run(h.container, { id: "order_1" })
+
+    expect(h.eventBus.emit).not.toHaveBeenCalled()
+    // Marker mimo to zostaje domknięty: wystawienie JEST faktem, tylko nie nowym.
+    expect(h.sent.some((q) => q.sql === MARK_DEFERRED_RESOLVED_SQL)).toBe(true)
+  })
+
+  it("amount_minor niecałkowite NIE blokuje odzysku (L-1: pole nieczytane przez wystawienie)", async () => {
+    // `payment.amount` jest kolumną `numeric`; `Number(r.amount)` potrafi dać
+    // ułamek. Wystawienie tej wartości nie czyta — odmowa byłaby ryzykiem
+    // bez zysku.
+    const liveIssue = liveIssueEntitlementsWithinTx as jest.Mock
+    liveIssue.mockReset()
+    liveIssue.mockResolvedValueOnce(issuedOnce())
+    const h = makeHarness([pathYRow({ amount: 25000.5 })])
+
+    await run(h.container, { id: "order_1" })
+
+    expect(liveIssue).toHaveBeenCalledTimes(1)
+    expect(liveIssue.mock.calls[0][1].payload.amount_minor).toBe(25000)
+  })
+
+  it("C2-L-3: marker BEZ amount_minor jest odmową, nie cichym zerem", async () => {
+    // Do review cyklu 2 `null`/`NaN` schodziło tu do `0` w dwóch miejscach
+    // naraz (`Number(r.amount ?? 0)` w mapperze i `? 0 :` w walidacji), więc
+    // brak kwoty stawał się kwotą — wartością legalną i nieodróżnialną od
+    // pomiaru. Bezpieczeństwo tej linii opierało się WYŁĄCZNIE na fakcie
+    // zewnętrznym: dziś `live-issue-from-payment-intent.ts` tego pola nie
+    // czyta. Kontrola przypina odmowę do tego samego kanału, co pozostałe
+    // nieczytelne pola: wiersz zostaje nierozwiązany, paczka żyje.
+    const liveIssue = liveIssueEntitlementsWithinTx as jest.Mock
+    liveIssue.mockReset()
+    liveIssue.mockResolvedValueOnce(issuedOnce())
+    const h = makeHarness([
+      pathYRow({ event_id: "evt_noamount#deferred-issuance", amount: null }),
+      pathYRow({ event_id: "evt_ok#deferred-issuance" }),
+    ])
+
+    await run(h.container, { id: "order_1" })
+
+    // Poprawny marker paczki wystawiony i domknięty; wadliwy — NIE.
+    expect(liveIssue).toHaveBeenCalledTimes(1)
+    const updates = h.sent.filter((q) => q.sql === MARK_DEFERRED_RESOLVED_SQL)
+    expect(updates.map((q) => q.values[0])).toEqual(["evt_ok#deferred-issuance"])
+    expect(h.logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining("marker Path Y nieodtwarzalny")
+    )
+    expect(h.logger.error).not.toHaveBeenCalled()
+  })
+
+  it("C2-L-3: amount nieczytelny (NaN po konwersji) też jest odmową", async () => {
+    const liveIssue = liveIssueEntitlementsWithinTx as jest.Mock
+    liveIssue.mockReset()
+    const h = makeHarness([
+      pathYRow({
+        event_id: "evt_nan#deferred-issuance",
+        amount: "nie-liczba" as unknown as number,
+      }),
+    ])
+
+    await run(h.container, { id: "order_1" })
+
+    expect(liveIssue).not.toHaveBeenCalled()
+    expect(h.sent.some((q) => q.sql === MARK_DEFERRED_RESOLVED_SQL)).toBe(false)
+    expect(h.logger.error).not.toHaveBeenCalled()
+  })
+
+  it("marker bez market_id jest pomijany, a nie wywraca paczki", async () => {
+    const liveIssue = liveIssueEntitlementsWithinTx as jest.Mock
+    liveIssue.mockReset()
+    liveIssue.mockResolvedValueOnce(issuedOnce())
+    const h = makeHarness([
+      pathYRow({ event_id: "evt_nomarket#deferred-issuance", market_id: null }),
+      pathYRow({ event_id: "evt_ok#deferred-issuance" }),
+    ])
+
+    await run(h.container, { id: "order_1" })
+
+    expect(liveIssue).toHaveBeenCalledTimes(1)
+    const updates = h.sent.filter((q) => q.sql === MARK_DEFERRED_RESOLVED_SQL)
+    expect(updates.map((q) => q.values[0])).toEqual(["evt_ok#deferred-issuance"])
   })
 })

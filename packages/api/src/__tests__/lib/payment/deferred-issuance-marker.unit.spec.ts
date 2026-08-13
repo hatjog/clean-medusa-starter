@@ -27,6 +27,7 @@ describe("persistDeferredIssuanceMarker", () => {
     event_id: "evt_123",
     payment_intent_id: "pi_456",
     market_id: "bonbeauty",
+    psp_occurred_at: "2026-08-12T12:34:56.000Z",
   }
 
   it("pisze przez ten sam SQL co rezerwacja — `ON CONFLICT DO NOTHING`", async () => {
@@ -81,6 +82,9 @@ describe("persistDeferredIssuanceMarker", () => {
     expect(envelope.event_type).toBe("payment.captured")
     expect(envelope.entitlement_issue_deferred_reason).toBe(DEFERRED_ISSUANCE_REASON)
     expect(DEFERRED_ISSUANCE_REASON).toBe("webhook_before_order")
+    // Recovery Path Y musi zachować czas FAKTU PSP, nie wymyślać czasu
+    // wystawienia podczas późniejszego order.placed.
+    expect(envelope.psp_occurred_at).toBe(input.psp_occurred_at)
     // Ślad NIE niesie `entitlement_issue_resolved_at` — inaczej odzysk
     // odfiltrowałby go od razu jako już domknięty.
     expect(envelope).not.toHaveProperty("entitlement_issue_resolved_at")

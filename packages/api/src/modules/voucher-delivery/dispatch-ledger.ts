@@ -886,6 +886,105 @@ export class PgDispatchLedger
     return true
   }
 
+  async findByProviderMessageId(
+    providerMessageId: string,
+  ): Promise<DispatchRow | null> {
+    const rows = await this.queryRows<DispatchRow>(
+      `SELECT ${SELECT_COLUMNS}
+         FROM ${VOUCHER_DELIVERY_DISPATCH_TABLE}
+        WHERE provider_message_id = $1
+        LIMIT 1`,
+      [providerMessageId],
+    )
+    return rows.length > 0 ? normalizeRow(rows[0]) : null
+  }
+
+  /**
+   * Atomowa bariera potwierdzenia dostawy.
+   *
+   * Jedno `UPDATE ... WHERE status <> target` rozstrzyga zarówno przejście,
+   * jak i replay tego samego provider_event_id. Nie ma tu cache'u procesu ani
+   * sekwencji „odczyt → decyzja → zapis”; trwały wiersz ledgera jest źródłem
+   * prawdy także dla dwóch instancji backendu.
+   */
+  async applyProviderDeliveryState(
+    input: ApplyProviderDeliveryStateInput,
+  ): Promise<ApplyProviderDeliveryStateResult> {
+    if (!isDeliveryDispatchState(input.status)) {
+      throw new DispatchLedgerError(
+        `status spoza kontraktu: ${String(input.status)}`,
+        "VOUCHER_DELIVERY_STATE_UNKNOWN",
+      )
+    }
+    if (!input.provider_event_id.trim()) {
+      throw new DispatchLedgerError(
+        "provider_event_id nie może być pusty",
+        "VOUCHER_DELIVERY_PROVIDER_EVENT_ID_REQUIRED",
+      )
+    }
+    if (input.status === "failed" && !input.error_code) {
+      throw new DispatchLedgerError(
+        "failed wymaga error_code",
+        "VOUCHER_DELIVERY_FAILED_ERROR_CODE_REQUIRED",
+      )
+    }
+
+    const occurredAt = input.occurred_at ?? this.now().toISOString()
+    const rows = await this.queryRows<DispatchRow>(
+      `UPDATE ${VOUCHER_DELIVERY_DISPATCH_TABLE}
+          SET status = $1,
+              provider = COALESCE($2, provider),
+              error_code = CASE WHEN $1 = 'failed' THEN $3 ELSE error_code END,
+              failed_at = CASE WHEN $1 = 'failed' THEN $4 ELSE failed_at END,
+              updated_at = $4
+        WHERE provider_message_id = $5
+          AND status <> $1
+        RETURNING ${SELECT_COLUMNS}`,
+      [
+        input.status,
+        input.provider ?? null,
+        input.error_code ?? null,
+        occurredAt,
+        input.provider_event_id,
+      ],
+    )
+
+    if (rows.length > 0) {
+      const row = normalizeRow(rows[0])
+      await this.appendAudit(row, null, input.status, input.error_code ?? null, occurredAt)
+      return {
+        outcome: "updated",
+        dispatch_id: row.dispatch_id,
+        previous_status: null,
+        status: row.status,
+      }
+    }
+
+    const existing = await this.findByProviderMessageId(input.provider_event_id)
+    if (!existing) {
+      return {
+        outcome: "orphan",
+        dispatch_id: null,
+        previous_status: null,
+        status: null,
+      }
+    }
+    if (existing.status === input.status) {
+      return {
+        outcome: "duplicate",
+        dispatch_id: existing.dispatch_id,
+        previous_status: existing.status,
+        status: existing.status,
+      }
+    }
+    return {
+      outcome: "state_transition_rejected",
+      dispatch_id: existing.dispatch_id,
+      previous_status: existing.status,
+      status: existing.status,
+    }
+  }
+
   async findByIdentity(
     identity: DispatchIdentity,
   ): Promise<DispatchRow | null> {
@@ -1951,6 +2050,27 @@ function assertMeasurementContext(
       )
     }
   }
+}
+
+export interface ApplyProviderDeliveryStateInput {
+  provider_event_id: string
+  status: DeliveryDispatchState
+  error_code?: string | null
+  occurred_at?: string
+  provider?: string | null
+}
+
+export type ApplyProviderDeliveryStateOutcome =
+  | "updated"
+  | "duplicate"
+  | "orphan"
+  | "state_transition_rejected"
+
+export interface ApplyProviderDeliveryStateResult {
+  outcome: ApplyProviderDeliveryStateOutcome
+  dispatch_id: string | null
+  previous_status: DeliveryDispatchState | null
+  status: DeliveryDispatchState | null
 }
 
 function assertRecipientHash(value: string): void {
