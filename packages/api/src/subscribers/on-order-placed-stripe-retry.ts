@@ -64,6 +64,7 @@ import {
   type TransitionAuditEnvelope,
   type TransitionEventEnvelope,
 } from "../modules/voucher/entitlement-transition-wiring"
+import { activateIssuedEntitlement } from "../modules/voucher/workflows/activate-issued-entitlement"
 import {
   issueEntitlementsForAllLineItems,
   MissingEntitlementProfileError,
@@ -417,50 +418,6 @@ async function markDeferredResolved(
     MARK_DEFERRED_RESOLVED_SQL,
     buildMarkDeferredResolvedBindings(eventId, resolvedAt.toISOString(), orderId)
   )
-}
-
-/**
- * Podnosi wiersz z ISSUED do ACTIVE W TEJ SAMEJ tx co wystawienie (odzysk Path Y).
- *
- * DLACZEGO to tu jest: ta funkcja obsługuje JEDEN scenariusz — `payment.captured`
- * i `order.placed` OBA już zaszły — i wybiera między dwoma pokoleniami mechanizmu
- * wyłącznie po wartości `wep.provider`. Gałąź natywna woła
- * `issueEntitlementsForAllLineItems`, która tworzy wiersz OD RAZU w ACTIVE
- * (ADR-099a: ISSUED jest tam konceptualny). Gałąź Path Y woła
- * `liveIssueEntitlementsWithinTx`, której GRANICĄ jest ISSUED (E3: „issue ≠
- * posting", okablowanie L4 należy do callera). Bez tego kroku ten sam zakup
- * kończył w RÓŻNYM stanie terminalnym zależnie od tego, które pokolenie webhooka
- * zostawiło ślad — a `redeem-partial-entitlement.ts` przyjmuje wyłącznie
- * `{ACTIVE, REDEEMED_PARTIAL}`, więc wariant Path Y dawał voucher NIEMOŻLIWY do
- * wykorzystania.
- *
- * ZMIERZONE na `gp_mercur` 2026-08-13: wszystkie 3 entitlementy z zakupów tego
- * dnia stały w ISSUED, `POST /vendor/vouchers/<kod>/redeem` → 422, a dziennik
- * tranzycji nie miał po `__genesis__ → ISSUED` ŻADNEJ krawędzi dalej.
- *
- * DLACZEGO to NIE jest ominięcie claimu: magic-link (`/v1/entitlements/claim`,
- * ADR-138) domyka handoff do OBCEGO odbiorcy i pozostaje jedyną drogą dla linku
- * z maila; tutaj aktywujemy odzysk zakupu, który w gałęzi natywnej NIGDY claimu
- * nie wymagał. Rozstrzygnięcie „które ścieżki wystawienia wymagają claimu"
- * jest szersze niż ten regres i idzie osobno do PO.
- *
- * Guard `AND state = 'ISSUED'` czyni krok idempotentnym: powtórka `order.placed`
- * po wcześniejszej redempcji nie cofa stanu (zwraca 0 wierszy ⇒ `false` ⇒ brak
- * drugiego eventu).
- */
-async function activateIssuedEntitlement(
-  client: PgClient,
-  entitlementId: string
-): Promise<boolean> {
-  const result = await client.query<{ id: string }>(
-    `UPDATE entitlement_instance
-        SET state = 'ACTIVE', updated_at = NOW()
-      WHERE id = $1
-        AND state = 'ISSUED'
-      RETURNING id`,
-    [entitlementId]
-  )
-  return result.rows.length > 0
 }
 
 /**
