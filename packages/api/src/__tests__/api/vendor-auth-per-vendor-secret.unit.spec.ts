@@ -16,6 +16,16 @@ import { describe, it, expect, jest, beforeEach, afterEach } from "@jest/globals
 
 import { buildVendorSignatureHeader } from "../../lib/vendor-hmac"
 import { withVendorGate } from "../helpers/vendor-auth-chain"
+
+// Trasa, na ktorej te przypadki mierza bramke. Po DW-15-171 bramka jest
+// SWIADOMA SCIEZKI: zadanie bez `originalUrl` szlo obok niej bez zadnego
+// uwierzytelnienia, wiec przypadek nie mierzyl tego, co deklarowal.
+//
+// To MUSI byc trasa GP-owned I NIEOBJETA wyjatkiem. Po Story 5.8 z szesciu
+// tras `VENDOR_GP_OWNED_ROUTES` az piec jest na liscie wyjatkow (transporty
+// przegladarkowe), wiec `/vendor/training-cert/upload` jest jedyna trasa,
+// na ktorej bramka HMAC faktycznie uwierzytelnia.
+const GATED_ROUTE = "/vendor/training-cert/upload"
 import { createReplayGuardTestDb } from "../helpers/replay-guard-test-db"
 import {
   configureVendorSecretCryptoCore,
@@ -111,7 +121,7 @@ async function callRoute(header: string | undefined) {
     res.status(200).json({ ok: true })
   })
 
-  const wrapped = withVendorGate(handler as any)
+  const wrapped = withVendorGate(handler as any, GATED_ROUTE)
   await wrapped(
     buildMockReq(header === undefined ? {} : { "x-vendor-signature": header }, logged),
     res,

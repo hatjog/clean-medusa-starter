@@ -19,6 +19,16 @@ import { config as subscriberConfig } from "../subscribers/on-order-completed.js
 import { NotImplementedError, VendorNotMappedError } from "../modules/gp-core/service"
 import { vendorAuthMiddleware } from "../lib/vendor-auth"
 import { withVendorGate } from "./helpers/vendor-auth-chain"
+
+// Trasa, na ktorej te przypadki mierza bramke. Po DW-15-171 bramka jest
+// SWIADOMA SCIEZKI: zadanie bez `originalUrl` szlo obok niej bez zadnego
+// uwierzytelnienia, wiec przypadek nie mierzyl tego, co deklarowal.
+//
+// To MUSI byc trasa GP-owned I NIEOBJETA wyjatkiem. Po Story 5.8 z szesciu
+// tras `VENDOR_GP_OWNED_ROUTES` az piec jest na liscie wyjatkow (transporty
+// przegladarkowe), wiec `/vendor/training-cert/upload` jest jedyna trasa,
+// na ktorej bramka HMAC faktycznie uwierzytelnia.
+const GATED_ROUTE = "/vendor/training-cert/upload"
 import { buildVendorSignatureHeader } from "../lib/vendor-hmac"
 import { createReplayGuardTestDb } from "./helpers/replay-guard-test-db"
 import {
@@ -143,7 +153,7 @@ function buildMockRes() {
 describe("/vendor/* gate", () => {
   it("returns 401 when x-vendor-signature header is missing (enforced mode)", async () => {
     const handler = jest.fn()
-    const wrapped = withVendorGate(handler as any)
+    const wrapped = withVendorGate(handler as any, GATED_ROUTE)
     const req = buildMockReq({})
     const res = buildMockRes()
     const next = jest.fn()
@@ -162,7 +172,7 @@ describe("/vendor/* gate", () => {
     const handler = jest.fn(async (req: any) => {
       capturedAuth = req.vendorAuth
     })
-    const wrapped = withVendorGate(handler as any)
+    const wrapped = withVendorGate(handler as any, GATED_ROUTE)
     const req = buildMockReq({ "x-vendor-signature": makeSignedHeader() })
     const res = buildMockRes()
     const next = jest.fn()
@@ -180,7 +190,7 @@ describe("/vendor/* gate", () => {
   // mapowania jest teraz ODMOWĄ AUTORYZACYJNĄ `403 VENDOR_NOT_MAPPED`.
   it("returns 403 VENDOR_NOT_MAPPED when the seller has no GP vendor mapping", async () => {
     const handler = jest.fn()
-    const wrapped = withVendorGate(handler as any)
+    const wrapped = withVendorGate(handler as any, GATED_ROUTE)
     const req = buildMockReq({ "x-vendor-signature": makeSignedHeader() })
 
     // Override gp_core to throw VendorNotMappedError (Story 5.8, AC1)
@@ -221,7 +231,7 @@ describe("/vendor/* gate", () => {
 
   it("returns 503 when GpCoreService is not available", async () => {
     const handler = jest.fn()
-    const wrapped = withVendorGate(handler as any)
+    const wrapped = withVendorGate(handler as any, GATED_ROUTE)
     const req = buildMockReq({ "x-vendor-signature": makeSignedHeader() })
 
     req.scope.resolve = jest.fn((key: string) => {
@@ -248,7 +258,7 @@ describe("/vendor/* gate", () => {
 
   it("returns 500 on unexpected error from resolveVendorId", async () => {
     const handler = jest.fn()
-    const wrapped = withVendorGate(handler as any)
+    const wrapped = withVendorGate(handler as any, GATED_ROUTE)
     const req = buildMockReq({ "x-vendor-signature": makeSignedHeader() })
 
     req.scope.resolve = jest.fn((key: string) => {
