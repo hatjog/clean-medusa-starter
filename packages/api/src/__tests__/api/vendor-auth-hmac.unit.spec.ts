@@ -28,6 +28,16 @@ import { describe, it, expect, jest, beforeEach, afterEach } from "@jest/globals
 import { buildVendorSignatureHeader } from "../../lib/vendor-hmac"
 import type { VendorAuthContext } from "../../lib/vendor-auth"
 import { withVendorGate } from "../helpers/vendor-auth-chain"
+
+// Trasa, na ktorej te przypadki mierza bramke. Po DW-15-171 bramka jest
+// SWIADOMA SCIEZKI: zadanie bez `originalUrl` szlo obok niej bez zadnego
+// uwierzytelnienia, wiec przypadek nie mierzyl tego, co deklarowal.
+//
+// To MUSI byc trasa GP-owned I NIEOBJETA wyjatkiem. Po Story 5.8 z szesciu
+// tras `VENDOR_GP_OWNED_ROUTES` az piec jest na liscie wyjatkow (transporty
+// przegladarkowe), wiec `/vendor/training-cert/upload` jest jedyna trasa,
+// na ktorej bramka HMAC faktycznie uwierzytelnia.
+const GATED_ROUTE = "/vendor/training-cert/upload"
 import { createReplayGuardTestDb } from "../helpers/replay-guard-test-db"
 import {
   configureVendorSecretCryptoCore,
@@ -177,7 +187,7 @@ describe("/vendor/* gate — HMAC enforced", () => {
       capturedAuth = req.vendorAuth
     })
 
-    const wrapped = withVendorGate(handler as any)
+    const wrapped = withVendorGate(handler as any, GATED_ROUTE)
     const req = buildMockReq({ "x-vendor-signature": makeSignedHeader() })
     const res = buildMockRes()
 
@@ -193,7 +203,7 @@ describe("/vendor/* gate — HMAC enforced", () => {
   // Case 2: Invalid signature → 401 VENDOR_AUTH_SIGNATURE_INVALID
   it("case-2: invalid signature → 401 VENDOR_AUTH_SIGNATURE_INVALID", async () => {
     const handler = jest.fn()
-    const wrapped = withVendorGate(handler as any)
+    const wrapped = withVendorGate(handler as any, GATED_ROUTE)
 
     // Build header with wrong secret
     const wrongHeader = buildVendorSignatureHeader(SELLER_ID, "wrong-secret")
@@ -210,7 +220,7 @@ describe("/vendor/* gate — HMAC enforced", () => {
   // Case 3: Expired timestamp (drift+1) → 401 VENDOR_AUTH_TIMESTAMP_EXPIRED
   it("case-3: expired timestamp → 401 VENDOR_AUTH_TIMESTAMP_EXPIRED", async () => {
     const handler = jest.fn()
-    const wrapped = withVendorGate(handler as any)
+    const wrapped = withVendorGate(handler as any, GATED_ROUTE)
 
     const expiredHeader = makeSignedHeader(SELLER_ID, -(300 + 1))
     const req = buildMockReq({ "x-vendor-signature": expiredHeader })
@@ -226,7 +236,7 @@ describe("/vendor/* gate — HMAC enforced", () => {
   // Case 4: Missing signature header → 401 VENDOR_AUTH_SIGNATURE_MISSING
   it("case-4: missing signature header → 401 VENDOR_AUTH_SIGNATURE_MISSING", async () => {
     const handler = jest.fn()
-    const wrapped = withVendorGate(handler as any)
+    const wrapped = withVendorGate(handler as any, GATED_ROUTE)
 
     const req = buildMockReq({}) // no x-vendor-signature
     const res = buildMockRes()
@@ -246,7 +256,7 @@ describe("/vendor/* gate — HMAC enforced", () => {
     const header = buildVendorSignatureHeader(SELLER_ID, TEST_SECRET, ts, uniqueNonce)
 
     const handler = jest.fn()
-    const wrapped = withVendorGate(handler as any)
+    const wrapped = withVendorGate(handler as any, GATED_ROUTE)
 
     // First call
     const req1 = buildMockReq({ "x-vendor-signature": header })
@@ -279,7 +289,7 @@ describe("/vendor/* gate — enforcement flag turned off", () => {
     process.env.VENDOR_HMAC_ENFORCED = "false"
 
     const handler = jest.fn()
-    const wrapped = withVendorGate(handler as any)
+    const wrapped = withVendorGate(handler as any, GATED_ROUTE)
 
     const req = buildMockReq({ "x-vendor-token": SELLER_ID })
     const res = buildMockRes()
@@ -298,7 +308,7 @@ describe("/vendor/* gate — enforcement flag turned off", () => {
     process.env.VENDOR_HMAC_ENFORCED = "false"
 
     const handler = jest.fn()
-    const wrapped = withVendorGate(handler as any)
+    const wrapped = withVendorGate(handler as any, GATED_ROUTE)
 
     const req = buildMockReq({})
     const res = buildMockRes()
@@ -333,7 +343,7 @@ describe("/vendor/* gate — shared secret removed (Story 5.4, AC1)", () => {
     const handler = jest.fn(async (req: any) => {
       capturedAuth = req.vendorAuth
     })
-    const wrapped = withVendorGate(handler as any)
+    const wrapped = withVendorGate(handler as any, GATED_ROUTE)
 
     const req = buildMockReq({ "x-vendor-signature": makeSignedHeader() })
     const res = buildMockRes()
@@ -349,7 +359,7 @@ describe("/vendor/* gate — shared secret removed (Story 5.4, AC1)", () => {
     // Removing the shared secret must not blur the failure modes 5.2 separated:
     // "this seller has no secret" is 401, never 503 and never a silent success.
     const handler = jest.fn()
-    const wrapped = withVendorGate(handler as any)
+    const wrapped = withVendorGate(handler as any, GATED_ROUTE)
 
     const req = buildMockReq({
       "x-vendor-signature": makeSignedHeader("seller-never-provisioned"),

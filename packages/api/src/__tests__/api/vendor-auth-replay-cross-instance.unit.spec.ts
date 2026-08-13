@@ -37,6 +37,16 @@ import {
   VENDOR_AUTH_REPLAY_GUARD_UNAVAILABLE,
 } from "../../lib/vendor-auth"
 import { withVendorGate } from "../helpers/vendor-auth-chain"
+
+// Trasa, na ktorej te przypadki mierza bramke. Po DW-15-171 bramka jest
+// SWIADOMA SCIEZKI: zadanie bez `originalUrl` szlo obok niej bez zadnego
+// uwierzytelnienia, wiec przypadek nie mierzyl tego, co deklarowal.
+//
+// To MUSI byc trasa GP-owned I NIEOBJETA wyjatkiem. Po Story 5.8 z szesciu
+// tras `VENDOR_GP_OWNED_ROUTES` az piec jest na liscie wyjatkow (transporty
+// przegladarkowe), wiec `/vendor/training-cert/upload` jest jedyna trasa,
+// na ktorej bramka HMAC faktycznie uwierzytelnia.
+const GATED_ROUTE = "/vendor/training-cert/upload"
 import {
   VENDOR_AUTH_REPLAY_DETECTED,
   VENDOR_AUTH_SIGNATURE_INVALID,
@@ -170,7 +180,7 @@ function buildInstance(db: { raw: SharedGuardTable["raw"] }) {
       seen.sellerId = req.vendorAuth?.seller_id
       res.status(200).json({ ok: true })
     })
-    await withVendorGate(handler as any)(buildReq(header, body), res, (() => {}) as any)
+    await withVendorGate(handler as any, GATED_ROUTE)(buildReq(header, body), res, (() => {}) as any)
     return { status: captured.status, body: captured.body, logged, seen, handler }
   }
 

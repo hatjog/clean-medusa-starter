@@ -292,7 +292,7 @@ describe("training-cert upload route — real uploadHandler (review F5)", () => 
     const innerCalled = jest.fn()
     const wrapped = withVendorGate(async (_req, _res, _next) => {
       innerCalled()
-    })
+    }, "/vendor/training-cert/upload")
 
     const { res, status } = buildResMock()
     const req = { headers: {}, scope: { resolve: () => undefined } } as any
@@ -310,7 +310,7 @@ describe("training-cert upload route — real uploadHandler (review F5)", () => 
     const innerCalled = jest.fn()
     const wrapped = withVendorGate(async (_req, _res, _next) => {
       innerCalled()
-    })
+    }, "/vendor/training-cert/upload")
 
     // Build a header with a wrong secret — HMAC will not match
     const badHeader = buildVendorSignatureHeader(CERT_TEST_SELLER, "wrong-secret-xxx")
