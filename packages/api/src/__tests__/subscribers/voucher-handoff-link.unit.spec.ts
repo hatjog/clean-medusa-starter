@@ -254,8 +254,19 @@ function makeDeps(overrides: {
       },
     },
     logger,
-    env: overrides.env ?? {
-      GP_STOREFRONT_URL_BONBEAUTY: "https://dev.bonbeauty.pl",
+    // AD-25: kontekst pomiaru (`GP_INSTANCE_ID` + `GP_ENV`) jest niezmiennikiem
+    // PROCESU, nie przedmiotem tych przypadkow. Bez niego
+    // `resolveDeliveryMeasurementContext` rzuca zanim ktorykolwiek przypadek
+    // dojdzie do swojej asercji, wiec uprzaz ODTWARZALA awarie zamiast ja
+    // wykrywac (ten sam wzorzec, ktory opisano juz przy sweepie 2.5).
+    // Dlatego kontekst jest SPODEM, a `overrides.env` steruje tylko tym, co
+    // przypadek naprawde bada — np. brakiem base URL storefrontu.
+    env: {
+      GP_INSTANCE_ID: "gp-test",
+      GP_ENV: "test",
+      ...(overrides.env ?? {
+        GP_STOREFRONT_URL_BONBEAUTY: "https://dev.bonbeauty.pl",
+      }),
     },
   }
 
