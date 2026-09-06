@@ -110,6 +110,7 @@ maybe("Story 3.3 AC3 — migracja purchase_key na realnym PG", () => {
       // zapis prymitywem produkcyjnym: dwa wiersze pętli jednego zakupu
       for (const orderId of ["order_a", "order_b"]) {
         const insert = buildEventProcessedDedupeInsert({
+          market_id: "bonbeauty",
           external_id: `${PAYMENT_INTENT_ID}:${orderId}`,
           event_type: "gp.stripe.payment_intent_succeeded.v1",
           processed_at: 1_780_000_000_000,

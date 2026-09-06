@@ -226,9 +226,31 @@ export async function POST(
   }
   const paymentIntentId = identifiers.payment_intent_id
 
-  // Klucz idempotencji transportu. Zdarzenie bez `id` (poza realnym Stripe'em)
-  // dostaje klucz wyprowadzony z PI — dedupe nie może zależeć od pola opcjonalnego.
-  const deliveryEventId = stripeEvent.id ?? `stripe:pi:${paymentIntentId}`
+  // `event.id` jest JEDYNĄ tożsamością dostawy. Fallback po PaymentIntencie
+  // scalałby różne zdarzenia Stripe w jedną rezerwację i łamał kontrakt AC2.
+  // Brak identyfikatora jest błędem danych wejściowych, nie sygnałem do
+  // wymyślenia klucza z PI/sesji/trasy.
+  const submittedEventId = stripeEvent.id
+  if (submittedEventId === undefined || submittedEventId === null || submittedEventId === "") {
+    logger.warn?.("[stripe/payment-intent] zdarzenie bez event.id — odrzucono")
+    res.status(400).json({ type: "invalid", reason: "stripe_event_id_missing" })
+    return
+  }
+  if (typeof submittedEventId !== "string") {
+    logger.warn?.("[stripe/payment-intent] zdarzenie z nie-stringowym event.id — odrzucono")
+    res.status(400).json({ type: "invalid", reason: "stripe_event_id_invalid" })
+    return
+  }
+  // Nie kanonizujemy identyfikatora "po cichu": transport i `causation_id`
+  // muszą opisywać dokładnie ten sam, podpisany fakt Stripe. Trim tutaj, bez
+  // trim w kopercie, scalałby `" evt_X "` z `"evt_X"`, ale zostawiał dwa
+  // różne causation_id. Nie-string również jest błędem danych, nie wyjątkiem.
+  if (submittedEventId.trim() !== submittedEventId) {
+    logger.warn?.("[stripe/payment-intent] zdarzenie z niekanonicznym event.id — odrzucono")
+    res.status(400).json({ type: "invalid", reason: "stripe_event_id_invalid" })
+    return
+  }
+  const deliveryEventId = submittedEventId
 
   let handle: WebhookPgHandle | null
   try {
@@ -295,13 +317,10 @@ export async function POST(
       // są trwałe — ponowienie ich nie naprawi, a ślad zamieniłby się w pętlę
       // odzysku wołaną przy każdym `order.placed` tego zamówienia.
       //
-      // Kluczem śladu jest `deliveryEventId` — TA SAMA wartość, którą rezerwuje
-      // transport, razem z jej świadomym fallbackiem `stripe:pi:<pi>` dla
-      // zdarzenia bez `id`. Bramka na `stripeEvent.id` zostawiała takie
-      // zdarzenia zupełnie bez śladu, choć dedupe dawno przestał od tego pola
-      // zależeć. `paymentIntentId` NIE jest tu członem bramki: kilkadziesiąt
-      // linii wyżej wartość falszywa kończy się `400`, więc w tym punkcie
-      // z definicji jest niepusta — warunek był martwy.
+      // Kluczem śladu jest `deliveryEventId` — TA SAMA, zweryfikowana wartość,
+      // którą rezerwuje transport. `paymentIntentId` NIE jest członem klucza:
+      // event bez `id` zakończył się wcześniej `400`, więc nie wolno tu
+      // odtwarzać fallbacku po PI.
       if (retryableLinkRace) {
         try {
           const marked = await persistDeferredIssuanceMarker(handle.client, {

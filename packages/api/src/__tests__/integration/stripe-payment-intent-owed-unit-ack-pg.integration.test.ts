@@ -14,9 +14,10 @@
  * Fixture (tabele tymczasowe) jest kopią 1:1 z
  * `stripe-payment-intent-multi-order-pg.integration.test.ts` — celowo, żeby
  * kontrakt ACK był mierzony na TYM SAMYM kształcie danych co kontrakt ADR-166.
- * Wymaga `DATABASE_URL` do IZOLOWANEJ DB z tabelą `money_path_compensation_failure`
- * (route czyta rejestr kompensacji w gałęzi duplikatu). Bez `DATABASE_URL`:
- * `describe.skip` (widoczne pominięcie, nie zielone).
+ * Wymaga jawnego `GP_STORY_3_1_TEST_DATABASE_URL` do IZOLOWANEJ DB z tabelą `money_path_compensation_failure`
+ * (route czyta rejestr kompensacji w gałęzi duplikatu). Bez izolowanego
+ * `DATABASE_URL` suita kończy się błędem precondition — `skip` nie jest
+ * wynikiem bramki AC3.
  */
 import { describe, it, expect, beforeAll, afterAll, beforeEach, jest } from "@jest/globals"
 import { createHmac } from "node:crypto"
@@ -38,8 +39,55 @@ import {
   STRIPE_PATH_Y_WEBHOOK_PROVIDER,
 } from "../../lib/payment/stripe-webhook-barrier-contract"
 
-const DATABASE_URL = process.env.DATABASE_URL
-const runOrSkip = DATABASE_URL ? describe : describe.skip
+const STORY_TEST_DATABASE_URL_ENV = "GP_STORY_3_1_TEST_DATABASE_URL"
+const DATABASE_URL = process.env[STORY_TEST_DATABASE_URL_ENV]
+
+function hasTrustedStoryTestDatabaseUrl(
+  value: string | undefined,
+  configuredDatabaseUrl = process.env.DATABASE_URL
+): boolean {
+  if (!value) return false
+  if (configuredDatabaseUrl !== value) return false
+  try {
+    const url = new URL(value)
+    const databaseName = decodeURIComponent(url.pathname).replace(/^\//, "")
+    return (
+      (url.protocol === "postgres:" || url.protocol === "postgresql:") &&
+      databaseName === "gp_story_3_1_test" &&
+      ["localhost", "127.0.0.1", "::1"].includes(url.hostname)
+    )
+  } catch {
+    return false
+  }
+}
+
+const HAS_TRUSTED_STORY_TEST_DATABASE_URL = hasTrustedStoryTestDatabaseUrl(DATABASE_URL)
+
+describe("Story 3.1 AC3 — precondition PostgreSQL", () => {
+  it("wymaga jawnego URL tej story, zgodnego z DATABASE_URL; brak nie może dać PASS przez skip", () => {
+    expect(HAS_TRUSTED_STORY_TEST_DATABASE_URL).toBe(true)
+  })
+
+  it("odrzuca URL produkcyjnego hosta lub obcej bazy nawet z sufiksem _test", () => {
+    const safe = "postgres://test_runner:secret@localhost:5432/gp_story_3_1_test"
+    expect(hasTrustedStoryTestDatabaseUrl(safe, safe)).toBe(true)
+    expect(
+      hasTrustedStoryTestDatabaseUrl(
+        "postgres://prod_role:secret@prod-db.internal:5432/gp_story_3_1_test",
+        "postgres://prod_role:secret@prod-db.internal:5432/gp_story_3_1_test"
+      )
+    ).toBe(false)
+    expect(
+      hasTrustedStoryTestDatabaseUrl(
+        "postgres://test_runner:secret@localhost:5432/gp_mercur_test",
+        "postgres://test_runner:secret@localhost:5432/gp_mercur_test"
+      )
+    ).toBe(false)
+    expect(hasTrustedStoryTestDatabaseUrl(safe, "postgres://test_runner:secret@localhost:5432/other_test")).toBe(false)
+  })
+})
+
+const runWithIsolatedDatabase = HAS_TRUSTED_STORY_TEST_DATABASE_URL ? describe : describe.skip
 
 const SECRET = "whsec_3_1_owed_unit_ack"
 const EVENT_ID = "evt_3_1_owed_unit_ack"
@@ -154,7 +202,7 @@ async function settledUnits(client: PoolClient): Promise<string[]> {
   return rows.rows.map((row) => row.external_id).sort()
 }
 
-runOrSkip("Story 3.1 AC3 — kontrakt ACK vs jednostki należne na realnym PostgreSQL", () => {
+runWithIsolatedDatabase("Story 3.1 AC3 — kontrakt ACK vs jednostki należne na realnym PostgreSQL", () => {
   let pool: Pool
   let client: PoolClient
 
@@ -360,7 +408,7 @@ runOrSkip("Story 3.1 AC3 — kontrakt ACK vs jednostki należne na realnym Postg
     ).toBe("0")
   })
 
-  it("domknięcie brakującej jednostki ⇒ PASS; ponowienie ⇒ 200 zgodne z kontraktem; dedupe poziomu 2 nie dubluje A", async () => {
+  it("odrębna nowa dostawa może ręcznie domknąć brak ⇒ PASS; to NIE jest retry tego samego event.id", async () => {
     const queue: QueuedEnvelope[] = []
     const owed = buildOwedBusinessUnits({ payment_intent_id: PAYMENT_INTENT_ID, order_ids: [ORDER_A, ORDER_B] })
 
@@ -368,9 +416,11 @@ runOrSkip("Story 3.1 AC3 — kontrakt ACK vs jednostki należne na realnym Postg
     await consume(client, queue, [ORDER_A])
     expect(evaluateOwedUnitAck({ owed_units: owed, settled_units: await settledUnits(client) }).verdict).toBe("FAIL")
 
-    // Odzysk (to, co 3.2–3.6 mają zrobić automatycznie): nowa dostawa dla tego
-    // samego PI (inny event.id — np. `stripe events resend` tworzy nowy event),
-    // konsument przetwarza OBIE koperty; A jest no-opem poziomu 2, B się domyka.
+    // To celowo ODRĘBNA dostawa dla tego samego PI z innym event.id. Nie nazywamy
+    // jej Stripe resend: prawdziwy retry zachowuje event.id i jest zmierzony w
+    // poprzednim teście (obecnie ujawnia lukę 200 duplicate). Ten scenariusz
+    // pokazuje wyłącznie ręczny recovery, który Stories 3.3–3.4 mają zastąpić
+    // bezpiecznym retry tego samego eventu.
     const redelivery = await deliver(client, queue, stripeEvent(`${EVENT_ID}_redelivery`))
     expect(redelivery.statusCode).toBe(200)
     expect(queue).toHaveLength(2)

@@ -66,6 +66,7 @@
     "@medusajs/framework": "2.14.2",
     "@medusajs/icons": "2.14.2",
     "@medusajs/medusa": "2.14.2",
+    "@medusajs/payment-stripe": "2.14.2",
     "@medusajs/ui": "4.0.25",
     "@mercurjs/cli": "2.1.1",
     "@mercurjs/core": "2.1.1",

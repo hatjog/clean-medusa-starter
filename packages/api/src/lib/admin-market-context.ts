@@ -115,6 +115,19 @@ export type AdminMarketContextResult =
       requested_market_id: string
     }
 
+const verifiedAdminMarketContexts = new WeakSet<object>()
+
+/** Runtime proof that the result came from the server-side resolver. */
+export function isVerifiedAdminMarketContextResult(value: AdminMarketContextResult): boolean {
+  return typeof value === "object" && value !== null && verifiedAdminMarketContexts.has(value)
+}
+
+function issueAdminMarketContext<T extends AdminMarketContextResult>(result: T): T {
+  const verified = Object.freeze(result)
+  verifiedAdminMarketContexts.add(verified)
+  return verified
+}
+
 /**
  * resolveAdminMarketContext — server-side market binding for admin routes.
  *
@@ -138,20 +151,20 @@ export async function resolveAdminMarketContext(
 ): Promise<AdminMarketContextResult> {
   const ctx = getAuthContext(req)
   if (!ctx?.actor_id) {
-    return {
+    return issueAdminMarketContext({
       ok: false,
       status: 401,
       code: "UNAUTHORIZED",
       message: "Valid admin session required",
-    }
+    })
   }
   if (ctx.actor_type !== undefined && ctx.actor_type !== "user") {
-    return {
+    return issueAdminMarketContext({
       ok: false,
       status: 401,
       code: "UNAUTHORIZED",
       message: "Admin actor_type required (actor_type=user); other actor types are rejected",
-    }
+    })
   }
 
   const headerMarketId = readMarketIdHeader(req)
@@ -178,25 +191,25 @@ export async function resolveAdminMarketContext(
   // ok:true with market_id=null so the caller can decide what to do
   // (e.g. cross-market platform-wide ops for super-admins).
   if (!requestedMarketId) {
-    return {
+    return issueAdminMarketContext({
       ok: true,
       market_id: null,
       actor_id: ctx.actor_id,
       actor_type: "user",
       is_super_admin: isSuperAdmin,
       source: "none",
-    }
+    })
   }
 
   if (isSuperAdmin) {
-    return {
+    return issueAdminMarketContext({
       ok: true,
       market_id: requestedMarketId,
       actor_id: ctx.actor_id,
       actor_type: "user",
       is_super_admin: true,
       source,
-    }
+    })
   }
 
   // Non-super-admin — require an admin_market_grants row.
@@ -204,23 +217,23 @@ export async function resolveAdminMarketContext(
     ? await hasAdminMarketGrant(db, ctx.actor_id, requestedMarketId)
     : false
   if (!hasGrant) {
-    return {
+    return issueAdminMarketContext({
       ok: false,
       status: 403,
       code: "MARKET_FORBIDDEN",
       message: `Admin actor does not have access to market ${requestedMarketId}`,
       requested_market_id: requestedMarketId,
-    }
+    })
   }
 
-  return {
+  return issueAdminMarketContext({
     ok: true,
     market_id: requestedMarketId,
     actor_id: ctx.actor_id,
     actor_type: "user",
     is_super_admin: false,
     source,
-  }
+  })
 }
 
 /**

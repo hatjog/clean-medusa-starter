@@ -193,8 +193,14 @@ export async function liveIssueEntitlementsWithinTx(
     )
   }
 
+  const dedupeMarketId = readString(scope.market_id)
+  if (!dedupeMarketId) {
+    throw new Error("liveIssueEntitlementsWithinTx: market_id required before business dedupe")
+  }
+
   // ── (i) EVENT-LEVEL dedupe (DEC-5 pkt 3.i) — PIERWSZY krok transakcji ──────
   const dedupeInsert = buildEventProcessedDedupeInsert({
+    market_id: dedupeMarketId,
     external_id: buildPaymentIntentOrderExternalId(
       payload.payment_intent_id,
       payload.order_id
