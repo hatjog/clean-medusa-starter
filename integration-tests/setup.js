@@ -51,8 +51,9 @@ const { MetadataStorage } = require("@medusajs/framework/mikro-orm/core")
  *
  * Reguła warstwy B: baza docelowa musi WYGLĄDAĆ NA TESTOWĄ (człon `test`
  * w nazwie), być bazą utrzymaniową (`postgres` — bez niej nie da się założyć
- * izolowanej bazy testowej), być wymieniona w `GP_TEST_DATABASE_NAMES` albo
- * przebieg musi nieść nazwę jawnie dopuszczoną w `GP_TEST_DATABASE_NAMES`.
+ * izolowanej bazy testowej) albo mieć wąski, rozpoznawalny wzorzec bazy
+ * jednorazowej Medusy. Zmienna środowiskowa może potwierdzić wyłącznie nazwę,
+ * która sama niesie oddzielny człon `test`; nie może otworzyć dowolnej bazy.
  * Wszystko inne (w tym `gp_mercur`, `gp_core`, `gp_portal`) jest odmową Z NAZWANĄ BAZĄ.
  *
  * Obie warstwy są TWARDE (rzucają), bo cichy przebieg na złej bazie kasuje dane
@@ -63,13 +64,14 @@ const TEST_TYPE = process.env.TEST_TYPE ?? ""
 const requiresIsolatedDb = /-pg$/.test(TEST_TYPE) || TEST_TYPE === "stripe-multi-order"
 const DEVELOPMENT_DATABASES = new Set(["gp_mercur", "gp_core", "gp_portal"])
 const MAINTENANCE_DATABASES = new Set(["postgres", "template1"])
+const TEST_DATABASE_NAME_TOKEN = /(^|[_.-])test([_.-]|$)/i
 
-/** Nazwy dopuszczone jawnie przez środowisko (np. baza szablonowa CI). */
+/** Jawne wyjątki zachowują wyłącznie nazwy, które same deklarują cel testowy. */
 function extraAllowedDatabaseNames() {
 	return (process.env.GP_TEST_DATABASE_NAMES ?? "")
 		.split(",")
 		.map((entry) => entry.trim())
-		.filter(Boolean)
+		.filter((entry) => TEST_DATABASE_NAME_TOKEN.test(entry))
 }
 
 /**
@@ -80,9 +82,8 @@ function extraAllowedDatabaseNames() {
  */
 function looksLikeTestDatabase(dbName) {
 	return (
-		/(^|[_.-])test([_.-]|$)/i.test(dbName) ||
-		EPHEMERAL_MEDUSA_DB.test(dbName) ||
-		extraAllowedDatabaseNames().includes(dbName)
+		TEST_DATABASE_NAME_TOKEN.test(dbName) ||
+		EPHEMERAL_MEDUSA_DB.test(dbName)
 	)
 }
 
@@ -153,8 +154,7 @@ if (requiresIsolatedDb) {
 	if (!isTestDb) {
 		throw new Error(
 			`[test-db-guard] TEST_TYPE=${TEST_TYPE} ZAKLADA I KASUJE tabele, a DATABASE_URL wskazuje baze ` +
-				`'${resolvedDatabaseTarget.dbName}', ktora nie wyglada na testowa (oczekiwany sufiks '_test' albo wpis ` +
-				`w GP_TEST_DATABASE_NAMES).\n` +
+				`'${resolvedDatabaseTarget.dbName}', ktora nie wyglada na testowa (oczekiwany sufiks '_test').\n` +
 				`Uruchomienie na tej bazie skasowaloby z niej tabele i dane — 2026-08-09 dokladnie tak ` +
 				`zniknely 4 tabele i zawartosc 'entitlement_instance' oraz 'seller' z bazy deweloperskiej.\n` +
 				`Wskaz izolowana baze: DATABASE_URL=postgres://.../<nazwa>_test`
@@ -164,9 +164,9 @@ if (requiresIsolatedDb) {
 
 // ── WARSTWA B ────────────────────────────────────────────────────────────────
 function assertConnectionTargetIsIsolated(dbName, host) {
-	// Wyjatki sa sprawdzane DOPIERO po zakazie baz deweloperskich. W przeciwnym
-	// razie GP_TEST_DATABASE_NAMES=gp_mercur otwieraloby bezposrednie polaczenie
-	// mimo poprawnego, izolowanego DATABASE_URL uruchamiajacego suite.
+	// Zakaz baz deweloperskich pozostaje jawny, a allowlista może potwierdzić
+	// wyłącznie nazwę z oddzielnym członem `test`. W przeciwnym razie nazwa
+	// produkcyjna w środowisku otwierałaby połączenie mimo bezpiecznego startu suity.
 	if (DEVELOPMENT_DATABASES.has(dbName)) {
 		throw new Error(
 			`[test-db-guard] SUITA TESTOWA PROBUJE SIE POLACZYC Z DEWELOPERSKA BAZA '${dbName}' (host: ${host || "?"}). Odmowa przed polaczeniem.`
@@ -185,7 +185,7 @@ function assertConnectionTargetIsIsolated(dbName, host) {
 			`danych z bazy deweloperskiej przez suity biegnace pod profilem, ktory tego nie deklarowal.\n` +
 			`Testy dotykajace Postgresa maja brac adres z DEDYKOWANEJ zmiennej (wzorzec: ` +
 			`GP_CORE_RLS_TEST_DATABASE_URL) i POMIJAC sie, gdy jej nie ma — nigdy z fallbacku na DATABASE_URL.\n` +
-			`Wskaz izolowana baze (czlon 'test' w nazwie) albo dopisz nazwe do GP_TEST_DATABASE_NAMES.`
+			`Wskaz izolowana baze z czlonem 'test' w nazwie albo jawnie potwierdz taka nazwe w GP_TEST_DATABASE_NAMES.`
 	)
 }
 

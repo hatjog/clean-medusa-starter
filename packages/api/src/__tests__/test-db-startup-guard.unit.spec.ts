@@ -21,13 +21,14 @@ function runBootstrap(options: {
   envFileDatabaseUrl?: string
   allowedDatabaseNames?: string
   directConnectionUrl?: string
+  testType?: string
 }): BootstrapResult {
   const cwd = mkdtempSync(join(tmpdir(), "gp-test-db-startup-guard-"))
   const fixtureDirectory = mkdtempSync(join(BACKEND_ROOT, ".test-db-startup-guard-"))
   const fixturePath = join(fixtureDirectory, "startup-guard.fixture.test.js")
   const env: NodeJS.ProcessEnv = {
     ...process.env,
-    TEST_TYPE: "profile-name-cannot-authorize-database",
+    TEST_TYPE: options.testType ?? "profile-name-cannot-authorize-database",
   }
 
   delete env.DATABASE_URL
@@ -159,12 +160,52 @@ describe("test database startup guard", () => {
     expect(result.output).toContain(FIXTURE_EXECUTED)
   })
 
+  it("permits an explicitly named test database for a destructive profile", () => {
+    const result = runBootstrap({
+      databaseUrl: "postgres://127.0.0.1:55432/gp_mercur-smoke-test",
+      allowedDatabaseNames: "gp_mercur-smoke-test",
+      testType: "destructive-pg",
+    })
+
+    expect(result.status).toBe(0)
+    expect(result.signal).toBeNull()
+    expect(result.output).toContain(FIXTURE_EXECUTED)
+  })
+
+  it("refuses a non-suffix test database for a destructive profile without the explicit safe allowlist", () => {
+    const result = runBootstrap({
+      databaseUrl: "postgres://127.0.0.1:55432/gp_mercur-smoke-test",
+      testType: "destructive-pg",
+    })
+
+    expectBootstrapRefusal(result)
+    expect(result.output).toContain("gp_mercur-smoke-test")
+  })
+
   it("rejects a developer target requested after startup even when the allowlist names it", () => {
     const syntheticPassword = Buffer.from("c2VrcmV0", "base64").toString("utf8")
     const directConnectionUrl = `postgres://test-user:${syntheticPassword}@127.0.0.1:1/gp_mercur`
     const result = runBootstrap({
       databaseUrl: "postgres://127.0.0.1:55432/gp_mercur_test",
       allowedDatabaseNames: "gp_mercur",
+      directConnectionUrl,
+    })
+
+    expect(result.status).toBe(0)
+    expect(result.signal).toBeNull()
+    expect(result.output).toContain(FIXTURE_EXECUTED)
+    expect(result.output).toContain(DIRECT_CONNECTION_BLOCKED)
+    expect(result.output).not.toContain(ORIGINAL_CONNECT_REACHED)
+    expect(result.output).not.toContain(syntheticPassword)
+    expect(result.output).not.toContain(directConnectionUrl)
+  })
+
+  it("rejects a non-test target requested after startup even when an environment allowlist names it", () => {
+    const syntheticPassword = Buffer.from("c2VrcmV0", "base64").toString("utf8")
+    const directConnectionUrl = `postgres://test-user:${syntheticPassword}@127.0.0.1:1/gp_mercur_prod`
+    const result = runBootstrap({
+      databaseUrl: "postgres://127.0.0.1:55432/gp_mercur_test",
+      allowedDatabaseNames: "gp_mercur_prod",
       directConnectionUrl,
     })
 
@@ -192,7 +233,7 @@ describe("test database startup guard", () => {
 
     expectBootstrapRefusal(result)
     expect(result.output).toContain(expectedMessage)
-    if (databaseUrl) {
+    if (databaseUrl?.trim()) {
       expect(result.output).not.toContain(databaseUrl)
     }
   })
