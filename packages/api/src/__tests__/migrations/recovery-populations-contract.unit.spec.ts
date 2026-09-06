@@ -22,13 +22,17 @@ import { RECOVERY_POPULATION_TYPES } from "../../lib/recovery/recovery-action-co
 import {
   classifyHistoricalCompensationRow,
   COMPENSATION_FAILURE_TABLE,
+  COMPENSATION_BACKFILL_PROVENANCE_SOURCE,
   DEFERRED_ISSUANCE_TRACE_TABLE,
   DLQ_ENTRY_TABLE,
   INSTANCE_ID_BACKFILL_SOURCE,
+  isTrustworthyOwner,
   isTrustworthyScopeValue,
   LEGACY_COMPENSATION_STATES,
   RECOVERY_MIGRATION_PLAN,
+  materializeCompensationBackfill,
   type CarrierPlan,
+  type VerifiedHistoricalCompensationMetadata,
 } from "../../lib/recovery/recovery-migration-plan"
 
 class RecordingMigration extends Migration20260818090000MoneyPathCompensationFailureTable {
@@ -109,65 +113,135 @@ describe("NOT NULL dla nowych danych i brak default poza licznikami", () => {
     }
   })
 
-  it("SET NOT NULL na istniejącej tabeli ma warunek wstępny zero NULL-i po backfillu", () => {
+  it("SET NOT NULL na istniejącej tabeli ma warunek wstępny zero NULL-i po atomowym przeniesieniu do kwarantanny", () => {
     const step = planFor("compensation_failure").up.find((s) => s.id === "cf-set-not-null")!
-    expect(step.sql_shape).toMatch(/PRECONDITION: count\(\*\) WHERE instance_id IS NULL = 0/)
+    const backfill = planFor("compensation_failure").up.find((s) => s.id === "cf-backfill")!
+    expect(backfill.sql_shape).toMatch(/INSERT INTO money_path_compensation_failure_backfill_quarantine/)
+    expect(backfill.sql_shape).toMatch(/DELETE FROM money_path_compensation_failure/)
+    expect(backfill.sql_shape).toMatch(/BEGIN;.*COMMIT;/)
+    expect(step.sql_shape).toMatch(/PRECONDITION: count\(\*\) WHERE instance_id IS NULL OR owner_id IS NULL OR deadline IS NULL/)
   })
 })
 
 describe("backfill bez wartości zastępczej", () => {
-  const mapping = new Map([["bonbeauty", "gp-prod-eu1"], ["bongarden", "gp-prod-eu1"]])
+  const instanceByMarket = new Map([["bonbeauty", "gp-prod-eu1"], ["bongarden", "gp-prod-eu1"]])
+  const certified = new Map<string, VerifiedHistoricalCompensationMetadata>([
+    [
+      "f1",
+      {
+        owner: { owner_type: "operator_role", owner_id: "compensation-ops" },
+        deadline: "2026-08-20T12:00:00Z",
+        legacy_resolver: null,
+      },
+    ],
+    [
+      "f2",
+      {
+        owner: { owner_type: "operator_user", owner_id: "usr_1" },
+        deadline: "2026-08-19T12:00:00Z",
+        legacy_resolver: { actor_type: "user", actor_id: "usr_1", auth_identity_id: null, session_source: "medusa_admin_session" },
+      },
+    ],
+  ])
 
-  it("wiersz `open` ze znanym rynkiem → migrate/open, proweniencja backfilled_verified z nazwanym źródłem", () => {
+  it("wiersz `open` z kompletem certyfikowanych faktów → migrate/open, bez syntetycznego ownera ani deadline", () => {
     const decision = classifyHistoricalCompensationRow(
       { failure_id: "f1", market_id: "bonbeauty", resolution_state: "open", resolved_by: null, resolved_at: null },
-      mapping
+      instanceByMarket,
+      certified
     )
     expect(decision).toEqual({
       decision: "migrate",
       instance_id: "gp-prod-eu1",
       state: "open",
+      owner: { owner_type: "operator_role", owner_id: "compensation-ops" },
+      deadline: "2026-08-20T12:00:00Z",
       provenance: { kind: "backfilled_verified", source: INSTANCE_ID_BACKFILL_SOURCE },
-      resolution_evidence_kind: null,
+      resolution_evidence: null,
     })
   })
 
-  it("wiersz `resolved_manually` z resolved_by/at → closed_legacy_unevidenced z evidence legacy (nie wymyślonym)", () => {
+  it("wiersz `resolved_manually` z certyfikowanym aktorem → pełne evidence legacy zgodne ze schemą", () => {
     const decision = classifyHistoricalCompensationRow(
       { failure_id: "f2", market_id: "bongarden", resolution_state: "resolved_manually", resolved_by: "usr_1", resolved_at: "2026-08-19T12:04:55Z" },
-      mapping
+      instanceByMarket,
+      certified
     )
-    expect(decision).toMatchObject({ decision: "migrate", state: "closed_legacy_unevidenced", resolution_evidence_kind: "legacy_manual_resolution" })
+    expect(decision).toMatchObject({
+      decision: "migrate",
+      state: "closed_legacy_unevidenced",
+      resolution_evidence: {
+        kind: "legacy_manual_resolution",
+        recorded_at: "2026-08-19T12:04:55Z",
+        recorded_by: { actor_type: "user", actor_id: "usr_1", auth_identity_id: null, session_source: "medusa_admin_session" },
+      },
+    })
   })
 
   it("wiersz `resolved_manually` BEZ resolved_by → kwarantanna (nie ma nawet dowodu legacy)", () => {
     const decision = classifyHistoricalCompensationRow(
       { failure_id: "f3", market_id: "bongarden", resolution_state: "resolved_manually", resolved_by: null, resolved_at: null },
-      mapping
+      instanceByMarket,
+      certified
     )
     expect(decision.decision).toBe("quarantine")
   })
 
-  it("rynek bez odwzorowania → kwarantanna, NIE wymyślony instance_id", () => {
+  it("rynek bez zweryfikowanego mapowania → kwarantanna, NIE wymyślony instance_id", () => {
     const decision = classifyHistoricalCompensationRow(
       { failure_id: "f4", market_id: "market-from-2025", resolution_state: "open", resolved_by: null, resolved_at: null },
-      mapping
+      instanceByMarket,
+      certified
     )
-    expect(decision).toEqual({ decision: "quarantine", reason: expect.stringContaining("market-from-2025") })
-    expect(JSON.stringify(decision)).not.toMatch(/gp-prod-eu1/)
+    expect(decision).toEqual({ decision: "quarantine", reason: expect.stringContaining("f4") })
+    expect(JSON.stringify(decision)).not.toMatch(/ops-recovery|24 hours|gp-prod-eu1/)
   })
 
-  it("fałszywy backfill: odwzorowanie na wartość zastępczą (`default`) jest odrzucone", () => {
-    const poisoned = new Map([["bonbeauty", "default"]])
+  it("brak certyfikowanego ownera/deadline → kwarantanna, NIE `ops-recovery` ani created_at + 24h", () => {
+    const decision = classifyHistoricalCompensationRow(
+      { failure_id: "missing-owner-deadline", market_id: "bonbeauty", resolution_state: "open", resolved_by: null, resolved_at: null },
+      instanceByMarket,
+      certified
+    )
+    expect(decision).toEqual({ decision: "quarantine", reason: expect.stringContaining("missing-owner-deadline") })
+    expect(JSON.stringify(decision)).not.toMatch(/ops-recovery|24 hours|gp-prod-eu1/)
+  })
+
+  it("fałszywy backfill: placeholder scope lub owner z dowolną wielkością liter jest odrzucony", () => {
+    const poisoned = new Map<string, VerifiedHistoricalCompensationMetadata>([["f5", { owner: { owner_type: "operator_role", owner_id: "UNASSIGNED" }, deadline: "2026-08-20T12:00:00Z", legacy_resolver: null }]])
+    const poisonedInstanceByMarket = new Map([["bonbeauty", "Default"]])
     const decision = classifyHistoricalCompensationRow(
       { failure_id: "f5", market_id: "bonbeauty", resolution_state: "open", resolved_by: null, resolved_at: null },
+      poisonedInstanceByMarket,
       poisoned
     )
     expect(decision.decision).toBe("quarantine")
-    for (const v of ["unknown", "default", "null", "none", "n/a", "TBD", " todo ", ""]) {
+    for (const v of ["unknown", "UNKNOWN", "default", "Default", "null", "none", "n/a", "TBD", " todo ", "UNASSIGNED", ""]) {
       expect({ v, ok: isTrustworthyScopeValue(v) }).toEqual({ v, ok: false })
     }
+    expect(isTrustworthyOwner({ owner_type: "operator_role", owner_id: " Default " })).toBe(false)
     expect(isTrustworthyScopeValue("gp-prod-eu1")).toBe(true)
+  })
+
+  it("wiersz bez metadanych jest atomowo przeniesiony do kwarantanny przed SET NOT NULL", () => {
+    const result = materializeCompensationBackfill(
+      [
+        { failure_id: "f1", market_id: "bonbeauty", resolution_state: "open", resolved_by: null, resolved_at: null },
+        { failure_id: "missing-owner-deadline", market_id: "bonbeauty", resolution_state: "open", resolved_by: null, resolved_at: null },
+      ],
+      instanceByMarket,
+      certified
+    )
+    expect(result.migrated).toHaveLength(1)
+    expect(result.quarantine).toHaveLength(1)
+    expect(result.source_rows_after.map((row) => row.failure_id)).toEqual(["f1"])
+    expect(result.source_rows_after[0]).toMatchObject({
+      instance_id: "gp-prod-eu1",
+      owner: { owner_type: "operator_role", owner_id: "compensation-ops" },
+      deadline: "2026-08-20T12:00:00Z",
+      resolution_evidence: null,
+    })
+    expect(JSON.stringify(result.migrated)).not.toMatch(/ops-recovery|created_at \+ interval '24 hours'/)
   })
 
   it("reguła backfillu nie ma pola default_value; brak odwzorowania = quarantine", () => {
@@ -242,6 +316,7 @@ describe("linkowalność planu z ADR-221", () => {
       expect({ table, present: text.includes(table) }).toEqual({ table, present: true })
     }
     expect(text).toContain(INSTANCE_ID_BACKFILL_SOURCE)
+    expect(text).toContain(COMPENSATION_BACKFILL_PROVENANCE_SOURCE)
     expect(text).not.toMatch(/\*\*Status:\*\*\s*Rejected/)
   })
 })
