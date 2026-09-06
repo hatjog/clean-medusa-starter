@@ -135,7 +135,7 @@ type Trace = {
 }
 
 async function collectUpSql(
-  MigrationClass: { prototype: unknown },
+  MigrationClass: { prototype: object },
   sessionLocalTables = false
 ): Promise<string[]> {
   const sqls: string[] = []
