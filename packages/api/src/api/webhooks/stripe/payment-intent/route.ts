@@ -230,12 +230,27 @@ export async function POST(
   // scalałby różne zdarzenia Stripe w jedną rezerwację i łamał kontrakt AC2.
   // Brak identyfikatora jest błędem danych wejściowych, nie sygnałem do
   // wymyślenia klucza z PI/sesji/trasy.
-  const deliveryEventId = stripeEvent.id?.trim()
-  if (!deliveryEventId) {
+  const submittedEventId = stripeEvent.id
+  if (submittedEventId === undefined || submittedEventId === null || submittedEventId === "") {
     logger.warn?.("[stripe/payment-intent] zdarzenie bez event.id — odrzucono")
     res.status(400).json({ type: "invalid", reason: "stripe_event_id_missing" })
     return
   }
+  if (typeof submittedEventId !== "string") {
+    logger.warn?.("[stripe/payment-intent] zdarzenie z nie-stringowym event.id — odrzucono")
+    res.status(400).json({ type: "invalid", reason: "stripe_event_id_invalid" })
+    return
+  }
+  // Nie kanonizujemy identyfikatora "po cichu": transport i `causation_id`
+  // muszą opisywać dokładnie ten sam, podpisany fakt Stripe. Trim tutaj, bez
+  // trim w kopercie, scalałby `" evt_X "` z `"evt_X"`, ale zostawiał dwa
+  // różne causation_id. Nie-string również jest błędem danych, nie wyjątkiem.
+  if (submittedEventId.trim() !== submittedEventId) {
+    logger.warn?.("[stripe/payment-intent] zdarzenie z niekanonicznym event.id — odrzucono")
+    res.status(400).json({ type: "invalid", reason: "stripe_event_id_invalid" })
+    return
+  }
+  const deliveryEventId = submittedEventId
 
   let handle: WebhookPgHandle | null
   try {

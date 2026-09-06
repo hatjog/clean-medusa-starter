@@ -56,7 +56,7 @@ export const STRIPE_ROUTE_INVENTORY: ReadonlyArray<StripeRouteInventoryEntry> = 
     path: "/hooks/payment/stripe",
     owner: "medusa-native",
     status: "live",
-    signature_verifier: "@medusajs/payment-stripe (constructEvent w subscriberze, PO odpowiedzi 200)",
+    signature_verifier: "@medusajs/payment-stripe (webhooks.constructEvent w providerze, PO odpowiedzi 200)",
     barrier: { table: WEBHOOK_DELIVERY_BARRIER_TABLE, provider: STRIPE_NATIVE_WEBHOOK_PROVIDER },
     consumer_event: "payment.captured",
     terminal_state: "ACTIVE",
@@ -135,6 +135,7 @@ function stripeMatchers(): string[] {
 
 type RouteRepositorySources = {
   native_route: string
+  native_stripe_provider: string
   path_y_route: string
   path_y_transport: string
   native_workflow: string
@@ -152,6 +153,10 @@ function readRouteRepositorySources(): RouteRepositorySources {
   return {
     native_route: readFileSync(
       path.join(resolveNativeMedusaPackageDir(), NATIVE_HOOK_ROUTE_RELPATH),
+      "utf8"
+    ),
+    native_stripe_provider: readFileSync(
+      require.resolve("@medusajs/payment-stripe/dist/core/stripe-base"),
       "utf8"
     ),
     path_y_route: readFileSync(path.join(__dirname, "../payment-intent/route.ts"), "utf8"),
@@ -189,6 +194,13 @@ function observeRouteInventory(sources: RouteRepositorySources): StripeRouteInve
   const nativeRouteObserved =
     sources.native_route.includes("PaymentWebhookEvents.WebhookReceived") &&
     sources.native_route.includes("sendStatus(200)")
+  const nativeSignatureObserved =
+    sources.native_stripe_provider.includes("constructWebhookEvent") &&
+    sources.native_stripe_provider.includes("webhooks.constructEvent(") &&
+    sources.native_stripe_provider.includes('data.headers["stripe-signature"]')
+  const pathYSubscriberEvents = Array.isArray(pathYSubscriberConfig.event)
+    ? pathYSubscriberConfig.event
+    : [pathYSubscriberConfig.event]
   const pathYSignatureObserved =
     sources.path_y_route.includes("verifyStripeSignature(") &&
     /res\.status\(400\)\.json\(\{ type: "invalid_signature"/m.test(sources.path_y_route)
@@ -200,8 +212,8 @@ function observeRouteInventory(sources: RouteRepositorySources): StripeRouteInve
       path: "/hooks/payment/stripe",
       owner: nativeRouteObserved ? "medusa-native" : "gp",
       status: nativeRouteObserved ? "live" : "retired",
-      signature_verifier: nativeRouteObserved
-        ? "@medusajs/payment-stripe (constructEvent w subscriberze, PO odpowiedzi 200)"
+      signature_verifier: nativeRouteObserved && nativeSignatureObserved
+        ? "@medusajs/payment-stripe (webhooks.constructEvent w providerze, PO odpowiedzi 200)"
         : "niezweryfikowany native hook",
       barrier: nativeBarrierObserved
         ? {
@@ -230,7 +242,9 @@ function observeRouteInventory(sources: RouteRepositorySources): StripeRouteInve
       barrier: pathYBarrierObserved
         ? { table: WEBHOOK_DELIVERY_BARRIER_TABLE, provider: STRIPE_PATH_Y_WEBHOOK_PROVIDER }
         : null,
-      consumer_event: pathYSubscriberConfig.event ?? null,
+      consumer_event: pathYSubscriberEvents.includes(PAYMENT_INTENT_SUCCEEDED_EVENT)
+        ? PAYMENT_INTENT_SUCCEEDED_EVENT
+        : null,
       terminal_state:
         sources.path_y_issue.includes("EntitlementInstanceState.ISSUED") &&
         !sources.path_y_issue.includes("state: EntitlementInstanceState.ACTIVE")
@@ -394,6 +408,22 @@ describe("Story 3.1 AC1 — kontrola negatywna z fixture'em źródeł repo", () 
     const diffs = diffRouteInventory(STRIPE_ROUTE_INVENTORY, observed)
     expect(diffs.some((diff) => /^\/hooks\/payment\/stripe\.owner:/.test(diff))).toBe(true)
     expect(diffs.some((diff) => /^\/hooks\/payment\/stripe\.status:/.test(diff))).toBe(true)
+  })
+
+  it("mutant bez constructEvent providera natywnego ⇒ obserwacja rozjeżdża signature_verifier", () => {
+    const sources = readRouteRepositorySources()
+    const observed = observeRouteInventory({
+      ...sources,
+      native_stripe_provider: sources.native_stripe_provider.replace(
+        "webhooks.constructEvent(",
+        "webhooks.constructEventRemoved("
+      ),
+    })
+    expect(
+      diffRouteInventory(STRIPE_ROUTE_INVENTORY, observed).some((diff) =>
+        /^\/hooks\/payment\/stripe\.signature_verifier:/.test(diff)
+      )
+    ).toBe(true)
   })
 })
 
