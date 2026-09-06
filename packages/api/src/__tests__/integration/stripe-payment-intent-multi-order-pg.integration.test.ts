@@ -447,6 +447,7 @@ runOrSkip("F2 — multi-seller na realnej ścieżce PostgreSQL", () => {
       expect(new Set(correlated.rows.map((row) => row.purchase_key))).toEqual(
         new Set([PAYMENT_INTENT_ID])
       )
+      expect(SESSION_ID).not.toBe(PAYMENT_INTENT_ID)
 
       // Oba zamówienia realnie wystawione — seller B nie został bez vouchera.
       expect(
@@ -487,6 +488,27 @@ runOrSkip("F2 — multi-seller na realnej ścieżce PostgreSQL", () => {
     expect(delivery.res.statusCode).toBe(400)
     expect(delivery.res.body.type).toBe("unresolved_link")
     expect(delivery.res.body.reason).toBe("link_unresolved")
+    expect(delivery.emitted).toHaveLength(0)
+    expect(
+      Number((await client.query(`SELECT COUNT(*) AS count FROM entitlement_instance`)).rows[0].count)
+    ).toBe(0)
+  })
+
+  it("dwa rynki w jednym linku → link_ambiguous bez emisji i bez entitlementu", async () => {
+    await client.query(
+      `UPDATE sales_channel
+          SET metadata = $1::jsonb
+        WHERE id = 'sc_seller_b'`,
+      [JSON.stringify({ gp_market_id: "testmarketb" })]
+    )
+
+    const delivery = await postThroughRealPath(client, stripeEvent("evt_f2_ambiguous_market"))
+
+    expect(delivery.res.statusCode).toBe(400)
+    expect(delivery.res.body).toMatchObject({
+      type: "unresolved_link",
+      reason: "link_ambiguous",
+    })
     expect(delivery.emitted).toHaveLength(0)
     expect(
       Number((await client.query(`SELECT COUNT(*) AS count FROM entitlement_instance`)).rows[0].count)
