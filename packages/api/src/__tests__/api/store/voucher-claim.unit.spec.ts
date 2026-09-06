@@ -31,6 +31,7 @@ import {
 } from "../../../api/store/vouchers/[code]/claim/helpers"
 import { Modules } from "@medusajs/framework/utils"
 import { VoucherService, type VoucherWithEvents } from "../../../modules/voucher"
+import { marketContextStorage } from "../../../lib/market-context"
 
 // ---------------------------------------------------------------------------
 // VoucherService mock factory
@@ -39,6 +40,10 @@ import { VoucherService, type VoucherWithEvents } from "../../../modules/voucher
 type MockVoucherService = {
   getByCode: jest.Mock | ((code: string) => Promise<VoucherWithEvents | null>)
   claim: jest.Mock | ((code: string, opts?: Record<string, unknown>) => Promise<unknown>)
+}
+
+async function runInTestMarket<T>(work: () => Promise<T>): Promise<T> {
+  return marketContextStorage.run({ market_id: "market-test" }, work)
 }
 
 function makeMockVoucherService(defaults?: {
@@ -562,10 +567,10 @@ describe("POST /store/vouchers/:code/claim", () => {
     }
 
     const res1 = makeRes()
-    await POST(
+    await runInTestMarket(() => POST(
       makeReq(IDLE_VOUCHER.code, body, "127.0.0.1", service, scope) as never,
       res1 as never
-    )
+    ))
     expect(res1._status).toBe(200)
     expect(pg.claimUpdates).toBe(1)
 
@@ -573,10 +578,10 @@ describe("POST /store/vouchers/:code/claim", () => {
     _clearAuditLog()
 
     const res2 = makeRes()
-    await POST(
+    await runInTestMarket(() => POST(
       makeReq(IDLE_VOUCHER.code, body, "127.0.0.2", service, scope) as never,
       res2 as never
-    )
+    ))
 
     expect(res2._status).toBe(200)
     // LOW-3 fix: durable replay now adds idempotent:true to match in-memory contract.
@@ -597,13 +602,13 @@ describe("POST /store/vouchers/:code/claim", () => {
       },
     }
 
-    await POST(
+    await runInTestMarket(() => POST(
       makeReq(IDLE_VOUCHER.code, body, "127.0.0.1", service, scope) as never,
       makeRes() as never
-    )
+    ))
 
     const res = makeRes()
-    await POST(
+    await runInTestMarket(() => POST(
       makeReq(
         IDLE_VOUCHER.code,
         { ...body, recipient_session: "tampered-session" },
@@ -612,7 +617,7 @@ describe("POST /store/vouchers/:code/claim", () => {
         scope
       ) as never,
       res as never
-    )
+    ))
 
     expect(res._status).toBe(409)
     expect((res._body as Record<string, unknown>).type).toBe("replay_mismatch")
@@ -716,10 +721,10 @@ describe("POST /store/vouchers/:code/claim", () => {
 
     // First claim — succeeds, binding stored.
     const res1 = makeRes()
-    await POST(
+    await runInTestMarket(() => POST(
       makeReq(IDLE_VOUCHER.code, body, "127.0.0.1", service, scope) as never,
       res1 as never
-    )
+    ))
     expect(res1._status).toBe(200)
     expect(pg.claimUpdates).toBe(1)
 
@@ -737,10 +742,10 @@ describe("POST /store/vouchers/:code/claim", () => {
     // LOW-2 fix: reserveClaimBinding detects expired conflict, refreshes in-place,
     // and treats this as a new (inserted) binding — re-runs mutation.
     const res2 = makeRes()
-    await POST(
+    await runInTestMarket(() => POST(
       makeReq(IDLE_VOUCHER.code, body, "127.0.0.2", service, scope) as never,
       res2 as never
-    )
+    ))
     expect(res2._status).toBe(200)
     // Must NOT return idempotent:true (this is a fresh claim after TTL drift, not a replay).
     expect((res2._body as Record<string, unknown>).idempotent).toBeUndefined()
@@ -760,20 +765,20 @@ describe("POST /store/vouchers/:code/claim", () => {
 
     // First claim.
     const res1 = makeRes()
-    await POST(
+    await runInTestMarket(() => POST(
       makeReq(IDLE_VOUCHER.code, body, "127.0.0.1", service, scope) as never,
       res1 as never
-    )
+    ))
     expect(res1._status).toBe(200)
 
     // Durable replay (clear in-memory binding to force PG path).
     _clearBindingStore()
 
     const res2 = makeRes()
-    await POST(
+    await runInTestMarket(() => POST(
       makeReq(IDLE_VOUCHER.code, body, "127.0.0.2", service, scope) as never,
       res2 as never
-    )
+    ))
     expect(res2._status).toBe(200)
     // LOW-3 fix: durable replay must include idempotent:true (contract parity with fallback).
     expect((res2._body as Record<string, unknown>).idempotent).toBe(true)

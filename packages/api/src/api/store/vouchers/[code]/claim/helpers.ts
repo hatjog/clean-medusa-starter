@@ -279,7 +279,7 @@ export async function reserveClaimBinding(
   // The expired row has no live claimant, so overwriting it is safe: any
   // parallel request for the same key also hits the conflict branch and will
   // block on the SELECT FOR UPDATE above until we COMMIT.
-  await client.query(
+  const refreshed = await client.query(
     `UPDATE voucher_claim_binding
         SET binding_hash  = $2,
             code          = $3,
