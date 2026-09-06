@@ -1,14 +1,5 @@
 const { MetadataStorage } = require("@medusajs/framework/mikro-orm/core")
 
-if (process.env.DATABASE_URL) {
-	const databaseUrl = new URL(process.env.DATABASE_URL)
-
-	process.env.DB_HOST ||= databaseUrl.hostname
-	process.env.DB_PORT ||= databaseUrl.port
-	process.env.DB_USERNAME ||= decodeURIComponent(databaseUrl.username)
-	process.env.DB_PASSWORD ||= decodeURIComponent(databaseUrl.password)
-}
-
 /**
  * BRAMKA IZOLACJI BAZY — DWIE WARSTWY, DWA NIEZALEŻNE NOŚNIKI.
  *
@@ -49,9 +40,9 @@ if (process.env.DATABASE_URL) {
  * był ten sam. Naprawiony razem z tą bramką.
  *
  * ── WARSTWA B (realne połączenie, niezależna od `TEST_TYPE`) ─────────────────
- * Bramka nie może rzucać na starcie każdego przebiegu, bo `test:unit` jest
- * w większości bezbazowy i zieleń bezbazowych suit ma zostać zielenią. Dlatego
- * warstwa B nie sprawdza NICZEGO przy starcie — instaluje kontrolę w
+ * Warstwa startowa odmawia bez wartości, z nieparsowalnym adresem i z rozpoznaną
+ * bazą deweloperską. Warstwa B pozostaje potrzebna dla każdego dalszego połączenia
+ * i instaluje kontrolę w
  * `Client.prototype.connect` sterownika `pg`. To jedyne miejsce, przez które
  * przechodzi KAŻDE połączenie: `new Client(...)`, `new Pool(...)` (pula tworzy
  * klientów) oraz `knex({ client: "pg" })` (dialekt pg używa tego samego
@@ -61,8 +52,8 @@ if (process.env.DATABASE_URL) {
  * Reguła warstwy B: baza docelowa musi WYGLĄDAĆ NA TESTOWĄ (człon `test`
  * w nazwie), być bazą utrzymaniową (`postgres` — bez niej nie da się założyć
  * izolowanej bazy testowej), być wymieniona w `GP_TEST_DATABASE_NAMES` albo
- * przebieg musi nieść JAWNY opt-out `GP_ALLOW_NON_TEST_DB=1`. Wszystko inne
- * (w tym `gp_mercur`, `gp_core`, `gp_portal`) jest odmową Z NAZWANĄ BAZĄ.
+ * przebieg musi nieść nazwę jawnie dopuszczoną w `GP_TEST_DATABASE_NAMES`.
+ * Wszystko inne (w tym `gp_mercur`, `gp_core`, `gp_portal`) jest odmową Z NAZWANĄ BAZĄ.
  *
  * Obie warstwy są TWARDE (rzucają), bo cichy przebieg na złej bazie kasuje dane
  * bez śladu, a jedyny ślad w logu — zielona suita — wygląda identycznie jak
@@ -70,6 +61,8 @@ if (process.env.DATABASE_URL) {
  */
 const TEST_TYPE = process.env.TEST_TYPE ?? ""
 const requiresIsolatedDb = /-pg$/.test(TEST_TYPE) || TEST_TYPE === "stripe-multi-order"
+const DEVELOPMENT_DATABASES = new Set(["gp_mercur", "gp_core", "gp_portal"])
+const MAINTENANCE_DATABASES = new Set(["postgres", "template1"])
 
 /** Nazwy dopuszczone jawnie przez środowisko (np. baza szablonowa CI). */
 function extraAllowedDatabaseNames() {
@@ -104,46 +97,67 @@ function looksLikeTestDatabase(dbName) {
  */
 const EPHEMERAL_MEDUSA_DB = /^medusa-[a-z0-9._-]*integration-\d+$/i
 
-// ── WARSTWA A ────────────────────────────────────────────────────────────────
-if (requiresIsolatedDb && process.env.DATABASE_URL) {
-	if (process.env.GP_ALLOW_NON_TEST_DB === "1") {
-		// Pominięcie ZADEKLAROWANE jest dopuszczalne; ciche nie jest.
-		console.warn(
-			`[test-db-guard] GP_ALLOW_NON_TEST_DB=1 — bramka izolacji bazy POMINIĘTA dla TEST_TYPE=${TEST_TYPE}`
+function resolveDatabaseTarget() {
+	const rawDatabaseUrl = process.env.DATABASE_URL
+	if (typeof rawDatabaseUrl !== "string" || rawDatabaseUrl.trim() === "") {
+		throw new Error(
+			"[test-db-guard] DATABASE_URL jest wymagany; suita nie uruchomi sie bez rozwiazanego celu bazy."
 		)
-	} else {
-		const dbName = decodeURIComponent(new URL(process.env.DATABASE_URL).pathname).replace(/^\//, "")
-		// Nazwa bazy jest jedynym nośnikiem, jaki mamy przed połączeniem.
-		// Dodatkowe nazwy (np. baza szablonowa CI) idą przez zmienną, żeby nie
-		// trzeba było ruszać tego pliku.
-		const isTestDb = /_test$/.test(dbName) || extraAllowedDatabaseNames().includes(dbName)
+	}
 
-		if (!isTestDb) {
-			throw new Error(
-				`[test-db-guard] TEST_TYPE=${TEST_TYPE} ZAKLADA I KASUJE tabele, a DATABASE_URL wskazuje baze ` +
-					`'${dbName}', ktora nie wyglada na testowa (oczekiwany sufiks '_test' albo wpis ` +
-					`w GP_TEST_DATABASE_NAMES).\n` +
-					`Uruchomienie na tej bazie skasowaloby z niej tabele i dane — 2026-08-09 dokladnie tak ` +
-					`zniknely 4 tabele i zawartosc 'entitlement_instance' oraz 'seller' z bazy deweloperskiej.\n` +
-					`Wskaz izolowana baze: DATABASE_URL=postgres://.../<nazwa>_test\n` +
-					`Swiadome pominiecie (wiesz, ze ta baza jest do skasowania): GP_ALLOW_NON_TEST_DB=1`
-			)
-		}
+	let databaseUrl
+	let dbName
+	try {
+		databaseUrl = new URL(rawDatabaseUrl)
+		dbName = decodeURIComponent(databaseUrl.pathname).replace(/^\//, "")
+	} catch {
+		throw new Error(
+			"[test-db-guard] DATABASE_URL ma niepoprawny format; suita odmawia startu bez bezpiecznego celu bazy."
+		)
+	}
+
+	if (!dbName) {
+		throw new Error(
+			"[test-db-guard] DATABASE_URL musi zawierac nazwe bazy; suita odmawia startu bez bezpiecznego celu."
+		)
+	}
+
+	return { databaseUrl, dbName }
+}
+
+const resolvedDatabaseTarget = resolveDatabaseTarget()
+
+if (DEVELOPMENT_DATABASES.has(resolvedDatabaseTarget.dbName)) {
+	throw new Error(
+		`[test-db-guard] Odmowa startu: rozwiazany DATABASE_URL wskazuje deweloperska baze '${resolvedDatabaseTarget.dbName}'. Ustaw izolowana baze testowa.`
+	)
+}
+
+process.env.DB_HOST ||= resolvedDatabaseTarget.databaseUrl.hostname
+process.env.DB_PORT ||= resolvedDatabaseTarget.databaseUrl.port
+process.env.DB_USERNAME ||= decodeURIComponent(resolvedDatabaseTarget.databaseUrl.username)
+process.env.DB_PASSWORD ||= decodeURIComponent(resolvedDatabaseTarget.databaseUrl.password)
+
+// ── WARSTWA A ────────────────────────────────────────────────────────────────
+if (requiresIsolatedDb) {
+	const isTestDb =
+		/_test$/.test(resolvedDatabaseTarget.dbName) ||
+		extraAllowedDatabaseNames().includes(resolvedDatabaseTarget.dbName)
+
+	if (!isTestDb) {
+		throw new Error(
+			`[test-db-guard] TEST_TYPE=${TEST_TYPE} ZAKLADA I KASUJE tabele, a DATABASE_URL wskazuje baze ` +
+				`'${resolvedDatabaseTarget.dbName}', ktora nie wyglada na testowa (oczekiwany sufiks '_test' albo wpis ` +
+				`w GP_TEST_DATABASE_NAMES).\n` +
+				`Uruchomienie na tej bazie skasowaloby z niej tabele i dane — 2026-08-09 dokladnie tak ` +
+				`zniknely 4 tabele i zawartosc 'entitlement_instance' oraz 'seller' z bazy deweloperskiej.\n` +
+				`Wskaz izolowana baze: DATABASE_URL=postgres://.../<nazwa>_test`
+		)
 	}
 }
 
 // ── WARSTWA B ────────────────────────────────────────────────────────────────
-/**
- * Bazy utrzymaniowe: połączenie do `postgres` jest JEDYNYM sposobem, w jaki
- * suita może założyć albo skasować izolowaną bazę testową. Zablokowanie jej
- * zablokowałoby sam mechanizm izolacji, którego ta bramka broni.
- */
-const MAINTENANCE_DATABASES = new Set(["postgres", "template1"])
-
 function assertConnectionTargetIsIsolated(dbName, host) {
-	if (process.env.GP_ALLOW_NON_TEST_DB === "1") {
-		return
-	}
 	if (!dbName || MAINTENANCE_DATABASES.has(dbName) || looksLikeTestDatabase(dbName)) {
 		return
 	}
@@ -156,8 +170,7 @@ function assertConnectionTargetIsIsolated(dbName, host) {
 			`danych z bazy deweloperskiej przez suity biegnace pod profilem, ktory tego nie deklarowal.\n` +
 			`Testy dotykajace Postgresa maja brac adres z DEDYKOWANEJ zmiennej (wzorzec: ` +
 			`GP_CORE_RLS_TEST_DATABASE_URL) i POMIJAC sie, gdy jej nie ma — nigdy z fallbacku na DATABASE_URL.\n` +
-			`Wskaz izolowana baze (czlon 'test' w nazwie), dopisz nazwe do GP_TEST_DATABASE_NAMES ` +
-			`albo — jesli SWIADOMIE godzisz sie na utrate danych z '${dbName}' — ustaw GP_ALLOW_NON_TEST_DB=1.`
+			`Wskaz izolowana baze (czlon 'test' w nazwie) albo dopisz nazwe do GP_TEST_DATABASE_NAMES.`
 	)
 }
 
