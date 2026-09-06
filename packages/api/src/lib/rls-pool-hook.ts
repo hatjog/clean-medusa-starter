@@ -27,6 +27,15 @@ export type HookLogger = {
   error?: (...args: unknown[]) => void;
 };
 
+export class RlsMarketContextRequiredError extends Error {
+  readonly error_code = "GP_RLS_MARKET_CONTEXT_REQUIRED";
+
+  constructor(reason: "missing_market_context" | "invalid_market_id") {
+    super(`RLS connection acquisition denied: ${reason}`);
+    this.name = "RlsMarketContextRequiredError";
+  }
+}
+
 type QueryableConnection = {
   query: (sql: string, params?: unknown[]) => Promise<unknown>;
   end?: () => Promise<unknown> | unknown;
@@ -81,14 +90,32 @@ export function installRlsPoolHook(
     const ctx = marketContextStorage.getStore();
 
     if (!ctx?.market_id) {
-      return connection;
+      logger?.error?.("RLS pool hook acquire denied", {
+        error_code: "GP_RLS_MARKET_CONTEXT_REQUIRED",
+        reason: "missing_market_context",
+      });
+      await destroyConnection(
+        client,
+        connection,
+        logger,
+        "RLS pool hook missing-context destroy failed"
+      );
+      throw new RlsMarketContextRequiredError("missing_market_context");
     }
 
     if (!SAFE_ID_RE.test(ctx.market_id)) {
-      logger?.warn?.("RLS pool hook skipped invalid market id", {
+      logger?.error?.("RLS pool hook acquire denied", {
+        error_code: "GP_RLS_MARKET_CONTEXT_REQUIRED",
+        reason: "invalid_market_id",
         market_id: ctx.market_id,
       });
-      return connection;
+      await destroyConnection(
+        client,
+        connection,
+        logger,
+        "RLS pool hook invalid-context destroy failed"
+      );
+      throw new RlsMarketContextRequiredError("invalid_market_id");
     }
 
     try {
