@@ -228,7 +228,12 @@ runOrSkip("F2 — multi-seller na realnej ścieżce PostgreSQL", () => {
          vat_classification text NOT NULL, reference_price_minor integer,
          entitlement_dedupe_key text NOT NULL UNIQUE, recipient_index integer NOT NULL,
          recipient_customer_id text, created_at timestamptz NOT NULL,
-         updated_at timestamptz NOT NULL, UNIQUE (order_id, line_item_id)
+         updated_at timestamptz NOT NULL,
+         -- v1.16.0 Story 3.1 (dryf fixture'a): live-issue od 2026-08-13 (#168)
+         -- INSERT-uje takze claim_token i expires_at; bez tych kolumn ta suita
+         -- byla czerwona na realnym PG, wiec nie mierzyla kontraktu ADR-166.
+         claim_token text, expires_at timestamptz,
+         UNIQUE (order_id, line_item_id)
        ) ON COMMIT DROP`,
       `CREATE TEMP TABLE entitlement_choice_set_item (
          id text PRIMARY KEY, instance_id text NOT NULL, market_id text NOT NULL,
