@@ -66,6 +66,8 @@ const FIXTURE_PURCHASE_FINGERPRINT = `sha256:${createHash("sha256")
       market_id: FIXTURE.marketId,
       purchase_mode: FIXTURE.purchaseMode,
       recipient_hash: FIXTURE.recipientHash,
+      isolation: expect.stringContaining("two independent PostgreSQL sessions"),
+      transaction_scope: expect.stringContaining("runtime transaction_id"),
     })
   )
   .digest("hex")}`
@@ -499,6 +501,8 @@ function assertEvidenceMatches(rows: readonly Measurement[]): void {
       market_id: FIXTURE.marketId,
       purchase_mode: FIXTURE.purchaseMode,
       recipient_hash: FIXTURE.recipientHash,
+      isolation: expect.stringContaining("two independent PostgreSQL sessions"),
+      transaction_scope: expect.stringContaining("runtime transaction_id"),
     })
   )
   expect(evidence.runs).toHaveLength(2)
@@ -543,6 +547,8 @@ function assertSerializedEvidence(value: string): void {
   expect(evidence.fixture.purchase_fingerprint).toBe(FIXTURE_PURCHASE_FINGERPRINT)
   expect(evidence.fixture.order_id).toBe(FIXTURE.orderId)
   expect(evidence.fixture.line_item_id).toBe(FIXTURE.lineItemId)
+  expect(evidence.fixture.isolation).toBe("two independent PostgreSQL sessions; each session loads production migration DDL into session-local tables and runs one production call-site transaction")
+  expect(evidence.fixture.transaction_scope).toBe("runtime transaction_id is captured by the integration test; the serialized artifact keeps the run-scoped marker <runtime>")
   expect(evidence.runs).toHaveLength(2)
   expect(new Set(evidence.runs.map((run) => run.route))).toEqual(
     new Set(["POST /hooks/payment/stripe", "POST /webhooks/stripe/payment-intent"])
@@ -698,6 +704,8 @@ describe("Story 3.6 AC1 — ujemne kontrole evidence", () => {
     ;(missingLayerMutant.runs as Array<Record<string, unknown>>)[0].voucher_status = null
     const orderIdentityMutant = JSON.parse(raw) as Record<string, unknown>
     ;(orderIdentityMutant.fixture as Record<string, unknown>).line_item_id = "li_other_purchase"
+    const isolationMutant = JSON.parse(raw) as Record<string, unknown>
+    ;(isolationMutant.fixture as Record<string, unknown>).isolation = "shared database state"
     const axisMergeMutant = JSON.parse(raw) as Record<string, unknown>
     const axisMergeRun = (axisMergeMutant.runs as Array<Record<string, unknown>>)[0]
     const axisMergeEffect = axisMergeRun.effect as Record<string, unknown>
@@ -706,6 +714,7 @@ describe("Story 3.6 AC1 — ujemne kontrole evidence", () => {
     expect(() => assertSerializedEvidence(JSON.stringify(routeMutant))).toThrow()
     expect(() => assertSerializedEvidence(JSON.stringify(missingLayerMutant))).toThrow()
     expect(() => assertSerializedEvidence(JSON.stringify(orderIdentityMutant))).toThrow()
+    expect(() => assertSerializedEvidence(JSON.stringify(isolationMutant))).toThrow()
     expect(() => assertSerializedEvidence(JSON.stringify(axisMergeMutant))).toThrow()
     expect(runs).toHaveLength(2)
   })
