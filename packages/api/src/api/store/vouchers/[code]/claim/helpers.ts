@@ -1,5 +1,6 @@
 import type { MedusaRequest } from "@medusajs/framework/http"
 import { ContainerRegistrationKeys } from "@medusajs/framework/utils"
+import { marketContextStorage } from "../../../../../lib/market-context"
 
 export interface ClaimAuditRow {
   idempotency_key: string
@@ -14,6 +15,19 @@ export interface ClaimAuditRow {
     | "expired"
     | "already_claimed"
   occurred_at: string
+}
+
+export class ClaimMarketContextRequiredError extends Error {
+  constructor() {
+    super("Market context required for voucher claim persistence")
+    this.name = "ClaimMarketContextRequiredError"
+  }
+}
+
+function requireClaimMarketId(): string {
+  const marketId = marketContextStorage.getStore()?.market_id
+  if (!marketId) throw new ClaimMarketContextRequiredError()
+  return marketId
 }
 
 export interface ClaimRouteResponse {
@@ -69,7 +83,8 @@ function resolveDb(req: MedusaRequest): unknown | null {
   } catch {
     try {
       return req.scope.resolve(ContainerRegistrationKeys.PG_CONNECTION)
-    } catch {
+    } catch (error) {
+      if (error instanceof ClaimMarketContextRequiredError) throw error
       return null
     }
   }
@@ -139,11 +154,12 @@ export async function appendClaimAudit(
   client: PgClientLike,
   row: ClaimAuditRow
 ): Promise<void> {
-  await client.query(
+  const marketId = requireClaimMarketId()
+  const refreshed = await client.query(
     `INSERT INTO voucher_claim_audit
-       (idempotency_key, code, ip, outcome, occurred_at)
-     VALUES ($1, $2, $3, $4, $5)`,
-    [row.idempotency_key, row.code, row.ip, row.outcome, row.occurred_at]
+       (idempotency_key, code, ip, outcome, occurred_at, market_id)
+     VALUES ($1, $2, $3, $4, $5, $6)`,
+    [row.idempotency_key, row.code, row.ip, row.outcome, row.occurred_at, marketId]
   )
 }
 
@@ -214,10 +230,11 @@ export async function reserveClaimBinding(
   | { inserted: true }
   | { inserted: false; bindingHash: string; response: ClaimRouteResponse | null }
 > {
+  const marketId = requireClaimMarketId()
   const inserted = await client.query(
     `INSERT INTO voucher_claim_binding
-       (idempotency_key, binding_hash, code, claimed_at, expires_at, created_at, updated_at)
-     VALUES ($1, $2, $3, $4, NOW() + ($5::text || ' hours')::interval, NOW(), NOW())
+       (idempotency_key, binding_hash, code, claimed_at, expires_at, created_at, updated_at, market_id)
+     VALUES ($1, $2, $3, $4, NOW() + ($5::text || ' hours')::interval, NOW(), NOW(), $6)
      ON CONFLICT (idempotency_key) DO NOTHING`,
     [
       input.idempotencyKey,
@@ -225,6 +242,7 @@ export async function reserveClaimBinding(
       input.code,
       input.claimedAt,
       String(ttlHours()),
+      marketId,
     ]
   )
 
@@ -233,11 +251,12 @@ export async function reserveClaimBinding(
   // INSERT had a conflict — check for a live (non-expired) binding first.
   const existing = await client.query<BindingReplayRow>(
     `SELECT binding_hash, response_status, response_body
-       FROM voucher_claim_binding
+      FROM voucher_claim_binding
       WHERE idempotency_key = $1
+        AND market_id = $2
         AND expires_at > NOW()
       FOR UPDATE`,
-    [input.idempotencyKey]
+    [input.idempotencyKey, marketId]
   )
 
   const row = existing.rows[0]
@@ -260,7 +279,7 @@ export async function reserveClaimBinding(
   // The expired row has no live claimant, so overwriting it is safe: any
   // parallel request for the same key also hits the conflict branch and will
   // block on the SELECT FOR UPDATE above until we COMMIT.
-  await client.query(
+  const refreshed = await client.query(
     `UPDATE voucher_claim_binding
         SET binding_hash  = $2,
             code          = $3,
@@ -269,15 +288,18 @@ export async function reserveClaimBinding(
             response_status = NULL,
             response_body   = NULL,
             updated_at    = NOW()
-      WHERE idempotency_key = $1`,
+      WHERE idempotency_key = $1
+        AND market_id = $6`,
     [
       input.idempotencyKey,
       input.bindingHash,
       input.code,
       input.claimedAt,
       String(ttlHours()),
+      marketId,
     ]
   )
+  if ((refreshed.rowCount ?? 0) !== 1) throw new ClaimMarketContextRequiredError()
   return { inserted: true }
 }
 
@@ -286,13 +308,15 @@ export async function completeClaimBinding(
   idempotencyKey: string,
   response: ClaimRouteResponse
 ): Promise<void> {
+  const marketId = requireClaimMarketId()
   await client.query(
     `UPDATE voucher_claim_binding
         SET response_status = $2,
             response_body = $3::jsonb,
             updated_at = NOW()
-      WHERE idempotency_key = $1`,
-    [idempotencyKey, response.status, JSON.stringify(response.body)]
+      WHERE idempotency_key = $1
+        AND market_id = $4`,
+    [idempotencyKey, response.status, JSON.stringify(response.body), marketId]
   )
 }
 
