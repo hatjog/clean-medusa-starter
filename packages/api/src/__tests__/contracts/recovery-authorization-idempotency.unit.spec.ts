@@ -155,28 +155,10 @@ const OUTSIDER = "usr_OUTSIDER_NO_GRANTS"
 const SESSION_INSTANCE = "gp-prod-eu1"
 
 /** Surowe wejścia, które w runtime tworzą wyłącznie middleware i resolver serwera. */
-function serverContext(
-  actorId = OPERATOR,
-  marketId = "bonbeauty",
-  isSuperAdmin = false,
-  sessionInstanceId = SESSION_INSTANCE
-): Pick<ApplyRecoveryIntentInput, "recoverySession"> {
-  const record = baseRecord()
-  return {
-    recoverySession: establishRecoveryServerSession({
-      operatorAuth: { actor_id: actorId, actor_type: "user" },
-      marketContext: {
-        ok: true,
-        market_id: marketId,
-        actor_id: actorId,
-        actor_type: "user",
-        is_super_admin: isSuperAdmin,
-        source: "intrinsic",
-      },
-      sessionInstanceId,
-      record,
-    }),
-  }
+let standardRecoverySession: RecoveryServerSession
+
+function serverContext(): Pick<ApplyRecoveryIntentInput, "recoverySession"> {
+  return { recoverySession: standardRecoverySession }
 }
 
 function baseRecord(): RecoveryRecordView {
@@ -219,19 +201,35 @@ function intentFor(record: RecoveryRecordView, action: RecoveryIntent["action"],
 
 class MemoryLedger implements IdempotencyLedger {
   readonly applied = new Map<string, RecoveryActionAuditRecord>()
-  findApplied(key: string) {
-    return this.applied.get(key)
-  }
-  record(audit: RecoveryActionAuditRecord) {
-    if (audit.outcome === "applied") this.applied.set(audit.idempotency_key, audit)
+  executeOnce(
+    scope: Pick<RecoveryRecordView, "instance_id" | "market_id">,
+    key: string,
+    operation: () => ReturnType<typeof applyRecoveryIntent>
+  ): ReturnType<IdempotencyLedger["executeOnce"]> {
+    const scopedKey = `${scope.instance_id}\u0000${scope.market_id}\u0000${key}`
+    const prior = this.applied.get(scopedKey)
+    if (prior) return { created: false, applied: prior }
+    const result = operation()
+    if (result.outcome === "applied") this.applied.set(scopedKey, result.audit)
+    return { created: true, result }
   }
 }
 
 let auditSeq = 0
 const nextAuditId = () => `rcv_audit_${String(++auditSeq).padStart(4, "0")}`
 
-beforeEach(() => {
+beforeEach(async () => {
   __setKnexForAdminMarketTests(undefined)
+  __resetCapabilityCache()
+  const { operatorAuth } = await operatorAuthFromSession({ actor_id: OPERATOR, actor_type: "user" })
+  __setKnexForAdminMarketTests(makeKnex({ marketGrants: { [OPERATOR]: new Set(["bonbeauty"]) } }))
+  const marketContext = await marketContextFor(OPERATOR, "bonbeauty")
+  standardRecoverySession = establishRecoveryServerSession({
+    operatorAuth,
+    marketContext,
+    sessionInstanceId: SESSION_INSTANCE,
+    record: baseRecord(),
+  })
   __resetCapabilityCache()
 })
 
@@ -269,7 +267,7 @@ describe("aktor pochodzi z sesji (withOperatorAuth), body jest ignorowane", () =
     expect(deriveSessionActor(operatorAuth)).toBeNull()
   })
 
-  it("ręcznie złożony actor/grant ani token nie są wejściem kernela i nie dają skutku", () => {
+  it("stare wejście z osobnym actor/grant nie jest wejściem kernela i nie daje skutku", () => {
     const record = baseRecord()
     const legacyForgedInput = {
       record,
@@ -283,6 +281,15 @@ describe("aktor pochodzi z sesji (withOperatorAuth), body jest ignorowane", () =
     }
     expect(() => applyRecoveryIntent(legacyForgedInput as unknown as ApplyRecoveryIntentInput)).toThrow(RecoveryUnauthenticatedError)
     expect(record.version).toBe(1)
+  })
+
+  it("ręcznie złożone wejścia issuer factory nie mintują capability", () => {
+    expect(() => establishRecoveryServerSession({
+      operatorAuth: { actor_id: "usr_ATTACKER", actor_type: "user" },
+      marketContext: { ok: true, market_id: "bonbeauty", actor_id: "usr_ATTACKER", actor_type: "user", is_super_admin: true, source: "intrinsic" },
+      sessionInstanceId: SESSION_INSTANCE,
+      record: baseRecord(),
+    })).toThrow(RecoveryUnauthenticatedError)
   })
 })
 
@@ -305,11 +312,12 @@ describe("autoryzacja rynku i instancji wiersza (resolveAdminMarketContext)", ()
     expect(ctx.ok).toBe(false)
     if (!ctx.ok) expect(ctx.status).toBe(403)
     const record = baseRecord()
+    const { operatorAuth } = await operatorAuthFromSession({ actor_id: OUTSIDER, actor_type: "user" })
     const result = applyRecoveryIntent({
       record,
       intent: intentFor(record, "escalate", { target_state: "recovery_in_progress" }),
       recoverySession: establishRecoveryServerSession({
-        operatorAuth: { actor_id: OUTSIDER, actor_type: "user" },
+        operatorAuth,
         marketContext: ctx,
         sessionInstanceId: SESSION_INSTANCE,
         record,
@@ -352,13 +360,11 @@ describe("autoryzacja rynku i instancji wiersza (resolveAdminMarketContext)", ()
     })
   })
 
-  it("wynik resolvera innego aktora nie może dać grantu bieżącej sesji", () => {
+  it("ręcznie złożony wynik resolvera innego aktora nie mintuje capability", async () => {
     const record = baseRecord()
-    const result = applyRecoveryIntent({
-      record,
-      intent: intentFor(record, "escalate", { target_state: "recovery_in_progress" }),
-      recoverySession: establishRecoveryServerSession({
-        operatorAuth: { actor_id: OUTSIDER, actor_type: "user" },
+    const { operatorAuth } = await operatorAuthFromSession({ actor_id: OUTSIDER, actor_type: "user" })
+    expect(() => establishRecoveryServerSession({
+        operatorAuth,
         marketContext: {
           ok: true,
           market_id: "bonbeauty",
@@ -369,14 +375,7 @@ describe("autoryzacja rynku i instancji wiersza (resolveAdminMarketContext)", ()
         },
         sessionInstanceId: SESSION_INSTANCE,
         record,
-      }),
-      ledger: new MemoryLedger(),
-      now: "2026-09-06T12:00:00Z",
-      auditId: nextAuditId(),
-    })
-    expect(result.outcome).toBe("refused_market_forbidden")
-    expect(result.domain_effects).toBe(0)
-    expect(result.audit.actor.actor_id).toBe(OUTSIDER)
+      })).toThrow(RecoveryUnauthenticatedError)
   })
 })
 
@@ -391,7 +390,6 @@ describe("idempotencja intencji i optymistyczna kontrola wersji", () => {
     const intent = intentFor(record, "escalate", { target_state: "recovery_in_progress" })
 
     const first = applyRecoveryIntent({ record, intent, ...serverContext(), ledger, now, auditId: nextAuditId() })
-    ledger.record(first.audit)
     expect(first.outcome).toBe("applied")
     expect(first.domain_effects).toBe(1)
     expect(first.record.state).toBe("recovery_in_progress")
@@ -430,7 +428,6 @@ describe("idempotencja intencji i optymistyczna kontrola wersji", () => {
     const ledger = new MemoryLedger()
     const record = baseRecord()
     const a = applyRecoveryIntent({ record, intent: intentFor(record, "escalate", { target_state: "recovery_in_progress" }), ...serverContext(), ledger, now, auditId: nextAuditId() })
-    ledger.record(a.audit)
     const b = applyRecoveryIntent({
       record: a.record,
       intent: intentFor(record, "resolve", { target_state: "closed_unrecoverable", resolution_evidence: evidenceFor(OPERATOR) }),
@@ -549,6 +546,53 @@ describe("idempotencja intencji i optymistyczna kontrola wersji", () => {
     expect(result.record.owner).toEqual({ owner_type: "operator_user", owner_id: OPERATOR })
     expect(result.audit.after.owner).toEqual({ owner_type: "operator_user", owner_id: OPERATOR })
     expectAuditValid(result.audit)
+  })
+
+  it.each([" ", "default", "UNKNOWN", "bad owner"])("take_ownership odrzuca owner_id=%p", (ownerId) => {
+    const record = baseRecord()
+    const result = applyRecoveryIntent({
+      record,
+      intent: intentFor(record, "take_ownership", { new_owner: { owner_type: "operator_user", owner_id: ownerId } }),
+      ...serverContext(), ledger: new MemoryLedger(), now, auditId: nextAuditId(),
+    })
+    expect(result.outcome).toBe("refused_invalid_transition")
+    expect(result.domain_effects).toBe(0)
+  })
+
+  it("take_ownership nie zmienia ownera rekordu terminalnego", () => {
+    const record = { ...baseRecord(), state: "resolved_recovered", resolution_evidence: evidenceFor(OPERATOR) }
+    const result = applyRecoveryIntent({
+      record,
+      intent: intentFor(record, "take_ownership", { new_owner: { owner_type: "operator_user", owner_id: OPERATOR } }),
+      ...serverContext(), ledger: new MemoryLedger(), now, auditId: nextAuditId(),
+    })
+    expect(result.outcome).toBe("refused_invalid_transition")
+    expect(result.record.owner).toEqual(record.owner)
+  })
+
+  it("runtime odrzuca action spoza zamkniętego słownika", () => {
+    const record = baseRecord()
+    const intent = intentFor(record, "escalate", { target_state: "recovery_in_progress" })
+    ;(intent as unknown as { action: string }).action = "force_close"
+    const result = applyRecoveryIntent({ record, intent, ...serverContext(), ledger: new MemoryLedger(), now, auditId: nextAuditId() })
+    expect(result.outcome).toBe("refused_invalid_transition")
+    expect(result.domain_effects).toBe(0)
+  })
+
+  it("ledger atomowo claimuje scoped key i nie uruchamia skutku drugi raz", () => {
+    const ledger = new MemoryLedger()
+    let calls = 0
+    const applied = applyRecoveryIntent({
+      record: baseRecord(),
+      intent: intentFor(baseRecord(), "escalate", { target_state: "recovery_in_progress" }),
+      ...serverContext(), ledger, now, auditId: nextAuditId(),
+    })
+    const operation = () => { calls += 1; return applied }
+    const scope = { instance_id: SESSION_INSTANCE, market_id: "other-market" }
+    expect(ledger.executeOnce(scope, applied.audit.idempotency_key, operation).created).toBe(true)
+    expect(ledger.executeOnce(scope, applied.audit.idempotency_key, operation).created).toBe(false)
+    expect(calls).toBe(1)
+    expect(ledger.applied.size).toBe(2) // ten sam key w dwóch market scopes nie koliduje
   })
 })
 

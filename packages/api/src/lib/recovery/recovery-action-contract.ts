@@ -28,8 +28,8 @@
  *     `__tests__/contracts/recovery-population-contract.unit.spec.ts` porównuje oba
  *     nośniki wartość po wartości.
  */
-import type { OperatorAuthContext } from "../../middlewares/with-operator-auth"
-import type { AdminMarketContextResult } from "../admin-market-context"
+import { isVerifiedOperatorAuthContext, type OperatorAuthContext } from "../../middlewares/with-operator-auth"
+import { isVerifiedAdminMarketContextResult, type AdminMarketContextResult } from "../admin-market-context"
 
 export const RECOVERY_CONTRACT_VERSION = "1.0.0" as const
 
@@ -251,7 +251,12 @@ export function isAllowedTransition(population: RecoveryPopulationType, from: st
 
 /** Ledger wykonanych intencji — abstrakcja nad tabelą audytu (Story 11.3 podaje implementację). */
 export interface IdempotencyLedger {
-  findApplied(idempotencyKey: string): RecoveryActionAuditRecord | undefined
+  /** Adapter DB: unique claim + operation + zapis applied muszą być jedną transakcją. */
+  executeOnce(
+    scope: Pick<RecoveryRecordView, "instance_id" | "market_id">,
+    idempotencyKey: string,
+    operation: () => ApplyRecoveryIntentResult
+  ): { created: true; result: ApplyRecoveryIntentResult } | { created: false; applied: RecoveryActionAuditRecord }
 }
 
 declare const recoveryServerSessionBrand: unique symbol
@@ -292,6 +297,9 @@ export type EstablishRecoveryServerSessionInput = {
  * może dostać się do ścieżki skutku domenowego.
  */
 export function establishRecoveryServerSession(input: EstablishRecoveryServerSessionInput): RecoveryServerSession {
+  if (!isVerifiedOperatorAuthContext(input.operatorAuth) || !isVerifiedAdminMarketContextResult(input.marketContext)) {
+    throw new RecoveryUnauthenticatedError()
+  }
   const actor = deriveSessionActor(input.operatorAuth)
   if (!actor) {
     throw new RecoveryUnauthenticatedError()
@@ -401,6 +409,9 @@ export function applyRecoveryIntent(input: ApplyRecoveryIntentInput): ApplyRecov
   if (authorization.decision !== "granted") {
     return refuse("refused_market_forbidden", actor)
   }
+  if (!RECOVERY_ACTIONS.includes(intent.action)) {
+    return refuse("refused_invalid_transition", actor)
+  }
 
   // 2. Klucz idempotencji musi wynikać z intencji — brak albo obcy kształt jest błędem
   //    programisty, nie odmową biznesową.
@@ -419,25 +430,9 @@ export function applyRecoveryIntent(input: ApplyRecoveryIntentInput): ApplyRecov
     throw new Error("[recovery-action-contract] intencja wskazuje inny wiersz niż podany rekord")
   }
 
-  // 3. Powtórka: ta sama intencja już wykonana → zero skutku, rekord `replayed`
-  //    z DOKŁADNIE tym samym `after`, co pierwsze wykonanie.
-  const prior = ledger.findApplied(intent.idempotency_key)
-  if (prior) {
-    return {
-      outcome: "replayed",
-      record,
-      domain_effects: 0,
-      audit: buildAudit({
-        outcome: "replayed",
-        before: prior.after,
-        after: prior.after,
-        actor,
-        resolution_evidence: null,
-      }),
-    }
-  }
-
-  // 4. Optymistyczna kontrola wersji.
+  const execute = (): ApplyRecoveryIntentResult => {
+  // 3. Wersja, przejście i skutek wykonują się wewnątrz atomowego claimu ledgeru.
+  //    Adapter DB scope'uje unikalność przez instance_id + market_id + key.
   if (intent.expected_version !== record.version) {
     return refuse("refused_version_conflict", actor)
   }
@@ -447,7 +442,7 @@ export function applyRecoveryIntent(input: ApplyRecoveryIntentInput): ApplyRecov
   let nextOwner: RecoveryOwner = { ...record.owner }
   let nextRetry = record.retry_count
   if (intent.action === "take_ownership") {
-    if (!intent.new_owner || !intent.new_owner.owner_id) {
+    if (isTerminalState(record.population_type, record.state) || !intent.new_owner || !isValidRecoveryOwner(intent.new_owner)) {
       return refuse("refused_invalid_transition", actor)
     }
     nextOwner = { ...intent.new_owner }
@@ -506,6 +501,41 @@ export function applyRecoveryIntent(input: ApplyRecoveryIntentInput): ApplyRecov
     domain_effects: 1,
     audit: buildAudit({ outcome: "applied", before, after, actor, resolution_evidence: goesTerminal ? evidence : null }),
   }
+  }
+
+  const atomic = ledger.executeOnce(
+    { instance_id: record.instance_id, market_id: record.market_id },
+    intent.idempotency_key,
+    execute
+  )
+  if (!atomic.created) {
+    const prior = atomic.applied
+    return {
+      outcome: "replayed",
+      record,
+      domain_effects: 0,
+      audit: buildAudit({
+        outcome: "replayed",
+        before: prior.after,
+        after: prior.after,
+        actor,
+        resolution_evidence: null,
+      }),
+    }
+  }
+  return atomic.result
+}
+
+const INVALID_OWNER_IDS = new Set(["unknown", "default", "null", "none", "n/a", "tbd", "todo", "unassigned", ""])
+const RECOVERY_OWNER_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/
+
+function isValidRecoveryOwner(owner: RecoveryOwner): boolean {
+  return (
+    (owner.owner_type === "operator_role" || owner.owner_type === "operator_user") &&
+    owner.owner_id === owner.owner_id.trim() &&
+    RECOVERY_OWNER_ID.test(owner.owner_id) &&
+    !INVALID_OWNER_IDS.has(owner.owner_id.toLowerCase())
+  )
 }
 
 export class RecoveryUnauthenticatedError extends Error {

@@ -29,6 +29,7 @@ import {
   INSTANCE_ID_BACKFILL_SOURCE,
   isTrustworthyOwner,
   isTrustworthyScopeValue,
+  isRfc3339Timestamp,
   LEGACY_COMPENSATION_STATES,
   RECOVERY_MIGRATION_PLAN,
   materializeCompensationBackfill,
@@ -125,7 +126,7 @@ describe("NOT NULL dla nowych danych i brak default poza licznikami", () => {
     expect(backfill.sql_shape).toMatch(/INSERT INTO money_path_compensation_failure_backfill_quarantine/)
     expect(backfill.sql_shape).toMatch(/DELETE FROM money_path_compensation_failure/)
     expect(backfill.sql_shape).toMatch(/BEGIN;.*COMMIT;/)
-    expect(step.sql_shape).toMatch(/PRECONDITION: count\(\*\) WHERE instance_id IS NULL OR owner_id IS NULL OR deadline IS NULL/)
+    expect(step.sql_shape).toMatch(/PRECONDITION: count\(\*\) WHERE instance_id IS NULL OR owner_type IS NULL OR owner_id IS NULL OR deadline IS NULL/)
   })
 
   it("literalny SQL kwalifikuje pełne certyfikowane metadata i nie tylko niepuste kolumny", () => {
@@ -133,15 +134,32 @@ describe("NOT NULL dla nowych danych i brak default poza licznikami", () => {
     const remap = planFor("compensation_failure").up.find((s) => s.id === "cf-remap-legacy-resolved")!
     for (const sql of [backfill.sql_shape, remap.sql_shape]) {
       expect(sql).toContain("owner_type IN ('operator_role','operator_user')")
-      expect(sql).toContain("lower(btrim(")
+      expect(sql).toMatch(/owner_id ~|q\.owner_id ~|p\.owner_id ~/)
       expect(sql).toContain("NOT IN ('unknown','default','null','none','n/a','tbd','todo','unassigned')")
-      expect(sql).toContain("deadline::text ~")
+      expect(sql).not.toContain("::text ~")
       expect(sql).toContain("jsonb_typeof(")
       expect(sql).toContain("legacy_resolver->>'actor_type'='user'")
       expect(sql).toContain("legacy_resolver->>'actor_id'=c.resolved_by")
       expect(sql).toContain("legacy_resolver->>'session_source'='medusa_admin_session'")
     }
     expect(backfill.sql_shape).toContain("missing certified scope, owner, deadline, or legacy resolver evidence")
+  })
+
+  it("plan używa prawdziwych nazw obu constraintów i zachowuje stan legacy do remapu", () => {
+    const widen = planFor("compensation_failure").up.find((s) => s.id === "cf-widen-state-check")!
+    expect(widen.sql_shape).toContain("money_path_compensation_failure_state_check")
+    expect(widen.sql_shape).toContain("money_path_compensation_failure_resolution_check")
+    expect(widen.sql_shape).toContain("'resolved_manually'")
+    expect(widen.sql_shape).not.toContain("resolution_state_check")
+  })
+
+  it("nowe nośniki i kwarantanny wymuszają fail-closed RLS", () => {
+    for (const plan of RECOVERY_MIGRATION_PLAN) {
+      for (const step of plan.up.filter((candidate) => candidate.id.includes("create"))) {
+        expect(step.sql_shape).toContain("ENABLE ROW LEVEL SECURITY")
+        expect(step.sql_shape).toContain("FORCE ROW LEVEL SECURITY")
+      }
+    }
   })
 })
 
@@ -274,7 +292,16 @@ describe("backfill bez wartości zastępczej", () => {
       expect({ v, ok: isTrustworthyScopeValue(v) }).toEqual({ v, ok: false })
     }
     expect(isTrustworthyOwner({ owner_type: "operator_role", owner_id: " Default " })).toBe(false)
+    expect(isTrustworthyScopeValue("gp prod eu1")).toBe(false)
+    expect(isTrustworthyScopeValue("gp/prod/eu1")).toBe(false)
     expect(isTrustworthyScopeValue("gp-prod-eu1")).toBe(true)
+  })
+
+  it("timestamp RFC3339 sprawdza kalendarz, czas i offset, nie tylko kształt", () => {
+    expect(isRfc3339Timestamp("2026-02-28T23:59:59+23:59")).toBe(true)
+    for (const value of ["2026-99-99T99:99:99+99:99", "2026-02-30T12:00:00Z", "2026-01-01 12:00:00+00"] ) {
+      expect({ value, valid: isRfc3339Timestamp(value) }).toEqual({ value, valid: false })
+    }
   })
 
   it("wiersz bez metadanych jest atomowo przeniesiony do kwarantanny przed SET NOT NULL", () => {
@@ -312,6 +339,15 @@ describe("backfill bez wartości zastępczej", () => {
     const plan = planFor("dlq_entry")
     expect(plan.backfill.kind).toBe("none")
     expect(plan.kind).toBe("create_new")
+  })
+
+  it("backfill deferral materializuje pełny wiersz albo kwarantannę bez wielokropka", () => {
+    const step = planFor("deferred_issuance_trace").up.find((s) => s.id === "dit-backfill")!
+    expect(step.sql_shape).not.toContain("SELECT ...")
+    for (const field of ["owner_type", "owner_id", "deadline", "closure_path", "provenance_kind", "payment_intent_id", "stripe_event_id", "psp_occurred_at"]) {
+      expect({ field, present: step.sql_shape.includes(field) }).toEqual({ field, present: true })
+    }
+    expect(step.sql_shape).toMatch(/INSERT INTO deferred_issuance_trace_backfill_quarantine/)
   })
 
   it("mapowanie stanów historycznych kompensacji pokrywa DOKŁADNIE słownik legacy", () => {
@@ -359,6 +395,15 @@ describe("baza planu = realna migracja 20260818090000", () => {
       expect(restore.sql_shape).toContain(`'${s}'`)
     }
     expect(restore.sql_shape).not.toContain("closed_legacy_unevidenced")
+  })
+
+  it("rollback kwarantannuje stany runtime przed przywróceniem legacy CHECK", () => {
+    const unmap = planFor("compensation_failure").down.find((s) => s.id === "cf-unmap-legacy-resolved")!
+    for (const state of ["recovery_in_progress", "resolved_recovered", "closed_unrecoverable"]) {
+      expect(unmap.sql_shape).toContain(`'${state}'`)
+    }
+    expect(unmap.sql_shape).toContain("post-migration state cannot be represented")
+    expect(unmap.sql_shape).toContain("DELETE FROM money_path_compensation_failure")
   })
 })
 

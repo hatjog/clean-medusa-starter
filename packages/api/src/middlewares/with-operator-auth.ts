@@ -26,6 +26,21 @@ export type OperatorAuthContext = {
   auth_identity_id?: string
 }
 
+const verifiedOperatorAuthContexts = new WeakSet<object>()
+
+/** Runtime proof that the context was emitted by this middleware, not parsed from request body. */
+export function isVerifiedOperatorAuthContext(
+  value: OperatorAuthContext | undefined | null
+): value is OperatorAuthContext {
+  return typeof value === "object" && value !== null && verifiedOperatorAuthContexts.has(value)
+}
+
+function issueOperatorAuthContext(authContext: OperatorAuthContext): OperatorAuthContext {
+  const verified = Object.freeze(authContext)
+  verifiedOperatorAuthContexts.add(verified)
+  return verified
+}
+
 type RequestWithOperatorAuth = MedusaRequest & {
   operatorAuth?: OperatorAuthContext
 }
@@ -96,11 +111,11 @@ export function withOperatorAuth(
     )
 
     const operatorReq = req as RequestWithOperatorAuth
-    operatorReq.operatorAuth = {
+    operatorReq.operatorAuth = issueOperatorAuthContext({
       actor_id: authContext.actor_id,
       actor_type: authContext.actor_type,
       auth_identity_id: authContext.auth_identity_id,
-    }
+    })
 
     await handler(operatorReq, res, next)
   }
@@ -140,11 +155,11 @@ export async function operatorAuthMiddleware(
   )
 
   const operatorReq = req as RequestWithOperatorAuth
-  operatorReq.operatorAuth = {
+  operatorReq.operatorAuth = issueOperatorAuthContext({
     actor_id: authContext.actor_id,
     actor_type: authContext.actor_type,
     auth_identity_id: authContext.auth_identity_id,
-  }
+  })
 
   next()
 }
