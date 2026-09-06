@@ -9,11 +9,13 @@
  *
  * Kontrakt jako kod (`specs/contracts/recovery/`):
  *
- *  1. AKTOR pochodzi WYŁĄCZNIE z sesji serwera (`req.operatorAuth` ustawiony przez
- *     `withOperatorAuth`). Pole w body nie jest źródłem aktora — `deriveSessionActor`
- *     przyjmuje tylko `OperatorAuthContext`, więc kompilator nie pozwoli przekazać body.
+ *  1. AKTOR i AUTORYZACJA pochodzą WYŁĄCZNIE z surowych, serwerowych wyników
+ *     `withOperatorAuth` oraz `resolveAdminMarketContext`. `establishRecoveryServerSession`
+ *     wiąże je przed wejściem do kernela; publiczne wejście przyjmuje tylko opaque
+ *     capability zapisane w prywatnym WeakMap, nie ręcznie składany aktor ani grant.
  *  2. AUTORYZACJA RYNKU jest wynikiem `resolveAdminMarketContext` (`super_admin` |
- *     `market_grant`); brak dostępu = `refused_market_forbidden`, bez skutku.
+ *     `market_grant`); brak dostępu albo rozbieżność aktora =
+ *     `refused_market_forbidden`, bez skutku.
  *  3. Każda intencja niesie `idempotency_key` = `<population_type>:<population_id>:<action>:<expected_version>`
  *     (funkcja `buildRecoveryIdempotencyKey`) i `expected_version`. Ta sama intencja dwa razy =
  *     JEDEN skutek domenowy i drugi rekord audytu `replayed` z identycznym `after`.
@@ -212,12 +214,18 @@ export type MarketAuthorization = {
  * instancja sesji równa się instancji wiersza.
  */
 export function authorizeRecoveryMarket(input: {
+  actor: SessionActor
   marketContext: AdminMarketContextResult
   sessionInstanceId: string
   record: Pick<RecoveryRecordView, "instance_id" | "market_id">
 }): MarketAuthorization {
   const ctx = input.marketContext
   if (!ctx.ok) {
+    return { market_access: "none", decision: "denied" }
+  }
+  // Resolver musi być wynikiem oceny TEJ samej sesji. To zamyka drogę, na której
+  // endpoint łączyłby prawidłowy grant innego administratora z własnym aktorem.
+  if (ctx.actor_id !== input.actor.actor_id || ctx.actor_type !== input.actor.actor_type) {
     return { market_access: "none", decision: "denied" }
   }
   if (input.sessionInstanceId !== input.record.instance_id) {
@@ -246,11 +254,80 @@ export interface IdempotencyLedger {
   findApplied(idempotencyKey: string): RecoveryActionAuditRecord | undefined
 }
 
+declare const recoveryServerSessionBrand: unique symbol
+
+/**
+ * Opaque capability wystawiana wyłącznie po związaniu wyniku `withOperatorAuth`
+ * z wynikiem `resolveAdminMarketContext`. Nie ma eksportowanego konstruktora ani
+ * pól, które wywołujący mógłby złożyć z body żądania.
+ */
+export type RecoveryServerSession = {
+  readonly [recoveryServerSessionBrand]: true
+}
+
+type RecoveryServerSessionState = {
+  actor: SessionActor
+  authorization: MarketAuthorization
+  instance_id: string
+  market_id: string
+}
+
+const issuedRecoveryServerSessions = new WeakMap<object, RecoveryServerSessionState>()
+
+export type EstablishRecoveryServerSessionInput = {
+  /** Wartość ustawiona przez `withOperatorAuth`, nigdy pole body. */
+  operatorAuth: OperatorAuthContext | undefined | null
+  /** Wynik serwerowego `resolveAdminMarketContext` dla tej samej sesji. */
+  marketContext: AdminMarketContextResult
+  /** instance_id runtime sesji serwera, nie wartość z body. */
+  sessionInstanceId: string
+  /** Wiersz, dla którego resolver ocenia market i instancję. */
+  record: Pick<RecoveryRecordView, "instance_id" | "market_id">
+}
+
+/**
+ * Wiąże źródła serwerowe z zakresem wiersza, zanim intencja trafi do kernela.
+ * `applyRecoveryIntent` przyjmuje wyłącznie wynik tej funkcji i dodatkowo
+ * sprawdza jego obecność w prywatnym WeakMap, więc ręcznie złożony obiekt nie
+ * może dostać się do ścieżki skutku domenowego.
+ */
+export function establishRecoveryServerSession(input: EstablishRecoveryServerSessionInput): RecoveryServerSession {
+  const actor = deriveSessionActor(input.operatorAuth)
+  if (!actor) {
+    throw new RecoveryUnauthenticatedError()
+  }
+  const authorization = authorizeRecoveryMarket({
+    actor,
+    marketContext: input.marketContext,
+    sessionInstanceId: input.sessionInstanceId,
+    record: input.record,
+  })
+  const session = Object.freeze({}) as RecoveryServerSession
+  issuedRecoveryServerSessions.set(session, {
+    actor,
+    authorization,
+    instance_id: input.record.instance_id,
+    market_id: input.record.market_id,
+  })
+  return session
+}
+
+function readRecoveryServerSession(session: RecoveryServerSession | undefined): RecoveryServerSessionState {
+  if (!session || typeof session !== "object") {
+    throw new RecoveryUnauthenticatedError()
+  }
+  const state = issuedRecoveryServerSessions.get(session)
+  if (!state) {
+    throw new RecoveryUnauthenticatedError()
+  }
+  return state
+}
+
 export type ApplyRecoveryIntentInput = {
   record: RecoveryRecordView
   intent: RecoveryIntent
-  actor: SessionActor | null
-  authorization: MarketAuthorization
+  /** Opaque capability z `establishRecoveryServerSession`, nie dane z body. */
+  recoverySession: RecoveryServerSession
   ledger: IdempotencyLedger
   now: string
   auditId: string
@@ -275,7 +352,13 @@ function snapshot(record: RecoveryRecordView): StateSnapshot {
  * wersja → przejście → evidence → skutek.
  */
 export function applyRecoveryIntent(input: ApplyRecoveryIntentInput): ApplyRecoveryIntentResult {
-  const { record, intent, actor, authorization, ledger } = input
+  const { record, intent, ledger } = input
+  const serverSession = readRecoveryServerSession(input.recoverySession)
+  const actor = serverSession.actor
+  const authorization =
+    serverSession.instance_id === record.instance_id && serverSession.market_id === record.market_id
+      ? serverSession.authorization
+      : { market_access: "none" as const, decision: "denied" as const }
   const before = snapshot(record)
 
   const refuse = (outcome: RecoveryOutcome, actorForAudit: SessionActor): ApplyRecoveryIntentResult => ({
@@ -314,19 +397,12 @@ export function applyRecoveryIntent(input: ApplyRecoveryIntentInput): ApplyRecov
     recorded_at: input.now,
   })
 
-  // 1. Uwierzytelnienie — bez aktora z sesji nie ma nawet rekordu audytu z aktorem;
-  //    wołający (endpoint) odpowiada 401 PRZED wywołaniem kernela (withOperatorAuth),
-  //    ale kernel nie ufa, że tak się stało.
-  if (!actor) {
-    throw new RecoveryUnauthenticatedError()
-  }
-
-  // 2. Autoryzacja rynku i instancji.
+  // 1. Autoryzacja rynku i instancji.
   if (authorization.decision !== "granted") {
     return refuse("refused_market_forbidden", actor)
   }
 
-  // 3. Klucz idempotencji musi wynikać z intencji — brak albo obcy kształt jest błędem
+  // 2. Klucz idempotencji musi wynikać z intencji — brak albo obcy kształt jest błędem
   //    programisty, nie odmową biznesową.
   const expectedKey = buildRecoveryIdempotencyKey({
     population_type: record.population_type,
@@ -343,7 +419,7 @@ export function applyRecoveryIntent(input: ApplyRecoveryIntentInput): ApplyRecov
     throw new Error("[recovery-action-contract] intencja wskazuje inny wiersz niż podany rekord")
   }
 
-  // 4. Powtórka: ta sama intencja już wykonana → zero skutku, rekord `replayed`
+  // 3. Powtórka: ta sama intencja już wykonana → zero skutku, rekord `replayed`
   //    z DOKŁADNIE tym samym `after`, co pierwsze wykonanie.
   const prior = ledger.findApplied(intent.idempotency_key)
   if (prior) {
@@ -361,12 +437,12 @@ export function applyRecoveryIntent(input: ApplyRecoveryIntentInput): ApplyRecov
     }
   }
 
-  // 5. Optymistyczna kontrola wersji.
+  // 4. Optymistyczna kontrola wersji.
   if (intent.expected_version !== record.version) {
     return refuse("refused_version_conflict", actor)
   }
 
-  // 6. Przejście.
+  // 5. Przejście.
   let nextState = record.state
   let nextOwner: RecoveryOwner = { ...record.owner }
   let nextRetry = record.retry_count
@@ -385,7 +461,7 @@ export function applyRecoveryIntent(input: ApplyRecoveryIntentInput): ApplyRecov
     }
   }
 
-  // 7. Evidence: stan terminalny bez dowodu jest odmową; dowód przy stanie
+  // 6. Evidence: stan terminalny bez dowodu jest odmową; dowód przy stanie
   //    nieterminalnym też (evidence null wyłącznie nieterminalnie).
   const goesTerminal = isTerminalState(record.population_type, nextState)
   const evidence = intent.resolution_evidence ?? null
@@ -395,12 +471,26 @@ export function applyRecoveryIntent(input: ApplyRecoveryIntentInput): ApplyRecov
   if (!goesTerminal && evidence) {
     return refuse("refused_invalid_transition", actor)
   }
+  if (
+    evidence &&
+    (evidence.recorded_by.actor_id !== actor.actor_id ||
+      evidence.recorded_by.actor_type !== actor.actor_type ||
+      evidence.recorded_by.session_source !== actor.session_source)
+  ) {
+    // Dowód z body nie może podszyć się pod innego operatora niż sesja, która
+    // wykonuje mutację. auth_identity_id jest audytowym atrybutem sesji, więc
+    // również musi być identyczny (null oznacza jej rzeczywisty brak).
+    return refuse("refused_invalid_transition", actor)
+  }
+  if (evidence && evidence.recorded_by.auth_identity_id !== actor.auth_identity_id) {
+    return refuse("refused_invalid_transition", actor)
+  }
   if (evidence && evidence.kind === "legacy_manual_resolution") {
     // Stan legacy jest osiągalny wyłącznie przez backfill (ADR-221 §3), nigdy przez akcję.
     return refuse("refused_invalid_transition", actor)
   }
 
-  // 8. Skutek — DOKŁADNIE jeden.
+  // 7. Skutek — DOKŁADNIE jeden.
   const nextRecord: RecoveryRecordView = {
     ...record,
     state: nextState,

@@ -56,7 +56,7 @@ export const STRIPE_ROUTE_INVENTORY: ReadonlyArray<StripeRouteInventoryEntry> = 
     path: "/hooks/payment/stripe",
     owner: "medusa-native",
     status: "live",
-    signature_verifier: "@medusajs/payment-stripe (constructEvent w subscriberze, PO odpowiedzi 200)",
+    signature_verifier: "@medusajs/payment-stripe (webhooks.constructEvent w providerze, PO odpowiedzi 200)",
     barrier: { table: WEBHOOK_DELIVERY_BARRIER_TABLE, provider: STRIPE_NATIVE_WEBHOOK_PROVIDER },
     consumer_event: "payment.captured",
     terminal_state: "ACTIVE",
@@ -133,9 +133,145 @@ function stripeMatchers(): string[] {
     )
 }
 
+type RouteRepositorySources = {
+  native_route: string
+  native_stripe_provider: string
+  path_y_route: string
+  path_y_transport: string
+  native_workflow: string
+  native_issue: string
+  path_y_issue: string
+  retired_route: string
+}
+
+/**
+ * Odczyt obserwowanej powierzchni do osobnego obiektu pozwala kontrolom
+ * negatywnym mutować ŹRÓDŁO fixture'u, a nie oczekiwany inwentarz. W produkcji
+ * fixture jest zawsze zbudowany z plików repozytorium/natywnej zależności.
+ */
+function readRouteRepositorySources(): RouteRepositorySources {
+  return {
+    native_route: readFileSync(
+      path.join(resolveNativeMedusaPackageDir(), NATIVE_HOOK_ROUTE_RELPATH),
+      "utf8"
+    ),
+    native_stripe_provider: readFileSync(
+      require.resolve("@medusajs/payment-stripe/dist/core/stripe-base"),
+      "utf8"
+    ),
+    path_y_route: readFileSync(path.join(__dirname, "../payment-intent/route.ts"), "utf8"),
+    path_y_transport: readFileSync(
+      path.join(__dirname, "../../../../lib/payment/stripe-payment-intent-transport.ts"),
+      "utf8"
+    ),
+    native_workflow: readFileSync(
+      path.join(__dirname, "../../../../workflows/payment/stripe-payment-audit.ts"),
+      "utf8"
+    ),
+    native_issue: readFileSync(
+      path.join(__dirname, "../../../../workflows/entitlements/issue-entitlement.ts"),
+      "utf8"
+    ),
+    path_y_issue: readFileSync(
+      path.join(__dirname, "../../../../workflows/entitlements/live-issue-from-payment-intent.ts"),
+      "utf8"
+    ),
+    retired_route: readFileSync(path.join(__dirname, "../route.ts"), "utf8"),
+  }
+}
+
+/** Każde pole obserwacji pochodzi z konkretnego źródła, nigdy z inwentarza. */
+function observeRouteInventory(sources: RouteRepositorySources): StripeRouteInventoryEntry[] {
+  const nativeProviderLiterals = [
+    ...sources.native_workflow.matchAll(/provider\s*=\s*'([^']+)'/g),
+  ].map((match) => match[1])
+  const nativeBarrierObserved =
+    sources.native_workflow.includes(`INSERT INTO ${WEBHOOK_DELIVERY_BARRIER_TABLE}`) &&
+    nativeProviderLiterals.length > 0
+  const pathYBarrierObserved =
+    sources.path_y_transport.includes(`INSERT INTO ${WEBHOOK_DELIVERY_BARRIER_TABLE}`) &&
+    sources.path_y_transport.includes("STRIPE_PATH_Y_WEBHOOK_PROVIDER")
+  const nativeRouteObserved =
+    sources.native_route.includes("PaymentWebhookEvents.WebhookReceived") &&
+    sources.native_route.includes("sendStatus(200)")
+  const nativeSignatureObserved =
+    sources.native_stripe_provider.includes("constructWebhookEvent") &&
+    sources.native_stripe_provider.includes("webhooks.constructEvent(") &&
+    sources.native_stripe_provider.includes('data.headers["stripe-signature"]')
+  const pathYSubscriberEvents = Array.isArray(pathYSubscriberConfig.event)
+    ? pathYSubscriberConfig.event
+    : [pathYSubscriberConfig.event]
+  const pathYSignatureObserved =
+    sources.path_y_route.includes("verifyStripeSignature(") &&
+    /res\.status\(400\)\.json\(\{ type: "invalid_signature"/m.test(sources.path_y_route)
+  const retiredObserved =
+    retiredAUTHENTICATE === false && /res\.status\(410\)\.json\(/m.test(sources.retired_route)
+
+  return [
+    {
+      path: "/hooks/payment/stripe",
+      owner: nativeRouteObserved ? "medusa-native" : "gp",
+      status: nativeRouteObserved ? "live" : "retired",
+      signature_verifier: nativeRouteObserved && nativeSignatureObserved
+        ? "@medusajs/payment-stripe (webhooks.constructEvent w providerze, PO odpowiedzi 200)"
+        : "niezweryfikowany native hook",
+      barrier: nativeBarrierObserved
+        ? {
+            table: WEBHOOK_DELIVERY_BARRIER_TABLE,
+            provider: nativeProviderLiterals[0] ?? "nieznany_provider",
+          }
+        : null,
+      consumer_event: (Array.isArray(nativeSubscriberConfig.event)
+        ? nativeSubscriberConfig.event
+        : [nativeSubscriberConfig.event]
+      ).includes("payment.captured")
+        ? "payment.captured"
+        : null,
+      terminal_state: sources.native_issue.includes("EntitlementInstanceState.ACTIVE")
+        ? "ACTIVE"
+        : null,
+      nominal_http: nativeRouteObserved ? 200 : 500,
+    },
+    {
+      path: "/webhooks/stripe/payment-intent",
+      owner: sources.path_y_route.includes("export async function POST") ? "gp" : "medusa-native",
+      status: stripeMatchers().includes("/webhooks/stripe/payment-intent") ? "live" : "retired",
+      signature_verifier: pathYSignatureObserved
+        ? "route (HMAC-SHA256 na rawBody, fail-closed 400 PRZED odpowiedzią)"
+        : "niezweryfikowany podpis Path Y",
+      barrier: pathYBarrierObserved
+        ? { table: WEBHOOK_DELIVERY_BARRIER_TABLE, provider: STRIPE_PATH_Y_WEBHOOK_PROVIDER }
+        : null,
+      consumer_event: pathYSubscriberEvents.includes(PAYMENT_INTENT_SUCCEEDED_EVENT)
+        ? PAYMENT_INTENT_SUCCEEDED_EVENT
+        : null,
+      terminal_state:
+        sources.path_y_issue.includes("EntitlementInstanceState.ISSUED") &&
+        !sources.path_y_issue.includes("state: EntitlementInstanceState.ACTIVE")
+          ? "ISSUED"
+          : null,
+      nominal_http: /res\.status\(200\)\.json\(\{[\s\S]*received: true/m.test(sources.path_y_route)
+        ? 200
+        : 500,
+    },
+    {
+      path: "/webhooks/stripe",
+      owner: sources.retired_route.includes("export async function POST") ? "gp" : "medusa-native",
+      status: retiredObserved ? "retired" : "live",
+      signature_verifier: retiredObserved ? "brak (410 bez czytania body)" : "niezweryfikowana trasa retired",
+      barrier: null,
+      consumer_event: null,
+      terminal_state: null,
+      nominal_http: retiredObserved ? 410 : 500,
+    },
+  ]
+}
+
 describe("Story 3.1 AC1 — inwentaryzacja tras webhooka Stripe (inwentarz == repo)", () => {
   it("F-1: GP montuje dokładnie dwie trasy `/webhooks/stripe*` i NIE montuje `/hooks/payment/stripe` (to trasa natywna Medusy)", () => {
     const matchers = stripeMatchers()
+    expect(matchers).toHaveLength(2)
+    expect(new Set(matchers).size).toBe(2)
     expect(new Set(matchers)).toEqual(new Set(["/webhooks/stripe", "/webhooks/stripe/payment-intent"]))
     expect(matchers.some((m) => m.includes("/hooks/payment"))).toBe(false)
     // Path Y jest jedyną trasą GP, która MUSI mieć rawBody (podpis HMAC na bajtach).
@@ -236,34 +372,62 @@ describe("Story 3.1 AC1 — inwentaryzacja tras webhooka Stripe (inwentarz == re
   })
 
   it("F-8: inwentarz == obserwacja (komparator zwraca pusty diff)", () => {
-    const observed: StripeRouteInventoryEntry[] = STRIPE_ROUTE_INVENTORY.map((entry) => {
-      // Obserwacja odtwarza pola mierzalne z repo; pola opisowe kopiuje.
-      if (entry.path === "/webhooks/stripe") {
-        return { ...entry, status: "retired", nominal_http: 410, barrier: null, consumer_event: null }
-      }
-      if (entry.path === "/webhooks/stripe/payment-intent") {
-        const mounted = stripeMatchers().includes(entry.path)
-        return {
-          ...entry,
-          status: mounted ? "live" : "retired",
-          consumer_event: pathYSubscriberConfig.event as string,
-          barrier: { table: WEBHOOK_DELIVERY_BARRIER_TABLE, provider: STRIPE_PATH_Y_WEBHOOK_PROVIDER },
-        }
-      }
-      const nativeExists = existsSync(
-        path.join(resolveNativeMedusaPackageDir(), NATIVE_HOOK_ROUTE_RELPATH)
-      )
-      return {
-        ...entry,
-        status: nativeExists ? "live" : "retired",
-        barrier: { table: WEBHOOK_DELIVERY_BARRIER_TABLE, provider: STRIPE_NATIVE_WEBHOOK_PROVIDER },
-      }
-    })
+    const observed = observeRouteInventory(readRouteRepositorySources())
     expect(diffRouteInventory(STRIPE_ROUTE_INVENTORY, observed)).toEqual([])
   })
 })
 
-describe("Story 3.1 AC1 — kontrola negatywna komparatora (zmutowany inwentarz ⇒ niepusty diff)", () => {
+describe("Story 3.1 AC1 — kontrola negatywna z fixture'em źródeł repo", () => {
+  it("mutant route Path Y bez weryfikacji podpisu ⇒ obserwacja rozjeżdża signature_verifier", () => {
+    const sources = readRouteRepositorySources()
+    const observed = observeRouteInventory({
+      ...sources,
+      path_y_route: sources.path_y_route.replace("verifyStripeSignature(", "verifySignatureRemoved("),
+    })
+    expect(
+      diffRouteInventory(STRIPE_ROUTE_INVENTORY, observed).some((diff) =>
+        /^\/webhooks\/stripe\/payment-intent\.signature_verifier:/.test(diff)
+      )
+    ).toBe(true)
+  })
+
+  it("mutant retired route z 410 na 200 ⇒ obserwacja rozjeżdża status i nominal_http", () => {
+    const sources = readRouteRepositorySources()
+    const observed = observeRouteInventory({
+      ...sources,
+      retired_route: sources.retired_route.replace("res.status(410)", "res.status(200)"),
+    })
+    const diffs = diffRouteInventory(STRIPE_ROUTE_INVENTORY, observed)
+    expect(diffs.some((diff) => /^\/webhooks\/stripe\.status:/.test(diff))).toBe(true)
+    expect(diffs.some((diff) => /^\/webhooks\/stripe\.nominal_http:/.test(diff))).toBe(true)
+  })
+
+  it("mutant bez źródła native hooka ⇒ obserwacja rozjeżdża owner i status", () => {
+    const sources = readRouteRepositorySources()
+    const observed = observeRouteInventory({ ...sources, native_route: "" })
+    const diffs = diffRouteInventory(STRIPE_ROUTE_INVENTORY, observed)
+    expect(diffs.some((diff) => /^\/hooks\/payment\/stripe\.owner:/.test(diff))).toBe(true)
+    expect(diffs.some((diff) => /^\/hooks\/payment\/stripe\.status:/.test(diff))).toBe(true)
+  })
+
+  it("mutant bez constructEvent providera natywnego ⇒ obserwacja rozjeżdża signature_verifier", () => {
+    const sources = readRouteRepositorySources()
+    const observed = observeRouteInventory({
+      ...sources,
+      native_stripe_provider: sources.native_stripe_provider.replace(
+        "webhooks.constructEvent(",
+        "webhooks.constructEventRemoved("
+      ),
+    })
+    expect(
+      diffRouteInventory(STRIPE_ROUTE_INVENTORY, observed).some((diff) =>
+        /^\/hooks\/payment\/stripe\.signature_verifier:/.test(diff)
+      )
+    ).toBe(true)
+  })
+})
+
+describe("Story 3.1 AC1 — czysty komparator (zmutowany inwentarz ⇒ niepusty diff)", () => {
   it("usunięta trasa wycofana ⇒ diff nazywa brak", () => {
     const mutated = STRIPE_ROUTE_INVENTORY.filter((r) => r.path !== "/webhooks/stripe")
     const diffs = diffRouteInventory(STRIPE_ROUTE_INVENTORY, mutated)
