@@ -19,6 +19,7 @@ import path from "node:path"
 
 import { Migration20260818090000MoneyPathCompensationFailureTable } from "../../migrations/Migration20260818090000MoneyPathCompensationFailureTable"
 import { RECOVERY_POPULATION_TYPES } from "../../lib/recovery/recovery-action-contract"
+import { LiteValidator, type JsonSchema } from "../contracts/json-schema-lite"
 import {
   classifyHistoricalCompensationRow,
   COMPENSATION_FAILURE_TABLE,
@@ -44,6 +45,11 @@ class RecordingMigration extends Migration20260818090000MoneyPathCompensationFai
 
 const REPO_ROOT = path.resolve(__dirname, "../../../../../../..")
 const ADR_PATH = path.join(REPO_ROOT, "specs/adr/2026-09-06-adr-221-kontrakt-trzech-populacji-recovery-i-migracji.md")
+const POPULATION_SCHEMA = "recovery-population.v1.schema.json"
+const populationSchema = JSON.parse(
+  fs.readFileSync(path.join(REPO_ROOT, "specs/contracts/recovery/schemas", POPULATION_SCHEMA), "utf8")
+) as JsonSchema
+const populationValidator = new LiteValidator({ [POPULATION_SCHEMA]: populationSchema })
 
 const planFor = (pop: CarrierPlan["population_type"]): CarrierPlan => {
   const plan = RECOVERY_MIGRATION_PLAN.find((p) => p.population_type === pop)
@@ -176,6 +182,38 @@ describe("backfill bez wartości zastępczej", () => {
         recorded_by: { actor_type: "user", actor_id: "usr_1", auth_identity_id: null, session_source: "medusa_admin_session" },
       },
     })
+  })
+
+  it("zmaterializowany legacy row przechodzi recovery-population.v1 z pełnym evidence", () => {
+    const source = materializeCompensationBackfill(
+      [{ failure_id: "f2", market_id: "bongarden", resolution_state: "resolved_manually", resolved_by: "usr_1", resolved_at: "2026-08-19T12:04:55Z" }],
+      instanceByMarket,
+      certified
+    ).source_rows_after[0]
+    const contractRow = {
+      contract_version: "1.0.0",
+      population_type: "compensation_failure",
+      population_id: source.failure_id,
+      instance_id: source.instance_id,
+      market_id: source.market_id,
+      state: "closed_legacy_unevidenced",
+      owner: source.owner,
+      deadline: source.deadline,
+      retry_count: 0,
+      resolution_evidence: source.resolution_evidence,
+      version: 1,
+      occurred_at: "2026-08-19T12:00:00Z",
+      closure_path: "operator_action",
+      provenance: { kind: "backfilled_verified", source: INSTANCE_ID_BACKFILL_SOURCE },
+      payload: {
+        compensation_kind: "webhook_delivery_release",
+        delivery_path: "stripe_webhook",
+        stripe_event_id: "evt_legacy_1",
+        attempt_count: 1,
+        order_id: "order_legacy_1",
+      },
+    }
+    expect(populationValidator.validate(POPULATION_SCHEMA, contractRow)).toEqual([])
   })
 
   it("wiersz `resolved_manually` BEZ resolved_by → kwarantanna (nie ma nawet dowodu legacy)", () => {
