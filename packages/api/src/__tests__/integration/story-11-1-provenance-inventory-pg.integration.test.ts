@@ -76,8 +76,12 @@ describe("Story 11.1 — UNKNOWN legacy provenance", () => {
       await client.query(fixture)
       await setRuntime(client, "instance-a", "market-a")
       expect((await client.query("SELECT external_id FROM event_processed WHERE external_id = 'story-11-1-unknown'")).rows).toEqual([])
+      expect((await client.query("SELECT audit_id FROM voucher_claim_audit WHERE idempotency_key = 'story-11-1-unknown-audit'")).rows).toEqual([])
+      expect((await client.query("SELECT idempotency_key FROM voucher_claim_binding WHERE idempotency_key = 'story-11-1-unknown-binding'")).rows).toEqual([])
       await setRuntime(client, "instance-a", "market-b")
       expect((await client.query("SELECT external_id FROM event_processed WHERE external_id = 'story-11-1-unknown'")).rows).toEqual([])
+      expect((await client.query("SELECT audit_id FROM voucher_claim_audit WHERE idempotency_key = 'story-11-1-unknown-audit'")).rows).toEqual([])
+      expect((await client.query("SELECT idempotency_key FROM voucher_claim_binding WHERE idempotency_key = 'story-11-1-unknown-binding'")).rows).toEqual([])
     } finally {
       await client.query("RESET ROLE").catch(() => undefined)
       await client.query("ROLLBACK")

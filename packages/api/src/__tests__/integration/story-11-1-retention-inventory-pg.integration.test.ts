@@ -14,6 +14,14 @@ const inventory = JSON.parse(fs.readFileSync(
   carriers: Array<{ carrier: string; table: string; mechanism: string; remaining_count: string; relation_present: boolean }>
 }
 
+function assertReadOnlyInventory(candidate: typeof inventory): void {
+  for (const entry of candidate.carriers) {
+    if (/\b(DELETE|UPDATE|INSERT|TRUNCATE)\b/i.test(entry.mechanism)) {
+      throw new Error(`mutacja w inventory retention: ${entry.carrier}`)
+    }
+  }
+}
+
 describe("Story 11.1 — read-only retention inventory", () => {
   it("obejmuje sześć nośników, zapisuje wynik pomiaru z kontrolą relacji i nie zawiera mutacji", () => {
     expect(inventory.measurement_status).toBe("MEASURED")
@@ -25,14 +33,20 @@ describe("Story 11.1 — read-only retention inventory", () => {
       "order_metadata",
       "voucher_recipient_pii",
     ])
+    expect(() => assertReadOnlyInventory(inventory)).not.toThrow()
     for (const entry of inventory.carriers) {
       if (entry.relation_present) {
         expect(entry.remaining_count).toMatch(/^\d+$/)
       } else {
         expect(entry.remaining_count).toBe("ABSENT")
       }
-      expect(entry.mechanism).not.toMatch(/\b(DELETE|UPDATE|INSERT|TRUNCATE)\b/i)
     }
+  })
+
+  it("odrzuca mutant z mutacją retencji w read-only inventory", () => {
+    const mutant = structuredClone(inventory)
+    mutant.carriers[0]!.mechanism = "DELETE FROM voucher_recipient_pii"
+    expect(() => assertReadOnlyInventory(mutant)).toThrow(/mutacja/)
   })
 
   if (!enabled) {

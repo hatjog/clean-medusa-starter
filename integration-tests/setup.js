@@ -61,6 +61,12 @@ const { MetadataStorage } = require("@medusajs/framework/mikro-orm/core")
  */
 const TEST_TYPE = process.env.TEST_TYPE ?? ""
 const requiresIsolatedDb = /-pg$/.test(TEST_TYPE) || TEST_TYPE === "stripe-multi-order"
+// Story 11.1 ma jawny, niemutujący tryb NOT_RUN. Musi dać się uruchomić bez
+// URL-a, aby brak bezpiecznej bazy był widoczny jako wynik testu, a nie jako
+// błąd globalnego setupu. Każdy przebieg live nadal wymaga DATABASE_URL.
+const permitsDatabaseFreeNotRun =
+	TEST_TYPE === "story-11-1-runtime-recovery-pg" &&
+	process.env.GP_RUN_MIGRATION_INTEGRATION !== "1"
 const DEVELOPMENT_DATABASES = new Set(["gp_mercur", "gp_core", "gp_portal"])
 const MAINTENANCE_DATABASES = new Set(["postgres", "template1"])
 
@@ -125,21 +131,23 @@ function resolveDatabaseTarget() {
 	return { databaseUrl, dbName }
 }
 
-const resolvedDatabaseTarget = resolveDatabaseTarget()
+const resolvedDatabaseTarget = permitsDatabaseFreeNotRun ? null : resolveDatabaseTarget()
 
-if (DEVELOPMENT_DATABASES.has(resolvedDatabaseTarget.dbName)) {
+if (resolvedDatabaseTarget && DEVELOPMENT_DATABASES.has(resolvedDatabaseTarget.dbName)) {
 	throw new Error(
 		`[test-db-guard] Odmowa startu: rozwiazany DATABASE_URL wskazuje deweloperska baze '${resolvedDatabaseTarget.dbName}'. Ustaw izolowana baze testowa.`
 	)
 }
 
-process.env.DB_HOST ||= resolvedDatabaseTarget.databaseUrl.hostname
-process.env.DB_PORT ||= resolvedDatabaseTarget.databaseUrl.port
-process.env.DB_USERNAME ||= decodeURIComponent(resolvedDatabaseTarget.databaseUrl.username)
-process.env.DB_PASSWORD ||= decodeURIComponent(resolvedDatabaseTarget.databaseUrl.password)
+if (resolvedDatabaseTarget) {
+	process.env.DB_HOST ||= resolvedDatabaseTarget.databaseUrl.hostname
+	process.env.DB_PORT ||= resolvedDatabaseTarget.databaseUrl.port
+	process.env.DB_USERNAME ||= decodeURIComponent(resolvedDatabaseTarget.databaseUrl.username)
+	process.env.DB_PASSWORD ||= decodeURIComponent(resolvedDatabaseTarget.databaseUrl.password)
+}
 
 // ── WARSTWA A ────────────────────────────────────────────────────────────────
-if (requiresIsolatedDb) {
+if (requiresIsolatedDb && resolvedDatabaseTarget) {
 	const isTestDb =
 		/_test$/.test(resolvedDatabaseTarget.dbName) ||
 		extraAllowedDatabaseNames().includes(resolvedDatabaseTarget.dbName)

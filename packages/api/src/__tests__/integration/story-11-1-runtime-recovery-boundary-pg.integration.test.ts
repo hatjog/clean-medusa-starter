@@ -111,6 +111,19 @@ describe("Story 11.1 — RLS claim/issuance na rzeczywistym PostgreSQL", () => {
         { table_name: "voucher_claim_binding", privilege_type: "UPDATE" },
       ])
 
+      // Transportowy inbox zachowuje własny klucz; ten sam zakup może mieć
+      // jeden replay transportu i dokładnie jeden skutek business issuance.
+      expect((await client.query(
+        `INSERT INTO webhook_event_processed (event_id, provider, market_id, received_at, envelope)
+         VALUES ('story-11-1-transport', 'stripe', 'market-a', NOW(), '{}'::jsonb)
+         ON CONFLICT DO NOTHING`
+      )).rowCount).toBe(1)
+      expect((await client.query(
+        `INSERT INTO webhook_event_processed (event_id, provider, market_id, received_at, envelope)
+         VALUES ('story-11-1-transport', 'stripe', 'market-a', NOW(), '{}'::jsonb)
+         ON CONFLICT DO NOTHING`
+      )).rowCount).toBe(0)
+
       await configureRuntime(client, "instance-a", "market-a")
       await client.query(`INSERT INTO voucher_claim_audit (idempotency_key, code, ip, outcome, occurred_at, instance_id, market_id) VALUES ('story-11-1-audit', 'story-11-1-code', '127.0.0.1', 'ok', NOW(), 'instance-a', 'market-a')`)
       await client.query(`INSERT INTO voucher_claim_audit (idempotency_key, code, ip, outcome, occurred_at, instance_id, market_id) VALUES ('story-11-1-audit-chain', 'story-11-1-code', '127.0.0.1', 'idempotent_replay', NOW(), 'instance-a', 'market-a')`)
@@ -118,6 +131,10 @@ describe("Story 11.1 — RLS claim/issuance na rzeczywistym PostgreSQL", () => {
       await client.query(`INSERT INTO event_processed (external_id, event_type, processed_at, purchase_key, instance_id, market_id) VALUES ('story-11-1-issuance', 'issued', 1779016000000, 'story-11-1-purchase', 'instance-a', 'market-a')`)
       expect((await client.query("SELECT external_id FROM event_processed WHERE external_id = 'story-11-1-issuance'")).rows).toEqual([
         { external_id: "story-11-1-issuance" },
+      ])
+      await resetRuntime(client)
+      expect((await client.query("SELECT event_id FROM webhook_event_processed WHERE event_id = 'story-11-1-transport'")).rows).toEqual([
+        { event_id: "story-11-1-transport" },
       ])
       const auditChain = await client.query<{ idempotency_key: string; prev_row_hash: string | null; content_hash: string }>(
         "SELECT idempotency_key, prev_row_hash, content_hash FROM voucher_claim_audit WHERE idempotency_key IN ('story-11-1-audit', 'story-11-1-audit-chain') ORDER BY audit_id"
