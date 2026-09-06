@@ -51,8 +51,9 @@ const { MetadataStorage } = require("@medusajs/framework/mikro-orm/core")
  *
  * Reguła warstwy B: baza docelowa musi WYGLĄDAĆ NA TESTOWĄ (człon `test`
  * w nazwie), być bazą utrzymaniową (`postgres` — bez niej nie da się założyć
- * izolowanej bazy testowej), być wymieniona w `GP_TEST_DATABASE_NAMES` albo
- * przebieg musi nieść nazwę jawnie dopuszczoną w `GP_TEST_DATABASE_NAMES`.
+ * izolowanej bazy testowej) albo mieć wąski, rozpoznawalny wzorzec bazy
+ * jednorazowej Medusy. Zmienna środowiskowa może potwierdzić wyłącznie nazwę,
+ * która sama niesie oddzielny człon `test`; nie może otworzyć dowolnej bazy.
  * Wszystko inne (w tym `gp_mercur`, `gp_core`, `gp_portal`) jest odmową Z NAZWANĄ BAZĄ.
  *
  * Obie warstwy są TWARDE (rzucają), bo cichy przebieg na złej bazie kasuje dane
@@ -69,13 +70,14 @@ const permitsDatabaseFreeNotRun =
 	process.env.GP_RUN_MIGRATION_INTEGRATION !== "1"
 const DEVELOPMENT_DATABASES = new Set(["gp_mercur", "gp_core", "gp_portal"])
 const MAINTENANCE_DATABASES = new Set(["postgres", "template1"])
+const TEST_DATABASE_NAME_TOKEN = /(^|[_.-])test([_.-]|$)/i
 
-/** Nazwy dopuszczone jawnie przez środowisko (np. baza szablonowa CI). */
+/** Jawne wyjątki zachowują wyłącznie nazwy, które same deklarują cel testowy. */
 function extraAllowedDatabaseNames() {
 	return (process.env.GP_TEST_DATABASE_NAMES ?? "")
 		.split(",")
 		.map((entry) => entry.trim())
-		.filter(Boolean)
+		.filter((entry) => TEST_DATABASE_NAME_TOKEN.test(entry))
 }
 
 /**
@@ -86,9 +88,8 @@ function extraAllowedDatabaseNames() {
  */
 function looksLikeTestDatabase(dbName) {
 	return (
-		/(^|[_.-])test([_.-]|$)/i.test(dbName) ||
-		EPHEMERAL_MEDUSA_DB.test(dbName) ||
-		extraAllowedDatabaseNames().includes(dbName)
+		TEST_DATABASE_NAME_TOKEN.test(dbName) ||
+		EPHEMERAL_MEDUSA_DB.test(dbName)
 	)
 }
 
@@ -102,6 +103,20 @@ function looksLikeTestDatabase(dbName) {
  * bronić. Wzorzec jest WĄSKI i przypięty do generatora nazw z test-utils.
  */
 const EPHEMERAL_MEDUSA_DB = /^medusa-[a-z0-9._-]*integration-\d+$/i
+
+/**
+ * Profile, ktore w ogole nie siegaja po Postgresa. Dla nich brak DATABASE_URL
+ * nie jest bledem konfiguracji, tylko normalnym stanem — a twarde zadanie
+ * adresu bazy przy starcie kasowalo cala suite jednostkowa, ktora zadnego
+ * polaczenia nie otwiera. WARSTWA B zostaje uzbrojona tak czy inaczej, wiec
+ * proba polaczenia nadal jest blokowana przy `Client.connect`, czyli w
+ * momencie, w ktorym fakt siegania po baze jest realny, a nie deklarowany.
+ */
+const DATABASE_FREE_TEST_TYPES = new Set(["unit", "patches"])
+const hasDatabaseUrl =
+	typeof process.env.DATABASE_URL === "string" && process.env.DATABASE_URL.trim() !== ""
+const skipDatabaseTargetResolution =
+	!hasDatabaseUrl && !requiresIsolatedDb && DATABASE_FREE_TEST_TYPES.has(TEST_TYPE)
 
 function resolveDatabaseTarget() {
 	const rawDatabaseUrl = process.env.DATABASE_URL
@@ -122,6 +137,12 @@ function resolveDatabaseTarget() {
 		)
 	}
 
+	if (databaseUrl.protocol !== "postgres:" && databaseUrl.protocol !== "postgresql:") {
+		throw new Error(
+			"[test-db-guard] DATABASE_URL musi uzywac schematu postgres albo postgresql; suita odmawia startu bez bezpiecznego celu bazy."
+		)
+	}
+
 	if (!dbName) {
 		throw new Error(
 			"[test-db-guard] DATABASE_URL musi zawierac nazwe bazy; suita odmawia startu bez bezpiecznego celu."
@@ -131,23 +152,29 @@ function resolveDatabaseTarget() {
 	return { databaseUrl, dbName }
 }
 
-const resolvedDatabaseTarget = permitsDatabaseFreeNotRun ? null : resolveDatabaseTarget()
+// Dwa NIEZALEZNE powody, by nie rozwiazywac celu bazy, i zaden nie zawiera drugiego:
+// Story 11.1 daje jawny, niemutujacy tryb NOT_RUN dla swojego TEST_TYPE, zeby brak
+// bezpiecznej bazy byl WYNIKIEM TESTU, a nie awaria globalnego setupu; Story 7.2 pomija
+// rozwiazywanie dla typow bezbazowych (`unit`, `patches`), gdy DATABASE_URL nie ma wcale.
+// Scalone alternatywa: wybor jednej strony konfliktu cofnalby bramke drugiej story.
+const resolvedDatabaseTarget =
+	permitsDatabaseFreeNotRun || skipDatabaseTargetResolution ? null : resolveDatabaseTarget()
 
-if (resolvedDatabaseTarget && DEVELOPMENT_DATABASES.has(resolvedDatabaseTarget.dbName)) {
-	throw new Error(
-		`[test-db-guard] Odmowa startu: rozwiazany DATABASE_URL wskazuje deweloperska baze '${resolvedDatabaseTarget.dbName}'. Ustaw izolowana baze testowa.`
-	)
-}
+if (resolvedDatabaseTarget !== null) {
+	if (DEVELOPMENT_DATABASES.has(resolvedDatabaseTarget.dbName)) {
+		throw new Error(
+			`[test-db-guard] Odmowa startu: rozwiazany DATABASE_URL wskazuje deweloperska baze '${resolvedDatabaseTarget.dbName}'. Ustaw izolowana baze testowa.`
+		)
+	}
 
-if (resolvedDatabaseTarget) {
 	process.env.DB_HOST ||= resolvedDatabaseTarget.databaseUrl.hostname
 	process.env.DB_PORT ||= resolvedDatabaseTarget.databaseUrl.port
 	process.env.DB_USERNAME ||= decodeURIComponent(resolvedDatabaseTarget.databaseUrl.username)
 	process.env.DB_PASSWORD ||= decodeURIComponent(resolvedDatabaseTarget.databaseUrl.password)
 }
 
-// ── WARSTWA A ────────────────────────────────────────────────────────────────
-if (requiresIsolatedDb && resolvedDatabaseTarget) {
+// ── WARSTWA A ────────────────────────────────────────────────────────
+if (requiresIsolatedDb && resolvedDatabaseTarget !== null) {
 	const isTestDb =
 		/_test$/.test(resolvedDatabaseTarget.dbName) ||
 		extraAllowedDatabaseNames().includes(resolvedDatabaseTarget.dbName)
@@ -155,8 +182,7 @@ if (requiresIsolatedDb && resolvedDatabaseTarget) {
 	if (!isTestDb) {
 		throw new Error(
 			`[test-db-guard] TEST_TYPE=${TEST_TYPE} ZAKLADA I KASUJE tabele, a DATABASE_URL wskazuje baze ` +
-				`'${resolvedDatabaseTarget.dbName}', ktora nie wyglada na testowa (oczekiwany sufiks '_test' albo wpis ` +
-				`w GP_TEST_DATABASE_NAMES).\n` +
+				`'${resolvedDatabaseTarget.dbName}', ktora nie wyglada na testowa (oczekiwany sufiks '_test').\n` +
 				`Uruchomienie na tej bazie skasowaloby z niej tabele i dane — 2026-08-09 dokladnie tak ` +
 				`zniknely 4 tabele i zawartosc 'entitlement_instance' oraz 'seller' z bazy deweloperskiej.\n` +
 				`Wskaz izolowana baze: DATABASE_URL=postgres://.../<nazwa>_test`
@@ -166,6 +192,15 @@ if (requiresIsolatedDb && resolvedDatabaseTarget) {
 
 // ── WARSTWA B ────────────────────────────────────────────────────────────────
 function assertConnectionTargetIsIsolated(dbName, host) {
+	// Zakaz baz deweloperskich pozostaje jawny, a allowlista może potwierdzić
+	// wyłącznie nazwę z oddzielnym członem `test`. W przeciwnym razie nazwa
+	// produkcyjna w środowisku otwierałaby połączenie mimo bezpiecznego startu suity.
+	if (DEVELOPMENT_DATABASES.has(dbName)) {
+		throw new Error(
+			`[test-db-guard] SUITA TESTOWA PROBUJE SIE POLACZYC Z DEWELOPERSKA BAZA '${dbName}' (host: ${host || "?"}). Odmowa przed polaczeniem.`
+		)
+	}
+
 	if (!dbName || MAINTENANCE_DATABASES.has(dbName) || looksLikeTestDatabase(dbName)) {
 		return
 	}
@@ -178,7 +213,7 @@ function assertConnectionTargetIsIsolated(dbName, host) {
 			`danych z bazy deweloperskiej przez suity biegnace pod profilem, ktory tego nie deklarowal.\n` +
 			`Testy dotykajace Postgresa maja brac adres z DEDYKOWANEJ zmiennej (wzorzec: ` +
 			`GP_CORE_RLS_TEST_DATABASE_URL) i POMIJAC sie, gdy jej nie ma — nigdy z fallbacku na DATABASE_URL.\n` +
-			`Wskaz izolowana baze (czlon 'test' w nazwie) albo dopisz nazwe do GP_TEST_DATABASE_NAMES.`
+			`Wskaz izolowana baze z czlonem 'test' w nazwie albo jawnie potwierdz taka nazwe w GP_TEST_DATABASE_NAMES.`
 	)
 }
 

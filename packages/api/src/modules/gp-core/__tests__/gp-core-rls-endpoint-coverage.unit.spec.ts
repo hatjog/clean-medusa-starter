@@ -6,13 +6,11 @@
  * connection role allowed to `SET LOCAL ROLE gp_core_runtime`.
  *
  * Run:
- *   GP_TEST_DATABASE_NAMES=gp_core \
- *   GP_CORE_RLS_TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/gp_core \
+ *   GP_CORE_RLS_TEST_DATABASE_URL=postgres://<rola>:<redacted>@127.0.0.1:55432/gp_mercur_test \
  *
- * `GP_TEST_DATABASE_NAMES` jest WYMAGANE: warstwa B bramki izolacji
- * (`integration-tests/setup.js`) odmawia połączenia do bazy, której nazwa nie
- * niesie członu `test` — a ta suita pisze do `gp_core.entitlements`. Wskazanie
- * bazy jednorazowej (`…_test`) jest bezpieczniejsze niż dopisanie `gp_core`.
+ * Warstwa B bramki izolacji (`integration-tests/setup.js`) odmawia połączenia
+ * do bazy, której nazwa nie niesie członu `test`. Ta suita zapisuje do
+ * `gp_core.entitlements`, dlatego adres musi wskazywać odrębną bazę `…_test`.
  *     pnpm jest packages/api/src/modules/gp-core/__tests__/gp-core-rls-endpoint-coverage.unit.spec.ts --runInBand
  *
  * Smoke psql:

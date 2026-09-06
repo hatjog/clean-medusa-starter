@@ -143,13 +143,13 @@ describe("AC2.4 — walidacja PRZED zapisem", () => {
   )
 
   it.each([
-    [null],
-    [{}],
-    [{ default: "pl" }],
-    [{ default: "pl", supported: [] }],
-    [{ default: "pl", supported: ["en"] }],
-    [{ default: "", supported: ["pl"] }],
-  ])("odrzuca niepoprawny blok locales: %p", (block) => {
+    ["null", null],
+    ["pusty obiekt", {}],
+    ["brak supported", { default: "pl" }],
+    ["puste supported", { default: "pl", supported: [] }],
+    ["default poza supported", { default: "pl", supported: ["en"] }],
+    ["pusty default", { default: "", supported: ["pl"] }],
+  ])("odrzuca niepoprawny blok locales (%s): %p", (_caseName, block) => {
     expect(() => normalizeLocalesBlock(block)).toThrow(
       MarketRuntimeConfigInvalidError,
     )
