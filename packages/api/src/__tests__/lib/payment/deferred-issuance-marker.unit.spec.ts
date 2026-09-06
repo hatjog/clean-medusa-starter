@@ -141,14 +141,16 @@ describe("route: ślad tylko dla wyścigu przejściowego", () => {
   })
 
   it("kluczem śladu jest `deliveryEventId`, nie `stripeEvent.id`", () => {
-    // Transport ma dla zdarzenia bez `id` świadomy fallback
-    // `deliveryEventId = stripeEvent.id ?? "stripe:pi:<pi>"`. Bramka na
-    // `stripeEvent.id` zostawiała takie zdarzenia zupełnie bez śladu.
+    // Brak, nie-string albo wartość z białym znakiem `event.id` jest odrzucana
+    // przed PG. Nie istnieje fallback po PaymentIntencie, bo scalałby dostawy
+    // bez wspólnej, podpisanej tożsamości Stripe.
     const call = ROUTE.indexOf("persistDeferredIssuanceMarker(handle.client")
     const body = ROUTE.slice(call, call + 400)
     expect(body).toContain("event_id: deliveryEventId")
     expect(body).not.toContain("event_id: stripeEvent.id")
-    expect(ROUTE).toContain("const deliveryEventId = stripeEvent.id ??")
+    expect(ROUTE).toContain("const submittedEventId = stripeEvent.id")
+    expect(ROUTE).toContain("const deliveryEventId = submittedEventId")
+    expect(ROUTE).not.toContain('"stripe:pi:${paymentIntentId}"')
   })
 
   it("pominięcie śladu ZOSTAWIA sygnał — cisza jest nieodróżnialna od awarii", () => {

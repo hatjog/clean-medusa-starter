@@ -14,7 +14,7 @@
  * Fixture (tabele tymczasowe) jest kopią 1:1 z
  * `stripe-payment-intent-multi-order-pg.integration.test.ts` — celowo, żeby
  * kontrakt ACK był mierzony na TYM SAMYM kształcie danych co kontrakt ADR-166.
- * Wymaga `DATABASE_URL` do IZOLOWANEJ DB z tabelą `money_path_compensation_failure`
+ * Wymaga jawnego `GP_STORY_3_1_TEST_DATABASE_URL` do IZOLOWANEJ DB z tabelą `money_path_compensation_failure`
  * (route czyta rejestr kompensacji w gałęzi duplikatu). Bez izolowanego
  * `DATABASE_URL` suita kończy się błędem precondition — `skip` nie jest
  * wynikiem bramki AC3.
@@ -39,27 +39,55 @@ import {
   STRIPE_PATH_Y_WEBHOOK_PROVIDER,
 } from "../../lib/payment/stripe-webhook-barrier-contract"
 
-const DATABASE_URL = process.env.DATABASE_URL
+const STORY_TEST_DATABASE_URL_ENV = "GP_STORY_3_1_TEST_DATABASE_URL"
+const DATABASE_URL = process.env[STORY_TEST_DATABASE_URL_ENV]
 
-function hasIsolatedDatabaseUrl(value: string | undefined): boolean {
+function hasTrustedStoryTestDatabaseUrl(
+  value: string | undefined,
+  configuredDatabaseUrl = process.env.DATABASE_URL
+): boolean {
   if (!value) return false
+  if (configuredDatabaseUrl !== value) return false
   try {
-    const databaseName = decodeURIComponent(new URL(value).pathname).replace(/^\//, "")
-    return /_test$/i.test(databaseName)
+    const url = new URL(value)
+    const databaseName = decodeURIComponent(url.pathname).replace(/^\//, "")
+    return (
+      (url.protocol === "postgres:" || url.protocol === "postgresql:") &&
+      databaseName === "gp_story_3_1_test" &&
+      ["localhost", "127.0.0.1", "::1"].includes(url.hostname)
+    )
   } catch {
     return false
   }
 }
 
-const HAS_ISOLATED_DATABASE_URL = hasIsolatedDatabaseUrl(DATABASE_URL)
+const HAS_TRUSTED_STORY_TEST_DATABASE_URL = hasTrustedStoryTestDatabaseUrl(DATABASE_URL)
 
 describe("Story 3.1 AC3 — precondition PostgreSQL", () => {
-  it("wymaga DATABASE_URL do izolowanej bazy *_test; brak nie może dać PASS przez skip", () => {
-    expect(HAS_ISOLATED_DATABASE_URL).toBe(true)
+  it("wymaga jawnego URL tej story, zgodnego z DATABASE_URL; brak nie może dać PASS przez skip", () => {
+    expect(HAS_TRUSTED_STORY_TEST_DATABASE_URL).toBe(true)
+  })
+
+  it("odrzuca URL produkcyjnego hosta lub obcej bazy nawet z sufiksem _test", () => {
+    const safe = "postgres://test_runner:secret@localhost:5432/gp_story_3_1_test"
+    expect(hasTrustedStoryTestDatabaseUrl(safe, safe)).toBe(true)
+    expect(
+      hasTrustedStoryTestDatabaseUrl(
+        "postgres://prod_role:secret@prod-db.internal:5432/gp_story_3_1_test",
+        "postgres://prod_role:secret@prod-db.internal:5432/gp_story_3_1_test"
+      )
+    ).toBe(false)
+    expect(
+      hasTrustedStoryTestDatabaseUrl(
+        "postgres://test_runner:secret@localhost:5432/gp_mercur_test",
+        "postgres://test_runner:secret@localhost:5432/gp_mercur_test"
+      )
+    ).toBe(false)
+    expect(hasTrustedStoryTestDatabaseUrl(safe, "postgres://test_runner:secret@localhost:5432/other_test")).toBe(false)
   })
 })
 
-const runWithIsolatedDatabase = HAS_ISOLATED_DATABASE_URL ? describe : describe.skip
+const runWithIsolatedDatabase = HAS_TRUSTED_STORY_TEST_DATABASE_URL ? describe : describe.skip
 
 const SECRET = "whsec_3_1_owed_unit_ack"
 const EVENT_ID = "evt_3_1_owed_unit_ack"
