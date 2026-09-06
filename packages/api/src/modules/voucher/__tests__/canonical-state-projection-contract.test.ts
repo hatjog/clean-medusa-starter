@@ -14,7 +14,7 @@ const VOCABULARY_PATH = resolve(
 
 type MappingRow = {
   legacy: string
-  canonical: string
+  canonical: string[]
 }
 
 function readContract(): string {
@@ -26,12 +26,16 @@ function readVocabularyStates(): MappingRow[] {
   const rows: MappingRow[] = []
   const lines = yaml.split("\n")
   for (let index = 0; index < lines.length; index += 1) {
-    const id = lines[index].match(/^\s{6}- id:\s*([a-z_]+)\s*$/)?.[1]
+    const id = lines[index].match(/^\s*- id:\s*([a-z_]+)\s*$/)?.[1]
     if (!id) continue
-    const nextState = lines.slice(index + 1, index + 8).find((line) => line.includes("maps_to_entitlement_states:"))
-    const canonical = nextState?.match(/\[([^\]]+)/)?.[1]?.split(",")[0]?.trim()
-    if (canonical) rows.push({ legacy: id, canonical })
+    const nextState = lines.slice(index + 1).find((line) => line.includes("maps_to_entitlement_states:"))
+    const canonical = nextState?.match(/\[([^\]]+)\]/)?.[1]
+      ?.split(",")
+      .map((value) => value.trim())
+      .filter(Boolean)
+    if (canonical?.length) rows.push({ legacy: id, canonical })
   }
+  expect(rows).not.toHaveLength(0)
   return rows
 }
 
@@ -82,7 +86,13 @@ function assertContractShape(document: string): void {
   expect(mappingRows.some((row) => row[0] === "uprawnienie" && row[1].includes("entitlement_instance.state"))).toBe(true)
   expect(mappingRows.some((row) => row[0] === "kod vouchera" && row[1].includes("voucher_status"))).toBe(true)
   for (const state of readVocabularyStates()) {
-    expect(mappingRows.some((row) => row[0] === "kod vouchera" && row[1].includes(state.legacy) && row[1].includes(state.canonical))).toBe(true)
+    for (const canonical of state.canonical) {
+      expect(
+        mappingRows.some(
+          (row) => row[0] === "kod vouchera" && row[1].includes(`\`${state.legacy}\` → \`${canonical}\``)
+        )
+      ).toBe(true)
+    }
   }
 
   for (const [producer, consumer] of [
@@ -109,6 +119,7 @@ describe("Story 3.6 AC2 — strukturalny draft kanonicznej projekcji", () => {
   it.each([
     ["brak mapowania legacy", (document: string) => document.replace("| kod vouchera |", "| usunięty wiersz |")],
     ["zmiana wartości refunded", (document: string) => document.replace("`refunded` → `REFUNDED`", "`refunded` → `ISSUED`")],
+    ["zmiana drugiej wartości idle", (document: string) => document.replace("`idle` → `ACTIVE`", "`idle` → `VOIDED`")],
     ["zmiana konsumenta", (document: string) => document.replace("voucher-live-issue` → `live-issue-from-payment-intent.ts", "voucher-live-issue` → `wrong-consumer.ts")],
     ["zlanie osi triggera i skutku", (document: string) => document.replace("Dowód skutku aktywacji", "Dowód aktywacji")],
     ["przedwczesny wybór triggera", (document: string) => document.replace("pozostaje wyłącznie kandydatem triggera", "jest wybranym triggerem")],
