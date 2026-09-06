@@ -127,6 +127,22 @@ describe("NOT NULL dla nowych danych i brak default poza licznikami", () => {
     expect(backfill.sql_shape).toMatch(/BEGIN;.*COMMIT;/)
     expect(step.sql_shape).toMatch(/PRECONDITION: count\(\*\) WHERE instance_id IS NULL OR owner_id IS NULL OR deadline IS NULL/)
   })
+
+  it("literalny SQL kwalifikuje pełne certyfikowane metadata i nie tylko niepuste kolumny", () => {
+    const backfill = planFor("compensation_failure").up.find((s) => s.id === "cf-backfill")!
+    const remap = planFor("compensation_failure").up.find((s) => s.id === "cf-remap-legacy-resolved")!
+    for (const sql of [backfill.sql_shape, remap.sql_shape]) {
+      expect(sql).toContain("owner_type IN ('operator_role','operator_user')")
+      expect(sql).toContain("lower(btrim(")
+      expect(sql).toContain("NOT IN ('unknown','default','null','none','n/a','tbd','todo','unassigned')")
+      expect(sql).toContain("deadline::text ~")
+      expect(sql).toContain("jsonb_typeof(")
+      expect(sql).toContain("legacy_resolver->>'actor_type'='user'")
+      expect(sql).toContain("legacy_resolver->>'actor_id'=c.resolved_by")
+      expect(sql).toContain("legacy_resolver->>'session_source'='medusa_admin_session'")
+    }
+    expect(backfill.sql_shape).toContain("missing certified scope, owner, deadline, or legacy resolver evidence")
+  })
 })
 
 describe("backfill bez wartości zastępczej", () => {

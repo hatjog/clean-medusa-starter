@@ -10,9 +10,9 @@
  * Kontrakt jako kod (`specs/contracts/recovery/`):
  *
  *  1. AKTOR i AUTORYZACJA pochodzą WYŁĄCZNIE z surowych, serwerowych wyników
- *     `withOperatorAuth` oraz `resolveAdminMarketContext`. Publiczne wejście kernela
- *     NIE przyjmuje gotowego aktora ani grantu: wyprowadza oba wewnątrz, a wynik
- *     resolvera musi być przypisany do tego samego aktora sesji.
+ *     `withOperatorAuth` oraz `resolveAdminMarketContext`. `establishRecoveryServerSession`
+ *     wiąże je przed wejściem do kernela; publiczne wejście przyjmuje tylko opaque
+ *     capability zapisane w prywatnym WeakMap, nie ręcznie składany aktor ani grant.
  *  2. AUTORYZACJA RYNKU jest wynikiem `resolveAdminMarketContext` (`super_admin` |
  *     `market_grant`); brak dostępu albo rozbieżność aktora =
  *     `refused_market_forbidden`, bez skutku.
@@ -254,15 +254,80 @@ export interface IdempotencyLedger {
   findApplied(idempotencyKey: string): RecoveryActionAuditRecord | undefined
 }
 
-export type ApplyRecoveryIntentInput = {
-  record: RecoveryRecordView
-  intent: RecoveryIntent
-  /** Niesfałszowany kontekst ustawiony wyłącznie przez `withOperatorAuth`. */
+declare const recoveryServerSessionBrand: unique symbol
+
+/**
+ * Opaque capability wystawiana wyłącznie po związaniu wyniku `withOperatorAuth`
+ * z wynikiem `resolveAdminMarketContext`. Nie ma eksportowanego konstruktora ani
+ * pól, które wywołujący mógłby złożyć z body żądania.
+ */
+export type RecoveryServerSession = {
+  readonly [recoveryServerSessionBrand]: true
+}
+
+type RecoveryServerSessionState = {
+  actor: SessionActor
+  authorization: MarketAuthorization
+  instance_id: string
+  market_id: string
+}
+
+const issuedRecoveryServerSessions = new WeakMap<object, RecoveryServerSessionState>()
+
+export type EstablishRecoveryServerSessionInput = {
+  /** Wartość ustawiona przez `withOperatorAuth`, nigdy pole body. */
   operatorAuth: OperatorAuthContext | undefined | null
   /** Wynik serwerowego `resolveAdminMarketContext` dla tej samej sesji. */
   marketContext: AdminMarketContextResult
-  /** instance_id sesji serwera; nie pochodzi z body ani z wiersza. */
+  /** instance_id runtime sesji serwera, nie wartość z body. */
   sessionInstanceId: string
+  /** Wiersz, dla którego resolver ocenia market i instancję. */
+  record: Pick<RecoveryRecordView, "instance_id" | "market_id">
+}
+
+/**
+ * Wiąże źródła serwerowe z zakresem wiersza, zanim intencja trafi do kernela.
+ * `applyRecoveryIntent` przyjmuje wyłącznie wynik tej funkcji i dodatkowo
+ * sprawdza jego obecność w prywatnym WeakMap, więc ręcznie złożony obiekt nie
+ * może dostać się do ścieżki skutku domenowego.
+ */
+export function establishRecoveryServerSession(input: EstablishRecoveryServerSessionInput): RecoveryServerSession {
+  const actor = deriveSessionActor(input.operatorAuth)
+  if (!actor) {
+    throw new RecoveryUnauthenticatedError()
+  }
+  const authorization = authorizeRecoveryMarket({
+    actor,
+    marketContext: input.marketContext,
+    sessionInstanceId: input.sessionInstanceId,
+    record: input.record,
+  })
+  const session = Object.freeze({}) as RecoveryServerSession
+  issuedRecoveryServerSessions.set(session, {
+    actor,
+    authorization,
+    instance_id: input.record.instance_id,
+    market_id: input.record.market_id,
+  })
+  return session
+}
+
+function readRecoveryServerSession(session: RecoveryServerSession | undefined): RecoveryServerSessionState {
+  if (!session || typeof session !== "object") {
+    throw new RecoveryUnauthenticatedError()
+  }
+  const state = issuedRecoveryServerSessions.get(session)
+  if (!state) {
+    throw new RecoveryUnauthenticatedError()
+  }
+  return state
+}
+
+export type ApplyRecoveryIntentInput = {
+  record: RecoveryRecordView
+  intent: RecoveryIntent
+  /** Opaque capability z `establishRecoveryServerSession`, nie dane z body. */
+  recoverySession: RecoveryServerSession
   ledger: IdempotencyLedger
   now: string
   auditId: string
@@ -288,19 +353,12 @@ function snapshot(record: RecoveryRecordView): StateSnapshot {
  */
 export function applyRecoveryIntent(input: ApplyRecoveryIntentInput): ApplyRecoveryIntentResult {
   const { record, intent, ledger } = input
-  // Nie przyjmujemy `SessionActor`/`MarketAuthorization` od wywołującego. Oba
-  // fakty są wyprowadzane razem z surowych ogniw serwera, zanim kernel oceni
-  // klucz, wersję albo przejście.
-  const actor = deriveSessionActor(input.operatorAuth)
-  if (!actor) {
-    throw new RecoveryUnauthenticatedError()
-  }
-  const authorization = authorizeRecoveryMarket({
-    actor,
-    marketContext: input.marketContext,
-    sessionInstanceId: input.sessionInstanceId,
-    record,
-  })
+  const serverSession = readRecoveryServerSession(input.recoverySession)
+  const actor = serverSession.actor
+  const authorization =
+    serverSession.instance_id === record.instance_id && serverSession.market_id === record.market_id
+      ? serverSession.authorization
+      : { market_access: "none" as const, decision: "denied" as const }
   const before = snapshot(record)
 
   const refuse = (outcome: RecoveryOutcome, actorForAudit: SessionActor): ApplyRecoveryIntentResult => ({

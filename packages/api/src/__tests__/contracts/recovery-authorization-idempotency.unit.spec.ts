@@ -32,12 +32,14 @@ import {
   authorizeRecoveryMarket,
   buildRecoveryIdempotencyKey,
   deriveSessionActor,
+  establishRecoveryServerSession,
   RecoveryUnauthenticatedError,
   type IdempotencyLedger,
   type ApplyRecoveryIntentInput,
   type RecoveryActionAuditRecord,
   type RecoveryIntent,
   type RecoveryRecordView,
+  type RecoveryServerSession,
   type ResolutionEvidence,
 } from "../../lib/recovery/recovery-action-contract"
 import { LiteValidator, type JsonSchema } from "./json-schema-lite"
@@ -158,18 +160,22 @@ function serverContext(
   marketId = "bonbeauty",
   isSuperAdmin = false,
   sessionInstanceId = SESSION_INSTANCE
-): Pick<ApplyRecoveryIntentInput, "operatorAuth" | "marketContext" | "sessionInstanceId"> {
+): Pick<ApplyRecoveryIntentInput, "recoverySession"> {
+  const record = baseRecord()
   return {
-    operatorAuth: { actor_id: actorId, actor_type: "user" },
-    marketContext: {
-      ok: true,
-      market_id: marketId,
-      actor_id: actorId,
-      actor_type: "user",
-      is_super_admin: isSuperAdmin,
-      source: "intrinsic",
-    },
-    sessionInstanceId,
+    recoverySession: establishRecoveryServerSession({
+      operatorAuth: { actor_id: actorId, actor_type: "user" },
+      marketContext: {
+        ok: true,
+        market_id: marketId,
+        actor_id: actorId,
+        actor_type: "user",
+        is_super_admin: isSuperAdmin,
+        source: "intrinsic",
+      },
+      sessionInstanceId,
+      record,
+    }),
   }
 }
 
@@ -248,9 +254,7 @@ describe("aktor pochodzi z sesji (withOperatorAuth), body jest ignorowane", () =
       applyRecoveryIntent({
         record,
         intent: intentFor(record, "escalate", { target_state: "recovery_in_progress" }),
-        operatorAuth,
-        marketContext: { ok: false, status: 401, code: "UNAUTHORIZED", message: "missing session" },
-        sessionInstanceId: SESSION_INSTANCE,
+        recoverySession: undefined as unknown as RecoveryServerSession,
         ledger: new MemoryLedger(),
         now: "2026-09-06T12:00:00Z",
         auditId: nextAuditId(),
@@ -265,13 +269,14 @@ describe("aktor pochodzi z sesji (withOperatorAuth), body jest ignorowane", () =
     expect(deriveSessionActor(operatorAuth)).toBeNull()
   })
 
-  it("stare wejście z osobnym actor/grant nie jest wejściem kernela i nie daje skutku", () => {
+  it("ręcznie złożony actor/grant ani token nie są wejściem kernela i nie dają skutku", () => {
     const record = baseRecord()
     const legacyForgedInput = {
       record,
       intent: intentFor(record, "escalate", { target_state: "recovery_in_progress" }),
       actor: { actor_type: "user", actor_id: "usr_FROM_BODY_ATTACKER", auth_identity_id: null, session_source: "medusa_admin_session" },
       authorization: { market_access: "super_admin", decision: "granted" },
+      recoverySession: {} as RecoveryServerSession,
       ledger: new MemoryLedger(),
       now: "2026-09-06T12:00:00Z",
       auditId: nextAuditId(),
@@ -303,9 +308,12 @@ describe("autoryzacja rynku i instancji wiersza (resolveAdminMarketContext)", ()
     const result = applyRecoveryIntent({
       record,
       intent: intentFor(record, "escalate", { target_state: "recovery_in_progress" }),
-      operatorAuth: { actor_id: OUTSIDER, actor_type: "user" },
-      marketContext: ctx,
-      sessionInstanceId: SESSION_INSTANCE,
+      recoverySession: establishRecoveryServerSession({
+        operatorAuth: { actor_id: OUTSIDER, actor_type: "user" },
+        marketContext: ctx,
+        sessionInstanceId: SESSION_INSTANCE,
+        record,
+      }),
       ledger: new MemoryLedger(),
       now: "2026-09-06T12:00:00Z",
       auditId: nextAuditId(),
@@ -346,12 +354,22 @@ describe("autoryzacja rynku i instancji wiersza (resolveAdminMarketContext)", ()
 
   it("wynik resolvera innego aktora nie może dać grantu bieżącej sesji", () => {
     const record = baseRecord()
-    const trustedForOperator = serverContext(OPERATOR)
     const result = applyRecoveryIntent({
       record,
       intent: intentFor(record, "escalate", { target_state: "recovery_in_progress" }),
-      ...trustedForOperator,
-      operatorAuth: { actor_id: OUTSIDER, actor_type: "user" },
+      recoverySession: establishRecoveryServerSession({
+        operatorAuth: { actor_id: OUTSIDER, actor_type: "user" },
+        marketContext: {
+          ok: true,
+          market_id: "bonbeauty",
+          actor_id: OPERATOR,
+          actor_type: "user",
+          is_super_admin: false,
+          source: "intrinsic",
+        },
+        sessionInstanceId: SESSION_INSTANCE,
+        record,
+      }),
       ledger: new MemoryLedger(),
       now: "2026-09-06T12:00:00Z",
       auditId: nextAuditId(),

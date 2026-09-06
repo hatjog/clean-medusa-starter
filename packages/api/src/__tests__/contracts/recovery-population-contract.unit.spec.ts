@@ -59,6 +59,28 @@ const FROZEN_V1_STATES = {
   dlq_entry: ["dlq_pending_retry", "dlq_pending_ops_review", "replayed", "discarded_with_evidence"],
 } as const
 
+const FROZEN_V1_TRANSITIONS = {
+  compensation_failure: {
+    open: ["recovery_in_progress", "resolved_recovered", "closed_unrecoverable"],
+    recovery_in_progress: ["open", "resolved_recovered", "closed_unrecoverable"],
+    resolved_recovered: [],
+    closed_unrecoverable: [],
+    closed_legacy_unevidenced: [],
+  },
+  deferred_issuance_trace: {
+    awaiting_order: ["escalated", "issued_after_link", "closed_order_never_created"],
+    escalated: ["issued_after_link", "closed_order_never_created"],
+    issued_after_link: [],
+    closed_order_never_created: [],
+  },
+  dlq_entry: {
+    dlq_pending_retry: ["replayed", "dlq_pending_ops_review", "discarded_with_evidence"],
+    dlq_pending_ops_review: ["replayed", "discarded_with_evidence"],
+    replayed: [],
+    discarded_with_evidence: [],
+  },
+} as const
+
 const clone = <T>(v: T): T => JSON.parse(JSON.stringify(v)) as T
 const findRow = (pred: (r: Row) => boolean): Row => {
   const row = examples.find(pred)
@@ -121,6 +143,12 @@ describe("recovery-population.v1 — mutanty muszą dać FAIL", () => {
     const donor = findRow((r) => r.state === "resolved_recovered")
     const row = findRow((r) => r.state === "open")
     row.resolution_evidence = donor.resolution_evidence
+    expect(errorsOf(row).join("\n")).toMatch(/resolution_evidence/)
+  })
+
+  it.each(["deferred_issuance_trace", "dlq_entry"] as const)("%s nie przyjmuje legacy_manual_resolution", (population) => {
+    const row = findRow((r) => r.population_type === population && r.resolution_evidence !== null)
+    ;(row.resolution_evidence as { kind: string }).kind = "legacy_manual_resolution"
     expect(errorsOf(row).join("\n")).toMatch(/resolution_evidence/)
   })
 
@@ -211,6 +239,13 @@ describe("parytet dwóch nośników tabeli przejść (kernel TS vs $defs.transit
       )
       const live = ((branch!.properties as Record<string, JsonSchema>).state as { enum: string[] }).enum
       expect([...live].sort()).toEqual(expected)
+    }
+  })
+
+  it("każda krawędź przejścia odpowiada zamrożonej polityce v1, nie tylko żywemu drugiemu nośnikowi", () => {
+    for (const pop of RECOVERY_POPULATION_TYPES) {
+      expect(RECOVERY_TRANSITIONS[pop].allowed).toEqual(FROZEN_V1_TRANSITIONS[pop])
+      expect(transitions[pop].allowed).toEqual(FROZEN_V1_TRANSITIONS[pop])
     }
   })
 
