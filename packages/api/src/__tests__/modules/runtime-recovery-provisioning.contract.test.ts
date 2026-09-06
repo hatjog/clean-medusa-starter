@@ -28,6 +28,8 @@ describe("runtime recovery provisioning contract", () => {
       expect(sql).toContain(`ALTER TABLE ${table} ENABLE ROW LEVEL SECURITY`)
       expect(sql).toContain(`ALTER TABLE ${table} FORCE ROW LEVEL SECURITY`)
       expect(sql).toContain(`REVOKE ALL PRIVILEGES ON ${table} FROM medusa_store`)
+      expect(sql).toContain(`ADD COLUMN IF NOT EXISTS instance_id text NULL`)
+      expect(sql).toContain(`instance_id = current_setting('app.gp_instance_id', true) AND market_id = current_setting('app.gp_market_id', true)`)
     }
   })
 
@@ -38,6 +40,15 @@ describe("runtime recovery provisioning contract", () => {
     expect(sql).not.toContain("GRANT SELECT, INSERT, UPDATE, DELETE ON voucher_claim_audit TO medusa_store")
     expect(sql).not.toContain("GRANT SELECT, INSERT, UPDATE, DELETE ON event_processed TO medusa_store")
     expect(sql).toContain("GRANT USAGE ON SEQUENCE voucher_claim_audit_audit_id_seq TO medusa_store")
+  })
+
+  it("tworzy tamper-evident hash chain dla audytu claim bez nadawania runtime UPDATE", () => {
+    expect(sql).toContain("CREATE EXTENSION IF NOT EXISTS pgcrypto")
+    expect(sql).toContain("ADD COLUMN IF NOT EXISTS prev_row_hash text NULL")
+    expect(sql).toContain("ADD COLUMN IF NOT EXISTS content_hash text NULL")
+    expect(sql).toContain("CREATE OR REPLACE FUNCTION public.gp_voucher_claim_audit_hash_chain()")
+    expect(sql).toContain("pg_advisory_xact_lock")
+    expect(sql).toContain("CREATE TRIGGER gp_voucher_claim_audit_hash_chain_before_insert")
   })
 
   it("końcowy guard reprovisioningu odbiera UPDATE/DELETE po każdym szerokim grancie infrastruktury", () => {

@@ -23,7 +23,7 @@ function installHarness() {
       connection.ended = true
     },
   }
-  const releaseConnection = jest.fn(async () => undefined)
+  const releaseConnection = jest.fn(async (_connection: FakeConnection) => undefined)
   const destroyRawConnection = jest.fn(async () => undefined)
   const client = {
     acquireConnection: async () => connection,
@@ -62,7 +62,7 @@ describe("rls-pool-hook fail closed", () => {
     const harness = installHarness()
 
     await expect(
-      marketContextStorage.run({ market_id: "invalid market" }, () => harness.client.acquireConnection())
+      marketContextStorage.run({ market_id: "invalid market", instance_id: "instance_a" }, () => harness.client.acquireConnection())
     ).rejects.toEqual(expect.objectContaining({ error_code: "GP_RLS_MARKET_CONTEXT_REQUIRED" }))
 
     expect(harness.connection.queries).toEqual([])
@@ -73,11 +73,26 @@ describe("rls-pool-hook fail closed", () => {
     )
   })
 
+  it("odmawia brak instance_id nawet przy poprawnym market_id", async () => {
+    const harness = installHarness()
+
+    await expect(
+      marketContextStorage.run({ market_id: "market_a" }, () => harness.client.acquireConnection())
+    ).rejects.toEqual(expect.objectContaining({ error_code: "GP_RLS_MARKET_CONTEXT_REQUIRED" }))
+
+    expect(harness.connection.queries).toEqual([])
+    expect(harness.connection.ended).toBe(true)
+    expect(harness.logger.error).toHaveBeenCalledWith(
+      "RLS pool hook acquire denied",
+      expect.objectContaining({ reason: "missing_instance_id" })
+    )
+  })
+
   it("uzbraja tylko connection z poprawnym scope i czyści je przy release", async () => {
     const harness = installHarness()
 
     const connection = await marketContextStorage.run(
-      { market_id: "market_a" },
+      { market_id: "market_a", instance_id: "instance_a" },
       () => harness.client.acquireConnection()
     )
     await harness.client.releaseConnection(connection)
@@ -85,7 +100,9 @@ describe("rls-pool-hook fail closed", () => {
     expect(harness.connection.queries).toEqual([
       { sql: "SET ROLE medusa_store", params: undefined },
       { sql: "SELECT set_config('app.gp_market_id', $1, false)", params: ["market_a"] },
+      { sql: "SELECT set_config('app.gp_instance_id', $1, false)", params: ["instance_a"] },
       { sql: "RESET app.gp_market_id", params: undefined },
+      { sql: "RESET app.gp_instance_id", params: undefined },
       { sql: "RESET ROLE", params: undefined },
     ])
     expect(harness.releaseConnection).toHaveBeenCalledWith(connection)

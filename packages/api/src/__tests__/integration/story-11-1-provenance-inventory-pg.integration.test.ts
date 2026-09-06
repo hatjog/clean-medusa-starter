@@ -4,6 +4,8 @@ import path from "node:path"
 import { afterAll, beforeAll, describe, expect, it } from "@jest/globals"
 import { Pool, type PoolClient } from "pg"
 
+import { applyRuntimeRecoveryMigration } from "./story-11-1-runtime-recovery-migration-support"
+
 const enabled = process.env.GP_RUN_MIGRATION_INTEGRATION === "1" && !!process.env.DATABASE_URL
 const REPO_ROOT = path.resolve(__dirname, "../../../../../../..")
 const fixture = fs.readFileSync(
@@ -13,15 +15,20 @@ const fixture = fs.readFileSync(
 const inventory = JSON.parse(fs.readFileSync(
   path.join(REPO_ROOT, "_bmad-output/releases/v1.16.0/implementation-artifacts/evidence/11-1/provenance-inventory.json"),
   "utf8"
-)) as { legacy_populations: Array<{ table: string; historical_count: string; provenance: string }> }
+)) as {
+  measurement_status: string
+  legacy_populations: Array<{ table: string; historical_count: string; provenance: string; relation_present: boolean }>
+}
 
-async function setRuntime(client: PoolClient, marketId: string): Promise<void> {
+async function setRuntime(client: PoolClient, instanceId: string, marketId: string): Promise<void> {
   await client.query("SET ROLE medusa_store")
+  await client.query("SELECT set_config('app.gp_instance_id', $1, false)", [instanceId])
   await client.query("SELECT set_config('app.gp_market_id', $1, false)", [marketId])
 }
 
 describe("Story 11.1 — UNKNOWN legacy provenance", () => {
   it("nie zawiera automatycznego marketu ani sfałszowanego pomiaru", () => {
+    expect(inventory.measurement_status).toBe("MEASURED")
     expect(fixture).not.toMatch(/market_id|default|bonbeauty|bongarden/i)
     expect(inventory.legacy_populations.map((entry) => entry.table).sort()).toEqual([
       "event_processed",
@@ -29,7 +36,8 @@ describe("Story 11.1 — UNKNOWN legacy provenance", () => {
       "voucher_claim_binding",
     ])
     for (const entry of inventory.legacy_populations) {
-      expect(entry.historical_count).toBe("NOT_MEASURED")
+      expect(entry.relation_present).toBe(true)
+      expect(entry.historical_count).toMatch(/^\d+$/)
       expect(entry.provenance).toContain("UNKNOWN")
     }
   })
@@ -53,13 +61,22 @@ describe("Story 11.1 — UNKNOWN legacy provenance", () => {
     await pool?.end()
   })
 
-  it("utrzymuje fixture bez marketu niewidoczną dla A i B oraz rollbackuje probe", async () => {
+  it("mierzy legacy UNKNOWN i utrzymuje fixture bez obu osi niewidoczną dla A i B", async () => {
     await client.query("BEGIN")
     try {
+      await applyRuntimeRecoveryMigration(client)
+      for (const population of inventory.legacy_populations) {
+        const count = await client.query<{ historical_count: string }>(
+          `SELECT COUNT(*)::text AS historical_count
+             FROM ${population.table}
+            WHERE market_id IS NULL OR instance_id IS NULL`
+        )
+        expect(count.rows).toEqual([expect.objectContaining({ historical_count: expect.stringMatching(/^\d+$/) })])
+      }
       await client.query(fixture)
-      await setRuntime(client, "market-a")
+      await setRuntime(client, "instance-a", "market-a")
       expect((await client.query("SELECT external_id FROM event_processed WHERE external_id = 'story-11-1-unknown'")).rows).toEqual([])
-      await setRuntime(client, "market-b")
+      await setRuntime(client, "instance-a", "market-b")
       expect((await client.query("SELECT external_id FROM event_processed WHERE external_id = 'story-11-1-unknown'")).rows).toEqual([])
     } finally {
       await client.query("RESET ROLE").catch(() => undefined)

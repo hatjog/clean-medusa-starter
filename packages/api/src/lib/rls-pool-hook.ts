@@ -20,6 +20,7 @@ import { marketContextStorage } from "./market-context";
 const SAFE_ID_RE = /^[a-zA-Z0-9_-]+$/;
 const RLS_MARKER = Symbol("__gp_rls_active");
 export const GP_MARKET_SESSION_VAR = "app.gp_market_id";
+export const GP_INSTANCE_SESSION_VAR = "app.gp_instance_id";
 
 export type HookLogger = {
   warn?: (...args: unknown[]) => void;
@@ -30,7 +31,13 @@ export type HookLogger = {
 export class RlsMarketContextRequiredError extends Error {
   readonly error_code = "GP_RLS_MARKET_CONTEXT_REQUIRED";
 
-  constructor(reason: "missing_market_context" | "invalid_market_id") {
+  constructor(
+    reason:
+      | "missing_market_context"
+      | "invalid_market_id"
+      | "missing_instance_id"
+      | "invalid_instance_id"
+  ) {
     super(`RLS connection acquisition denied: ${reason}`);
     this.name = "RlsMarketContextRequiredError";
   }
@@ -118,11 +125,45 @@ export function installRlsPoolHook(
       throw new RlsMarketContextRequiredError("invalid_market_id");
     }
 
+    if (!ctx.instance_id) {
+      logger?.error?.("RLS pool hook acquire denied", {
+        error_code: "GP_RLS_MARKET_CONTEXT_REQUIRED",
+        reason: "missing_instance_id",
+        market_id: ctx.market_id,
+      });
+      await destroyConnection(
+        client,
+        connection,
+        logger,
+        "RLS pool hook missing-instance destroy failed"
+      );
+      throw new RlsMarketContextRequiredError("missing_instance_id");
+    }
+
+    if (!SAFE_ID_RE.test(ctx.instance_id)) {
+      logger?.error?.("RLS pool hook acquire denied", {
+        error_code: "GP_RLS_MARKET_CONTEXT_REQUIRED",
+        reason: "invalid_instance_id",
+        instance_id: ctx.instance_id,
+      });
+      await destroyConnection(
+        client,
+        connection,
+        logger,
+        "RLS pool hook invalid-instance destroy failed"
+      );
+      throw new RlsMarketContextRequiredError("invalid_instance_id");
+    }
+
     try {
       await connection.query("SET ROLE medusa_store");
       await connection.query(
         `SELECT set_config('${GP_MARKET_SESSION_VAR}', $1, false)`,
         [ctx.market_id]
+      );
+      await connection.query(
+        `SELECT set_config('${GP_INSTANCE_SESSION_VAR}', $1, false)`,
+        [ctx.instance_id]
       );
       connection[RLS_MARKER] = true;
     } catch (error) {
@@ -133,6 +174,12 @@ export function installRlsPoolHook(
 
       try {
         await connection.query(`RESET ${GP_MARKET_SESSION_VAR}`);
+      } catch {
+        // ignore best-effort cleanup and destroy the connection below
+      }
+
+      try {
+        await connection.query(`RESET ${GP_INSTANCE_SESSION_VAR}`);
       } catch {
         // ignore best-effort cleanup and destroy the connection below
       }
@@ -161,6 +208,7 @@ export function installRlsPoolHook(
     if (connection[RLS_MARKER]) {
       try {
         await connection.query(`RESET ${GP_MARKET_SESSION_VAR}`);
+        await connection.query(`RESET ${GP_INSTANCE_SESSION_VAR}`);
         await connection.query("RESET ROLE");
       } catch (error) {
         logger?.error?.("RLS pool hook release cleanup failed", {

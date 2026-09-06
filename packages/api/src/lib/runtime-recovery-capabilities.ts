@@ -12,10 +12,29 @@ const PARTIAL_EFFECT_SUCCESSORS: Record<(typeof POPULATIONS)[number], string> = 
   dlq_entry: "dlq_pending_ops_review",
 }
 
+const EXPECTED_TRANSITIONS: Record<(typeof POPULATIONS)[number], Record<string, readonly string[]>> = {
+  compensation_failure: {
+    open: ["recovery_in_progress", "partial_effect", "resolved_recovered", "closed_unrecoverable"],
+    recovery_in_progress: ["partial_effect", "resolved_recovered", "closed_unrecoverable"],
+    partial_effect: ["recovery_in_progress"],
+  },
+  deferred_issuance_trace: {
+    awaiting_order: ["escalated", "partial_effect", "issued_after_link", "closed_order_never_created"],
+    escalated: ["partial_effect", "issued_after_link", "closed_order_never_created"],
+    partial_effect: ["escalated"],
+  },
+  dlq_entry: {
+    dlq_pending_retry: ["dlq_pending_ops_review", "partial_effect", "replayed", "discarded_with_evidence"],
+    dlq_pending_ops_review: ["partial_effect", "replayed", "discarded_with_evidence"],
+    partial_effect: ["dlq_pending_ops_review"],
+  },
+}
+
 type Capability = {
   retry: unknown
   resolve: unknown
   approval_required: unknown
+  business_unit_idempotency_key: unknown
   allowed_transitions: unknown
   terminal_states: unknown
   outcome: unknown
@@ -44,6 +63,10 @@ function stringArray(value: unknown, label: string): string[] {
     invalid(`${label} must be a non-empty string array`)
   }
   return value as string[]
+}
+
+function sameStringArray(actual: readonly string[], expected: readonly string[]): boolean {
+  return actual.length === expected.length && actual.every((value, index) => value === expected[index])
 }
 
 /**
@@ -79,6 +102,9 @@ export function parseRuntimeRecoveryCapabilities(source: string): void {
     retries.add(retry)
     resolves.add(resolve)
     if (capability.approval_required !== true) invalid(`${population} must require approval`)
+    if (capability.business_unit_idempotency_key !== "required") {
+      invalid(`${population} must require a business-unit idempotency key`)
+    }
     nonEmptyString(capability.outcome, `${population}.outcome`)
 
     const transitions = record(capability.allowed_transitions, `${population}.allowed_transitions`)
@@ -88,6 +114,19 @@ export function parseRuntimeRecoveryCapabilities(source: string): void {
     const requiredSuccessor = PARTIAL_EFFECT_SUCCESSORS[population]
     if (partialTransitions.length !== 1 || partialTransitions[0] !== requiredSuccessor) {
       invalid(`${population} may only return partial_effect to ${requiredSuccessor}`)
+    }
+
+    const expectedTransitions = EXPECTED_TRANSITIONS[population]
+    const actualStates = Object.keys(transitions).sort()
+    const expectedStates = Object.keys(expectedTransitions).sort()
+    if (!sameStringArray(actualStates, expectedStates)) {
+      invalid(`${population} must retain its complete allowed transition graph`)
+    }
+    for (const state of expectedStates) {
+      const actualDestinations = stringArray(transitions[state], `${population}.${state} transitions`)
+      if (!sameStringArray(actualDestinations, expectedTransitions[state])) {
+        invalid(`${population}.${state} differs from the approved transition graph`)
+      }
     }
 
     const knownStates = new Set([...Object.keys(transitions), ...terminalStates])

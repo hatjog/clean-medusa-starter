@@ -33,10 +33,12 @@ export class ClaimPersistenceUnavailableError extends Error {
   }
 }
 
-function requireClaimMarketId(): string {
-  const marketId = marketContextStorage.getStore()?.market_id
-  if (!marketId) throw new ClaimMarketContextRequiredError()
-  return marketId
+function requireClaimScope(): { marketId: string; instanceId: string } {
+  const context = marketContextStorage.getStore()
+  const marketId = context?.market_id
+  const instanceId = context?.instance_id
+  if (!marketId || !instanceId) throw new ClaimMarketContextRequiredError()
+  return { marketId, instanceId }
 }
 
 export interface ClaimRouteResponse {
@@ -170,12 +172,12 @@ export async function appendClaimAudit(
   client: PgClientLike,
   row: ClaimAuditRow
 ): Promise<void> {
-  const marketId = requireClaimMarketId()
+  const { marketId, instanceId } = requireClaimScope()
   const refreshed = await client.query(
     `INSERT INTO voucher_claim_audit
-       (idempotency_key, code, ip, outcome, occurred_at, market_id)
-     VALUES ($1, $2, $3, $4, $5, $6)`,
-    [row.idempotency_key, row.code, row.ip, row.outcome, row.occurred_at, marketId]
+       (idempotency_key, code, ip, outcome, occurred_at, instance_id, market_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+    [row.idempotency_key, row.code, row.ip, row.outcome, row.occurred_at, instanceId, marketId]
   )
 }
 
@@ -247,11 +249,11 @@ export async function reserveClaimBinding(
   | { inserted: true }
   | { inserted: false; bindingHash: string; response: ClaimRouteResponse | null }
 > {
-  const marketId = requireClaimMarketId()
+  const { marketId, instanceId } = requireClaimScope()
   const inserted = await client.query(
     `INSERT INTO voucher_claim_binding
-       (idempotency_key, binding_hash, code, claimed_at, expires_at, created_at, updated_at, market_id)
-     VALUES ($1, $2, $3, $4, NOW() + ($5::text || ' hours')::interval, NOW(), NOW(), $6)
+       (idempotency_key, binding_hash, code, claimed_at, expires_at, created_at, updated_at, instance_id, market_id)
+     VALUES ($1, $2, $3, $4, NOW() + ($5::text || ' hours')::interval, NOW(), NOW(), $6, $7)
      ON CONFLICT (idempotency_key) DO NOTHING`,
     [
       input.idempotencyKey,
@@ -259,6 +261,7 @@ export async function reserveClaimBinding(
       input.code,
       input.claimedAt,
       String(ttlHours()),
+      instanceId,
       marketId,
     ]
   )
@@ -270,10 +273,11 @@ export async function reserveClaimBinding(
     `SELECT binding_hash, response_status, response_body
       FROM voucher_claim_binding
       WHERE idempotency_key = $1
-        AND market_id = $2
+        AND instance_id = $2
+        AND market_id = $3
         AND expires_at > NOW()
       FOR UPDATE`,
-    [input.idempotencyKey, marketId]
+    [input.idempotencyKey, instanceId, marketId]
   )
 
   const row = existing.rows[0]
@@ -306,13 +310,15 @@ export async function reserveClaimBinding(
             response_body   = NULL,
             updated_at    = NOW()
       WHERE idempotency_key = $1
-        AND market_id = $6`,
+        AND instance_id = $6
+        AND market_id = $7`,
     [
       input.idempotencyKey,
       input.bindingHash,
       input.code,
       input.claimedAt,
       String(ttlHours()),
+      instanceId,
       marketId,
     ]
   )
@@ -325,15 +331,16 @@ export async function completeClaimBinding(
   idempotencyKey: string,
   response: ClaimRouteResponse
 ): Promise<void> {
-  const marketId = requireClaimMarketId()
+  const { marketId, instanceId } = requireClaimScope()
   await client.query(
     `UPDATE voucher_claim_binding
         SET response_status = $2,
             response_body = $3::jsonb,
             updated_at = NOW()
       WHERE idempotency_key = $1
-        AND market_id = $4`,
-    [idempotencyKey, response.status, JSON.stringify(response.body), marketId]
+        AND instance_id = $4
+        AND market_id = $5`,
+    [idempotencyKey, response.status, JSON.stringify(response.body), instanceId, marketId]
   )
 }
 

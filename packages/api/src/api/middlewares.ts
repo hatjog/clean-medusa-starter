@@ -32,6 +32,7 @@ import {
 } from "../lib/customer-scoped-email";
 import {
   marketContextStorage,
+  resolveRuntimeInstanceId,
   type MarketContext,
 } from "../lib/market-context";
 import {
@@ -249,12 +250,14 @@ function resolveLogger(
 
 async function resolveRequestMarketContext(req: MedusaRequest): Promise<{
   marketId: string;
+  instanceId: string;
   salesChannelId: string;
 } | null> {
   const existingContext = marketContextStorage.getStore();
-  if (existingContext?.market_id && existingContext.sales_channel_id) {
+  if (existingContext?.market_id && existingContext.instance_id && existingContext.sales_channel_id) {
     return {
       marketId: existingContext.market_id,
+      instanceId: existingContext.instance_id,
       salesChannelId: existingContext.sales_channel_id,
     };
   }
@@ -273,12 +276,14 @@ async function resolveRequestMarketContext(req: MedusaRequest): Promise<{
   await marketContextCache.ensureLoaded(req.scope);
 
   const marketId = marketContextCache.get(salesChannelId);
-  if (!marketId) {
+  const instanceId = resolveRuntimeInstanceId()
+  if (!marketId || !instanceId) {
     return null;
   }
 
   return {
     marketId,
+    instanceId,
     salesChannelId,
   };
 }
@@ -378,11 +383,12 @@ export async function marketContextMiddleware(
 
   logRlsDebug(req, "market-context-resolved", {
     market_id: context.marketId,
+    instance_id: context.instanceId,
     sales_channel_id: context.salesChannelId,
   });
 
   marketContextStorage.run(
-    { market_id: context.marketId, sales_channel_id: context.salesChannelId },
+    { market_id: context.marketId, instance_id: context.instanceId, sales_channel_id: context.salesChannelId },
     () => next()
   );
 }

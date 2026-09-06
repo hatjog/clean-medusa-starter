@@ -33,7 +33,7 @@
 
 import type { Knex } from "knex"
 
-import { marketContextStorage, type MarketContext } from "./market-context"
+import { marketContextStorage, resolveRuntimeInstanceId, type MarketContext } from "./market-context"
 
 /** Ten sam kształt identyfikatora, który przyjmuje hook RLS. */
 const SAFE_MARKET_ID_RE = /^[a-zA-Z0-9_-]+$/
@@ -57,6 +57,7 @@ export class HttpMarketContextError extends Error {
 export async function runInHttpMarketContext<T>(
   marketId: string,
   work: () => Promise<T>,
+  options?: { instanceId?: string },
 ): Promise<T> {
   if (typeof marketId !== "string" || !SAFE_MARKET_ID_RE.test(marketId)) {
     throw new HttpMarketContextError(
@@ -66,7 +67,15 @@ export async function runInHttpMarketContext<T>(
     )
   }
 
-  const context: MarketContext = { market_id: marketId }
+  const instanceId = resolveRuntimeInstanceId(options?.instanceId)
+  if (!instanceId) {
+    throw new HttpMarketContextError(
+      "trasa HTTP nie ma jawnego instance_id z routingu lub konfiguracji środowiska; " +
+        "brak instancji jest odmową, nie domyślnym gp-dev",
+    )
+  }
+
+  const context: MarketContext = { market_id: marketId, instance_id: instanceId }
   return marketContextStorage.run(context, work)
 }
 

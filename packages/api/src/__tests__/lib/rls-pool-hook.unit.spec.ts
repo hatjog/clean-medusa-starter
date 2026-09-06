@@ -41,7 +41,7 @@ describe("installRlsPoolHook", () => {
     installRlsPoolHook(harness.pgConnection, harness.logger);
 
     await marketContextStorage.run(
-      { market_id: "bonbeauty", sales_channel_id: "sc_001" },
+      { market_id: "bonbeauty", instance_id: "gp-test", sales_channel_id: "sc_001" },
       async () => {
         await harness.client.acquireConnection();
       }
@@ -53,32 +53,40 @@ describe("installRlsPoolHook", () => {
       "SELECT set_config('app.gp_market_id', $1, false)",
       ["bonbeauty"]
     );
+    expect(harness.connection.query).toHaveBeenNthCalledWith(
+      3,
+      "SELECT set_config('app.gp_instance_id', $1, false)",
+      ["gp-test"]
+    );
   });
 
-  it("skips pool mutation when ALS context is missing", async () => {
+  it("odmawia i niszczy połączenie when ALS context is missing", async () => {
     const harness = createHarness();
     installRlsPoolHook(harness.pgConnection, harness.logger);
 
-    await harness.client.acquireConnection();
+    await expect(harness.client.acquireConnection()).rejects.toEqual(
+      expect.objectContaining({ error_code: "GP_RLS_MARKET_CONTEXT_REQUIRED" })
+    );
 
     expect(harness.connection.query).not.toHaveBeenCalled();
+    expect(harness.client.destroyRawConnection).toHaveBeenCalledWith(harness.connection);
   });
 
   it("rejects invalid market ids instead of interpolating them", async () => {
     const harness = createHarness();
     installRlsPoolHook(harness.pgConnection, harness.logger);
 
-    await marketContextStorage.run(
-      { market_id: "bad'value", sales_channel_id: "sc_001" },
-      async () => {
-        await harness.client.acquireConnection();
-      }
-    );
+    await expect(
+      marketContextStorage.run(
+        { market_id: "bad'value", instance_id: "gp-test", sales_channel_id: "sc_001" },
+        async () => harness.client.acquireConnection()
+      )
+    ).rejects.toEqual(expect.objectContaining({ error_code: "GP_RLS_MARKET_CONTEXT_REQUIRED" }));
 
     expect(harness.connection.query).not.toHaveBeenCalled();
-    expect(harness.logger.warn).toHaveBeenCalledWith(
-      "RLS pool hook skipped invalid market id",
-      { market_id: "bad'value" }
+    expect(harness.logger.error).toHaveBeenCalledWith(
+      "RLS pool hook acquire denied",
+      expect.objectContaining({ reason: "invalid_market_id", market_id: "bad'value" })
     );
   });
 
@@ -93,7 +101,7 @@ describe("installRlsPoolHook", () => {
 
     await expect(
       marketContextStorage.run(
-        { market_id: "bonbeauty", sales_channel_id: "sc_001" },
+        { market_id: "bonbeauty", instance_id: "gp-test", sales_channel_id: "sc_001" },
         async () => harness.client.acquireConnection()
       )
     ).rejects.toThrow("set_config failed");
@@ -112,7 +120,7 @@ describe("installRlsPoolHook", () => {
     installRlsPoolHook(harness.pgConnection, harness.logger);
 
     const connection = await marketContextStorage.run(
-      { market_id: "bonevent", sales_channel_id: "sc_002" },
+      { market_id: "bonevent", instance_id: "gp-test", sales_channel_id: "sc_002" },
       async () => harness.client.acquireConnection()
     );
 
@@ -123,7 +131,8 @@ describe("installRlsPoolHook", () => {
       1,
       "RESET app.gp_market_id"
     );
-    expect(harness.connection.query).toHaveBeenNthCalledWith(2, "RESET ROLE");
+    expect(harness.connection.query).toHaveBeenNthCalledWith(2, "RESET app.gp_instance_id");
+    expect(harness.connection.query).toHaveBeenNthCalledWith(3, "RESET ROLE");
     expect(harness.originalReleaseConnection).toHaveBeenCalledWith(connection);
   });
 
@@ -132,7 +141,7 @@ describe("installRlsPoolHook", () => {
     installRlsPoolHook(harness.pgConnection, harness.logger);
 
     const connection = await marketContextStorage.run(
-      { market_id: "bonevent", sales_channel_id: "sc_002" },
+      { market_id: "bonevent", instance_id: "gp-test", sales_channel_id: "sc_002" },
       async () => harness.client.acquireConnection()
     );
 
@@ -157,7 +166,7 @@ describe("installRlsPoolHook", () => {
     installRlsPoolHook(second.pgConnection, second.logger);
 
     await marketContextStorage.run(
-      { market_id: "bonbeauty", sales_channel_id: "sc_001" },
+      { market_id: "bonbeauty", instance_id: "gp-test", sales_channel_id: "sc_001" },
       async () => {
         await first.client.acquireConnection();
         await second.client.acquireConnection();

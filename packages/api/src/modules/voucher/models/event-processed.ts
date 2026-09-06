@@ -65,6 +65,8 @@ export const EVENT_PROCESSED_PK_COLUMNS = ["external_id", "event_type"] as const
 
 /** Persisted shape `event_processed` (1:1 z DDL migracji). */
 export interface EventProcessedRow {
+  /** Pierwsza oś RLS; zapis bez jawnej instancji jest odmową. */
+  instance_id: string
   /** RLS scope of this business-consumption record; it is never inferred. */
   market_id: string
   /** external_id = payment_intent.id:order_id (jednostka issuance, ADR-166). */
@@ -125,15 +127,15 @@ export function buildEventProcessedPurchaseQuery(purchaseKey: string): {
  */
 export function buildEventProcessedDedupeInsert(row: EventProcessedRow): {
   sql: string
-  params: [string, string, number, string, string]
+  params: [string, string, number, string, string, string]
 } {
   return {
     sql:
       `INSERT INTO ${EVENT_PROCESSED_TABLE} ` +
-      `(external_id, event_type, processed_at, ${EVENT_PROCESSED_PURCHASE_KEY_COLUMN}, market_id) ` +
-      `VALUES ($1, $2, $3, $4, $5) ` +
+      `(external_id, event_type, processed_at, ${EVENT_PROCESSED_PURCHASE_KEY_COLUMN}, instance_id, market_id) ` +
+      `VALUES ($1, $2, $3, $4, $5, $6) ` +
       `ON CONFLICT (external_id, event_type) DO NOTHING`,
-    params: [row.external_id, row.event_type, row.processed_at, row.purchase_key, row.market_id],
+    params: [row.external_id, row.event_type, row.processed_at, row.purchase_key, row.instance_id, row.market_id],
   }
 }
 

@@ -195,11 +195,16 @@ export async function liveIssueEntitlementsWithinTx(
 
   const dedupeMarketId = readString(scope.market_id)
   if (!dedupeMarketId) {
-    throw new Error("liveIssueEntitlementsWithinTx: market_id required before business dedupe")
+    throw new Error("liveIssueEntitlementsWithinTx: market_id nierozwiązywalny przed business dedupe")
+  }
+  const dedupeInstanceId = readString(scope.instance_id)
+  if (!dedupeInstanceId) {
+    throw new Error("liveIssueEntitlementsWithinTx: instance_id nierozwiązywalny przed business dedupe")
   }
 
   // ── (i) EVENT-LEVEL dedupe (DEC-5 pkt 3.i) — PIERWSZY krok transakcji ──────
   const dedupeInsert = buildEventProcessedDedupeInsert({
+    instance_id: dedupeInstanceId,
     market_id: dedupeMarketId,
     external_id: buildPaymentIntentOrderExternalId(
       payload.payment_intent_id,

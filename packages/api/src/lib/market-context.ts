@@ -16,6 +16,12 @@ export interface SystemExecutionOriginTag {
 export interface MarketContext {
   market_id: string;
   /**
+   * Kanoniczna instancja runtime z konfiguracji środowiska/routingu albo
+   * tokenu serwisowego. Brak wartości nie może zostać zastąpiony domyślną
+   * instancją na granicy RLS.
+   */
+  instance_id?: string;
+  /**
    * Ustawiany przez łańcuch `/store/*` z publishable key. Wykonanie
    * asynchroniczne zwykle go nie ma — `undefined` jest tu uczciwsze niż
    * podstawiony pusty string, który wyglądałby jak realny kanał sprzedaży.
@@ -25,3 +31,14 @@ export interface MarketContext {
 }
 
 export const marketContextStorage = new AsyncLocalStorage<MarketContext>();
+
+const SAFE_RUNTIME_SCOPE_ID = /^[a-zA-Z0-9_-]+$/
+
+/**
+ * Odczytuje instancję wyłącznie z jawnego nośnika runtime. Nie ma domyślki:
+ * `gp-dev` byłoby zgadywaniem scopu i mogłoby skleić niezależne instancje.
+ */
+export function resolveRuntimeInstanceId(raw = process.env.GP_INSTANCE_ID): string | null {
+  const instanceId = typeof raw === "string" ? raw.trim() : ""
+  return SAFE_RUNTIME_SCOPE_ID.test(instanceId) ? instanceId : null
+}

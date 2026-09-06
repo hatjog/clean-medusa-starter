@@ -199,6 +199,7 @@ maybe("Story 3.2 — migracja na realnym PG (review AI-01 / AI-04)", () => {
   it("(AI-04) event_processed replay: ON CONFLICT DO NOTHING = NO-OP (nie podwaja, zachowuje processed_at)", async () => {
     await withMigratedTx(async (c) => {
       const first = buildEventProcessedDedupeInsert({
+        instance_id: "gp-test",
         market_id: "bonbeauty",
         external_id: "pi_pg_replay",
         event_type: "gp.stripe.payment_intent_succeeded.v1",
@@ -210,6 +211,7 @@ maybe("Story 3.2 — migracja na realnym PG (review AI-01 / AI-04)", () => {
 
       // replay tego samego (external_id, event_type) z późniejszym processed_at
       const replay = buildEventProcessedDedupeInsert({
+        instance_id: "gp-test",
         market_id: "bonbeauty",
         external_id: "pi_pg_replay",
         event_type: "gp.stripe.payment_intent_succeeded.v1",

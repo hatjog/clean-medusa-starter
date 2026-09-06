@@ -40,7 +40,7 @@
  * @module lib/system-market-context
  */
 
-import { marketContextStorage, type MarketContext } from "./market-context"
+import { marketContextStorage, resolveRuntimeInstanceId, type MarketContext } from "./market-context"
 
 /** Powierzchnie wykonania poza żądaniem HTTP — dokładnie te trzy z AC1. */
 export type SystemExecutionSurface = "subscriber" | "workflow" | "job"
@@ -66,6 +66,8 @@ export type SystemMarketContextDenialReason =
   | "markets_empty"
   /** Identyfikator rynku niezgodny z kształtem akceptowanym przez hook RLS. */
   | "market_id_invalid"
+  /** Brak albo niepoprawny instance_id z konfiguracji/routingu. */
+  | "instance_id_invalid"
   /** Operacja wymagająca kontekstu wykonana poza jakimkolwiek kontekstem. */
   | "context_missing"
 
@@ -175,6 +177,8 @@ function deny(
 export type SystemMarketScope = {
   /** Wyliczona, niepusta lista rynków, których wolno dotknąć temu wykonaniu. */
   markets: readonly string[]
+  /** Jawna instancja nośnika; gdy jej nie podano, wymagane jest GP_INSTANCE_ID. */
+  instanceId?: string
   origin: SystemExecutionOrigin
   /**
    * Opcjonalny sales channel per rynek. Kształt kontekstu jest ten sam co
@@ -219,6 +223,17 @@ export async function runInSystemMarketContext<T>(
     )
   }
 
+  const instanceId = resolveRuntimeInstanceId(scope.instanceId)
+  if (!instanceId) {
+    deny(
+      "instance_id_invalid",
+      "wykonanie poza żądaniem HTTP musi mieć jawny instance_id z konfiguracji " +
+        "lub routingu; brak nie oznacza gp-dev",
+      origin,
+      logger,
+    )
+  }
+
   for (const marketId of scope.markets) {
     if (typeof marketId !== "string" || !SAFE_MARKET_ID_RE.test(marketId)) {
       deny(
@@ -235,6 +250,7 @@ export async function runInSystemMarketContext<T>(
   for (const marketId of scope.markets) {
     const context: MarketContext = {
       market_id: marketId,
+      instance_id: instanceId,
       sales_channel_id: scope.salesChannelIdByMarket?.[marketId],
       system: origin ?? undefined,
     }
