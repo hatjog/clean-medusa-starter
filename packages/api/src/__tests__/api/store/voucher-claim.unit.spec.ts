@@ -350,11 +350,13 @@ beforeEach(() => {
   _clearBindingStore()
   _resetBuckets()
   process.env.JWT_SECRET = "test-secret-for-unit-tests"
+  process.env.GP_ALLOW_IN_MEMORY_CLAIM_PERSISTENCE = "1"
 })
 
 afterEach(() => {
   delete process.env.JWT_SECRET
   delete process.env.GP_VOUCHER_CLAIM_HMAC_SECRET
+  delete process.env.GP_ALLOW_IN_MEMORY_CLAIM_PERSISTENCE
 })
 
 // ---------------------------------------------------------------------------

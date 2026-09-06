@@ -98,6 +98,20 @@ function looksLikeTestDatabase(dbName) {
  */
 const EPHEMERAL_MEDUSA_DB = /^medusa-[a-z0-9._-]*integration-\d+$/i
 
+/**
+ * Profile, ktore w ogole nie siegaja po Postgresa. Dla nich brak DATABASE_URL
+ * nie jest bledem konfiguracji, tylko normalnym stanem — a twarde zadanie
+ * adresu bazy przy starcie kasowalo cala suite jednostkowa, ktora zadnego
+ * polaczenia nie otwiera. WARSTWA B zostaje uzbrojona tak czy inaczej, wiec
+ * proba polaczenia nadal jest blokowana przy `Client.connect`, czyli w
+ * momencie, w ktorym fakt siegania po baze jest realny, a nie deklarowany.
+ */
+const DATABASE_FREE_TEST_TYPES = new Set(["unit", "patches"])
+const hasDatabaseUrl =
+	typeof process.env.DATABASE_URL === "string" && process.env.DATABASE_URL.trim() !== ""
+const skipDatabaseTargetResolution =
+	!hasDatabaseUrl && !requiresIsolatedDb && DATABASE_FREE_TEST_TYPES.has(TEST_TYPE)
+
 function resolveDatabaseTarget() {
 	const rawDatabaseUrl = process.env.DATABASE_URL
 	if (typeof rawDatabaseUrl !== "string" || rawDatabaseUrl.trim() === "") {
@@ -132,21 +146,23 @@ function resolveDatabaseTarget() {
 	return { databaseUrl, dbName }
 }
 
-const resolvedDatabaseTarget = resolveDatabaseTarget()
+const resolvedDatabaseTarget = skipDatabaseTargetResolution ? null : resolveDatabaseTarget()
 
-if (DEVELOPMENT_DATABASES.has(resolvedDatabaseTarget.dbName)) {
-	throw new Error(
-		`[test-db-guard] Odmowa startu: rozwiazany DATABASE_URL wskazuje deweloperska baze '${resolvedDatabaseTarget.dbName}'. Ustaw izolowana baze testowa.`
-	)
+if (resolvedDatabaseTarget !== null) {
+	if (DEVELOPMENT_DATABASES.has(resolvedDatabaseTarget.dbName)) {
+		throw new Error(
+			`[test-db-guard] Odmowa startu: rozwiazany DATABASE_URL wskazuje deweloperska baze '${resolvedDatabaseTarget.dbName}'. Ustaw izolowana baze testowa.`
+		)
+	}
+
+	process.env.DB_HOST ||= resolvedDatabaseTarget.databaseUrl.hostname
+	process.env.DB_PORT ||= resolvedDatabaseTarget.databaseUrl.port
+	process.env.DB_USERNAME ||= decodeURIComponent(resolvedDatabaseTarget.databaseUrl.username)
+	process.env.DB_PASSWORD ||= decodeURIComponent(resolvedDatabaseTarget.databaseUrl.password)
 }
 
-process.env.DB_HOST ||= resolvedDatabaseTarget.databaseUrl.hostname
-process.env.DB_PORT ||= resolvedDatabaseTarget.databaseUrl.port
-process.env.DB_USERNAME ||= decodeURIComponent(resolvedDatabaseTarget.databaseUrl.username)
-process.env.DB_PASSWORD ||= decodeURIComponent(resolvedDatabaseTarget.databaseUrl.password)
-
 // ── WARSTWA A ────────────────────────────────────────────────────────────────
-if (requiresIsolatedDb) {
+if (requiresIsolatedDb && resolvedDatabaseTarget !== null) {
 	const isTestDb =
 		/_test$/.test(resolvedDatabaseTarget.dbName) ||
 		extraAllowedDatabaseNames().includes(resolvedDatabaseTarget.dbName)
