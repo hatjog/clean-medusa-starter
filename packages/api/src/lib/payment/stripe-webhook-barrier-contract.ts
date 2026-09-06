@@ -149,9 +149,10 @@ export type OwedUnitAckEvaluation = {
  *
  *  - `settled_units === null` ⇒ `UNKNOWN` (stanu nie dało się odczytać; ACK przy
  *    nieznanym stanie byłby decyzją nieodwracalną w imieniu klientki);
- *  - każda jednostka należna ∈ rozliczone ⇒ `PASS`;
- *  - w przeciwnym razie `FAIL` z listą braków (JEDNOSTKI, nie licznik — dwa
- *    braki i dwa nadmiary dałyby równy licznik i fałszywe `PASS`).
+ *  - `owed_units === settled_units` ⇒ `PASS`;
+ *  - w przeciwnym razie `FAIL` z listą braków i nadmiarów (JEDNOSTKI, nie
+ *    licznik — dwa braki i dwa nadmiary dałyby równy licznik i fałszywe
+ *    `PASS`).
  */
 export function evaluateOwedUnitAck(input: {
   owed_units: ReadonlyArray<string>
@@ -176,7 +177,10 @@ export function evaluateOwedUnitAck(input: {
   const missing = owed.filter((unit) => !settledSet.has(unit))
   const unexpected = settled.filter((unit) => !owedSet.has(unit))
   return {
-    verdict: missing.length === 0 ? "PASS" : "FAIL",
+    // ACK sukcesu wymaga RÓWNOŚCI zbiorów, nie samego zawierania owed w
+    // settled. Obca jednostka przy komplecie należnych jest naruszeniem
+    // kontraktu dostawy i musi zachować retry tak samo jak brak.
+    verdict: missing.length === 0 && unexpected.length === 0 ? "PASS" : "FAIL",
     owed_units: owed,
     settled_units: settled,
     missing_units: missing,

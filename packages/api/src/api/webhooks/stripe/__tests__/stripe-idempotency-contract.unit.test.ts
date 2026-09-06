@@ -13,9 +13,8 @@
  * `order_id` zlewa N jednostek w jedną (drugie zamówienie zostaje bez vouchera).
  *
  * Lustro dla ludzi: `evidence/3-1/idempotency-key-contract.json` (super-repo).
- * Gdy super-repo jest dostępne (uruchomienie z worktree GP), test porównuje
- * lustro z kontraktem — dryf = FAIL. Bez super-repo (samodzielny checkout
- * submodułu) porównanie jest raportowane jako POMINIĘTE, nie jako zielone.
+ * To śledzony dowód wydania, więc jego brak jest błędem bramki także w
+ * samodzielnym checkoutcie submodułu — nie wolno zmieniać go w `skip`.
  */
 import { describe, it, expect, jest } from "@jest/globals"
 import { createHmac } from "node:crypto"
@@ -216,6 +215,18 @@ describe("Story 3.1 AC2 — poziom 1: klucz dostawy = (event.id, provider), NIE 
       /event\.id wymagany/
     )
   })
+
+  it("brak Stripe event.id ⇒ 400 przed rezerwacją i emisją; PI nie staje się fallbackiem event_key", async () => {
+    const world = makeWorld([ORDER_A, ORDER_B])
+    const eventWithoutId = stripeEvent("evt_will_be_removed", "payses_1") as { id?: string }
+    delete eventWithoutId.id
+
+    const { res, emitted } = await world.deliver(eventWithoutId as ReturnType<typeof stripeEvent>)
+    expect(res.statusCode).toBe(400)
+    expect(res.body).toEqual({ type: "invalid", reason: "stripe_event_id_missing" })
+    expect(world.reserveInserts).toEqual([])
+    expect(emitted).toEqual([])
+  })
 })
 
 describe("Story 3.1 AC2 — poziom 2: jednostka należna = payment_intent_id:order_id, po jednej na zamówienie", () => {
@@ -311,26 +322,27 @@ function findMirror(): string | null {
 const MIRROR = findMirror()
 
 describe("Story 3.1 AC2 — lustro kontraktu w evidence/3-1 (dryf = FAIL)", () => {
-  ;(MIRROR ? it : it.skip)(
-    MIRROR
-      ? "idempotency-key-contract.json zgadza się z kontraktem w kodzie"
-      : "POMINIĘTE: brak super-repo (samodzielny checkout submodułu) — lustro nieporównane",
-    () => {
-      const mirror = JSON.parse(readFileSync(MIRROR as string, "utf8")) as {
-        levels: {
-          transport: { table: string; key_columns: string[]; providers: Record<string, string> }
-          owed_business_unit: { table: string; key_shape: string; example: { payment_intent_id: string; order_ids: string[]; units: string[] } }
-        }
-      }
-      expect(mirror.levels.transport.table).toBe(WEBHOOK_DELIVERY_BARRIER_TABLE)
-      expect(mirror.levels.transport.key_columns).toEqual(["event_id", "provider"])
-      expect(mirror.levels.transport.providers).toEqual({
-        "/hooks/payment/stripe": STRIPE_NATIVE_WEBHOOK_PROVIDER,
-        "/webhooks/stripe/payment-intent": STRIPE_PATH_Y_WEBHOOK_PROVIDER,
-      })
-      expect(mirror.levels.owed_business_unit.table).toBe("event_processed")
-      const ex = mirror.levels.owed_business_unit.example
-      expect(ex.units).toEqual(buildOwedBusinessUnits({ payment_intent_id: ex.payment_intent_id, order_ids: ex.order_ids }))
+  it("idempotency-key-contract.json jest wymaganym lustrem i zgadza się z kontraktem w kodzie", () => {
+    expect(MIRROR).not.toBeNull()
+    if (!MIRROR) {
+      throw new Error(
+        "Brak wymaganego evidence/3-1/idempotency-key-contract.json: uruchom test z worktree GP zawierającego artefakt wydania"
+      )
     }
-  )
+    const mirror = JSON.parse(readFileSync(MIRROR, "utf8")) as {
+      levels: {
+        transport: { table: string; key_columns: string[]; providers: Record<string, string> }
+        owed_business_unit: { table: string; key_shape: string; example: { payment_intent_id: string; order_ids: string[]; units: string[] } }
+      }
+    }
+    expect(mirror.levels.transport.table).toBe(WEBHOOK_DELIVERY_BARRIER_TABLE)
+    expect(mirror.levels.transport.key_columns).toEqual(["event_id", "provider"])
+    expect(mirror.levels.transport.providers).toEqual({
+      "/hooks/payment/stripe": STRIPE_NATIVE_WEBHOOK_PROVIDER,
+      "/webhooks/stripe/payment-intent": STRIPE_PATH_Y_WEBHOOK_PROVIDER,
+    })
+    expect(mirror.levels.owed_business_unit.table).toBe("event_processed")
+    const ex = mirror.levels.owed_business_unit.example
+    expect(ex.units).toEqual(buildOwedBusinessUnits({ payment_intent_id: ex.payment_intent_id, order_ids: ex.order_ids }))
+  })
 })

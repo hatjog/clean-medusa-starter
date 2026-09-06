@@ -79,6 +79,16 @@ describe("Story 3.1 AC3 — werdykt ACK liczony zbiorami jednostek należnych", 
     expect(v.unexpected_units).toEqual([foreign])
   })
 
+  it("obca jednostka przy kompletnym zbiorze należnym ⇒ FAIL, nie 200 ACK", () => {
+    const foreign = `${PI}:order_obcy`
+    const v = evaluateOwedUnitAck({ owed_units: owed, settled_units: [...owed, foreign] })
+    expect(v.missing_units).toEqual([])
+    expect(v.unexpected_units).toEqual([foreign])
+    expect(v.verdict).toBe("FAIL")
+    expect(ackStatusForVerdict(v.verdict)).toBeGreaterThanOrEqual(500)
+    expect(isAckAllowed(v.verdict)).toBe(false)
+  })
+
   it("MUTANT mapowania: żaden werdykt poza PASS nie może mapować się na 2xx", () => {
     for (const [verdict, status] of Object.entries(OWED_UNIT_ACK_HTTP_STATUS)) {
       if (verdict === "PASS") expect(status).toBe(200)
