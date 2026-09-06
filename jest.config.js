@@ -52,6 +52,14 @@ if (process.env.TEST_TYPE === "integration:http") {
   module.exports.testMatch = [
     "**/packages/api/src/__tests__/integration/stripe-payment-intent-multi-order-pg.integration.test.[jt]s",
   ];
+} else if (process.env.TEST_TYPE === "owed-unit-ack-pg") {
+  // v1.16.0 Story 3.1 AC3 — kontrakt „ACK vs jednostki nalezne" (AD-47) i dowod
+  // luki `200 duplicate` na realnym PostgreSQL. DATABASE_URL musi wskazywac
+  // IZOLOWANA DB testowa (temp tables + ROLLBACK, ale rejestr kompensacji jest
+  // czytany z realnej tabeli `money_path_compensation_failure`).
+  module.exports.testMatch = [
+    "**/packages/api/src/__tests__/integration/stripe-payment-intent-owed-unit-ack-pg.integration.test.[jt]s",
+  ];
 } else if (process.env.TEST_TYPE === "replay-guard-pg") {
   // v1.15.0 Story 5.3 — bariera anty-replay wykonana przez sam modul na realnym
   // Postgresie (knex.raw). DATABASE_URL musi wskazywac IZOLOWANA DB testowa:
