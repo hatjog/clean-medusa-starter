@@ -1,28 +1,35 @@
 import fs from "node:fs"
 import path from "node:path"
 
+import { parseRuntimeRecoveryCapabilities } from "../../lib/runtime-recovery-capabilities"
+
 const contract = path.resolve(__dirname, "../../../../../../../specs/contracts/recovery/runtime-recovery-capabilities.v1.yaml")
 
 describe("runtime recovery capabilities v1", () => {
   const source = fs.readFileSync(contract, "utf8")
-  const valid = (value: string) =>
-    /generic_retry_dlq: forbidden/.test(value) &&
-    (value.match(/approval_required: true/g) ?? []).length === 3 &&
-    (value.match(/business_unit_idempotency_key/g) ?? []).length === 1 &&
-    (value.match(/partial_effect/g) ?? []).length >= 4
 
-  it("ma rozłączne populacje, approval, klucz business-unit oraz partial outcome", () => {
-    expect(valid(source)).toBe(true)
-    expect(source).toMatch(/compensation_failure:/)
-    expect(source).toMatch(/deferred_issuance_trace:/)
-    expect(source).toMatch(/dlq_entry:/)
-    expect(source).toMatch(/approval_required: true/)
-    expect(source).toMatch(/business_unit_idempotency_key/)
-    expect(source).toMatch(/partial_effect/)
+  it("ma semantycznie rozłączne populacje, approval, klucz business-unit oraz nonterminal partial outcome", () => {
+    expect(() => parseRuntimeRecoveryCapabilities(source)).not.toThrow()
   })
 
-  it("mutant generycznego DLQ retry i terminal bez approval jest odrzucony przez zamrożony oracle", () => {
-    const mutant = source.replace("approval_required: true", "approval_required: false").replace("generic_retry_dlq: forbidden", "generic_retry_dlq: true")
-    expect(valid(mutant)).toBe(false)
+  it.each([
+    ["compensation", "partial_effect: [recovery_in_progress]", "partial_effect: [resolved_recovered]"],
+    ["deferred issuance", "partial_effect: [escalated]", "partial_effect: [issued_after_link]"],
+    ["DLQ", "partial_effect: [dlq_pending_ops_review]", "partial_effect: [replayed]"],
+  ])("odrzuca terminalne przejście po partial_effect dla %s", (_population, expected, mutantValue) => {
+    expect(() => parseRuntimeRecoveryCapabilities(source.replace(expected, mutantValue))).toThrow(/partial_effect/)
+  })
+
+  it.each([
+    ["compensation", "partial_effect: [recovery_in_progress]", "partial_effect: [unrecognised_state]"],
+    ["deferred issuance", "partial_effect: [escalated]", "partial_effect: [unrecognised_state]"],
+    ["DLQ", "partial_effect: [dlq_pending_ops_review]", "partial_effect: [unrecognised_state]"],
+  ])("odrzuca przejście po partial_effect poza maszynę stanów dla %s", (_population, expected, mutantValue) => {
+    expect(() => parseRuntimeRecoveryCapabilities(source.replace(expected, mutantValue))).toThrow(/partial_effect/)
+  })
+
+  it("odrzuca brak approval i wspólne capability między populacjami", () => {
+    expect(() => parseRuntimeRecoveryCapabilities(source.replace("approval_required: true", "approval_required: false"))).toThrow(/approval/)
+    expect(() => parseRuntimeRecoveryCapabilities(source.replace("retry_issuance_link", "retry_compensation"))).toThrow(/distinct/)
   })
 })

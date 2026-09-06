@@ -116,6 +116,12 @@ function resolveDatabaseTarget() {
 		)
 	}
 
+	if (databaseUrl.protocol !== "postgres:" && databaseUrl.protocol !== "postgresql:") {
+		throw new Error(
+			"[test-db-guard] DATABASE_URL musi uzywac schematu postgres albo postgresql; suita odmawia startu bez bezpiecznego celu bazy."
+		)
+	}
+
 	if (!dbName) {
 		throw new Error(
 			"[test-db-guard] DATABASE_URL musi zawierac nazwe bazy; suita odmawia startu bez bezpiecznego celu."
@@ -158,6 +164,15 @@ if (requiresIsolatedDb) {
 
 // ── WARSTWA B ────────────────────────────────────────────────────────────────
 function assertConnectionTargetIsIsolated(dbName, host) {
+	// Wyjatki sa sprawdzane DOPIERO po zakazie baz deweloperskich. W przeciwnym
+	// razie GP_TEST_DATABASE_NAMES=gp_mercur otwieraloby bezposrednie polaczenie
+	// mimo poprawnego, izolowanego DATABASE_URL uruchamiajacego suite.
+	if (DEVELOPMENT_DATABASES.has(dbName)) {
+		throw new Error(
+			`[test-db-guard] SUITA TESTOWA PROBUJE SIE POLACZYC Z DEWELOPERSKA BAZA '${dbName}' (host: ${host || "?"}). Odmowa przed polaczeniem.`
+		)
+	}
+
 	if (!dbName || MAINTENANCE_DATABASES.has(dbName) || looksLikeTestDatabase(dbName)) {
 		return
 	}
