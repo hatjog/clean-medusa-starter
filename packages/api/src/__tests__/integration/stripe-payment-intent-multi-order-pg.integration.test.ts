@@ -212,6 +212,24 @@ runOrSkip("F2 — multi-seller na realnej ścieżce PostgreSQL", () => {
          envelope jsonb NOT NULL, received_at timestamptz NOT NULL,
          PRIMARY KEY (event_id, provider)
        ) ON COMMIT DROP`,
+      `CREATE TEMP TABLE money_path_compensation_failure (
+         failure_id text PRIMARY KEY,
+         market_id text NOT NULL,
+         compensation_kind text NOT NULL,
+         delivery_path text NOT NULL,
+         stripe_event_id text NOT NULL,
+         payment_intent_id text NOT NULL,
+         order_id text,
+         purchase_correlation_key text NOT NULL,
+         failure_code text NOT NULL,
+         failure_detail text NOT NULL,
+         occurred_at timestamptz NOT NULL DEFAULT now(),
+         attempt_count integer NOT NULL DEFAULT 1,
+         last_attempt_at timestamptz NOT NULL DEFAULT now(),
+         resolution_state text NOT NULL DEFAULT 'open',
+         resolved_at timestamptz,
+         resolved_by text
+       ) ON COMMIT DROP`,
       // `purchase_key` = kolumna klucza zakupu (Story 3.3 / AD-16 / ADR-190,
       // migracja 1779006000000). Kształt lustrzany wobec migracji modułu.
       `CREATE TEMP TABLE event_processed (

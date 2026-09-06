@@ -51,6 +51,14 @@ const auditSchema = readJson<JsonSchema>(`schemas/${AUDIT_SCHEMA}`)
 const examples = readJson<Row[]>("examples/recovery-populations.v1.example.json")
 const validator = new LiteValidator({ [POPULATION_SCHEMA]: schema, [AUDIT_SCHEMA]: auditSchema })
 
+// Zamrożony oracle v1: nie odczytujemy polityki z żywej schemy. Mutacja schemy
+// oraz examples w tym samym commicie nadal musi uszkodzić ten test.
+const FROZEN_V1_STATES = {
+  compensation_failure: ["open", "recovery_in_progress", "resolved_recovered", "closed_unrecoverable", "closed_legacy_unevidenced"],
+  deferred_issuance_trace: ["awaiting_order", "escalated", "issued_after_link", "closed_order_never_created"],
+  dlq_entry: ["dlq_pending_retry", "dlq_pending_ops_review", "replayed", "discarded_with_evidence"],
+} as const
+
 const clone = <T>(v: T): T => JSON.parse(JSON.stringify(v)) as T
 const findRow = (pred: (r: Row) => boolean): Row => {
   const row = examples.find(pred)
@@ -88,6 +96,12 @@ describe("recovery-population.v1 — mutanty muszą dać FAIL", () => {
   it("wiersz z instance_id=unknown (wartość zastępcza udająca scope)", () => {
     const row = findRow((r) => r.state === "open")
     row.instance_id = "unknown"
+    expect(errorsOf(row).join("\n")).toMatch(/instance_id/)
+  })
+
+  it.each(["UNKNOWN", "Default", " UNASSIGNED "])("scope placeholder `%s` niezależnie od wielkości liter lub spacji", (value) => {
+    const row = findRow((r) => r.state === "open")
+    row.instance_id = value
     expect(errorsOf(row).join("\n")).toMatch(/instance_id/)
   })
 
@@ -158,6 +172,12 @@ describe("recovery-population.v1 — mutanty muszą dać FAIL", () => {
     expect(errorsOf(row).join("\n")).toMatch(/owner/)
   })
 
+  it.each(["default", "UNASSIGNED", " unknown "])("owner placeholder `%s` jest odrzucany", (value) => {
+    const row = findRow((r) => r.state === "open")
+    ;(row.owner as { owner_id: string }).owner_id = value
+    expect(errorsOf(row).join("\n")).toMatch(/owner_id/)
+  })
+
   it("brak wersji rekordu (kontrola współbieżności martwa)", () => {
     const row = findRow((r) => r.state === "open")
     delete (row as Record<string, unknown>).version
@@ -180,6 +200,18 @@ describe("parytet dwóch nośników tabeli przejść (kernel TS vs $defs.transit
   it("zbiór populacji jest identyczny", () => {
     const fromSchema = Object.keys(transitions).filter((k) => k !== "description").sort()
     expect(fromSchema).toEqual([...RECOVERY_POPULATION_TYPES].sort())
+  })
+
+  it("żywa schema i kernel odpowiadają zamrożonemu kontraktowi v1, nie sobie nawzajem", () => {
+    for (const pop of RECOVERY_POPULATION_TYPES) {
+      const expected = [...FROZEN_V1_STATES[pop]].sort()
+      expect(Object.keys(RECOVERY_TRANSITIONS[pop].allowed).sort()).toEqual(expected)
+      const branch = (schema.oneOf as JsonSchema[]).find(
+        (b) => ((b.properties as Record<string, JsonSchema>).population_type as { const: string }).const === pop
+      )
+      const live = ((branch!.properties as Record<string, JsonSchema>).state as { enum: string[] }).enum
+      expect([...live].sort()).toEqual(expected)
+    }
   })
 
   it.each([...RECOVERY_POPULATION_TYPES])("%s: terminal i allowed są identyczne wartość po wartości", (pop) => {
