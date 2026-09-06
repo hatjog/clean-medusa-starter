@@ -48,6 +48,7 @@
     "test:integration:replay-guard-pg": "TEST_TYPE=replay-guard-pg NODE_OPTIONS=--experimental-vm-modules jest --silent=false --runInBand --forceExit",
     "test:integration:dispatch-barrier-pg": "TEST_TYPE=dispatch-barrier-pg NODE_OPTIONS=--experimental-vm-modules jest --silent=false --runInBand --forceExit",
     "test:integration:dispatch-window-provider": "TEST_TYPE=dispatch-window-provider NODE_OPTIONS=--experimental-vm-modules jest --silent=false --runInBand --forceExit",
+    "test:integration:story-3-6-canonical-state-pg": "TEST_TYPE=story-3-6-canonical-state-pg NODE_OPTIONS=--experimental-vm-modules jest --silent=false --runInBand --forceExit",
     "test:integration:modules": "TEST_TYPE=integration:modules NODE_OPTIONS=--experimental-vm-modules jest --silent=false --runInBand --forceExit",
     "test:integration:voucher-rls": "TEST_TYPE=voucher-rls-pg NODE_OPTIONS=--experimental-vm-modules jest --silent=false --runInBand --forceExit",
     "test:integration:voucher-redemption": "TEST_TYPE=voucher-redemption-pg NODE_OPTIONS=--experimental-vm-modules jest --silent=false --runInBand --forceExit",
