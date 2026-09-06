@@ -140,6 +140,18 @@ if (process.env.TEST_TYPE === "integration:http") {
   module.exports.testMatch = [
     "**/packages/api/src/__tests__/integration/story-3-6-canonical-state-provenance-pg.integration.test.[jt]s",
   ];
+} else if (process.env.TEST_TYPE === "story-11-1-runtime-recovery-pg") {
+  // Story 11.1 — profil musi wskazywać wyłącznie własne suity. Bez tego
+  // nieznany TEST_TYPE pozostawia domyślny discovery Jesta i miesza dowód
+  // RLS/NOT_RUN z niepowiązanymi testami jednostkowymi.
+  module.exports.testMatch = [
+    "**/packages/api/src/__tests__/integration/story-11-1-runtime-recovery-migration-pg.integration.test.[jt]s",
+    "**/packages/api/src/__tests__/integration/story-11-1-runtime-scope-pg.integration.test.[jt]s",
+    "**/packages/api/src/__tests__/integration/story-11-1-provisioning-roles-pg.integration.test.[jt]s",
+    "**/packages/api/src/__tests__/integration/story-11-1-runtime-recovery-boundary-pg.integration.test.[jt]s",
+    "**/packages/api/src/__tests__/integration/story-11-1-provenance-inventory-pg.integration.test.[jt]s",
+    "**/packages/api/src/__tests__/integration/story-11-1-retention-inventory-pg.integration.test.[jt]s",
+  ];
 } else if (process.env.TEST_TYPE === "unit") {
   module.exports.testMatch = [
     "**/packages/api/src/**/__tests__/**/*.unit.spec.[jt]s",
