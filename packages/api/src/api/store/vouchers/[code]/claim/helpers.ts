@@ -24,6 +24,15 @@ export class ClaimMarketContextRequiredError extends Error {
   }
 }
 
+export class ClaimPersistenceUnavailableError extends Error {
+  readonly error_code = "GP_CLAIM_PERSISTENCE_UNAVAILABLE"
+
+  constructor(message = "Durable voucher claim persistence is required") {
+    super(message)
+    this.name = "ClaimPersistenceUnavailableError"
+  }
+}
+
 function requireClaimMarketId(): string {
   const marketId = marketContextStorage.getStore()?.market_id
   if (!marketId) throw new ClaimMarketContextRequiredError()
@@ -69,6 +78,10 @@ export const auditLog: ClaimAuditRow[] = []
 
 export const CLAIM_BINDING_TTL_HOURS = 24
 
+function canUseInMemoryClaimPersistence(): boolean {
+  return process.env.NODE_ENV === "test" && process.env.GP_ALLOW_IN_MEMORY_CLAIM_PERSISTENCE === "1"
+}
+
 function isPgPool(value: unknown): value is PgPoolLike {
   return (
     !!value &&
@@ -110,7 +123,10 @@ export async function withClaimTransaction<T>(
   handler: (client: PgClientLike) => Promise<T>
 ): Promise<T | null> {
   const db = resolveDb(req)
-  if (!db) return null
+  if (!db) {
+    if (canUseInMemoryClaimPersistence()) return null
+    throw new ClaimPersistenceUnavailableError()
+  }
 
   if (isPgPool(db)) {
     const client = await db.connect()
@@ -171,14 +187,10 @@ export async function appendClaimAudit(
  * BEGIN/COMMIT via `withClaimTransaction`, amplifying connection-pool pressure
  * under flood (each 429 → 1 acquired connection + transaction).
  *
- * New strategy: attempt a lightweight non-transactional auto-commit INSERT by
- * acquiring a single pooled connection (no BEGIN/COMMIT).  PG auto-commits a
- * bare INSERT, so pool pressure is lower: connection is acquired, INSERT sent,
- * connection released — no round-trips for BEGIN/COMMIT.  On failure (pool
- * exhaustion, network), fall back to in-memory `auditLog` (same as before).
- *
- * Knex path falls through to the original `withClaimTransaction` path since
- * Knex does not expose a clean non-transactional API.
+ * Production always propagates a missing market scope or a persistence error:
+ * an in-memory row is neither RLS-scoped nor durable.  The in-memory path is
+ * available only to explicit unit tests that set
+ * `GP_ALLOW_IN_MEMORY_CLAIM_PERSISTENCE=1` under `NODE_ENV=test`.
  */
 export async function appendClaimAuditWithFallback(
   req: MedusaRequest,
@@ -193,12 +205,16 @@ export async function appendClaimAuditWithFallback(
       client = await db.connect()
       await appendClaimAudit(client, row)
       return
-    } catch {
-      // Best-effort — fall through to in-memory on any failure.
+    } catch (error) {
+      if (error instanceof ClaimMarketContextRequiredError) throw error
+      if (!canUseInMemoryClaimPersistence()) {
+        throw new ClaimPersistenceUnavailableError(
+          `Durable voucher claim audit failed: ${error instanceof Error ? error.message : String(error)}`
+        )
+      }
     } finally {
       client?.release?.()
     }
-    // PG write failed — record in-memory as fallback.
     auditLog.push(row)
     return
   }
@@ -209,12 +225,13 @@ export async function appendClaimAuditWithFallback(
       appendClaimAudit(client, row)
     )
     if (persisted === null) {
+      if (!canUseInMemoryClaimPersistence()) throw new ClaimPersistenceUnavailableError()
       auditLog.push(row)
     }
     return
   }
 
-  // No DB configured — single-instance fallback.
+  if (!canUseInMemoryClaimPersistence()) throw new ClaimPersistenceUnavailableError()
   auditLog.push(row)
 }
 
