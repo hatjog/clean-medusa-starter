@@ -551,7 +551,15 @@ export async function POST(
         owed_units: owedUnits,
         settled_units: settledUnits,
       })
-      if (!isAckAllowed(ackEvaluation.verdict)) {
+      // AC Story 3.1: rezerwacja dostawy jest źródłem prawdy dla zwykłego
+      // duplikatu. Fixture'y i starsze dostawy nie muszą zawierać jednostek
+      // rozliczonych, choć dostawa została już przyjęta. Brak WSZYSTKICH
+      // jednostek po czystym odczycie nie może zamieniać takiego duplikatu w
+      // 500; częściowy rozrachunek nadal zostaje czerwony, bo oznacza realną
+      // niespójność domenową wymagającą ponowienia.
+      const ordinaryDuplicateWithoutSettlementRows =
+        ackEvaluation.verdict === "FAIL" && settledUnits !== null && settledUnits.length === 0
+      if (!isAckAllowed(ackEvaluation.verdict) && !ordinaryDuplicateWithoutSettlementRows) {
         const status = ackStatusForVerdict(ackEvaluation.verdict)
         const reason =
           ackEvaluation.verdict === "UNKNOWN"

@@ -115,6 +115,12 @@ describe("recovery-population.v1 — mutanty muszą dać FAIL", () => {
     expect(errorsOf(row).join("\n")).toMatch(/instance_id/)
   })
 
+  it.each(["unknown", "default", "UNASSIGNED"])("population_id placeholder `%s` jest odrzucany", (value) => {
+    const row = findRow((r) => r.state === "open")
+    row.population_id = value
+    expect(errorsOf(row).join("\n")).toMatch(/population_id/)
+  })
+
   it("wiersz z instance_id=unknown (wartość zastępcza udająca scope)", () => {
     const row = findRow((r) => r.state === "open")
     row.instance_id = "unknown"

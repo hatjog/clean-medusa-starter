@@ -120,6 +120,10 @@ export type RecoveryRecordView = {
   resolution_evidence: ResolutionEvidence | null
 }
 
+export type RecoveryCompareAndSetResult =
+  | { applied: true; record: RecoveryRecordView }
+  | { applied: false; record: RecoveryRecordView }
+
 /**
  * Jedyna brama odczytu wiersza dla kernela. Implementacja runtime (Story 11.1)
  * pobiera go z nośnika pod RLS i scope'uje już w zapytaniu po instance_id;
@@ -131,6 +135,19 @@ export interface RecoveryRecordStore {
     population_id: string
     instance_id: string
   }): RecoveryRecordView | null
+  /**
+   * Trwały adapter wykonuje `UPDATE ... WHERE version = expected_version` w tej
+   * samej transakcji, w której utrwala wiersz. Różne klucze idempotencji nie mogą
+   * ominąć tego warunku i zapisać dwóch skutków z jednego snapshotu.
+   */
+  compareAndSetForRecovery(input: {
+    population_type: RecoveryPopulationType
+    population_id: string
+    instance_id: string
+    market_id: string
+    expected_version: number
+    next: RecoveryRecordView
+  }): Promise<RecoveryCompareAndSetResult>
 }
 
 /**
@@ -197,6 +214,29 @@ export type RecoveryActionAuditRecord = {
   recorded_at: string
 }
 
+const INVALID_RECOVERY_IDENTIFIERS = new Set([
+  "unknown",
+  "default",
+  "null",
+  "none",
+  "n/a",
+  "tbd",
+  "todo",
+  "unassigned",
+  "",
+])
+const RECOVERY_IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/
+const RECOVERY_POPULATION_IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:#-]*$/
+const RECOVERY_IDEMPOTENCY_POPULATION_IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._#-]*$/
+
+export function isConcreteRecoveryIdentifier(value: string): boolean {
+  return value === value.trim() && RECOVERY_IDENTIFIER.test(value) && !INVALID_RECOVERY_IDENTIFIERS.has(value.toLowerCase())
+}
+
+function isConcreteRecoveryPopulationIdentifier(value: string): boolean {
+  return value === value.trim() && RECOVERY_POPULATION_IDENTIFIER.test(value) && !INVALID_RECOVERY_IDENTIFIERS.has(value.toLowerCase())
+}
+
 /** Jedyny dozwolony kształt klucza idempotencji — wynika z intencji, nie z klienta. */
 export function buildRecoveryIdempotencyKey(input: {
   population_type: RecoveryPopulationType
@@ -204,9 +244,12 @@ export function buildRecoveryIdempotencyKey(input: {
   action: RecoveryAction
   expected_version: number
 }): string {
-  if (!/^[^:\s]+$/.test(input.population_id)) {
+  // `population_id` może zachować transportowy marker `#deferred-issuance`,
+  // ale dwukropek jest separatorem czterosegmentowego klucza i nie może wejść
+  // do jego drugiego segmentu.
+  if (!isConcreteRecoveryPopulationIdentifier(input.population_id) || !RECOVERY_IDEMPOTENCY_POPULATION_IDENTIFIER.test(input.population_id)) {
     throw new Error(
-      `[recovery-action-contract] population_id "${input.population_id}" zawiera dwukropek albo biały znak — klucz idempotencji byłby niejednoznaczny`
+      `[recovery-action-contract] population_id "${input.population_id}" nie jest konkretnym identyfikatorem — klucz idempotencji byłby niejednoznaczny albo udawałby wartość zastępczą`
     )
   }
   if (!Number.isInteger(input.expected_version) || input.expected_version < 1) {
@@ -430,6 +473,15 @@ export async function applyRecoveryIntent(input: ApplyRecoveryIntentInput): Prom
   const auditAction: RecoveryAction = RECOVERY_ACTIONS.includes(intent.action)
     ? intent.action
     : actionFromIdempotencyKey(intent.idempotency_key)
+  const auditExpectedVersion = Number.isInteger(intent.expected_version) && intent.expected_version >= 1
+    ? intent.expected_version
+    : record.version
+  const auditIdempotencyKey = buildRecoveryIdempotencyKey({
+    population_type: record.population_type,
+    population_id: record.population_id,
+    action: auditAction,
+    expected_version: auditExpectedVersion,
+  })
 
   const buildAudit = (parts: {
     outcome: RecoveryOutcome
@@ -451,8 +503,8 @@ export async function applyRecoveryIntent(input: ApplyRecoveryIntentInput): Prom
       verified_by: "server_admin_market_context",
       decision: authorization.decision,
     },
-    idempotency_key: intent.idempotency_key,
-    expected_version: intent.expected_version,
+    idempotency_key: auditIdempotencyKey,
+    expected_version: auditExpectedVersion,
     outcome: parts.outcome,
     before: parts.before,
     after: parts.after,
@@ -561,6 +613,37 @@ export async function applyRecoveryIntent(input: ApplyRecoveryIntentInput): Prom
     version: record.version + 1,
     resolution_evidence: goesTerminal ? evidence : null,
   }
+  const persisted = await input.recordStore.compareAndSetForRecovery({
+    population_type: record.population_type,
+    population_id: record.population_id,
+    instance_id: record.instance_id,
+    market_id: record.market_id,
+    expected_version: record.version,
+    next: nextRecord,
+  })
+  if (!persisted.applied) {
+    if (
+      persisted.record.population_type !== record.population_type ||
+      persisted.record.population_id !== record.population_id ||
+      persisted.record.instance_id !== record.instance_id ||
+      persisted.record.market_id !== record.market_id
+    ) {
+      throw new Error("[recovery-action-contract] store zwrócił konflikt dla innego wiersza recovery")
+    }
+    const conflict = snapshot(persisted.record)
+    return {
+      outcome: "refused_version_conflict",
+      record: persisted.record,
+      domain_effects: 0,
+      audit: buildAudit({
+        outcome: "refused_version_conflict",
+        before: conflict,
+        after: conflict,
+        actor,
+        resolution_evidence: null,
+      }),
+    }
+  }
   const after = snapshot(nextRecord)
   return {
     outcome: "applied",
@@ -593,15 +676,10 @@ export async function applyRecoveryIntent(input: ApplyRecoveryIntentInput): Prom
   return atomic.result
 }
 
-const INVALID_OWNER_IDS = new Set(["unknown", "default", "null", "none", "n/a", "tbd", "todo", "unassigned", ""])
-const RECOVERY_OWNER_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/
-
 function isValidRecoveryOwner(owner: RecoveryOwner): boolean {
   return (
     (owner.owner_type === "operator_role" || owner.owner_type === "operator_user") &&
-    owner.owner_id === owner.owner_id.trim() &&
-    RECOVERY_OWNER_ID.test(owner.owner_id) &&
-    !INVALID_OWNER_IDS.has(owner.owner_id.toLowerCase())
+    isConcreteRecoveryIdentifier(owner.owner_id)
   )
 }
 
