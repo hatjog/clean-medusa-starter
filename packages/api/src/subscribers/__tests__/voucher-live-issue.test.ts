@@ -13,6 +13,7 @@ import subscriber, {
   PAYMENT_INTENT_SUCCEEDED_EVENT,
   toLiveIssueInput,
 } from "../voucher-live-issue"
+import { marketContextStorage } from "../../lib/market-context"
 
 describe("Story 3.3 — toLiveIssueInput (mapowanie envelope.v1, fail-loud NFR4)", () => {
   const envelope = {
@@ -66,9 +67,14 @@ function makeFakeContainer() {
   const entitlements = new Map<string, unknown>()
   const log: string[] = []
   const txLog: string[] = []
+  const seenScopes: Array<{ market_id: string; instance_id?: string } | undefined> = []
+  const queryScopes: Array<{ sql: string; scope: { market_id: string; instance_id?: string } | undefined }> = []
 
   const client = {
     query: async (sql: string, values: ReadonlyArray<unknown> = []) => {
+      const currentScope = marketContextStorage.getStore()
+      seenScopes.push(currentScope)
+      queryScopes.push({ sql, scope: currentScope })
       if (/^(BEGIN|COMMIT|ROLLBACK)/i.test(sql.trim())) {
         txLog.push(sql.trim().toUpperCase())
         return { rows: [], rowCount: 0 }
@@ -133,7 +139,7 @@ function makeFakeContainer() {
       throw new Error(`unresolved ${key}`)
     },
   }
-  return { container, entitlements, log, txLog }
+  return { container, entitlements, log, txLog, seenScopes, queryScopes }
 }
 
 function envelopeEvent() {
@@ -175,6 +181,27 @@ describe("Story 3.3 — subscriber orchestracja (tx + idempotencja end-to-end)",
     const bad = { name: PAYMENT_INTENT_SUCCEEDED_EVENT, data: { payload: { order_id: "o" } } }
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await expect(subscriber({ event: bad, container } as any)).rejects.toThrow()
+  })
+
+  it("ustanawia subscriberowy scope przed transakcją i wykonaniem workflow", async () => {
+    const { container, seenScopes, queryScopes } = makeFakeContainer()
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await subscriber({ event: envelopeEvent(), container } as any)
+    expect(seenScopes).toEqual(expect.arrayContaining([
+      expect.objectContaining({ market_id: "bonbeauty", instance_id: "gp-dev" }),
+    ]))
+    expect(queryScopes.find(({ sql }) => /INSERT INTO event_processed/i.test(sql))?.scope).toEqual(
+      expect.objectContaining({ market_id: "bonbeauty", instance_id: "gp-dev" }),
+    )
+  })
+
+  it("odmawia brakującego instance_id przed otwarciem transakcji", async () => {
+    const { container, txLog } = makeFakeContainer()
+    const event = envelopeEvent()
+    event.data.scope = { market_id: "bonbeauty" }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await expect(subscriber({ event, container } as any)).rejects.toThrow(/scope\.instance_id/)
+    expect(txLog).toEqual([])
   })
 })
 

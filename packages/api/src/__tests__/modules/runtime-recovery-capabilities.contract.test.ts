@@ -41,4 +41,12 @@ describe("runtime recovery capabilities v1", () => {
   ])("odrzuca usunięcie zwykłego przejścia dla %s", (_population, expected, mutantValue) => {
     expect(() => parseRuntimeRecoveryCapabilities(source.replace(expected, mutantValue))).toThrow(/transition graph/)
   })
+
+  it.each([
+    ["compensation", "terminal_states: [resolved_recovered, closed_unrecoverable]", "terminal_states: [resolved_recovered, closed_unrecoverable, recovery_in_progress]"],
+    ["deferred issuance", "terminal_states: [issued_after_link, closed_order_never_created]", "terminal_states: [issued_after_link, closed_order_never_created, escalated]"],
+    ["DLQ", "terminal_states: [replayed, discarded_with_evidence]", "terminal_states: [replayed, discarded_with_evidence, dlq_pending_ops_review]"],
+  ])("odrzuca dodatkowy terminal poza zatwierdzonym zbiorem dla %s", (_population, expected, mutantValue) => {
+    expect(() => parseRuntimeRecoveryCapabilities(source.replace(expected, mutantValue))).toThrow(/exact terminal states/)
+  })
 })

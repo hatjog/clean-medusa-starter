@@ -157,6 +157,17 @@ describe("Story 11.1 — RLS claim/issuance na rzeczywistym PostgreSQL", () => {
           second.query(`INSERT INTO event_processed (external_id, event_type, processed_at, purchase_key, instance_id, market_id) VALUES ('story-11-1-concurrent', 'issued', 1779016000003, 'story-11-1-purchase', 'instance-a', 'market-a') ON CONFLICT DO NOTHING`),
         ])
         expect((firstInsert.rowCount ?? 0) + (secondInsert.rowCount ?? 0)).toBe(1)
+
+        const [firstClaim, secondClaim] = await Promise.all([
+          first.query(`INSERT INTO voucher_claim_binding (idempotency_key, binding_hash, code, claimed_at, expires_at, instance_id, market_id) VALUES ('story-11-1-concurrent-claim', 'story-11-1-first-hash', 'story-11-1-code', NOW(), NOW() + interval '1 hour', 'instance-a', 'market-a') ON CONFLICT DO NOTHING`),
+          second.query(`INSERT INTO voucher_claim_binding (idempotency_key, binding_hash, code, claimed_at, expires_at, instance_id, market_id) VALUES ('story-11-1-concurrent-claim', 'story-11-1-second-hash', 'story-11-1-code', NOW(), NOW() + interval '1 hour', 'instance-a', 'market-a') ON CONFLICT DO NOTHING`),
+        ])
+        expect((firstClaim.rowCount ?? 0) + (secondClaim.rowCount ?? 0)).toBe(1)
+        const concurrentClaim = await client.query<{ binding_hash: string }>(
+          "SELECT binding_hash FROM voucher_claim_binding WHERE idempotency_key = 'story-11-1-concurrent-claim'"
+        )
+        expect(concurrentClaim.rows).toHaveLength(1)
+        expect(concurrentClaim.rows[0]?.binding_hash).toMatch(/^story-11-1-(first|second)-hash$/)
       } finally {
         await resetRuntime(first).catch(() => undefined)
         await resetRuntime(second).catch(() => undefined)
@@ -198,10 +209,12 @@ describe("Story 11.1 — RLS claim/issuance na rzeczywistym PostgreSQL", () => {
       await client.query("DROP POLICY market_isolation ON event_processed")
       await client.query("CREATE POLICY market_isolation ON event_processed TO medusa_store USING (true) WITH CHECK (true)")
       await configureRuntime(client, "instance-a", "market-b")
-      await expect(
-        client.query("SELECT external_id FROM event_processed WHERE external_id = 'story-11-1-issuance'")
-          .then((result) => expect(result.rows).toEqual([]))
-      ).rejects.toThrow()
+      // Kontrola mutanta: jawnie osłabiona polityka MUSI odsłonić obcy wiersz.
+      // Jeżeli ten pomiar przestanie widzieć ekspozycję, test granicy powyżej
+      // nie byłby zdolny odróżnić właściwej polityki od permissive RLS.
+      expect((await client.query("SELECT external_id FROM event_processed WHERE external_id = 'story-11-1-issuance'")).rows).toEqual([
+        { external_id: "story-11-1-issuance" },
+      ])
     } finally {
       await resetRuntime(client).catch(() => undefined)
       await client.query("ROLLBACK")
@@ -209,8 +222,11 @@ describe("Story 11.1 — RLS claim/issuance na rzeczywistym PostgreSQL", () => {
       // głównego. Sprzątamy wyłącznie deterministyczny klucz fixture przed
       // asercją post-condition, aby kolejny przebieg nie odziedziczył skutku.
       await client.query("DELETE FROM event_processed WHERE external_id = 'story-11-1-concurrent'")
+      await client.query("DELETE FROM voucher_claim_binding WHERE idempotency_key = 'story-11-1-concurrent-claim'")
       const persisted = await client.query("SELECT external_id FROM event_processed WHERE external_id LIKE 'story-11-1-%'")
       expect(persisted.rows).toEqual([])
+      const persistedClaim = await client.query("SELECT idempotency_key FROM voucher_claim_binding WHERE idempotency_key = 'story-11-1-concurrent-claim'")
+      expect(persistedClaim.rows).toEqual([])
     }
   }, 30_000)
 })

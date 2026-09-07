@@ -14,11 +14,28 @@ const inventory = JSON.parse(fs.readFileSync(
   carriers: Array<{ carrier: string; table: string; mechanism: string; remaining_count: string; relation_present: boolean }>
 }
 
+const RELATIONS: Record<string, string> = {
+  voucher_recipient_pii: "voucher_recipient_pii",
+  voucher_delivery_decision: "voucher_delivery_decision",
+  notification: "notification",
+  order: '"order"',
+  voucher_delivery_dispatch: "voucher_delivery_dispatch",
+  voucher_claim_audit: "voucher_claim_audit",
+}
+
 function assertReadOnlyInventory(candidate: typeof inventory): void {
   for (const entry of candidate.carriers) {
     if (/\b(DELETE|UPDATE|INSERT|TRUNCATE)\b/i.test(entry.mechanism)) {
       throw new Error(`mutacja w inventory retention: ${entry.carrier}`)
     }
+  }
+}
+
+function assertRecordedCount(entry: (typeof inventory.carriers)[number], measured: string): void {
+  if (entry.remaining_count !== measured) {
+    throw new Error(
+      `rozjazd retention inventory dla ${entry.carrier}: artefakt=${entry.remaining_count}, pomiar=${measured}`
+    )
   }
 }
 
@@ -49,6 +66,12 @@ describe("Story 11.1 — read-only retention inventory", () => {
     expect(() => assertReadOnlyInventory(mutant)).toThrow(/mutacja/)
   })
 
+  it("odrzuca mutant rozjeżdżający wartość artefaktu z pomiarem", () => {
+    const entry = inventory.carriers.find((carrier) => carrier.carrier === "claim_audit")!
+    const mutant = { ...entry, remaining_count: entry.remaining_count === "0" ? "1" : "0" }
+    expect(() => assertRecordedCount(mutant, entry.remaining_count)).toThrow(/rozjazd retention inventory/)
+  })
+
   if (!enabled) {
     it("NOT_RUN: pomiar tabel wymaga GP_RUN_MIGRATION_INTEGRATION=1 i DATABASE_URL", () => {
       console.warn("[NOT_RUN] Story 11.1 retention inventory: ustaw GP_RUN_MIGRATION_INTEGRATION=1 i DATABASE_URL")
@@ -68,23 +91,29 @@ describe("Story 11.1 — read-only retention inventory", () => {
     await pool?.end()
   })
 
-  it("mierzy każdy nośnik tylko przez SELECT COUNT(*)", async () => {
+  it("mierzy każdy nośnik tylko przez SELECT COUNT(*) i wiąże wynik z artefaktem", async () => {
     const database = await client.query<{ current_database: string }>("SELECT current_database()")
     expect(database.rows[0]?.current_database).toEqual(expect.any(String))
     for (const entry of inventory.carriers) {
-      const relation = entry.table === "order" ? '"order"' : entry.table
+      const relation = RELATIONS[entry.table]
+      expect(relation).toBeDefined()
       const exists = await client.query<{ relation: string | null }>(
         "SELECT to_regclass($1) AS relation",
         [entry.table]
       )
       expect(exists.rows).toHaveLength(1)
-      // Brak tabeli jest wynikiem inwentarza tego konkretnego środowiska, nie
-      // pretekstem do wpisania fałszywego zera ani do tworzenia nośnika danych.
-      if (!exists.rows[0]?.relation) continue
+      const relationPresent = Boolean(exists.rows[0]?.relation)
+      expect(relationPresent).toBe(entry.relation_present)
+      if (!relationPresent) {
+        expect(entry.remaining_count).toBe("ABSENT")
+        continue
+      }
       const count = await client.query<{ remaining_count: string }>(
         `SELECT COUNT(*)::text AS remaining_count FROM ${relation}`
       )
-      expect(count.rows).toEqual([expect.objectContaining({ remaining_count: expect.stringMatching(/^\d+$/) })])
+      const measured = count.rows[0]?.remaining_count
+      expect(measured).toMatch(/^\d+$/)
+      assertRecordedCount(entry, measured!)
     }
   })
 })

@@ -4,7 +4,6 @@ import { Pool, type PoolClient } from "pg"
 import { applyRuntimeRecoveryMigration } from "./story-11-1-runtime-recovery-migration-support"
 
 const enabled = process.env.GP_RUN_MIGRATION_INTEGRATION === "1" && !!process.env.DATABASE_URL
-const SURFACES = ["http", "job", "subscriber", "workflow", "script"] as const
 
 async function setRuntime(client: PoolClient, instanceId: string, marketId: string): Promise<void> {
   await client.query("SET ROLE medusa_store")
@@ -39,7 +38,7 @@ describe("Story 11.1 — fail-closed scope na rzeczywistym PostgreSQL", () => {
     await pool?.end()
   })
 
-  it.each(SURFACES)("odmawia zapis %s bez obu osi scopu", async (surface) => {
+  it("odmawia zapisu bez obu osi scopu", async () => {
     await client.query("BEGIN")
     try {
       await applyRuntimeRecoveryMigration(client)
@@ -49,7 +48,7 @@ describe("Story 11.1 — fail-closed scope na rzeczywistym PostgreSQL", () => {
       await expect(client.query(
         `INSERT INTO event_processed (external_id, event_type, processed_at, purchase_key, instance_id, market_id)
          VALUES ($1, 'scope-missing', 1779016000000, $1, 'instance-a', 'market-a')`,
-        [`story-11-1-${surface}`]
+        ["story-11-1-missing-scope"]
       )).rejects.toThrow(/row-level security|permission denied/i)
     } finally {
       await resetRuntime(client).catch(() => undefined)

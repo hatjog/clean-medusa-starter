@@ -12,6 +12,12 @@ const PARTIAL_EFFECT_SUCCESSORS: Record<(typeof POPULATIONS)[number], string> = 
   dlq_entry: "dlq_pending_ops_review",
 }
 
+const EXPECTED_TERMINAL_STATES: Record<(typeof POPULATIONS)[number], readonly string[]> = {
+  compensation_failure: ["resolved_recovered", "closed_unrecoverable"],
+  deferred_issuance_trace: ["issued_after_link", "closed_order_never_created"],
+  dlq_entry: ["replayed", "discarded_with_evidence"],
+}
+
 const EXPECTED_TRANSITIONS: Record<(typeof POPULATIONS)[number], Record<string, readonly string[]>> = {
   compensation_failure: {
     open: ["recovery_in_progress", "partial_effect", "resolved_recovered", "closed_unrecoverable"],
@@ -108,7 +114,12 @@ export function parseRuntimeRecoveryCapabilities(source: string): void {
     nonEmptyString(capability.outcome, `${population}.outcome`)
 
     const transitions = record(capability.allowed_transitions, `${population}.allowed_transitions`)
-    const terminalStates = new Set(stringArray(capability.terminal_states, `${population}.terminal_states`))
+    const terminalStateValues = stringArray(capability.terminal_states, `${population}.terminal_states`)
+    const expectedTerminalStates = EXPECTED_TERMINAL_STATES[population]
+    if (!sameStringArray(terminalStateValues, expectedTerminalStates)) {
+      invalid(`${population} must retain its exact terminal states`)
+    }
+    const terminalStates = new Set(terminalStateValues)
     if (terminalStates.has("partial_effect")) invalid(`${population} treats partial_effect as terminal`)
     const partialTransitions = stringArray(transitions.partial_effect, `${population}.partial_effect transitions`)
     const requiredSuccessor = PARTIAL_EFFECT_SUCCESSORS[population]

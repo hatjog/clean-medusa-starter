@@ -1,5 +1,7 @@
 import type { MedusaContainer } from "@medusajs/framework/types";
 
+import { runInSystemMarketContext } from "../lib/system-market-context";
+
 /**
  * voucher-pii-retention-sweep — STORY-2-2 D-70 daily retention scheduler.
  *
@@ -186,37 +188,47 @@ export default async function voucherPiiRetentionSweep(
 
   let totalDeleted = 0;
   let totalOrphans = 0;
-  for (const market_id of markets) {
-    try {
-      const result = await service.purgeExpiredPii({
-        market_id,
-        cutoff,
-        batch_size: batchSize,
-      });
-      totalDeleted += result.rows_deleted;
-      totalOrphans += result.orphans_deleted;
-      logger.info(
-        `market=${market_id} purged=${result.rows_deleted} orphans=${result.orphans_deleted}`
-      );
-      posthog?.capture({
-        distinctId: `retention:${market_id}`,
-        event: "voucher.pii.purged.v1",
-        properties: {
-          market_id,
-          rows_deleted: result.rows_deleted,
-          orphans_deleted: result.orphans_deleted,
-        },
-      });
-    } catch (err) {
-      logger.error(
-        `market=${market_id} retention sweep error`,
-        err
-      );
-      sentry?.captureMessage(
-        `voucher-pii-retention-sweep failure market=${market_id}: ${(err as Error)?.message}`,
-        "error"
-      );
-    }
+  if (markets.length > 0) {
+    await runInSystemMarketContext(
+      {
+        markets,
+        instanceId: process.env.GP_INSTANCE_ID,
+        origin: { surface: "job", name: SCHEDULE_NAME },
+        logger,
+      },
+      async (market_id) => {
+        try {
+          const result = await service.purgeExpiredPii({
+            market_id,
+            cutoff,
+            batch_size: batchSize,
+          });
+          totalDeleted += result.rows_deleted;
+          totalOrphans += result.orphans_deleted;
+          logger.info(
+            `market=${market_id} purged=${result.rows_deleted} orphans=${result.orphans_deleted}`
+          );
+          posthog?.capture({
+            distinctId: `retention:${market_id}`,
+            event: "voucher.pii.purged.v1",
+            properties: {
+              market_id,
+              rows_deleted: result.rows_deleted,
+              orphans_deleted: result.orphans_deleted,
+            },
+          });
+        } catch (err) {
+          logger.error(
+            `market=${market_id} retention sweep error`,
+            err
+          );
+          sentry?.captureMessage(
+            `voucher-pii-retention-sweep failure market=${market_id}: ${(err as Error)?.message}`,
+            "error"
+          );
+        }
+      }
+    );
   }
 
   // Heartbeat — Sentry monitors absence (alert if no event >24h).

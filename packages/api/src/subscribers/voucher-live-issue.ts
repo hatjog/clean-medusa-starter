@@ -28,6 +28,8 @@
 import type { SubscriberArgs, SubscriberConfig } from "@medusajs/framework"
 import { ContainerRegistrationKeys, Modules } from "@medusajs/framework/utils"
 
+import { runInSystemMarketContext } from "../lib/system-market-context"
+
 import {
   liveIssueEntitlementsWithinTx,
   type LiveIssueInput,
@@ -199,6 +201,9 @@ export function toLiveIssueInput(
   const marketId =
     typeof scope.market_id === "string" ? scope.market_id.trim() : ""
   if (!marketId) missing.push("scope.market_id")
+  const instanceId =
+    typeof scope.instance_id === "string" ? scope.instance_id.trim() : ""
+  if (!instanceId) missing.push("scope.instance_id")
   if (missing.length > 0) {
     throw new Error(
       `[voucher-live-issue] envelope niekompletny: brak ${missing.join(",")} ` +
@@ -236,13 +241,21 @@ export default async function voucherLiveIssueSubscriber({
   // M2: `scope.market_id` zwalidowany w `toLiveIssueInput` (niepusty) — bezpieczne
   // źródło scope audytu/eventu okablowania (spójne z market_id użytym do INSERT).
   const marketId = String(input.scope.market_id)
+  const instanceId = String(input.scope.instance_id)
 
   try {
     // ── (A) issue + OKABLOWANIE GENEZY ISSUED w JEDNEJ DB-tx (atomicity) ──────
     // Audyt (append-only) + posting hook (bramkowany, inert przy
     // runtime_enabled=false) wykonywane W TEJ tx (atomowo ze zmianą stanu, AI-Review-3).
     // Eventy zbierane do emisji POST-COMMIT (kontrakt atomowości okablowania).
-    const wired = await withTransaction(db, async (client) => {
+    const scopedResults = await runInSystemMarketContext(
+      {
+        markets: [marketId],
+        instanceId,
+        origin: { surface: "subscriber", name: "voucher-live-issue" },
+        logger,
+      },
+      async () => withTransaction(db, async (client) => {
       const result = await liveIssueEntitlementsWithinTx(client, input, now)
       const events: TransitionEventEnvelope[] = []
       const appendAudit = makeTransitionAuditSink(logger)
@@ -276,7 +289,10 @@ export default async function voucherLiveIssueSubscriber({
         events.push(event)
       }
       return { result, events }
-    })
+      })
+    )
+    const wired = scopedResults[0]
+    if (!wired) throw new Error("voucher-live-issue nie ustanowił scope systemowego")
 
     // ── (B) replay/no-op event-level — zero issue, zero okablowania ───────────
     if (!wired.result.event_processed) {

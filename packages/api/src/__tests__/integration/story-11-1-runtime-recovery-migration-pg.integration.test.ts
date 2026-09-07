@@ -33,7 +33,8 @@ describe("Story 11.1 — migracja granicy RLS na rzeczywistym PostgreSQL", () =>
   it("wykonuje up i niedestrukcyjny down w izolowanej transakcji", async () => {
     await client.query("BEGIN")
     try {
-      await applyRuntimeRecoveryMigration(client)
+      const execution = await applyRuntimeRecoveryMigration(client)
+      expect(execution.rolesObservedDuringSetRole).toEqual(["gp_runtime_recovery_migrator"])
       const columns = await client.query<{ relname: string; attname: string }>(
         `SELECT c.relname, a.attname
            FROM pg_class c JOIN pg_attribute a ON a.attrelid = c.oid

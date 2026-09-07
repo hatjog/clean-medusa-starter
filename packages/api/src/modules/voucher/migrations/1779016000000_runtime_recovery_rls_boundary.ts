@@ -37,6 +37,9 @@ export class Migration1779016000000 extends Migration {
       $$
     `)
     this.addSql(`ALTER ROLE ${MIGRATION_ROLE} NOLOGIN NOBYPASSRLS`)
+    // Członkostwo jest tymczasowe: pozwala uruchomić dalsze DDL jako właściciel
+    // migracyjny, ale nie zostawia wykonawcy trwałej ścieżki eskalacji.
+    this.addSql(`GRANT ${MIGRATION_ROLE} TO CURRENT_USER`)
 
     for (const table of TABLES) {
       this.addSql(`ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS market_id text NULL`)
@@ -44,17 +47,6 @@ export class Migration1779016000000 extends Migration {
       this.addSql(`CREATE INDEX IF NOT EXISTS ${table}_market_id_idx ON ${table} (market_id)`)
       this.addSql(`CREATE INDEX IF NOT EXISTS ${table}_instance_market_id_idx ON ${table} (instance_id, market_id)`)
       this.addSql(`ALTER TABLE ${table} OWNER TO ${MIGRATION_ROLE}`)
-      this.addSql(`REVOKE ALL PRIVILEGES ON ${table} FROM ${RUNTIME_ROLE}`)
-      this.addSql(runtimeGrant(table))
-      this.addSql(`ALTER TABLE ${table} ENABLE ROW LEVEL SECURITY`)
-      this.addSql(`ALTER TABLE ${table} FORCE ROW LEVEL SECURITY`)
-      this.addSql(`DROP POLICY IF EXISTS market_isolation ON ${table}`)
-      this.addSql(`
-        CREATE POLICY market_isolation ON ${table}
-          TO medusa_store
-          USING (instance_id = ${INSTANCE_SETTING} AND market_id = ${MARKET_SETTING})
-          WITH CHECK (instance_id = ${INSTANCE_SETTING} AND market_id = ${MARKET_SETTING})
-      `)
     }
 
     this.addSql(`CREATE EXTENSION IF NOT EXISTS pgcrypto`)
@@ -123,6 +115,23 @@ export class Migration1779016000000 extends Migration {
 
     this.addSql(`REVOKE ALL PRIVILEGES ON SEQUENCE voucher_claim_audit_audit_id_seq FROM ${RUNTIME_ROLE}`)
     this.addSql(`GRANT USAGE ON SEQUENCE voucher_claim_audit_audit_id_seq TO ${RUNTIME_ROLE}`)
+
+    // Od tego punktu wykonujemy RLS i przywileje jako rola, która będzie
+    // właścicielem nośników. Nie wystarczy zadeklarować tej roli w DDL.
+    this.addSql(`SET ROLE ${MIGRATION_ROLE}`)
+    for (const table of TABLES) {
+      this.addSql(`REVOKE ALL PRIVILEGES ON ${table} FROM ${RUNTIME_ROLE}`)
+      this.addSql(runtimeGrant(table))
+      this.addSql(`ALTER TABLE ${table} ENABLE ROW LEVEL SECURITY`)
+      this.addSql(`ALTER TABLE ${table} FORCE ROW LEVEL SECURITY`)
+      this.addSql(`DROP POLICY IF EXISTS market_isolation ON ${table}`)
+      this.addSql(`
+        CREATE POLICY market_isolation ON ${table}
+          TO medusa_store
+          USING (instance_id = ${INSTANCE_SETTING} AND market_id = ${MARKET_SETTING})
+          WITH CHECK (instance_id = ${INSTANCE_SETTING} AND market_id = ${MARKET_SETTING})
+      `)
+    }
     this.addSql(`
       ALTER DEFAULT PRIVILEGES FOR ROLE ${MIGRATION_ROLE} IN SCHEMA public
       REVOKE ALL ON TABLES FROM ${RUNTIME_ROLE}
@@ -136,6 +145,8 @@ export class Migration1779016000000 extends Migration {
     this.addSql(`COMMENT ON COLUMN voucher_claim_binding.instance_id IS 'NULL = UNKNOWN legacy provenance; RLS requires both instance_id and market_id'`)
     this.addSql(`COMMENT ON COLUMN event_processed.market_id IS 'NULL = UNKNOWN legacy provenance; business dedupe key remains global; runtime is INSERT-only'`)
     this.addSql(`COMMENT ON COLUMN event_processed.instance_id IS 'NULL = UNKNOWN legacy provenance; RLS requires both instance_id and market_id'`)
+    this.addSql(`RESET ROLE`)
+    this.addSql(`REVOKE ${MIGRATION_ROLE} FROM CURRENT_USER`)
   }
 
   async down(): Promise<void> {

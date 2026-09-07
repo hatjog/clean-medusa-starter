@@ -20,10 +20,27 @@ const inventory = JSON.parse(fs.readFileSync(
   legacy_populations: Array<{ table: string; historical_count: string; provenance: string; relation_present: boolean }>
 }
 
+const LEGACY_RELATIONS: Record<string, string> = {
+  event_processed: "event_processed",
+  voucher_claim_audit: "voucher_claim_audit",
+  voucher_claim_binding: "voucher_claim_binding",
+}
+
 async function setRuntime(client: PoolClient, instanceId: string, marketId: string): Promise<void> {
   await client.query("SET ROLE medusa_store")
   await client.query("SELECT set_config('app.gp_instance_id', $1, false)", [instanceId])
   await client.query("SELECT set_config('app.gp_market_id', $1, false)", [marketId])
+}
+
+function assertRecordedHistoricalCount(
+  entry: (typeof inventory.legacy_populations)[number],
+  measured: string,
+): void {
+  if (entry.historical_count !== measured) {
+    throw new Error(
+      `rozjazd provenance inventory dla ${entry.table}: artefakt=${entry.historical_count}, pomiar=${measured}`
+    )
+  }
 }
 
 describe("Story 11.1 — UNKNOWN legacy provenance", () => {
@@ -40,6 +57,12 @@ describe("Story 11.1 — UNKNOWN legacy provenance", () => {
       expect(entry.historical_count).toMatch(/^\d+$/)
       expect(entry.provenance).toContain("UNKNOWN")
     }
+  })
+
+  it("odrzuca mutant rozjeżdżający historical_count z artefaktem", () => {
+    const entry = inventory.legacy_populations[0]!
+    const mutant = { ...entry, historical_count: entry.historical_count === "0" ? "1" : "0" }
+    expect(() => assertRecordedHistoricalCount(mutant, entry.historical_count)).toThrow(/rozjazd provenance inventory/)
   })
 
   if (!enabled) {
@@ -66,12 +89,16 @@ describe("Story 11.1 — UNKNOWN legacy provenance", () => {
     try {
       await applyRuntimeRecoveryMigration(client)
       for (const population of inventory.legacy_populations) {
+        const relation = LEGACY_RELATIONS[population.table]
+        expect(relation).toBeDefined()
         const count = await client.query<{ historical_count: string }>(
           `SELECT COUNT(*)::text AS historical_count
-             FROM ${population.table}
+             FROM ${relation}
             WHERE market_id IS NULL OR instance_id IS NULL`
         )
-        expect(count.rows).toEqual([expect.objectContaining({ historical_count: expect.stringMatching(/^\d+$/) })])
+        const measured = count.rows[0]?.historical_count
+        expect(measured).toMatch(/^\d+$/)
+        assertRecordedHistoricalCount(population, measured!)
       }
       await client.query(fixture)
       await setRuntime(client, "instance-a", "market-a")

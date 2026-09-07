@@ -23,6 +23,8 @@ describe("runtime recovery provisioning contract", () => {
   it("oddziela rolę migracyjną od runtime i wymusza RLS na wszystkich trzech tabelach", () => {
     expect(sql).toContain("CREATE ROLE gp_runtime_recovery_migrator NOLOGIN NOBYPASSRLS")
     expect(sql).toContain("ALTER ROLE gp_runtime_recovery_migrator NOLOGIN NOBYPASSRLS")
+    expect(sql).toContain("SET ROLE gp_runtime_recovery_migrator")
+    expect(sql).toContain("RESET ROLE")
     for (const table of TABLES) {
       expect(sql).toContain(`ALTER TABLE ${table} OWNER TO gp_runtime_recovery_migrator`)
       expect(sql).toContain(`ALTER TABLE ${table} ENABLE ROW LEVEL SECURITY`)
