@@ -37,6 +37,10 @@ import { createStripePaymentAuditWorkflowFromScope } from "../../workflows/payme
 import voucherLiveIssueSubscriber from "../../subscribers/voucher-live-issue"
 
 const STORY_TEST_DATABASE_URL_ENV = "GP_STORY_3_6_TEST_DATABASE_URL"
+const TRUSTED_STORY_TEST_DATABASE_NAMES = new Set([
+  "gp_story_3_6_test",
+  "gp_story_3_6_c4_test",
+])
 const DATABASE_URL = process.env[STORY_TEST_DATABASE_URL_ENV]
 const EVIDENCE_PATH = resolve(
   process.cwd(),
@@ -163,7 +167,7 @@ function hasTrustedStoryTestDatabaseUrl(
     const databaseName = decodeURIComponent(url.pathname).replace(/^\//, "")
     return (
       (url.protocol === "postgres:" || url.protocol === "postgresql:") &&
-      databaseName === "gp_story_3_6_test" &&
+      TRUSTED_STORY_TEST_DATABASE_NAMES.has(databaseName) &&
       ["localhost", "127.0.0.1", "::1"].includes(url.hostname)
     )
   } catch {
@@ -947,8 +951,10 @@ describe("Story 3.6 AC1 — precondition PostgreSQL", () => {
   })
 
   it("odrzuca produkcyjny host i obcą bazę testową", () => {
-    const safe = "postgres://test_runner@localhost:5432/gp_story_3_6_test"
-    expect(hasTrustedStoryTestDatabaseUrl(safe, safe)).toBe(true)
+    const historicalSafe = "postgres://test_runner@localhost:5432/gp_story_3_6_test"
+    const cycleFourSafe = "postgres://test_runner@localhost:5432/gp_story_3_6_c4_test"
+    expect(hasTrustedStoryTestDatabaseUrl(historicalSafe, historicalSafe)).toBe(true)
+    expect(hasTrustedStoryTestDatabaseUrl(cycleFourSafe, cycleFourSafe)).toBe(true)
     expect(
       hasTrustedStoryTestDatabaseUrl(
         "postgres://prod_role@prod-db.internal:5432/gp_story_3_6_test",
@@ -959,6 +965,12 @@ describe("Story 3.6 AC1 — precondition PostgreSQL", () => {
       hasTrustedStoryTestDatabaseUrl(
         "postgres://test_runner@localhost:5432/gp_mercur_test",
         "postgres://test_runner@localhost:5432/gp_mercur_test"
+      )
+    ).toBe(false)
+    expect(
+      hasTrustedStoryTestDatabaseUrl(
+        "postgres://test_runner@localhost:5432/gp_story_3_6_c4_test_extra",
+        "postgres://test_runner@localhost:5432/gp_story_3_6_c4_test_extra"
       )
     ).toBe(false)
   })
