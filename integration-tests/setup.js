@@ -1,4 +1,4 @@
-const { MetadataStorage } = require("@medusajs/framework/mikro-orm/core")
+const { MetadataStorage } = require("@medusajs/framework/mikro-orm/core");
 
 /**
  * BRAMKA IZOLACJI BAZY — DWIE WARSTWY, DWA NIEZALEŻNE NOŚNIKI.
@@ -60,24 +60,25 @@ const { MetadataStorage } = require("@medusajs/framework/mikro-orm/core")
  * bez śladu, a jedyny ślad w logu — zielona suita — wygląda identycznie jak
  * przebieg poprawny.
  */
-const TEST_TYPE = process.env.TEST_TYPE ?? ""
-const requiresIsolatedDb = /-pg$/.test(TEST_TYPE) || TEST_TYPE === "stripe-multi-order"
+const TEST_TYPE = process.env.TEST_TYPE ?? "";
+const requiresIsolatedDb =
+  /-pg$/.test(TEST_TYPE) || TEST_TYPE === "stripe-multi-order";
 // Story 11.1 ma jawny, niemutujący tryb NOT_RUN. Musi dać się uruchomić bez
 // URL-a, aby brak bezpiecznej bazy był widoczny jako wynik testu, a nie jako
 // błąd globalnego setupu. Każdy przebieg live nadal wymaga DATABASE_URL.
 const permitsDatabaseFreeNotRun =
-	TEST_TYPE === "story-11-1-runtime-recovery-pg" &&
-	process.env.GP_RUN_MIGRATION_INTEGRATION !== "1"
-const DEVELOPMENT_DATABASES = new Set(["gp_mercur", "gp_core", "gp_portal"])
-const MAINTENANCE_DATABASES = new Set(["postgres", "template1"])
-const TEST_DATABASE_NAME_TOKEN = /(^|[_.-])test([_.-]|$)/i
+  TEST_TYPE === "story-11-1-runtime-recovery-pg" &&
+  process.env.GP_RUN_MIGRATION_INTEGRATION !== "1";
+const DEVELOPMENT_DATABASES = new Set(["gp_mercur", "gp_core", "gp_portal"]);
+const MAINTENANCE_DATABASES = new Set(["postgres", "template1"]);
+const TEST_DATABASE_NAME_TOKEN = /(^|[_.-])test([_.-]|$)/i;
 
 /** Jawne wyjątki zachowują wyłącznie nazwy, które same deklarują cel testowy. */
 function extraAllowedDatabaseNames() {
-	return (process.env.GP_TEST_DATABASE_NAMES ?? "")
-		.split(",")
-		.map((entry) => entry.trim())
-		.filter((entry) => TEST_DATABASE_NAME_TOKEN.test(entry))
+  return (process.env.GP_TEST_DATABASE_NAMES ?? "")
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter((entry) => TEST_DATABASE_NAME_TOKEN.test(entry));
 }
 
 /**
@@ -87,10 +88,9 @@ function extraAllowedDatabaseNames() {
  * `test-db`), a nie podciągiem — inaczej `contest_prod` przechodziłby bramkę.
  */
 function looksLikeTestDatabase(dbName) {
-	return (
-		TEST_DATABASE_NAME_TOKEN.test(dbName) ||
-		EPHEMERAL_MEDUSA_DB.test(dbName)
-	)
+  return (
+    TEST_DATABASE_NAME_TOKEN.test(dbName) || EPHEMERAL_MEDUSA_DB.test(dbName)
+  );
 }
 
 /**
@@ -102,119 +102,112 @@ function looksLikeTestDatabase(dbName) {
  * i `test:integration:modules` — czyli bramka zabijałaby izolację zamiast jej
  * bronić. Wzorzec jest WĄSKI i przypięty do generatora nazw z test-utils.
  */
-const EPHEMERAL_MEDUSA_DB = /^medusa-[a-z0-9._-]*integration-\d+$/i
-
-/**
- * Profile, ktore w ogole nie siegaja po Postgresa. Dla nich brak DATABASE_URL
- * nie jest bledem konfiguracji, tylko normalnym stanem — a twarde zadanie
- * adresu bazy przy starcie kasowalo cala suite jednostkowa, ktora zadnego
- * polaczenia nie otwiera. WARSTWA B zostaje uzbrojona tak czy inaczej, wiec
- * proba polaczenia nadal jest blokowana przy `Client.connect`, czyli w
- * momencie, w ktorym fakt siegania po baze jest realny, a nie deklarowany.
- */
-const DATABASE_FREE_TEST_TYPES = new Set(["unit", "patches"])
-const hasDatabaseUrl =
-	typeof process.env.DATABASE_URL === "string" && process.env.DATABASE_URL.trim() !== ""
-const skipDatabaseTargetResolution =
-	!hasDatabaseUrl && !requiresIsolatedDb && DATABASE_FREE_TEST_TYPES.has(TEST_TYPE)
+const EPHEMERAL_MEDUSA_DB = /^medusa-[a-z0-9._-]*integration-\d+$/i;
 
 function resolveDatabaseTarget() {
-	const rawDatabaseUrl = process.env.DATABASE_URL
-	if (typeof rawDatabaseUrl !== "string" || rawDatabaseUrl.trim() === "") {
-		throw new Error(
-			"[test-db-guard] DATABASE_URL jest wymagany; suita nie uruchomi sie bez rozwiazanego celu bazy."
-		)
-	}
+  const rawDatabaseUrl = process.env.DATABASE_URL;
+  if (typeof rawDatabaseUrl !== "string" || rawDatabaseUrl.trim() === "") {
+    throw new Error(
+      "[test-db-guard] DATABASE_URL jest wymagany; suita nie uruchomi sie bez rozwiazanego celu bazy.",
+    );
+  }
 
-	let databaseUrl
-	let dbName
-	try {
-		databaseUrl = new URL(rawDatabaseUrl)
-		dbName = decodeURIComponent(databaseUrl.pathname).replace(/^\//, "")
-	} catch {
-		throw new Error(
-			"[test-db-guard] DATABASE_URL ma niepoprawny format; suita odmawia startu bez bezpiecznego celu bazy."
-		)
-	}
+  let databaseUrl;
+  let dbName;
+  try {
+    databaseUrl = new URL(rawDatabaseUrl);
+    dbName = decodeURIComponent(databaseUrl.pathname).replace(/^\//, "");
+  } catch {
+    throw new Error(
+      "[test-db-guard] DATABASE_URL ma niepoprawny format; suita odmawia startu bez bezpiecznego celu bazy.",
+    );
+  }
 
-	if (databaseUrl.protocol !== "postgres:" && databaseUrl.protocol !== "postgresql:") {
-		throw new Error(
-			"[test-db-guard] DATABASE_URL musi uzywac schematu postgres albo postgresql; suita odmawia startu bez bezpiecznego celu bazy."
-		)
-	}
+  if (
+    databaseUrl.protocol !== "postgres:" &&
+    databaseUrl.protocol !== "postgresql:"
+  ) {
+    throw new Error(
+      "[test-db-guard] DATABASE_URL musi uzywac schematu postgres albo postgresql; suita odmawia startu bez bezpiecznego celu bazy.",
+    );
+  }
 
-	if (!dbName) {
-		throw new Error(
-			"[test-db-guard] DATABASE_URL musi zawierac nazwe bazy; suita odmawia startu bez bezpiecznego celu."
-		)
-	}
+  if (!dbName) {
+    throw new Error(
+      "[test-db-guard] DATABASE_URL musi zawierac nazwe bazy; suita odmawia startu bez bezpiecznego celu.",
+    );
+  }
 
-	return { databaseUrl, dbName }
+  return { databaseUrl, dbName };
 }
 
-// Dwa NIEZALEZNE powody, by nie rozwiazywac celu bazy, i zaden nie zawiera drugiego:
-// Story 11.1 daje jawny, niemutujacy tryb NOT_RUN dla swojego TEST_TYPE, zeby brak
-// bezpiecznej bazy byl WYNIKIEM TESTU, a nie awaria globalnego setupu; Story 7.2 pomija
-// rozwiazywanie dla typow bezbazowych (`unit`, `patches`), gdy DATABASE_URL nie ma wcale.
-// Scalone alternatywa: wybor jednej strony konfliktu cofnalby bramke drugiej story.
-const resolvedDatabaseTarget =
-	permitsDatabaseFreeNotRun || skipDatabaseTargetResolution ? null : resolveDatabaseTarget()
+const resolvedDatabaseTarget = permitsDatabaseFreeNotRun
+  ? null
+  : resolveDatabaseTarget();
 
 if (resolvedDatabaseTarget !== null) {
-	if (DEVELOPMENT_DATABASES.has(resolvedDatabaseTarget.dbName)) {
-		throw new Error(
-			`[test-db-guard] Odmowa startu: rozwiazany DATABASE_URL wskazuje deweloperska baze '${resolvedDatabaseTarget.dbName}'. Ustaw izolowana baze testowa.`
-		)
-	}
+  if (DEVELOPMENT_DATABASES.has(resolvedDatabaseTarget.dbName)) {
+    throw new Error(
+      `[test-db-guard] Odmowa startu: rozwiazany DATABASE_URL wskazuje deweloperska baze '${resolvedDatabaseTarget.dbName}'. Ustaw izolowana baze testowa.`,
+    );
+  }
 
-	process.env.DB_HOST ||= resolvedDatabaseTarget.databaseUrl.hostname
-	process.env.DB_PORT ||= resolvedDatabaseTarget.databaseUrl.port
-	process.env.DB_USERNAME ||= decodeURIComponent(resolvedDatabaseTarget.databaseUrl.username)
-	process.env.DB_PASSWORD ||= decodeURIComponent(resolvedDatabaseTarget.databaseUrl.password)
+  process.env.DB_HOST ||= resolvedDatabaseTarget.databaseUrl.hostname;
+  process.env.DB_PORT ||= resolvedDatabaseTarget.databaseUrl.port;
+  process.env.DB_USERNAME ||= decodeURIComponent(
+    resolvedDatabaseTarget.databaseUrl.username,
+  );
+  process.env.DB_PASSWORD ||= decodeURIComponent(
+    resolvedDatabaseTarget.databaseUrl.password,
+  );
 }
 
 // ── WARSTWA A ────────────────────────────────────────────────────────
 if (requiresIsolatedDb && resolvedDatabaseTarget !== null) {
-	const isTestDb =
-		/_test$/.test(resolvedDatabaseTarget.dbName) ||
-		extraAllowedDatabaseNames().includes(resolvedDatabaseTarget.dbName)
+  const isTestDb =
+    /_test$/.test(resolvedDatabaseTarget.dbName) ||
+    extraAllowedDatabaseNames().includes(resolvedDatabaseTarget.dbName);
 
-	if (!isTestDb) {
-		throw new Error(
-			`[test-db-guard] TEST_TYPE=${TEST_TYPE} ZAKLADA I KASUJE tabele, a DATABASE_URL wskazuje baze ` +
-				`'${resolvedDatabaseTarget.dbName}', ktora nie wyglada na testowa (oczekiwany sufiks '_test').\n` +
-				`Uruchomienie na tej bazie skasowaloby z niej tabele i dane — 2026-08-09 dokladnie tak ` +
-				`zniknely 4 tabele i zawartosc 'entitlement_instance' oraz 'seller' z bazy deweloperskiej.\n` +
-				`Wskaz izolowana baze: DATABASE_URL=postgres://.../<nazwa>_test`
-		)
-	}
+  if (!isTestDb) {
+    throw new Error(
+      `[test-db-guard] TEST_TYPE=${TEST_TYPE} ZAKLADA I KASUJE tabele, a DATABASE_URL wskazuje baze ` +
+        `'${resolvedDatabaseTarget.dbName}', ktora nie wyglada na testowa (oczekiwany sufiks '_test').\n` +
+        `Uruchomienie na tej bazie skasowaloby z niej tabele i dane — 2026-08-09 dokladnie tak ` +
+        `zniknely 4 tabele i zawartosc 'entitlement_instance' oraz 'seller' z bazy deweloperskiej.\n` +
+        `Wskaz izolowana baze: DATABASE_URL=postgres://.../<nazwa>_test`,
+    );
+  }
 }
 
 // ── WARSTWA B ────────────────────────────────────────────────────────────────
 function assertConnectionTargetIsIsolated(dbName, host) {
-	// Zakaz baz deweloperskich pozostaje jawny, a allowlista może potwierdzić
-	// wyłącznie nazwę z oddzielnym członem `test`. W przeciwnym razie nazwa
-	// produkcyjna w środowisku otwierałaby połączenie mimo bezpiecznego startu suity.
-	if (DEVELOPMENT_DATABASES.has(dbName)) {
-		throw new Error(
-			`[test-db-guard] SUITA TESTOWA PROBUJE SIE POLACZYC Z DEWELOPERSKA BAZA '${dbName}' (host: ${host || "?"}). Odmowa przed polaczeniem.`
-		)
-	}
+  // Zakaz baz deweloperskich pozostaje jawny, a allowlista może potwierdzić
+  // wyłącznie nazwę z oddzielnym członem `test`. W przeciwnym razie nazwa
+  // produkcyjna w środowisku otwierałaby połączenie mimo bezpiecznego startu suity.
+  if (DEVELOPMENT_DATABASES.has(dbName)) {
+    throw new Error(
+      `[test-db-guard] SUITA TESTOWA PROBUJE SIE POLACZYC Z DEWELOPERSKA BAZA '${dbName}' (host: ${host || "?"}). Odmowa przed polaczeniem.`,
+    );
+  }
 
-	if (!dbName || MAINTENANCE_DATABASES.has(dbName) || looksLikeTestDatabase(dbName)) {
-		return
-	}
+  if (
+    !dbName ||
+    MAINTENANCE_DATABASES.has(dbName) ||
+    looksLikeTestDatabase(dbName)
+  ) {
+    return;
+  }
 
-	throw new Error(
-		`[test-db-guard] SUITA TESTOWA PROBUJE SIE POLACZYC Z BAZA '${dbName}' (host: ${host || "?"}), ` +
-			`ktora nie wyglada na testowa.\n` +
-			`Bramka nie patrzy juz na TEST_TYPE (=${TEST_TYPE || "<pusty>"}) — nazwa profilu NIE jest nosnikiem ` +
-			`faktu, ze suita siega po baze. 2026-08-09 i 2026-08-10 dwa razy skonczylo sie to skasowaniem ` +
-			`danych z bazy deweloperskiej przez suity biegnace pod profilem, ktory tego nie deklarowal.\n` +
-			`Testy dotykajace Postgresa maja brac adres z DEDYKOWANEJ zmiennej (wzorzec: ` +
-			`GP_CORE_RLS_TEST_DATABASE_URL) i POMIJAC sie, gdy jej nie ma — nigdy z fallbacku na DATABASE_URL.\n` +
-			`Wskaz izolowana baze z czlonem 'test' w nazwie albo jawnie potwierdz taka nazwe w GP_TEST_DATABASE_NAMES.`
-	)
+  throw new Error(
+    `[test-db-guard] SUITA TESTOWA PROBUJE SIE POLACZYC Z BAZA '${dbName}' (host: ${host || "?"}), ` +
+      `ktora nie wyglada na testowa.\n` +
+      `Bramka nie patrzy juz na TEST_TYPE (=${TEST_TYPE || "<pusty>"}) — nazwa profilu NIE jest nosnikiem ` +
+      `faktu, ze suita siega po baze. 2026-08-09 i 2026-08-10 dwa razy skonczylo sie to skasowaniem ` +
+      `danych z bazy deweloperskiej przez suity biegnace pod profilem, ktory tego nie deklarowal.\n` +
+      `Testy dotykajace Postgresa maja brac adres z DEDYKOWANEJ zmiennej (wzorzec: ` +
+      `GP_CORE_RLS_TEST_DATABASE_URL) i POMIJAC sie, gdy jej nie ma — nigdy z fallbacku na DATABASE_URL.\n` +
+      `Wskaz izolowana baze z czlonem 'test' w nazwie albo jawnie potwierdz taka nazwe w GP_TEST_DATABASE_NAMES.`,
+  );
 }
 
 /**
@@ -224,25 +217,30 @@ function assertConnectionTargetIsIsolated(dbName, host) {
  * Dzięki temu jeden hak pokrywa `pg.Client`, `pg.Pool` i `knex({client:"pg"})`.
  */
 try {
-	// eslint-disable-next-line @typescript-eslint/no-var-requires
-	const pg = require("pg")
-	if (pg && pg.Client && pg.Client.prototype && !pg.Client.prototype.__gpTestDbGuard) {
-		const originalConnect = pg.Client.prototype.connect
-		function guardedConnect(...args) {
-			const params = this.connectionParameters || {}
-			assertConnectionTargetIsIsolated(params.database, params.host)
-			return originalConnect.apply(this, args)
-		}
-		guardedConnect.__gpTestDbGuard = true
-		pg.Client.prototype.connect = guardedConnect
-		pg.Client.prototype.__gpTestDbGuard = true
-	}
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const pg = require("pg");
+  if (
+    pg &&
+    pg.Client &&
+    pg.Client.prototype &&
+    !pg.Client.prototype.__gpTestDbGuard
+  ) {
+    const originalConnect = pg.Client.prototype.connect;
+    function guardedConnect(...args) {
+      const params = this.connectionParameters || {};
+      assertConnectionTargetIsIsolated(params.database, params.host);
+      return originalConnect.apply(this, args);
+    }
+    guardedConnect.__gpTestDbGuard = true;
+    pg.Client.prototype.connect = guardedConnect;
+    pg.Client.prototype.__gpTestDbGuard = true;
+  }
 } catch (error) {
-	// Brak sterownika `pg` w tym workspace = nie ma czego przechwytywać. To NIE
-	// jest ciche pominięcie bramki: bez `pg` żadne połączenie i tak nie powstanie.
-	if (!error || error.code !== "MODULE_NOT_FOUND") {
-		throw error
-	}
+  // Brak sterownika `pg` w tym workspace = nie ma czego przechwytywać. To NIE
+  // jest ciche pominięcie bramki: bez `pg` żadne połączenie i tak nie powstanie.
+  if (!error || error.code !== "MODULE_NOT_FOUND") {
+    throw error;
+  }
 }
 
-MetadataStorage.clear()
+MetadataStorage.clear();
