@@ -23,7 +23,7 @@ import {
   DEFERRED_ISSUANCE_REASON,
   STRIPE_PATH_Y_WEBHOOK_PROVIDER,
 } from "../../lib/payment/stripe-payment-intent-transport"
-import { RECOVERY_POPULATION_TYPES } from "../../lib/recovery/recovery-action-contract"
+import { RECOVERY_POPULATION_TYPES, type SessionActor } from "../../lib/recovery/recovery-action-contract"
 import { LiteValidator, type JsonSchema } from "../contracts/json-schema-lite"
 import {
   classifyHistoricalCompensationRow,
@@ -154,6 +154,32 @@ describe("NOT NULL dla nowych danych i brak default poza licznikami", () => {
     expect(backfill.sql_shape).toContain("missing certified scope, owner, deadline, or legacy resolver evidence")
   })
 
+  it("źródła backfillu są parametrami JSONB, nie literałami zastępującymi dane operacyjne", () => {
+    const backfill = planFor("compensation_failure").up.find((s) => s.id === "cf-backfill")!
+    const remap = planFor("compensation_failure").up.find((s) => s.id === "cf-remap-legacy-resolved")!
+    const deferred = planFor("deferred_issuance_trace").up.find((s) => s.id === "dit-backfill")!
+    for (const sql of [backfill.sql_shape, remap.sql_shape, deferred.sql_shape]) {
+      expect(sql).not.toContain("<verified")
+      expect(sql).not.toContain("<operator-certified")
+      expect(sql).toContain("jsonb_to_recordset($1::jsonb)")
+    }
+    expect(backfill.sql_shape).toContain("jsonb_to_recordset($2::jsonb)")
+    expect(deferred.sql_shape).toContain("jsonb_to_recordset($2::jsonb)")
+  })
+
+  it("SQL dit-backfill odrzuca marker z drugim sufiksem; mutacja usuwająca fence jest czerwona", () => {
+    const sql = planFor("deferred_issuance_trace").up.find((s) => s.id === "dit-backfill")!.sql_shape
+    const baseEventId = `left(w.event_id,length(w.event_id)-length('${DEFERRED_ISSUANCE_EVENT_SUFFIX}'))`
+    const suffixFence = `position('${DEFERRED_ISSUANCE_EVENT_SUFFIX}' IN ${baseEventId})=0`
+    const requiresCanonicalMarker = (candidate: string) =>
+      candidate.includes(`${baseEventId} ~ '^[A-Za-z0-9][A-Za-z0-9._:-]*$'`) &&
+      candidate.includes(`lower(${baseEventId}) NOT IN ('unknown','default','null','none','n/a','tbd','todo','unassigned')`) &&
+      candidate.includes(suffixFence)
+
+    expect(requiresCanonicalMarker(sql)).toBe(true)
+    expect(requiresCanonicalMarker(sql.replace(suffixFence, "TRUE"))).toBe(false)
+  })
+
   it("plan używa prawdziwych nazw obu constraintów i zachowuje stan legacy do remapu", () => {
     const widen = planFor("compensation_failure").up.find((s) => s.id === "cf-widen-state-check")!
     expect(widen.sql_shape).toContain("money_path_compensation_failure_state_check")
@@ -270,6 +296,30 @@ describe("backfill bez wartości zastępczej", () => {
       { failure_id: "f3", market_id: "bongarden", resolution_state: "resolved_manually", resolved_by: null, resolved_at: null },
       instanceByMarket,
       certified
+    )
+    expect(decision.decision).toBe("quarantine")
+  })
+
+  it("legacy resolver z nietekstowym auth_identity_id → kwarantanna zamiast evidence", () => {
+    const poisoned = new Map<string, VerifiedHistoricalCompensationMetadata>([
+      [
+        "f-auth-identity-type",
+        {
+          owner: { owner_type: "operator_user", owner_id: "usr_1" },
+          deadline: "2026-08-20T12:00:00Z",
+          legacy_resolver: {
+            actor_type: "user",
+            actor_id: "usr_1",
+            auth_identity_id: 42,
+            session_source: "medusa_admin_session",
+          } as unknown as SessionActor,
+        },
+      ],
+    ])
+    const decision = classifyHistoricalCompensationRow(
+      { failure_id: "f-auth-identity-type", market_id: "bonbeauty", resolution_state: "resolved_manually", resolved_by: "usr_1", resolved_at: "2026-08-19T12:04:55Z" },
+      instanceByMarket,
+      poisoned
     )
     expect(decision.decision).toBe("quarantine")
   })
@@ -404,6 +454,7 @@ describe("backfill bez wartości zastępczej", () => {
     ["placeholder owner", { owner_id: "UNASSIGNED" }],
     ["niepoprawny timestamp", { psp_occurred_at: "2026-02-30T12:00:00Z" }],
     ["brak suffixu", { event_id: "evt_3U2vWGLq7ZbYtR8m0aBcDeFg" }],
+    ["drugi suffix", { event_id: `evt_3U2vWGLq7ZbYtR8m0aBcDeFg${DEFERRED_ISSUANCE_EVENT_SUFFIX}${DEFERRED_ISSUANCE_EVENT_SUFFIX}` }],
   ])("marker deferral z wadą %s trafia do kwarantanny", (_caseName, override) => {
     const marker: HistoricalDeferredIssuanceMarker = {
       event_id: `evt_3U2vWGLq7ZbYtR8m0aBcDeFg${DEFERRED_ISSUANCE_EVENT_SUFFIX}`,

@@ -160,10 +160,14 @@ const SESSION_INSTANCE = "gp-prod-eu1"
 /** Surowe wejścia, które w runtime tworzą wyłącznie middleware i resolver serwera. */
 let standardRecoverySession: RecoveryServerSession
 
-function serverContext(record: RecoveryRecordView, recoverySession = standardRecoverySession): Pick<ApplyRecoveryIntentInput, "recoverySession" | "recordStore" | "evidenceVerifier"> {
+function serverContext(
+  record: RecoveryRecordView,
+  recoverySession = standardRecoverySession,
+  recordStore: RecoveryRecordStore = new MemoryRecoveryRecordStore(record)
+): Pick<ApplyRecoveryIntentInput, "recoverySession" | "recordStore" | "evidenceVerifier"> {
   return {
     recoverySession,
-    recordStore: new MemoryRecoveryRecordStore(record),
+    recordStore,
     evidenceVerifier: new RecordedEvidenceVerifier([evidenceFor(OPERATOR)]),
   }
 }
@@ -207,12 +211,35 @@ function intentFor(record: RecoveryRecordView, action: RecoveryIntent["action"],
 }
 
 class MemoryRecoveryRecordStore implements RecoveryRecordStore {
-  constructor(private readonly record: RecoveryRecordView) {}
+  constructor(private record: RecoveryRecordView) {}
 
   readForRecovery(input: { population_type: RecoveryRecordView["population_type"]; population_id: string; instance_id: string }): RecoveryRecordView | null {
     return input.population_type === this.record.population_type && input.population_id === this.record.population_id && input.instance_id === this.record.instance_id
       ? this.record
       : null
+  }
+
+  async compareAndSetForRecovery(input: {
+    population_type: RecoveryRecordView["population_type"]
+    population_id: string
+    instance_id: string
+    market_id: string
+    expected_version: number
+    next: RecoveryRecordView
+  }) {
+    if (
+      input.population_type !== this.record.population_type ||
+      input.population_id !== this.record.population_id ||
+      input.instance_id !== this.record.instance_id ||
+      input.market_id !== this.record.market_id
+    ) {
+      throw new Error("MemoryRecoveryRecordStore: compare-and-set wskazuje inny wiersz")
+    }
+    if (this.record.version !== input.expected_version) {
+      return { applied: false as const, record: this.record }
+    }
+    this.record = input.next
+    return { applied: true as const, record: this.record }
   }
 }
 
@@ -498,6 +525,38 @@ describe("idempotencja intencji i optymistyczna kontrola wersji", () => {
     expect(b.record.state).toBe("recovery_in_progress")
   })
 
+  it("RÓWNOLEGŁE różne klucze na tej samej wersji wykonują dokładnie jeden compare-and-set", async () => {
+    const ledger = new MemoryLedger()
+    const record = baseRecord()
+    const store = new MemoryRecoveryRecordStore(record)
+    const [first, second] = await Promise.all([
+      applyRecoveryIntent({
+        intent: intentFor(record, "escalate", { target_state: "recovery_in_progress" }),
+        ...serverContext(record, standardRecoverySession, store),
+        ledger,
+        now,
+        auditId: nextAuditId(),
+      }),
+      applyRecoveryIntent({
+        intent: intentFor(record, "take_ownership", { new_owner: { owner_type: "operator_user", owner_id: OPERATOR } }),
+        ...serverContext(record, standardRecoverySession, store),
+        ledger,
+        now,
+        auditId: nextAuditId(),
+      }),
+    ])
+
+    expect([first.outcome, second.outcome].sort()).toEqual(["applied", "refused_version_conflict"])
+    expect(first.domain_effects + second.domain_effects).toBe(1)
+    expect(store.readForRecovery({
+      population_type: record.population_type,
+      population_id: record.population_id,
+      instance_id: record.instance_id,
+    })?.version).toBe(2)
+    expectAuditValid(first.audit)
+    expectAuditValid(second.audit)
+  })
+
   it("przejście w stan terminalny bez evidence → refused_missing_evidence (zmiana stanu nie jest dowodem)", async () => {
     const record = baseRecord()
     const result = await applyRecoveryIntent({
@@ -663,6 +722,23 @@ describe("idempotencja intencji i optymistyczna kontrola wersji", () => {
     expectAuditValid(result.audit)
   })
 
+  it("nieznana action z wadliwym kluczem zapisuje schematyczny audit odmowy, nie surowe body", async () => {
+    const record = baseRecord()
+    const intent = intentFor(record, "escalate", { target_state: "recovery_in_progress", idempotency_key: "garbage" })
+    ;(intent as unknown as { action: string }).action = "force_close"
+    const result = await applyRecoveryIntent({ intent, ...serverContext(record), ledger: new MemoryLedger(), now, auditId: nextAuditId() })
+    expect(result.outcome).toBe("refused_invalid_transition")
+    expect(result.domain_effects).toBe(0)
+    expect(result.audit.action).toBe("retry")
+    expect(result.audit.idempotency_key).toBe(buildRecoveryIdempotencyKey({
+      population_type: record.population_type,
+      population_id: record.population_id,
+      action: "retry",
+      expected_version: record.version,
+    }))
+    expectAuditValid(result.audit)
+  })
+
   it("ledger atomowo claimuje scoped key i nie uruchamia skutku drugi raz", async () => {
     const ledger = new MemoryLedger()
     let calls = 0
@@ -701,7 +777,11 @@ describe("test-the-test: klucz idempotencji musi wynikać z intencji", () => {
   })
 
   it("population_id z dwukropkiem → klucz niejednoznaczny → błąd", async () => {
-    expect(() => buildRecoveryIdempotencyKey({ population_type: "dlq_entry", population_id: "a:b", action: "retry", expected_version: 1 })).toThrow(/dwukropek/)
+    expect(() => buildRecoveryIdempotencyKey({ population_type: "dlq_entry", population_id: "a:b", action: "retry", expected_version: 1 })).toThrow(/konkretnym identyfikatorem/)
+  })
+
+  it.each(["unknown", "default", "UNASSIGNED"])("population_id=%s nie może być wartością zastępczą", (populationId) => {
+    expect(() => buildRecoveryIdempotencyKey({ population_type: "dlq_entry", population_id: populationId, action: "retry", expected_version: 1 })).toThrow(/konkretnym identyfikatorem/)
   })
 
   it("intencja wskazująca inny wiersz niż rekord → błąd", async () => {
