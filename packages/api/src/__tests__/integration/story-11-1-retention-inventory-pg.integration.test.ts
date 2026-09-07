@@ -20,8 +20,19 @@ const RELATIONS: Record<string, string> = {
   notification: "notification",
   order: '"order"',
   voucher_delivery_dispatch: "voucher_delivery_dispatch",
+  voucher_delivery_dispatch_audit: "voucher_delivery_dispatch_audit",
   voucher_claim_audit: "voucher_claim_audit",
 }
+
+const REQUIRED_CARRIERS = [
+  "claim_audit",
+  "delivery_decision",
+  "delivery_ledger",
+  "delivery_ledger_audit",
+  "notification_payload",
+  "order_metadata",
+  "voucher_recipient_pii",
+]
 
 function assertReadOnlyInventory(candidate: typeof inventory): void {
   for (const entry of candidate.carriers) {
@@ -39,17 +50,14 @@ function assertRecordedCount(entry: (typeof inventory.carriers)[number], measure
   }
 }
 
+function assertRequiredCarriers(candidate: typeof inventory): void {
+  expect(candidate.carriers.map((entry) => entry.carrier).sort()).toEqual(REQUIRED_CARRIERS)
+}
+
 describe("Story 11.1 — read-only retention inventory", () => {
-  it("obejmuje sześć nośników, zapisuje wynik pomiaru z kontrolą relacji i nie zawiera mutacji", () => {
+  it("obejmuje siedem nośników, w tym ledger i jego append-only audit, zapisuje wynik pomiaru z kontrolą relacji i nie zawiera mutacji", () => {
     expect(inventory.measurement_status).toBe("MEASURED")
-    expect(inventory.carriers.map((entry) => entry.carrier).sort()).toEqual([
-      "claim_audit",
-      "delivery_decision",
-      "delivery_ledger",
-      "notification_payload",
-      "order_metadata",
-      "voucher_recipient_pii",
-    ])
+    assertRequiredCarriers(inventory)
     expect(() => assertReadOnlyInventory(inventory)).not.toThrow()
     for (const entry of inventory.carriers) {
       if (entry.relation_present) {
@@ -64,6 +72,12 @@ describe("Story 11.1 — read-only retention inventory", () => {
     const mutant = structuredClone(inventory)
     mutant.carriers[0]!.mechanism = "DELETE FROM voucher_recipient_pii"
     expect(() => assertReadOnlyInventory(mutant)).toThrow(/mutacja/)
+  })
+
+  it("odrzuca mutant pomijający append-only audit ledgera", () => {
+    const mutant = structuredClone(inventory)
+    mutant.carriers = mutant.carriers.filter((entry) => entry.carrier !== "delivery_ledger_audit")
+    expect(() => assertRequiredCarriers(mutant)).toThrow()
   })
 
   it("odrzuca mutant rozjeżdżający wartość artefaktu z pomiarem", () => {
