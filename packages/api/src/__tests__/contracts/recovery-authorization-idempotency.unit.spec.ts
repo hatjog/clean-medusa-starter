@@ -419,6 +419,23 @@ describe("autoryzacja rynku i instancji wiersza (resolveAdminMarketContext)", ()
         sessionInstanceId: SESSION_INSTANCE,
       })).toThrow(RecoveryUnauthenticatedError)
   })
+
+  it("wynik resolvera innego aktora nie może dać grantu bieżącej sesji", () => {
+    const decision = authorizeRecoveryMarket({
+      actor: deriveSessionActor({ actor_id: OUTSIDER, actor_type: "user" })!,
+      marketContext: {
+        ok: true,
+        market_id: "bonbeauty",
+        actor_id: OPERATOR,
+        actor_type: "user",
+        is_super_admin: true,
+        source: "intrinsic",
+      },
+      sessionInstanceId: SESSION_INSTANCE,
+      record: baseRecord(),
+    })
+    expect(decision).toEqual({ market_access: "none", decision: "denied" })
+  })
 })
 
 // ── AC2: idempotencja i wersja ─────────────────────────────────────────────────
