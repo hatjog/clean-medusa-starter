@@ -120,6 +120,35 @@ export type RecoveryRecordView = {
   resolution_evidence: ResolutionEvidence | null
 }
 
+/**
+ * Jedyna brama odczytu wiersza dla kernela. Implementacja runtime (Story 11.1)
+ * pobiera go z nośnika pod RLS i scope'uje już w zapytaniu po instance_id;
+ * body przekazuje tylko typ i identyfikator, nigdy gotowy rekord.
+ */
+export interface RecoveryRecordStore {
+  readForRecovery(input: {
+    population_type: RecoveryPopulationType
+    population_id: string
+    instance_id: string
+  }): RecoveryRecordView | null
+}
+
+/**
+ * Serwerowy adapter potwierdzający, że evidence opisuje wykonany skutek domenowy.
+ * Nie jest walidatorem kształtu: jego implementacja sprawdza referencję w
+ * autorytatywnym nośniku refundacji, issuance albo DLQ przed przekazaniem jej do
+ * kernela. Story 11.3 dostarcza adapter trwały; surowy body nigdy nim nie jest.
+ */
+export interface ResolutionEvidenceVerifier {
+  verifies(input: {
+    evidence: ResolutionEvidence
+    record: RecoveryRecordView
+    action: RecoveryAction
+    target_state: string
+    actor: SessionActor
+  }): boolean
+}
+
 export type RecoveryIntent = {
   action: RecoveryAction
   population_type: RecoveryPopulationType
@@ -249,14 +278,30 @@ export function isAllowedTransition(population: RecoveryPopulationType, from: st
   return Array.isArray(allowed) && allowed.includes(to)
 }
 
+/**
+ * Audit ma zawsze kształt kontraktu. Gdy granica HTTP ominie parser i poda action
+ * spoza słownika, odzyskujemy wyłącznie prawidłowy segment z deterministycznego
+ * klucza; surowa wartość body nie może zatruć trwałego audytu. Brak poprawnego
+ * segmentu otrzymuje stałą kategorię `retry`, ale outcome pozostaje odmową.
+ */
+function actionFromIdempotencyKey(key: string): RecoveryAction {
+  const segments = key.split(":")
+  const candidate = segments[segments.length - 2]
+  return RECOVERY_ACTIONS.includes(candidate as RecoveryAction) ? (candidate as RecoveryAction) : "retry"
+}
+
 /** Ledger wykonanych intencji — abstrakcja nad tabelą audytu (Story 11.3 podaje implementację). */
 export interface IdempotencyLedger {
-  /** Adapter DB: unique claim + operation + zapis applied muszą być jedną transakcją. */
+  /**
+   * Adapter DB: unique claim + operation + zapis applied są jedną transakcją.
+   * Promise pozwala drugiemu równoległemu żądaniu zaczekać na wynik pierwszego
+   * claimu i dostać replay, a nie wykonać callback po sekwencyjnym check-then-set.
+   */
   executeOnce(
     scope: Pick<RecoveryRecordView, "instance_id" | "market_id">,
     idempotencyKey: string,
-    operation: () => ApplyRecoveryIntentResult
-  ): { created: true; result: ApplyRecoveryIntentResult } | { created: false; applied: RecoveryActionAuditRecord }
+    operation: () => Promise<ApplyRecoveryIntentResult>
+  ): Promise<{ created: true; result: ApplyRecoveryIntentResult } | { created: false; applied: RecoveryActionAuditRecord }>
 }
 
 declare const recoveryServerSessionBrand: unique symbol
@@ -272,9 +317,8 @@ export type RecoveryServerSession = {
 
 type RecoveryServerSessionState = {
   actor: SessionActor
-  authorization: MarketAuthorization
-  instance_id: string
-  market_id: string
+  marketContext: AdminMarketContextResult
+  session_instance_id: string
 }
 
 const issuedRecoveryServerSessions = new WeakMap<object, RecoveryServerSessionState>()
@@ -286,12 +330,12 @@ export type EstablishRecoveryServerSessionInput = {
   marketContext: AdminMarketContextResult
   /** instance_id runtime sesji serwera, nie wartość z body. */
   sessionInstanceId: string
-  /** Wiersz, dla którego resolver ocenia market i instancję. */
-  record: Pick<RecoveryRecordView, "instance_id" | "market_id">
 }
 
 /**
- * Wiąże źródła serwerowe z zakresem wiersza, zanim intencja trafi do kernela.
+ * Wiąże źródła serwerowe z instancją sesji, zanim intencja trafi do kernela.
+ * Sam wiersz jest pobierany później wyłącznie przez `RecoveryRecordStore`, więc
+ * capability nie może zostać wydana dla obiektu z body.
  * `applyRecoveryIntent` przyjmuje wyłącznie wynik tej funkcji i dodatkowo
  * sprawdza jego obecność w prywatnym WeakMap, więc ręcznie złożony obiekt nie
  * może dostać się do ścieżki skutku domenowego.
@@ -304,18 +348,11 @@ export function establishRecoveryServerSession(input: EstablishRecoveryServerSes
   if (!actor) {
     throw new RecoveryUnauthenticatedError()
   }
-  const authorization = authorizeRecoveryMarket({
-    actor,
-    marketContext: input.marketContext,
-    sessionInstanceId: input.sessionInstanceId,
-    record: input.record,
-  })
   const session = Object.freeze({}) as RecoveryServerSession
   issuedRecoveryServerSessions.set(session, {
     actor,
-    authorization,
-    instance_id: input.record.instance_id,
-    market_id: input.record.market_id,
+    marketContext: input.marketContext,
+    session_instance_id: input.sessionInstanceId,
   })
   return session
 }
@@ -332,10 +369,13 @@ function readRecoveryServerSession(session: RecoveryServerSession | undefined): 
 }
 
 export type ApplyRecoveryIntentInput = {
-  record: RecoveryRecordView
   intent: RecoveryIntent
   /** Opaque capability z `establishRecoveryServerSession`, nie dane z body. */
   recoverySession: RecoveryServerSession
+  /** Serwerowy odczyt pod RLS — kernela nie można zasilić gotowym wierszem z body. */
+  recordStore: RecoveryRecordStore
+  /** Potwierdza rzeczywisty skutek domenowy przed zamknięciem terminalnym. */
+  evidenceVerifier: ResolutionEvidenceVerifier
   ledger: IdempotencyLedger
   now: string
   auditId: string
@@ -359,14 +399,25 @@ function snapshot(record: RecoveryRecordView): StateSnapshot {
  * uwierzytelnienie → autoryzacja rynku/instancji → klucz idempotencji → powtórka →
  * wersja → przejście → evidence → skutek.
  */
-export function applyRecoveryIntent(input: ApplyRecoveryIntentInput): ApplyRecoveryIntentResult {
-  const { record, intent, ledger } = input
+export async function applyRecoveryIntent(input: ApplyRecoveryIntentInput): Promise<ApplyRecoveryIntentResult> {
+  const { intent, ledger } = input
   const serverSession = readRecoveryServerSession(input.recoverySession)
   const actor = serverSession.actor
-  const authorization =
-    serverSession.instance_id === record.instance_id && serverSession.market_id === record.market_id
-      ? serverSession.authorization
-      : { market_access: "none" as const, decision: "denied" as const }
+  const record = input.recordStore.readForRecovery({
+    population_type: intent.population_type,
+    population_id: intent.population_id,
+    instance_id: serverSession.session_instance_id,
+  })
+  if (!record) throw new RecoveryRecordNotFoundError()
+  if (record.population_type !== intent.population_type || record.population_id !== intent.population_id) {
+    throw new Error("[recovery-action-contract] store zwrócił wiersz innej populacji albo identyfikatora")
+  }
+  const authorization = authorizeRecoveryMarket({
+    actor,
+    marketContext: serverSession.marketContext,
+    sessionInstanceId: serverSession.session_instance_id,
+    record,
+  })
   const before = snapshot(record)
 
   const refuse = (outcome: RecoveryOutcome, actorForAudit: SessionActor): ApplyRecoveryIntentResult => ({
@@ -375,6 +426,10 @@ export function applyRecoveryIntent(input: ApplyRecoveryIntentInput): ApplyRecov
     domain_effects: 0,
     audit: buildAudit({ outcome, before, after: before, actor: actorForAudit, resolution_evidence: null }),
   })
+
+  const auditAction: RecoveryAction = RECOVERY_ACTIONS.includes(intent.action)
+    ? intent.action
+    : actionFromIdempotencyKey(intent.idempotency_key)
 
   const buildAudit = (parts: {
     outcome: RecoveryOutcome
@@ -385,7 +440,7 @@ export function applyRecoveryIntent(input: ApplyRecoveryIntentInput): ApplyRecov
   }): RecoveryActionAuditRecord => ({
     contract_version: RECOVERY_CONTRACT_VERSION,
     audit_id: input.auditId,
-    action: intent.action,
+    action: auditAction,
     population_type: record.population_type,
     population_id: record.population_id,
     instance_id: record.instance_id,
@@ -430,7 +485,7 @@ export function applyRecoveryIntent(input: ApplyRecoveryIntentInput): ApplyRecov
     throw new Error("[recovery-action-contract] intencja wskazuje inny wiersz niż podany rekord")
   }
 
-  const execute = (): ApplyRecoveryIntentResult => {
+  const execute = async (): Promise<ApplyRecoveryIntentResult> => {
   // 3. Wersja, przejście i skutek wykonują się wewnątrz atomowego claimu ledgeru.
   //    Adapter DB scope'uje unikalność przez instance_id + market_id + key.
   if (intent.expected_version !== record.version) {
@@ -484,6 +539,18 @@ export function applyRecoveryIntent(input: ApplyRecoveryIntentInput): ApplyRecov
     // Stan legacy jest osiągalny wyłącznie przez backfill (ADR-221 §3), nigdy przez akcję.
     return refuse("refused_invalid_transition", actor)
   }
+  if (
+    evidence &&
+    !input.evidenceVerifier.verifies({
+      evidence,
+      record,
+      action: intent.action,
+      target_state: nextState,
+      actor,
+    })
+  ) {
+    return refuse("refused_invalid_transition", actor)
+  }
 
   // 7. Skutek — DOKŁADNIE jeden.
   const nextRecord: RecoveryRecordView = {
@@ -503,7 +570,7 @@ export function applyRecoveryIntent(input: ApplyRecoveryIntentInput): ApplyRecov
   }
   }
 
-  const atomic = ledger.executeOnce(
+  const atomic = await ledger.executeOnce(
     { instance_id: record.instance_id, market_id: record.market_id },
     intent.idempotency_key,
     execute
@@ -543,5 +610,12 @@ export class RecoveryUnauthenticatedError extends Error {
   constructor() {
     super("[recovery-action-contract] brak aktora z sesji — intencja odrzucona przed jakąkolwiek oceną")
     this.name = "RecoveryUnauthenticatedError"
+  }
+}
+
+export class RecoveryRecordNotFoundError extends Error {
+  constructor() {
+    super("[recovery-action-contract] brak serwerowo odczytanego wiersza recovery dla intencji")
+    this.name = "RecoveryRecordNotFoundError"
   }
 }

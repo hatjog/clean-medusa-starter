@@ -22,6 +22,11 @@ import type {
   ResolutionEvidence,
   SessionActor,
 } from "./recovery-action-contract"
+import {
+  DEFERRED_ISSUANCE_EVENT_SUFFIX,
+  DEFERRED_ISSUANCE_REASON,
+  STRIPE_PATH_Y_WEBHOOK_PROVIDER,
+} from "../payment/stripe-payment-intent-transport"
 
 /** Jawnie nazwane źródło odwzorowania market_id -> instance_id dla backfillu. */
 export const INSTANCE_ID_BACKFILL_SOURCE =
@@ -36,6 +41,7 @@ export const COMPENSATION_BACKFILL_PROVENANCE_SOURCE =
   "operator-certified/recovery-compensation-provenance.v1#failure_id" as const
 export const DEFERRED_ISSUANCE_BACKFILL_PROVENANCE_SOURCE =
   "operator-certified/recovery-deferred-issuance-provenance.v1#event_id" as const
+export const DEFERRED_ISSUANCE_AGE_SOURCE = "database_now_minus_occurred_at" as const
 
 export type MigrationStep = {
   /** Identyfikator kroku; `down` odwołuje się do niego przez `reverses`. */
@@ -108,7 +114,7 @@ export const RECOVERY_MIGRATION_PLAN: readonly CarrierPlan[] = [
     not_null_for_new_data: [...COMMON_ROW_COLUMNS],
     semantic_defaults: [...COMMON_SEMANTIC_DEFAULTS],
     up: [
-      { id: "cf-add-columns", sql_shape: `ALTER TABLE ${COMPENSATION_FAILURE_TABLE} ADD COLUMN instance_id TEXT, ADD COLUMN owner_type TEXT, ADD COLUMN owner_id TEXT, ADD COLUMN deadline TIMESTAMPTZ, ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0, ADD COLUMN version INTEGER NOT NULL DEFAULT 1, ADD COLUMN closure_path TEXT, ADD COLUMN resolution_evidence JSONB, ADD COLUMN provenance_kind TEXT, ADD COLUMN provenance_source TEXT` },
+      { id: "cf-add-columns", sql_shape: `ALTER TABLE ${COMPENSATION_FAILURE_TABLE} ADD COLUMN instance_id TEXT, ADD COLUMN owner_type TEXT, ADD COLUMN owner_id TEXT, ADD COLUMN deadline TIMESTAMPTZ, ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0, ADD COLUMN version INTEGER NOT NULL DEFAULT 1, ADD COLUMN closure_path TEXT, ADD COLUMN resolution_evidence JSONB, ADD COLUMN provenance_kind TEXT, ADD COLUMN provenance_source TEXT; ALTER TABLE ${COMPENSATION_FAILURE_TABLE} ENABLE ROW LEVEL SECURITY; ALTER TABLE ${COMPENSATION_FAILURE_TABLE} FORCE ROW LEVEL SECURITY -- przed politykami Story 4.7 istniejący nośnik także fail-closed` },
       { id: "cf-widen-state-check", sql_shape: `ALTER TABLE ${COMPENSATION_FAILURE_TABLE} DROP CONSTRAINT money_path_compensation_failure_state_check, ADD CONSTRAINT money_path_compensation_failure_state_check CHECK (resolution_state IN ('open','resolved_manually','recovery_in_progress','resolved_recovered','closed_unrecoverable','closed_legacy_unevidenced')); ALTER TABLE ${COMPENSATION_FAILURE_TABLE} DROP CONSTRAINT money_path_compensation_failure_resolution_check, ADD CONSTRAINT money_path_compensation_failure_resolution_check CHECK ((resolution_state='open' AND resolved_at IS NULL AND resolved_by IS NULL) OR (resolution_state='resolved_manually' AND resolved_at IS NOT NULL AND resolved_by IS NOT NULL) OR resolution_state IN ('recovery_in_progress','resolved_recovered','closed_unrecoverable','closed_legacy_unevidenced'))` },
       { id: "cf-create-quarantine", sql_shape: `CREATE TABLE ${COMPENSATION_FAILURE_TABLE}_backfill_quarantine (source_failure_id TEXT PRIMARY KEY, source_row JSONB NOT NULL, reason TEXT NOT NULL, quarantined_at TIMESTAMPTZ NOT NULL DEFAULT now()); ALTER TABLE ${COMPENSATION_FAILURE_TABLE}_backfill_quarantine ENABLE ROW LEVEL SECURITY; ALTER TABLE ${COMPENSATION_FAILURE_TABLE}_backfill_quarantine FORCE ROW LEVEL SECURITY` },
       {
@@ -142,12 +148,12 @@ export const RECOVERY_MIGRATION_PLAN: readonly CarrierPlan[] = [
     population_type: "deferred_issuance_trace",
     table: DEFERRED_ISSUANCE_TRACE_TABLE,
     kind: "create_new",
-    not_null_for_new_data: [...COMMON_ROW_COLUMNS, "payment_intent_id", "stripe_event_id", "psp_occurred_at"],
+    not_null_for_new_data: [...COMMON_ROW_COLUMNS, "payment_intent_id", "stripe_event_id", "deferral_reason", "psp_occurred_at", "age_source"],
     semantic_defaults: [...COMMON_SEMANTIC_DEFAULTS],
     up: [
-      { id: "dit-create-table", sql_shape: `CREATE TABLE ${DEFERRED_ISSUANCE_TRACE_TABLE} (trace_id TEXT PRIMARY KEY, instance_id TEXT NOT NULL, market_id TEXT NOT NULL, state TEXT NOT NULL CHECK (state IN ('awaiting_order','escalated','issued_after_link','closed_order_never_created')), owner_type TEXT NOT NULL, owner_id TEXT NOT NULL, deadline TIMESTAMPTZ NOT NULL, retry_count INTEGER NOT NULL DEFAULT 0, version INTEGER NOT NULL DEFAULT 1, occurred_at TIMESTAMPTZ NOT NULL, closure_path TEXT NOT NULL, resolution_evidence JSONB, provenance_kind TEXT NOT NULL, provenance_source TEXT NOT NULL, payment_intent_id TEXT NOT NULL, stripe_event_id TEXT NOT NULL, psp_occurred_at TIMESTAMPTZ NOT NULL); ALTER TABLE ${DEFERRED_ISSUANCE_TRACE_TABLE} ENABLE ROW LEVEL SECURITY; ALTER TABLE ${DEFERRED_ISSUANCE_TRACE_TABLE} FORCE ROW LEVEL SECURITY` },
+      { id: "dit-create-table", sql_shape: `CREATE TABLE ${DEFERRED_ISSUANCE_TRACE_TABLE} (trace_id TEXT PRIMARY KEY, instance_id TEXT NOT NULL, market_id TEXT NOT NULL, state TEXT NOT NULL CHECK (state IN ('awaiting_order','escalated','issued_after_link','closed_order_never_created')), owner_type TEXT NOT NULL, owner_id TEXT NOT NULL, deadline TIMESTAMPTZ NOT NULL, retry_count INTEGER NOT NULL DEFAULT 0, version INTEGER NOT NULL DEFAULT 1, occurred_at TIMESTAMPTZ NOT NULL, closure_path TEXT NOT NULL, resolution_evidence JSONB, provenance_kind TEXT NOT NULL, provenance_source TEXT NOT NULL, payment_intent_id TEXT NOT NULL, stripe_event_id TEXT NOT NULL, deferral_reason TEXT NOT NULL CHECK (deferral_reason='${DEFERRED_ISSUANCE_REASON}'), psp_occurred_at TIMESTAMPTZ NOT NULL, age_source TEXT NOT NULL CHECK (age_source='${DEFERRED_ISSUANCE_AGE_SOURCE}')); ALTER TABLE ${DEFERRED_ISSUANCE_TRACE_TABLE} ENABLE ROW LEVEL SECURITY; ALTER TABLE ${DEFERRED_ISSUANCE_TRACE_TABLE} FORCE ROW LEVEL SECURITY` },
       { id: "dit-create-quarantine", sql_shape: `CREATE TABLE ${DEFERRED_ISSUANCE_TRACE_TABLE}_backfill_quarantine (source_event_id TEXT PRIMARY KEY, source_row JSONB NOT NULL, reason TEXT NOT NULL, quarantined_at TIMESTAMPTZ NOT NULL DEFAULT now()); ALTER TABLE ${DEFERRED_ISSUANCE_TRACE_TABLE}_backfill_quarantine ENABLE ROW LEVEL SECURITY; ALTER TABLE ${DEFERRED_ISSUANCE_TRACE_TABLE}_backfill_quarantine FORCE ROW LEVEL SECURITY` },
-      { id: "dit-backfill", sql_shape: `BEGIN; WITH candidates AS (SELECT w.event_id, w.market_id, w.received_at, w.envelope, m.instance_id, p.owner_type, p.owner_id, p.deadline FROM webhook_event_processed w LEFT JOIN <verified instance mapping by market_id: ${INSTANCE_ID_BACKFILL_SOURCE}> m ON m.market_id=w.market_id LEFT JOIN <operator-certified typed per-event provenance: ${DEFERRED_ISSUANCE_BACKFILL_PROVENANCE_SOURCE}> p ON p.event_id=w.event_id WHERE w.provider='stripe' AND w.envelope ? 'entitlement_issue_deferred_reason'), qualified AS (SELECT * FROM candidates WHERE instance_id ~ '^[A-Za-z0-9][A-Za-z0-9._:-]*$' AND market_id ~ '^[A-Za-z0-9][A-Za-z0-9._:-]*$' AND owner_type IN ('operator_role','operator_user') AND owner_id ~ '^[A-Za-z0-9][A-Za-z0-9._:-]*$' AND deadline IS NOT NULL AND envelope->>'payment_intent_id' IS NOT NULL AND envelope->>'psp_occurred_at' IS NOT NULL), inserted AS (INSERT INTO ${DEFERRED_ISSUANCE_TRACE_TABLE} (trace_id,instance_id,market_id,state,owner_type,owner_id,deadline,retry_count,version,occurred_at,closure_path,resolution_evidence,provenance_kind,provenance_source,payment_intent_id,stripe_event_id,psp_occurred_at) SELECT event_id || '#deferred-issuance',instance_id,market_id,'awaiting_order',owner_type,owner_id,deadline,0,1,received_at,'not_closed',NULL,'backfilled_verified','${DEFERRED_ISSUANCE_BACKFILL_PROVENANCE_SOURCE}',envelope->>'payment_intent_id',event_id,(envelope->>'psp_occurred_at')::timestamptz FROM qualified RETURNING stripe_event_id) INSERT INTO ${DEFERRED_ISSUANCE_TRACE_TABLE}_backfill_quarantine (source_event_id,source_row,reason) SELECT c.event_id,jsonb_build_object('event_id',c.event_id,'market_id',c.market_id,'received_at',c.received_at,'envelope',c.envelope),'missing certified scope, owner, deadline, payment_intent_id, or psp_occurred_at' FROM candidates c LEFT JOIN inserted i ON i.stripe_event_id=c.event_id WHERE i.stripe_event_id IS NULL; COMMIT` },
+      { id: "dit-backfill", sql_shape: `BEGIN; WITH candidates AS (SELECT w.event_id, w.market_id, w.received_at, w.envelope, m.instance_id, p.owner_type, p.owner_id, p.deadline, CASE WHEN pg_input_is_valid(w.envelope->>'psp_occurred_at', 'timestamp with time zone'::regtype) THEN (w.envelope->>'psp_occurred_at')::timestamptz ELSE NULL END AS validated_psp_occurred_at FROM webhook_event_processed w LEFT JOIN <verified instance mapping by market_id: ${INSTANCE_ID_BACKFILL_SOURCE}> m ON m.market_id=w.market_id LEFT JOIN <operator-certified typed per-event provenance: ${DEFERRED_ISSUANCE_BACKFILL_PROVENANCE_SOURCE}> p ON p.event_id=w.event_id WHERE w.provider='${STRIPE_PATH_Y_WEBHOOK_PROVIDER}' AND w.event_id LIKE '%' || '${DEFERRED_ISSUANCE_EVENT_SUFFIX}' AND w.event_id <> '${DEFERRED_ISSUANCE_EVENT_SUFFIX}' AND w.envelope->>'entitlement_issue_deferred_reason'='${DEFERRED_ISSUANCE_REASON}'), qualified AS (SELECT * FROM candidates WHERE instance_id ~ '^[A-Za-z0-9][A-Za-z0-9._:-]*$' AND lower(instance_id) NOT IN ('unknown','default','null','none','n/a','tbd','todo','unassigned') AND market_id ~ '^[A-Za-z0-9][A-Za-z0-9._:-]*$' AND lower(market_id) NOT IN ('unknown','default','null','none','n/a','tbd','todo','unassigned') AND owner_type IN ('operator_role','operator_user') AND owner_id ~ '^[A-Za-z0-9][A-Za-z0-9._:-]*$' AND lower(owner_id) NOT IN ('unknown','default','null','none','n/a','tbd','todo','unassigned') AND deadline IS NOT NULL AND envelope->>'payment_intent_id' ~ '^[A-Za-z0-9][A-Za-z0-9._:-]*$' AND lower(envelope->>'payment_intent_id') NOT IN ('unknown','default','null','none','n/a','tbd','todo','unassigned') AND envelope->>'psp_occurred_at' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,6})?(Z|[+-][0-9]{2}:[0-9]{2})$' AND validated_psp_occurred_at IS NOT NULL), inserted AS (INSERT INTO ${DEFERRED_ISSUANCE_TRACE_TABLE} (trace_id,instance_id,market_id,state,owner_type,owner_id,deadline,retry_count,version,occurred_at,closure_path,resolution_evidence,provenance_kind,provenance_source,payment_intent_id,stripe_event_id,deferral_reason,psp_occurred_at,age_source) SELECT event_id,instance_id,market_id,'awaiting_order',owner_type,owner_id,deadline,0,1,received_at,'not_closed',NULL,'backfilled_verified','${DEFERRED_ISSUANCE_BACKFILL_PROVENANCE_SOURCE}',envelope->>'payment_intent_id',left(event_id,length(event_id)-length('${DEFERRED_ISSUANCE_EVENT_SUFFIX}')),'${DEFERRED_ISSUANCE_REASON}',validated_psp_occurred_at,'${DEFERRED_ISSUANCE_AGE_SOURCE}' FROM qualified RETURNING trace_id) INSERT INTO ${DEFERRED_ISSUANCE_TRACE_TABLE}_backfill_quarantine (source_event_id,source_row,reason) SELECT c.event_id,jsonb_build_object('event_id',c.event_id,'provider','${STRIPE_PATH_Y_WEBHOOK_PROVIDER}','market_id',c.market_id,'received_at',c.received_at,'envelope',c.envelope),'marker lacks certified scope, owner, deadline, canonical suffix/reason, payment_intent_id, or valid psp_occurred_at' FROM candidates c LEFT JOIN inserted i ON i.trace_id=c.event_id WHERE i.trace_id IS NULL; COMMIT` },
     ],
     down: [
       { id: "dit-unbackfill", reverses: "dit-backfill", sql_shape: `-- brak kroku danych: źródło (webhook_event_processed) pozostaje nietknięte, DROP tabeli wystarcza` },
@@ -320,6 +326,141 @@ export function materializeCompensationBackfill(
   // zaktualizowany, a każdy niekwalifikujący przeniesiony do kwarantanny. Żaden
   // source row bez wymaganych faktów nie zostaje przed SET NOT NULL.
   return { migrated, quarantine, source_rows_after }
+}
+
+/** Historyczny marker transportowy, z którego Story 4.4 utworzy trwały ślad deferral. */
+export type HistoricalDeferredIssuanceMarker = {
+  event_id: string
+  provider: string
+  market_id: string | null
+  received_at: string
+  envelope: Record<string, unknown>
+}
+
+/** Fakty per marker pochodzą wyłącznie z podpisanego eksportu operatorskiego. */
+export type VerifiedHistoricalDeferredIssuanceMetadata = {
+  owner: RecoveryOwner
+  deadline: string
+}
+
+export type DeferredIssuanceContractRow = {
+  contract_version: "1.0.0"
+  population_type: "deferred_issuance_trace"
+  population_id: string
+  instance_id: string
+  market_id: string
+  state: "awaiting_order"
+  owner: RecoveryOwner
+  deadline: string
+  retry_count: 0
+  resolution_evidence: null
+  version: 1
+  occurred_at: string
+  closure_path: "not_closed"
+  provenance: { kind: "backfilled_verified"; source: typeof DEFERRED_ISSUANCE_BACKFILL_PROVENANCE_SOURCE }
+  payload: {
+    payment_intent_id: string
+    stripe_event_id: string
+    deferral_reason: typeof DEFERRED_ISSUANCE_REASON
+    psp_occurred_at: string
+    age_source: typeof DEFERRED_ISSUANCE_AGE_SOURCE
+  }
+}
+
+export type DeferredIssuanceBackfillDecision =
+  | { decision: "migrate"; row: DeferredIssuanceContractRow }
+  | { decision: "quarantine"; reason: string }
+
+function stringField(envelope: Record<string, unknown>, key: string): string | null {
+  const value = envelope[key]
+  return typeof value === "string" ? value : null
+}
+
+/**
+ * Wykonywalny model `dit-backfill`. Zdejmuje wyłącznie TRANSPORTOWY sufiks markera
+ * z `stripe_event_id`; `trace_id` zachowuje cały marker, aby nośnik miał własną,
+ * niekolidującą tożsamość. Każda niepewność trafia do kwarantanny, także błędny
+ * provider, powód deferral, placeholder scope/owner oraz timestamp.
+ */
+export function classifyHistoricalDeferredIssuanceMarker(
+  marker: HistoricalDeferredIssuanceMarker,
+  instanceByMarket: ReadonlyMap<string, string>,
+  metadataByMarkerEventId: ReadonlyMap<string, VerifiedHistoricalDeferredIssuanceMetadata>
+): DeferredIssuanceBackfillDecision {
+  const quarantine = (reason: string): DeferredIssuanceBackfillDecision => ({
+    decision: "quarantine",
+    reason: `${reason} dla event_id="${marker.event_id}"`,
+  })
+  if (marker.provider !== STRIPE_PATH_Y_WEBHOOK_PROVIDER) return quarantine("nie jest markerem Path Y")
+  if (!marker.event_id.endsWith(DEFERRED_ISSUANCE_EVENT_SUFFIX) || marker.event_id === DEFERRED_ISSUANCE_EVENT_SUFFIX) {
+    return quarantine("brak kanonicznego sufiksu markera")
+  }
+  const stripeEventId = marker.event_id.slice(0, -DEFERRED_ISSUANCE_EVENT_SUFFIX.length)
+  const paymentIntentId = stringField(marker.envelope, "payment_intent_id")
+  const deferralReason = stringField(marker.envelope, "entitlement_issue_deferred_reason")
+  const pspOccurredAt = stringField(marker.envelope, "psp_occurred_at")
+  const metadata = metadataByMarkerEventId.get(marker.event_id)
+  const instanceId = marker.market_id ? instanceByMarket.get(marker.market_id) : undefined
+  if (!marker.market_id || !isTrustworthyScopeValue(marker.market_id) || !instanceId || !isTrustworthyScopeValue(instanceId)) {
+    return quarantine("brak wiarygodnego scope'u")
+  }
+  if (!metadata || !isTrustworthyOwner(metadata.owner) || !isRfc3339Timestamp(metadata.deadline)) {
+    return quarantine("brak certyfikowanego ownera albo deadline")
+  }
+  if (deferralReason !== DEFERRED_ISSUANCE_REASON) return quarantine("niekanoniczny powód deferral")
+  if (!paymentIntentId || !isTrustworthyScopeValue(paymentIntentId) || !isTrustworthyScopeValue(stripeEventId)) {
+    return quarantine("brak wiarygodnego identyfikatora płatności albo zdarzenia Stripe")
+  }
+  if (!pspOccurredAt || !isRfc3339Timestamp(pspOccurredAt) || !isRfc3339Timestamp(marker.received_at)) {
+    return quarantine("nieprawidłowy timestamp PSP albo otrzymania")
+  }
+  return {
+    decision: "migrate",
+    row: {
+      contract_version: "1.0.0",
+      population_type: "deferred_issuance_trace",
+      population_id: marker.event_id,
+      instance_id: instanceId,
+      market_id: marker.market_id,
+      state: "awaiting_order",
+      owner: metadata.owner,
+      deadline: metadata.deadline,
+      retry_count: 0,
+      resolution_evidence: null,
+      version: 1,
+      occurred_at: marker.received_at,
+      closure_path: "not_closed",
+      provenance: { kind: "backfilled_verified", source: DEFERRED_ISSUANCE_BACKFILL_PROVENANCE_SOURCE },
+      payload: {
+        payment_intent_id: paymentIntentId,
+        stripe_event_id: stripeEventId,
+        deferral_reason: DEFERRED_ISSUANCE_REASON,
+        psp_occurred_at: pspOccurredAt,
+        age_source: DEFERRED_ISSUANCE_AGE_SOURCE,
+      },
+    },
+  }
+}
+
+export type DeferredIssuanceBackfillMaterialization = {
+  migrated: DeferredIssuanceContractRow[]
+  quarantine: Extract<DeferredIssuanceBackfillDecision, { decision: "quarantine" }>[]
+}
+
+/** Model atomowego rozdzielenia markera: pełny wiersz albo pełny source row w kwarantannie. */
+export function materializeDeferredIssuanceBackfill(
+  markers: readonly HistoricalDeferredIssuanceMarker[],
+  instanceByMarket: ReadonlyMap<string, string>,
+  metadataByMarkerEventId: ReadonlyMap<string, VerifiedHistoricalDeferredIssuanceMetadata>
+): DeferredIssuanceBackfillMaterialization {
+  const migrated: DeferredIssuanceContractRow[] = []
+  const quarantine: DeferredIssuanceBackfillMaterialization["quarantine"] = []
+  for (const marker of markers) {
+    const decision = classifyHistoricalDeferredIssuanceMarker(marker, instanceByMarket, metadataByMarkerEventId)
+    if (decision.decision === "migrate") migrated.push(decision.row)
+    else quarantine.push(decision)
+  }
+  return { migrated, quarantine }
 }
 
 const PLACEHOLDER_SCOPE_VALUES = new Set(["unknown", "default", "null", "none", "n/a", "tbd", "todo", "unassigned", ""])

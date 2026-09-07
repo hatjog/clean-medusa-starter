@@ -18,6 +18,11 @@ import fs from "node:fs"
 import path from "node:path"
 
 import { Migration20260818090000MoneyPathCompensationFailureTable } from "../../migrations/Migration20260818090000MoneyPathCompensationFailureTable"
+import {
+  DEFERRED_ISSUANCE_EVENT_SUFFIX,
+  DEFERRED_ISSUANCE_REASON,
+  STRIPE_PATH_Y_WEBHOOK_PROVIDER,
+} from "../../lib/payment/stripe-payment-intent-transport"
 import { RECOVERY_POPULATION_TYPES } from "../../lib/recovery/recovery-action-contract"
 import { LiteValidator, type JsonSchema } from "../contracts/json-schema-lite"
 import {
@@ -25,6 +30,7 @@ import {
   COMPENSATION_FAILURE_TABLE,
   COMPENSATION_BACKFILL_PROVENANCE_SOURCE,
   DEFERRED_ISSUANCE_TRACE_TABLE,
+  DEFERRED_ISSUANCE_AGE_SOURCE,
   DLQ_ENTRY_TABLE,
   INSTANCE_ID_BACKFILL_SOURCE,
   isTrustworthyOwner,
@@ -33,7 +39,10 @@ import {
   LEGACY_COMPENSATION_STATES,
   RECOVERY_MIGRATION_PLAN,
   materializeCompensationBackfill,
+  materializeDeferredIssuanceBackfill,
   type CarrierPlan,
+  type HistoricalDeferredIssuanceMarker,
+  type VerifiedHistoricalDeferredIssuanceMetadata,
   type VerifiedHistoricalCompensationMetadata,
 } from "../../lib/recovery/recovery-migration-plan"
 
@@ -160,6 +169,12 @@ describe("NOT NULL dla nowych danych i brak default poza licznikami", () => {
         expect(step.sql_shape).toContain("FORCE ROW LEVEL SECURITY")
       }
     }
+  })
+
+  it("istniejący nośnik kompensacji przechodzi na fail-closed RLS wraz z polami operatorskimi", () => {
+    const step = planFor("compensation_failure").up.find((candidate) => candidate.id === "cf-add-columns")!
+    expect(step.sql_shape).toContain("ENABLE ROW LEVEL SECURITY")
+    expect(step.sql_shape).toContain("FORCE ROW LEVEL SECURITY")
   })
 })
 
@@ -344,10 +359,78 @@ describe("backfill bez wartości zastępczej", () => {
   it("backfill deferral materializuje pełny wiersz albo kwarantannę bez wielokropka", () => {
     const step = planFor("deferred_issuance_trace").up.find((s) => s.id === "dit-backfill")!
     expect(step.sql_shape).not.toContain("SELECT ...")
-    for (const field of ["owner_type", "owner_id", "deadline", "closure_path", "provenance_kind", "payment_intent_id", "stripe_event_id", "psp_occurred_at"]) {
+    for (const field of ["owner_type", "owner_id", "deadline", "closure_path", "provenance_kind", "payment_intent_id", "stripe_event_id", "deferral_reason", "psp_occurred_at", "age_source"]) {
       expect({ field, present: step.sql_shape.includes(field) }).toEqual({ field, present: true })
     }
+    expect(step.sql_shape).toContain(`w.provider='${STRIPE_PATH_Y_WEBHOOK_PROVIDER}'`)
+    expect(step.sql_shape).toContain(DEFERRED_ISSUANCE_EVENT_SUFFIX)
+    expect(step.sql_shape).toContain("pg_input_is_valid")
+    expect(step.sql_shape).toContain("lower(instance_id) NOT IN")
     expect(step.sql_shape).toMatch(/INSERT INTO deferred_issuance_trace_backfill_quarantine/)
+  })
+
+  it("marker deferral materializuje zgodny wiersz z odsufiksowanym stripe_event_id", () => {
+    const marker: HistoricalDeferredIssuanceMarker = {
+      event_id: `evt_3U2vWGLq7ZbYtR8m0aBcDeFg${DEFERRED_ISSUANCE_EVENT_SUFFIX}`,
+      provider: STRIPE_PATH_Y_WEBHOOK_PROVIDER,
+      market_id: "bonbeauty",
+      received_at: "2026-09-06T12:01:00Z",
+      envelope: {
+        entitlement_issue_deferred_reason: DEFERRED_ISSUANCE_REASON,
+        payment_intent_id: "pi_3U2vWGLq7ZbYtR8m0aBcDeFg",
+        psp_occurred_at: "2026-09-06T12:00:00Z",
+      },
+    }
+    const metadata = new Map<string, VerifiedHistoricalDeferredIssuanceMetadata>([
+      [marker.event_id, { owner: { owner_type: "operator_role", owner_id: "recovery-ops" }, deadline: "2026-09-07T12:00:00Z" }],
+    ])
+    const result = materializeDeferredIssuanceBackfill([marker], new Map([["bonbeauty", "gp-prod-eu1"]]), metadata)
+    expect(result.quarantine).toEqual([])
+    expect(result.migrated).toHaveLength(1)
+    expect(result.migrated[0].population_id).toBe(marker.event_id)
+    expect(result.migrated[0].payload).toEqual({
+      payment_intent_id: "pi_3U2vWGLq7ZbYtR8m0aBcDeFg",
+      stripe_event_id: "evt_3U2vWGLq7ZbYtR8m0aBcDeFg",
+      deferral_reason: DEFERRED_ISSUANCE_REASON,
+      psp_occurred_at: "2026-09-06T12:00:00Z",
+      age_source: DEFERRED_ISSUANCE_AGE_SOURCE,
+    })
+    expect(populationValidator.validate(POPULATION_SCHEMA, result.migrated[0])).toEqual([])
+  })
+
+  it.each([
+    ["provider", { provider: "stripe" }],
+    ["placeholder scope", { market_id: "DEFAULT" }],
+    ["placeholder owner", { owner_id: "UNASSIGNED" }],
+    ["niepoprawny timestamp", { psp_occurred_at: "2026-02-30T12:00:00Z" }],
+    ["brak suffixu", { event_id: "evt_3U2vWGLq7ZbYtR8m0aBcDeFg" }],
+  ])("marker deferral z wadą %s trafia do kwarantanny", (_caseName, override) => {
+    const marker: HistoricalDeferredIssuanceMarker = {
+      event_id: `evt_3U2vWGLq7ZbYtR8m0aBcDeFg${DEFERRED_ISSUANCE_EVENT_SUFFIX}`,
+      provider: STRIPE_PATH_Y_WEBHOOK_PROVIDER,
+      market_id: "bonbeauty",
+      received_at: "2026-09-06T12:01:00Z",
+      envelope: {
+        entitlement_issue_deferred_reason: DEFERRED_ISSUANCE_REASON,
+        payment_intent_id: "pi_3U2vWGLq7ZbYtR8m0aBcDeFg",
+        psp_occurred_at: "2026-09-06T12:00:00Z",
+      },
+    }
+    const mutated = {
+      ...marker,
+      ...(override as Partial<HistoricalDeferredIssuanceMarker>),
+      envelope: {
+        ...marker.envelope,
+        ...("psp_occurred_at" in override ? { psp_occurred_at: override.psp_occurred_at } : {}),
+      },
+    }
+    const ownerId = "owner_id" in override ? override.owner_id : "recovery-ops"
+    const metadata = new Map<string, VerifiedHistoricalDeferredIssuanceMetadata>([
+      [mutated.event_id, { owner: { owner_type: "operator_role", owner_id: ownerId }, deadline: "2026-09-07T12:00:00Z" }],
+    ])
+    const result = materializeDeferredIssuanceBackfill([mutated], new Map([["bonbeauty", "gp-prod-eu1"], ["DEFAULT", "gp-prod-eu1"]]), metadata)
+    expect(result.migrated).toEqual([])
+    expect(result.quarantine).toHaveLength(1)
   })
 
   it("mapowanie stanów historycznych kompensacji pokrywa DOKŁADNIE słownik legacy", () => {

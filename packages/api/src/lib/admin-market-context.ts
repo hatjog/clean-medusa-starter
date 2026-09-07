@@ -158,7 +158,7 @@ export async function resolveAdminMarketContext(
       message: "Valid admin session required",
     })
   }
-  if (ctx.actor_type !== undefined && ctx.actor_type !== "user") {
+  if (ctx.actor_type !== "user") {
     return issueAdminMarketContext({
       ok: false,
       status: 401,
