@@ -50,6 +50,7 @@
 import type { MedusaRequest, MedusaResponse } from "@medusajs/framework/http"
 import { Modules } from "@medusajs/framework/utils"
 
+import { marketContextStorage } from "../../../../lib/market-context"
 import {
   buildPaymentIntentSucceededEnvelope,
   PAYMENT_INTENT_SUCCEEDED_EVENT,
@@ -78,6 +79,13 @@ import {
   type CompensationFailureRecord,
   type RecordedCompensationFailure,
 } from "../../../../lib/payment/money-path-compensation-registry"
+import { buildEventProcessedPurchaseQuery } from "../../../../modules/voucher/models/event-processed"
+import {
+  ackStatusForVerdict,
+  buildOwedBusinessUnits,
+  evaluateOwedUnitAck,
+  isAckAllowed,
+} from "../../../../lib/payment/stripe-webhook-barrier-contract"
 import {
   STRIPE_SIGNATURE_HEADER,
   STRIPE_WEBHOOK_SECRET_ENV,
@@ -514,8 +522,68 @@ export async function POST(
         return
       }
 
+      const owedUnits = buildOwedBusinessUnits({
+        payment_intent_id: paymentIntentId,
+        order_ids: resolution.orders.map((order) => order.order_id),
+      })
+      let settledUnits: string[] | null
+      let settlementReadError: Error | null = null
+      try {
+        const purchaseQuery = buildEventProcessedPurchaseQuery(paymentIntentId)
+        const result = await marketContextStorage.run(
+          {
+            market_id: marketId,
+            instance_id: envelopes[0].scope.instance_id,
+          },
+          () =>
+            handle.client.query<{ external_id: string }>(
+              purchaseQuery.sql,
+              purchaseQuery.params
+            )
+        )
+        settledUnits = result.rows.map((row) => row.external_id)
+      } catch (err) {
+        settledUnits = null
+        settlementReadError = err as Error
+      }
+
+      const ackEvaluation = evaluateOwedUnitAck({
+        owed_units: owedUnits,
+        settled_units: settledUnits,
+      })
+      if (!isAckAllowed(ackEvaluation.verdict)) {
+        const status = ackStatusForVerdict(ackEvaluation.verdict)
+        const reason =
+          ackEvaluation.verdict === "UNKNOWN"
+            ? "owed_units_unreadable"
+            : "owed_units_unsettled"
+        logger.error(
+          `[stripe/payment-intent] dostawa ${deliveryEventId} nie może dostać ACK: ` +
+            `verdict=${ackEvaluation.verdict}; missing_units=` +
+            `[${ackEvaluation.missing_units.join(",")}]; unexpected_units=` +
+            `[${ackEvaluation.unexpected_units.join(",")}]` +
+            (settlementReadError
+              ? `; settlement_read_error=${settlementReadError.message}`
+              : "")
+        )
+        res.status(status).json({
+          type: "owed_unit_ack_incomplete",
+          reason,
+          verdict: ackEvaluation.verdict,
+          owed_units: ackEvaluation.owed_units,
+          settled_units: ackEvaluation.settled_units,
+          missing_units: ackEvaluation.missing_units,
+          unexpected_units: ackEvaluation.unexpected_units,
+          ...(settlementReadError
+            ? { settlement_read_error: settlementReadError.message }
+            : {}),
+        })
+        return
+      }
+
       // Ta sama dostawa już przyjęta (np. `stripe events resend`) i rejestr
-      // NIE zna dla niej otwartej porażki. ACK bez emisji.
+      // NIE zna dla niej otwartej porażki, a wszystkie jednostki są rozliczone.
+      // ACK bez emisji.
       // Druga warstwa (`event_processed` po payment_intent_id + order_id) i tak
       // nie dopuści drugiego kompletu voucherów, ale zatrzymanie tutaj oszczędza
       // cały przebieg.

@@ -4,9 +4,10 @@
  *
  * KONTRAKT wspólnej bariery idempotencji dla dwóch tras webhooka Stripe oraz
  * kontrakt „ACK vs jednostki należne". Ten plik NICZEGO nie wpina w runtime:
- * jest czystą definicją (bez I/O), z której korzystają testy Story 3.1 i z której
- * MAJĄ korzystać Stories 3.2–3.6, gdy zaczną egzekwować kontrakt na realnej
- * ścieżce. Inwentaryzacja tras (owner, konsument, stan końcowy) jest w
+ * jest czystą definicją (bez I/O), z której korzystają testy Story 3.1 oraz
+ * gałąź ponowionej dostawy Path Y: route odczytuje rozliczone jednostki z
+ * `event_processed`, ocenia je tym modułem i pozwala na `200 duplicate` tylko
+ * przy `PASS`. Inwentaryzacja tras (owner, konsument, stan końcowy) jest w
  * `api/webhooks/stripe/__tests__/stripe-route-inventory.unit.test.ts` i w
  * artefakcie `evidence/3-1/stripe-routes-inventory.md` (super-repo).
  *
@@ -39,12 +40,13 @@
  *  `200` wolno odpowiedzieć WYŁĄCZNIE, gdy KAŻDA jednostka należna z poziomu 2
  *  jest rozliczona (`PASS`). Brak choć jednej (`FAIL`) albo niemożność odczytu
  *  stanu (`UNKNOWN`) ⇒ odpowiedź MUSI zachować ponowienie Stripe (nie-2xx).
- *  Dzisiejsza gałąź `!reserved` route'u Path Y odpowiada `200 duplicate` bez
- *  patrzenia na poziom 2 — to LUKA nazwana w Story 3.1 i zamykana w 3.2–3.6;
- *  test `owed-unit-ack-contract.unit.test.ts` mierzy tę rozbieżność wprost.
+ *  Gałąź `!reserved` route'u Path Y odczytuje rozliczone jednostki po
+ *  `event_processed.purchase_key = payment_intent_id` i musi użyć tego werdyktu
+ *  przed odpowiedzią `duplicate`; test
+ *  `owed-unit-ack-contract.unit.test.ts` mierzy tę decyzję na realnej ścieżce.
  *
- * Granica: ten moduł NIE zmienia tabel, NIE zmienia kontraktów `specs/contracts`
- * i NIE jest wołany przez route (jeszcze). Zmiana kształtu klucza poziomu 1/2
+ * Granica: ten moduł NIE zmienia tabel ani kontraktów `specs/contracts`.
+ * Zmiana kształtu klucza poziomu 1/2
  * wymaga ADR (ADR-166/ADR-190 są SSOT kształtu).
  */
 

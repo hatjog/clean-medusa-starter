@@ -7,11 +7,9 @@
  * MUSI zachować ponowienie (nie-2xx). Werdykt liczy się ZBIORAMI jednostek, nie
  * licznikiem — kontrola negatywna pokazuje, że licznik dałby fałszywe `PASS`.
  *
- * DRUGA CZĘŚĆ PLIKU TO DOWÓD LUKI, nie jej akceptacja: dzisiejsza gałąź
- * `!reserved` route'u Path Y odpowiada `200 duplicate` bez patrzenia na poziom 2.
- * Test mierzy ROZBIEŻNOŚĆ między werdyktem kontraktu a odpowiedzią route'u; gdy
- * Stories 3.2–3.6 wepną kontrakt w route, ten blok MA PĘKNĄĆ — wtedy usuwa się
- * blok „LUKA", a zostaje kontrakt. Nie należy „naprawiać" go zmianą oczekiwań.
+ * Druga część pliku sprawdza ścieżkę produkcyjną: powtórzona dostawa po
+ * częściowej konsumpcji MUSI odmówić ACK zgodnie z kontraktem, zaś komplet
+ * jednostek MUSI pozwolić na `200 duplicate`.
  *
  * Lustro dla ludzi: `evidence/3-1/owed-unit-ack-contract.json` (super-repo);
  * ten sam scenariusz na realnym PostgreSQL:
@@ -102,7 +100,7 @@ describe("Story 3.1 AC3 — werdykt ACK liczony zbiorami jednostek należnych", 
   })
 })
 
-// ── LUKA AC3 na realnym route Path Y (fake PG) ───────────────────────────────
+// ── AC3 na realnym route Path Y (fake PG) ────────────────────────────────────
 
 const SECRET = "whsec_ack_3_1"
 
@@ -177,6 +175,13 @@ function makeWorld() {
           rowCount: 2,
         }
       }
+      if (/FROM event_processed/i.test(sql)) {
+        expect(values).toEqual([PI])
+        return {
+          rows: [...settled].sort().map((external_id) => ({ external_id })),
+          rowCount: settled.size,
+        }
+      }
       return { rows: [], rowCount: 0 }
     },
     release: () => {},
@@ -213,12 +218,12 @@ function makeWorld() {
   return { deliver, consume, settled, queue }
 }
 
-describe("Story 3.1 AC3 — LUKA (zamyka 3.2–3.6): route ACK-uje ponowienie mimo brakującej jednostki", () => {
+describe("Story 3.1 AC3 — route Path Y steruje ACK werdyktem jednostek należnych", () => {
   beforeEach(() => {
     process.env.STRIPE_WEBHOOK_SECRET = SECRET
   })
 
-  it("po częściowej konsumpcji kontrakt mówi FAIL, a route odpowiada 200 duplicate — rozbieżność jest mierzalna", async () => {
+  it("po częściowej konsumpcji kontrakt mówi FAIL, a route odmawia ACK z widocznym powodem", async () => {
     const world = makeWorld()
     const owed = buildOwedBusinessUnits({ payment_intent_id: PI, order_ids: [ORDER_A, ORDER_B] })
 
@@ -233,15 +238,19 @@ describe("Story 3.1 AC3 — LUKA (zamyka 3.2–3.6): route ACK-uje ponowienie mi
     expect(afterPartial.verdict).toBe("FAIL")
     expect(afterPartial.missing_units).toEqual([UNIT_B])
 
-    // Dostawa 2 (ponowienie Stripe, ten sam event.id): kontrakt żąda nie-2xx…
+    // Dostawa 2 (ponowienie Stripe, ten sam event.id): kontrakt żąda nie-2xx.
     const retry = await world.deliver("evt_ack_1")
-    expect(world.queue).toHaveLength(0) // …i route faktycznie NIC nie re-emituje…
-    // …ale odpowiada 200 duplicate — to jest LUKA. Asercja mierzy rozbieżność,
-    // nie akceptuje jej: gdy route zacznie honorować kontrakt, ta linia pęknie.
-    expect(retry.statusCode).toBe(200)
-    expect((retry.body as { duplicate?: boolean }).duplicate).toBe(true)
-    expect(retry.statusCode).not.toBe(ackStatusForVerdict(afterPartial.verdict))
-    // Jednostka B pozostaje nierozliczona po ACK — klientka zapłaciła, vouchera nie ma.
+    expect(world.queue).toHaveLength(0)
+    expect(retry.statusCode).toBe(ackStatusForVerdict(afterPartial.verdict))
+    expect(retry.statusCode).toBeGreaterThanOrEqual(500)
+    expect(retry.body).toMatchObject({
+      type: "owed_unit_ack_incomplete",
+      reason: "owed_units_unsettled",
+      verdict: "FAIL",
+      missing_units: [UNIT_B],
+      unexpected_units: [],
+    })
+    // Jednostka B pozostaje nierozliczona, więc retry Stripe'a musi zostać zachowane.
     expect(world.settled.has(UNIT_B)).toBe(false)
   })
 

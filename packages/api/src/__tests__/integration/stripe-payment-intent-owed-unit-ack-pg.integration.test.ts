@@ -7,8 +7,8 @@
  *   1. dostawa 1 dla PI z DWOMA zamówieniami ⇒ 200, dwie koperty w kolejce;
  *   2. konsument rozlicza TYLKO zamówienie A (B ginie) ⇒ w `event_processed`
  *      jest jedna jednostka; kontrakt: FAIL, brak `pi:order_B`;
- *   3. ponowienie Stripe (ten sam event.id) ⇒ route odpowiada `200 duplicate`
- *      (LUKA AC3 — mierzona jako rozbieżność z werdyktem, nie akceptowana);
+ *   3. ponowienie Stripe (ten sam event.id) ⇒ route odmawia ACK przez `500`,
+ *      z widocznym werdyktem `FAIL` i brakującą jednostką;
  *   4. domknięcie B ⇒ PASS; ponowienie ⇒ 200 zgodne z kontraktem.
  *
  * Fixture (tabele tymczasowe) jest kopią 1:1 z
@@ -370,7 +370,7 @@ runWithIsolatedDatabase("Story 3.1 AC3 — kontrakt ACK vs jednostki należne na
     )
   })
 
-  it("częściowa konsumpcja ⇒ FAIL (brak pi:order_B); ponowienie dostaje 200 duplicate — LUKA mierzona, nie akceptowana", async () => {
+  it("częściowa konsumpcja ⇒ FAIL (brak pi:order_B); ponowienie odmawia ACK z widocznym powodem", async () => {
     const queue: QueuedEnvelope[] = []
     const owed = buildOwedBusinessUnits({ payment_intent_id: PAYMENT_INTENT_ID, order_ids: [ORDER_A, ORDER_B] })
 
@@ -394,13 +394,19 @@ runWithIsolatedDatabase("Story 3.1 AC3 — kontrakt ACK vs jednostki należne na
       )
     ).toEqual([ORDER_A])
 
-    // 3. ponowienie Stripe (ten sam event.id): kontrakt żąda nie-2xx, route daje 200 duplicate.
+    // 3. ponowienie Stripe (ten sam event.id): kontrakt żąda nie-2xx, route odmawia ACK.
     const retry = await deliver(client, queue)
     expect(queue).toHaveLength(0)
-    expect(retry.statusCode).toBe(200)
-    expect((retry.body as { duplicate?: boolean }).duplicate).toBe(true)
-    expect(retry.statusCode).not.toBe(ackStatusForVerdict(afterPartial.verdict))
-    // Po ACK jednostka B nadal NIE istnieje ani w event_processed, ani w entitlement_instance.
+    expect(retry.statusCode).toBe(ackStatusForVerdict(afterPartial.verdict))
+    expect(retry.statusCode).toBeGreaterThanOrEqual(500)
+    expect(retry.body).toMatchObject({
+      type: "owed_unit_ack_incomplete",
+      reason: "owed_units_unsettled",
+      verdict: "FAIL",
+      missing_units: [`${PAYMENT_INTENT_ID}:${ORDER_B}`],
+      unexpected_units: [],
+    })
+    // Jednostka B nadal NIE istnieje, więc Stripe zachowuje retry zamiast ACK.
     expect(await settledUnits(client)).toEqual([`${PAYMENT_INTENT_ID}:${ORDER_A}`])
     expect(
       (await client.query<{ n: string }>(`SELECT COUNT(*)::text AS n FROM entitlement_instance WHERE order_id = $1`, [ORDER_B]))
@@ -418,7 +424,7 @@ runWithIsolatedDatabase("Story 3.1 AC3 — kontrakt ACK vs jednostki należne na
 
     // To celowo ODRĘBNA dostawa dla tego samego PI z innym event.id. Nie nazywamy
     // jej Stripe resend: prawdziwy retry zachowuje event.id i jest zmierzony w
-    // poprzednim teście (obecnie ujawnia lukę 200 duplicate). Ten scenariusz
+    // poprzednim teście (odmawia ACK przy braku jednostki). Ten scenariusz
     // pokazuje wyłącznie ręczny recovery, który Stories 3.3–3.4 mają zastąpić
     // bezpiecznym retry tego samego eventu.
     const redelivery = await deliver(client, queue, stripeEvent(`${EVENT_ID}_redelivery`))
