@@ -254,6 +254,34 @@ describe("Story 3.1 AC3 — route Path Y steruje ACK werdyktem jednostek należn
     expect(world.settled.has(UNIT_B)).toBe(false)
   })
 
+  it("brak WSZYSTKICH skutków po trafieniu rezerwacji ⇒ FAIL, nie zwykły 200 duplicate", async () => {
+    const world = makeWorld()
+    const owed = buildOwedBusinessUnits({ payment_intent_id: PI, order_ids: [ORDER_A, ORDER_B] })
+
+    // Pierwsza dostawa rezerwuje transport i kolejkuje koperty, ale konsument
+    // nie zapisał jeszcze żadnego skutku. Ponowienie tego samego event.id nie
+    // może uznać samej rezerwacji za biznesowy ACK.
+    const first = await world.deliver("evt_ack_no_settlement")
+    expect(first.statusCode).toBe(200)
+    expect(world.queue).toHaveLength(2)
+
+    const noSettlement = evaluateOwedUnitAck({ owed_units: owed, settled_units: [] })
+    expect(noSettlement.verdict).toBe("FAIL")
+    expect(noSettlement.missing_units).toEqual([UNIT_A, UNIT_B])
+
+    const retry = await world.deliver("evt_ack_no_settlement")
+    expect(world.queue).toHaveLength(2)
+    expect(retry.statusCode).toBe(ackStatusForVerdict(noSettlement.verdict))
+    expect(retry.statusCode).toBeGreaterThanOrEqual(500)
+    expect(retry.body).toMatchObject({
+      type: "owed_unit_ack_incomplete",
+      reason: "owed_units_unsettled",
+      verdict: "FAIL",
+      missing_units: [UNIT_A, UNIT_B],
+      unexpected_units: [],
+    })
+  })
+
   it("po domknięciu brakującej jednostki kontrakt i route są ZGODNE (200 == PASS) — kontrola, że rozbieżność wynika z braku, nie z route'u", async () => {
     const world = makeWorld()
     const owed = buildOwedBusinessUnits({ payment_intent_id: PI, order_ids: [ORDER_A, ORDER_B] })

@@ -90,6 +90,7 @@ function makeRes(): FakeRes {
 function makeWorld(orderIds: string[]) {
   const reservations = new Map<string, { event_id: string; provider: string; market_id: string | null }>()
   const reserveInserts: unknown[][] = []
+  const settled = new Set<string>()
   const client = {
     query: async (sql: string, values: ReadonlyArray<unknown> = []) => {
       if (new RegExp(`INSERT INTO ${WEBHOOK_DELIVERY_BARRIER_TABLE}`, "i").test(sql)) {
@@ -116,6 +117,12 @@ function makeWorld(orderIds: string[]) {
             sales_channel_market_id: "bonbeauty",
           })),
           rowCount: orderIds.length,
+        }
+      }
+      if (/FROM event_processed/i.test(sql)) {
+        return {
+          rows: [...settled].sort().map((external_id) => ({ external_id })),
+          rowCount: settled.size,
         }
       }
       return { rows: [], rowCount: 0 }
@@ -145,7 +152,12 @@ function makeWorld(orderIds: string[]) {
     await POST(req as any, res as any)
     return { res, emitted: emitted.slice(before) }
   }
-  return { deliver, reservations, reserveInserts, emitted }
+  function settleAll() {
+    for (const orderId of orderIds) {
+      settled.add(buildPaymentIntentOrderExternalId(PI, orderId))
+    }
+  }
+  return { deliver, settleAll, reservations, reserveInserts, emitted }
 }
 
 type Envelope = {
@@ -177,9 +189,12 @@ describe("Story 3.1 AC2 — poziom 1: klucz dostawy = (event.id, provider), NIE 
     })
   })
 
-  it("ta sama dostawa (event.id) z ROTOWANYM session_id ⇒ duplikat poziomu 1, zero emisji", async () => {
+  it("ta sama dostawa (event.id) z ROTOWANYM session_id po pełnej konsumpcji ⇒ 200 duplicate, zero emisji", async () => {
     const world = makeWorld([ORDER_A, ORDER_B])
     const first = await world.deliver(stripeEvent("evt_l1_same", "payses_1"))
+    // Drugi POST jest prawidłowym ACK dopiero po pełnym skutku biznesowym;
+    // sama rezerwacja transportowa nie jest wystarczająca (AC3).
+    world.settleAll()
     const second = await world.deliver(stripeEvent("evt_l1_same", "payses_ROTATED"))
     expect(first.res.statusCode).toBe(200)
     expect(first.emitted).toHaveLength(2)
