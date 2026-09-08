@@ -681,7 +681,9 @@ function assertSerializedEvidence(value: string): void {
   expect(evidence.fixture.order_id).toBe(FIXTURE.orderId)
   expect(evidence.fixture.line_item_id).toBe(FIXTURE.lineItemId)
   expect(evidence.fixture.recipient_hash).toMatch(/^sha256:[0-9a-f]{64}$/)
-  expect(evidence.fixture.isolation).toBe("two independent PostgreSQL sessions; each session loads production migration DDL into session-local tables and runs one production call-site transaction")
+  expect(evidence.fixture.isolation).toBe(
+    "two independent PostgreSQL sessions; production event_processed schema is migrated in the isolated database, while voucher fixtures load production voucher DDL into session-local tables and each runs one production call-site transaction"
+  )
   expect(evidence.fixture.transaction_scope).toBe("runtime transaction_id is captured by the integration test; the serialized artifact keeps the run-scoped marker <runtime>")
   expect(Object.keys(evidence.fixture).sort()).toEqual([
     "isolation",
