@@ -23,23 +23,22 @@ import { Migration1778925500000 } from "../../modules/voucher/migrations/1778925
 import { Migration1778926000000 } from "../../modules/voucher/migrations/1778926000000_extend_entitlement_instance_check_constraints"
 import { Migration1778926100000 } from "../../modules/voucher/migrations/1778926100000_add_voucher_expired_status_and_recipient_columns"
 import { Migration1778926200000 } from "../../modules/voucher/migrations/1778926200000_add_claim_token_to_entitlement_instance"
-import { Migration1778928000000 } from "../../modules/voucher/migrations/1778928000000_create_event_processed_table"
 import { Migration1778928100000 } from "../../modules/voucher/migrations/1778928100000_add_vat_classification_and_ontology_fk"
 import { Migration1778928200000 } from "../../modules/voucher/migrations/1778928200000_add_entitlement_dedupe_key_and_recipient_index"
 import { Migration1778928300000 } from "../../modules/voucher/migrations/1778928300000_tighten_sales_channel_scope_live_issue"
 import { Migration1778930000000 } from "../../modules/voucher/migrations/1778930000000_add_claim_token_ttl_to_entitlement_instance"
 import { Migration1778932000000 } from "../../modules/voucher/migrations/1778932000000_add_reference_price_and_choice_set"
 import { Migration1779000000000 } from "../../modules/voucher/migrations/1779000000000_enable_rls_on_voucher_module_tables"
-import { Migration1779006000000 } from "../../modules/voucher/migrations/1779006000000_add_purchase_key_to_event_processed"
 import { Migration1779008000000 } from "../../modules/voucher/migrations/1779008000000_add_voucher_refunded_status"
 import { EntitlementInstanceState } from "../../modules/voucher/models/entitlement"
-import { createStripePaymentAuditWorkflowFromScope } from "../../workflows/payment/stripe-payment-audit"
 import voucherLiveIssueSubscriber from "../../subscribers/voucher-live-issue"
+import { createStripePaymentAuditWorkflowFromScope } from "../../workflows/payment/stripe-payment-audit"
 
 const STORY_TEST_DATABASE_URL_ENV = "GP_STORY_3_6_TEST_DATABASE_URL"
 const TRUSTED_STORY_TEST_DATABASE_NAMES = new Set([
   "gp_story_3_6_test",
   "gp_story_3_6_c4_test",
+  "gp_story_3_6_c5_test",
 ])
 const DATABASE_URL = process.env[STORY_TEST_DATABASE_URL_ENV]
 const EVIDENCE_PATH = resolve(
@@ -205,9 +204,9 @@ function makeResponse(): {
   }
 }
 
-function stripeEvent() {
+function stripeEvent(eventId = "evt_3_6_path_y") {
   return {
-    id: "evt_3_6_path_y",
+    id: eventId,
     type: "payment_intent.succeeded",
     created: Math.floor(new Date(FIXTURE.eventTimes.pathY).getTime() / 1000),
     data: {
@@ -217,7 +216,10 @@ function stripeEvent() {
         amount_received: PROFILE.amount_minor,
         currency: "pln",
         created: Math.floor(new Date(FIXTURE.eventTimes.pathY).getTime() / 1000),
-        metadata: { session_id: "payses_3_6_same_purchase" },
+        metadata: {
+          instance_id: "instance_3_6",
+          session_id: "payses_3_6_same_purchase",
+        },
       },
     },
   }
@@ -231,7 +233,7 @@ function makeTrackedClient(client: PoolClient, trace: Trace): PoolClient {
       const sql = String(args[0])
       const result = await originalQuery(...args)
       const normalized = sql.replace(/\s+/g, " ").trim().toLowerCase()
-      if (normalized === "begin") {
+      if (normalized === "begin" && trace.transactionId === null) {
         const tx = await originalQuery("SELECT txid_current()::text AS txid")
         trace.transactionId = String((tx.rows as Array<{ txid: string }>)[0].txid)
       }
@@ -248,6 +250,15 @@ function makeTrackedClient(client: PoolClient, trace: Trace): PoolClient {
 }
 
 async function createFixtureSchema(client: PoolClient): Promise<void> {
+  const publicEventProcessed = await client.query<{ column_name: string }>(
+    `SELECT column_name
+       FROM information_schema.columns
+      WHERE table_schema = 'public' AND table_name = 'event_processed'
+      ORDER BY ordinal_position`
+  )
+  expect(publicEventProcessed.rows.map((row) => row.column_name)).toEqual(
+    expect.arrayContaining(["external_id", "event_type", "purchase_key", "market_id", "instance_id"])
+  )
   await client.query("BEGIN")
   await client.query(`
     CREATE TEMP TABLE sales_channel (
@@ -292,25 +303,17 @@ async function createFixtureSchema(client: PoolClient): Promise<void> {
     Migration1778926000000,
     Migration1778926100000,
     Migration1778926200000,
-    Migration1778928000000,
     Migration1778928100000,
     Migration1778928200000,
     Migration1778928300000,
     Migration1778930000000,
     Migration1778932000000,
     Migration1779000000000,
-    Migration1779006000000,
     Migration1779008000000,
     Migration20260516000000StripePathYWebhookEventProcessed,
   ]) {
     for (const sql of await collectUpSql(MigrationClass, true)) await client.query(sql)
   }
-  // The event_processed runtime writer carries market scope; retain that
-  // existing runtime column while loading the table and index from production.
-  await client.query(
-    `ALTER TABLE event_processed
-       ADD COLUMN IF NOT EXISTS market_id text NOT NULL`
-  )
   await client.query(`
     CREATE TEMP TABLE money_path_compensation_failure (
       failure_id text PRIMARY KEY,
@@ -376,6 +379,7 @@ async function createFixtureSchema(client: PoolClient): Promise<void> {
   await client.query("GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA pg_temp TO medusa_store")
   await client.query("SET ROLE medusa_store")
   await client.query("SELECT set_config('app.gp_market_id', $1, false)", [FIXTURE.marketId])
+  await client.query("SELECT set_config('app.gp_instance_id', $1, false)", ["instance_3_6"])
   await client.query("COMMIT")
 }
 
@@ -431,10 +435,10 @@ async function readMeasurement(
        JOIN "order" o ON o.id = ei.order_id
        JOIN order_line_item oli ON oli.id = ei.line_item_id
       WHERE ei.order_id = $1 AND ei.line_item_id = $2
-      ORDER BY ei.created_at
-      LIMIT 1`,
+      ORDER BY ei.created_at`,
     [FIXTURE.orderId, FIXTURE.lineItemId]
   )
+  expect(result.rowCount).toBe(1)
   const row = result.rows[0]
   expect(row).toBeDefined()
   const transitionPayload = transition.payload as {
@@ -475,7 +479,7 @@ async function readMeasurement(
 
   const effect: Measurement["effect"] = {
     id: row.id,
-    timestamp: new Date().toISOString(),
+    timestamp: row.created_at.toISOString(),
     producer: "entitlement-transition-wiring",
     consumer: "canonical-state-measurement",
     verdict: "observed",
@@ -560,7 +564,7 @@ function assertMeasurementSet(rows: readonly Measurement[]): void {
     expect(captured?.[field]).toBe(pathY?.[field])
   }
   for (const row of rows) {
-    expect(Date.parse(row.effect.timestamp)).toBeGreaterThan(Date.parse(row.trigger.timestamp))
+    expect(Date.parse(row.effect.timestamp)).toBeGreaterThanOrEqual(Date.parse(row.trigger.timestamp))
   }
   expect(captured).toEqual(
     expect.objectContaining({
@@ -614,7 +618,7 @@ function assertEvidenceMatches(rows: readonly Measurement[]): void {
       })
     )
     expect(recorded?.transaction_id).toBe("<runtime>")
-    expect(Date.parse(recorded?.effect.timestamp ?? "")).toBeGreaterThan(
+    expect(Date.parse(recorded?.effect.timestamp ?? "")).toBeGreaterThanOrEqual(
       Date.parse(recorded?.trigger.timestamp ?? "")
     )
   }
@@ -646,7 +650,10 @@ function assertEvidenceMatches(rows: readonly Measurement[]): void {
 
 function assertSerializedEvidence(value: string): void {
   const evidence = JSON.parse(value) as {
+    adr_219_status: string
+    decision: string
     measurement_status: string
+    sensitive_data: string
     fixture: Record<string, unknown>
     runs: Measurement[]
     differences: string[]
@@ -665,9 +672,15 @@ function assertSerializedEvidence(value: string): void {
     "verdict_code",
   ])
   expect(evidence.measurement_status).toBe("observed")
+  expect(evidence.adr_219_status).toBe("proposed")
+  expect(evidence.decision).toBe("not_ratified")
+  expect(evidence.sensitive_data).toBe(
+    "recipient represented only by hash; no raw recipient, token, provider secret or email stored"
+  )
   expect(evidence.fixture.purchase_fingerprint).toBe(FIXTURE_PURCHASE_FINGERPRINT)
   expect(evidence.fixture.order_id).toBe(FIXTURE.orderId)
   expect(evidence.fixture.line_item_id).toBe(FIXTURE.lineItemId)
+  expect(evidence.fixture.recipient_hash).toMatch(/^sha256:[0-9a-f]{64}$/)
   expect(evidence.fixture.isolation).toBe("two independent PostgreSQL sessions; each session loads production migration DDL into session-local tables and runs one production call-site transaction")
   expect(evidence.fixture.transaction_scope).toBe("runtime transaction_id is captured by the integration test; the serialized artifact keeps the run-scoped marker <runtime>")
   expect(Object.keys(evidence.fixture).sort()).toEqual([
@@ -733,7 +746,7 @@ function assertSerializedEvidence(value: string): void {
     expect(run.trigger.timestamp).toEqual(expect.any(String))
     expect(run.effect.id).not.toBe(run.trigger.id)
     expect(run.effect.timestamp).toEqual(expect.any(String))
-    expect(Date.parse(run.effect.timestamp)).toBeGreaterThan(Date.parse(run.trigger.timestamp))
+    expect(Date.parse(run.effect.timestamp)).toBeGreaterThanOrEqual(Date.parse(run.trigger.timestamp))
     expect(run.effect.table).toBe("entitlement_instance")
     expect(run.effect.entitlement_state).toBe(run.entitlement_instance_state)
     expect(run.gate_order).toEqual([
@@ -814,10 +827,22 @@ runWithIsolatedDatabase("Story 3.6 AC1 — produkcyjne call-site'y na realnym Po
       expect(capturedReplay.deduplicated).toBe(true)
 
       const pathYEvents: unknown[] = []
+      const pathYLogs: string[] = []
+      const pathYLogger = {
+        info(message: unknown) {
+          pathYLogs.push(`info: ${String(message)}`)
+        },
+        warn(message: unknown) {
+          pathYLogs.push(`warn: ${String(message)}`)
+        },
+        error(message: unknown) {
+          pathYLogs.push(`error: ${String(message)}`)
+        },
+      }
       const subscriberContainer = {
         resolve: (key: string): unknown => {
           if (key === "__pg_pool__") return workflowPool(pathYFixture.client)
-          if (key === "logger") return { info() {}, warn() {}, error() {} }
+          if (key === "logger") return pathYLogger
           if (key === Modules.EVENT_BUS) return { emit: async (event: unknown) => pathYEvents.push(event) }
           throw new Error(`unresolved ${key}`)
         },
@@ -825,7 +850,7 @@ runWithIsolatedDatabase("Story 3.6 AC1 — produkcyjne call-site'y na realnym Po
       const routeScope = {
         resolve: (key: string): unknown => {
           if (key === "__pg_pool__") return workflowPool(pathYFixture.client)
-          if (key === "logger") return { info() {}, warn() {}, error() {} }
+          if (key === "logger") return pathYLogger
           if (key === Modules.EVENT_BUS) {
             return {
               emit: async (event: { name: string; data: unknown }) => {
@@ -850,9 +875,75 @@ runWithIsolatedDatabase("Story 3.6 AC1 — produkcyjne call-site'y na realnym Po
         } as never,
         response as never
       )
+      if (response.statusCode !== 200) {
+        throw new Error(
+          `Path Y returned ${response.statusCode}: ${JSON.stringify(response.body)}; ` +
+            `logs=${JSON.stringify(pathYLogs)}`
+        )
+      }
       expect(response.statusCode).toBe(200)
       expect(response.body).toEqual(expect.objectContaining({ emitted: PAYMENT_INTENT_SUCCEEDED_EVENT }))
       expect(pathYEvents).toHaveLength(1)
+      const businessReplayRawBody = JSON.stringify(stripeEvent("evt_3_6_path_y_business_replay"))
+      const businessReplayResponse = makeResponse()
+      await POST(
+        {
+          rawBody: Buffer.from(businessReplayRawBody),
+          headers: { [STRIPE_SIGNATURE_HEADER]: signedHeader(businessReplayRawBody) },
+          scope: routeScope,
+        } as never,
+        businessReplayResponse as never
+      )
+      expect(businessReplayResponse.statusCode).toBe(200)
+      expect(businessReplayResponse.body).toEqual(
+        expect.objectContaining({ emitted: PAYMENT_INTENT_SUCCEEDED_EVENT })
+      )
+      expect(pathYEvents).toHaveLength(1)
+      const businessDedupe = await pathYFixture.client.query<{
+        instance_id: string
+        market_id: string
+        purchase_key: string
+      }>(
+        `SELECT instance_id, market_id, purchase_key
+           FROM public.event_processed
+          WHERE external_id = $1 AND event_type = $2`,
+        [`${FIXTURE.paymentIntentId}:${FIXTURE.orderId}`, PAYMENT_INTENT_SUCCEEDED_EVENT]
+      )
+      expect(businessDedupe.rows).toEqual([
+        {
+          instance_id: "instance_3_6",
+          market_id: FIXTURE.marketId,
+          purchase_key: FIXTURE.paymentIntentId,
+        },
+      ])
+
+      await pathYFixture.client.query("BEGIN")
+      try {
+        await pathYFixture.client.query("SELECT set_config('app.gp_market_id', $1, true)", ["other-market"])
+        const foreignRead = await pathYFixture.client.query(
+          `SELECT external_id FROM public.event_processed
+            WHERE external_id = $1 AND event_type = $2`,
+          [`${FIXTURE.paymentIntentId}:${FIXTURE.orderId}`, PAYMENT_INTENT_SUCCEEDED_EVENT]
+        )
+        expect(foreignRead.rows).toHaveLength(0)
+        await expect(
+          pathYFixture.client.query(
+            `INSERT INTO public.event_processed
+              (external_id, event_type, processed_at, purchase_key, instance_id, market_id)
+             VALUES ($1, $2, $3, $4, $5, $6)`,
+            [
+              "pi_3_6_cross_market:order_3_6_cross_market",
+              PAYMENT_INTENT_SUCCEEDED_EVENT,
+              Date.now(),
+              "pi_3_6_cross_market",
+              "instance_3_6",
+              FIXTURE.marketId,
+            ]
+          )
+        ).rejects.toThrow(/row-level security/)
+      } finally {
+        await pathYFixture.client.query("ROLLBACK")
+      }
       const replayResponse = makeResponse()
       await POST(
         {
@@ -896,8 +987,13 @@ runWithIsolatedDatabase("Story 3.6 AC1 — produkcyjne call-site'y na realnym Po
     } finally {
       await capturedFixture.client.query("RESET ROLE")
       await pathYFixture.client.query("RESET ROLE")
-      await capturedFixture.client.query("DROP TABLE IF EXISTS event_processed, webhook_event_processed, voucher_event, voucher, entitlement_instance, order_item, order_line_item, product_product_seller_seller, seller, product, payment_session, order_payment_collection, \"order\", sales_channel CASCADE")
-      await pathYFixture.client.query("DROP TABLE IF EXISTS event_processed, webhook_event_processed, voucher_event, voucher, entitlement_instance, order_item, order_line_item, product_product_seller_seller, seller, product, payment_session, order_payment_collection, \"order\", sales_channel CASCADE")
+      await pathYFixture.client.query(
+        `DELETE FROM event_processed
+          WHERE external_id = $1 AND event_type = $2`,
+        [`${FIXTURE.paymentIntentId}:${FIXTURE.orderId}`, PAYMENT_INTENT_SUCCEEDED_EVENT]
+      )
+      await capturedFixture.client.query("DROP TABLE IF EXISTS webhook_event_processed, voucher_event, voucher, entitlement_instance, order_item, order_line_item, product_product_seller_seller, seller, product, payment_session, order_payment_collection, \"order\", sales_channel CASCADE")
+      await pathYFixture.client.query("DROP TABLE IF EXISTS webhook_event_processed, voucher_event, voucher, entitlement_instance, order_item, order_line_item, product_product_seller_seller, seller, product, payment_session, order_payment_collection, \"order\", sales_channel CASCADE")
       capturedFixture.release()
       pathYFixture.release()
     }
@@ -932,6 +1028,14 @@ describe("Story 3.6 AC1 — ujemne kontrole evidence", () => {
     ;(fixturePiiMutant.fixture as Record<string, unknown>).recipient_email = "recipient@example.test"
     const effectSecretMutant = JSON.parse(raw) as Record<string, unknown>
     ;((effectSecretMutant.runs as Array<Record<string, unknown>>)[0].effect as Record<string, unknown>).provider_secret = "not-a-secret"
+    const adrStatusMutant = JSON.parse(raw) as Record<string, unknown>
+    adrStatusMutant.adr_219_status = "ratified"
+    const decisionMutant = JSON.parse(raw) as Record<string, unknown>
+    decisionMutant.decision = "ratified"
+    const sensitiveDataMutant = JSON.parse(raw) as Record<string, unknown>
+    sensitiveDataMutant.sensitive_data = "raw recipient email retained"
+    const recipientHashMutant = JSON.parse(raw) as Record<string, unknown>
+    ;(recipientHashMutant.fixture as Record<string, unknown>).recipient_hash = "recipient@example.test"
     expect(() => assertSerializedEvidence(JSON.stringify(routeMutant))).toThrow()
     expect(() => assertSerializedEvidence(JSON.stringify(missingLayerMutant))).toThrow()
     expect(() => assertSerializedEvidence(JSON.stringify(orderIdentityMutant))).toThrow()
@@ -941,6 +1045,10 @@ describe("Story 3.6 AC1 — ujemne kontrole evidence", () => {
     expect(() => assertSerializedEvidence(JSON.stringify(piiMutant))).toThrow()
     expect(() => assertSerializedEvidence(JSON.stringify(fixturePiiMutant))).toThrow()
     expect(() => assertSerializedEvidence(JSON.stringify(effectSecretMutant))).toThrow()
+    expect(() => assertSerializedEvidence(JSON.stringify(adrStatusMutant))).toThrow()
+    expect(() => assertSerializedEvidence(JSON.stringify(decisionMutant))).toThrow()
+    expect(() => assertSerializedEvidence(JSON.stringify(sensitiveDataMutant))).toThrow()
+    expect(() => assertSerializedEvidence(JSON.stringify(recipientHashMutant))).toThrow()
     expect(runs).toHaveLength(2)
   })
 })

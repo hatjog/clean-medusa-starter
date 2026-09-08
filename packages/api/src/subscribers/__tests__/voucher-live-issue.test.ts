@@ -198,7 +198,7 @@ describe("Story 3.3 — subscriber orchestracja (tx + idempotencja end-to-end)",
   it("odmawia brakującego instance_id przed otwarciem transakcji", async () => {
     const { container, txLog } = makeFakeContainer()
     const event = envelopeEvent()
-    event.data.scope = { market_id: "bonbeauty" }
+    event.data.scope = { instance_id: "", market_id: "bonbeauty" }
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await expect(subscriber({ event, container } as any)).rejects.toThrow(/scope\.instance_id/)
     expect(txLog).toEqual([])

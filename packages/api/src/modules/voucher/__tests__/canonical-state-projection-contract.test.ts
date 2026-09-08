@@ -21,14 +21,17 @@ function readContract(): string {
   return readFileSync(CONTRACT_PATH, "utf8")
 }
 
-function readVocabularyStates(): MappingRow[] {
-  const yaml = readFileSync(VOCABULARY_PATH, "utf8")
+function readVocabularyStates(yaml = readFileSync(VOCABULARY_PATH, "utf8")): MappingRow[] {
   const rows: MappingRow[] = []
   const lines = yaml.split("\n")
   for (let index = 0; index < lines.length; index += 1) {
     const id = lines[index].match(/^\s*- id:\s*([a-z_]+)\s*$/)?.[1]
     if (!id) continue
-    const nextState = lines.slice(index + 1).find((line) => line.includes("maps_to_entitlement_states:"))
+    const followingLines = lines.slice(index + 1)
+    const nextEntryIndex = followingLines.findIndex((line) => /^\s*- id:\s*/.test(line))
+    const stateBlock =
+      nextEntryIndex === -1 ? followingLines : followingLines.slice(0, nextEntryIndex)
+    const nextState = stateBlock.find((line) => line.includes("maps_to_entitlement_states:"))
     const canonical = nextState?.match(/\[([^\]]+)\]/)?.[1]
       ?.split(",")
       .map((value) => value.trim())
@@ -95,14 +98,16 @@ function assertContractShape(document: string): void {
     }
   }
 
+  const producerRows = markdownTableRows(producers)
   for (const [producer, consumer] of [
-    ["voucher-live-issue", "live-issue-from-payment-intent.ts"],
-    ["stripe-payment-audit", "stripe-payment-audit.ts"],
-    ["entitlement-transition-wiring", "envelope stanu po commit"],
+    ["natywny Stripe hook Medusy", "stripe-payment-audit.ts"],
+    ["GP Path Y", "voucher-live-issue"],
+    ["entitlement-transition-wiring", "odbiorcy audytu/projekcji"],
     ["voucher-purchase-delivery", "ścieżka realizacji"],
   ]) {
-    expect(producers).toContain(producer)
-    expect(producers).toContain(consumer)
+    expect(
+      producerRows.some((row) => row[1]?.includes(producer) && row[2]?.includes(consumer))
+    ).toBe(true)
   }
   expect(axes).toContain("Dowód triggera")
   expect(axes).toContain("Dowód skutku aktywacji")
@@ -120,10 +125,40 @@ describe("Story 3.6 AC2 — strukturalny draft kanonicznej projekcji", () => {
     ["brak mapowania legacy", (document: string) => document.replace("| kod vouchera |", "| usunięty wiersz |")],
     ["zmiana wartości refunded", (document: string) => document.replace("`refunded` → `REFUNDED`", "`refunded` → `ISSUED`")],
     ["zmiana drugiej wartości idle", (document: string) => document.replace("`idle` → `ACTIVE`", "`idle` → `VOIDED`")],
-    ["zmiana konsumenta", (document: string) => document.replace("voucher-live-issue` → `live-issue-from-payment-intent.ts", "voucher-live-issue` → `wrong-consumer.ts")],
+    [
+      "zmiana konsumenta",
+      (document: string) =>
+        document.replace(
+          "GP Path Y `/webhooks/stripe/payment-intent` | `voucher-live-issue` → `live-issue-from-payment-intent.ts`",
+          "GP Path Y `/webhooks/stripe/payment-intent` | `wrong-consumer` → `live-issue-from-payment-intent.ts`"
+        ),
+    ],
+    [
+      "zamiana pełnych par producent–konsument",
+      (document: string) =>
+        document
+          .replace(
+            "| `payment.captured` | natywny Stripe hook Medusy `/hooks/payment/stripe` | `stripe-payment-audit` → `workflows/payment/stripe-payment-audit.ts` → `issue-entitlement.ts` | persisted `ACTIVE` |",
+            "| `payment.captured` | natywny Stripe hook Medusy `/hooks/payment/stripe` | `voucher-live-issue` → `live-issue-from-payment-intent.ts` | persisted `ACTIVE` |"
+          )
+          .replace(
+            "| `gp.stripe.payment_intent_succeeded.v1` | GP Path Y `/webhooks/stripe/payment-intent` | `voucher-live-issue` → `live-issue-from-payment-intent.ts` | persisted `ISSUED` |",
+            "| `gp.stripe.payment_intent_succeeded.v1` | GP Path Y `/webhooks/stripe/payment-intent` | `stripe-payment-audit` → `workflows/payment/stripe-payment-audit.ts` → `issue-entitlement.ts` | persisted `ISSUED` |"
+          ),
+    ],
     ["zlanie osi triggera i skutku", (document: string) => document.replace("Dowód skutku aktywacji", "Dowód aktywacji")],
     ["przedwczesny wybór triggera", (document: string) => document.replace("pozostaje wyłącznie kandydatem triggera", "jest wybranym triggerem")],
   ])("odrzuca mutację: %s", (_name, mutate) => {
     expect(() => assertContractShape(mutate(readContract()))).toThrow()
+  })
+
+  it("nie pobiera mapowania z następnego bloku słownika", () => {
+    expect(
+      readVocabularyStates(`
+  - id: idle
+  - id: refunded
+    maps_to_entitlement_states: [REFUNDED]
+`)
+    ).toEqual([{ legacy: "refunded", canonical: ["REFUNDED"] }])
   })
 })
