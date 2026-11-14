@@ -170,3 +170,19 @@ describe("Story 3.8 AC1 — bramka stanu uprawnienia przed projekcją voucher_st
     expect(inner.listAudits()).toHaveLength(0)
   })
 })
+
+describe("Story 3.8 R-15 — REDEEMABLE_SOURCE_STATES niemutowalny w runtime", () => {
+  it("add/delete/clear rzucają, a zbiór zostaje {ACTIVE, REDEEMED_PARTIAL}", () => {
+    const gate = REDEEMABLE_SOURCE_STATES as Set<EntitlementInstanceState>
+    expect(() => gate.add(EntitlementInstanceState.ISSUED)).toThrow(TypeError)
+    expect(() => gate.delete(EntitlementInstanceState.ACTIVE)).toThrow(TypeError)
+    expect(() => gate.clear()).toThrow(TypeError)
+    expect(() => {
+      ;(gate as { add: unknown }).add = Set.prototype.add
+    }).toThrow(TypeError)
+    expect([...REDEEMABLE_SOURCE_STATES].sort()).toEqual(
+      [EntitlementInstanceState.ACTIVE, EntitlementInstanceState.REDEEMED_PARTIAL].sort()
+    )
+    expect(REDEEMABLE_SOURCE_STATES.has(EntitlementInstanceState.ISSUED)).toBe(false)
+  })
+})

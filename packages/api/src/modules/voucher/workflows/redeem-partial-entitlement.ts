@@ -81,10 +81,27 @@ import type { VoucherStatus } from "../models/types"
  * Graf (3.4) prowadzi OBA przez `REDEMPTION_REQUESTED` → `REDEEMED_PARTIAL`/
  * `REDEEMED_FULL` (krawędzie istnieją; NIE zmieniamy taksonomii, D-5).
  */
-export const REDEEMABLE_SOURCE_STATES: ReadonlySet<EntitlementInstanceState> = new Set([
-  EntitlementInstanceState.ACTIVE,
-  EntitlementInstanceState.REDEEMED_PARTIAL,
-])
+export const REDEEMABLE_SOURCE_STATES: ReadonlySet<EntitlementInstanceState> = sealSet(
+  new Set([
+    EntitlementInstanceState.ACTIVE,
+    EntitlementInstanceState.REDEEMED_PARTIAL,
+  ])
+)
+
+/**
+ * Zbiór niemutowalny także w runtime (review 3.8 R-15): `ReadonlySet` to tylko
+ * typ, a `Object.freeze` nie blokuje `Set#add`. Metody mutujące instancji rzucają
+ * i są niekonfigurowalne, więc inny moduł nie rozszerzy bramki odkupu.
+ */
+function sealSet<T>(set: Set<T>): ReadonlySet<T> {
+  const refuse = (): never => {
+    throw new TypeError("REDEEMABLE_SOURCE_STATES is immutable")
+  }
+  for (const name of ["add", "delete", "clear"] as const) {
+    Object.defineProperty(set, name, { value: refuse, writable: false, configurable: false })
+  }
+  return set
+}
 
 const AMOUNT_REDEEMABLE_TYPES: ReadonlySet<EntitlementType> = new Set([
   EntitlementType.VOUCHER_AMOUNT,
