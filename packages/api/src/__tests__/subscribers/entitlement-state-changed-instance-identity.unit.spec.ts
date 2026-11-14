@@ -34,11 +34,11 @@ jest.mock("../../workflows/entitlements/issue-entitlement", () => {
 
 jest.mock("../../workflows/entitlements/live-issue-from-payment-intent", () => ({
   __esModule: true,
-  liveIssueEntitlementsWithinTx: jest.fn(),
+  liveIssueEntitlementsPerLineWithinTx: jest.fn(),
 }))
 
 import { issueEntitlementsForAllLineItems } from "../../workflows/entitlements/issue-entitlement"
-import { liveIssueEntitlementsWithinTx } from "../../workflows/entitlements/live-issue-from-payment-intent"
+import { liveIssueEntitlementsPerLineWithinTx } from "../../workflows/entitlements/live-issue-from-payment-intent"
 import onOrderPlacedStripeRetry, {
   FIND_DEFERRED_CAPTURES_SQL,
 } from "../../subscribers/on-order-placed-stripe-retry"
@@ -62,7 +62,7 @@ const PREVIOUS = process.env.GP_INSTANCE_ID
 
 beforeEach(() => {
   process.env.GP_INSTANCE_ID = RUNTIME
-  ;(liveIssueEntitlementsWithinTx as jest.Mock).mockReset()
+  ;(liveIssueEntitlementsPerLineWithinTx as jest.Mock).mockReset()
   ;(issueEntitlementsForAllLineItems as jest.Mock).mockReset()
 })
 afterAll(() => {
@@ -150,9 +150,11 @@ describe("Story 11.2 AC1 — voucher-live-issue (geneza ISSUED Path Y live)", ()
   }
 
   it("scope.instance_id = GP_INSTANCE_ID, entitlement id w payload.entitlement_id", async () => {
-    ;(liveIssueEntitlementsWithinTx as jest.Mock).mockResolvedValueOnce({
+    ;(liveIssueEntitlementsPerLineWithinTx as jest.Mock).mockResolvedValueOnce({
       event_processed: true,
       issued: [{ entitlement_id: ENT, entitlement_dedupe_key: "c".repeat(64), created: true }],
+      line_outcomes: [],
+      failed_lines: [],
     })
     const h = makeContainer(genericClient())
     await voucherLiveIssueSubscriber({
@@ -173,7 +175,7 @@ describe("Story 11.2 AC1 — voucher-live-issue (geneza ISSUED Path Y live)", ()
         container: h.container,
       } as never)
     ).rejects.toBeInstanceOf(RuntimeInstanceIdentityError)
-    expect(liveIssueEntitlementsWithinTx).not.toHaveBeenCalled()
+    expect(liveIssueEntitlementsPerLineWithinTx).not.toHaveBeenCalled()
     expect(h.eventBus.emit).not.toHaveBeenCalled()
   })
 })
@@ -194,9 +196,11 @@ describe("Story 11.2 AC1 — on-order-placed-stripe-retry (genesis Path Y + odzy
   }
 
   it("Path Y: ISSUED i ACTIVE niosą instancję runtime, nie entitlement id (DW-15-298 p.4)", async () => {
-    ;(liveIssueEntitlementsWithinTx as jest.Mock).mockResolvedValueOnce({
+    ;(liveIssueEntitlementsPerLineWithinTx as jest.Mock).mockResolvedValueOnce({
       event_processed: true,
       issued: [{ entitlement_id: ENT, entitlement_dedupe_key: "c".repeat(64), created: true }],
+      line_outcomes: [],
+      failed_lines: [],
     })
     const h = makeContainer(genericClient([pathYRow]))
     await (onOrderPlacedStripeRetry as unknown as (a: unknown) => Promise<void>)({
