@@ -335,7 +335,7 @@
       ]
     },
     {
-      "name": "pusta allowlista => FAIL licznosci i FAIL trasy",
+      "name": "pusta allowlista => FAIL trasy (bez KNOWN-DIVERGENCE)",
       "observations": [
         {
           "route": "captured-path",
@@ -349,16 +349,12 @@
       "expected": [
         [
           "FAIL",
-          "(allowlista)"
-        ],
-        [
-          "FAIL",
           "captured-path"
         ]
       ]
     },
     {
-      "name": "druga trasa w allowliscie => FAIL licznosci",
+      "name": "trasa spoza zamknietego zbioru w allowliscie => FAIL, bez KNOWN-DIVERGENCE",
       "observations": [
         {
           "route": "captured-path",
@@ -403,7 +399,7 @@
           "captured-path"
         ],
         [
-          "KNOWN-DIVERGENCE",
+          "FAIL",
           "path-y-live-issue"
         ]
       ]
@@ -468,6 +464,349 @@
         [
           "FAIL",
           "captured-path"
+        ]
+      ]
+    },
+    {
+      "name": "D-11: trzy znane trasy gift+ACTIVE => 3x KNOWN-DIVERGENCE",
+      "observations": [
+        {
+          "route": "captured-path",
+          "producer": "src/workflows/entitlements/issue-entitlement.ts",
+          "purchase_mode": "gift",
+          "genesis_state": "ACTIVE",
+          "not_applicable_reason": null
+        },
+        {
+          "route": "lost-code-reissue",
+          "producer": "src/modules/voucher/workflows/reissue-lost-code.ts",
+          "purchase_mode": "gift",
+          "genesis_state": "ACTIVE",
+          "not_applicable_reason": null
+        },
+        {
+          "route": "retention-issue",
+          "producer": "src/modules/voucher/workflows/issue-retention.ts",
+          "purchase_mode": "gift",
+          "genesis_state": "ACTIVE",
+          "not_applicable_reason": null
+        }
+      ],
+      "allowlist": [
+        {
+          "route": "captured-path",
+          "producer": "src/workflows/entitlements/issue-entitlement.ts",
+          "refs": [
+            "DW-15-210",
+            "DW-15-271"
+          ]
+        },
+        {
+          "route": "lost-code-reissue",
+          "producer": "src/modules/voucher/workflows/reissue-lost-code.ts",
+          "refs": [
+            "DW-15-281"
+          ]
+        },
+        {
+          "route": "retention-issue",
+          "producer": "src/modules/voucher/workflows/issue-retention.ts",
+          "refs": [
+            "DW-15-281"
+          ]
+        }
+      ],
+      "expected": [
+        [
+          "KNOWN-DIVERGENCE",
+          "captured-path"
+        ],
+        [
+          "KNOWN-DIVERGENCE",
+          "lost-code-reissue"
+        ],
+        [
+          "KNOWN-DIVERGENCE",
+          "retention-issue"
+        ]
+      ]
+    },
+    {
+      "name": "D-11: nowa trasa nastepcy gift+ACTIVE spoza zbioru => FAIL",
+      "observations": [
+        {
+          "route": "captured-path",
+          "producer": "src/workflows/entitlements/issue-entitlement.ts",
+          "purchase_mode": "gift",
+          "genesis_state": "ACTIVE",
+          "not_applicable_reason": null
+        },
+        {
+          "route": "lost-code-reissue",
+          "producer": "src/modules/voucher/workflows/reissue-lost-code.ts",
+          "purchase_mode": "gift",
+          "genesis_state": "ACTIVE",
+          "not_applicable_reason": null
+        },
+        {
+          "route": "retention-issue",
+          "producer": "src/modules/voucher/workflows/issue-retention.ts",
+          "purchase_mode": "gift",
+          "genesis_state": "ACTIVE",
+          "not_applicable_reason": null
+        },
+        {
+          "route": "new-successor",
+          "producer": "src/modules/voucher/workflows/new-successor.ts",
+          "purchase_mode": "gift",
+          "genesis_state": "ACTIVE",
+          "not_applicable_reason": null
+        }
+      ],
+      "allowlist": [
+        {
+          "route": "captured-path",
+          "producer": "src/workflows/entitlements/issue-entitlement.ts",
+          "refs": [
+            "DW-15-210",
+            "DW-15-271"
+          ]
+        },
+        {
+          "route": "lost-code-reissue",
+          "producer": "src/modules/voucher/workflows/reissue-lost-code.ts",
+          "refs": [
+            "DW-15-281"
+          ]
+        },
+        {
+          "route": "retention-issue",
+          "producer": "src/modules/voucher/workflows/issue-retention.ts",
+          "refs": [
+            "DW-15-281"
+          ]
+        }
+      ],
+      "expected": [
+        [
+          "KNOWN-DIVERGENCE",
+          "captured-path"
+        ],
+        [
+          "KNOWN-DIVERGENCE",
+          "lost-code-reissue"
+        ],
+        [
+          "KNOWN-DIVERGENCE",
+          "retention-issue"
+        ],
+        [
+          "FAIL",
+          "new-successor"
+        ]
+      ]
+    },
+    {
+      "name": "D-11 mutant: allowlista poszerzona wzorcem => FAIL, wzorzec nie daje KNOWN-DIVERGENCE",
+      "observations": [
+        {
+          "route": "captured-path",
+          "producer": "src/workflows/entitlements/issue-entitlement.ts",
+          "purchase_mode": "gift",
+          "genesis_state": "ACTIVE",
+          "not_applicable_reason": null
+        },
+        {
+          "route": "lost-code-reissue",
+          "producer": "src/modules/voucher/workflows/reissue-lost-code.ts",
+          "purchase_mode": "gift",
+          "genesis_state": "ACTIVE",
+          "not_applicable_reason": null
+        },
+        {
+          "route": "retention-issue",
+          "producer": "src/modules/voucher/workflows/issue-retention.ts",
+          "purchase_mode": "gift",
+          "genesis_state": "ACTIVE",
+          "not_applicable_reason": null
+        },
+        {
+          "route": "new-successor",
+          "producer": "src/modules/voucher/workflows/new-successor.ts",
+          "purchase_mode": "gift",
+          "genesis_state": "ACTIVE",
+          "not_applicable_reason": null
+        }
+      ],
+      "allowlist": [
+        {
+          "route": "captured-path",
+          "producer": "src/workflows/entitlements/issue-entitlement.ts",
+          "refs": [
+            "DW-15-210",
+            "DW-15-271"
+          ]
+        },
+        {
+          "route": "lost-code-reissue",
+          "producer": "src/modules/voucher/workflows/reissue-lost-code.ts",
+          "refs": [
+            "DW-15-281"
+          ]
+        },
+        {
+          "route": "retention-issue",
+          "producer": "src/modules/voucher/workflows/issue-retention.ts",
+          "refs": [
+            "DW-15-281"
+          ]
+        },
+        {
+          "route": "*",
+          "producer": "src/modules/voucher/workflows/*",
+          "refs": [
+            "DW-15-281"
+          ]
+        }
+      ],
+      "expected": [
+        [
+          "FAIL",
+          "(allowlista)"
+        ],
+        [
+          "KNOWN-DIVERGENCE",
+          "captured-path"
+        ],
+        [
+          "KNOWN-DIVERGENCE",
+          "lost-code-reissue"
+        ],
+        [
+          "KNOWN-DIVERGENCE",
+          "retention-issue"
+        ],
+        [
+          "FAIL",
+          "new-successor"
+        ]
+      ]
+    },
+    {
+      "name": "D-11: rozbieznosc nastepcy ustapila (zrodlo bez ISSUED) => STALE zamknij DW-15-281",
+      "observations": [
+        {
+          "route": "captured-path",
+          "producer": "src/workflows/entitlements/issue-entitlement.ts",
+          "purchase_mode": "gift",
+          "genesis_state": "ACTIVE",
+          "not_applicable_reason": null
+        },
+        {
+          "route": "lost-code-reissue",
+          "producer": "src/modules/voucher/workflows/reissue-lost-code.ts",
+          "purchase_mode": "gift",
+          "genesis_state": "ACTIVE",
+          "not_applicable_reason": "zrodlo ACTIVE wyklucza ISSUED"
+        },
+        {
+          "route": "retention-issue",
+          "producer": "src/modules/voucher/workflows/issue-retention.ts",
+          "purchase_mode": "gift",
+          "genesis_state": "ACTIVE",
+          "not_applicable_reason": null
+        }
+      ],
+      "allowlist": [
+        {
+          "route": "captured-path",
+          "producer": "src/workflows/entitlements/issue-entitlement.ts",
+          "refs": [
+            "DW-15-210",
+            "DW-15-271"
+          ]
+        },
+        {
+          "route": "lost-code-reissue",
+          "producer": "src/modules/voucher/workflows/reissue-lost-code.ts",
+          "refs": [
+            "DW-15-281"
+          ]
+        },
+        {
+          "route": "retention-issue",
+          "producer": "src/modules/voucher/workflows/issue-retention.ts",
+          "refs": [
+            "DW-15-281"
+          ]
+        }
+      ],
+      "expected": [
+        [
+          "KNOWN-DIVERGENCE",
+          "captured-path"
+        ],
+        [
+          "PASS",
+          "lost-code-reissue"
+        ],
+        [
+          "KNOWN-DIVERGENCE",
+          "retention-issue"
+        ],
+        [
+          "FAIL",
+          "lost-code-reissue"
+        ]
+      ]
+    },
+    {
+      "name": "D-11: wpis nastepcy bez DW-15-281 => FAIL",
+      "observations": [
+        {
+          "route": "captured-path",
+          "producer": "src/workflows/entitlements/issue-entitlement.ts",
+          "purchase_mode": "gift",
+          "genesis_state": "ACTIVE",
+          "not_applicable_reason": null
+        },
+        {
+          "route": "lost-code-reissue",
+          "producer": "src/modules/voucher/workflows/reissue-lost-code.ts",
+          "purchase_mode": "gift",
+          "genesis_state": "ACTIVE",
+          "not_applicable_reason": null
+        }
+      ],
+      "allowlist": [
+        {
+          "route": "captured-path",
+          "producer": "src/workflows/entitlements/issue-entitlement.ts",
+          "refs": [
+            "DW-15-210",
+            "DW-15-271"
+          ]
+        },
+        {
+          "route": "lost-code-reissue",
+          "producer": "src/modules/voucher/workflows/reissue-lost-code.ts",
+          "refs": [
+            "DW-15-210"
+          ]
+        }
+      ],
+      "expected": [
+        [
+          "FAIL",
+          "(allowlista)"
+        ],
+        [
+          "KNOWN-DIVERGENCE",
+          "captured-path"
+        ],
+        [
+          "KNOWN-DIVERGENCE",
+          "lost-code-reissue"
         ]
       ]
     }

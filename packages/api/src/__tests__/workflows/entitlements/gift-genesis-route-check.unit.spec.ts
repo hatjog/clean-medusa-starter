@@ -10,11 +10,19 @@ import {
   checkGiftGenesis,
   type KnownDivergenceEntry,
   GIFT_GENESIS_KNOWN_DIVERGENCE,
+  KNOWN_DIVERGENCE_CLOSED_SET,
   type GenesisObservation,
 } from "../../../workflows/entitlements/gift-genesis-route-check"
 
 const CAPTURED = "src/workflows/entitlements/issue-entitlement.ts"
 const PATH_Y = "src/workflows/entitlements/live-issue-from-payment-intent.ts"
+const REISSUE = "src/modules/voucher/workflows/reissue-lost-code.ts"
+const RETENTION = "src/modules/voucher/workflows/issue-retention.ts"
+const NEW_SUCCESSOR = "src/modules/voucher/workflows/new-successor.ts"
+
+// Allowlista zawężona do captured-path: przypadki z jedną obserwacją nie mają
+// wtedy wierszy STALE od wpisów następców (D-11), które mają osobne testy.
+const CAPTURED_ONLY = GIFT_GENESIS_KNOWN_DIVERGENCE.filter((e) => e.route === "captured-path")
 
 const obs = (o: Partial<GenesisObservation>): GenesisObservation => ({
   route: "captured-path",
@@ -55,7 +63,7 @@ describe("Story 3.8 AC2 — gift + ACTIVE czerwieni z nazwą trasy", () => {
   })
 
   it("captured-path gift + ACTIVE ⇒ wiersz KNOWN-DIVERGENCE z trasą, DW-15-210 i DW-15-271 (nie wyciszenie)", () => {
-    const r = checkGiftGenesis([obs({})])
+    const r = checkGiftGenesis([obs({})], CAPTURED_ONLY)
     expect(r.ok).toBe(true)
     const row = r.rows.find((x) => x.verdict === "KNOWN-DIVERGENCE")
     expect(row).toBeDefined()
@@ -64,17 +72,69 @@ describe("Story 3.8 AC2 — gift + ACTIVE czerwieni z nazwą trasy", () => {
     expect(row!.line).toContain("DW-15-271")
   })
 
-  it("allowlista zawiera DOKŁADNIE jedną trasę: captured-path", () => {
-    expect(GIFT_GENESIS_KNOWN_DIVERGENCE).toHaveLength(1)
-    expect(GIFT_GENESIS_KNOWN_DIVERGENCE[0].route).toBe("captured-path")
-    expect(GIFT_GENESIS_KNOWN_DIVERGENCE[0].producer).toBe(CAPTURED)
+  it("D-11: allowlista == zamknięty zbiór DOKŁADNIE trzech tras po nazwie i pliku", () => {
+    expect(GIFT_GENESIS_KNOWN_DIVERGENCE.map((e) => [e.route, e.producer, [...e.refs]])).toEqual([
+      ["captured-path", CAPTURED, ["DW-15-210", "DW-15-271"]],
+      ["lost-code-reissue", REISSUE, ["DW-15-281"]],
+      ["retention-issue", RETENTION, ["DW-15-281"]],
+    ])
+    expect(Object.keys(KNOWN_DIVERGENCE_CLOSED_SET).sort()).toEqual([
+      "captured-path",
+      "lost-code-reissue",
+      "retention-issue",
+    ])
+  })
+
+  it("D-11: następcy gift + ACTIVE ⇒ KNOWN-DIVERGENCE z DW-15-281, rc ok", () => {
+    const r = checkGiftGenesis([
+      obs({}),
+      obs({ route: "lost-code-reissue", producer: REISSUE }),
+      obs({ route: "retention-issue", producer: RETENTION }),
+    ])
+    expect(r.ok).toBe(true)
+    const kd = r.rows.filter((x) => x.verdict === "KNOWN-DIVERGENCE")
+    expect(kd.map((x) => x.route)).toEqual(["captured-path", "lost-code-reissue", "retention-issue"])
+    expect(kd[1].line).toContain("refs=DW-15-281")
+  })
+
+  it("D-11: NOWA trasa następcy gift + ACTIVE ⇒ FAIL (D-1)", () => {
+    const r = checkGiftGenesis([
+      obs({}),
+      obs({ route: "lost-code-reissue", producer: REISSUE }),
+      obs({ route: "retention-issue", producer: RETENTION }),
+      obs({ route: "new-successor", producer: NEW_SUCCESSOR }),
+    ])
+    expect(r.ok).toBe(false)
+    expect(r.rows.filter((x) => x.verdict === "FAIL").map((x) => x.route)).toEqual(["new-successor"])
+  })
+
+  it("D-11 mutant: wpis-wzorzec w allowliście nie dopuszcza nowej trasy ⇒ FAIL", () => {
+    const r = checkGiftGenesis(
+      [obs({}), obs({ route: "new-successor", producer: NEW_SUCCESSOR })],
+      [...GIFT_GENESIS_KNOWN_DIVERGENCE, { route: "*", producer: "*", refs: ["DW-15-210", "DW-15-271", "DW-15-281"] }]
+    )
+    expect(r.ok).toBe(false)
+    expect(r.rows.some((x) => x.verdict === "KNOWN-DIVERGENCE" && x.route === "new-successor")).toBe(false)
+    expect(r.rows.some((x) => x.line.includes("spoza zamkniętego zbioru"))).toBe(true)
+  })
+
+  it("D-11: rozbieżność następcy ustąpiła ⇒ sygnał „zamknij DW-15-281”", () => {
+    const r = checkGiftGenesis([
+      obs({}),
+      obs({ route: "lost-code-reissue", producer: REISSUE, genesis_state: "ISSUED" }),
+      obs({ route: "retention-issue", producer: RETENTION }),
+    ])
+    expect(r.ok).toBe(false)
+    const stale = r.rows.find((x) => x.line.includes("STALE"))
+    expect(stale?.route).toBe("lost-code-reissue")
+    expect(stale?.line).toContain("rozbieżność ustąpiła — zamknij DW-15-281")
   })
 
   it("mutant: gift + ACTIVE na INNEJ trasie (przy zachowanej allowliście) ⇒ FAIL", () => {
     const r = checkGiftGenesis([
       obs({}),
       obs({ route: "path-y-live-issue", producer: PATH_Y }),
-    ])
+    ], CAPTURED_ONLY)
     expect(r.ok).toBe(false)
     expect(r.rows.filter((x) => x.verdict === "FAIL").map((x) => x.route)).toEqual([
       "path-y-live-issue",
@@ -93,7 +153,7 @@ describe("Story 3.8 AC2 — gift + ACTIVE czerwieni z nazwą trasy", () => {
     expect(r.rows.some((x) => x.verdict === "FAIL" && x.route === "captured-path")).toBe(true)
   })
 
-  it("mutant: druga trasa dopisana do allowlisty ⇒ FAIL (liczność ≠ 1)", () => {
+  it("mutant: trasa spoza zamkniętego zbioru dopisana do allowlisty ⇒ FAIL", () => {
     const r = checkGiftGenesis(
       [obs({}), obs({ route: "path-y-live-issue", producer: PATH_Y })],
       [
@@ -121,7 +181,7 @@ describe("Story 3.8 AC2 — gift + ACTIVE czerwieni z nazwą trasy", () => {
     const r = checkGiftGenesis([
       obs({}),
       obs({ route: "path-y-live-issue", producer: PATH_Y, purchase_mode: "self" }),
-    ])
+    ], CAPTURED_ONLY)
     expect(r.ok).toBe(true)
   })
 
@@ -136,7 +196,7 @@ describe("Story 3.8 AC2 — gift + ACTIVE czerwieni z nazwą trasy", () => {
   // Poza super-repo (samodzielny checkout submodułu) bramki Pythona nie ma —
   // wtedy test jest jawnie pominięty z nazwą, nie zielony.
   const realIt = existsSync(VALIDATOR) ? it : it.skip
-  realIt("realne źródło: werdykty TS == werdykty bramki Pythona; KNOWN-DIVERGENCE tylko captured-path", () => {
+  realIt("realne źródło: werdykty TS == werdykty bramki Pythona; KNOWN-DIVERGENCE dokładnie 3 trasy (D-11)", () => {
     let out: string
     try {
       out = execFileSync("python3", [VALIDATOR, "--root", REPO_ROOT, "--json"], { encoding: "utf8" })
@@ -147,6 +207,7 @@ describe("Story 3.8 AC2 — gift + ACTIVE czerwieni z nazwą trasy", () => {
     const py = JSON.parse(out) as {
       observations: GenesisObservation[]
       allowlist: KnownDivergenceEntry[]
+      closed_set: unknown
       rows: { verdict: string; route: string }[]
     }
     expect(py.observations.length).toBeGreaterThanOrEqual(2)
@@ -157,9 +218,13 @@ describe("Story 3.8 AC2 — gift + ACTIVE czerwieni z nazwą trasy", () => {
     expect(ts.rows.map((x) => [x.verdict, x.route])).toEqual(
       py.rows.map((x) => [x.verdict, x.route])
     )
-    expect(ts.rows.filter((x) => x.verdict === "KNOWN-DIVERGENCE").map((x) => x.route)).toEqual([
-      "captured-path",
-    ])
+    expect(py.closed_set).toEqual(
+      JSON.parse(JSON.stringify(KNOWN_DIVERGENCE_CLOSED_SET))
+    )
+    expect(ts.ok).toBe(true)
+    expect(
+      ts.rows.filter((x) => x.verdict === "KNOWN-DIVERGENCE").map((x) => x.route).sort()
+    ).toEqual(["captured-path", "lost-code-reissue", "retention-issue"])
     const pathY = py.observations.find((o) => o.route === "path-y-live-issue")
     expect(pathY?.genesis_state).toBe("ISSUED")
     // Wyjście kontroli — widoczne w logu przebiegu (evidence).

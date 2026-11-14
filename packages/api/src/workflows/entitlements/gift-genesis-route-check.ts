@@ -3,7 +3,9 @@
  *
  * Kontrola RAPORTUJĄCA, NAZWANA (decyzja PO D-1, decisions-2026-11-14.md):
  * zakup prezentowy (`purchase_mode = gift`) zakończony genezą `ACTIVE` jest
- * czerwienią z nazwą trasy. Dokładnie JEDNA znana trasa (captured-path,
+ * czerwienią z nazwą trasy. D-11 dopisuje do zbioru znanych tras dwie trasy
+ * następców (lost-code-reissue, retention-issue; DW-15-281, v1.17.0).
+ * Pierwotnie JEDNA znana trasa (captured-path,
  * `payment.captured` → `issue-entitlement.ts`) daje zamiast tego wiersz
  * KNOWN-DIVERGENCE z odwołaniem do DW-15-210 (pomiar v1.16.0) i DW-15-271
  * (ujednolicenie genezy w v1.17.0). Wiersz jest WYJŚCIEM kontroli, nie
@@ -49,10 +51,47 @@ export const GIFT_GENESIS_KNOWN_DIVERGENCE: readonly KnownDivergenceEntry[] = [
     producer: "src/workflows/entitlements/issue-entitlement.ts",
     refs: ["DW-15-210", "DW-15-271"],
   },
+  {
+    route: "lost-code-reissue",
+    producer: "src/modules/voucher/workflows/reissue-lost-code.ts",
+    refs: ["DW-15-281"],
+  },
+  {
+    route: "retention-issue",
+    producer: "src/modules/voucher/workflows/issue-retention.ts",
+    refs: ["DW-15-281"],
+  },
 ]
 // GIFT_GENESIS_KNOWN_DIVERGENCE:END
 
 export const REQUIRED_DIVERGENCE_REFS = ["DW-15-210", "DW-15-271"] as const
+
+/**
+ * Decyzja PO D-11 (decisions-2026-11-14.md, zastępuje D-8): trasy następców
+ * lost-code-reissue i retention-issue dostają nazwany KNOWN-DIVERGENCE z
+ * DW-15-281 (naprawa v1.17.0). Zbiór ZAMKNIĘTY: wpis allowlisty spoza niego
+ * (inna trasa, wzorzec, inny plik producenta) = FAIL. Lustro
+ * `KNOWN_DIVERGENCE_CLOSED_SET` bramki Pythona (parytet przez `--json`).
+ */
+export const KNOWN_DIVERGENCE_CLOSED_SET: Readonly<
+  Record<string, { producer: string; refs: readonly string[]; close: string }>
+> = {
+  "captured-path": {
+    producer: "src/workflows/entitlements/issue-entitlement.ts",
+    refs: ["DW-15-210", "DW-15-271"],
+    close: "DW-15-271",
+  },
+  "lost-code-reissue": {
+    producer: "src/modules/voucher/workflows/reissue-lost-code.ts",
+    refs: ["DW-15-281"],
+    close: "DW-15-281",
+  },
+  "retention-issue": {
+    producer: "src/modules/voucher/workflows/issue-retention.ts",
+    refs: ["DW-15-281"],
+    close: "DW-15-281",
+  },
+}
 
 export type GiftGenesisVerdict = "PASS" | "KNOWN-DIVERGENCE" | "FAIL"
 
@@ -71,19 +110,31 @@ export type GiftGenesisReport = {
 const ACTIVE = "ACTIVE"
 
 function allowlistProblems(
-  allowlist: readonly KnownDivergenceEntry[]
+  allowlist: readonly KnownDivergenceEntry[],
+  admitted: KnownDivergenceEntry[]
 ): string[] {
   const problems: string[] = []
-  if (allowlist.length !== 1) {
-    problems.push(
-      `allowlista KNOWN-DIVERGENCE musi zawierać DOKŁADNIE jedną trasę, ma ${allowlist.length}`
-    )
-  }
+  const seen = new Set<string>()
+  const known = Object.keys(KNOWN_DIVERGENCE_CLOSED_SET).sort().join(", ")
   for (const e of allowlist) {
-    const missing = REQUIRED_DIVERGENCE_REFS.filter((r) => !e.refs.includes(r))
+    const spec = Object.prototype.hasOwnProperty.call(KNOWN_DIVERGENCE_CLOSED_SET, e.route)
+      ? KNOWN_DIVERGENCE_CLOSED_SET[e.route]
+      : undefined
+    if (!spec || spec.producer !== e.producer) {
+      problems.push(
+        `wpis route=${e.route} producer=${e.producer} spoza zamkniętego zbioru KNOWN-DIVERGENCE (${known}; D-1/D-11)`
+      )
+      continue
+    }
+    admitted.push(e)
+    if (seen.has(e.route)) {
+      problems.push(`zdublowany wpis route=${e.route}`)
+    }
+    seen.add(e.route)
+    const missing = spec.refs.filter((r) => !e.refs.includes(r))
     if (missing.length) {
       problems.push(
-        `wpis allowlisty ${e.route} nie odsyła do ${missing.join(", ")}`
+        `wpis ${e.route} nie odsyła do ${missing.join(", ")}`
       )
     }
   }
@@ -101,7 +152,9 @@ function allowlistProblems(
  *  - gift w stanie innym niż ACTIVE → PASS;
  *  - wpis allowlisty bez obserwacji gift+ACTIVE → FAIL (STALE: naprawa weszła,
  *    wpis trzeba usunąć — inaczej allowlista przeżyje swój powód);
- *  - allowlista o liczności ≠ 1 albo bez DW-15-210/DW-15-271 → FAIL.
+ *  - wpis allowlisty spoza zamkniętego zbioru `KNOWN_DIVERGENCE_CLOSED_SET`
+ *    (D-11: captured-path, lost-code-reissue, retention-issue), zdublowany albo
+ *    bez wymaganych odesłań → FAIL.
  */
 export function checkGiftGenesis(
   observations: readonly GenesisObservation[],
@@ -109,7 +162,9 @@ export function checkGiftGenesis(
 ): GiftGenesisReport {
   const rows: GiftGenesisRow[] = []
 
-  for (const p of allowlistProblems(allowlist)) {
+  // Wpis spoza zamkniętego zbioru NIE daje KNOWN-DIVERGENCE (D-11).
+  const admitted: KnownDivergenceEntry[] = []
+  for (const p of allowlistProblems(allowlist, admitted)) {
     rows.push({ verdict: "FAIL", route: "(allowlista)", producer: "-", line: `FAIL allowlista: ${p}` })
   }
 
@@ -145,7 +200,7 @@ export function checkGiftGenesis(
       })
       continue
     }
-    const entry = allowlist.find(
+    const entry = admitted.find(
       (e) => e.route === o.route && e.producer === o.producer
     )
     if (entry) {
@@ -170,15 +225,16 @@ export function checkGiftGenesis(
     }
   }
 
-  for (const e of allowlist) {
+  for (const e of admitted) {
     if (!usedAllowlist.has(e)) {
+      const close = KNOWN_DIVERGENCE_CLOSED_SET[e.route]?.close ?? "DW"
       rows.push({
         verdict: "FAIL",
         route: e.route,
         producer: e.producer,
         line:
-          `FAIL STALE route=${e.route} producer=${e.producer}: wpis KNOWN-DIVERGENCE bez obserwacji ` +
-          `gift+ACTIVE — usuń wpis (refs=${e.refs.join(",")})`,
+          `FAIL STALE route=${e.route} producer=${e.producer}: rozbieżność ustąpiła — zamknij ${close} ` +
+          `i usuń wpis KNOWN-DIVERGENCE (brak obserwacji gift+ACTIVE)`,
       })
     }
   }
