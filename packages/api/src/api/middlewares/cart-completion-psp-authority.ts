@@ -38,6 +38,18 @@
  *
  * Carts without a Stripe payment session are untouched (other providers keep
  * their existing path).
+ *
+ * Fix round 2 (checkpoint 8.2): the fence connection is a long-idle socket
+ * for the whole saga. It now gets an `'error'` listener BEFORE `connect()`
+ * (a server-side session end — PG restart/failover, `pg_terminate_backend`,
+ * TCP reset — would otherwise be an unhandled `'error'` event that kills the
+ * Medusa process): the loss is logged as `gp.cart_complete.fence_connection_lost`,
+ * the connection is marked destroyed and `releaseAll` never throws. The
+ * order/Stripe-session pre-checks run on a short borrow from `PG_CONNECTION`
+ * (returned before the saga starts), so a fence connection is opened only for
+ * carts with a Stripe session; it has `connectionTimeoutMillis` and a ceiling
+ * on concurrent fence connections (`gp.cart_complete.fence_saturated`,
+ * `503 completion_fence_saturated`).
  */
 import type { MedusaRequest, MedusaResponse } from "@medusajs/framework/http"
 
@@ -63,6 +75,7 @@ export type PspAuthorityRefusal =
   | "psp_status_unavailable"
   | "completion_in_progress"
   | "psp_authority_unavailable"
+  | "completion_fence_saturated"
 
 type QueryClient = {
   query: (
@@ -75,7 +88,16 @@ export type PspAuthorityConnection = {
   client: QueryClient
   /** `destroy: true` = the session may still hold the lock; never reuse it. */
   release: (opts?: { destroy?: boolean }) => void | Promise<void>
+  /** True once the server ended the session (the lock is gone with it). */
+  lost?: () => boolean
 }
+
+/** Short read on a connection returned immediately (not held over the saga). */
+export type PspAuthorityReadQuery = (
+  scope: MedusaRequest["scope"],
+  sql: string,
+  params: ReadonlyArray<unknown>
+) => Promise<Array<Record<string, unknown>>>
 
 type LoggerLike = { error?: (msg: string) => void; warn?: (msg: string) => void }
 
@@ -86,6 +108,8 @@ export type PspAuthorityDeps = {
     paymentIntentId: string
     marketId: string | null
   }) => Promise<string>
+  /** Pre-check reads (existing order, Stripe sessions); default: PG_CONNECTION borrow. */
+  readQuery?: PspAuthorityReadQuery
   /** Ceiling for a fence whose client disconnected before the handler ended. */
   orphanLockCeilingMs?: number
 }
@@ -100,6 +124,22 @@ export const UNLOCK_SQL = "SELECT pg_advisory_unlock(hashtextextended($1, 0)) AS
 /** Named log events of the fence lifecycle. */
 export const PSP_AUTHORITY_UNLOCK_FAILED = "gp.cart_complete.unlock_failed"
 export const PSP_AUTHORITY_ORPHAN_CEILING = "gp.cart_complete.orphan_lock_ceiling"
+export const PSP_AUTHORITY_FENCE_CONNECTION_LOST = "gp.cart_complete.fence_connection_lost"
+export const PSP_AUTHORITY_FENCE_SATURATED = "gp.cart_complete.fence_saturated"
+
+/** `application_name` of fence sessions (visible in `pg_stat_activity`). */
+export const FENCE_APPLICATION_NAME = "gp_cart_complete_fence"
+/** Default ceiling of concurrent fence connections per process. */
+export const DEFAULT_FENCE_MAX_CONNECTIONS = 20
+export const DEFAULT_FENCE_CONNECT_TIMEOUT_MS = 5000
+
+/** Thrown by a fence acquirer whose ceiling is reached; mapped to a named 503. */
+export class FenceSaturatedError extends Error {
+  constructor(readonly max: number) {
+    super(`${PSP_AUTHORITY_FENCE_SATURATED}: ${max} concurrent fence connections in use`)
+    this.name = "FenceSaturatedError"
+  }
+}
 
 /** Default ceiling (ms) after a client disconnect; saga normally ends far earlier. */
 export const DEFAULT_ORPHAN_LOCK_CEILING_MS = 10 * 60 * 1000
@@ -162,37 +202,136 @@ export function resolveFenceDatabaseUrl(scope: MedusaRequest["scope"]): string |
  * Dedicated connection OUTSIDE the saga pool. One short-lived `pg.Client`
  * per completion: it cannot starve `PG_CONNECTION`, and ending it always
  * drops any session lock with it (so `destroy` and normal release coincide).
+ * The `'error'` listener is attached BEFORE `connect()`: an idle client whose
+ * session the server ends emits `'error'`, and without a listener Node turns
+ * it into an uncaught exception that kills the process.
  */
 export async function openDedicatedPgConnection(
-  connectionString: string
+  connectionString: string,
+  opts: {
+    logger?: LoggerLike
+    label?: string
+    connectionTimeoutMillis?: number
+  } = {}
 ): Promise<PspAuthorityConnection> {
-  const client = new PgClient({ connectionString })
-  await client.connect()
+  const client = new PgClient({
+    connectionString,
+    connectionTimeoutMillis: opts.connectionTimeoutMillis ?? DEFAULT_FENCE_CONNECT_TIMEOUT_MS,
+    application_name: FENCE_APPLICATION_NAME,
+  })
   let ended = false
+  let lost = false
+  client.on("error", (err: unknown) => {
+    if (lost) return
+    lost = true
+    ;(opts.logger ?? console).error?.(
+      `${PSP_AUTHORITY_FENCE_CONNECTION_LOST}${opts.label ? ` ${opts.label}` : ""}: ${
+        err instanceof Error ? err.message : String(err)
+      } — fence session ended by the server, connection destroyed`
+    )
+  })
+  try {
+    await client.connect()
+  } catch (err) {
+    ended = true
+    await client.end().catch(() => undefined)
+    throw err
+  }
   return {
     client: client as unknown as QueryClient,
+    lost: () => lost,
     release: async () => {
       if (ended) return
       ended = true
-      await client.end().catch(() => {
-        // Ending a broken socket: PostgreSQL drops the session (and its locks).
-        client.removeAllListeners()
-      })
+      // A lost session has no lock left; `end()` on it only closes the socket.
+      await client.end().catch(() => undefined)
     },
   }
 }
 
-export async function defaultAcquireConnection(
-  scope: MedusaRequest["scope"]
-): Promise<PspAuthorityConnection | null> {
-  const url = resolveFenceDatabaseUrl(scope)
-  if (!url) return null
-  return openDedicatedPgConnection(url)
+/**
+ * Fence acquirer with a per-process ceiling of concurrent connections. The
+ * slot is returned when the connection is released (exactly once).
+ */
+export function createFenceAcquirer(
+  options: {
+    maxConnections?: number
+    connectionTimeoutMillis?: number
+  } = {}
+): PspAuthorityDeps["acquireConnection"] & { inUse: () => number } {
+  const max = options.maxConnections ?? DEFAULT_FENCE_MAX_CONNECTIONS
+  let inUse = 0
+  const acquire = async (scope: MedusaRequest["scope"]): Promise<PspAuthorityConnection | null> => {
+    const url = resolveFenceDatabaseUrl(scope)
+    if (!url) return null
+    if (inUse >= max) throw new FenceSaturatedError(max)
+    inUse++
+    let slotReturned = false
+    const returnSlot = () => {
+      if (slotReturned) return
+      slotReturned = true
+      inUse--
+    }
+    let conn: PspAuthorityConnection
+    try {
+      conn = await openDedicatedPgConnection(url, {
+        logger: resolveLogger(scope),
+        connectionTimeoutMillis: options.connectionTimeoutMillis,
+      })
+    } catch (err) {
+      returnSlot()
+      throw err
+    }
+    return {
+      ...conn,
+      release: async opts => {
+        try {
+          await conn.release(opts)
+        } finally {
+          returnSlot()
+        }
+      },
+    }
+  }
+  return Object.assign(acquire, { inUse: () => inUse })
+}
+
+function envPositiveInt(name: string): number | undefined {
+  const n = Number(process.env[name])
+  return Number.isInteger(n) && n > 0 ? n : undefined
+}
+
+export const defaultAcquireConnection = createFenceAcquirer({
+  maxConnections: envPositiveInt("GP_CART_COMPLETE_FENCE_MAX_CONNECTIONS"),
+  connectionTimeoutMillis: envPositiveInt("GP_CART_COMPLETE_FENCE_CONNECT_TIMEOUT_MS"),
+})
+
+/**
+ * Pre-check reads on a connection borrowed from `PG_CONNECTION` and returned
+ * at once (before `next()`), so the saga pool is never held across the saga.
+ */
+export const defaultReadQuery: PspAuthorityReadQuery = async (scope, sql, params) => {
+  const knex = (scope as unknown as { resolve: (k: string) => unknown }).resolve(
+    ContainerRegistrationKeys.PG_CONNECTION
+  ) as {
+    client: {
+      acquireConnection: () => Promise<QueryClient>
+      releaseConnection: (c: QueryClient) => unknown
+    }
+  }
+  const conn = await knex.client.acquireConnection()
+  try {
+    const r = await conn.query(sql, params)
+    return r.rows
+  } finally {
+    await knex.client.releaseConnection(conn)
+  }
 }
 
 const defaultDeps: PspAuthorityDeps = {
   acquireConnection: defaultAcquireConnection,
   retrievePaymentIntentStatus: defaultRetrievePaymentIntentStatus,
+  readQuery: defaultReadQuery,
 }
 
 function resolveLogger(scope: MedusaRequest["scope"]): LoggerLike {
@@ -214,6 +353,7 @@ function refuse(
 
 export function createCartCompletionPspAuthorityMiddleware(deps: PspAuthorityDeps = defaultDeps) {
   const ceilingMs = deps.orphanLockCeilingMs ?? DEFAULT_ORPHAN_LOCK_CEILING_MS
+  const readQuery = deps.readQuery ?? defaultReadQuery
   return async function cartCompletionPspAuthorityMiddleware(
     req: MedusaRequest,
     res: MedusaResponse,
@@ -225,10 +365,44 @@ export function createCartCompletionPspAuthorityMiddleware(deps: PspAuthorityDep
       return
     }
 
+    // Pre-checks on a short PG_CONNECTION borrow: no fence connection is
+    // opened for a completed cart or a cart without a Stripe session.
+    let intentIds: string[]
+    try {
+      const completed = await readQuery(req.scope, CART_HAS_ORDER_SQL, [cartId])
+      if (completed.length > 0) {
+        // Idempotent path: existing order, no PSP read, no fence.
+        next()
+        return
+      }
+      const sessions = await readQuery(req.scope, CART_STRIPE_PAYMENT_INTENTS_SQL, [cartId])
+      intentIds = sessions
+        .map(row => row.payment_intent_id)
+        .filter((id): id is string => typeof id === "string" && id.length > 0)
+    } catch (err) {
+      next(err)
+      return
+    }
+    if (intentIds.length === 0) {
+      // No Stripe session: other providers keep their path, no lock taken.
+      next()
+      return
+    }
+
     let handle: PspAuthorityConnection | null = null
     try {
       handle = await deps.acquireConnection(req.scope)
-    } catch {
+    } catch (err) {
+      if (err instanceof FenceSaturatedError) {
+        resolveLogger(req.scope).warn?.(`${PSP_AUTHORITY_FENCE_SATURATED} cart=${cartId}: ${err.message}`)
+        refuse(res, 503, "completion_fence_saturated", "Cart completion capacity exhausted, retry")
+        return
+      }
+      resolveLogger(req.scope).error?.(
+        `gp.cart_complete.fence_connect_failed cart=${cartId}: ${
+          err instanceof Error ? err.message : String(err)
+        }`
+      )
       handle = null
     }
     if (!handle) {
@@ -244,7 +418,10 @@ export function createCartCompletionPspAuthorityMiddleware(deps: PspAuthorityDep
       if (released) return
       released = true
       let destroy = false
-      if (locked) {
+      if (locked && conn.lost?.()) {
+        // Session ended by the server: the lock already went with it.
+        destroy = true
+      } else if (locked) {
         try {
           await conn.client.query(UNLOCK_SQL, [lockKey])
         } catch (err) {
@@ -268,24 +445,6 @@ export function createCartCompletionPspAuthorityMiddleware(deps: PspAuthorityDep
     }
 
     try {
-      const completed = await conn.client.query(CART_HAS_ORDER_SQL, [cartId])
-      if (completed.rows.length > 0) {
-        // Idempotent path: existing order, no PSP read, no fence.
-        await releaseAll()
-        next()
-        return
-      }
-      const sessions = await conn.client.query(CART_STRIPE_PAYMENT_INTENTS_SQL, [cartId])
-      const intentIds = sessions.rows
-        .map(row => row.payment_intent_id)
-        .filter((id): id is string => typeof id === "string" && id.length > 0)
-      if (intentIds.length === 0) {
-        // No Stripe session: other providers keep their path, no lock taken.
-        await releaseAll()
-        next()
-        return
-      }
-
       const lockRows = await conn.client.query(TRY_LOCK_SQL, [lockKey])
       locked = lockRows.rows[0]?.locked === true
       if (!locked) {

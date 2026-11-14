@@ -25,7 +25,11 @@ import { ContainerRegistrationKeys } from "@medusajs/framework/utils"
 import {
   createCartCompletionPspAuthorityMiddleware,
   defaultAcquireConnection,
+  createFenceAcquirer,
   CART_COMPLETE_LOCK_NAMESPACE,
+  FENCE_APPLICATION_NAME,
+  PSP_AUTHORITY_FENCE_CONNECTION_LOST,
+  PSP_AUTHORITY_FENCE_SATURATED,
   PSP_AUTHORITY_ORPHAN_CEILING,
   PSP_AUTHORITY_UNLOCK_FAILED,
   TRY_LOCK_SQL,
@@ -63,6 +67,9 @@ function makeRes(): Res {
 let client: Client
 let releases = 0
 
+const testReadQuery = async (_scope: unknown, sql: string, params: ReadonlyArray<unknown>) =>
+  (await client.query(sql, params as unknown[])).rows
+
 async function run(
   deps: Partial<PspAuthorityDeps>,
   cartId = CART
@@ -75,6 +82,7 @@ async function run(
       },
     }),
     retrievePaymentIntentStatus: async () => "succeeded",
+    readQuery: testReadQuery,
     ...deps,
   } as PspAuthorityDeps)
   const res = makeRes()
@@ -201,7 +209,9 @@ describe("Story 8.2 — autorytet PSP dla POST /store/carts/:id/complete (ADR-23
   })
 
   it("brak połączenia PG ⇒ 503 psp_authority_unavailable", async () => {
+    await seedStripeSession(CART, "pi_story82_noconn")
     const middleware = createCartCompletionPspAuthorityMiddleware({
+      readQuery: testReadQuery,
       acquireConnection: async () => null,
       retrievePaymentIntentStatus: async () => "succeeded",
     })
@@ -319,8 +329,9 @@ describe("Story 8.2 — autorytet PSP dla POST /store/carts/:id/complete (ADR-23
     }
   }
 
-  it("fix 1: koszyk BEZ sesji Stripe ⇒ przepuszczony bez zakładania blokady", async () => {
+  it("fix 1/fix 2: koszyk BEZ sesji Stripe ⇒ przepuszczony bez blokady i BEZ otwierania połączenia blokady", async () => {
     const issued: string[] = []
+    let acquired = 0
     const spy = {
       query: (sql: string, params?: ReadonlyArray<unknown>) => {
         issued.push(sql)
@@ -328,7 +339,11 @@ describe("Story 8.2 — autorytet PSP dla POST /store/carts/:id/complete (ADR-23
       },
     }
     const middleware = createCartCompletionPspAuthorityMiddleware({
-      acquireConnection: async () => ({ client: spy as never, release: () => void releases++ }),
+      readQuery: async (_s, sql, params) => (await spy.query(sql, params)).rows,
+      acquireConnection: async () => {
+        acquired++
+        return { client: spy as never, release: () => void releases++ }
+      },
       retrievePaymentIntentStatus: async () => "succeeded",
     })
     const res = makeRes()
@@ -338,7 +353,8 @@ describe("Story 8.2 — autorytet PSP dla POST /store/carts/:id/complete (ADR-23
     })
     expect(nextCalled).toBe(true)
     expect(issued).not.toContain(TRY_LOCK_SQL)
-    expect(releases).toBe(1)
+    expect(acquired).toBe(0)
+    expect(releases).toBe(0)
     expect(await lockIsFree("cart_story82_nostripe")).toBe(true)
   })
 
@@ -353,6 +369,7 @@ describe("Story 8.2 — autorytet PSP dla POST /store/carts/:id/complete (ADR-23
           : client.query(sql, params as unknown[]),
     }
     const middleware = createCartCompletionPspAuthorityMiddleware({
+      readQuery: testReadQuery,
       acquireConnection: async () => ({
         client: failingUnlock as never,
         release: opts => void releaseCalls.push(opts),
@@ -396,6 +413,7 @@ describe("Story 8.2 — autorytet PSP dla POST /store/carts/:id/complete (ADR-23
     await seedStripeSession(CART, "pi_story82_ceiling")
     const warns: string[] = []
     const middleware = createCartCompletionPspAuthorityMiddleware({
+      readQuery: testReadQuery,
       acquireConnection: async () => ({ client: client as never, release: () => void releases++ }),
       retrievePaymentIntentStatus: async () => "succeeded",
       orphanLockCeilingMs: 100,
@@ -494,6 +512,110 @@ describe("Story 8.2 fix 1 — blokada NIE pochodzi z puli sagi (PG_CONNECTION)",
     }
     expect(await lockIsFreeOn(admin, "cart_pool_a")).toBe(true)
     expect(await lockIsFreeOn(admin, "cart_pool_b")).toBe(true)
+  })
+})
+
+describe("Story 8.2 fix 2 — zerwanie sesji blokady i sufit połączeń", () => {
+  let admin: Client
+  const LOST_CART = "cart_story82_lost"
+
+  beforeAll(async () => {
+    admin = new Client({ connectionString: DATABASE_URL })
+    await admin.connect()
+  })
+  afterAll(async () => {
+    await admin?.end()
+  })
+
+  function scopeWith(logs: string[]) {
+    const log = (m: string) => void logs.push(m)
+    return {
+      resolve: (k: string) => {
+        if (k === ContainerRegistrationKeys.CONFIG_MODULE) return { projectConfig: { databaseUrl: DATABASE_URL } }
+        if (k === "logger") return { error: log, warn: log }
+        throw new Error(`unregistered ${k}`)
+      },
+    }
+  }
+
+  it("realne pg_terminate_backend sesji blokady ⇒ proces żyje, nazwany log, releaseAll nie rzuca", async () => {
+    await seedStripeSession(LOST_CART, "pi_story82_lost")
+    const logs: string[] = []
+    const acquire = createFenceAcquirer({ maxConnections: 2 })
+    const middleware = createCartCompletionPspAuthorityMiddleware({
+      readQuery: testReadQuery,
+      acquireConnection: acquire,
+      retrievePaymentIntentStatus: async () => "succeeded",
+    })
+    const res = makeRes()
+    let nextCalled = false
+    await middleware({ params: { id: LOST_CART }, scope: scopeWith(logs) } as never, res as never, () => {
+      nextCalled = true
+    })
+    expect(nextCalled).toBe(true)
+    expect(acquire.inUse()).toBe(1)
+    const pids = await admin.query(
+      "SELECT pid FROM pg_stat_activity WHERE application_name = $1 AND pid <> pg_backend_pid()",
+      [FENCE_APPLICATION_NAME]
+    )
+    expect(pids.rows).toHaveLength(1)
+    const uncaught: unknown[] = []
+    const onUncaught = (e: unknown) => void uncaught.push(e)
+    process.prependListener("uncaughtException", onUncaught)
+    try {
+      await admin.query("SELECT pg_terminate_backend($1)", [pids.rows[0].pid])
+      await new Promise(r => setTimeout(r, 300))
+    } finally {
+      process.removeListener("uncaughtException", onUncaught)
+    }
+    expect(uncaught).toEqual([])
+    expect(logs.some(m => m.startsWith(PSP_AUTHORITY_FENCE_CONNECTION_LOST))).toBe(true)
+    // Blokada odeszła razem z sesją (NFR-4: nazwane, nie ciche).
+    expect(await lockIsFreeOn(admin, LOST_CART)).toBe(true)
+    // Handler kończy odpowiedź: releaseAll nie rzuca i zwraca slot sufitu.
+    expect(() => res.end()).not.toThrow()
+    res.emit("finish")
+    await new Promise(r => setTimeout(r, 100))
+    expect(acquire.inUse()).toBe(0)
+  })
+
+  it("przekroczenie sufitu połączeń blokady ⇒ 503 completion_fence_saturated + nazwany log", async () => {
+    await seedStripeSession("cart_story82_cap_a", "pi_story82_cap_a")
+    await seedStripeSession("cart_story82_cap_b", "pi_story82_cap_b")
+    const logs: string[] = []
+    const acquire = createFenceAcquirer({ maxConnections: 1 })
+    const middleware = createCartCompletionPspAuthorityMiddleware({
+      readQuery: testReadQuery,
+      acquireConnection: acquire,
+      retrievePaymentIntentStatus: async () => "succeeded",
+    })
+    const scope = scopeWith(logs)
+    const resA = makeRes()
+    let passedA = false
+    await middleware({ params: { id: "cart_story82_cap_a" }, scope } as never, resA as never, () => {
+      passedA = true
+    })
+    expect(passedA).toBe(true)
+    const resB = makeRes()
+    let passedB = false
+    await middleware({ params: { id: "cart_story82_cap_b" }, scope } as never, resB as never, () => {
+      passedB = true
+    })
+    expect(passedB).toBe(false)
+    expect(resB.statusCode).toBe(503)
+    expect(resB.body?.type).toBe("completion_fence_saturated")
+    expect(logs.some(m => m.startsWith(PSP_AUTHORITY_FENCE_SATURATED))).toBe(true)
+    resA.emit("finish")
+    await new Promise(r => setTimeout(r, 100))
+    expect(acquire.inUse()).toBe(0)
+    const resC = makeRes()
+    let passedC = false
+    await middleware({ params: { id: "cart_story82_cap_b" }, scope } as never, resC as never, () => {
+      passedC = true
+    })
+    expect(passedC).toBe(true)
+    resC.emit("finish")
+    await new Promise(r => setTimeout(r, 100))
   })
 })
 
