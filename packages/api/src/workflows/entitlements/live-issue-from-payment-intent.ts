@@ -20,6 +20,12 @@ import {
 } from "../../modules/voucher/vat-resolver"
 import { VoucherPostingInvariantError } from "../../modules/voucher/posting-profile"
 import { readDatabaseMinorIntegerStrict } from "../../lib/payment/numeric-minor"
+import {
+  hasProductVoucherIntent,
+  hasVoucherIntent,
+  isSupportedVoucherLineQuantity,
+  VOUCHER_LINE_QUANTITY_ISSUE_REASON,
+} from "../../lib/payment/voucher-line-quantity"
 
 /**
  * live-issue-from-payment-intent.ts — Story 3.3 (v1.11.0 Epic 3) — RDZEŃ live-issue
@@ -596,9 +602,9 @@ async function issueOrderLine(
     // wystawić JEDNO uprawnienie za N opłaconych sztuk. Story nie dodaje obsługi
     // quantity>1 (AC2); `order_item.quantity` jest NOT NULL w Medusa — brak
     // kolumny w wierszu (lustro testowe bez kolumny) nie jest wartością ≠1.
-    if (line.line_quantity !== undefined && readDatabaseNumber(line.line_quantity) !== 1) {
+    if (line.line_quantity !== undefined && !isSupportedVoucherLineQuantity(line.line_quantity)) {
       throw new LineIssueError(
-        "quantity_per_line_unsupported",
+        VOUCHER_LINE_QUANTITY_ISSUE_REASON,
         line.line_item_id,
         `liveIssueEntitlementsWithinTx: linia voucherowa ${line.line_item_id} ` +
           `(order ${payload.order_id}, payment_intent ${payload.payment_intent_id}) ma ` +
@@ -682,30 +688,8 @@ async function issueOrderLine(
  * (fail-loud), nie legalne pominięcie. Linia bez żadnego markera = faktyczny
  * non-voucher SKU (pomijana cicho — poprawnie).
  */
-const VOUCHER_INTENT_KEYS = [
-  "entitlement_profile",
-  "entitlement_profile_id",
-  "profile_id",
-  "entitlement_type",
-  "entitlement_policy",
-  "recipients",
-] as const
-
-function hasVoucherIntent(
-  metadata: Record<string, unknown> | null | undefined
-): boolean {
-  if (!metadata || typeof metadata !== "object") return false
-  return VOUCHER_INTENT_KEYS.some(
-    (k) => (metadata as Record<string, unknown>)[k] != null
-  )
-}
-
-function hasProductVoucherIntent(
-  metadata: Record<string, unknown> | null | undefined
-): boolean {
-  const gp = readObject(metadata?.gp)
-  return gp?.entitlement_profile != null
-}
+// Story 3.3 AC2 runda fix 2: kryterium i reguła krotności są wspólne z trasami
+// koszyka i wystawcą captured (`lib/payment/voucher-line-quantity`).
 
 /**
  * Walidacja typu entitlementu względem taksonomii (L4). Nieznany (poza enumem

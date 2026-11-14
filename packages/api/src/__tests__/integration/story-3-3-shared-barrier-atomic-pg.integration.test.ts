@@ -38,6 +38,11 @@ import {
   liveIssueEntitlementsPerLineWithinTx,
   liveIssueEntitlementsWithinTx,
 } from "../../workflows/entitlements/live-issue-from-payment-intent"
+import {
+  issueEntitlementsForAllLineItems,
+  VoucherIssuanceBlockedError,
+  VoucherLineQuantityUnsupportedError,
+} from "../../workflows/entitlements/issue-entitlement"
 
 const DATABASE_URL = process.env.DATABASE_URL
 const enabled = !!DATABASE_URL
@@ -415,6 +420,65 @@ describeOrNotRun("Story 3.3 — wspólna bariera skutku na realnym PostgreSQL", 
         [line, "quantity_per_line_unsupported"],
       ])
       expect(await countFor(a, pi, order)).toEqual({ entitlements: 0, barrier: 0, markers: 0 })
+    } finally {
+      await a.query("ROLLBACK")
+    }
+  })
+
+  it("AC2 (runda fix 2): trasa captured (issueEntitlementsForAllLineItems) z pozycją quantity=2 ⇒ ten sam fail-loud co Path Y, 0 uprawnień", async () => {
+    const order = "order_3_3_cap_q2"
+    const line = "li_3_3_cap_q2"
+    const capturedInput = {
+      event_id: "evt_3_3_cap_q2",
+      order_id: order,
+      payment_intent_id: `${PREFIX}cap_q2`,
+      market_id: SCOPE.market_id,
+      amount_minor: 30000,
+      currency: "PLN",
+      entitlement_profile: null,
+    }
+    await a.query("BEGIN")
+    try {
+      await seedLiveIssueFixture(a, { order, line, quantity: 2 })
+      // wariant A: voucher rozpoznany po profilu produktu (metadane linii puste)
+      // wariant B: marker entitlement w metadanych linii (kryterium ścieżki captured)
+      for (const variant of ["product_profile", "line_marker"] as const) {
+        if (variant === "line_marker") {
+          await a.query(`UPDATE order_line_item SET metadata = $2::jsonb WHERE id = $1`, [
+            line,
+            JSON.stringify({
+              entitlement_profile: {
+                profile_id: "voucher-rezerwacja-otwarta",
+                entitlement_type: "VOUCHER_SERVICE",
+                currency: "PLN",
+                policy: { validity_months: 12, vat_rate_uniqueness: true },
+              },
+            }),
+          ])
+        }
+        await a.query("SAVEPOINT cap")
+        let caught: unknown
+        try {
+          await issueEntitlementsForAllLineItems(a as never, capturedInput as never, new Date())
+        } catch (err) {
+          caught = err
+        }
+        expect({ variant, cls: (caught as Error | undefined)?.name }).toEqual({
+          variant,
+          cls: "VoucherLineQuantityUnsupportedError",
+        })
+        expect(caught).toBeInstanceOf(VoucherLineQuantityUnsupportedError)
+        // rodzina obsługiwana przez obu wołających (stripe-payment-audit, on-order-placed-stripe-retry)
+        expect(caught).toBeInstanceOf(VoucherIssuanceBlockedError)
+        expect((caught as VoucherIssuanceBlockedError).reason).toBe("quantity_per_line_unsupported")
+        expect((caught as VoucherIssuanceBlockedError).line_item_id).toBe(line)
+        await a.query("ROLLBACK TO SAVEPOINT cap")
+        expect(await countFor(a, capturedInput.payment_intent_id, order)).toEqual({
+          entitlements: 0,
+          barrier: 0,
+          markers: 0,
+        })
+      }
     } finally {
       await a.query("ROLLBACK")
     }
