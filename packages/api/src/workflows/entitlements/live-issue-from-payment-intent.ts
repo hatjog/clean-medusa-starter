@@ -8,10 +8,8 @@ import {
   snapshotPolicy,
   type EntitlementPolicySnapshot,
 } from "../../modules/voucher/models/entitlement"
-import {
-  buildEventProcessedDedupeInsert,
-  EVENT_PROCESSED_TABLE,
-} from "../../modules/voucher/models/event-processed"
+import { EVENT_PROCESSED_TABLE } from "../../modules/voucher/models/event-processed"
+import { buildOwedUnitEffectBarrierInsert } from "../../lib/payment/owed-unit-effect-barrier"
 import {
   buildEntitlementDedupeKey,
   ENTITLEMENT_DEDUPE_ON_CONFLICT_CLAUSE,
@@ -22,6 +20,12 @@ import {
 } from "../../modules/voucher/vat-resolver"
 import { VoucherPostingInvariantError } from "../../modules/voucher/posting-profile"
 import { readDatabaseMinorIntegerStrict } from "../../lib/payment/numeric-minor"
+import {
+  hasProductVoucherIntent,
+  hasVoucherIntent,
+  isSupportedVoucherLineQuantity,
+  VOUCHER_LINE_QUANTITY_ISSUE_REASON,
+} from "../../lib/payment/voucher-line-quantity"
 
 /**
  * live-issue-from-payment-intent.ts — Story 3.3 (v1.11.0 Epic 3) — RDZEŃ live-issue
@@ -139,6 +143,7 @@ export const LINE_ISSUE_FAILURE_REASONS = [
   "entitlement_type_not_issuable",
   "scope_unresolved",
   "multi_recipient_per_line",
+  "quantity_per_line_unsupported",
   "posting_invariant_violated",
   "issue_write_failed",
 ] as const
@@ -229,6 +234,11 @@ type OrderLineRow = {
   product_metadata: Record<string, unknown> | null
   /** pg zwraca NUMERIC jako string; nie ufamy deklaracji TypeScript na granicy SQL. */
   line_unit_price: unknown
+  /**
+   * Story 3.3 AC2 (ADR-242 §Krotność): `order_item.quantity` (NUMERIC NOT NULL
+   * w Medusa) — kontrakt wystawienia egzekwuje quantity=1 per linia voucherowa.
+   */
+  line_quantity?: unknown
   /**
    * Dane sprzedawcy i tytuł usługi — nośnik `voucher.seller_*` / `product_title`
    * przy genezie kodu (patrz `issueVoucherCodeWithinTx`). Kolumny są NOT NULL w
@@ -389,7 +399,7 @@ async function runLiveIssue(
   }
 
   // ── (i) EVENT-LEVEL dedupe (DEC-5 pkt 3.i) — PIERWSZY krok transakcji ──────
-  const dedupeInsert = buildEventProcessedDedupeInsert({
+  const dedupeMarker = {
     instance_id: dedupeInstanceId,
     market_id: dedupeMarketId,
     external_id: buildPaymentIntentOrderExternalId(
@@ -402,6 +412,17 @@ async function runLiveIssue(
     // pętli, więc N wystawień jednego zakupu koreluje się po kolumnie zamiast
     // przez parsowanie `external_id` po separatorze.
     purchase_key: payload.payment_intent_id,
+  }
+  // Story 3.3 (AC1, ADR-242 Proposed): rezerwacja klucza jednostki należnej we
+  // WSPÓLNEJ barierze i znacznik skutku w `event_processed` to JEDNA instrukcja
+  // w tej samej tx co INSERT-y entitlementów — bez stanu pośredniego.
+  const dedupeInsert = buildOwedUnitEffectBarrierInsert(dedupeMarker, {
+    owed_business_unit_key: dedupeMarker.external_id,
+    payment_intent_id: payload.payment_intent_id,
+    order_id: payload.order_id,
+    instance_id: dedupeInstanceId,
+    market_id: dedupeMarketId,
+    claimed_by_path: LIVE_ISSUE_PATH,
   })
   if (!options.skipEventInsert) {
     if (mode === "isolate_lines") {
@@ -439,6 +460,7 @@ async function runLiveIssue(
             oli.metadata,
             p.metadata AS product_metadata,
             oli.unit_price AS line_unit_price,
+            oi.quantity AS line_quantity,
             COALESCE(oli.title, p.title) AS line_title,
             s.id     AS seller_id,
             s.name   AS seller_name,
@@ -573,6 +595,24 @@ async function issueOrderLine(
       payload
     )
 
+    // Story 3.3 AC2 (ADR-242 §Krotność, AR-03): klucz jednostki należnej to
+    // `payment_intent_id:order_id`, a wystawca tworzy entitlement per
+    // (linia × recipient) — NIE per sztuka. Kontrakt egzekwuje więc quantity=1
+    // na linii voucherowej: quantity≠1 ⇒ FAIL-LOUD przed INSERT, zamiast cicho
+    // wystawić JEDNO uprawnienie za N opłaconych sztuk. Story nie dodaje obsługi
+    // quantity>1 (AC2); `order_item.quantity` jest NOT NULL w Medusa — brak
+    // kolumny w wierszu (lustro testowe bez kolumny) nie jest wartością ≠1.
+    if (line.line_quantity !== undefined && !isSupportedVoucherLineQuantity(line.line_quantity)) {
+      throw new LineIssueError(
+        VOUCHER_LINE_QUANTITY_ISSUE_REASON,
+        line.line_item_id,
+        `liveIssueEntitlementsWithinTx: linia voucherowa ${line.line_item_id} ` +
+          `(order ${payload.order_id}, payment_intent ${payload.payment_intent_id}) ma ` +
+          `quantity=${String(line.line_quantity)}; kontrakt wystawienia egzekwuje quantity=1 ` +
+          `per linia (ADR-242 §Krotność) — fail-loud przed INSERT, NIE jedno uprawnienie za N sztuk`
+      )
+    }
+
     const recipients = extractFrozenRecipients(line.metadata)
 
     // C1 (multi-recipient-per-line) — ODGRODZENIE FAIL-LOUD (model świadomie deferowany).
@@ -648,30 +688,8 @@ async function issueOrderLine(
  * (fail-loud), nie legalne pominięcie. Linia bez żadnego markera = faktyczny
  * non-voucher SKU (pomijana cicho — poprawnie).
  */
-const VOUCHER_INTENT_KEYS = [
-  "entitlement_profile",
-  "entitlement_profile_id",
-  "profile_id",
-  "entitlement_type",
-  "entitlement_policy",
-  "recipients",
-] as const
-
-function hasVoucherIntent(
-  metadata: Record<string, unknown> | null | undefined
-): boolean {
-  if (!metadata || typeof metadata !== "object") return false
-  return VOUCHER_INTENT_KEYS.some(
-    (k) => (metadata as Record<string, unknown>)[k] != null
-  )
-}
-
-function hasProductVoucherIntent(
-  metadata: Record<string, unknown> | null | undefined
-): boolean {
-  const gp = readObject(metadata?.gp)
-  return gp?.entitlement_profile != null
-}
+// Story 3.3 AC2 runda fix 2: kryterium i reguła krotności są wspólne z trasami
+// koszyka i wystawcą captured (`lib/payment/voucher-line-quantity`).
 
 /**
  * Walidacja typu entitlementu względem taksonomii (L4). Nieznany (poza enumem

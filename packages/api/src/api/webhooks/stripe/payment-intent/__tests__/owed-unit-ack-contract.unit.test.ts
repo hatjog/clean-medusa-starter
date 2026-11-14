@@ -26,12 +26,17 @@ import { PAYMENT_INTENT_SUCCEEDED_EMIT_OPTIONS, POST } from "../route"
 import { STRIPE_SIGNATURE_HEADER } from "../helpers"
 import {
   ackStatusForVerdict,
+  buildOwedBusinessUnitKey,
   buildOwedBusinessUnits,
   evaluateOwedUnitAck,
   isAckAllowed,
   OWED_UNIT_ACK_HTTP_STATUS,
   WEBHOOK_DELIVERY_BARRIER_TABLE,
 } from "../../../../../lib/payment/stripe-webhook-barrier-contract"
+import {
+  buildOwedUnitEffectBarrierInsert,
+  OWED_UNIT_EFFECT_BARRIER_CONTRACT_VERSION,
+} from "../../../../../lib/payment/owed-unit-effect-barrier"
 import { Modules } from "@medusajs/framework/utils"
 import { marketContextStorage } from "../../../../../lib/market-context"
 
@@ -427,5 +432,51 @@ describe("Story 3.1 fix — odczyt poziomu 2 pod kontekstem RLS i bez wycieku", 
     expect(serialized).not.toContain("does not exist")
     expect(serialized).not.toContain("db-internal")
     expect(serialized).not.toContain("settlement_read_error")
+  })
+})
+
+describe("Story 3.3 — czysty duplikat bez settlement (D-35 p.4) i kontrakt wspólnej bariery skutku", () => {
+  const ORIGINAL_INSTANCE = process.env.GP_INSTANCE_ID
+  beforeEach(() => {
+    process.env.GP_INSTANCE_ID = "gp-test"
+    process.env.STRIPE_WEBHOOK_SECRET = SECRET
+  })
+  afterEach(() => {
+    if (ORIGINAL_INSTANCE === undefined) delete process.env.GP_INSTANCE_ID
+    else process.env.GP_INSTANCE_ID = ORIGINAL_INSTANCE
+  })
+
+  it("D-35 p.4: ponowiona dostawa bez żadnego skutku ⇒ dokładnie HTTP 500, nie 200 duplicate", async () => {
+    const world = makeWorld()
+    expect((await world.deliver("evt_3_3_pure_duplicate")).statusCode).toBe(200)
+    const retry = await world.deliver("evt_3_3_pure_duplicate")
+    expect(retry.statusCode).toBe(500)
+    expect((retry.body as { duplicate?: boolean }).duplicate).toBeUndefined()
+    expect(world.queue).toHaveLength(2)
+  })
+
+  it("SemVer kontraktu bariery 1.1.0; jedna instrukcja rezerwuje klucz jednostki i znacznik skutku", () => {
+    expect(OWED_UNIT_EFFECT_BARRIER_CONTRACT_VERSION).toBe("1.1.0")
+    const key = buildOwedBusinessUnitKey({ payment_intent_id: PI, order_id: ORDER_A })
+    const scope = { instance_id: "gp-test", market_id: "bonbeauty" }
+    const insert = buildOwedUnitEffectBarrierInsert(
+      { external_id: key, event_type: "gp.stripe.payment_intent_succeeded.v1", processed_at: 1, purchase_key: PI, ...scope },
+      { owed_business_unit_key: key, payment_intent_id: PI, order_id: ORDER_A, ...scope, claimed_by_path: "route:test" }
+    )
+    expect(insert.sql).toMatch(/^WITH barrier_claim AS \(INSERT INTO owed_unit_effect_barrier/)
+    expect(insert.sql).toMatch(/INSERT INTO event_processed .* WHERE EXISTS \(SELECT 1 FROM barrier_claim\)/)
+    expect(insert.params.slice(0, 6)).toEqual([key, "gp.stripe.payment_intent_succeeded.v1", 1, PI, "gp-test", "bonbeauty"])
+    expect(() =>
+      buildOwedUnitEffectBarrierInsert(
+        { external_id: `${key}x`, event_type: "e", processed_at: 1, purchase_key: PI, ...scope },
+        { owed_business_unit_key: key, payment_intent_id: PI, order_id: ORDER_A, ...scope, claimed_by_path: "r" }
+      )
+    ).toThrow(/external_id/)
+    expect(() =>
+      buildOwedUnitEffectBarrierInsert(
+        { external_id: key, event_type: "e", processed_at: 1, purchase_key: PI, ...scope },
+        { owed_business_unit_key: key, payment_intent_id: PI, order_id: ORDER_A, ...scope, market_id: " ", claimed_by_path: "r" }
+      )
+    ).toThrow(/market_id/)
   })
 })
