@@ -154,6 +154,13 @@ export const RECORD_COMPENSATION_FAILURE_SQL = `
  * backfillu NADAL jest otwartą porażką tej dostawy — drugi człon `UNION ALL`
  * czyta go z `source_row`, więc ponowienie Stripe'a dostaje `500
  * compensation_failed/delivery_release_unresolved` jak przed migracją.
+ *
+ * Runda fix 2 D-31: wiersz kwarantanny przestaje być liczony jako otwarty,
+ *  - gdy w populacji istnieje wiersz z tym samym `failure_id` (`NOT EXISTS`) —
+ *    o stanie rozstrzyga wtedy populacja (brak duplikatu w `registry_failure_ids`,
+ *    `resolved_manually` w populacji odblokowuje dostawę),
+ *  - gdy ops-recovery zamknął go stanem terminalnym `closed_by_ops_recovery`
+ *    (`backfill_state`; fakt `source_row` zostaje, wiersz nie jest kasowany).
  */
 export const FIND_OPEN_COMPENSATION_FAILURES_SQL = `
   SELECT failure_id, attempt_count, order_id
@@ -169,6 +176,12 @@ export const FIND_OPEN_COMPENSATION_FAILURES_SQL = `
    WHERE q.source_row->>'delivery_path' = $1
      AND q.source_row->>'stripe_event_id' = $2
      AND q.source_row->>'resolution_state' = 'open'
+     AND q.backfill_state = 'quarantined_pending_review'
+     AND NOT EXISTS (
+       SELECT 1
+         FROM money_path_compensation_failure c
+        WHERE c.failure_id = q.source_failure_id
+     )
 `
 
 export async function findOpenCompensationFailures(

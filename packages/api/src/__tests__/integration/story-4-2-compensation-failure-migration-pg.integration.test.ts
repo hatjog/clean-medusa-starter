@@ -18,11 +18,14 @@ import { Pool, type PoolClient } from "pg"
 
 import { Migration20260818090000MoneyPathCompensationFailureTable } from "../../migrations/Migration20260818090000MoneyPathCompensationFailureTable"
 import {
+  CLOSE_QUARANTINED_COMPENSATION_FAILURE_SQL,
+  LEGACY_BACKFILL_CLOSED_STATE,
   LEGACY_BACKFILL_STATE,
   LEGACY_INSTANCE_ID_BACKFILL_SOURCE,
   Migration20261114120000MoneyPathCompensationFailureRecoveryColumns,
 } from "../../migrations/Migration20261114120000MoneyPathCompensationFailureRecoveryColumns"
 import {
+  buildCompensationFailureId,
   buildPurchaseCorrelationKey,
   CompensationFailureInstanceUnconfiguredError,
   findOpenCompensationFailures,
@@ -378,6 +381,102 @@ describe("Story 4.2 — migracja tabeli porażek kompensacji na realnym PostgreS
     expect(resolved).toEqual([])
   })
 
+  it("Fix 2 D-31: sekwencja pod medusa_store — kwarantanna open → ponowienie bez duplikatu → resolved_manually odblokowuje; zamknięcie ops-recovery odblokowuje", async () => {
+    const MIGRATOR = "gp_runtime_recovery_migrator"
+    const retried = record({ stripe_event_id: "evt_seq_retry", order_id: "order_seq_retry" })
+    const closed = record({ stripe_event_id: "evt_seq_closed", order_id: "order_seq_closed" })
+    const retriedId = buildCompensationFailureId(retried)
+    const closedId = buildCompensationFailureId(closed)
+    const find = (stripe_event_id: string) =>
+      findOpenCompensationFailures(client, { delivery_path: STRIPE_PATH_Y_WEBHOOK_PROVIDER, stripe_event_id })
+    const asRuntime = async () => {
+      await client.query("RESET ROLE")
+      await client.query("SET LOCAL ROLE medusa_store")
+      await client.query("SELECT set_config('app.gp_instance_id', $1, true)", [INSTANCE])
+      await client.query("SELECT set_config('app.gp_market_id', $1, true)", ["bonbeauty"])
+    }
+    const previous = process.env.GP_INSTANCE_ID
+    process.env.GP_INSTANCE_ID = INSTANCE
+    await client.query("BEGIN")
+    try {
+      // Wiersze zastane `open` w kwarantannie z deterministycznym failure_id writera
+      // (kształt wiersza po cf-backfill; zapis superuserem = migracja).
+      for (const [id, rec] of [[retriedId, retried], [closedId, closed]] as const) {
+        await client.query(
+          `INSERT INTO ${QUARANTINE} (source_failure_id, source_row, reason, market_id, instance_id,
+             instance_id_source, backfill_state, owner_type, owner_id, deadline)
+           VALUES ($1, $2::jsonb, 'test', 'bonbeauty', $3, $4, $5, 'operator_role', 'ops-recovery', now() + interval '24 hours')`,
+          [
+            id,
+            JSON.stringify({ failure_id: id, delivery_path: rec.delivery_path, stripe_event_id: rec.stripe_event_id,
+              order_id: rec.order_id, attempt_count: 1, resolution_state: "open" }),
+            INSTANCE,
+            LEGACY_INSTANCE_ID_BACKFILL_SOURCE,
+            LEGACY_BACKFILL_STATE,
+          ]
+        )
+      }
+      await asRuntime()
+      expect(await find("evt_seq_retry")).toEqual([{ failure_id: retriedId, attempt_count: 1, order_id: "order_seq_retry" }])
+
+      // Ponowienie: writer zapisuje wiersz populacji z tym samym failure_id.
+      const written = await recordCompensationFailure(client, retried)
+      expect(written.failure_id).toBe(retriedId)
+      const afterRetry = await find("evt_seq_retry")
+      expect(afterRetry.map((r) => r.failure_id)).toEqual([retriedId])
+
+      // Operator rozwiązuje wiersz populacji — dostawa odblokowana.
+      await client.query(
+        `UPDATE ${TABLE} SET resolution_state = 'resolved_manually', resolved_at = now(), resolved_by = 'ops@test'
+          WHERE failure_id = $1`,
+        [retriedId]
+      )
+      expect(await find("evt_seq_retry")).toEqual([])
+
+      // Zamknięcie wiersza kwarantanny: medusa_store nie może, ops-recovery (migrator) może.
+      expect(await find("evt_seq_closed")).toHaveLength(1)
+      await client.query("SAVEPOINT runtime_close")
+      await expect(
+        client.query(CLOSE_QUARANTINED_COMPENSATION_FAILURE_SQL, [closedId, "ops@test", JSON.stringify({ ticket: "T-1" })])
+      ).rejects.toThrow(/permission denied/)
+      await client.query("ROLLBACK TO SAVEPOINT runtime_close")
+      await client.query("RESET ROLE")
+      await client.query(`SET LOCAL ROLE ${MIGRATOR}`)
+      const closure = await client.query(CLOSE_QUARANTINED_COMPENSATION_FAILURE_SQL, [
+        closedId, "ops@test", JSON.stringify({ ticket: "T-1" }),
+      ])
+      expect(closure.rows.map((r) => [r.source_failure_id, r.backfill_state])).toEqual([[closedId, LEGACY_BACKFILL_CLOSED_STATE]])
+      // Przejście jednokrotne: drugi raz zero wierszy.
+      const again = await client.query(CLOSE_QUARANTINED_COMPENSATION_FAILURE_SQL, [closedId, "ops@test", "{}"])
+      expect(again.rowCount).toBe(0)
+      await asRuntime()
+      expect(await find("evt_seq_closed")).toEqual([])
+      // Fakt nie jest kasowany: wiersz i zamrożony source_row zostają.
+      const kept = await client.query<{ backfill_state: string; state: string }>(
+        `SELECT backfill_state, source_row->>'resolution_state' AS state FROM ${QUARANTINE} WHERE source_failure_id = $1`,
+        [closedId]
+      )
+      expect(kept.rows).toEqual([{ backfill_state: LEGACY_BACKFILL_CLOSED_STATE, state: "open" }])
+    } finally {
+      await client.query("ROLLBACK")
+      if (previous === undefined) delete process.env.GP_INSTANCE_ID
+      else process.env.GP_INSTANCE_ID = previous
+    }
+  })
+
+  it("Fix 2 D-31: stan terminalny kwarantanny wymaga closed_at/closed_by/dowodu (CHECK)", async () => {
+    await client.query("BEGIN")
+    try {
+      await expect(
+        client.query(`UPDATE ${QUARANTINE} SET backfill_state = $1 WHERE source_failure_id = 'legacy_open'`, [
+          LEGACY_BACKFILL_CLOSED_STATE,
+        ])
+      ).rejects.toThrow(/mpcf_backfill_quarantine_closure_check/)
+    } finally {
+      await client.query("ROLLBACK")
+    }
+  })
+
   it("R-2: ponowny provisioning 003 przywraca least privilege obu tabel 4.2 (idempotentnie)", async () => {
     expect(reprovisioning).toBeDefined()
     await client.query("BEGIN")
@@ -406,13 +505,22 @@ describe("Story 4.2 — migracja tabeli porażek kompensacji na realnym PostgreS
     await expect(runInTx(client, down)).rejects.toThrow(/rollback refused/)
     await client.query(`DELETE FROM ${TABLE}`)
 
+    // Wiersz kwarantanny zamknięty przez ops-recovery wraca w down jako resolved_manually.
+    await client.query("BEGIN")
+    await client.query("SET LOCAL ROLE gp_runtime_recovery_migrator")
+    const closedLegacy = await client.query(CLOSE_QUARANTINED_COMPENSATION_FAILURE_SQL, [
+      "legacy_open", "ops@test", JSON.stringify({ ticket: "T-down" }),
+    ])
+    await client.query("COMMIT")
+    expect(closedLegacy.rowCount).toBe(1)
+
     await runInTx(client, down)
     expect((await client.query("SELECT to_regclass($1) AS t", [QUARANTINE])).rows[0].t).toBeNull()
     const restored = await client.query<{ failure_id: string; resolution_state: string; resolved_by: string | null }>(
       `SELECT failure_id, resolution_state, resolved_by FROM ${TABLE} ORDER BY failure_id`
     )
     expect(restored.rows).toEqual([
-      { failure_id: "legacy_open", resolution_state: "open", resolved_by: null },
+      { failure_id: "legacy_open", resolution_state: "resolved_manually", resolved_by: "ops@test" },
       { failure_id: "legacy_resolved", resolution_state: "resolved_manually", resolved_by: "robert@bonbeauty" },
     ])
     const cols = await client.query<{ column_name: string; column_default: string | null }>(

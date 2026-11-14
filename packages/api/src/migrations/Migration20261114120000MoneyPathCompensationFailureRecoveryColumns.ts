@@ -43,6 +43,12 @@ export const LEGACY_INSTANCE_ID_BACKFILL_SOURCE =
   `env:GP_INSTANCE_ID@${COMPENSATION_FAILURE_RECOVERY_MIGRATION}` as const
 /** Jawny stan backfillu wiersza zastanego (nie NULL, nie „nierozstrzygnięte"). */
 export const LEGACY_BACKFILL_STATE = "quarantined_pending_review" as const
+/**
+ * Stan terminalny wiersza kwarantanny (runda fix 2 D-31, ADR-238 §7): ops-recovery
+ * zamknął przegląd. `source_row` zostaje nietknięty (fakt nie jest kasowany),
+ * a `FIND_OPEN_COMPENSATION_FAILURES_SQL` przestaje liczyć wiersz jako otwarty.
+ */
+export const LEGACY_BACKFILL_CLOSED_STATE = "closed_by_ops_recovery" as const
 export const LEGACY_BACKFILL_OWNER = { owner_type: "operator_role", owner_id: "ops-recovery" } as const
 export const LEGACY_BACKFILL_SLA_HOURS = 24
 export const LEGACY_BACKFILL_REASON =
@@ -56,6 +62,26 @@ export const RECOVERY_RESOLUTION_STATES = [
   "closed_unrecoverable",
   "closed_legacy_unevidenced",
 ] as const
+
+/**
+ * Nazwana ścieżka zamknięcia wiersza kwarantanny (ADR-238 §7). Wykonuje ją
+ * ops-recovery rolą `gp_runtime_recovery_migrator` (właściciel tabeli, polityka
+ * `ops_recovery_closure`); `medusa_store` ma na kwarantannie wyłącznie SELECT.
+ * $1 = source_failure_id, $2 = identyfikator operatora zamykającego,
+ * $3 = dowód zamknięcia (JSON, np. odnośnik do zgłoszenia/decyzji).
+ * Przejście dozwolone wyłącznie z `quarantined_pending_review`; zero wierszy
+ * w RETURNING = brak przejścia (wiersz nieistniejący albo już zamknięty).
+ */
+export const CLOSE_QUARANTINED_COMPENSATION_FAILURE_SQL = `
+  UPDATE ${QUARANTINE}
+     SET backfill_state = '${LEGACY_BACKFILL_CLOSED_STATE}',
+         closed_at = now(),
+         closed_by = $2,
+         closure_evidence = $3::jsonb
+   WHERE source_failure_id = $1
+     AND backfill_state = '${LEGACY_BACKFILL_STATE}'
+  RETURNING source_failure_id, backfill_state, closed_at, closed_by
+`
 
 const STATE_LIST = RECOVERY_RESOLUTION_STATES.map((s) => `'${s}'`).join(", ")
 
@@ -137,8 +163,17 @@ export class Migration20261114120000MoneyPathCompensationFailureRecoveryColumns 
         owner_type         TEXT NOT NULL,
         owner_id           TEXT NOT NULL,
         deadline           TIMESTAMPTZ NOT NULL,
+        closed_at          TIMESTAMPTZ,
+        closed_by          TEXT,
+        closure_evidence   JSONB,
         CONSTRAINT ${QUARANTINE}_state_check
-          CHECK (backfill_state IN ('${LEGACY_BACKFILL_STATE}')),
+          CHECK (backfill_state IN ('${LEGACY_BACKFILL_STATE}', '${LEGACY_BACKFILL_CLOSED_STATE}')),
+        CONSTRAINT mpcf_backfill_quarantine_closure_check
+          CHECK (
+            (backfill_state = '${LEGACY_BACKFILL_STATE}' AND closed_at IS NULL AND closed_by IS NULL AND closure_evidence IS NULL)
+            OR (backfill_state = '${LEGACY_BACKFILL_CLOSED_STATE}' AND closed_at IS NOT NULL
+                AND closed_by IS NOT NULL AND btrim(closed_by) <> '' AND closure_evidence IS NOT NULL)
+          ),
         CONSTRAINT ${QUARANTINE}_owner_type_check
           CHECK (owner_type IN ('operator_role', 'operator_user'))
       )
@@ -212,6 +247,17 @@ export class Migration20261114120000MoneyPathCompensationFailureRecoveryColumns 
           WITH CHECK (instance_id = ${INSTANCE_SETTING} AND market_id = ${MARKET_SETTING})
       `)
     }
+    // Ścieżka zamknięcia ops-recovery (ADR-238 §7): FORCE RLS obejmuje też
+    // właściciela, więc rola migratora dostaje własne polityki na kwarantannie
+    // — odczyt i przejście do stanu terminalnego, bez DELETE.
+    this.addSql(`DROP POLICY IF EXISTS ops_recovery_read ON ${QUARANTINE}`)
+    this.addSql(`CREATE POLICY ops_recovery_read ON ${QUARANTINE} FOR SELECT TO ${MIGRATION_ROLE} USING (true)`)
+    this.addSql(`DROP POLICY IF EXISTS ops_recovery_closure ON ${QUARANTINE}`)
+    this.addSql(`
+      CREATE POLICY ops_recovery_closure ON ${QUARANTINE} FOR UPDATE TO ${MIGRATION_ROLE}
+        USING (backfill_state = '${LEGACY_BACKFILL_STATE}')
+        WITH CHECK (backfill_state = '${LEGACY_BACKFILL_CLOSED_STATE}')
+    `)
     this.addSql(`RESET ROLE`)
     this.addSql(`REVOKE ${MIGRATION_ROLE} FROM CURRENT_USER`)
   }
@@ -259,12 +305,20 @@ export class Migration20261114120000MoneyPathCompensationFailureRecoveryColumns 
         ALTER COLUMN provenance_source DROP NOT NULL
     `)
     // cf-unbackfill: odtworzenie przeniesionych source rows PRZED dropem kwarantanny.
+    // Wiersz zamknięty przez ops-recovery wraca jako `resolved_manually`
+    // (resolved_at/resolved_by = closed_at/closed_by) — zamknięcie nie ginie.
     this.addSql(`
       DO $$
       BEGIN
         IF to_regclass('${QUARANTINE}') IS NOT NULL THEN
           INSERT INTO ${TABLE}
-          SELECT (jsonb_populate_record(NULL::${TABLE}, q.source_row)).*
+          SELECT (jsonb_populate_record(NULL::${TABLE},
+                    CASE WHEN q.backfill_state = '${LEGACY_BACKFILL_CLOSED_STATE}'
+                         THEN q.source_row || jsonb_build_object(
+                                'resolution_state', 'resolved_manually',
+                                'resolved_at', q.closed_at,
+                                'resolved_by', q.closed_by)
+                         ELSE q.source_row END)).*
             FROM ${QUARANTINE} q
           ON CONFLICT (failure_id) DO NOTHING;
         END IF;
