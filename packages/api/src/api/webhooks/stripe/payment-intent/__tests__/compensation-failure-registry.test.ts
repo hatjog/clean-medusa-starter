@@ -31,6 +31,10 @@ import {
 } from "../../../../../lib/payment/money-path-compensation-registry"
 import { STRIPE_PATH_Y_WEBHOOK_PROVIDER } from "../../../../../lib/payment/stripe-payment-intent-transport"
 
+// Story 3.1 C3-SEC-002: instancja RLS wyłącznie ze źródła serwerowego (GP_INSTANCE_ID),
+// bez domyślnego "gp" — testy ustawiają ją jawnie.
+process.env.GP_INSTANCE_ID = "gp-test"
+
 const SECRET = "whsec_test_3_5"
 const PI_ID = "pi_3Tzcompensation000001"
 const EVT_ID = "evt_compensation_3_5"
@@ -647,7 +651,7 @@ describe("Story 3.5 AC2/AC3 review-fix — ponowienie Stripe'a NIE ląduje w cis
     expect(rows[0].attempt_count).toBe(3)
   })
 
-  it("gdy rejestr NIE zna otwartej porażki, `duplicate` nadal jest zwykłym ACK", async () => {
+  it("gdy rejestr NIE zna otwartej porażki, czysty duplikat bez settlement ⇒ 500 (D-35 p.4), bez wiersza rejestru", async () => {
     // Kontrola dodatnia w drugą stronę: fix nie może zamienić każdego
     // `stripe events resend` w wieczne 500.
     const h = makeHarness({
@@ -661,9 +665,15 @@ describe("Story 3.5 AC2/AC3 review-fix — ponowienie Stripe'a NIE ląduje w cis
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await POST(h.withBody(raw) as any, res as any)
 
-    expect(res.statusCode).toBe(200)
-    expect(res.body?.duplicate).toBe(true)
-    expect(res.body?.reason).toBe("delivery_already_processed")
+    // Decyzja PO D-35 p.4 (Story 3.1, DW-15-225): czysty duplikat BEZ wierszy
+    // settlement to NIE jest ACK — 500 zachowuje ponowienie. Rejestr kompensacji
+    // nadal nie dostaje wiersza (to nie jest porażka kompensacji).
+    expect(res.statusCode).toBe(500)
+    expect(res.body?.type).toBe("owed_unit_ack_incomplete")
+    // Harness nie emuluje hooka RLS, więc odczyt poziomu 2 kończy się odmową
+    // fail-closed (UNKNOWN) — w obu przypadkach ACK jest wstrzymany.
+    expect(["owed_units_unsettled", "owed_units_unreadable"]).toContain(res.body?.reason)
+    expect(res.body?.duplicate).toBeUndefined()
     expect(Array.from(h.registry.values())).toHaveLength(0)
   })
 })

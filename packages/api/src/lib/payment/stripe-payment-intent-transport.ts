@@ -26,6 +26,8 @@
 import { ContainerRegistrationKeys } from "@medusajs/framework/utils"
 
 import { toKnexPositionalSql } from "../knex-positional-sql"
+import { marketContextStorage, type MarketContext } from "../market-context"
+import { GP_INSTANCE_SESSION_VAR, GP_MARKET_SESSION_VAR } from "../rls-pool-hook"
 import type { PaymentLinkQueryClient } from "./stripe-payment-intent-link"
 
 /** Wartość `webhook_event_processed.provider` dla cienkiego webhooka Path Y. */
@@ -267,6 +269,69 @@ export async function acquireFreshPgConnection(scope: {
   }
 
   return null
+}
+
+/** Nazwany kod odmowy odczytu poziomu 2 bez ustawionego kontekstu RLS. */
+export const RLS_CONTEXT_NOT_APPLIED = "rls_context_not_applied" as const
+
+export class RlsScopedReadError extends Error {
+  readonly code: string
+  constructor(code: string, message: string) {
+    super(message)
+    this.name = "RlsScopedReadError"
+    this.code = code
+  }
+}
+
+/**
+ * Odczyt pod kontekstem RLS (Story 3.1 C3-SEC-001).
+ *
+ * Hook RLS (`lib/rls-pool-hook.ts`) ustawia GUC rynku i instancji WYŁĄCZNIE przy
+ * `acquireConnection`. Połączenie wzięte PRZED `marketContextStorage.run` nie
+ * dostaje kontekstu — samo owinięcie zapytania w `run` nic nie zmienia. Dlatego
+ * połączenie jest brane WEWNĄTRZ kontekstu, a przed zapytaniem sprawdzamy, że
+ * sesja faktycznie niesie TEN rynek i TĘ instancję. Rozjazd (np. ścieżka bez
+ * hooka) jest odmową fail-closed, nie odczytem bez filtra.
+ */
+export async function queryUnderMarketContext<T = Record<string, unknown>>(
+  scope: { resolve: (key: string) => unknown },
+  context: Required<Pick<MarketContext, "market_id" | "instance_id">>,
+  sql: string,
+  params: ReadonlyArray<unknown>
+): Promise<{ rows: T[] }> {
+  return marketContextStorage.run(
+    { market_id: context.market_id, instance_id: context.instance_id },
+    async () => {
+      const connection = await acquireFreshPgConnection(scope)
+      if (!connection) {
+        throw new RlsScopedReadError(
+          "pg_connection_unavailable",
+          "brak rozłącznego połączenia PG dla odczytu pod kontekstem RLS"
+        )
+      }
+      try {
+        const guc = await connection.client.query<{ market_id: string | null; instance_id: string | null }>(
+          `SELECT current_setting('${GP_MARKET_SESSION_VAR}', true) AS market_id, ` +
+            `current_setting('${GP_INSTANCE_SESSION_VAR}', true) AS instance_id`,
+          []
+        )
+        const applied = guc.rows[0]
+        if (
+          applied?.market_id !== context.market_id ||
+          applied?.instance_id !== context.instance_id
+        ) {
+          throw new RlsScopedReadError(
+            RLS_CONTEXT_NOT_APPLIED,
+            "połączenie nie niesie kontekstu RLS żądanego rynku/instancji"
+          )
+        }
+        const result = await connection.client.query<T>(sql, params)
+        return { rows: result.rows }
+      } finally {
+        connection.release()
+      }
+    }
+  )
 }
 
 export function createKnexQueryClient(db: KnexLike): PaymentLinkQueryClient {

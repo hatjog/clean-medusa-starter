@@ -11,6 +11,10 @@ import { describe, expect, it } from "@jest/globals"
 
 import { buildPaymentIntentSucceededEnvelope } from "../../../lib/payment/stripe-payment-intent-event"
 
+// Story 3.1 C3-SEC-002: instancja RLS wyłącznie ze źródła serwerowego (GP_INSTANCE_ID),
+// bez domyślnego "gp" — testy ustawiają ją jawnie.
+process.env.GP_INSTANCE_ID = "gp-test"
+
 const NOW = new Date("2026-06-02T10:15:30.000Z")
 
 function event(metadata: Record<string, string>) {
