@@ -499,30 +499,37 @@ describe("AC4 — kazda klasa ma WLASNA reakcje, wykonywana na realnej sciezce",
     expect(ctx.auditEvents[0].market_id).toBe("ua")
   })
 
-  it("AD-21 kontrola NEGATYWNA — brak deklaracji rynku to ODMOWA, nie zapis dla wszystkich rynkow", async () => {
+  it("AD-21 kontrola NEGATYWNA — brak deklaracji rynku: zastany hamulec fail-closed, jawny kod, nic nie zapisane (R-8)", async () => {
+    // R-8 (checkpoint 6.6, PO D-4): przeplyw hamulca dla zdarzenia bez rynku
+    // jest ZASTANY (kontrakt 6.8) — odczyt dla `""` jest fail-closed i konczy
+    // obsluge PRZED kontekstem rynku. 6.6 nie zmienia tej semantyki; dodaje
+    // jedynie jawny kod DELIVERY_PATH_BRAKE_ENGAGED.
     const ctx = makeContainer(null)
 
-    await expect(
-      run(
-        {
-          provider_id: "brevo",
-          provider_event_id: "pe-no-market",
-          event_type: "hard_bounce",
-        },
-        ctx.container,
-        "notification.hard_bounce",
-      ),
-    ).rejects.toThrow(/AD-21/)
+    await run(
+      {
+        provider_id: "brevo",
+        provider_event_id: "pe-no-market",
+        event_type: "hard_bounce",
+      },
+      ctx.container,
+      "notification.hard_bounce",
+    )
 
     // Kluczowe: NIC nie zostalo zapisane.
     expect(ctx.auditEvents).toHaveLength(0)
-    // Odmowa jest policzona, nie tylko zalogowana.
+    expect(ctx.logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining(
+        "error_code=DELIVERY_PATH_BRAKE_ENGAGED metric=gp_brevo_delivery_brake_skipped_total outcome=skipped_unclassified market_id=missing",
+      ),
+    )
+    // Hamulec rozstrzyga przed kontekstem rynku — odmowy AD-21 tu nie ma.
     expect(
       getSystemMarketContextDenials({ reason: "markets_empty", surface: "subscriber" }),
-    ).toBe(1)
+    ).toBe(0)
   })
 
-  it("idempotencja — ten sam provider_event_id dwa razy daje JEDNA reakcje", async () => {
+  it("idempotencja — ten sam provider_event_id dwa razy: JEDEN skutek w ledgerze, koperta z TYM SAMYM audit_id (R-5)", async () => {
     // Story 6.6: idempotencje rozstrzyga TRWALY ledger (atomowy UPDATE ... WHERE
     // status <> $1), nie pamiec procesu. Atrapa odtwarza dokladnie ten kontrakt:
     // pierwsze zastosowanie `updated`, kazde kolejne `duplicate`. Do v1.15.0
@@ -559,9 +566,12 @@ describe("AC4 — kazda klasa ma WLASNA reakcje, wykonywana na realnej sciezce",
     await run(payload, ctx.container, "notification.hard_bounce")
     await run(payload, ctx.container, "notification.hard_bounce")
 
-    // Dostawca ponawia webhook do 7 dni — druga dostawa NIE moze wyprodukowac
-    // drugiej eskalacji ani drugiego zuzycia proby.
-    expect(ctx.auditEvents).toHaveLength(1)
+    // R-5: `duplicate` nie dowodzi, ze koperta dotarla (ledger zatwierdza stan
+    // przed sinkiem), wiec replay emituje ja ponownie — z TYM SAMYM
+    // deterministycznym audit_id (F-08), po ktorym deduplikuje sink. Skutek
+    // (budzet, eskalacja z predykatu wiersza) stosuje ledger raz.
+    expect(ctx.auditEvents).toHaveLength(2)
+    expect(ctx.auditEvents[1].audit_id).toBe(ctx.auditEvents[0].audit_id)
     expect(ctx.auditEvents[0].delivery_reaction.escalate).toBe(true)
     // Trwale odbicie domyka budzet odbiorcy (droga wyczerpania budzetu) — ten
     // sam nosnik przy obu dostawach; to UPDATE w ledgerze stosuje go raz.
@@ -572,7 +582,7 @@ describe("AC4 — kazda klasa ma WLASNA reakcje, wykonywana na realnej sciezce",
       exhaust_recipient_budget: { max_attempt_count: 5 },
     })
     expect(ctx.logger.info).toHaveBeenCalledWith(
-      expect.stringContaining("outcome=replay_suppressed provider_event_id=pe-idempotent"),
+      expect.stringContaining("outcome=replay_reemitted provider_event_id=pe-idempotent"),
     )
   })
 

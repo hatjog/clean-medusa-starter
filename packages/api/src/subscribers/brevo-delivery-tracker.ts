@@ -208,7 +208,8 @@ export default async function brevoDeliveryTracker({
       // zdarzenie znikalo bez bledu, bez metryki i bez zmiany stanu, a Medusa
       // uznawala je za obsluzone. Teraz odmowa jest GLOSNA: nazwany kod bledu,
       // przyrost licznika i propagacja wyjatku, wiec zdarzenie NIE jest
-      // potwierdzone jako obsluzone i wraca w ponowieniu dostawcy.
+      // potwierdzone jako obsluzone. Ponowienie daje szyna zdarzen (opcje
+      // zadania z trasy webhooka, R-4), nie dostawca — ten dostal juz 202.
       logger.error?.(
         `[brevo-delivery-tracker] error_code=${error.code} ` +
           `metric=${UNRECOGNIZED_DELIVERY_EVENT_METRIC} ` +
@@ -257,32 +258,26 @@ export default async function brevoDeliveryTracker({
       },
       logger,
     )
-    // Brak rynku NIE jest pytaniem do hamulca: odczyt hamulca dla pustego
-    // rynku jest fail-closed (`engaged`) i konczyl sie cichym `return`, przez co
-    // odmowa AD-21 (`markets_empty`) nigdy nie padala. Bez rynku idziemy prosto
-    // do `runInSystemMarketContext`, ktory odmawia glosno. Semantyka hamulca dla
-    // rynku zadeklarowanego zostaje bez zmian (kontrakt 6.8).
-    if (marketId) {
-      const deliveryPathReleased = await brakeReader.isReleased(
-        marketId,
-        "fr_9_delivery_idempotency",
+    // R-8 (checkpoint 6.6): przeplyw hamulca jest ZASTANY — odczyt takze dla
+    // zdarzenia bez rynku (`""`, fail-closed). Semantyka hamulca to kontrakt
+    // 6.8 (PO D5/D8); 6.6 dodaje wylacznie jawny kod tam, gdzie hamulec jest
+    // zaciagniety.
+    const deliveryPathReleased = await brakeReader.isReleased(
+      marketId ?? "",
+      "fr_9_delivery_idempotency",
+    )
+    if (!deliveryPathReleased) {
+      brakeSkippedCount += 1
+      logger.warn?.(
+        `[brevo-delivery-tracker] error_code=${DELIVERY_PATH_BRAKE_ENGAGED_CODE} ` +
+          `metric=${DELIVERY_PATH_BRAKE_ENGAGED_METRIC} outcome=skipped_unclassified ` +
+          `market_id=${marketId ?? "missing"} brake=fr_9_delivery_idempotency ` +
+          `provider_event_id=${normalized.provider_event_id} event_type=${normalized.event_type}`,
       )
-      if (!deliveryPathReleased) {
-        // Story 6.6 AC4: `return` zostaje (kontrakt 6.8, PO D5/D8), ale jest
-        // JAWNY — nazwany kod, metryka i klasa zdarzenia, ktorej NIE
-        // sklasyfikowano. Wczesniej byl to log info bez kodu.
-        brakeSkippedCount += 1
-        logger.warn?.(
-          `[brevo-delivery-tracker] error_code=${DELIVERY_PATH_BRAKE_ENGAGED_CODE} ` +
-            `metric=${DELIVERY_PATH_BRAKE_ENGAGED_METRIC} outcome=skipped_unclassified ` +
-            `market_id=${marketId} brake=fr_9_delivery_idempotency ` +
-            `provider_event_id=${normalized.provider_event_id} event_type=${normalized.event_type}`,
-        )
-        logger.info?.(
-          `[brevo-delivery-tracker] money path brake engaged market_id=${marketId} brake=fr_9_delivery_idempotency`,
-        )
-        return
-      }
+      logger.info?.(
+        `[brevo-delivery-tracker] money path brake engaged market_id=${marketId ?? "missing"} brake=fr_9_delivery_idempotency`,
+      )
+      return
     }
 
     // ADR-213 wariant C: stan dostawy trafia do rejestru dopiero po
@@ -313,14 +308,17 @@ export default async function brevoDeliveryTracker({
         )
         logDeliveryStateResult(normalized!, stateResult, logger)
         if (stateResult.outcome === "duplicate") {
-          // Replay dostawcy (do 7 dni): trwaly ledger juz rozstrzygnal ten
-          // provider_event_id. Druga koperta z ta sama reakcja oznaczalaby druga
-          // eskalacje i drugie zuzycie proby — idempotencja AC4.
+          // R-5 (checkpoint 6.6): ledger zatwierdza stan PRZED koperta (bez
+          // wspolnej transakcji), wiec `duplicate` nie dowodzi, ze koperta
+          // dotarla — ponowienie po awarii sinka trafia wlasnie tutaj. Koperta
+          // jest emitowana ponownie z TYM SAMYM deterministycznym `audit_id`
+          // (F-08), a sink deduplikuje po nim. Idempotencja skutku (budzet,
+          // eskalacja) siedzi w ledgerze: drugi UPDATE niczego nie zmienia,
+          // a eskalacja idzie z predykatu wiersza (`escalated_at`), nie z koperty.
           logger.info?.(
-            `[brevo-delivery-tracker] outcome=${DELIVERY_REPLAY_SUPPRESSED_OUTCOME} ` +
+            `[brevo-delivery-tracker] outcome=${DELIVERY_REPLAY_REEMITTED_OUTCOME} ` +
               `provider_event_id=${normalized!.provider_event_id}`,
           )
-          return
         }
         const auditEvent = buildAuditEnvelope(normalized!, correlated)
 
@@ -538,7 +536,7 @@ export function __resetBrevoDeliveryTrackerForTests(): void {
 export const DELIVERY_PATH_BRAKE_ENGAGED_CODE = "DELIVERY_PATH_BRAKE_ENGAGED"
 export const DELIVERY_PATH_BRAKE_ENGAGED_METRIC =
   "gp_brevo_delivery_brake_skipped_total"
-export const DELIVERY_REPLAY_SUPPRESSED_OUTCOME = "replay_suppressed"
+export const DELIVERY_REPLAY_REEMITTED_OUTCOME = "replay_reemitted"
 
 let brakeSkippedCount = 0
 
@@ -728,12 +726,12 @@ async function lookupDispatch(
           market_id,
           template_key,
           locale,
-          consent_basis,
-          idempotency_key,
-          -- AD-23: numer proby pochodzi WYLACZNIE ze stanu systemu. Bez tej
-          -- kolumny w projekcji attempts bylo zawsze undefined, wiec drabina
-          -- ponowien startowala od nowa przy kazdym zdarzeniu.
-          attempts
+          -- R-2 (checkpoint 6.6): projekcja wylacznie z kolumn realnego
+          -- schematu voucher_delivery_dispatch. consent_basis i
+          -- idempotency_key tam nie istnieja (42703 => DISPATCH_LOOKUP_FAILED
+          -- => dispatch=null); licznik prob to attempt_count.
+          -- AD-23: numer proby pochodzi WYLACZNIE ze stanu systemu.
+          attempt_count AS attempts
         FROM voucher_delivery_dispatch
         WHERE provider_message_id = ?
         LIMIT 1

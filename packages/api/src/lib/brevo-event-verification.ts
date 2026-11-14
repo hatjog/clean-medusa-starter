@@ -25,6 +25,13 @@ export const DELIVERY_EVENT_VERIFICATION_FAILED_CODE =
 /**
  * Słownik filtra `event` endpointu statystyk Brevo (dokumentacja API v3,
  * `getEmailEventReport`). Mapa jest ZAMKNIĘTA: brak wpisu = błąd kompilacji.
+ *
+ * R-1 (checkpoint 6.6, PO D-4): pole `events[].event` w odpowiedzi ma TEN SAM
+ * enum co filtr — liczba mnoga (`bounces`, `hardBounces`, `softBounces`,
+ * `delivered`, `spam`, `requests`, `opened`, `clicks`, `invalid`, `deferred`,
+ * `blocked`, `unsubscribed`, `error`, `loadedByProxy`). Porównanie idzie po
+ * wartości filtra; mapowanie na liczbę pojedynczą dawało `unconfirmed` dla
+ * każdego prawdziwego odbicia i kliknięcia.
  */
 export const BREVO_STATISTICS_EVENT_BY_TYPE: Readonly<
   Record<NotificationDeliveryEventType, string>
@@ -113,7 +120,7 @@ export function createBrevoDeliveryEventVerifier(options: {
           entry &&
           typeof entry === "object" &&
           entry.messageId === provider_message_id &&
-          entry.event === statisticsEventSingular(statisticsEvent),
+          entry.event === statisticsEvent,
       )
       return confirmed
         ? { outcome: "confirmed", statistics_event: statisticsEvent }
@@ -123,24 +130,5 @@ export function createBrevoDeliveryEventVerifier(options: {
             error_code: DELIVERY_EVENT_PROVIDER_UNCONFIRMED_CODE,
           }
     },
-  }
-}
-
-/**
- * Filtr `event` jest w liczbie mnogiej dla części klas (`hardBounces`,
- * `softBounces`, `clicks`), a pole `event` w wierszu odpowiedzi — w pojedynczej
- * (`hardBounce`, `softBounce`, `click`). Porównanie po wartości z filtra dawałoby
- * „niepotwierdzone” dla każdego prawdziwego odbicia.
- */
-export function statisticsEventSingular(filter: string): string {
-  switch (filter) {
-    case "hardBounces":
-      return "hardBounce"
-    case "softBounces":
-      return "softBounce"
-    case "clicks":
-      return "click"
-    default:
-      return filter
   }
 }

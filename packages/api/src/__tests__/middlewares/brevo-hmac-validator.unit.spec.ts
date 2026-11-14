@@ -821,4 +821,41 @@ describe("Story 6.6 — ingress A+C: token w sciezce i jawna odmowa", () => {
       unavailable_total: 1,
     })
   })
+
+  it("R-6 — wyjatek ZAREJESTROWANEGO sinka to ta sama jawna niedostepnosc: odpowiedz odmowy, kod, licznik", async () => {
+    const { getBrevoWebhookAuditSinkState } = jest.requireActual(
+      "../../api/middlewares/brevo-hmac-validator",
+    ) as typeof import("../../api/middlewares/brevo-hmac-validator")
+    const { req } = pathRequest("not-the-token")
+    const logger = { info: jest.fn(), warn: jest.fn(), error: jest.fn() }
+    const sink = { record: jest.fn(async () => { throw new Error("sink write refused") }) }
+    req.scope.resolve = jest.fn<unknown, [string]>((key: string) => {
+      if (key === "logger") return logger
+      if (key === "notification_delivery_audit_sink") return sink
+      throw new Error(`Unknown container key: ${key}`)
+    })
+
+    const { res, nextCalled } = await invokeFullChain(req)
+    const payload = res.payload as Record<string, unknown>
+
+    expect(sink.record).toHaveBeenCalledTimes(1)
+    expect(nextCalled).toBe(false)
+    expect(res.statusCode).toBe(401)
+    expect(payload).toMatchObject({
+      error_code: "BREVO_WEBHOOK_PATH_TOKEN_MISMATCH",
+      audit_state: "BREVO_WEBHOOK_AUDIT_SINK_UNAVAILABLE",
+    })
+    expect(typeof payload.request_id).toBe("string")
+    expect(logger.error).toHaveBeenCalledWith(
+      expect.stringContaining("reason=sink_threw"),
+      expect.objectContaining({
+        error_code: "BREVO_WEBHOOK_AUDIT_SINK_UNAVAILABLE",
+        request_id: payload.request_id,
+      }),
+    )
+    expect(getBrevoWebhookAuditSinkState()).toEqual({
+      state: "unavailable_observed",
+      unavailable_total: 1,
+    })
+  })
 })

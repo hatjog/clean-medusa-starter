@@ -1,6 +1,10 @@
 import { EventEmitter } from "node:events"
 
-import { AUTHENTICATE, POST } from "../../../../api/hooks/notifications/brevo/route"
+import {
+  AUTHENTICATE,
+  BREVO_DELIVERY_EVENT_JOB_OPTIONS,
+  POST,
+} from "../../../../api/hooks/notifications/brevo/route"
 import * as tokenRoute from "../../../../api/hooks/notifications/brevo/[token]/route"
 import {
   BREVO_WEBHOOK_INGRESS_METRIC,
@@ -35,6 +39,10 @@ function request(body: Record<string, unknown>, eventBus: { emit: jest.Mock }, l
   }
 }
 
+const BREVO_DELIVERY_EVENT_JOB_OPTIONS_MATCHER = expect.objectContaining({
+  attempts: BREVO_DELIVERY_EVENT_JOB_OPTIONS.attempts,
+})
+
 describe("POST /hooks/notifications/brevo", () => {
   it("opts out of Medusa auth", () => {
     expect(AUTHENTICATE).toBe(false)
@@ -66,7 +74,7 @@ describe("POST /hooks/notifications/brevo", () => {
         provider_event_id: "brevo-message-1",
         event_type: "hard_bounce",
       }),
-    })
+    }, BREVO_DELIVERY_EVENT_JOB_OPTIONS_MATCHER)
     expect(res.statusCode).toBe(202)
     expect(res.payload).toEqual(
       expect.objectContaining({ type: "emitted", event_name: "notification.hard_bounce" }),
@@ -139,6 +147,30 @@ describe("Story 6.6 — POST /hooks/notifications/brevo/:token (ADR-213 wariant 
         provider_event_id: messageId,
         event_type: "hard_bounce",
       }),
-    })
+    }, BREVO_DELIVERY_EVENT_JOB_OPTIONS_MATCHER)
+  })
+})
+
+describe("R-4 — zdarzenie Brevo jest emitowane z ponowieniem szyny", () => {
+  it("emisja niesie attempts > 1 i backoff, wiec odmowa weryfikacji C nie gubi zdarzenia", async () => {
+    const eventBus = { emit: jest.fn(async () => undefined) }
+    const res = new FakeResponse()
+    await POST(
+      request(
+        { event: "hard_bounce", "message-id": "brevo-message-retry" },
+        eventBus,
+        { error: jest.fn() },
+      ) as never,
+      res as never,
+    )
+    expect(res.statusCode).toBe(202)
+    const options = (eventBus.emit.mock.calls[0] as unknown[])[1] as {
+      attempts: number
+      backoff: { type: string; delay: number }
+    }
+    // Domyslne `attempts: 1` event-bus-redis = brak ponowienia (FAIL).
+    expect(options.attempts).toBeGreaterThan(1)
+    expect(options.backoff.delay).toBeGreaterThan(0)
+    expect(options).toEqual(BREVO_DELIVERY_EVENT_JOB_OPTIONS)
   })
 })

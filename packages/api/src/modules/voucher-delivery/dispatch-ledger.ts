@@ -954,7 +954,14 @@ export class PgDispatchLedger
               END,
               updated_at = $4
         WHERE provider_message_id = $5
-          AND status <> $1
+          AND (
+            status <> $1
+            -- R-3: trwale odbicie po soft bounce/blocked (status juz 'failed')
+            -- MUSI domknac budzet; duplikatem jest dopiero wiersz z budzetem
+            -- juz domknietym, nie sam status docelowy.
+            OR ($6::int IS NOT NULL
+                AND attempt_count - non_recipient_failure_count < $6::int)
+          )
         RETURNING ${SELECT_COLUMNS}`,
       [
         input.status,

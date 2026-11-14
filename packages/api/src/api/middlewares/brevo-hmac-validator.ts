@@ -464,21 +464,28 @@ async function emitAuditEvent(
     ],
   )
 
-  if (typeof sink === "function") {
-    await sink(auditEvent)
-    return true
-  }
-  if (sink?.record) {
-    await sink.record(auditEvent)
-    return true
-  }
-  if (sink?.write) {
-    await sink.write(auditEvent)
-    return true
-  }
-  if (sink?.append) {
-    await sink.append(auditEvent)
-    return true
+  // R-6: wyjatek ZAREJESTROWANEGO sinka jest ta sama niedostepnoscia co brak
+  // bindingu — nie moze wyjsc z middleware'u przed odpowiedzia odmowy.
+  let sinkReason: "binding_missing" | "sink_threw" = "binding_missing"
+  try {
+    if (typeof sink === "function") {
+      await sink(auditEvent)
+      return true
+    }
+    if (sink?.record) {
+      await sink.record(auditEvent)
+      return true
+    }
+    if (sink?.write) {
+      await sink.write(auditEvent)
+      return true
+    }
+    if (sink?.append) {
+      await sink.append(auditEvent)
+      return true
+    }
+  } catch {
+    sinkReason = "sink_threw"
   }
 
   // AC3: niedostępny sink to JAWNY stan środowiska (kod, licznik, pole
@@ -486,9 +493,11 @@ async function emitAuditEvent(
   auditSinkUnavailableCount += 1
   resolveLogger(request)?.error?.(
     `[brevo-hmac-validator] error_code=${BREVO_WEBHOOK_AUDIT_SINK_UNAVAILABLE_CODE} ` +
+      `reason=${sinkReason} ` +
       `request_id=${auditEvent.request_id} rejected_error_code=${auditEvent.error_code}`,
     {
       error_code: BREVO_WEBHOOK_AUDIT_SINK_UNAVAILABLE_CODE,
+      reason: sinkReason,
       request_id: auditEvent.request_id,
       rejected_error_code: auditEvent.error_code,
     },
