@@ -19,7 +19,9 @@ import gpConfigSyncAccounts from "./gp-config-sync-accounts"
 import gpConfigSyncBlog from "./gp-config-sync-blog"
 import gpConfigSyncCatalog from "./gp-config-sync-catalog"
 import gpConfigSyncI18nContent from "./gp-config-sync-i18n-content"
-import gpConfigSyncMarketRuntime from "./gp-config-sync-market-runtime"
+import gpConfigSyncMarketRuntime, {
+  MONEY_PATH_BRAKES_DRIFT_ERROR_CODE,
+} from "./gp-config-sync-market-runtime"
 import gpConfigSyncTranslations from "./gp-config-sync-translations"
 import gpConfigSyncMedia from "./gp-config-sync-media"
 import gpConfigSyncPayments from "./gp-config-sync-payments"
@@ -397,6 +399,73 @@ export async function runStage(stage: {
   }
 }
 
+/**
+ * Story 6.8 (R-15/R-19) — etap `sync-market-runtime` zwrócił raport
+ * `ok=false` bez wyjątku. Wrapper nie może zamienić go na string sukcesu:
+ * błąd jest FATALNY z nazwanym kodem, więc `runStage` daje `failed`, a run
+ * kończy się `ok=false` / exit 1 (także w dry-run).
+ */
+export class MarketRuntimeStageNotOkError extends Error {
+  readonly error_code = MONEY_PATH_BRAKES_DRIFT_ERROR_CODE
+  readonly fatal = true
+
+  constructor(public readonly mismatches: string[]) {
+    super(
+      `${MONEY_PATH_BRAKES_DRIFT_ERROR_CODE} [stage-summary] sync-market-runtime zwrócił ok=false: ${
+        mismatches.length > 0 ? mismatches.join("; ") : "brak szczegółów"
+      }`,
+    )
+    this.name = "MarketRuntimeStageNotOkError"
+  }
+}
+
+type MarketRuntimeStageSummary = {
+  ok?: boolean
+  action?: string
+  warnings?: string[]
+  money_path_brakes_round_trip?: { mismatches?: string[] }
+} | undefined | null
+
+/**
+ * Story 6.8 (R-15/R-18/R-19) — logika wrappera etapu `sync-market-runtime`,
+ * wydzielona, żeby test mógł ją wołać przez `runStage`. Czyta `summary.ok`
+ * (brak raportu albo `ok !== true` = porażka fatalna) i przenosi nazwane
+ * warningi etapu (np. zastany rozjazd naprawiony w apply) do warningów runu.
+ */
+export async function executeMarketRuntimeStage(input: {
+  dryRun: boolean
+  run: () => Promise<MarketRuntimeStageSummary>
+  warnings: string[]
+}): Promise<string> {
+  const summary = await input.run()
+  if (!summary || summary.ok !== true) {
+    throw new MarketRuntimeStageNotOkError(
+      summary?.money_path_brakes_round_trip?.mismatches ?? [],
+    )
+  }
+  for (const warning of summary.warnings ?? []) {
+    input.warnings.push(`sync-market-runtime: ${warning}`)
+  }
+  return input.dryRun
+    ? `market runtime dry-run completed (action=${summary.action})`
+    : `market runtime sync completed (action=${summary.action})`
+}
+
+/**
+ * Story 6.8 (R-2/R-15) — werdykt runu: etap `failed` (fatalny, nazwany kod)
+ * wywraca run także w dry-run. Wydzielone z domyślnego eksportu, żeby mutant
+ * usuwający ten blok był czerwony w teście.
+ */
+export function applyFatalStageVerdict(
+  summary: { ok: boolean },
+  stages: ReadonlyArray<{ status: string }>,
+): void {
+  if (stages.some((stage) => stage.status === "failed")) {
+    summary.ok = false
+    process.exitCode = 1
+  }
+}
+
 export function buildStageArgs(orchestratorArgs: OrchestratorArgs): string[] {
   const args = [orchestratorArgs.instanceId, orchestratorArgs.marketId]
   if (orchestratorArgs.dryRun) {
@@ -770,20 +839,22 @@ export default async function gpConfigSyncOrchestrator({ container, args }: Exec
         // petla dobiega do konca i raport etapow powstaje.
         name: "sync-market-runtime",
         required: false,
-        execute: async () => {
-          const summary = await withStageEnv(orchestratorArgs, async () => {
-            return await invokeStageEntrypoint(
-              gpConfigSyncMarketRuntime,
-              container,
-              stageArgs,
-              { stage: "sync-market-runtime", sink: stageExitSignals },
-            )
-          })
-
-          return orchestratorArgs.dryRun
-            ? `market runtime dry-run completed (action=${summary?.action})`
-            : `market runtime sync completed (action=${summary?.action})`
-        },
+        // Story 6.8 (R-15/R-19): wrapper czyta `summary.ok` — raport
+        // `ok=false` jest błędem fatalnym, nie stringiem sukcesu.
+        execute: async () =>
+          executeMarketRuntimeStage({
+            dryRun: orchestratorArgs.dryRun,
+            warnings,
+            run: () =>
+              withStageEnv(orchestratorArgs, async () => {
+                return await invokeStageEntrypoint(
+                  gpConfigSyncMarketRuntime,
+                  container,
+                  stageArgs,
+                  { stage: "sync-market-runtime", sink: stageExitSignals },
+                )
+              }),
+          }),
       },
       {
         name: "sync-catalog",
@@ -1169,10 +1240,7 @@ export default async function gpConfigSyncOrchestrator({ container, args }: Exec
 
     // Story 6.8 (R-2) — etap z błędem fatalnym (nazwany kod) wywraca run
     // także w dry-run: rozjazd hamulca ścieżki pieniądza nie jest kosmetyką.
-    if (stages.some((stage) => stage.status === "failed")) {
-      summary.ok = false
-      process.exitCode = 1
-    }
+    applyFatalStageVerdict(summary, stages)
 
     if (!orchestratorArgs.dryRun && process.env.SLACK_WEBHOOK_URL?.trim()) {
       try {

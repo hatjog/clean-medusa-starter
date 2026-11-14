@@ -29,6 +29,11 @@ import {
   normalizeMoneyPathBrakes,
 } from "../../scripts/gp-config-sync-market-runtime"
 import gpConfigSyncMarketRuntime from "../../scripts/gp-config-sync-market-runtime"
+import {
+  applyFatalStageVerdict,
+  executeMarketRuntimeStage,
+  runStage,
+} from "../../scripts/gp-config-sync-orchestrator"
 
 describe("normalizeMoneyPathBrakes", () => {
   it("brak bloku => wszystkie pięć hamulców zaciągniętych", () => {
@@ -171,14 +176,21 @@ function fakeRuntimeDb(initial: Record<string, unknown> | null, options: { dropW
   return { raw, current: () => row }
 }
 
+/** `process.exitCode` ustawiony przez entrypoint w ostatnim `runSync` (przywracany po każdym wywołaniu). */
+let lastStageExitCode: number | string | undefined
+
 async function runSync(fixture: Fixture, db: { raw: jest.Mock }, apply: boolean) {
   const env = { ...process.env }
+  const previousExitCode = process.exitCode
+  process.exitCode = undefined
+  lastStageExitCode = undefined
   process.env.GP_CONFIG_ROOT = fixture.configRoot
   process.env.GP_MARKETS_SOURCE_ROOT = fixture.marketsSourceRoot
   delete process.env.GP_DRY_RUN
   if (apply) process.env.GP_SYNC_APPLY = "true"
   else delete process.env.GP_SYNC_APPLY
   const log = jest.spyOn(console, "log").mockImplementation(() => undefined)
+  const warn = jest.spyOn(console, "warn").mockImplementation(() => undefined)
   try {
     return await gpConfigSyncMarketRuntime({
       container: { resolve: () => db },
@@ -186,8 +198,44 @@ async function runSync(fixture: Fixture, db: { raw: jest.Mock }, apply: boolean)
     } as never)
   } finally {
     log.mockRestore()
+    warn.mockRestore()
     process.env = env
+    lastStageExitCode = process.exitCode
+    process.exitCode = previousExitCode
   }
+}
+
+const DRIFTED_ROW = {
+  locales: {},
+  support_email: "x",
+  market_url: "x",
+  money_path_brakes: { ...ALL_ENGAGED, fr_9_delivery_idempotency: "released" },
+}
+
+/**
+ * Etap tak, jak woła go orchestrator: `runStage` (etap OPCJONALNY) +
+ * wrapper `executeMarketRuntimeStage` + werdykt runu. Mutant wrappera
+ * ignorującego `summary.ok` albo werdyktu ignorującego `failed` jest czerwony.
+ */
+async function runStageAsOrchestrator(fixture: Fixture, db: { raw: jest.Mock }, apply: boolean) {
+  const warnings: string[] = []
+  const stage = await runStage({
+    name: "sync-market-runtime",
+    required: false,
+    execute: () =>
+      executeMarketRuntimeStage({
+        dryRun: !apply,
+        warnings,
+        run: () => runSync(fixture, db, apply),
+      }),
+  })
+  const previousExitCode = process.exitCode
+  process.exitCode = undefined
+  const summary = { ok: true }
+  applyFatalStageVerdict(summary, [stage])
+  const runExitCode = process.exitCode
+  process.exitCode = previousExitCode
+  return { stage, warnings, summary, runExitCode }
 }
 
 describe("Story 6.8 — kontrakt round-tripu na fixture'ach (kanoniczne źródło)", () => {
@@ -238,7 +286,8 @@ describe("Story 6.8 — kontrakt round-tripu na fixture'ach (kanoniczne źródł
 
   it("R-1: sidecar z innym sha źródła jest raportowany jako projekcja nie z tego źródła", async () => {
     const f = fixture({ source: ALL_ENGAGED, projection: ALL_ENGAGED, sidecarSourceSha: "stale" })
-    const summary = await runSync(f, fakeRuntimeDb(null), false)
+    // apply: dry-run na pustej bazie jest od R-18 fatalny (brak wiersza nie jest zgodnością)
+    const summary = await runSync(f, fakeRuntimeDb(null), true)
     expect(summary.money_path_brakes_round_trip.provenance.projection_built_from_source).toBe(false)
   })
 
@@ -251,32 +300,122 @@ describe("Story 6.8 — kontrakt round-tripu na fixture'ach (kanoniczne źródł
     })
   })
 
-  it("R-3: zastany rozjazd bazy (released przy źródle engaged) — dry-run ok=false i nazwany pre_apply_drift", async () => {
+  it("R-3/R-18: zastany rozjazd bazy (released przy źródle engaged) — dry-run kończy etap błędem fatalnym pre-apply i exitCode=1", async () => {
     const f = fixture({ source: ALL_ENGAGED, projection: ALL_ENGAGED })
-    const db = fakeRuntimeDb({
-      locales: {},
-      support_email: "x",
-      market_url: "x",
-      money_path_brakes: { ...ALL_ENGAGED, fr_9_delivery_idempotency: "released" },
+    const db = fakeRuntimeDb(DRIFTED_ROW)
+    await expect(runSync(f, db, false)).rejects.toMatchObject({
+      name: "MoneyPathBrakesDriftError",
+      error_code: MONEY_PATH_BRAKES_DRIFT_ERROR_CODE,
+      fatal: true,
+      phase: "pre-apply",
+      message: expect.stringMatching(
+        /fr_9_delivery_idempotency: source 'engaged' != runtime 'released'/,
+      ),
     })
-    const summary = await runSync(f, db, false)
-    expect(summary.ok).toBe(false)
-    expect(summary.money_path_brakes_round_trip.pre_apply_drift.join(" ")).toMatch(
-      /fr_9_delivery_idempotency: source 'engaged' != runtime 'released'/,
+    expect(lastStageExitCode).toBe(1)
+    expect(db.raw.mock.calls.some(([sql]) => /INSERT INTO/.test(String(sql)))).toBe(false)
+  })
+
+  it("R-15/R-19: zastany rozjazd w dry-run przez runStage => failed + nazwany kod, run ok=false / exit 1", async () => {
+    const f = fixture({ source: ALL_ENGAGED, projection: ALL_ENGAGED })
+    const { stage, summary, runExitCode } = await runStageAsOrchestrator(
+      f,
+      fakeRuntimeDb(DRIFTED_ROW),
+      false,
     )
+    expect(stage.status).toBe("failed")
+    expect(stage.error_code).toBe(MONEY_PATH_BRAKES_DRIFT_ERROR_CODE)
+    expect(stage.message).toMatch(/\[pre-apply\]/)
+    expect(summary.ok).toBe(false)
+    expect(runExitCode).toBe(1)
+  })
+
+  it("R-18: pusta baza bez wiersza rynku w dry-run => failed (brak wpisu nie zwalnia hamulca)", async () => {
+    const f = fixture({ source: ALL_ENGAGED, projection: ALL_ENGAGED })
+    const { stage, summary, runExitCode } = await runStageAsOrchestrator(f, fakeRuntimeDb(null), false)
+    expect(stage.status).toBe("failed")
+    expect(stage.error_code).toBe(MONEY_PATH_BRAKES_DRIFT_ERROR_CODE)
+    expect(stage.message).toMatch(/runtime: brak bloku money_path_brakes/)
+    expect(summary.ok).toBe(false)
+    expect(runExitCode).toBe(1)
+  })
+
+  it("R-18: zgodna baza w dry-run => ok (kontrola: hamulec nie wywraca zgodnego runu)", async () => {
+    const f = fixture({ source: ALL_ENGAGED, projection: ALL_ENGAGED })
+    const { stage, summary, runExitCode } = await runStageAsOrchestrator(
+      f,
+      fakeRuntimeDb({ ...DRIFTED_ROW, money_path_brakes: ALL_ENGAGED }),
+      false,
+    )
+    expect(stage.status).toBe("ok")
+    expect(summary.ok).toBe(true)
+    expect(runExitCode).toBeUndefined()
+  })
+
+  it("R-17/R-18: apply z zastanym rozjazdem naprawia w stronę źródła i NAZYWA rozjazd w warnings runu", async () => {
+    const f = fixture({ source: ALL_ENGAGED, projection: ALL_ENGAGED })
+    const db = fakeRuntimeDb(DRIFTED_ROW)
+    const { stage, warnings, summary } = await runStageAsOrchestrator(f, db, true)
+    expect(stage.status).toBe("ok")
+    expect(summary.ok).toBe(true)
+    expect(warnings.join("\n")).toMatch(
+      /sync-market-runtime: GP_CONFIG_MONEY_PATH_BRAKES_DRIFT \[pre-apply\].*fr_9_delivery_idempotency: source 'engaged' != runtime 'released'/,
+    )
+    expect((db.current() as { money_path_brakes: unknown }).money_path_brakes).toEqual(ALL_ENGAGED)
+  })
+
+  it("R-16: literówka w KANONICZNYM źródle (relesed) => fatal source-invalid przez runStage, baza nietknięta", async () => {
+    const f = fixture({ source: ALL_ENGAGED, projection: ALL_ENGAGED })
+    fs.writeFileSync(
+      f.sourcePath,
+      fs
+        .readFileSync(f.sourcePath, "utf8")
+        .replace(/fr_9_delivery_idempotency: engaged/, "fr_9_delivery_idempotency: relesed"),
+    )
+    expect(fs.readFileSync(f.sourcePath, "utf8")).toMatch(/relesed/)
+    const db = fakeRuntimeDb(DRIFTED_ROW)
+    await expect(runSync(f, db, true)).rejects.toMatchObject({
+      error_code: MONEY_PATH_BRAKES_DRIFT_ERROR_CODE,
+      fatal: true,
+      phase: "source-invalid",
+    })
+    const { stage, summary, runExitCode } = await runStageAsOrchestrator(f, db, true)
+    expect(stage.status).toBe("failed")
+    expect(stage.message).toMatch(/\[source-invalid\].*relesed/)
+    expect(summary.ok).toBe(false)
+    expect(runExitCode).toBe(1)
+    expect(db.raw.mock.calls.some(([sql]) => /INSERT INTO/.test(String(sql)))).toBe(false)
+    expect((db.current() as { money_path_brakes: unknown }).money_path_brakes).toEqual(
+      DRIFTED_ROW.money_path_brakes,
+    )
+  })
+
+  it("R-16: ta sama literówka w źródle I projekcji (assemble kopiuje) też jest fatalna, nie warningiem locales", async () => {
+    const typo = { ...ALL_ENGAGED, fr_9_delivery_idempotency: "relesed" }
+    const f = fixture({ source: typo, projection: typo })
+    const { stage, runExitCode } = await runStageAsOrchestrator(f, fakeRuntimeDb(null), true)
+    expect(stage.status).toBe("failed")
+    expect(stage.error_code).toBe(MONEY_PATH_BRAKES_DRIFT_ERROR_CODE)
+    expect(stage.message).toMatch(/\[source-invalid\]/)
+    expect(runExitCode).toBe(1)
+  })
+
+  it("R-16: nieparsowalny YAML kanonicznego źródła => fatal source-invalid", async () => {
+    const f = fixture({ source: ALL_ENGAGED, projection: ALL_ENGAGED })
+    fs.writeFileSync(f.sourcePath, "- tylko\n- lista\n")
+    await expect(runSync(f, fakeRuntimeDb(null), true)).rejects.toMatchObject({
+      error_code: MONEY_PATH_BRAKES_DRIFT_ERROR_CODE,
+      phase: "source-invalid",
+    })
   })
 
   it("R-3: apply naprawia zastany rozjazd w stronę źródła i to jest widoczne w raporcie", async () => {
     const f = fixture({ source: ALL_ENGAGED, projection: ALL_ENGAGED })
-    const db = fakeRuntimeDb({
-      locales: {},
-      support_email: "x",
-      market_url: "x",
-      money_path_brakes: { ...ALL_ENGAGED, fr_9_delivery_idempotency: "released" },
-    })
+    const db = fakeRuntimeDb(DRIFTED_ROW)
     const summary = await runSync(f, db, true)
     expect(summary.ok).toBe(true)
     expect(summary.money_path_brakes_round_trip.pre_apply_drift).not.toHaveLength(0)
+    expect(summary.warnings.join(" ")).toMatch(/GP_CONFIG_MONEY_PATH_BRAKES_DRIFT \[pre-apply\]/)
     expect((db.current() as { money_path_brakes: unknown }).money_path_brakes).toEqual(ALL_ENGAGED)
   })
 
@@ -364,6 +503,22 @@ describe("Story 6.8 — kontrakt round-tripu na fixture'ach (kanoniczne źródł
         existingRuntimeBlock: null,
       }),
     ).toThrow(/money_path_brakes\.fr_9_delivery_idempotency/)
+  })
+
+  it("R-16: checkMoneyPathBrakesBeforeApply — literówka w kanonicznym źródle jest fatalna (source-invalid)", () => {
+    let caught: unknown
+    try {
+      checkMoneyPathBrakesBeforeApply({
+        marketId: "bonbeauty",
+        canonicalBlock: { fr_9_delivery_idempotency: "relesed" },
+        projectionBlock: ALL_ENGAGED,
+        existingRuntimeBlock: ALL_ENGAGED,
+      })
+    } catch (error) {
+      caught = error
+    }
+    expect(caught).toBeInstanceOf(MoneyPathBrakesDriftError)
+    expect(caught).toMatchObject({ fatal: true, phase: "source-invalid" })
   })
 })
 

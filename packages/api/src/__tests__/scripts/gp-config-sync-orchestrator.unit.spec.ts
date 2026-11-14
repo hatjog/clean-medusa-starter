@@ -1,5 +1,7 @@
 import {
+  applyFatalStageVerdict,
   assertTranslationStageGate,
+  executeMarketRuntimeStage,
   buildHealthReport,
   buildStageArgs,
   callRevalidateAll,
@@ -268,6 +270,75 @@ describe("runStage", () => {
     })
     expect(result.status).toBe("warning")
     expect(result.error_code).toBeUndefined()
+  })
+})
+
+// Story 6.8 (R-15/R-19) — wrapper etapu sync-market-runtime czyta summary.ok.
+// Mutant „wrapper zwraca string sukcesu niezależnie od ok" daje tu `ok` => czerwień.
+describe("executeMarketRuntimeStage — wrapper nie połyka summary.ok=false", () => {
+  const stageOf = (summary: unknown, dryRun = true, warnings: string[] = []) =>
+    runStage({
+      name: "sync-market-runtime",
+      required: false,
+      execute: () =>
+        executeMarketRuntimeStage({ dryRun, warnings, run: async () => summary as never }),
+    })
+
+  it("summary.ok=false bez wyjątku => failed z nazwanym kodem", async () => {
+    const result = await stageOf({
+      ok: false,
+      action: "unchanged",
+      money_path_brakes_round_trip: { mismatches: ["fr_9_delivery_idempotency: source 'engaged' != runtime 'released'"] },
+    })
+    expect(result.status).toBe("failed")
+    expect(result.error_code).toBe("GP_CONFIG_MONEY_PATH_BRAKES_DRIFT")
+    expect(result.message).toMatch(/fr_9_delivery_idempotency/)
+  })
+
+  it("brak raportu etapu => failed (brak wpisu nie jest sukcesem)", async () => {
+    const result = await stageOf(undefined, false)
+    expect(result.status).toBe("failed")
+  })
+
+  it("summary.ok=true => ok, a nazwane warningi etapu trafiają do warningów runu", async () => {
+    const warnings: string[] = []
+    const result = await stageOf(
+      { ok: true, action: "update", warnings: ["GP_CONFIG_MONEY_PATH_BRAKES_DRIFT [pre-apply] x"] },
+      false,
+      warnings,
+    )
+    expect(result.status).toBe("ok")
+    expect(result.message).toBe("market runtime sync completed (action=update)")
+    expect(warnings).toEqual(["sync-market-runtime: GP_CONFIG_MONEY_PATH_BRAKES_DRIFT [pre-apply] x"])
+  })
+})
+
+describe("applyFatalStageVerdict — etap failed wywraca run (R-15/R-20)", () => {
+  const withExitCode = (fn: () => void) => {
+    const previous = process.exitCode
+    process.exitCode = undefined
+    try {
+      fn()
+      return process.exitCode
+    } finally {
+      process.exitCode = previous
+    }
+  }
+
+  it("failed => ok=false i exitCode=1", () => {
+    const summary = { ok: true }
+    const code = withExitCode(() =>
+      applyFatalStageVerdict(summary, [{ status: "ok" }, { status: "failed" }]),
+    )
+    expect(summary.ok).toBe(false)
+    expect(code).toBe(1)
+  })
+
+  it("same warningi => run nietknięty", () => {
+    const summary = { ok: true }
+    const code = withExitCode(() => applyFatalStageVerdict(summary, [{ status: "warning" }]))
+    expect(summary.ok).toBe(true)
+    expect(code).toBeUndefined()
   })
 })
 

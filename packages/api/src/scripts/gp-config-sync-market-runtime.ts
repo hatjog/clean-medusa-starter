@@ -311,7 +311,55 @@ export type MoneyPathBrakesRoundTrip = {
  */
 export const MONEY_PATH_BRAKES_DRIFT_ERROR_CODE = "GP_CONFIG_MONEY_PATH_BRAKES_DRIFT" as const
 
-export type MoneyPathBrakesDriftPhase = "source-projection" | "pre-apply" | "post-apply" | "source-missing"
+/**
+ * Fazy rozjazdu (Story 6.8):
+ * - `source-invalid` (R-16): KANONICZNE źródło ma niepoprawny blok hamulców
+ *   (literówka stanu, przełącznik spoza ADR-177, pusty blok, zły YAML). To nie
+ *   jest błąd locales — bez poprawnego źródła nie da się wykazać, co runtime
+ *   ma odtwarzać, więc etap jest fatalny, a zastany runtime nie jest „zgodny".
+ * - `source-projection`: projekcja `GP_CONFIG_ROOT` nie odtwarza źródła (także:
+ *   projekcja z niepoprawnym blokiem hamulców).
+ * - `pre-apply` (R-15/R-18/R-19): dry-run zastał bazę, która nie odtwarza
+ *   źródła — w tym PUSTĄ bazę bez wiersza rynku (brak wpisu nie zwalnia
+ *   hamulca i nie jest zgodnością przez wartość domyślną).
+ * - `post-apply`: po zapisie runtime nadal nie odtwarza źródła.
+ * - `source-missing`: brak pliku kanonicznego źródła.
+ */
+export type MoneyPathBrakesDriftPhase =
+  | "source-projection"
+  | "source-invalid"
+  | "pre-apply"
+  | "post-apply"
+  | "source-missing"
+
+/**
+ * Story 6.8 (R-16) — normalizuje blok hamulców, zamieniając
+ * `MarketRuntimeConfigInvalidError` w fatalny `MoneyPathBrakesDriftError`
+ * nazwanej fazy. Bez tego literówka w bloku hamulców (np. `relesed`) była
+ * zwykłym wyjątkiem, który etap opcjonalny degraduje do `warning`, a zastany
+ * runtime zostawał bez sygnału fail-closed.
+ */
+export function normalizeMoneyPathBrakesOrFatal(
+  marketId: string,
+  raw: unknown,
+  phase: "source-invalid" | "source-projection",
+): Record<string, string> {
+  try {
+    return normalizeMoneyPathBrakes(raw)
+  } catch (error) {
+    if (!(error instanceof MarketRuntimeConfigInvalidError)) throw error
+    throw new MoneyPathBrakesDriftError(
+      {
+        market_id: marketId,
+        ok: false,
+        source: {},
+        runtime: null,
+        mismatches: [`${phase === "source-invalid" ? "source" : "projection"}: ${error.message}`],
+      },
+      phase,
+    )
+  }
+}
 
 export class MoneyPathBrakesDriftError extends Error {
   readonly error_code = MONEY_PATH_BRAKES_DRIFT_ERROR_CODE
@@ -487,8 +535,29 @@ export async function loadCanonicalMarketSource(
   }
 
   const sourceSha = sha256Hex(sourceRaw)
+  // R-16: nieparsowalne kanoniczne źródło to ten sam przypadek co brak
+  // źródła — nie zwykły błąd etapu opcjonalnego.
+  let sourceDoc: Record<string, unknown>
+  try {
+    sourceDoc = parseMarketYamlDocument(sourceRaw.toString("utf8"), sourcePath)
+  } catch (error) {
+    throw new MoneyPathBrakesDriftError(
+      {
+        market_id: args.marketId,
+        ok: false,
+        source: {},
+        runtime: null,
+        mismatches: [
+          `source: niepoprawny YAML kanonicznego market.yaml (${sourcePath}): ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        ],
+      },
+      "source-invalid",
+    )
+  }
   return {
-    doc: parseMarketYamlDocument(sourceRaw.toString("utf8"), sourcePath),
+    doc: sourceDoc,
     provenance: {
       source_path: sourcePath,
       source_sha256: sourceSha,
@@ -523,8 +592,14 @@ export function checkMoneyPathBrakesBeforeApply(input: {
   projectionBlock: unknown
   existingRuntimeBlock: unknown
 }): MoneyPathBrakesPreApplyCheck {
-  // Projekcja musi się normalizować (literówka = błąd), a potem odtwarzać źródło.
-  const projection = normalizeMoneyPathBrakes(input.projectionBlock)
+  // R-16: najpierw KANONICZNE źródło — jego błąd jest fatalny (`source-invalid`).
+  normalizeMoneyPathBrakesOrFatal(input.marketId, input.canonicalBlock, "source-invalid")
+  // Projekcja musi się normalizować (literówka = błąd fatalny), a potem odtwarzać źródło.
+  const projection = normalizeMoneyPathBrakesOrFatal(
+    input.marketId,
+    input.projectionBlock,
+    "source-projection",
+  )
   const sourceProjection = compareMoneyPathBrakesRoundTrip(
     input.marketId,
     input.canonicalBlock,
@@ -701,13 +776,20 @@ export default async function gpConfigSyncMarketRuntime({
 }: ExecArgs) {
   const parsedArgs = parseMarketRuntimeSyncArgs(args)
   const marketYaml = await loadMarketYaml(parsedArgs)
+
+  // Story 6.8 (R-1/R-3/R-16): kontrola PRZED zapisem — kanoniczne źródło
+  // (gp-ops/markets) vs projekcja i vs zastany wiersz. Rozjazd albo błąd
+  // bloku hamulców (źródło lub projekcja) rzuca `MoneyPathBrakesDriftError`
+  // (fatal) zanim cokolwiek trafi do bazy — także zanim
+  // `buildMarketRuntimeRecord` zdążyłby rzucić zwykły (degradowany do
+  // `warning`) `MarketRuntimeConfigInvalidError` dla tego samego bloku.
+  const canonical = await loadCanonicalMarketSource(parsedArgs)
+  normalizeMoneyPathBrakesOrFatal(parsedArgs.marketId, canonical.doc.money_path_brakes, "source-invalid")
+  normalizeMoneyPathBrakesOrFatal(parsedArgs.marketId, marketYaml.money_path_brakes, "source-projection")
+
   const record = buildMarketRuntimeRecord(parsedArgs.marketId, marketYaml)
   const db = container.resolve(ContainerRegistrationKeys.PG_CONNECTION) as Knex
 
-  // Story 6.8 (R-1/R-3): kontrola PRZED zapisem — kanoniczne źródło
-  // (gp-ops/markets) vs projekcja i vs zastany wiersz. Rozjazd źródło↔projekcja
-  // rzuca `MoneyPathBrakesDriftError` (fatal) zanim cokolwiek trafi do bazy.
-  const canonical = await loadCanonicalMarketSource(parsedArgs)
   const preApply = checkMoneyPathBrakesBeforeApply({
     marketId: record.market_id,
     canonicalBlock: canonical.doc.money_path_brakes,
@@ -753,8 +835,27 @@ export default async function gpConfigSyncMarketRuntime({
       pre_apply_drift: preApply.pre_apply.ok ? [] : preApply.pre_apply.mismatches,
       provenance: canonical.provenance,
     },
+    // R-18: zastany rozjazd naprawiony w apply jest NAZWANY w warnings (apply
+    // w stronę źródła jest legalną ścieżką aktywacji — R-17 — więc to nie
+    // porażka, ale operator musi widzieć, że baza nie odtwarzała źródła).
+    warnings:
+      !parsedArgs.dryRun && !preApply.pre_apply.ok
+        ? [
+            `${MONEY_PATH_BRAKES_DRIFT_ERROR_CODE} [pre-apply] zastany rozjazd naprawiony w stronę źródła: ${preApply.pre_apply.mismatches.join("; ")}`,
+          ]
+        : ([] as string[]),
   }
 
   console.log(JSON.stringify(summary, null, 2))
+
+  // R-15/R-18/R-19: dry-run, który zastał rozjazd (także pustą bazę bez
+  // wiersza rynku — brak wpisu nie zwalnia hamulca), kończy etap błędem
+  // FATALNYM z nazwanym kodem. Sam `ok=false` w JSON i sam `process.exitCode`
+  // nie wystarczają: orchestrator degraduje exitCode etapu do `warning`.
+  if (parsedArgs.dryRun && !brakesRoundTrip.ok) {
+    process.exitCode = 1
+    throw new MoneyPathBrakesDriftError(brakesRoundTrip, "pre-apply")
+  }
+  for (const warning of summary.warnings) console.warn(warning)
   return summary
 }
