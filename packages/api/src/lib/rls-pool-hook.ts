@@ -15,6 +15,8 @@
  *   If RESET fails on release, the connection is destroyed (not returned dirty).
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
+
 import { marketContextStorage } from "./market-context";
 
 const SAFE_ID_RE = /^[a-zA-Z0-9_-]+$/;
@@ -95,6 +97,17 @@ export function installRlsPoolHook(
   client.acquireConnection = async function (): Promise<QueryableConnection> {
     const connection = await origAcquire();
     const ctx = marketContextStorage.getStore();
+
+    if (!ctx?.market_id && consumeSellerMarketLookupGrant()) {
+      // Named, one-shot exception (SELLER_MARKET_LOOKUP_EXCEPTION): exactly one
+      // connection for the fixed `seller` read by id in
+      // `lookupSellerMarketIdWithoutMarketContext`. No SET ROLE / market var —
+      // the connection carries no market and is released untouched.
+      logger?.info?.("RLS pool hook named exception", {
+        exception: SELLER_MARKET_LOOKUP_EXCEPTION,
+      });
+      return connection;
+    }
 
     if (!ctx?.market_id) {
       logger?.error?.("RLS pool hook acquire denied", {
@@ -233,4 +246,57 @@ export function installRlsPoolHook(
 /** Reset installed flag — for testing only */
 export function _resetRlsPoolHook(): void {
   installedClients = new WeakSet<object>();
+}
+
+/**
+ * Named exception to the 11.1 boundary ("no connection without market context"),
+ * Story 5.4 fix (DW-15-300). The market of an authenticated `/vendor/*` seller is
+ * stored on the seller row itself, so it cannot be read INSIDE a market context
+ * that does not exist yet. The exception is deliberately narrow:
+ *   - it is NOT a general "run without context" scope — the only entry point is
+ *     `lookupSellerMarketIdWithoutMarketContext`, which runs ONE fixed query
+ *     (`seller.metadata->'gp'->>'market_id'` WHERE `id = $sellerId`);
+ *   - the grant is one-shot: it admits a single connection acquisition and is
+ *     consumed by it; any further acquisition in the same async scope is denied
+ *     as before (`missing_market_context`);
+ *   - inside an existing market context it is never consulted.
+ */
+export const SELLER_MARKET_LOOKUP_EXCEPTION = "seller_market_lookup";
+
+type SellerMarketLookupGrant = { remaining: number };
+const sellerMarketLookupStorage = new AsyncLocalStorage<SellerMarketLookupGrant>();
+
+function consumeSellerMarketLookupGrant(): boolean {
+  const grant = sellerMarketLookupStorage.getStore();
+  if (!grant || grant.remaining <= 0) return false;
+  grant.remaining -= 1;
+  return true;
+}
+
+type SellerLookupKnex = {
+  (table: string): {
+    select: (...args: unknown[]) => {
+      where: (column: string, value: string) => {
+        first: () => Promise<{ market_id?: string | null } | undefined>;
+      };
+    };
+  };
+  raw: (sql: string) => unknown;
+};
+
+export async function lookupSellerMarketIdWithoutMarketContext(
+  db: SellerLookupKnex,
+  sellerId: string
+): Promise<string | null> {
+  const grant: SellerMarketLookupGrant = { remaining: 1 };
+  // `async` + `await` INSIDE run(): a Knex builder executes on `.then`, so it
+  // must be awaited within the grant scope, not after it.
+  const row = await sellerMarketLookupStorage.run(grant, async () =>
+    await db("seller")
+      .select(db.raw("metadata->'gp'->>'market_id' as market_id"))
+      .where("id", sellerId)
+      .first()
+  );
+  grant.remaining = 0;
+  return row?.market_id ?? null;
 }

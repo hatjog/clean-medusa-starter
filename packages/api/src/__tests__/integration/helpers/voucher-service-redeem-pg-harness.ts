@@ -132,8 +132,6 @@ async function moduleMigrationSql(): Promise<string[]> {
 export type Harness = {
   admin: Knex
   db: Knex
-  /** Pula BEZ hooka RLS — wyłącznie do odczytu `seller` przed kontekstem rynku. */
-  sellerLookupDb: Knex
   service: VoucherService
   container: Record<string, any>
 }
@@ -191,20 +189,14 @@ export async function setUpHarness(): Promise<Harness> {
     pool: { min: 1, max: 5 },
   })
   installRlsPoolHook(db)
-  const sellerLookupDb = knex({
-    client: "pg",
-    connection: connectionFor({ user: PRODUCER_LOGIN, password: LOGIN_PASSWORD }),
-    pool: { min: 0, max: 2 },
-  })
 
   const container = { [ContainerRegistrationKeys.PG_CONNECTION]: db }
   const service = new VoucherService(container)
-  return { admin, db, sellerLookupDb, service, container }
+  return { admin, db, service, container }
 }
 
 export async function tearDownHarness(h: Harness | undefined): Promise<void> {
   await h?.db?.destroy()
-  await h?.sellerLookupDb?.destroy()
   await h?.admin?.destroy()
   _resetRlsPoolHook()
   if (previousInstanceId === undefined) delete process.env.GP_INSTANCE_ID
@@ -303,7 +295,7 @@ export async function callRedeemRoute(
     seller_context: { seller_id: SELLER },
     scope: {
       resolve: (key: string) => {
-        if (key === ContainerRegistrationKeys.PG_CONNECTION) return withSellerLookup(h, pgConnection)
+        if (key === ContainerRegistrationKeys.PG_CONNECTION) return pgConnection
         if (key === "gp_core") return { resolveVendorId: async () => VENDOR }
         if (key === "voucher" || key === "voucherModuleService") return h.service
         throw new Error(`not registered: ${key}`)
@@ -312,26 +304,6 @@ export async function callRedeemRoute(
   }
   await REDEEM_ROUTE(req, res)
   return captured
-}
-
-/**
- * OBEJŚCIE ZNANEGO DEFEKTU, nazwane (DW zapisane przez Story 5.4): trasa woła
- * `resolveSellerMarketId(db, …)` PRZED `runInHttpMarketContext`, a hook RLS
- * na `PG_CONNECTION` (instalowany globalnie loaderem `market-context-cache`)
- * odmawia każdego połączenia bez kontekstu (`missing_market_context`). Na
- * puli z hookiem trasa nie dochodzi do realizacji w ogóle — to jest zastana
- * czerwień profili `voucher-redemption` / `redeem-for-seller`.
- *
- * Tu WYŁĄCZNIE wywołanie Knexa jako funkcji (`db("seller")`, jedyne użycie
- * w `resolveSellerMarketId`) idzie pulą bez hooka; `.client` — czyli cała
- * ścieżka realizacji przez `resolveRlsConnectionSource` — zostaje pod hookiem.
- */
-function withSellerLookup(h: Harness, pgConnection: any): unknown {
-  return new Proxy(pgConnection, {
-    apply(_target, _this, args) {
-      return (h.sellerLookupDb as any)(...args)
-    },
-  })
 }
 
 /**
