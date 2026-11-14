@@ -57,6 +57,40 @@ export type ClassifyOptions = {
   permanentDefectCode?: (err: unknown) => string | null
 }
 
+/**
+ * Kody błędów systemowych gniazda (node `net`/`dns`), z którymi node-pg
+ * zgłasza utratę połączenia BEZ SQLSTATE. To wady przejściowe — bez tego
+ * rozpoznania szły do DLQ jako `non-PG error` (runda fix 1, R-5).
+ */
+export const TRANSIENT_SOCKET_ERROR_CODES = new Set([
+  "ECONNRESET",
+  "ECONNREFUSED",
+  "ECONNABORTED",
+  "EPIPE",
+  "ETIMEDOUT",
+  "EHOSTUNREACH",
+  "ENETUNREACH",
+  "EAI_AGAIN",
+])
+
+/** Komunikaty node-pg / pg-pool o zerwanym albo nienawiązanym połączeniu (bez `code`). */
+const TRANSIENT_CONNECTION_MESSAGES = [
+  /^connection terminated/i,
+  /timeout exceeded when trying to connect/i,
+  /client has encountered a connection error and is not queryable/i,
+]
+
+/** Kod błędu gniazda, gdy `err` jest utratą połączenia bez SQLSTATE; inaczej `null`. */
+export function transientConnectionSignal(err: unknown): string | null {
+  if (err === null || typeof err !== "object") return null
+  const code = (err as { code?: unknown }).code
+  if (typeof code === "string" && TRANSIENT_SOCKET_ERROR_CODES.has(code)) return code
+  // Kod SQLSTATE (5 znaków) rozstrzyga klasyfikator nośnika — nie nadpisujemy go.
+  if (typeof code === "string" && /^[0-9A-Z]{5}$/.test(code)) return null
+  const message = String((err as { message?: unknown }).message ?? "")
+  return TRANSIENT_CONNECTION_MESSAGES.some((re) => re.test(message)) ? "connection_lost" : null
+}
+
 export function classifyEventFailure(
   err: unknown,
   options: ClassifyOptions = {}
@@ -73,6 +107,15 @@ export function classifyEventFailure(
       event_class: "permanent_data_defect",
       reason: `permanent_data_defect:${consumerCode}: ${message}`,
       dlq: terminal(dlq),
+    }
+  }
+
+  const socket = transientConnectionSignal(err)
+  if (socket) {
+    return {
+      event_class: "transient_retry",
+      reason: `transient_retry: connection ${socket}: ${message}`,
+      dlq: { ...dlq, tier: "transient", failure_mode: "FM-71-RT-7", is_retryable: true },
     }
   }
 

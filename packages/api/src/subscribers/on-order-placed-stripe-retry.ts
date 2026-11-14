@@ -76,10 +76,53 @@ import {
   classifyEventFailure,
   type EventFailureClassification,
 } from "../lib/events/event-failure-classification"
-import { recordEventDeadLetter } from "../lib/events/event-dead-letter"
+import { DeadLetterRefusedError, recordEventDeadLetter } from "../lib/events/event-dead-letter"
 
 /** `source_job` wierszy DLQ z tego konsumenta (Story 4.6, ADR-239). */
 export const STRIPE_RETRY_DLQ_SOURCE = "subscriber:on-order-placed-stripe-retry"
+
+/**
+ * Nazwany kod kanału fail-loud: zapis wiersza DLQ się NIE udał (odmowa
+ * `scope_missing` albo błąd bazy). Subskrybent NIE rzuca (ponowienie trwałej
+ * wady niczego nie naprawia i przerwałoby odzysk pozostałych zamówień) —
+ * zamiast tego `logger.error` z tym kodem per porażka, `logger.error` z kodem
+ * `dlq_write_failed_summary` na końcu przebiegu i `dlq_write_failures`
+ * w wyniku subskrybenta (Story 4.6, runda fix 1, R-1/R-2/R-6).
+ */
+export const DLQ_WRITE_FAILED_CODE = "dlq_write_failed" as const
+
+export type DlqWriteFailure = {
+  order_id: string
+  event_id: string
+  event_class: EventFailureClassification["event_class"]
+  /** Odmowa writera (`DeadLetterRefusedError.refusal`) albo `db_error`. */
+  cause: DeadLetterRefusedError["refusal"] | "db_error"
+  message: string
+}
+
+export type StripeRetryRunResult = { dlq_write_failures: DlqWriteFailure[] }
+
+function dlqWriteFailure(
+  orderId: string,
+  eventId: string,
+  classification: EventFailureClassification,
+  dlqErr: unknown
+): DlqWriteFailure {
+  return {
+    order_id: orderId,
+    event_id: eventId,
+    event_class: classification.event_class,
+    cause: dlqErr instanceof DeadLetterRefusedError ? dlqErr.refusal : "db_error",
+    message: dlqErr instanceof Error ? dlqErr.message : String(dlqErr),
+  }
+}
+
+function logDlqWriteFailure(logger: { error?: (msg: string) => void }, f: DlqWriteFailure): void {
+  logger.error?.(
+    `[on-order-placed-stripe-retry] code=${DLQ_WRITE_FAILED_CODE} order_id=${f.order_id} ` +
+      `event_id=${f.event_id} cause=${f.cause} class=${f.event_class}: ${f.message}`
+  )
+}
 
 /**
  * Porażka wiersza, której klasa idzie do DLQ, a której NIE da się zapisać
@@ -581,11 +624,12 @@ export function buildPathYRecoveryInput(
 export default async function onOrderPlacedStripeRetry({
   event,
   container,
-}: SubscriberArgs<OrderPlacedPayload>): Promise<void> {
+}: SubscriberArgs<OrderPlacedPayload>): Promise<StripeRetryRunResult> {
   const logger = resolveLogger(container as unknown as Record<string, unknown>)
+  const dlqWriteFailures: DlqWriteFailure[] = []
   const orderIds = extractOrderIds(event.data)
   if (orderIds.length === 0) {
-    return
+    return { dlq_write_failures: dlqWriteFailures }
   }
 
   const scope = container as unknown as { resolve: (key: string) => unknown }
@@ -816,12 +860,10 @@ export default async function onOrderPlacedStripeRetry({
                       `dlq_entry_id=${written.dlq_entry_id} inserted=${written.inserted}: ${err.message}`
                   )
                 } catch (dlqErr) {
+                  const failure = dlqWriteFailure(orderId, row.event_id, classification, dlqErr)
+                  dlqWriteFailures.push(failure)
+                  logDlqWriteFailure(logger, failure)
                   await client.query("ROLLBACK TO SAVEPOINT gp_dlq_entry")
-                  logger.error?.(
-                    `[on-order-placed-stripe-retry] order_id=${orderId} ` +
-                      `event_id=${row.event_id} dlq_write_failed ` +
-                      `class=${classification.event_class}: ${(dlqErr as Error).message}`
-                  )
                 }
                 continue
               }
@@ -868,13 +910,12 @@ export default async function onOrderPlacedStripeRetry({
               `dlq_entry_id=${written.dlq_entry_id} inserted=${written.inserted}: ${err.message}`
           )
         } catch (dlqErr) {
-          logger.error?.(
-            `[on-order-placed-stripe-retry] order_id=${orderId} ` +
-              `event_id=${err.row.event_id} dlq_write_failed ` +
-              `class=${err.classification.event_class}: ${(dlqErr as Error).message}`
-          )
-          // Utrata nośnika DLQ nie może być cicha (NFR-4): fail-loud.
-          throw dlqErr
+          // Utrata nośnika DLQ nie może być cicha (NFR-4): fail-loud NAZWANYM
+          // kanałem, bez rethrow — rethrow ponawiałby trwałą wadę i przerywał
+          // odzysk pozostałych zamówień (runda fix 1, R-1/R-2).
+          const failure = dlqWriteFailure(err.order_id, err.row.event_id, err.classification, dlqErr)
+          dlqWriteFailures.push(failure)
+          logDlqWriteFailure(logger, failure)
         }
         continue
       }
@@ -923,6 +964,15 @@ export default async function onOrderPlacedStripeRetry({
       )
     }
   }
+
+  if (dlqWriteFailures.length > 0) {
+    logger.error?.(
+      `[on-order-placed-stripe-retry] code=${DLQ_WRITE_FAILED_CODE}_summary ` +
+        `count=${dlqWriteFailures.length} ` +
+        `order_ids=${[...new Set(dlqWriteFailures.map((f) => f.order_id))].join(",")}`
+    )
+  }
+  return { dlq_write_failures: dlqWriteFailures }
 }
 
 type EventBusLike = {

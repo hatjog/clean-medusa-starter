@@ -81,7 +81,7 @@ export class Migration1779018600000 extends Migration {
         CONSTRAINT ${TABLE}_evidence_terminal CHECK (
           (state IN ('replayed','discarded_with_evidence')) = (resolution_evidence IS NOT NULL)
         ),
-        CONSTRAINT ${TABLE}_event_subject_unique UNIQUE (source_job, event_id, subject_id)
+        CONSTRAINT ${TABLE}_event_subject_unique UNIQUE (instance_id, market_id, source_job, event_id, subject_id)
       )
     `)
     this.addSql(`CREATE INDEX IF NOT EXISTS ${TABLE}_instance_market_state_idx ON ${TABLE} (instance_id, market_id, state)`)

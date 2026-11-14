@@ -17,13 +17,20 @@ import onOrderPlacedStripeRetry, {
   FIND_DEFERRED_CAPTURES_SQL,
   MARK_DEFERRED_RESOLVED_SQL,
   STRIPE_RETRY_DLQ_SOURCE,
+  type StripeRetryRunResult,
 } from "../../subscribers/on-order-placed-stripe-retry"
+import {
+  dlqEntryId,
+  INSERT_DLQ_ENTRY_SQL,
+  recordEventDeadLetter,
+} from "../../lib/events/event-dead-letter"
+import { classifyEventFailure, PermanentEventDataDefectError } from "../../lib/events/event-failure-classification"
 import { STRIPE_PATH_Y_WEBHOOK_PROVIDER } from "../../lib/payment/stripe-payment-intent-transport"
 
 const enabled = process.env.GP_RUN_MIGRATION_INTEGRATION === "1" && !!process.env.DATABASE_URL
 const SCOPE_A = { instance_id: "instance-a", market_id: "market-a" }
 
-type Behaviour = { findRows?: unknown[]; findError?: Error; otherError?: Error }
+type Behaviour = { findRows?: unknown[]; findError?: Error; otherError?: Error; dlqInsertSqlOverride?: string }
 
 async function migrationSql(): Promise<string[]> {
   const out: string[] = []
@@ -77,6 +84,10 @@ describe("Story 4.6 — DLQ na rzeczywistym PostgreSQL", () => {
           const rows = behaviour.findRows ?? []
           return { rows, rowCount: rows.length }
         }
+        if (sql === INSERT_DLQ_ENTRY_SQL && behaviour.dlqInsertSqlOverride) {
+          // Realny wyjątek bazy z PG (nie mock): zapytanie do nieistniejącej relacji.
+          return client.query(behaviour.dlqInsertSqlOverride, [])
+        }
         const passthrough = /SAVEPOINT|set_config|current_setting|mor_policy_dlq_entry/.test(sql)
         if (!passthrough && behaviour.otherError) throw behaviour.otherError
         return client.query(sql, values)
@@ -84,9 +95,9 @@ describe("Story 4.6 — DLQ na rzeczywistym PostgreSQL", () => {
     }),
   }
 
-  async function runConsumer(orderId: string): Promise<void> {
-    await (onOrderPlacedStripeRetry as unknown as (a: unknown) => Promise<void>)({
-      event: { data: { id: orderId } },
+  async function runConsumer(orderId: string | string[]): Promise<StripeRetryRunResult> {
+    const result = await (onOrderPlacedStripeRetry as unknown as (a: unknown) => Promise<StripeRetryRunResult>)({
+      event: { data: Array.isArray(orderId) ? { order_ids: orderId } : { id: orderId } },
       container: {
         logger,
         resolve: (key: string) => {
@@ -96,6 +107,7 @@ describe("Story 4.6 — DLQ na rzeczywistym PostgreSQL", () => {
       },
     })
     await client.query("RESET ROLE")
+    return result
   }
 
   async function dlqRows(scope: { instance_id: string; market_id: string }, eventId: string) {
@@ -205,5 +217,74 @@ describe("Story 4.6 — DLQ na rzeczywistym PostgreSQL", () => {
       )
     ).rejects.toMatchObject({ code: "23514" })
     await client.query("ROLLBACK TO SAVEPOINT bad_insert")
+  })
+
+  it("R-1/R-6: realny wyjątek bazy przy zapisie DLQ (ścieżka zewnętrzna) — bez rethrow, nazwany wynik, transakcja testu żywa", async () => {
+    behaviour = {
+      findRows: [{ ...pathYRow("evt_46_dbfail#deferred-issuance", {}), provider: "stripe" }],
+      otherError: new Error("unexpected consumer failure"),
+      dlqInsertSqlOverride: "SELECT * FROM mor_policy_dlq_entry_missing_relation",
+    }
+    const result = await runConsumer(["order_46_dbfail_a", "order_46_dbfail_b"])
+    expect(result.dlq_write_failures).toEqual([
+      expect.objectContaining({ order_id: "order_46_dbfail_a", cause: "db_error" }),
+      expect.objectContaining({ order_id: "order_46_dbfail_b", cause: "db_error" }),
+    ])
+    expect(await dlqRows(SCOPE_A, "evt_46_dbfail#deferred-issuance")).toEqual([])
+    const alive = await client.query("SELECT 1 AS ok")
+    expect(alive.rows).toEqual([{ ok: 1 }])
+  })
+
+  it("R-1/R-2: brak market_id na ścieżce zewnętrznej — odmowa scope_missing jako wynik, bez wiersza i bez rethrow", async () => {
+    behaviour = {
+      findRows: [{ ...pathYRow("evt_46_noscope#deferred-issuance", {}), provider: "stripe", market_id: null }],
+      otherError: new Error("unexpected consumer failure"),
+    }
+    const result = await runConsumer("order_46_noscope")
+    expect(result.dlq_write_failures).toEqual([
+      expect.objectContaining({ order_id: "order_46_noscope", cause: "scope_missing" }),
+    ])
+    const all = await client.query("SELECT count(*)::int AS n FROM mor_policy_dlq_entry WHERE event_id = $1", [
+      "evt_46_noscope#deferred-issuance",
+    ])
+    expect(all.rows[0]).toEqual({ n: 0 })
+  })
+
+  it("R-7: to samo zdarzenie w dwóch zakresach daje DWA wiersze (oś zakresu w kluczu), nie ciche inserted=false", async () => {
+    const classification = classifyEventFailure(new PermanentEventDataDefectError("x", "bad"))
+    const base = { source_job: "src46", event_id: "evt_46_twoscope", subject_id: "ord46", classification, occurred_at: new Date() }
+    await client.query("SAVEPOINT two_scope")
+    await client.query("SET LOCAL ROLE medusa_store")
+    const a = await recordEventDeadLetter(client, { ...base, ...SCOPE_A })
+    const b = await recordEventDeadLetter(client, { ...base, instance_id: SCOPE_A.instance_id, market_id: "market-b" })
+    const again = await recordEventDeadLetter(client, { ...base, ...SCOPE_A })
+    await client.query("RELEASE SAVEPOINT two_scope")
+    await client.query("RESET ROLE")
+    expect(a.inserted).toBe(true)
+    expect(b.inserted).toBe(true)
+    expect(a.dlq_entry_id).not.toBe(b.dlq_entry_id)
+    expect(again).toEqual({ dlq_entry_id: a.dlq_entry_id, inserted: false })
+  })
+
+  it("R-7: kolizja klucza z wierszem spoza zakresu (niewidocznym pod RLS) = nazwana odmowa scope_collision", async () => {
+    const classification = classifyEventFailure(new PermanentEventDataDefectError("x", "bad"))
+    const base = { source_job: "src46c", event_id: "evt_46_collide", subject_id: "ord46c", classification, occurred_at: new Date() }
+    const id = dlqEntryId(SCOPE_A.instance_id, SCOPE_A.market_id, base.source_job, base.event_id, base.subject_id)
+    // Wiersz o TYM SAMYM kluczu, ale w zakresie market-b — wstawiony z pominięciem writera (rola testu).
+    await client.query(
+      `INSERT INTO mor_policy_dlq_entry (dlq_entry_id, instance_id, market_id, state, owner_type, owner_id, deadline,
+        occurred_at, closure_path, provenance_kind, provenance_source, tier, classification, failure_mode,
+        is_retryable, reason, source_job, event_class, event_id, subject_id)
+       VALUES ($1,$2,'market-b','dlq_pending_ops_review','operator_role','ops-recovery',now(),now(),'not_closed',
+        'runtime_observed','t','dlq_pending_ops_review','terminal','FM-71-DLQ-2',false,'r','t','unknown_fail_closed','e','o')`,
+      [id, SCOPE_A.instance_id]
+    )
+    await client.query("SAVEPOINT collide")
+    await client.query("SET LOCAL ROLE medusa_store")
+    await expect(recordEventDeadLetter(client, { ...base, ...SCOPE_A })).rejects.toMatchObject({
+      refusal: "scope_collision",
+    })
+    await client.query("ROLLBACK TO SAVEPOINT collide")
+    await client.query("RESET ROLE")
   })
 })

@@ -9,8 +9,13 @@
  *    obu osiach, a scope NIE jest zgadywany (AD-44).
  *  - Ustawia GUC scope'u lokalnie dla transakcji (jak pool hook) i przywraca
  *    poprzednie wartości, żeby nie przestawić scope'u reszty transakcji.
- *  - Idempotentny: `dlq_entry_id` = `source_job|event_id|subject_id`,
+ *  - Idempotentny: `dlq_entry_id` = `instance_id|market_id|source_job|event_id|subject_id`,
  *    `ON CONFLICT DO NOTHING` — powtórka zdarzenia nie mnoży wierszy ani nie pętli.
+ *    Oś zakresu jest W kluczu (runda fix 1, R-7): bez niej to samo
+ *    `source_job|event_id|subject_id` z innego zakresu kolidowało z wierszem
+ *    niewidocznym pod RLS i dawało ciche `inserted=false`. Gdy mimo to INSERT
+ *    nic nie wstawi, a wiersza nie widać we własnym zakresie, writer rzuca
+ *    nazwaną odmowę `scope_collision` zamiast zgłosić „duplikat”.
  *  - Właściciel `operator_role:ops-recovery`, termin 24 h (decyzja PO D-35 p.9).
  */
 import {
@@ -41,7 +46,7 @@ export type DeadLetterEntryInput = {
 
 export class DeadLetterRefusedError extends Error {
   constructor(
-    readonly refusal: "transient_not_dead_letter" | "scope_missing",
+    readonly refusal: "transient_not_dead_letter" | "scope_missing" | "scope_collision",
     message: string
   ) {
     super(message)
@@ -64,8 +69,16 @@ export const INSERT_DLQ_ENTRY_SQL = `
   ON CONFLICT DO NOTHING
   RETURNING dlq_entry_id`
 
-export function dlqEntryId(sourceJob: string, eventId: string, subjectId: string): string {
-  return `${sourceJob}|${eventId}|${subjectId}`
+export const SELECT_OWN_DLQ_ENTRY_SQL = `SELECT dlq_entry_id FROM ${DLQ_ENTRY_TABLE} WHERE dlq_entry_id = $1`
+
+export function dlqEntryId(
+  instanceId: string,
+  marketId: string,
+  sourceJob: string,
+  eventId: string,
+  subjectId: string
+): string {
+  return `${instanceId}|${marketId}|${sourceJob}|${eventId}|${subjectId}`
 }
 
 export async function recordEventDeadLetter(
@@ -87,7 +100,7 @@ export async function recordEventDeadLetter(
     )
   }
 
-  const id = dlqEntryId(input.source_job, input.event_id, input.subject_id)
+  const id = dlqEntryId(instanceId, marketId, input.source_job, input.event_id, input.subject_id)
   const deadline = new Date(input.occurred_at.getTime() + DLQ_DEADLINE_HOURS * 3600 * 1000)
 
   const previous = await client.query<{ instance_id: string | null; market_id: string | null }>(
@@ -114,8 +127,22 @@ export async function recordEventDeadLetter(
       input.event_id,
       input.subject_id,
     ])
+    const inserted = result.rows.length > 0
+    if (!inserted) {
+      // Konflikt: prawdziwa powtórka ma wiersz widoczny we WŁASNYM zakresie.
+      // Niewidoczny = kolizja z wierszem spoza zakresu (RLS) — nazwana odmowa,
+      // nie ciche `inserted=false`.
+      const own = await client.query<{ dlq_entry_id: string }>(SELECT_OWN_DLQ_ENTRY_SQL, [id])
+      if (own.rows.length === 0) {
+        throw new DeadLetterRefusedError(
+          "scope_collision",
+          `[event-dead-letter] ${input.event_id}: dlq_entry_id=${id} koliduje z wierszem spoza zakresu ` +
+            `${instanceId}/${marketId} (niewidoczny pod RLS) — wiersz DLQ NIE zapisany`
+        )
+      }
+    }
     await setScope(client, prior.instance_id ?? "", prior.market_id ?? "")
-    return { dlq_entry_id: id, inserted: result.rows.length > 0 }
+    return { dlq_entry_id: id, inserted }
   }
 }
 

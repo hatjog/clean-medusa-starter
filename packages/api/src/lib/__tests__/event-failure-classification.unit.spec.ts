@@ -8,12 +8,15 @@ import {
   EVENT_FAILURE_CLASSES,
   isDeadLetterClass,
   PermanentEventDataDefectError,
+  TRANSIENT_SOCKET_ERROR_CODES,
   type EventFailureClass,
 } from "../events/event-failure-classification"
 import {
   DeadLetterRefusedError,
+  dlqEntryId,
   INSERT_DLQ_ENTRY_SQL,
   recordEventDeadLetter,
+  SELECT_OWN_DLQ_ENTRY_SQL,
 } from "../events/event-dead-letter"
 
 function pgError(code: string, message = "pg"): Error {
@@ -113,11 +116,86 @@ describe("Story 4.6 — writer DLQ", () => {
       instance_id: "inst", market_id: "mkt", source_job: "src", event_id: "evt", subject_id: "ord",
       classification: classifyEventFailure(new PermanentEventDataDefectError("x", "bad")), occurred_at: occurred,
     })
-    expect(out).toEqual({ dlq_entry_id: "src|evt|ord", inserted: true })
+    expect(out).toEqual({ dlq_entry_id: "inst|mkt|src|evt|ord", inserted: true })
     const insert = c.sent.find((q) => q.sql === INSERT_DLQ_ENTRY_SQL)!
-    expect(insert.values.slice(0, 3)).toEqual(["src|evt|ord", "inst", "mkt"])
+    expect(insert.values.slice(0, 3)).toEqual(["inst|mkt|src|evt|ord", "inst", "mkt"])
     expect(insert.values[5]).toBe("2026-11-15T10:00:00.000Z")
     expect(String(insert.values[10])).toMatch(/^permanent_data_defect:x/)
     expect(insert.values[11]).toBe("permanent_data_defect")
+  })
+})
+
+describe("Story 4.6 runda fix 1 (R-5) — błędy gniazda node-pg bez SQLSTATE są przejściowe", () => {
+  const sockets: [string, unknown][] = [
+    ...[...TRANSIENT_SOCKET_ERROR_CODES].map(
+      (code) => [code, Object.assign(new Error(`connect ${code} 127.0.0.1:5432`), { code, errno: -1, syscall: "connect" })] as [string, unknown]
+    ),
+    ["Connection terminated unexpectedly", new Error("Connection terminated unexpectedly")],
+    ["Connection terminated due to connection timeout", new Error("Connection terminated due to connection timeout")],
+    ["pg-pool: timeout exceeded when trying to connect", new Error("timeout exceeded when trying to connect")],
+    ["Client has encountered a connection error", new Error("Client has encountered a connection error and is not queryable")],
+  ]
+
+  it.each(sockets)("%s → transient_retry (ponowienie, nie DLQ)", (_name, err) => {
+    const result = classifyEventFailure(err)
+    expect(result.event_class).toBe("transient_retry")
+    expect(isDeadLetterClass(result.event_class)).toBe(false)
+    expect(result.dlq.tier).toBe("transient")
+    expect(result.dlq.is_retryable).toBe(true)
+  })
+
+  it("niesieciowy kod systemowy (ENOENT) nadal NIE jest ponowieniem — brak klasy domyślnej retry", () => {
+    expect(classifyEventFailure(Object.assign(new Error("no such file"), { code: "ENOENT" })).event_class).toBe(
+      "unknown_fail_closed"
+    )
+  })
+
+  it("SQLSTATE wygrywa z komunikatem: 23505 z 'Connection terminated' w treści to wada danych", () => {
+    expect(classifyEventFailure(pgError("23505", "Connection terminated by dup")).event_class).toBe(
+      "permanent_data_defect"
+    )
+  })
+
+  it("nazwana wada konsumenta wygrywa z kodem gniazda (klasy rozłączne)", () => {
+    const err = Object.assign(new Error("x"), { code: "ECONNRESET" })
+    expect(classifyEventFailure(err, { permanentDefectCode: () => "named" }).event_class).toBe("permanent_data_defect")
+  })
+})
+
+describe("Story 4.6 runda fix 1 (R-7) — oś zakresu w kluczu i nazwana kolizja", () => {
+  it("ten sam event/subject w dwóch zakresach daje RÓŻNE dlq_entry_id", () => {
+    expect(dlqEntryId("i", "market-a", "s", "e", "o")).not.toBe(dlqEntryId("i", "market-b", "s", "e", "o"))
+    expect(dlqEntryId("i-a", "m", "s", "e", "o")).not.toBe(dlqEntryId("i-b", "m", "s", "e", "o"))
+  })
+
+  function conflicting(ownVisible: boolean) {
+    const sent: string[] = []
+    return {
+      sent,
+      query: async (sql: string, values: ReadonlyArray<unknown> = []) => {
+        sent.push(sql)
+        if (sql === INSERT_DLQ_ENTRY_SQL) return { rows: [] as never[] }
+        if (sql === SELECT_OWN_DLQ_ENTRY_SQL) return { rows: (ownVisible ? [{ dlq_entry_id: values[0] }] : []) as never[] }
+        return { rows: [{ instance_id: null, market_id: null }] as never[] }
+      },
+    }
+  }
+  const input = {
+    instance_id: "inst", market_id: "mkt", source_job: "src", event_id: "evt", subject_id: "ord",
+    classification: classifyEventFailure(new PermanentEventDataDefectError("x", "bad")), occurred_at: new Date(),
+  }
+
+  it("konflikt z wierszem WŁASNEGO zakresu = powtórka: inserted=false bez błędu", async () => {
+    await expect(recordEventDeadLetter(conflicting(true), input)).resolves.toEqual({
+      dlq_entry_id: "inst|mkt|src|evt|ord",
+      inserted: false,
+    })
+  })
+
+  it("konflikt z wierszem niewidocznym pod RLS = nazwana odmowa scope_collision, nie ciche inserted=false", async () => {
+    await expect(recordEventDeadLetter(conflicting(false), input)).rejects.toMatchObject({
+      name: "DeadLetterRefusedError",
+      refusal: "scope_collision",
+    })
   })
 })

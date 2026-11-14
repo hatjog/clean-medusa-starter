@@ -64,7 +64,10 @@ import onOrderPlacedStripeRetry, {
   DEFERRAL_MARKER_PROVIDERS,
   FIND_DEFERRED_CAPTURES_SQL,
   MARK_DEFERRED_RESOLVED_SQL,
+  DLQ_WRITE_FAILED_CODE,
+  type StripeRetryRunResult,
 } from "../../subscribers/on-order-placed-stripe-retry"
+import { INSERT_DLQ_ENTRY_SQL } from "../../lib/events/event-dead-letter"
 
 const SOURCE = readFileSync(
   join(__dirname, "../../subscribers/on-order-placed-stripe-retry.ts"),
@@ -240,7 +243,7 @@ const ACTIVATION_SQL_MARKER = "SET state = 'ACTIVE'"
  */
 function makeHarness(
   rows: DeferredRow[],
-  options: { activation?: "applied" | "noop" } = {}
+  options: { activation?: "applied" | "noop"; dlqInsertError?: Error } = {}
 ) {
   const sent: SentQuery[] = []
   const client = {
@@ -248,6 +251,10 @@ function makeHarness(
       sent.push({ sql, values })
       if (sql === FIND_DEFERRED_CAPTURES_SQL) {
         return { rows, rowCount: rows.length }
+      }
+      if (sql === INSERT_DLQ_ENTRY_SQL) {
+        if (options.dlqInsertError) throw options.dlqInsertError
+        return { rows: [{ dlq_entry_id: values[0] }], rowCount: 1 }
       }
       if (sql.includes(ACTIVATION_SQL_MARKER)) {
         const applied = (options.activation ?? "applied") === "applied"
@@ -273,8 +280,8 @@ function makeHarness(
   return { sent, client, logger, eventBus, container }
 }
 
-async function run(container: unknown, data: Record<string, unknown>) {
-  await (onOrderPlacedStripeRetry as unknown as (args: unknown) => Promise<void>)({
+async function run(container: unknown, data: Record<string, unknown>): Promise<StripeRetryRunResult> {
+  return (onOrderPlacedStripeRetry as unknown as (args: unknown) => Promise<StripeRetryRunResult>)({
     event: { data },
     container,
   })
@@ -673,5 +680,106 @@ describe("odzysk Path Y — paczka mieszana, domknięcie i replay", () => {
     expect(liveIssue).toHaveBeenCalledTimes(1)
     const updates = h.sent.filter((q) => q.sql === MARK_DEFERRED_RESOLVED_SQL)
     expect(updates.map((q) => q.values[0])).toEqual(["evt_ok#deferred-issuance"])
+  })
+})
+
+describe("Story 4.6 runda fix 1 (R-1/R-2/R-6) — porażka zapisu DLQ: bez rethrow, izolacja zamówienia, fail-loud", () => {
+  const pathYRow = (overrides: Partial<DeferredRow> = {}) =>
+    makeRow({
+      event_id: "evt_pathy#deferred-issuance",
+      provider: STRIPE_PATH_Y_WEBHOOK_PROVIDER,
+      envelope: { entitlement_issue_deferred_reason: "webhook_before_order" },
+      ...overrides,
+    })
+  const loggedCodes = (logger: { error: jest.Mock }) =>
+    logger.error.mock.calls.map((c) => String(c[0])).filter((m) => m.includes(`code=${DLQ_WRITE_FAILED_CODE}`))
+
+  it("ścieżka zewnętrzna, brak scope'u (scope_missing): nie rzuca, drugie zamówienie przetworzone, nazwany wynik", async () => {
+    // Wiersz nie-Path-Y (provider stripe): nieznany błąd wystawienia → DLQ w NOWEJ
+    // transakcji; market_id null → writer odmawia `scope_missing`.
+    const rows = [makeRow({ market_id: null })]
+    const h2 = makeHarness(rows)
+    const { issueEntitlementsForAllLineItems } = jest.requireMock("../../workflows/entitlements/issue-entitlement") as {
+      issueEntitlementsForAllLineItems: jest.Mock
+    }
+    issueEntitlementsForAllLineItems.mockRejectedValueOnce(new Error("unexpected consumer failure"))
+
+    const result = await run(h2.container, { order_ids: ["order_1", "order_2"] })
+
+    expect(result.dlq_write_failures).toEqual([
+      expect.objectContaining({ order_id: "order_1", cause: "scope_missing", event_class: "unknown_fail_closed" }),
+    ])
+    // order_2 przetworzony mimo porażki order_1 (izolacja zamówienia).
+    const finds = h2.sent.filter((q) => q.sql === FIND_DEFERRED_CAPTURES_SQL).map((q) => q.values[0])
+    expect(finds).toEqual(["order_1", "order_2"])
+    expect(h2.sent.filter((q) => q.sql === MARK_DEFERRED_RESOLVED_SQL).length).toBeGreaterThanOrEqual(1)
+    const codes = loggedCodes(h2.logger)
+    expect(codes.some((m) => m.includes("order_id=order_1") && m.includes("cause=scope_missing"))).toBe(true)
+    expect(codes.some((m) => m.includes(`code=${DLQ_WRITE_FAILED_CODE}_summary count=1`))).toBe(true)
+  })
+
+  it("ścieżka zewnętrzna, wyjątek bazy przy INSERT DLQ: nie rzuca, cause=db_error, alarm podsumowania", async () => {
+    const { issueEntitlementsForAllLineItems } = jest.requireMock("../../workflows/entitlements/issue-entitlement") as {
+      issueEntitlementsForAllLineItems: jest.Mock
+    }
+    issueEntitlementsForAllLineItems.mockRejectedValueOnce(new Error("unexpected consumer failure"))
+    const h = makeHarness([makeRow()], {
+      dlqInsertError: Object.assign(new Error("relation mor_policy_dlq_entry does not exist"), { code: "42P01" }),
+    })
+
+    await expect(run(h.container, { order_ids: ["order_1", "order_2"] })).resolves.toEqual({
+      dlq_write_failures: [
+        expect.objectContaining({ order_id: "order_1", cause: "db_error", message: expect.stringContaining("does not exist") }),
+      ],
+    })
+    expect(h.sent.filter((q) => q.sql === FIND_DEFERRED_CAPTURES_SQL).map((q) => q.values[0])).toEqual([
+      "order_1",
+      "order_2",
+    ])
+    expect(loggedCodes(h.logger).some((m) => m.includes("cause=db_error"))).toBe(true)
+    expect(loggedCodes(h.logger).some((m) => m.includes("_summary count=1 order_ids=order_1"))).toBe(true)
+  })
+
+  it("ścieżka wewnętrzna (savepoint): porażka INSERT DLQ → ROLLBACK TO SAVEPOINT, sąsiad odzyskany, nazwany wynik", async () => {
+    const liveIssue = liveIssueEntitlementsWithinTx as jest.Mock
+    liveIssue.mockReset()
+    liveIssue.mockResolvedValueOnce({
+      event_processed: true,
+      issued: [{ entitlement_id: `ent_${"b".repeat(64)}`, entitlement_dedupe_key: "b".repeat(64), created: true }],
+    })
+    const h = makeHarness(
+      [
+        pathYRow({ event_id: "evt_legacy#deferred-issuance" }),
+        pathYRow({
+          event_id: "evt_ok#deferred-issuance",
+          envelope: { entitlement_issue_deferred_reason: "webhook_before_order", psp_occurred_at: "2026-08-12T12:34:56.000Z" },
+        }),
+      ],
+      { dlqInsertError: new Error("insert failed") }
+    )
+
+    const result = await run(h.container, { id: "order_1" })
+
+    const sqls = h.sent.map((q) => q.sql)
+    expect(sqls).toContain("ROLLBACK TO SAVEPOINT gp_dlq_entry")
+    expect(sqls).not.toContain("RELEASE SAVEPOINT gp_dlq_entry")
+    expect(h.sent.filter((q) => q.sql === MARK_DEFERRED_RESOLVED_SQL).map((q) => q.values[0])).toEqual([
+      "evt_ok#deferred-issuance",
+    ])
+    expect(sqls).toContain("COMMIT")
+    expect(result.dlq_write_failures).toEqual([
+      expect.objectContaining({ event_id: "evt_legacy#deferred-issuance", cause: "db_error", event_class: "permanent_data_defect" }),
+    ])
+    expect(loggedCodes(h.logger).some((m) => m.includes("event_id=evt_legacy#deferred-issuance"))).toBe(true)
+  })
+
+  it("udany zapis DLQ nie zgłasza porażki (kontrola: wynik pusty, brak kodu dlq_write_failed)", async () => {
+    const liveIssue = liveIssueEntitlementsWithinTx as jest.Mock
+    liveIssue.mockReset()
+    const h = makeHarness([pathYRow({ event_id: "evt_legacy#deferred-issuance" })])
+    const result = await run(h.container, { id: "order_1" })
+    expect(result.dlq_write_failures).toEqual([])
+    expect(h.sent.map((q) => q.sql)).toContain("RELEASE SAVEPOINT gp_dlq_entry")
+    expect(loggedCodes(h.logger)).toEqual([])
   })
 })
