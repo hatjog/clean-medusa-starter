@@ -22,6 +22,8 @@ import { paymentStatusRateLimitMiddleware } from "./middlewares/payment-status-r
 import { storeEntitlementsRateLimitMiddleware } from "./middlewares/store-entitlements-rate-limit";
 import { upstreamOrderAccessGuardMiddleware } from "./middlewares/upstream-order-access-guard";
 import { cartCompletionAuthorizationGuardMiddleware } from "./middlewares/cart-completion-authorization-guard";
+import { voucherLineQuantityGuardMiddleware } from "./middlewares/voucher-line-quantity-guard";
+import { cartCompletionPspAuthorityMiddleware } from "./middlewares/cart-completion-psp-authority";
 import {
   CUSTOMER_MARKET_FORBIDDEN_MESSAGE,
   isScopedToMarket,
@@ -996,7 +998,21 @@ export default defineMiddlewares({
     {
       method: ["POST"],
       matcher: "/store/carts/:id/complete",
-      middlewares: [cartCompletionAuthorizationGuardMiddleware],
+      // Story 8.2 (ADR-233): PSP authority + cross-instance fence BEFORE the
+      // guard, so a refusal never looks like an unreversed authorization.
+      middlewares: [cartCompletionPspAuthorityMiddleware, cartCompletionAuthorizationGuardMiddleware],
+    },
+    // Story 3.3 AC2 runda fix 2 (ADR-242 p.5): linia voucherowa ma quantity=1
+    // egzekwowane PRZED płatnością — odmowa 400 `voucher_line_quantity_unsupported`.
+    {
+      method: ["POST"],
+      matcher: "/store/carts/:id/line-items",
+      middlewares: [voucherLineQuantityGuardMiddleware],
+    },
+    {
+      method: ["POST"],
+      matcher: "/store/carts/:id/line-items/:line_id",
+      middlewares: [voucherLineQuantityGuardMiddleware],
     },
     {
       method: ["POST"],

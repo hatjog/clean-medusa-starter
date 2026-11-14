@@ -295,7 +295,7 @@ runWithIsolatedDatabase("Story 3.1 AC3 — kontrakt ACK vs jednostki należne na
          updated_at timestamptz NOT NULL
        ) ON COMMIT DROP`,
       `CREATE TEMP TABLE order_item (
-         order_id text NOT NULL, item_id text NOT NULL,
+         order_id text NOT NULL, item_id text NOT NULL, quantity numeric NOT NULL DEFAULT 1,
          created_at timestamptz NOT NULL, deleted_at timestamptz
        ) ON COMMIT DROP`,
       `CREATE TEMP TABLE webhook_event_processed (
@@ -357,6 +357,12 @@ runWithIsolatedDatabase("Story 3.1 AC3 — kontrakt ACK vs jednostki należne na
          purchase_key text CHECK (purchase_key IS NULL OR char_length(purchase_key) > 0),
          market_id text, instance_id text,
          PRIMARY KEY (external_id, event_type)
+       ) ON COMMIT DROP`,
+      `CREATE TEMP TABLE owed_unit_effect_barrier (
+         -- Story 3.3: lustro Migration20261114140000SharedIdempotencyBarrier (klucz bez event_type).
+         owed_business_unit_key text PRIMARY KEY, payment_intent_id text NOT NULL,
+         order_id text NOT NULL, instance_id text NOT NULL, market_id text NOT NULL,
+         claimed_by_path text NOT NULL, claimed_at timestamptz NOT NULL DEFAULT now()
        ) ON COMMIT DROP`,
       `CREATE TEMP TABLE entitlement_instance (
          id text PRIMARY KEY, entitlement_profile_id text NOT NULL,

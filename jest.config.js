@@ -160,6 +160,12 @@ if (process.env.TEST_TYPE === "integration:http") {
   module.exports.testMatch = [
     "**/packages/api/src/__tests__/integration/story-3-6-canonical-state-provenance-pg.integration.test.[jt]s",
   ];
+} else if (process.env.TEST_TYPE === "story-3-3-shared-barrier-pg") {
+  // v1.16.0 Story 3.3 (FR-9, AD-33) — wspolna bariera skutku per nalezna
+  // jednostka na realnym PostgreSQL (DATABASE_URL = izolowana *_test).
+  module.exports.testMatch = [
+    "**/packages/api/src/__tests__/integration/story-3-3-shared-barrier-atomic-pg.integration.test.[jt]s",
+  ];
 } else if (process.env.TEST_TYPE === "voucher-service-redeem-pg") {
   // v1.16.0 Story 5.4 (FR-19, AD-34) — realizacja VOUCHER_SERVICE jednym aktem,
   // atomowość aktu i śladu, rozłączność gałęzi. DATABASE_URL musi wskazywać

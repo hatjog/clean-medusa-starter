@@ -295,7 +295,7 @@ async function createFixtureSchema(client: PoolClient): Promise<void> {
       id text PRIMARY KEY, sales_channel_id text, metadata jsonb, deleted_at timestamptz
     );
     CREATE TEMP TABLE order_item (
-      order_id text NOT NULL, item_id text NOT NULL,
+      order_id text NOT NULL, item_id text NOT NULL, quantity numeric NOT NULL DEFAULT 1,
       created_at timestamptz NOT NULL, deleted_at timestamptz
     );
     CREATE TEMP TABLE order_line_item (
@@ -1064,6 +1064,11 @@ runWithIsolatedDatabase("Story 3.6 AC1 — produkcyjne call-site'y na realnym Po
         `DELETE FROM event_processed
           WHERE external_id = $1 AND event_type = $2`,
         [`${FIXTURE.paymentIntentId}:${FIXTURE.orderId}`, PAYMENT_INTENT_SUCCEEDED_EVENT]
+      )
+      // Story 3.3: wspólna bariera skutku (public) — sprzątanie klucza jednostki tej suity.
+      await pathYFixture.client.query(
+        `DELETE FROM owed_unit_effect_barrier WHERE owed_business_unit_key = $1`,
+        [`${FIXTURE.paymentIntentId}:${FIXTURE.orderId}`]
       )
       await capturedFixture.client.query("DROP TABLE IF EXISTS webhook_event_processed, voucher_event, voucher, entitlement_instance, order_item, order_line_item, product_product_seller_seller, seller, product, payment_session, order_payment_collection, \"order\", sales_channel CASCADE")
       await pathYFixture.client.query("DROP TABLE IF EXISTS webhook_event_processed, voucher_event, voucher, entitlement_instance, order_item, order_line_item, product_product_seller_seller, seller, product, payment_session, order_payment_collection, \"order\", sales_channel CASCADE")
