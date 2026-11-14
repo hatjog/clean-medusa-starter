@@ -23,7 +23,7 @@ function setUp(acquiresPerQuery = 1) {
   }
   const client = {
     acquireConnection: async () => connection,
-    releaseConnection: jest.fn(async () => undefined),
+    releaseConnection: jest.fn(async (_connection: unknown) => undefined),
     destroyRawConnection: jest.fn(async () => undefined),
   }
   const logger = { error: jest.fn(), info: jest.fn() }
