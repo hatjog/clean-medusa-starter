@@ -21,6 +21,8 @@ import gpConfigSyncCatalog from "./gp-config-sync-catalog"
 import gpConfigSyncI18nContent from "./gp-config-sync-i18n-content"
 import gpConfigSyncMarketRuntime, {
   MONEY_PATH_BRAKES_DRIFT_ERROR_CODE,
+  marketRuntimeStageMismatches,
+  type MarketRuntimeStageSummary,
 } from "./gp-config-sync-market-runtime"
 import gpConfigSyncTranslations from "./gp-config-sync-translations"
 import gpConfigSyncMedia from "./gp-config-sync-media"
@@ -419,13 +421,6 @@ export class MarketRuntimeStageNotOkError extends Error {
   }
 }
 
-type MarketRuntimeStageSummary = {
-  ok?: boolean
-  action?: string
-  warnings?: string[]
-  money_path_brakes_round_trip?: { mismatches?: string[] }
-} | undefined | null
-
 /**
  * Story 6.8 (R-15/R-18/R-19) — logika wrappera etapu `sync-market-runtime`,
  * wydzielona, żeby test mógł ją wołać przez `runStage`. Czyta `summary.ok`
@@ -439,9 +434,7 @@ export async function executeMarketRuntimeStage(input: {
 }): Promise<string> {
   const summary = await input.run()
   if (!summary || summary.ok !== true) {
-    throw new MarketRuntimeStageNotOkError(
-      summary?.money_path_brakes_round_trip?.mismatches ?? [],
-    )
+    throw new MarketRuntimeStageNotOkError(marketRuntimeStageMismatches(summary))
   }
   for (const warning of summary.warnings ?? []) {
     input.warnings.push(`sync-market-runtime: ${warning}`)

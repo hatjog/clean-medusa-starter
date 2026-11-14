@@ -302,6 +302,24 @@ export type MoneyPathBrakesRoundTrip = {
 }
 
 /**
+ * Story 6.8 (AUD-1) — raport etapu `sync-market-runtime` widziany przez
+ * orchestrator. Pole round-tripu hamulca nazywa wyłącznie ten plik (jedyny
+ * pisarz kolumny nośnika wg `validate_money_path_brake_carrier.py`), więc
+ * orchestrator dostaje listę rozjazdów przez helper i nie sięga po nazwę
+ * kolumny. Kształt bez zmian względem wrappera z R-15/R-19.
+ */
+export type MarketRuntimeStageSummary = {
+  ok?: boolean
+  action?: string
+  warnings?: string[]
+  money_path_brakes_round_trip?: { mismatches?: string[] }
+} | undefined | null
+
+export function marketRuntimeStageMismatches(summary: MarketRuntimeStageSummary): string[] {
+  return summary?.money_path_brakes_round_trip?.mismatches ?? []
+}
+
+/**
  * Story 6.8 (R-2/R-3) — nazwany kod rozjazdu. Etap `sync-market-runtime` jest
  * w orchestratorze OPCJONALNY (decyzja PO 2026-08-11: brak locales nie blokuje
  * zakupu), więc zwykły wyjątek zostałby zdegradowany do `warning`. Rozjazd
