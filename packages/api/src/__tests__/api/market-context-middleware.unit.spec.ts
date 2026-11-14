@@ -45,6 +45,18 @@ import {
 } from "../../api/middlewares";
 import { marketContextStorage } from "../../lib/market-context";
 
+// Story 11.2 (triage 7.1 poz. 2): od 11.1 kontekst rynku ma DRUGĄ oś scope —
+// instancję runtime wyłącznie z GP_INSTANCE_ID (bez domyślki gp-dev). Fixture
+// podaje ją jawnie; asercje rynku pozostają bez zmian.
+const PREVIOUS_GP_INSTANCE_ID = process.env.GP_INSTANCE_ID
+beforeEach(() => {
+  process.env.GP_INSTANCE_ID = "gp-test-instance"
+})
+afterAll(() => {
+  if (PREVIOUS_GP_INSTANCE_ID === undefined) delete process.env.GP_INSTANCE_ID
+  else process.env.GP_INSTANCE_ID = PREVIOUS_GP_INSTANCE_ID
+})
+
 describe("Market Context Middleware", () => {
   const originalRlsDebug = process.env.GP_RLS_DEBUG;
 
@@ -86,7 +98,7 @@ describe("Market Context Middleware", () => {
 
     await marketContextMiddleware(req, {} as any, () => {
       const ctx = marketContextStorage.getStore();
-      expect(ctx).toEqual({ market_id: "bonbeauty", sales_channel_id: "sc_bb" });
+      expect(ctx).toEqual({ market_id: "bonbeauty", instance_id: "gp-test-instance", sales_channel_id: "sc_bb" });
     });
 
     expect(mockInstallRlsPoolHook).toHaveBeenCalledWith(pgConnection, logger);

@@ -38,6 +38,7 @@ import {
   type TransitionEventEnvelope,
 } from "../../modules/voucher/entitlement-transition-wiring"
 import { redactFailureCode } from "../../lib/payment/failure-classification"
+import { requireRuntimeInstanceId } from "../../lib/runtime-instance-identity"
 
 export const STRIPE_PAYMENT_EVENTS = [
   "payment.captured",
@@ -246,6 +247,15 @@ export class StripePaymentAuditWorkflow {
     assertNativeStripePayload(eventType, payload)
     const envelope = buildPaymentAuditEnvelope(eventType, payload, now)
     const eventId = payload.event_id as string
+    // Story 11.2 (ADR-240, review R-5): tożsamość instancji runtime ustalana
+    // PRZED otwarciem transakcji — brak GP_INSTANCE_ID to nazwana odmowa
+    // (`RuntimeInstanceIdentityError`, GP_RUNTIME_INSTANCE_UNCONFIGURED) zanim
+    // powstanie wiersz dedupe albo jakiekolwiek uprawnienie. Wywołujący
+    // (subscriber `stripe-payment-audit`) rozpoznaje tę klasę osobno.
+    const runtimeInstanceId =
+      eventType === "payment.captured" && payload.order_id
+        ? requireRuntimeInstanceId("stripe-payment-audit")
+        : null
 
     return this.withTransaction(async (client) => {
       let entitlement: IssueEntitlementResult | undefined
@@ -318,7 +328,8 @@ export class StripePaymentAuditWorkflow {
               buildGenesisActiveTransition({
                 entitlement_id: issued.entitlement_id,
                 scope: {
-                  instance_id: issued.entitlement_id,
+                  // Story 11.2: ustalona przed tx (gałąź captured+order_id).
+                  instance_id: runtimeInstanceId as string,
                   // Precedens defensywny tego pliku (emit entitlement_issued.v1):
                   // brak market_id NIE może failować transakcji biznesowej.
                   market_id: payload.market_id ?? "unknown",

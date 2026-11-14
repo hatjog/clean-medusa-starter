@@ -64,6 +64,11 @@ import {
 } from "../lib/recovery/deferred-issuance-trace"
 import { resolveRuntimeInstanceId } from "../lib/market-context"
 import {
+  isRuntimeInstanceIdentityError,
+  requireRuntimeInstanceId,
+  RUNTIME_INSTANCE_UNCONFIGURED_ERROR_CODE,
+} from "../lib/runtime-instance-identity"
+import {
   buildGenesisActiveTransition,
   buildGenesisIssuedTransition,
   emitTransitionEventAfterCommit,
@@ -745,7 +750,9 @@ export default async function onOrderPlacedStripeRetry({
                   buildGenesisIssuedTransition({
                     entitlement_id: issued.entitlement_id,
                     scope: {
-                      instance_id: issued.entitlement_id,
+                      // Story 11.2 (DW-15-183/DW-15-298 p.4): instancja runtime
+                      // z `buildPathYRecoveryInput` (GP_INSTANCE_ID), nie id uprawnienia.
+                      instance_id: input.scope.instance_id,
                       market_id: input.scope.market_id,
                       sales_channel_id: null,
                       vendor_id: null,
@@ -775,7 +782,7 @@ export default async function onOrderPlacedStripeRetry({
                     buildGenesisActiveTransition({
                       entitlement_id: issued.entitlement_id,
                       scope: {
-                        instance_id: issued.entitlement_id,
+                        instance_id: input.scope.instance_id,
                         market_id: input.scope.market_id,
                         sales_channel_id: null,
                         vendor_id: null,
@@ -799,6 +806,12 @@ export default async function onOrderPlacedStripeRetry({
               continue
             }
 
+            // Story 11.2 (ADR-240, review R-5): tożsamość instancji ustalana
+            // PRZED wystawieniem — brak GP_INSTANCE_ID odmawia temu wierszowi,
+            // zanim cokolwiek zostanie zapisane (obsługa w `catch` niżej).
+            const runtimeInstanceId = requireRuntimeInstanceId(
+              "on-order-placed-stripe-retry"
+            )
             const result = await issueEntitlementsForAllLineItems(
               client,
               {
@@ -839,7 +852,7 @@ export default async function onOrderPlacedStripeRetry({
                 buildGenesisActiveTransition({
                   entitlement_id: issued.entitlement_id,
                   scope: {
-                    instance_id: issued.entitlement_id,
+                    instance_id: runtimeInstanceId,
                     // Ten sam precedens defensywny co w ścieżce webhooka: brak
                     // market_id nie może wywrócić transakcji biznesowej.
                     market_id: row.market_id ?? "unknown",
@@ -906,6 +919,20 @@ export default async function onOrderPlacedStripeRetry({
             // pozostałe markery tej samej paczki — w tym markery pokolenia
             // v1.9.0, które odzyskują się poprawnie — są przetwarzane dalej,
             // zamiast wywracać się razem z tym jednym.
+            // Story 11.2 (review R-5): brak GP_INSTANCE_ID — nazwana odmowa
+            // PRZED wystawieniem. Wiersz zostaje nierozwiązany (bez
+            // `markDeferredResolved`) do ponowienia po konfiguracji instancji;
+            // pozostałe wiersze paczki przetwarzane dalej.
+            if (isRuntimeInstanceIdentityError(err)) {
+              logger.error?.(
+                `[on-order-placed-stripe-retry] order_id=${orderId} ` +
+                  `event_id=${row.event_id} RuntimeInstanceIdentityError ` +
+                  `(${RUNTIME_INSTANCE_UNCONFIGURED_ERROR_CODE}) — uprawnienie NIE ` +
+                  `wystawione, zero zapisów, wiersz odroczony zostaje do ponowienia: ` +
+                  `${err.message}`
+              )
+              continue
+            }
             if (err instanceof PathYRecoveryInputError) {
               // Story 4.6 (AD-32): trwała wada danych markera → wiersz DLQ w TEJ
               // transakcji (pod savepointem, żeby porażka zapisu nie wywróciła

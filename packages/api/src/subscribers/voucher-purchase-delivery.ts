@@ -63,6 +63,10 @@
  * do locale domyślnego (R-2.3-M6).
  */
 
+import {
+  classifyEnvelopeInstance,
+  RUNTIME_INSTANCE_MISMATCH_ERROR_CODE,
+} from "../lib/runtime-instance-identity"
 import type { SubscriberArgs, SubscriberConfig } from "@medusajs/framework"
 import { ContainerRegistrationKeys, Modules } from "@medusajs/framework/utils"
 
@@ -205,6 +209,11 @@ export type PurchaseDeliveryTrigger = {
   from_state: string | null
   instance_id: string | null
   market_id: string | null
+  /**
+   * Story 11.2 (ADR-240): `occurred_at` koperty — wyznacza okno kompatybilności
+   * kopert zastanych. Opcjonalne: trigger sweepu go nie niesie.
+   */
+  occurred_at?: string | null
   /**
    * Story 4.4 — cel dosyłki. `null` w ścieżce ZDARZENIOWEJ: subscriber nadal
    * realizuje pełną matrycę AD-7, bo zgubiony event dotyczy wszystkich szablonów.
@@ -417,6 +426,7 @@ export function extractPurchaseDeliveryTrigger(
     to_state: nonEmpty(payload?.to_state),
     from_state: nonEmpty(payload?.from_state),
     instance_id: nonEmpty(scope?.instance_id),
+    occurred_at: nonEmpty(envelope.occurred_at),
     // `scope.market_id` JEST w kopercie eventu (2.1) — to pierwszy, najtańszy
     // nośnik rynku z danych domenowych (R-2.2-M4 / AC6b).
     market_id: nonEmpty(scope?.market_id),
@@ -617,6 +627,45 @@ export async function handleVoucherPurchaseDelivery(
       error_code: errorCode,
       handoff: null,
     }
+  }
+
+  // ── Story 11.2 (AD-49, DW-15-183): strażnik tożsamości instancji ──────────
+  // `scope.instance_id` koperty to instancja runtime PRODUCENTA. Konsument
+  // przyjmuje wyłącznie zdarzenia własnej instancji; koperta zastana (sprzed
+  // 11.2: entitlement id w `instance_id`) i trigger bez scope (sweep) przechodzą
+  // wg zasady kompatybilności ze schematu. Odmowa PRZED jakimkolwiek zapisem.
+  const instanceVerdict = classifyEnvelopeInstance({
+    envelope_instance_id: trigger.instance_id,
+    entitlement_id: entitlementId,
+    runtime_instance_id: measurementContext.instance_id,
+    occurred_at: trigger.occurred_at ?? null,
+  })
+  if (instanceVerdict === "mismatch") {
+    deps.logger?.error?.(
+      "[voucher-purchase-delivery] odmowa: koperta z obcej instancji runtime",
+      {
+        entitlement_id: entitlementId,
+        market_id: marketId,
+        error_code: RUNTIME_INSTANCE_MISMATCH_ERROR_CODE,
+        envelope_instance_id: trigger.instance_id,
+        runtime_instance_id: measurementContext.instance_id,
+      },
+    )
+    return {
+      outcome: "failed",
+      entitlement_id: entitlementId,
+      dispatch_id: null,
+      market_id: marketId,
+      locale: null,
+      error_code: RUNTIME_INSTANCE_MISMATCH_ERROR_CODE,
+      handoff: null,
+    }
+  }
+  if (instanceVerdict === "legacy_entitlement_scoped") {
+    deps.logger?.warn?.(
+      "[voucher-purchase-delivery] koperta zastana: scope.instance_id = entitlement id (sprzed Story 11.2)",
+      { entitlement_id: entitlementId, market_id: marketId },
+    )
   }
 
   const recipientEmail = nonEmpty(source.buyer_email)

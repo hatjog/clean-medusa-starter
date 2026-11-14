@@ -153,6 +153,15 @@ if (process.env.TEST_TYPE === "integration:http") {
   module.exports.testMatch = [
     "**/packages/api/src/__tests__/integration/story-3-6-canonical-state-provenance-pg.integration.test.[jt]s",
   ];
+} else if (process.env.TEST_TYPE === "voucher-service-redeem-pg") {
+  // v1.16.0 Story 5.4 (FR-19, AD-34) — realizacja VOUCHER_SERVICE jednym aktem,
+  // atomowość aktu i śladu, rozłączność gałęzi. DATABASE_URL musi wskazywać
+  // IZOLOWANĄ DB `*_test`: suity DROP-ują i odtwarzają tabele modułu voucher.
+  module.exports.testMatch = [
+    "**/packages/api/src/__tests__/integration/voucher-service-redeem-single-act.integration.spec.[jt]s",
+    "**/packages/api/src/__tests__/integration/voucher-service-redeem-atomicity.integration.spec.[jt]s",
+    "**/packages/api/src/__tests__/integration/voucher-redeem-branch-disjointness.integration.spec.[jt]s",
+  ];
 } else if (process.env.TEST_TYPE === "story-4-6-dlq-pg") {
   // v1.16.0 Story 4.6 — nośnik DLQ (mor_policy_dlq_entry) pod RLS na realnym
   // PostgreSQL; wyłącznie własna suita (DATABASE_URL = izolowana DB *_test).

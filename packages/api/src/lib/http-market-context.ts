@@ -34,6 +34,7 @@
 import type { Knex } from "knex"
 
 import { marketContextStorage, resolveRuntimeInstanceId, type MarketContext } from "./market-context"
+import { lookupSellerMarketIdWithoutMarketContext } from "./rls-pool-hook"
 
 /** Ten sam kształt identyfikatora, który przyjmuje hook RLS. */
 const SAFE_MARKET_ID_RE = /^[a-zA-Z0-9_-]+$/
@@ -91,12 +92,14 @@ export async function resolveSellerMarketId(
   db: Knex,
   sellerId: string,
 ): Promise<string> {
-  const row = await db("seller")
-    .select(db.raw("metadata->'gp'->>'market_id' as market_id"))
-    .where("id", sellerId)
-    .first<{ market_id?: string | null } | undefined>()
-
-  const marketId = row?.market_id ?? null
+  // Story 5.4 fix (DW-15-300): the market is not known yet, so the hook (11.1)
+  // would deny this read. It goes through the NAMED one-shot exception
+  // `SELLER_MARKET_LOOKUP_EXCEPTION` (rls-pool-hook.ts) — one fixed query on
+  // `seller` by the authenticated id, nothing else.
+  const marketId = await lookupSellerMarketIdWithoutMarketContext(
+    db as unknown as Parameters<typeof lookupSellerMarketIdWithoutMarketContext>[0],
+    sellerId,
+  )
   if (!marketId) {
     throw new HttpMarketContextError(
       `sprzedawca '${sellerId}' nie ma zadeklarowanego rynku ` +
