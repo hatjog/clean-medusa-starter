@@ -8,10 +8,8 @@ import {
   snapshotPolicy,
   type EntitlementPolicySnapshot,
 } from "../../modules/voucher/models/entitlement"
-import {
-  buildEventProcessedDedupeInsert,
-  EVENT_PROCESSED_TABLE,
-} from "../../modules/voucher/models/event-processed"
+import { EVENT_PROCESSED_TABLE } from "../../modules/voucher/models/event-processed"
+import { buildOwedUnitEffectBarrierInsert } from "../../lib/payment/owed-unit-effect-barrier"
 import {
   buildEntitlementDedupeKey,
   ENTITLEMENT_DEDUPE_ON_CONFLICT_CLAUSE,
@@ -389,7 +387,7 @@ async function runLiveIssue(
   }
 
   // ── (i) EVENT-LEVEL dedupe (DEC-5 pkt 3.i) — PIERWSZY krok transakcji ──────
-  const dedupeInsert = buildEventProcessedDedupeInsert({
+  const dedupeMarker = {
     instance_id: dedupeInstanceId,
     market_id: dedupeMarketId,
     external_id: buildPaymentIntentOrderExternalId(
@@ -402,6 +400,17 @@ async function runLiveIssue(
     // pętli, więc N wystawień jednego zakupu koreluje się po kolumnie zamiast
     // przez parsowanie `external_id` po separatorze.
     purchase_key: payload.payment_intent_id,
+  }
+  // Story 3.3 (AC1, ADR-242 Proposed): rezerwacja klucza jednostki należnej we
+  // WSPÓLNEJ barierze i znacznik skutku w `event_processed` to JEDNA instrukcja
+  // w tej samej tx co INSERT-y entitlementów — bez stanu pośredniego.
+  const dedupeInsert = buildOwedUnitEffectBarrierInsert(dedupeMarker, {
+    owed_business_unit_key: dedupeMarker.external_id,
+    payment_intent_id: payload.payment_intent_id,
+    order_id: payload.order_id,
+    instance_id: dedupeInstanceId,
+    market_id: dedupeMarketId,
+    claimed_by_path: LIVE_ISSUE_PATH,
   })
   if (!options.skipEventInsert) {
     if (mode === "isolate_lines") {

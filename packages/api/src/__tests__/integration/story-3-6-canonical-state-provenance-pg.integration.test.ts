@@ -1065,6 +1065,11 @@ runWithIsolatedDatabase("Story 3.6 AC1 — produkcyjne call-site'y na realnym Po
           WHERE external_id = $1 AND event_type = $2`,
         [`${FIXTURE.paymentIntentId}:${FIXTURE.orderId}`, PAYMENT_INTENT_SUCCEEDED_EVENT]
       )
+      // Story 3.3: wspólna bariera skutku (public) — sprzątanie klucza jednostki tej suity.
+      await pathYFixture.client.query(
+        `DELETE FROM owed_unit_effect_barrier WHERE owed_business_unit_key = $1`,
+        [`${FIXTURE.paymentIntentId}:${FIXTURE.orderId}`]
+      )
       await capturedFixture.client.query("DROP TABLE IF EXISTS webhook_event_processed, voucher_event, voucher, entitlement_instance, order_item, order_line_item, product_product_seller_seller, seller, product, payment_session, order_payment_collection, \"order\", sales_channel CASCADE")
       await pathYFixture.client.query("DROP TABLE IF EXISTS webhook_event_processed, voucher_event, voucher, entitlement_instance, order_item, order_line_item, product_product_seller_seller, seller, product, payment_session, order_payment_collection, \"order\", sales_channel CASCADE")
       capturedFixture.release()

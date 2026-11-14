@@ -153,6 +153,12 @@ if (process.env.TEST_TYPE === "integration:http") {
   module.exports.testMatch = [
     "**/packages/api/src/__tests__/integration/story-3-6-canonical-state-provenance-pg.integration.test.[jt]s",
   ];
+} else if (process.env.TEST_TYPE === "story-3-3-shared-barrier-pg") {
+  // v1.16.0 Story 3.3 (FR-9, AD-33) — wspolna bariera skutku per nalezna
+  // jednostka na realnym PostgreSQL (DATABASE_URL = izolowana *_test).
+  module.exports.testMatch = [
+    "**/packages/api/src/__tests__/integration/story-3-3-shared-barrier-atomic-pg.integration.test.[jt]s",
+  ];
 } else if (process.env.TEST_TYPE === "story-4-6-dlq-pg") {
   // v1.16.0 Story 4.6 — nośnik DLQ (mor_policy_dlq_entry) pod RLS na realnym
   // PostgreSQL; wyłącznie własna suita (DATABASE_URL = izolowana DB *_test).
