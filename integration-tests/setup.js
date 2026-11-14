@@ -63,12 +63,9 @@ const { MetadataStorage } = require("@medusajs/framework/mikro-orm/core");
 const TEST_TYPE = process.env.TEST_TYPE ?? "";
 const requiresIsolatedDb =
   /-pg$/.test(TEST_TYPE) || TEST_TYPE === "stripe-multi-order";
-// Story 11.1 ma jawny, niemutujący tryb NOT_RUN. Musi dać się uruchomić bez
-// URL-a, aby brak bezpiecznej bazy był widoczny jako wynik testu, a nie jako
-// błąd globalnego setupu. Każdy przebieg live nadal wymaga DATABASE_URL.
-const permitsDatabaseFreeNotRun =
-  TEST_TYPE === "story-11-1-runtime-recovery-pg" &&
-  process.env.GP_RUN_MIGRATION_INTEGRATION !== "1";
+// Decyzja PO D-35 p.3: zaden profil (w tym story-11-1-runtime-recovery-pg)
+// nie startuje bez DATABASE_URL. Brak mozliwosci uruchomienia zapisuje sie
+// w evidence jako NEEDS-LIVE-RUN, nie jako kontynuacja suity z RC=0.
 const DEVELOPMENT_DATABASES = new Set(["gp_mercur", "gp_core", "gp_portal"]);
 const MAINTENANCE_DATABASES = new Set(["postgres", "template1"]);
 const TEST_DATABASE_NAME_TOKEN = /(^|[_.-])test([_.-]|$)/i;
@@ -141,9 +138,7 @@ function resolveDatabaseTarget() {
   return { databaseUrl, dbName };
 }
 
-const resolvedDatabaseTarget = permitsDatabaseFreeNotRun
-  ? null
-  : resolveDatabaseTarget();
+const resolvedDatabaseTarget = resolveDatabaseTarget();
 
 if (resolvedDatabaseTarget !== null) {
   if (DEVELOPMENT_DATABASES.has(resolvedDatabaseTarget.dbName)) {

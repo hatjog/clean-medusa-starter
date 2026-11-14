@@ -1,6 +1,6 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 
 const BACKEND_ROOT = resolve(__dirname, "../../../..");
@@ -37,14 +37,21 @@ function runBootstrap(options: {
             directory: join(BACKEND_ROOT, "__tests__/patches"),
             filename: "startup-guard.fixture.spec.js",
           }
-        : {
-            directory: BACKEND_ROOT,
-            filename: "startup-guard.fixture.test.js",
-          };
+        : options.testType === "story-11-1-runtime-recovery-pg"
+          ? {
+              directory: BACKEND_ROOT,
+              filename:
+                "packages/api/src/__tests__/integration/story-11-1-runtime-scope-pg.integration.test.js",
+            }
+          : {
+              directory: BACKEND_ROOT,
+              filename: "startup-guard.fixture.test.js",
+            };
   const fixtureDirectory = mkdtempSync(
     join(fixtureLocation.directory, ".test-db-startup-guard-"),
   );
   const fixturePath = join(fixtureDirectory, fixtureLocation.filename);
+  mkdirSync(dirname(fixturePath), { recursive: true });
   const env: NodeJS.ProcessEnv = {
     ...process.env,
     TEST_TYPE: options.testType ?? "profile-name-cannot-authorize-database",
@@ -173,7 +180,7 @@ describe("test database startup guard", () => {
     expect(result.output).toContain(FIXTURE_EXECUTED);
   });
 
-  it.each(["unit", "patches"])(
+  it.each(["unit", "patches", "story-11-1-runtime-recovery-pg"])(
     "refuses a missing URL for the %s profile before the Jest fixture runs",
     (testType) => {
       const result = runBootstrap({ testType });
@@ -182,6 +189,20 @@ describe("test database startup guard", () => {
       expect(result.output).toContain("DATABASE_URL");
     },
   );
+
+  it("refuses a missing URL for story-11-1-runtime-recovery-pg even with GP_RUN_MIGRATION_INTEGRATION unset (D-35 p.3)", () => {
+    const previous = process.env.GP_RUN_MIGRATION_INTEGRATION;
+    delete process.env.GP_RUN_MIGRATION_INTEGRATION;
+    try {
+      const result = runBootstrap({ testType: "story-11-1-runtime-recovery-pg" });
+
+      expect(result.status).not.toBe(0);
+      expectBootstrapRefusal(result);
+      expect(result.output).toContain("DATABASE_URL");
+    } finally {
+      if (previous !== undefined) process.env.GP_RUN_MIGRATION_INTEGRATION = previous;
+    }
+  });
 
   it("prefers an explicit isolated test database over a misleading .env.test value", () => {
     const result = runBootstrap({
