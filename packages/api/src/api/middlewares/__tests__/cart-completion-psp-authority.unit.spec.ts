@@ -19,11 +19,17 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from "@jest/globals"
 import { EventEmitter } from "node:events"
 import { spawn, type ChildProcess } from "node:child_process"
-import { Client } from "pg"
+import { Client, Pool } from "pg"
+import { ContainerRegistrationKeys } from "@medusajs/framework/utils"
 
 import {
   createCartCompletionPspAuthorityMiddleware,
+  defaultAcquireConnection,
   CART_COMPLETE_LOCK_NAMESPACE,
+  PSP_AUTHORITY_ORPHAN_CEILING,
+  PSP_AUTHORITY_UNLOCK_FAILED,
+  TRY_LOCK_SQL,
+  UNLOCK_SQL,
   type PspAuthorityDeps,
 } from "../cart-completion-psp-authority"
 
@@ -35,6 +41,7 @@ type Res = EventEmitter & {
   body: Record<string, unknown> | null
   status: (code: number) => Res
   json: (body: Record<string, unknown>) => Res
+  end: () => Res
 }
 
 function makeRes(): Res {
@@ -49,6 +56,7 @@ function makeRes(): Res {
     res.body = body
     return res
   }
+  res.end = () => res
   return res
 }
 
@@ -296,4 +304,205 @@ describe("Story 8.2 — autorytet PSP dla POST /store/carts/:id/complete (ADR-23
       await concurrent.end()
     }
   })
+
+  async function lockIsFree(cartId: string): Promise<boolean> {
+    const probe = new Client({ connectionString: DATABASE_URL })
+    await probe.connect()
+    try {
+      const r = await probe.query(
+        "SELECT pg_try_advisory_lock(hashtextextended($1, 0)) AS locked",
+        [`${CART_COMPLETE_LOCK_NAMESPACE}${cartId}`]
+      )
+      return r.rows[0].locked === true
+    } finally {
+      await probe.end()
+    }
+  }
+
+  it("fix 1: koszyk BEZ sesji Stripe ⇒ przepuszczony bez zakładania blokady", async () => {
+    const issued: string[] = []
+    const spy = {
+      query: (sql: string, params?: ReadonlyArray<unknown>) => {
+        issued.push(sql)
+        return client.query(sql, params as unknown[])
+      },
+    }
+    const middleware = createCartCompletionPspAuthorityMiddleware({
+      acquireConnection: async () => ({ client: spy as never, release: () => void releases++ }),
+      retrievePaymentIntentStatus: async () => "succeeded",
+    })
+    const res = makeRes()
+    let nextCalled = false
+    await middleware({ params: { id: "cart_story82_nostripe" }, scope: {} } as never, res as never, () => {
+      nextCalled = true
+    })
+    expect(nextCalled).toBe(true)
+    expect(issued).not.toContain(TRY_LOCK_SQL)
+    expect(releases).toBe(1)
+    expect(await lockIsFree("cart_story82_nostripe")).toBe(true)
+  })
+
+  it("fix 1: nieudany unlock ⇒ połączenie NISZCZONE (destroy) + nazwany log, nie zwrot do puli", async () => {
+    await seedStripeSession(CART, "pi_story82_unlockfail")
+    const errors: string[] = []
+    const releaseCalls: Array<{ destroy?: boolean } | undefined> = []
+    const failingUnlock = {
+      query: (sql: string, params?: ReadonlyArray<unknown>) =>
+        sql === UNLOCK_SQL
+          ? Promise.reject(new Error("connection reset"))
+          : client.query(sql, params as unknown[]),
+    }
+    const middleware = createCartCompletionPspAuthorityMiddleware({
+      acquireConnection: async () => ({
+        client: failingUnlock as never,
+        release: opts => void releaseCalls.push(opts),
+      }),
+      retrievePaymentIntentStatus: async () => "succeeded",
+    })
+    const res = makeRes()
+    let nextCalled = false
+    const scope = {
+      resolve: (k: string) => {
+        if (k === "logger") return { error: (m: string) => errors.push(m) }
+        throw new Error(`unregistered ${k}`)
+      },
+    }
+    await middleware({ params: { id: CART }, scope } as never, res as never, () => {
+      nextCalled = true
+    })
+    expect(nextCalled).toBe(true)
+    res.emit("finish")
+    await new Promise(r => setTimeout(r, 50))
+    expect(releaseCalls).toEqual([{ destroy: true }])
+    expect(errors.some(m => m.startsWith(PSP_AUTHORITY_UNLOCK_FAILED))).toBe(true)
+  })
+
+  it("fix 1: zerwanie połączenia klienta ('close') NIE zwalnia blokady, dopóki handler nie domknie odpowiedzi", async () => {
+    await seedStripeSession(CART, "pi_story82_close")
+    const first = await run({})
+    expect(first.nextCalled).toBe(true)
+    first.res.emit("close")
+    await new Promise(r => setTimeout(r, 50))
+    expect(await lockIsFree(CART)).toBe(false)
+    expect(releases).toBe(0)
+    // Saga kończy się, handler woła res.json/res.end mimo zerwanego klienta.
+    first.res.end()
+    await new Promise(r => setTimeout(r, 50))
+    expect(releases).toBe(1)
+    expect(await lockIsFree(CART)).toBe(true)
+  })
+
+  it("fix 1: osierocona blokada po 'close' zwalniana po nazwanym suficie", async () => {
+    await seedStripeSession(CART, "pi_story82_ceiling")
+    const warns: string[] = []
+    const middleware = createCartCompletionPspAuthorityMiddleware({
+      acquireConnection: async () => ({ client: client as never, release: () => void releases++ }),
+      retrievePaymentIntentStatus: async () => "succeeded",
+      orphanLockCeilingMs: 100,
+    })
+    const res = makeRes()
+    const scope = { resolve: () => ({ warn: (m: string) => warns.push(m) }) }
+    await middleware({ params: { id: CART }, scope } as never, res as never, () => {})
+    res.emit("close")
+    await new Promise(r => setTimeout(r, 30))
+    expect(releases).toBe(0)
+    await new Promise(r => setTimeout(r, 200))
+    expect(releases).toBe(1)
+    expect(warns.some(m => m.startsWith(PSP_AUTHORITY_ORPHAN_CEILING))).toBe(true)
+  })
 })
+
+describe("Story 8.2 fix 1 — blokada NIE pochodzi z puli sagi (PG_CONNECTION)", () => {
+  const SCHEMA = "story82_fence_fixture"
+  let admin: Client
+  let sagaPool: Pool
+  let fixtureUrl: string
+
+  beforeAll(async () => {
+    const u = new URL(DATABASE_URL)
+    u.searchParams.set("options", `-c search_path=${SCHEMA}`)
+    fixtureUrl = u.toString()
+    admin = new Client({ connectionString: DATABASE_URL })
+    await admin.connect()
+    await admin.query(`
+      DROP SCHEMA IF EXISTS ${SCHEMA} CASCADE;
+      CREATE SCHEMA ${SCHEMA};
+      CREATE TABLE ${SCHEMA}."order" (id text PRIMARY KEY, deleted_at timestamptz);
+      CREATE TABLE ${SCHEMA}.order_cart (order_id text, cart_id text, deleted_at timestamptz);
+      CREATE TABLE ${SCHEMA}.cart_payment_collection (cart_id text, payment_collection_id text, deleted_at timestamptz);
+      CREATE TABLE ${SCHEMA}.payment_session (payment_collection_id text, provider_id text, data jsonb, deleted_at timestamptz);
+      INSERT INTO ${SCHEMA}.cart_payment_collection VALUES ('cart_pool_a','paycol_a',NULL),('cart_pool_b','paycol_b',NULL);
+      INSERT INTO ${SCHEMA}.payment_session VALUES
+        ('paycol_a','pp_stripe_stripe','{"id":"pi_pool_a"}',NULL),
+        ('paycol_b','pp_stripe_stripe','{"id":"pi_pool_b"}',NULL);
+    `)
+    // Pula sagi o rozmiarze 2 — odpowiednik PG_CONNECTION (Medusa: domyślnie 10).
+    sagaPool = new Pool({ connectionString: fixtureUrl, max: 2 })
+  })
+
+  afterAll(async () => {
+    await sagaPool?.end()
+    await admin?.query(`DROP SCHEMA IF EXISTS ${SCHEMA} CASCADE`)
+    await admin?.end()
+  })
+
+  it("dwa równoległe complete trzymają blokady, a saga nadal dostaje połączenie z puli rozmiaru 2", async () => {
+    const knexLike = {
+      raw: () => Promise.reject(new Error("not used")),
+      client: {
+        acquireConnection: () => sagaPool.connect(),
+        releaseConnection: (c: { release: () => void }) => c.release(),
+      },
+    }
+    const scope = {
+      resolve: (k: string) => {
+        if (k === ContainerRegistrationKeys.PG_CONNECTION) return knexLike
+        if (k === ContainerRegistrationKeys.CONFIG_MODULE) return { projectConfig: { databaseUrl: fixtureUrl } }
+        if (k === "logger") return console
+        throw new Error(`unregistered ${k}`)
+      },
+    }
+    const middleware = createCartCompletionPspAuthorityMiddleware({
+      acquireConnection: defaultAcquireConnection,
+      retrievePaymentIntentStatus: async () => "succeeded",
+    })
+    const resA = makeRes()
+    const resB = makeRes()
+    const passed: string[] = []
+    await Promise.all(
+      (["cart_pool_a", "cart_pool_b"] as const).map((id, i) =>
+        middleware({ params: { id }, scope } as never, (i === 0 ? resA : resB) as never, () => {
+          passed.push(id)
+        })
+      )
+    )
+    try {
+      expect(passed.sort()).toEqual(["cart_pool_a", "cart_pool_b"])
+      expect(await lockIsFreeOn(admin, "cart_pool_a")).toBe(false)
+      expect(await lockIsFreeOn(admin, "cart_pool_b")).toBe(false)
+      // Saga (zwykłe zapytanie z puli) MUSI dostać połączenie mimo trzymanych blokad.
+      const saga = sagaPool.query("SELECT 1 AS ok")
+      const outcome = await Promise.race([
+        saga.then(r => (r.rows[0].ok === 1 ? "saga-ok" : "saga-bad")),
+        new Promise<string>(r => setTimeout(() => r("saga-starved"), 3000)),
+      ])
+      expect(outcome).toBe("saga-ok")
+    } finally {
+      resA.emit("finish")
+      resB.emit("finish")
+      await new Promise(r => setTimeout(r, 100))
+    }
+    expect(await lockIsFreeOn(admin, "cart_pool_a")).toBe(true)
+    expect(await lockIsFreeOn(admin, "cart_pool_b")).toBe(true)
+  })
+})
+
+async function lockIsFreeOn(c: Client, cartId: string): Promise<boolean> {
+  const key = `${CART_COMPLETE_LOCK_NAMESPACE}${cartId}`
+  const r = await c.query("SELECT pg_try_advisory_lock(hashtextextended($1, 0)) AS locked", [key])
+  if (r.rows[0].locked === true) {
+    await c.query("SELECT pg_advisory_unlock(hashtextextended($1, 0))", [key])
+    return true
+  }
+  return false
+}
