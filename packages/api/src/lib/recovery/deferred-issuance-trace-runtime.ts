@@ -3,7 +3,7 @@
  * `deferred_issuance_trace` z route'u webhooka pod granicą RLS (Story 11.1).
  *
  * Kolejność: (1) rynek śladu z koszyka płatności (bez zgadywania), (2) SLA
- * właściciela z konfiguracji runtime, (3) INSERT na połączeniu wziętym
+ * właściciela z config-as-code (`recovery-config.ts`, D-35 p.9; fail-loud), (3) INSERT na połączeniu wziętym
  * WEWNĄTRZ kontekstu rynku (`queryUnderMarketContext` sprawdza, że sesja
  * niesie ten rynek i tę instancję). Każda odmowa ma nazwę.
  */
@@ -18,7 +18,7 @@ import {
 
 export type PersistDeferredIssuanceTraceOutcome =
   | { ok: true; created: boolean; market_id: string; trace_id: string }
-  | { ok: false; reason: "market_unresolved" | "market_ambiguous" | "trace_sla_unconfigured" }
+  | { ok: false; reason: "market_unresolved" | "market_ambiguous" }
 
 export async function persistDeferredIssuanceTraceRecord(
   scope: { resolve: (key: string) => unknown },
@@ -30,8 +30,7 @@ export async function persistDeferredIssuanceTraceRecord(
     session_id: string | null
     metadata_market_id: string | null
     psp_occurred_at: string
-  },
-  env: Record<string, string | undefined> = process.env
+  }
 ): Promise<PersistDeferredIssuanceTraceOutcome> {
   const market = await resolveDeferredTraceMarket(readClient, {
     session_id: input.session_id,
@@ -40,8 +39,7 @@ export async function persistDeferredIssuanceTraceRecord(
   })
   if (!market.ok) return { ok: false, reason: market.reason }
 
-  const slaSeconds = readDeferredIssuanceTraceSlaSeconds(env)
-  if (slaSeconds === null) return { ok: false, reason: "trace_sla_unconfigured" }
+  const slaSeconds = readDeferredIssuanceTraceSlaSeconds()
 
   // `queryUnderMarketContext` zwraca wyłącznie wiersze; INSERT … RETURNING daje
   // jeden wiersz, gdy rekord jest nowy, i zero przy `ON CONFLICT DO NOTHING`.
@@ -93,8 +91,7 @@ export async function recordWebhookDeferredIssuanceTrace(
     session_id: string | null
     metadata_market_id: string | null
     read_psp_occurred_at: () => string
-  },
-  env: Record<string, string | undefined> = process.env
+  }
 ): Promise<PersistDeferredIssuanceTraceOutcome | null> {
   try {
     const outcome = await persistDeferredIssuanceTraceRecord(
@@ -107,8 +104,7 @@ export async function recordWebhookDeferredIssuanceTrace(
         session_id: input.session_id,
         metadata_market_id: input.metadata_market_id,
         psp_occurred_at: input.read_psp_occurred_at(),
-      },
-      env
+      }
     )
     if (outcome.ok) {
       logger.info?.(

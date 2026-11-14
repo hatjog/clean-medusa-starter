@@ -31,13 +31,13 @@ import {
   runDeferredIssuanceTraceBackfill,
 } from "../../lib/recovery/deferred-issuance-trace"
 import { persistDeferredIssuanceTraceRecord } from "../../lib/recovery/deferred-issuance-trace-runtime"
+import { DEFERRED_ISSUANCE_TRACE_SLA_SECONDS } from "../../lib/recovery/recovery-config"
 import { STRIPE_PATH_Y_WEBHOOK_PROVIDER } from "../../lib/payment/stripe-payment-intent-transport"
 
 const enabled = process.env.GP_RUN_MIGRATION_INTEGRATION === "1" && !!process.env.DATABASE_URL
 
 const SCOPE_A = { instance_id: "gp_inst_4_4", market_id: "mkt_4_4_a" }
 const SCOPE_B = { instance_id: "gp_inst_4_4", market_id: "mkt_4_4_b" }
-const SLA_ENV = { GP_DEFERRED_ISSUANCE_TRACE_SLA_SECONDS: "3600" }
 
 function collectSql(direction: "up" | "down"): Promise<string[]> {
   const statements: string[] = []
@@ -207,8 +207,7 @@ describeOrNotRun("Story 4.4 — rekord deferred_issuance_trace na rzeczywistym P
           session_id: "payses_4_4",
           metadata_market_id: null,
           psp_occurred_at: "2026-11-14T10:00:00.000Z",
-        },
-        SLA_ENV
+        }
       )
       expect(outcome).toEqual({
         ok: true,
@@ -228,26 +227,9 @@ describeOrNotRun("Story 4.4 — rekord deferred_issuance_trace na rzeczywistym P
           session_id: "payses_4_4",
           metadata_market_id: null,
           psp_occurred_at: "2026-11-14T10:00:00.000Z",
-        },
-        SLA_ENV
+        }
       )
       expect(again).toMatchObject({ ok: true, created: false })
-
-      // Bez SLA w konfiguracji = nazwana odmowa, nie wartość domyślna.
-      const noSla = await persistDeferredIssuanceTraceRecord(
-        scope,
-        reader,
-        {
-          stripe_event_id: "evt_4_4_nosla",
-          payment_intent_id: "pi_4_4_nosla",
-          instance_id: SCOPE_A.instance_id,
-          session_id: "payses_4_4",
-          metadata_market_id: null,
-          psp_occurred_at: "2026-11-14T10:00:00.000Z",
-        },
-        {}
-      )
-      expect(noSla).toEqual({ ok: false, reason: "trace_sla_unconfigured" })
 
       // Rozjazd rynku metadata ↔ koszyk = odmowa, nie wybór jednego z nich.
       const ambiguous = await persistDeferredIssuanceTraceRecord(
@@ -260,8 +242,7 @@ describeOrNotRun("Story 4.4 — rekord deferred_issuance_trace na rzeczywistym P
           session_id: "payses_4_4",
           metadata_market_id: SCOPE_B.market_id,
           psp_occurred_at: "2026-11-14T10:00:00.000Z",
-        },
-        SLA_ENV
+        }
       )
       expect(ambiguous).toEqual({ ok: false, reason: "market_ambiguous" })
     } finally {
@@ -274,8 +255,9 @@ describeOrNotRun("Story 4.4 — rekord deferred_issuance_trace na rzeczywistym P
               resolution_evidence, version, retry_count, provenance_kind, stripe_event_id,
               payment_intent_id, deferral_reason, age_source,
               occurred_at IS NOT NULL AS has_occurred_at,
-              (deadline - occurred_at) = interval '3600 seconds' AS deadline_from_sla
-         FROM deferred_issuance_trace`
+              (deadline - occurred_at) = make_interval(secs => $1::double precision) AS deadline_from_sla
+         FROM deferred_issuance_trace`,
+      [DEFERRED_ISSUANCE_TRACE_SLA_SECONDS]
     )
     expect(row.rows).toEqual([
       {
@@ -355,6 +337,8 @@ describeOrNotRun("Story 4.4 — rekord deferred_issuance_trace na rzeczywistym P
         "order_placed_retry",
         JSON.stringify({ order_id: "order_x", orders: ["order_x"] }),
         "order_x",
+        SCOPE_B.market_id,
+        SCOPE_B.instance_id,
       ])
     })
     expect(crossClose.rowCount).toBe(0)
@@ -439,6 +423,50 @@ describeOrNotRun("Story 4.4 — rekord deferred_issuance_trace na rzeczywistym P
     await expect(
       asRuntime(client, SCOPE_A, () => client.query("DELETE FROM deferred_issuance_trace"))
     ).rejects.toThrow(/permission denied/)
+  })
+
+  it("R-6: predykat rynku/instancji w UPDATE domknięcia działa także BEZ RLS (rola omijająca RLS)", async () => {
+    await asRuntime(client, SCOPE_B, () =>
+      recordDeferredIssuanceTrace(client, traceInput("evt_4_4_r6", SCOPE_B))
+    )
+    // Połączenie testu jest superużytkownikiem (omija RLS): izolację daje
+    // wyłącznie predykat SQL. Domknięcie z rynkiem A nie może dotknąć rekordu B.
+    await client.query("BEGIN")
+    const wrongMarket = await closeDeferredIssuanceTrace(client, {
+      stripe_event_id: "evt_4_4_r6",
+      instance_id: SCOPE_B.instance_id,
+      market_id: SCOPE_A.market_id,
+      order_id: "order_r6",
+      closure_path: "order_placed_retry",
+      evidence: { resolver: "test" },
+    })
+    const wrongInstance = await closeDeferredIssuanceTrace(client, {
+      stripe_event_id: "evt_4_4_r6",
+      instance_id: "gp_inst_obca",
+      market_id: SCOPE_B.market_id,
+      order_id: "order_r6",
+      closure_path: "order_placed_retry",
+      evidence: { resolver: "test" },
+    })
+    await client.query("COMMIT")
+    expect(wrongMarket).toBeNull()
+    expect(wrongInstance).toBeNull()
+    const still = await client.query(
+      "SELECT state, version FROM deferred_issuance_trace WHERE trace_id = 'evt_4_4_r6#deferred-issuance'"
+    )
+    expect(still.rows).toEqual([{ state: "awaiting_order", version: 1 }])
+
+    await client.query("BEGIN")
+    const right = await closeDeferredIssuanceTrace(client, {
+      stripe_event_id: "evt_4_4_r6",
+      instance_id: SCOPE_B.instance_id,
+      market_id: SCOPE_B.market_id,
+      order_id: "order_r6",
+      closure_path: "order_placed_retry",
+      evidence: { resolver: "test" },
+    })
+    await client.query("COMMIT")
+    expect(right).toBe(2)
   })
 
   it("AC2 mutant: domknięcie bez evidence (NULL albo {}) albo ze ścieżką not_closed jest odmową bazy", async () => {

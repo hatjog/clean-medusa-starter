@@ -9,9 +9,15 @@ import { join } from "node:path"
 import { Migration20261114100000DeferredIssuanceTraceTable } from "../../migrations/Migration20261114100000DeferredIssuanceTraceTable"
 import { RECOVERY_MIGRATION_PLAN } from "../../lib/recovery/recovery-migration-plan"
 import {
+  CLOSE_DEFERRED_ISSUANCE_TRACE_SQL,
   deferredIssuanceTraceBackfillSql,
   readDeferredIssuanceTraceSlaSeconds,
 } from "../../lib/recovery/deferred-issuance-trace"
+import {
+  assertDeferredIssuanceTraceSla,
+  DEFERRED_ISSUANCE_TRACE_SLA,
+  DEFERRED_ISSUANCE_TRACE_SLA_SECONDS,
+} from "../../lib/recovery/recovery-config"
 
 function collectUp(): string[] {
   const statements: string[] = []
@@ -68,10 +74,33 @@ describe("Story 4.4 — kształt deferred_issuance_trace", () => {
       const src = readFileSync(join(__dirname, "../../lib/recovery", file), "utf8")
       expect(src).not.toMatch(/\b(86400|24\s*\*\s*60|'24 hours'|interval '24)/)
     }
-    expect(readDeferredIssuanceTraceSlaSeconds({})).toBeNull()
-    expect(readDeferredIssuanceTraceSlaSeconds({ GP_DEFERRED_ISSUANCE_TRACE_SLA_SECONDS: "0" })).toBeNull()
-    expect(readDeferredIssuanceTraceSlaSeconds({ GP_DEFERRED_ISSUANCE_TRACE_SLA_SECONDS: "12h" })).toBeNull()
-    expect(readDeferredIssuanceTraceSlaSeconds({ GP_DEFERRED_ISSUANCE_TRACE_SLA_SECONDS: "7200" })).toBe(7200)
+  })
+
+  it("R-1: termin SLA = jedna nazwana wartość w config-as-code (D-35 p.9), bez zmiennej środowiskowej", () => {
+    // Domyślne źródło działa bez ŻADNEJ zmiennej — rekord powstaje w każdym wdrożeniu.
+    expect(readDeferredIssuanceTraceSlaSeconds()).toBe(DEFERRED_ISSUANCE_TRACE_SLA.seconds)
+    expect(DEFERRED_ISSUANCE_TRACE_SLA_SECONDS).toBe(24 * 60 * 60)
+    expect(DEFERRED_ISSUANCE_TRACE_SLA.owner_id).toBe("ops-recovery")
+    expect(DEFERRED_ISSUANCE_TRACE_SLA.source).toMatch(/decisions-2026-11-14\.md#D-35 p\.9/)
+    for (const file of ["deferred-issuance-trace.ts", "deferred-issuance-trace-runtime.ts"]) {
+      const src = readFileSync(join(__dirname, "../../lib/recovery", file), "utf8")
+      expect(src).not.toMatch(/GP_DEFERRED_ISSUANCE_TRACE_SLA_SECONDS|process\.env/)
+    }
+  })
+
+  it("R-1: brak albo niepoprawna wartość SLA = fail-loud, nigdy null/ciche pominięcie", () => {
+    expect(() => assertDeferredIssuanceTraceSla(undefined)).toThrow(/recovery-config/)
+    for (const bad of [null, {}, { seconds: 0 }, { seconds: -1 }, { seconds: 1.5 },
+      { seconds: "86400" as unknown as number }, { seconds: 86400, owner_id: "", source: "x" },
+      { seconds: 86400, owner_id: "ops-recovery", source: "" }]) {
+      expect(() => readDeferredIssuanceTraceSlaSeconds(bad)).toThrow(/recovery-config/)
+      expect(() => assertDeferredIssuanceTraceSla(bad)).toThrow(/recovery-config/)
+    }
+  })
+
+  it("R-6: UPDATE domknięcia ma predykat rynku i instancji (obrona w głąb obok RLS)", () => {
+    const flat = CLOSE_DEFERRED_ISSUANCE_TRACE_SQL.replace(/\s+/g, " ")
+    expect(flat).toContain("WHERE trace_id = $1 AND market_id = $5 AND instance_id = $6 AND")
   })
 
   it("backfill wykonuje krok dit-backfill bez granic transakcji i pomija już zapisane rekordy", () => {

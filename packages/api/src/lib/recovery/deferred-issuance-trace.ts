@@ -14,8 +14,8 @@
  *     zero joinów; zmiana/usunięcie markera transportu nie zmienia wyniku.
  *
  * Właściciel: rola operatorska `ops-recovery` (D-35 p.9). Termin (`deadline`)
- * jest WEJŚCIEM (sekundy SLA z konfiguracji runtime) — progu wieku nie
- * ustala ta story (należy do 4.5), więc w kodzie nie ma literału okresu.
+ * liczy się z SLA w config-as-code (`recovery-config.ts`) — progu wieku nie
+ * ustala ta story (należy do 4.5), więc w tym pliku nie ma literału okresu.
  *
  * Tożsamość rekordu = klucz markera (`<event_id>#deferred-issuance`), ten sam,
  * którym posługuje się krok `dit-backfill` planu migracji. Zapis żywy
@@ -30,6 +30,11 @@ import {
   DEFERRED_ISSUANCE_TRACE_TABLE,
   RECOVERY_MIGRATION_PLAN,
 } from "./recovery-migration-plan"
+import {
+  assertDeferredIssuanceTraceSla,
+  DEFERRED_ISSUANCE_TRACE_SLA,
+  type DeferredIssuanceTraceSlaConfig,
+} from "./recovery-config"
 
 export type TraceQueryClient = {
   query: <T = Record<string, unknown>>(
@@ -44,8 +49,8 @@ export const DEFERRED_ISSUANCE_TRACE_OWNER = {
   owner_id: "ops-recovery",
 } as const
 
-/** Zmienna konfiguracji runtime niosąca SLA właściciela w sekundach. */
-export const DEFERRED_ISSUANCE_TRACE_SLA_ENV = "GP_DEFERRED_ISSUANCE_TRACE_SLA_SECONDS" as const
+/** Źródło terminu SLA: config-as-code (`recovery-config.ts`, D-35 p.9). */
+export { DEFERRED_ISSUANCE_TRACE_SLA, DEFERRED_ISSUANCE_TRACE_SLA_SECONDS } from "./recovery-config"
 
 /** Proweniencja rekordu zapisanego przez runtime (odróżniona od backfillu). */
 export const DEFERRED_ISSUANCE_TRACE_RUNTIME_PROVENANCE = {
@@ -56,6 +61,23 @@ export const DEFERRED_ISSUANCE_TRACE_RUNTIME_PROVENANCE = {
 /** Ścieżka zamknięcia przy odzysku na `order.placed`. */
 export const DEFERRED_ISSUANCE_TRACE_CLOSURE_ORDER_PLACED = "order_placed_retry" as const
 
+/**
+ * Ścieżka zamknięcia, gdy ponowienie Stripe (ta sama `event.id`) rozwiązało
+ * link w route i wystawienie domknął subscriber `voucher-live-issue` (R-5).
+ */
+export const DEFERRED_ISSUANCE_TRACE_CLOSURE_WEBHOOK_LIVE_ISSUE = "webhook_live_issue" as const
+
+/**
+ * Kontrakt domknięcia (R-5): rekord domykają DOKŁADNIE te ścieżki, które
+ * wystawiają uprawnienie dla śladu Path Y. Ścieżka natywna `payment.captured`
+ * (`issue-entitlement.ts`, marker provider `stripe`) NIE ma rekordu 4.4
+ * (rekord zapisuje wyłącznie route Path Y), więc nie ma czego domykać.
+ */
+export const DEFERRED_ISSUANCE_TRACE_CLOSING_PATHS = [
+  DEFERRED_ISSUANCE_TRACE_CLOSURE_ORDER_PLACED,
+  DEFERRED_ISSUANCE_TRACE_CLOSURE_WEBHOOK_LIVE_ISSUE,
+] as const
+
 export const OPEN_TRACE_STATES = ["awaiting_order", "escalated"] as const
 
 export function deferredIssuanceTraceId(stripeEventId: string): string {
@@ -63,15 +85,13 @@ export function deferredIssuanceTraceId(stripeEventId: string): string {
 }
 
 /**
- * SLA w sekundach z konfiguracji runtime. Brak/niepoprawna wartość = `null`
- * (nazwana odmowa wołającego), nigdy wartość domyślna.
+ * SLA w sekundach z config-as-code. Niepoprawna konfiguracja = wyjątek
+ * (fail-loud), nigdy `null` ani ciche pominięcie zapisu.
  */
 export function readDeferredIssuanceTraceSlaSeconds(
-  env: Record<string, string | undefined> = process.env
-): number | null {
-  const raw = env[DEFERRED_ISSUANCE_TRACE_SLA_ENV]
-  if (typeof raw !== "string" || !/^[1-9][0-9]*$/.test(raw.trim())) return null
-  return Number(raw.trim())
+  config: Partial<DeferredIssuanceTraceSlaConfig> | null | undefined = DEFERRED_ISSUANCE_TRACE_SLA
+): number {
+  return assertDeferredIssuanceTraceSla(config)
 }
 
 export const INSERT_DEFERRED_ISSUANCE_TRACE_SQL = `
@@ -192,6 +212,8 @@ export const CLOSE_DEFERRED_ISSUANCE_TRACE_SQL = `
          state = 'issued_after_link',
          version = version + 1
    WHERE trace_id = $1
+     AND market_id = $5
+     AND instance_id = $6
      AND (
            state IN ('awaiting_order', 'escalated')
         OR (state = 'issued_after_link'
@@ -234,6 +256,8 @@ export async function closeDeferredIssuanceTrace(
       input.closure_path,
       JSON.stringify(evidence),
       input.order_id,
+      input.market_id,
+      input.instance_id,
     ])
     return result.rows[0]?.version ?? null
   } finally {

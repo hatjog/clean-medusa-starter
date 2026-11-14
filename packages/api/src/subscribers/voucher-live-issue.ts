@@ -45,6 +45,11 @@ import {
   type TransitionEventEnvelope,
   type TransitionAuditEnvelope,
 } from "../modules/voucher/entitlement-transition-wiring"
+import { DEFERRED_ISSUANCE_EVENT_SUFFIX } from "../lib/payment/stripe-payment-intent-transport"
+import {
+  closeDeferredIssuanceTraceGuarded,
+  DEFERRED_ISSUANCE_TRACE_CLOSURE_WEBHOOK_LIVE_ISSUE,
+} from "../lib/recovery/deferred-issuance-trace"
 
 /** event_type kontraktu Story 3.1 (AR-EVENTS). */
 export const PAYMENT_INTENT_SUCCEEDED_EVENT =
@@ -76,6 +81,23 @@ type PaymentIntentEnvelope = {
   event_type?: string
   scope?: LiveIssueScope
   payload?: Partial<PaymentIntentSucceededPayload>
+  causation_id?: string
+}
+
+/** Prefiks `causation_id` koperty Path Y (`stripe:webhook:<event.id>`). */
+const STRIPE_WEBHOOK_CAUSATION_PREFIX = "stripe:webhook:"
+
+/**
+ * Story 4.4 (R-5): `event.id` Stripe z `causation_id` koperty — ta sama
+ * wartość, którą route zapisał jako `stripe_event_id` rekordu śladu.
+ */
+export function stripeEventIdFromCausation(causationId: unknown): string | null {
+  if (typeof causationId !== "string" || !causationId.startsWith(STRIPE_WEBHOOK_CAUSATION_PREFIX)) {
+    return null
+  }
+  const eventId = causationId.slice(STRIPE_WEBHOOK_CAUSATION_PREFIX.length)
+  if (!eventId || eventId.endsWith(DEFERRED_ISSUANCE_EVENT_SUFFIX)) return null
+  return eventId
 }
 
 function resolveLogger(container: Record<string, unknown> | undefined): LoggerLike {
@@ -257,6 +279,31 @@ export default async function voucherLiveIssueSubscriber({
       },
       async () => withTransaction(db, async (client) => {
       const result = await liveIssueEntitlementsWithinTx(client, input, now)
+      // Story 4.4 (R-5): ponowienie Stripe z rozwiązanym linkiem domyka rekord
+      // śladu tej dostawy w TEJ SAMEJ tx co wystawienie. Pod SAVEPOINT-em —
+      // porażka rekordu nie wycofuje wystawienia, ale zostawia linię `warn`.
+      const traceEventId = stripeEventIdFromCausation(event.data?.causation_id)
+      if (traceEventId && result.event_processed) {
+        const closed = await closeDeferredIssuanceTraceGuarded(client, {
+          stripe_event_id: traceEventId,
+          instance_id: instanceId,
+          market_id: marketId,
+          order_id: input.payload.order_id,
+          closure_path: DEFERRED_ISSUANCE_TRACE_CLOSURE_WEBHOOK_LIVE_ISSUE,
+          evidence: {
+            resolver: "subscriber:voucher-live-issue",
+            payment_intent_id: input.payload.payment_intent_id,
+            entitlements_issued: result.issued.length,
+            resolved_at: now.toISOString(),
+          },
+        })
+        if (!closed.ok) {
+          logger.warn?.(
+            `[voucher-live-issue] order=${input.payload.order_id} trace=${traceEventId} ` +
+              `domkniecie rekordu deferred_issuance_trace NIEUDANE (wystawienie zachowane): ${closed.error}`
+          )
+        }
+      }
       const events: TransitionEventEnvelope[] = []
       const appendAudit = makeTransitionAuditSink(logger)
       // Okabluj WYŁĄCZNIE nowo utworzone wiersze (`created=true`). Replay
