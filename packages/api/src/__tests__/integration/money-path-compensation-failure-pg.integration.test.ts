@@ -19,6 +19,7 @@ import { Pool } from "pg"
 import knexFactory from "knex"
 
 import { Migration20260818090000MoneyPathCompensationFailureTable } from "../../migrations/Migration20260818090000MoneyPathCompensationFailureTable"
+import { Migration20261114120000MoneyPathCompensationFailureRecoveryColumns } from "../../migrations/Migration20261114120000MoneyPathCompensationFailureRecoveryColumns"
 import {
   buildCompensationFailureId,
   buildPurchaseCorrelationKey,
@@ -45,17 +46,29 @@ const PI = "pi_pg_3_5"
  * pójdą na produkcję — nie ich ręcznie przepisaną kopię, która mogłaby się
  * rozjechać z plikiem i test świeciłby na zielono przy zepsutej migracji.
  */
-function collectSql(direction: "up" | "down"): Promise<string[]> {
+// Story 4.2: writer zapisuje `instance_id` wyłącznie ze źródła serwerowego.
+process.env.GP_INSTANCE_ID = process.env.GP_INSTANCE_ID || "gp-test"
+
+async function collectSql(direction: "up" | "down"): Promise<string[]> {
+  // Story 4.2: schemat produkcyjny = 3.5 (CREATE) + 4.2 (ALTER); down w odwrotnej kolejności.
+  const classes = [
+    Migration20260818090000MoneyPathCompensationFailureTable,
+    Migration20261114120000MoneyPathCompensationFailureRecoveryColumns,
+  ]
+  const ordered = direction === "up" ? classes : [...classes].reverse()
   const statements: string[] = []
-  const migration = Object.create(
-    Migration20260818090000MoneyPathCompensationFailureTable.prototype
-  ) as Migration20260818090000MoneyPathCompensationFailureTable & {
-    addSql: (sql: string) => void
+  for (const MigrationClass of ordered) {
+    const migration = Object.create(MigrationClass.prototype) as {
+      addSql: (sql: string) => void
+      up: () => Promise<void>
+      down: () => Promise<void>
+    }
+    migration.addSql = (sql: string) => {
+      statements.push(sql)
+    }
+    await migration[direction]()
   }
-  migration.addSql = (sql: string) => {
-    statements.push(sql)
-  }
-  return Promise.resolve(migration[direction]()).then(() => statements)
+  return statements
 }
 
 function record(

@@ -113,6 +113,12 @@ if (process.env.TEST_TYPE === "integration:http") {
   module.exports.testMatch = [
     "**/packages/api/src/__tests__/integration/money-path-compensation-failure-pg.integration.test.[jt]s",
   ];
+} else if (process.env.TEST_TYPE === "story-4-2-compensation-failure-pg") {
+  // v1.16.0 Story 4.2 (FR-11, AD-32) — migracja kolumn recovery tabeli
+  // money_path_compensation_failure (backfill do kwarantanny, RLS) na realnym PG.
+  module.exports.testMatch = [
+    "**/packages/api/src/__tests__/integration/story-4-2-compensation-failure-migration-pg.integration.test.[jt]s",
+  ];
 } else if (process.env.TEST_TYPE === "dispatch-barrier-pg") {
   // v1.15.0 Story 4.1 — bariera idempotencji wysylki wykonana przez sam modul
   // na realnym Postgresie (knex.raw). DATABASE_URL musi wskazywac IZOLOWANA DB

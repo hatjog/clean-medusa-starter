@@ -348,7 +348,14 @@ async function createFixtureSchema(client: PoolClient): Promise<void> {
       occurred_at timestamptz NOT NULL,
       attempt_count integer NOT NULL,
       last_attempt_at timestamptz NOT NULL,
-      resolution_state text NOT NULL
+      resolution_state text NOT NULL,
+      instance_id text,
+      owner_type text,
+      owner_id text,
+      deadline timestamptz,
+      closure_path text,
+      provenance_kind text,
+      provenance_source text
     )
   `)
   await client.query("INSERT INTO sales_channel (id, metadata) VALUES ('sc_3_6', $1::jsonb)", [

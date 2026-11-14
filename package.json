@@ -44,6 +44,8 @@
     "test:integration:http": "TEST_TYPE=integration:http NODE_OPTIONS=--experimental-vm-modules jest --silent=false --runInBand --forceExit",
     "test:integration:stripe-multi-order": "TEST_TYPE=stripe-multi-order NODE_OPTIONS=--experimental-vm-modules jest --silent=false --runInBand --forceExit",
     "db:migrate:story-11-1": "node scripts/story-11-1-apply-runtime-recovery-migration.cjs",
+    "db:migrate:story-4-2": "node scripts/story-4-2-apply-compensation-failure-migration.cjs",
+    "test:integration:story-4-2-compensation-failure-pg": "GP_RUN_MIGRATION_INTEGRATION=1 TEST_TYPE=story-4-2-compensation-failure-pg NODE_OPTIONS=--experimental-vm-modules jest --silent=false --runInBand --forceExit",
     "test:integration:story-11-1-runtime-recovery-pg": "GP_RUN_MIGRATION_INTEGRATION=1 TEST_TYPE=story-11-1-runtime-recovery-pg NODE_OPTIONS=--experimental-vm-modules jest --silent=false --runInBand --forceExit",
     "test:integration:owed-unit-ack-pg": "TEST_TYPE=owed-unit-ack-pg NODE_OPTIONS=--experimental-vm-modules jest --silent=false --runInBand --forceExit",
     "test:integration:completed-order-pg": "TEST_TYPE=completed-order-pg NODE_OPTIONS=--experimental-vm-modules jest --silent=false --runInBand --forceExit",

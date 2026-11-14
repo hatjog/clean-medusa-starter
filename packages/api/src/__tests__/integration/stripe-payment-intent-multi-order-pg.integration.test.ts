@@ -241,6 +241,13 @@ runOrSkip("F2 — multi-seller na realnej ścieżce PostgreSQL", () => {
          attempt_count integer NOT NULL DEFAULT 1,
          last_attempt_at timestamptz NOT NULL DEFAULT now(),
          resolution_state text NOT NULL DEFAULT 'open',
+         instance_id text,
+         owner_type text,
+         owner_id text,
+         deadline timestamptz,
+         closure_path text,
+         provenance_kind text,
+         provenance_source text,
          resolved_at timestamptz,
          resolved_by text
        ) ON COMMIT DROP`,

@@ -320,6 +320,13 @@ runWithIsolatedDatabase("Story 3.1 AC3 — kontrakt ACK vs jednostki należne na
          attempt_count integer NOT NULL DEFAULT 1,
          last_attempt_at timestamptz NOT NULL DEFAULT now(),
          resolution_state text NOT NULL DEFAULT 'open',
+         instance_id text,
+         owner_type text,
+         owner_id text,
+         deadline timestamptz,
+         closure_path text,
+         provenance_kind text,
+         provenance_source text,
          resolved_at timestamptz,
          resolved_by text
        ) ON COMMIT DROP`,

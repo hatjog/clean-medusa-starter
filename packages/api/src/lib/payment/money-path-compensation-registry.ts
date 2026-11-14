@@ -32,6 +32,7 @@
 import { createHash } from "node:crypto"
 
 import { emitStructuredAlert } from "../alert-emit"
+import { resolveRuntimeInstanceId } from "../market-context"
 import type { PaymentLinkQueryClient } from "./stripe-payment-intent-link"
 import { acquireFreshPgConnection } from "./stripe-payment-intent-transport"
 
@@ -97,12 +98,32 @@ export type RecordedCompensationFailure = {
   order_id: string | null
 }
 
+/**
+ * Story 4.2 (AD-32): właściciel i termin nowego wiersza. Owner to rola
+ * operatorska `ops-recovery` (ADR-221 §owner: `operator_role`), termin = SLA
+ * 24 h od zapisu (D-35 p.9). `instance_id` wyłącznie ze źródła serwerowego.
+ */
+export const COMPENSATION_FAILURE_OWNER = { owner_type: "operator_role", owner_id: "ops-recovery" } as const
+export const COMPENSATION_FAILURE_SLA_HOURS = 24
+export const COMPENSATION_FAILURE_INSTANCE_SOURCE = "env:GP_INSTANCE_ID" as const
+
+export class CompensationFailureInstanceUnconfiguredError extends Error {
+  constructor() {
+    super("money_path_compensation_failure: GP_INSTANCE_ID nie jest skonfigurowany — zapis odmówiony (fail-closed)")
+    this.name = "CompensationFailureInstanceUnconfiguredError"
+  }
+}
+
 export const RECORD_COMPENSATION_FAILURE_SQL = `
   INSERT INTO money_path_compensation_failure
     (failure_id, market_id, compensation_kind, delivery_path, stripe_event_id,
      payment_intent_id, order_id, purchase_correlation_key, failure_code,
-     failure_detail, occurred_at, attempt_count, last_attempt_at, resolution_state)
-  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now(), 1, now(), 'open')
+     failure_detail, occurred_at, attempt_count, last_attempt_at, resolution_state,
+     instance_id, owner_type, owner_id, deadline, closure_path, provenance_kind,
+     provenance_source)
+  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now(), 1, now(), 'open',
+          $11, $12, $13, now() + make_interval(hours => $14::int), 'not_closed',
+          'runtime_writer', $15)
   ON CONFLICT (failure_id) DO UPDATE
      SET attempt_count   = money_path_compensation_failure.attempt_count + 1,
          last_attempt_at = now(),
@@ -240,6 +261,10 @@ export async function recordCompensationFailure(
   record: CompensationFailureRecord
 ): Promise<RecordedCompensationFailure> {
   const failureId = buildCompensationFailureId(record)
+  const instanceId = resolveRuntimeInstanceId()
+  if (!instanceId) {
+    throw new CompensationFailureInstanceUnconfiguredError()
+  }
   const result = await client.query<RecordedCompensationFailure>(
     RECORD_COMPENSATION_FAILURE_SQL,
     [
@@ -253,6 +278,11 @@ export async function recordCompensationFailure(
       record.purchase_correlation_key,
       record.failure_code,
       record.failure_detail,
+      instanceId,
+      COMPENSATION_FAILURE_OWNER.owner_type,
+      COMPENSATION_FAILURE_OWNER.owner_id,
+      COMPENSATION_FAILURE_SLA_HOURS,
+      COMPENSATION_FAILURE_INSTANCE_SOURCE,
     ]
   )
   const row = result.rows?.[0]
