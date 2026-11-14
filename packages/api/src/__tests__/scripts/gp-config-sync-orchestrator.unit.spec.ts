@@ -10,6 +10,10 @@ import {
   withStageEnv,
 } from "../../scripts/gp-config-sync-orchestrator"
 import type { StageExitSignal } from "../../scripts/gp-config-sync-orchestrator"
+import {
+  MoneyPathBrakesDriftError,
+  compareMoneyPathBrakesRoundTrip,
+} from "../../scripts/gp-config-sync-market-runtime"
 import fs from "node:fs"
 import path from "node:path"
 
@@ -230,6 +234,40 @@ describe("runStage", () => {
         },
       })
     ).rejects.toThrow("required failed")
+  })
+
+  // Story 6.8 (R-2): rozjazd hamulca na etapie OPCJONALNYM nie może zostać
+  // zdegradowany do warningu (wtedy summary.ok=true i rc=0).
+  it("Story 6.8: fatalny błąd z nazwanym kodem na etapie opcjonalnym daje failed, nie warning", async () => {
+    const roundTrip = compareMoneyPathBrakesRoundTrip(
+      "bonbeauty",
+      { fr_9_delivery_idempotency: "engaged" },
+      { fr_9_delivery_idempotency: "released" },
+    )
+    const result = await runStage({
+      name: "sync-market-runtime",
+      required: false,
+      execute: async () => {
+        throw new MoneyPathBrakesDriftError(roundTrip, "source-projection")
+      },
+    })
+
+    expect(result.status).toBe("failed")
+    expect(result.error_code).toBe("GP_CONFIG_MONEY_PATH_BRAKES_DRIFT")
+    expect(result.message).toMatch(/fr_9_delivery_idempotency/)
+  })
+
+  it("Story 6.8: zwykły błąd etapu opcjonalnego nadal jest warningiem (kontrakt locales bez zmian)", async () => {
+    const error = Object.assign(new Error("locales missing"), { error_code: "X" })
+    const result = await runStage({
+      name: "sync-market-runtime",
+      required: false,
+      execute: async () => {
+        throw error
+      },
+    })
+    expect(result.status).toBe("warning")
+    expect(result.error_code).toBeUndefined()
   })
 })
 

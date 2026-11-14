@@ -63,9 +63,11 @@ type OrchestratorArgs = {
 type StageRunResult = {
   name: string
   required: boolean
-  status: "ok" | "skipped" | "warning"
+  status: "ok" | "skipped" | "warning" | "failed"
   duration_ms: number
   message?: string
+  /** Story 6.8 (R-2) — kod błędu FATALNEGO etapu opcjonalnego. */
+  error_code?: string
 }
 
 type StageExecutionResult =
@@ -363,6 +365,26 @@ export async function runStage(stage: {
     const message = error instanceof Error ? error.message : String(error)
     if (stage.required) {
       throw error
+    }
+
+    // Story 6.8 (R-2): błąd jawnie oznaczony `fatal: true` z nazwanym kodem
+    // (np. GP_CONFIG_MONEY_PATH_BRAKES_DRIFT) NIE jest degradowany do
+    // `warning`. Etap opcjonalny nie rzuca (pozostałe etapy dobiegają, jak
+    // chce decyzja PO 2026-08-11), ale run kończy się `ok=false` / exit 1.
+    if (
+      error &&
+      typeof error === "object" &&
+      error.fatal === true &&
+      typeof error.error_code === "string"
+    ) {
+      return {
+        name: stage.name,
+        required: stage.required,
+        status: "failed",
+        duration_ms: Date.now() - started,
+        message,
+        error_code: error.error_code,
+      }
     }
 
     return {
@@ -1002,6 +1024,9 @@ export default async function gpConfigSyncOrchestrator({ container, args }: Exec
       if (result.status === "warning" && result.message) {
         warnings.push(`${result.name}: ${result.message}`)
       }
+      if (result.status === "failed") {
+        warnings.push(`${result.name}: FATAL ${result.error_code}: ${result.message ?? ""}`)
+      }
     }
 
     // Verify-B5 V4 — etap, który sam zgłosił niezerowy kod wyjścia, nie może
@@ -1138,6 +1163,13 @@ export default async function gpConfigSyncOrchestrator({ container, args }: Exec
     // zastane warningi etapów są widoczne, ale nie wywracają runu.
     // Dry-run niczego nie zapisał, więc tam zostaje 0.
     if (ownershipProtectedSkips.length > 0 && !orchestratorArgs.dryRun) {
+      summary.ok = false
+      process.exitCode = 1
+    }
+
+    // Story 6.8 (R-2) — etap z błędem fatalnym (nazwany kod) wywraca run
+    // także w dry-run: rozjazd hamulca ścieżki pieniądza nie jest kosmetyką.
+    if (stages.some((stage) => stage.status === "failed")) {
       summary.ok = false
       process.exitCode = 1
     }

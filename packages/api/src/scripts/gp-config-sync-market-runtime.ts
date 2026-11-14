@@ -48,6 +48,7 @@ import { ExecArgs } from "@medusajs/framework/types"
 import { ContainerRegistrationKeys } from "@medusajs/framework/utils"
 import type { Knex } from "knex"
 
+import { createHash } from "node:crypto"
 import fs from "node:fs/promises"
 import path from "node:path"
 
@@ -69,6 +70,11 @@ export type MarketRuntimeSyncArgs = {
   instanceId: string
   marketId: string
   configRoot: string
+  /**
+   * Story 6.8 (R-1) — korzeń KANONICZNEGO źródła rynków (`gp-ops/markets`).
+   * Round-trip hamulca porównuje runtime z tym źródłem, nie z projekcją.
+   */
+  marketsSourceRoot: string
   dryRun: boolean
 }
 
@@ -118,11 +124,15 @@ export function parseMarketRuntimeSyncArgs(
   if (!instanceId) throw new Error("instanceId is required (args[0] or GP_INSTANCE_ID)")
   if (!marketId) throw new Error("marketId is required (args[1] or GP_MARKET_ID)")
   if (!configRoot) throw new Error("configRoot is required (GP_CONFIG_ROOT)")
+  const marketsSourceRoot = (
+    process.env.GP_MARKETS_SOURCE_ROOT ?? path.resolve(process.cwd(), "../../gp-ops/markets")
+  ).trim()
 
   return {
     instanceId,
     marketId,
     configRoot,
+    marketsSourceRoot,
     dryRun: orchestratorDryRun || !wantsApply,
   }
 }
@@ -291,10 +301,28 @@ export type MoneyPathBrakesRoundTrip = {
   mismatches: string[]
 }
 
+/**
+ * Story 6.8 (R-2/R-3) — nazwany kod rozjazdu. Etap `sync-market-runtime` jest
+ * w orchestratorze OPCJONALNY (decyzja PO 2026-08-11: brak locales nie blokuje
+ * zakupu), więc zwykły wyjątek zostałby zdegradowany do `warning`. Rozjazd
+ * hamulca to inna klasa: `fatal = true` + kod — `runStage` raportuje go jako
+ * `failed`, a orchestrator kończy run `ok=false` / exit 1, nie zmieniając
+ * `required` etapu (kontrakt locales zostaje nietknięty).
+ */
+export const MONEY_PATH_BRAKES_DRIFT_ERROR_CODE = "GP_CONFIG_MONEY_PATH_BRAKES_DRIFT" as const
+
+export type MoneyPathBrakesDriftPhase = "source-projection" | "pre-apply" | "post-apply" | "source-missing"
+
 export class MoneyPathBrakesDriftError extends Error {
-  constructor(public readonly roundTrip: MoneyPathBrakesRoundTrip) {
+  readonly error_code = MONEY_PATH_BRAKES_DRIFT_ERROR_CODE
+  readonly fatal = true
+
+  constructor(
+    public readonly roundTrip: MoneyPathBrakesRoundTrip,
+    public readonly phase: MoneyPathBrakesDriftPhase = "post-apply",
+  ) {
     super(
-      `money_path_brakes drift for market '${roundTrip.market_id}': ${roundTrip.mismatches.join("; ")}`,
+      `${MONEY_PATH_BRAKES_DRIFT_ERROR_CODE} [${phase}] money_path_brakes drift for market '${roundTrip.market_id}': ${roundTrip.mismatches.join("; ")}`,
     )
     this.name = "MoneyPathBrakesDriftError"
   }
@@ -351,12 +379,166 @@ export function assertMoneyPathBrakesRoundTrip(
   marketId: string,
   sourceBlock: unknown,
   runtimeBlock: unknown,
+  phase: MoneyPathBrakesDriftPhase = "post-apply",
 ): MoneyPathBrakesRoundTrip {
   const result = compareMoneyPathBrakesRoundTrip(marketId, sourceBlock, runtimeBlock)
   if (!result.ok) {
-    throw new MoneyPathBrakesDriftError(result)
+    throw new MoneyPathBrakesDriftError(result, phase)
   }
   return result
+}
+
+/**
+ * Story 6.8 (R-1) — proweniencja kanonicznego źródła hamulca.
+ *
+ * `source_*` to plik w `gp-ops/markets/**` (jedyne miejsce edycji),
+ * `projection_*` to złożony `GP_CONFIG_ROOT`, a `sidecar_*` to
+ * `.gp-projection-provenance.json` zapisany przez assemble (Story 7.7).
+ * `projection_built_from_source` = sidecar potwierdza, że projekcja powstała
+ * z TEGO sha źródła; `null` = brak sidecara (np. instancja bez assemble ze
+ * stemplem) — raportowane, nie zgadywane.
+ */
+export type MoneyPathBrakesSourceProvenance = {
+  source_path: string
+  source_sha256: string
+  projection_path: string
+  projection_sha256: string
+  sidecar_path: string
+  sidecar_source_sha256: string | null
+  projection_built_from_source: boolean | null
+}
+
+export type CanonicalMarketSource = {
+  doc: Record<string, unknown>
+  provenance: MoneyPathBrakesSourceProvenance
+}
+
+export function canonicalMarketSourcePath(
+  marketsSourceRoot: string,
+  instanceId: string,
+  marketId: string,
+): string {
+  return path.resolve(
+    marketsSourceRoot,
+    marketId,
+    "config",
+    instanceId,
+    "markets",
+    marketId,
+    "market.yaml",
+  )
+}
+
+function sha256Hex(raw: Buffer | string): string {
+  return createHash("sha256").update(raw).digest("hex")
+}
+
+function parseMarketYamlDocument(raw: string, origin: string): Record<string, unknown> {
+  const doc = yaml.load(raw, { schema: yaml.JSON_SCHEMA })
+  if (!doc || typeof doc !== "object" || Array.isArray(doc)) {
+    throw new Error(`Invalid YAML document: ${origin}`)
+  }
+  return doc as Record<string, unknown>
+}
+
+/**
+ * Czyta kanoniczne źródło rynku tym samym parserem co projekcję i liczy
+ * proweniencję. Brak pliku źródła jest ROZJAZDEM fatalnym (`source-missing`):
+ * bez źródła nie da się wykazać, że runtime je odtwarza.
+ */
+export async function loadCanonicalMarketSource(
+  args: Pick<MarketRuntimeSyncArgs, "configRoot" | "instanceId" | "marketId" | "marketsSourceRoot">,
+): Promise<CanonicalMarketSource> {
+  const sourcePath = canonicalMarketSourcePath(args.marketsSourceRoot, args.instanceId, args.marketId)
+  const projectionDir = path.resolve(args.configRoot, args.instanceId, "markets", args.marketId)
+  const projectionPath = path.join(projectionDir, "market.yaml")
+  const sidecarPath = path.join(projectionDir, ".gp-projection-provenance.json")
+
+  let sourceRaw: Buffer
+  try {
+    sourceRaw = await fs.readFile(sourcePath)
+  } catch (error) {
+    throw new MoneyPathBrakesDriftError(
+      {
+        market_id: args.marketId,
+        ok: false,
+        source: {},
+        runtime: null,
+        mismatches: [
+          `source: brak kanonicznego market.yaml (${sourcePath}): ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        ],
+      },
+      "source-missing",
+    )
+  }
+  const projectionRaw = await fs.readFile(projectionPath)
+
+  let sidecarSourceSha: string | null = null
+  try {
+    const sidecar = JSON.parse(await fs.readFile(sidecarPath, "utf8")) as {
+      source_files?: Record<string, unknown>
+    }
+    const entry = sidecar?.source_files?.["market.yaml"]
+    sidecarSourceSha = typeof entry === "string" ? entry : null
+  } catch {
+    sidecarSourceSha = null
+  }
+
+  const sourceSha = sha256Hex(sourceRaw)
+  return {
+    doc: parseMarketYamlDocument(sourceRaw.toString("utf8"), sourcePath),
+    provenance: {
+      source_path: sourcePath,
+      source_sha256: sourceSha,
+      projection_path: projectionPath,
+      projection_sha256: sha256Hex(projectionRaw),
+      sidecar_path: sidecarPath,
+      sidecar_source_sha256: sidecarSourceSha,
+      projection_built_from_source: sidecarSourceSha === null ? null : sidecarSourceSha === sourceSha,
+    },
+  }
+}
+
+/**
+ * Story 6.8 (R-1/R-3) — kontrola PRZED zapisem.
+ *
+ * 1. `source-projection`: kanoniczne źródło vs projekcja `GP_CONFIG_ROOT`,
+ *    z której powstaje rekord. Nieaktualna projekcja `released` przy źródle
+ *    `engaged` jest odmową — NIE trafia do bazy.
+ * 2. `pre-apply`: kanoniczne źródło vs ZASTANY wiersz bazy. Rozjazd nie jest
+ *    już „po cichu nadpisany": raport go nazywa (`pre_apply_drift`), dry-run
+ *    zwraca `ok=false`. Apply nadpisuje go wartością ze źródła (to jest
+ *    naprawa w stronę źródła), a kontrola `post-apply` sprawdza wynik.
+ */
+export type MoneyPathBrakesPreApplyCheck = {
+  source_projection: MoneyPathBrakesRoundTrip
+  pre_apply: MoneyPathBrakesRoundTrip
+}
+
+export function checkMoneyPathBrakesBeforeApply(input: {
+  marketId: string
+  canonicalBlock: unknown
+  projectionBlock: unknown
+  existingRuntimeBlock: unknown
+}): MoneyPathBrakesPreApplyCheck {
+  // Projekcja musi się normalizować (literówka = błąd), a potem odtwarzać źródło.
+  const projection = normalizeMoneyPathBrakes(input.projectionBlock)
+  const sourceProjection = compareMoneyPathBrakesRoundTrip(
+    input.marketId,
+    input.canonicalBlock,
+    projection,
+  )
+  if (!sourceProjection.ok) {
+    throw new MoneyPathBrakesDriftError(sourceProjection, "source-projection")
+  }
+  const preApply = compareMoneyPathBrakesRoundTrip(
+    input.marketId,
+    input.canonicalBlock,
+    input.existingRuntimeBlock,
+  )
+  return { source_projection: sourceProjection, pre_apply: preApply }
 }
 
 export async function readRuntimeMoneyPathBrakes(
@@ -522,31 +704,39 @@ export default async function gpConfigSyncMarketRuntime({
   const record = buildMarketRuntimeRecord(parsedArgs.marketId, marketYaml)
   const db = container.resolve(ContainerRegistrationKeys.PG_CONNECTION) as Knex
 
+  // Story 6.8 (R-1/R-3): kontrola PRZED zapisem — kanoniczne źródło
+  // (gp-ops/markets) vs projekcja i vs zastany wiersz. Rozjazd źródło↔projekcja
+  // rzuca `MoneyPathBrakesDriftError` (fatal) zanim cokolwiek trafi do bazy.
+  const canonical = await loadCanonicalMarketSource(parsedArgs)
+  const preApply = checkMoneyPathBrakesBeforeApply({
+    marketId: record.market_id,
+    canonicalBlock: canonical.doc.money_path_brakes,
+    projectionBlock: marketYaml.money_path_brakes,
+    existingRuntimeBlock: await readRuntimeMoneyPathBrakes(db, record.market_id),
+  })
+
   const plan = await planMarketRuntimeSync(db, record)
 
   if (!parsedArgs.dryRun && plan.action !== "unchanged") {
     await applyMarketRuntimeSync(db, record)
   }
 
-  // Story 6.8 (AC2): po apply runtime MUSI odtwarzac source dokladnie;
-  // rozjazd przerywa etap (fail-closed). Dry-run tylko raportuje rozjazd.
-  const runtimeBrakes = await readRuntimeMoneyPathBrakes(db, record.market_id)
+  // Story 6.8 (AC2): po apply runtime MUSI odtwarzac KANONICZNE źródło
+  // dokladnie; rozjazd przerywa etap (fail-closed, kod nazwany). Dry-run nie
+  // pisze, więc jego wynikiem jest stan zastany: rozjazd => `ok=false`.
   const brakesRoundTrip = parsedArgs.dryRun
-    ? compareMoneyPathBrakesRoundTrip(
-        record.market_id,
-        marketYaml.money_path_brakes,
-        runtimeBrakes,
-      )
+    ? preApply.pre_apply
     : assertMoneyPathBrakesRoundTrip(
         record.market_id,
-        marketYaml.money_path_brakes,
-        runtimeBrakes,
+        canonical.doc.money_path_brakes,
+        await readRuntimeMoneyPathBrakes(db, record.market_id),
+        "post-apply",
       )
 
   // Raport bez sekretów: `support_email` to adres kontaktowy rynku publikowany
   // w stopce maila, a nie dana wrażliwa; żadnych kluczy API tu nie ma.
   const summary = {
-    ok: true,
+    ok: brakesRoundTrip.ok,
     dry_run: parsedArgs.dryRun,
     instance_id: parsedArgs.instanceId,
     market_id: record.market_id,
@@ -560,6 +750,8 @@ export default async function gpConfigSyncMarketRuntime({
     money_path_brakes_round_trip: {
       ok: brakesRoundTrip.ok,
       mismatches: brakesRoundTrip.mismatches,
+      pre_apply_drift: preApply.pre_apply.ok ? [] : preApply.pre_apply.mismatches,
+      provenance: canonical.provenance,
     },
   }
 

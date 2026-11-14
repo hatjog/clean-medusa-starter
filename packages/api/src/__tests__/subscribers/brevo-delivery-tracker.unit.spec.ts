@@ -270,23 +270,36 @@ describe("brevoDeliveryTracker", () => {
   })
 
   it("Story 6.8: zwolniony hamulec NIE zostawia sladu engaged", async () => {
-    const ctx = makeContainer({ brakeState: "released" })
+    // R-7 (review 6.8): bez `.catch(() => undefined)` — wyjatek z budowy sladu
+    // przy `released` (mutant: slad bez warunku) MUSI wywrocic test, a nie
+    // zostac polkniety. Sciezka zwolniona wymaga kontekstu instancji, wiec
+    // test ustawia go lokalnie i przywraca.
+    const previousInstance = process.env.GP_INSTANCE_ID
+    process.env.GP_INSTANCE_ID = "gp-test"
+    try {
+      const ctx = makeContainer({ brakeState: "released" })
 
-    await handleDelivery(
-      {
-        provider_id: "brevo",
-        provider_event_id: "brevo-released-trace-1",
-        dispatch_id: "dispatch-released-trace-1",
-        event_type: "delivered",
-        market_id: "pl",
-      },
-      ctx.container,
-    ).catch(() => undefined)
+      await handleDelivery(
+        {
+          provider_id: "brevo",
+          provider_event_id: "brevo-released-trace-1",
+          dispatch_id: "dispatch-released-trace-1",
+          event_type: "delivered",
+          market_id: "pl",
+        },
+        ctx.container,
+      )
 
-    const traceLines = (ctx.logger.info.mock.calls as unknown[][])
-      .map((call) => String(call[0]))
-      .filter((line) => line.includes("money_path_brake_engaged_trace"))
-    expect(traceLines).toHaveLength(0)
+      const traceLines = (ctx.logger.info.mock.calls as unknown[][])
+        .map((call) => String(call[0]))
+        .filter((line) => line.includes("money_path_brake_engaged_trace"))
+      expect(traceLines).toHaveLength(0)
+      // kontrola dodatnia: sciezka zwolniona REALNIE doszla do klasyfikacji
+      expect(ctx.deliveryLedger.applyProviderDeliveryState).toHaveBeenCalledTimes(1)
+    } finally {
+      if (previousInstance === undefined) delete process.env.GP_INSTANCE_ID
+      else process.env.GP_INSTANCE_ID = previousInstance
+    }
   })
 
   it("hard_bounce mapuje outcome failed i HARD_BOUNCE", async () => {
