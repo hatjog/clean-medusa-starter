@@ -317,6 +317,9 @@ export const MONEY_PATH_BRAKES_DRIFT_ERROR_CODE = "GP_CONFIG_MONEY_PATH_BRAKES_D
  *   (literówka stanu, przełącznik spoza ADR-177, pusty blok, zły YAML). To nie
  *   jest błąd locales — bez poprawnego źródła nie da się wykazać, co runtime
  *   ma odtwarzać, więc etap jest fatalny, a zastany runtime nie jest „zgodny".
+ * - `projection-invalid` (R-25): projekcja `GP_CONFIG_ROOT` nie jest
+ *   parsowalnym dokumentem YAML (np. `YAMLException`). Źródło jest czytane
+ *   PIERWSZE, więc zły YAML w obu plikach daje `source-invalid`.
  * - `source-projection`: projekcja `GP_CONFIG_ROOT` nie odtwarza źródła (także:
  *   projekcja z niepoprawnym blokiem hamulców).
  * - `pre-apply` (R-15/R-18/R-19): dry-run zastał bazę, która nie odtwarza
@@ -328,6 +331,7 @@ export const MONEY_PATH_BRAKES_DRIFT_ERROR_CODE = "GP_CONFIG_MONEY_PATH_BRAKES_D
 export type MoneyPathBrakesDriftPhase =
   | "source-projection"
   | "source-invalid"
+  | "projection-invalid"
   | "pre-apply"
   | "post-apply"
   | "source-missing"
@@ -761,13 +765,26 @@ async function loadMarketYaml(
     "market.yaml",
   )
   const raw = await fs.readFile(marketPath, "utf8")
-  const doc = yaml.load(raw, { schema: yaml.JSON_SCHEMA })
-
-  if (!doc || typeof doc !== "object" || Array.isArray(doc)) {
-    throw new Error(`Invalid YAML document: ${marketPath}`)
+  // R-25: nieparsowalna projekcja to fatalny rozjazd nazwanej fazy, nie zwykły
+  // wyjątek, który etap opcjonalny zdegradowałby do `warning` (ok=true).
+  try {
+    return parseMarketYamlDocument(raw, marketPath)
+  } catch (error) {
+    throw new MoneyPathBrakesDriftError(
+      {
+        market_id: args.marketId,
+        ok: false,
+        source: {},
+        runtime: null,
+        mismatches: [
+          `projection: niepoprawny YAML projekcji market.yaml (${marketPath}): ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        ],
+      },
+      "projection-invalid",
+    )
   }
-
-  return doc as Record<string, unknown>
 }
 
 export default async function gpConfigSyncMarketRuntime({
@@ -775,7 +792,6 @@ export default async function gpConfigSyncMarketRuntime({
   args,
 }: ExecArgs) {
   const parsedArgs = parseMarketRuntimeSyncArgs(args)
-  const marketYaml = await loadMarketYaml(parsedArgs)
 
   // Story 6.8 (R-1/R-3/R-16): kontrola PRZED zapisem — kanoniczne źródło
   // (gp-ops/markets) vs projekcja i vs zastany wiersz. Rozjazd albo błąd
@@ -783,8 +799,11 @@ export default async function gpConfigSyncMarketRuntime({
   // (fatal) zanim cokolwiek trafi do bazy — także zanim
   // `buildMarketRuntimeRecord` zdążyłby rzucić zwykły (degradowany do
   // `warning`) `MarketRuntimeConfigInvalidError` dla tego samego bloku.
+  // R-25: kanoniczne źródło PRZED projekcją — zły YAML w obu plikach daje
+  // `source-invalid`, zły YAML tylko w projekcji `projection-invalid`.
   const canonical = await loadCanonicalMarketSource(parsedArgs)
   normalizeMoneyPathBrakesOrFatal(parsedArgs.marketId, canonical.doc.money_path_brakes, "source-invalid")
+  const marketYaml = await loadMarketYaml(parsedArgs)
   normalizeMoneyPathBrakesOrFatal(parsedArgs.marketId, marketYaml.money_path_brakes, "source-projection")
 
   const record = buildMarketRuntimeRecord(parsedArgs.marketId, marketYaml)

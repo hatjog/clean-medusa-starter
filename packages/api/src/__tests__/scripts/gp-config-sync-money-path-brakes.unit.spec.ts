@@ -409,6 +409,52 @@ describe("Story 6.8 — kontrakt round-tripu na fixture'ach (kanoniczne źródł
     })
   })
 
+  // R-25: składniowo zły YAML (YAMLException), nie tylko poprawny YAML o złym
+  // kształcie. Mutant: zwykły `yaml.load` bez obsługi w projekcji albo
+  // projekcja czytana przed źródłem => etap `warning` / inna faza => czerwień.
+  const BROKEN_YAML = "money_path_brakes: {fr_9: [engaged\n  : : :\n"
+
+  async function expectFatalYamlStage(f: Fixture, phase: string, dryRunToo = true) {
+    for (const apply of dryRunToo ? [false, true] : [true]) {
+      const db = fakeRuntimeDb(DRIFTED_ROW)
+      await expect(runSync(f, db, apply)).rejects.toMatchObject({
+        error_code: MONEY_PATH_BRAKES_DRIFT_ERROR_CODE,
+        fatal: true,
+        phase,
+      })
+      const { stage, summary, runExitCode, warnings } = await runStageAsOrchestrator(f, db, apply)
+      expect(stage.status).toBe("failed")
+      expect(stage.error_code).toBe(MONEY_PATH_BRAKES_DRIFT_ERROR_CODE)
+      expect(stage.message).toContain(`[${phase}]`)
+      expect(summary.ok).toBe(false)
+      expect(runExitCode).toBe(1)
+      expect(warnings).toHaveLength(0)
+      expect(db.raw.mock.calls.some(([sql]) => /INSERT INTO/.test(String(sql)))).toBe(false)
+    }
+  }
+
+  it("R-25 (a): zły YAML tylko w PROJEKCJI => fatal projection-invalid (dry-run i apply), run ok=false / exit 1", async () => {
+    const f = fixture({ source: ALL_ENGAGED, projection: ALL_ENGAGED })
+    const projectionPath = path.join(f.configRoot, "gp-dev", "markets", "bonbeauty", "market.yaml")
+    fs.writeFileSync(projectionPath, BROKEN_YAML)
+    expect(() => yaml.load(BROKEN_YAML)).toThrow()
+    await expectFatalYamlStage(f, "projection-invalid")
+  })
+
+  it("R-25 (b): zły YAML w ŹRÓDLE i PROJEKCJI => fatal source-invalid (źródło czytane pierwsze)", async () => {
+    const f = fixture({ source: ALL_ENGAGED, projection: ALL_ENGAGED })
+    const projectionPath = path.join(f.configRoot, "gp-dev", "markets", "bonbeauty", "market.yaml")
+    fs.writeFileSync(projectionPath, BROKEN_YAML)
+    fs.writeFileSync(f.sourcePath, BROKEN_YAML)
+    await expectFatalYamlStage(f, "source-invalid")
+  })
+
+  it("R-25 (c): zły YAML tylko w ŹRÓDLE (regresja R-16) => fatal source-invalid", async () => {
+    const f = fixture({ source: ALL_ENGAGED, projection: ALL_ENGAGED })
+    fs.writeFileSync(f.sourcePath, BROKEN_YAML)
+    await expectFatalYamlStage(f, "source-invalid")
+  })
+
   it("R-3: apply naprawia zastany rozjazd w stronę źródła i to jest widoczne w raporcie", async () => {
     const f = fixture({ source: ALL_ENGAGED, projection: ALL_ENGAGED })
     const db = fakeRuntimeDb(DRIFTED_ROW)
