@@ -23,6 +23,12 @@ import {
 } from "../lib/delivery-event-classification"
 import { createMoneyPathBrakeReader } from "../lib/money-path-brakes"
 import {
+  createBrevoDeliveryEventVerifier,
+  DELIVERY_EVENT_VERIFICATION_UNAVAILABLE_CODE,
+  type BrevoDeliveryEventVerifier,
+} from "../lib/brevo-event-verification"
+import { VOUCHER_DELIVERY_MAX_ATTEMPT_COUNT } from "../modules/voucher-delivery/attempt-policy"
+import {
   requireMarketContext,
   runInSystemMarketContext,
 } from "../lib/system-market-context"
@@ -251,15 +257,38 @@ export default async function brevoDeliveryTracker({
       },
       logger,
     )
-    const deliveryPathReleased = await brakeReader.isReleased(
-      marketId ?? "",
-      "fr_9_delivery_idempotency",
-    )
-    if (!deliveryPathReleased) {
-      logger.info?.(
-        `[brevo-delivery-tracker] money path brake engaged market_id=${marketId ?? "missing"} brake=fr_9_delivery_idempotency`,
+    // Brak rynku NIE jest pytaniem do hamulca: odczyt hamulca dla pustego
+    // rynku jest fail-closed (`engaged`) i konczyl sie cichym `return`, przez co
+    // odmowa AD-21 (`markets_empty`) nigdy nie padala. Bez rynku idziemy prosto
+    // do `runInSystemMarketContext`, ktory odmawia glosno. Semantyka hamulca dla
+    // rynku zadeklarowanego zostaje bez zmian (kontrakt 6.8).
+    if (marketId) {
+      const deliveryPathReleased = await brakeReader.isReleased(
+        marketId,
+        "fr_9_delivery_idempotency",
       )
-      return
+      if (!deliveryPathReleased) {
+        // Story 6.6 AC4: `return` zostaje (kontrakt 6.8, PO D5/D8), ale jest
+        // JAWNY — nazwany kod, metryka i klasa zdarzenia, ktorej NIE
+        // sklasyfikowano. Wczesniej byl to log info bez kodu.
+        brakeSkippedCount += 1
+        logger.warn?.(
+          `[brevo-delivery-tracker] error_code=${DELIVERY_PATH_BRAKE_ENGAGED_CODE} ` +
+            `metric=${DELIVERY_PATH_BRAKE_ENGAGED_METRIC} outcome=skipped_unclassified ` +
+            `market_id=${marketId} brake=fr_9_delivery_idempotency ` +
+            `provider_event_id=${normalized.provider_event_id} event_type=${normalized.event_type}`,
+        )
+        logger.info?.(
+          `[brevo-delivery-tracker] money path brake engaged market_id=${marketId} brake=fr_9_delivery_idempotency`,
+        )
+        return
+      }
+    }
+
+    // ADR-213 wariant C: stan dostawy trafia do rejestru dopiero po
+    // potwierdzeniu przez API dostawcy. Bez weryfikatora — odmowa glosna.
+    if (marketId) {
+      await verifyWithProvider(runtimeContainer, normalized, logger)
     }
 
     await runInSystemMarketContext(
@@ -283,6 +312,16 @@ export default async function brevoDeliveryTracker({
           logger,
         )
         logDeliveryStateResult(normalized!, stateResult, logger)
+        if (stateResult.outcome === "duplicate") {
+          // Replay dostawcy (do 7 dni): trwaly ledger juz rozstrzygnal ten
+          // provider_event_id. Druga koperta z ta sama reakcja oznaczalaby druga
+          // eskalacje i drugie zuzycie proby — idempotencja AC4.
+          logger.info?.(
+            `[brevo-delivery-tracker] outcome=${DELIVERY_REPLAY_SUPPRESSED_OUTCOME} ` +
+              `provider_event_id=${normalized!.provider_event_id}`,
+          )
+          return
+        }
         const auditEvent = buildAuditEnvelope(normalized!, correlated)
 
         await emitAuditEvent(runtimeContainer, auditEvent, logger)
@@ -420,12 +459,20 @@ async function applyDeliveryState(
     }
   }
 
+  // AC4 / DW-15-120: trwale odbicie (terminalne + eskalujace) zamyka budzet
+  // odbiorcy, wiec wiersz spelnia predykat parkowania i eskaluje TA SAMA droga
+  // co wyczerpanie budzetu (`claimAttemptPolicyEscalations`, powod
+  // `recipient_budget`); ponowienie jest odciete przez ten sam predykat.
+  const reaction = reactionFor(normalized.event_type)
   return writer.applyProviderDeliveryState({
     provider_event_id: normalized.provider_event_id,
     status,
     provider: "brevo",
     error_code: normalized.error_code ?? null,
     occurred_at: normalized.occurred_at,
+    ...(reaction.terminal && reaction.escalate && reaction.consumes_recipient_attempt
+      ? { exhaust_recipient_budget: { max_attempt_count: VOUCHER_DELIVERY_MAX_ATTEMPT_COUNT } }
+      : {}),
   })
 }
 
@@ -485,6 +532,61 @@ export const config: SubscriberConfig = {
 export function __resetBrevoDeliveryTrackerForTests(): void {
   // Zachowane jako kompatybilny punkt resetu testów. Idempotencja nie jest już
   // stanem procesu — rozstrzyga ją trwały ledger.
+  brakeSkippedCount = 0
+}
+
+export const DELIVERY_PATH_BRAKE_ENGAGED_CODE = "DELIVERY_PATH_BRAKE_ENGAGED"
+export const DELIVERY_PATH_BRAKE_ENGAGED_METRIC =
+  "gp_brevo_delivery_brake_skipped_total"
+export const DELIVERY_REPLAY_SUPPRESSED_OUTCOME = "replay_suppressed"
+
+let brakeSkippedCount = 0
+
+/** Licznik zdarzen pominietych przy zaciagnietym hamulcu (obserwowalnosc, nie stan). */
+export function getBrevoDeliveryBrakeSkippedTotal(): number {
+  return brakeSkippedCount
+}
+
+const VERIFIER_KEYS = [
+  "brevo_delivery_event_verifier",
+  "brevoDeliveryEventVerifier",
+] as const
+
+function resolveVerifier(container: ResolveContainer): BrevoDeliveryEventVerifier | null {
+  const configured = resolveOptional<BrevoDeliveryEventVerifier>(container, VERIFIER_KEYS)
+  if (configured && typeof configured.verify === "function") return configured
+  const apiKey = process.env.BREVO_API_KEY?.trim()
+  return apiKey ? createBrevoDeliveryEventVerifier({ apiKey }) : null
+}
+
+async function verifyWithProvider(
+  container: ResolveContainer,
+  normalized: NormalizedBrevoDeliveryEvent,
+  logger: LoggerLike,
+): Promise<void> {
+  const verifier = resolveVerifier(container)
+  if (!verifier) {
+    logger.error?.(
+      `[brevo-delivery-tracker] error_code=${DELIVERY_EVENT_VERIFICATION_UNAVAILABLE_CODE} ` +
+        `provider_event_id=${normalized.provider_event_id} — brak weryfikatora ADR-213 C`,
+    )
+    throw new Error(
+      `${DELIVERY_EVENT_VERIFICATION_UNAVAILABLE_CODE}: brak weryfikacji zwrotnej Brevo (ADR-213 C)`,
+    )
+  }
+  const result = await verifier.verify({
+    provider_message_id: normalized.provider_event_id,
+    event_type: normalized.event_type,
+  })
+  if (result.outcome === "confirmed") return
+  logger.error?.(
+    `[brevo-delivery-tracker] error_code=${result.error_code} outcome=${result.outcome} ` +
+      `statistics_event=${result.statistics_event} provider_event_id=${normalized.provider_event_id}` +
+      ("http_status" in result && result.http_status ? ` http_status=${result.http_status}` : ""),
+  )
+  throw new Error(
+    `${result.error_code}: zdarzenie ${normalized.event_type} nie potwierdzone przez API Brevo`,
+  )
 }
 
 function normalizeDeliveryEvent(

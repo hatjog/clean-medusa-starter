@@ -928,6 +928,15 @@ export class PgDispatchLedger
         "VOUCHER_DELIVERY_FAILED_ERROR_CODE_REQUIRED",
       )
     }
+    if (input.exhaust_recipient_budget) {
+      if (input.status !== "failed") {
+        throw new DispatchLedgerError(
+          "domkniecie budzetu odbiorcy dotyczy wylacznie stanu failed",
+          "VOUCHER_DELIVERY_BUDGET_EXHAUST_STATE_INVALID",
+        )
+      }
+      assertMaxAttemptCount(input.exhaust_recipient_budget.max_attempt_count)
+    }
 
     const occurredAt = input.occurred_at ?? this.now().toISOString()
     const rows = await this.queryRows<DispatchRow>(
@@ -936,6 +945,13 @@ export class PgDispatchLedger
               provider = COALESCE($2, provider),
               error_code = CASE WHEN $1 = 'failed' THEN $3 ELSE error_code END,
               failed_at = CASE WHEN $1 = 'failed' THEN $4 ELSE failed_at END,
+              -- Story 6.6 (DW-15-120): trwale odbicie domyka budzet odbiorcy w
+              -- TYM SAMYM atomowym UPDATE, wiec replay (status juz 'failed')
+              -- nie dotyka go drugi raz. NULL = bez zmiany budzetu.
+              attempt_count = CASE
+                WHEN $6::int IS NULL THEN attempt_count
+                ELSE GREATEST(attempt_count, non_recipient_failure_count + $6::int)
+              END,
               updated_at = $4
         WHERE provider_message_id = $5
           AND status <> $1
@@ -946,6 +962,9 @@ export class PgDispatchLedger
         input.error_code ?? null,
         occurredAt,
         input.provider_event_id,
+        input.exhaust_recipient_budget
+          ? input.exhaust_recipient_budget.max_attempt_count
+          : null,
       ],
     )
 
@@ -2058,6 +2077,12 @@ export interface ApplyProviderDeliveryStateInput {
   error_code?: string | null
   occurred_at?: string
   provider?: string | null
+  /**
+   * Story 6.6 AC4: trwale odbicie zamyka budzet odbiorcy (predykat parkowania
+   * `attempt_count - non_recipient_failure_count >= max_attempt_count`), zeby
+   * eskalowac droga wyczerpania budzetu i odciac ponowienie.
+   */
+  exhaust_recipient_budget?: { max_attempt_count: number }
 }
 
 export type ApplyProviderDeliveryStateOutcome =

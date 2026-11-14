@@ -519,7 +519,7 @@ describe("Brevo webhook HMAC middleware", () => {
       await invokeFullChain(req)
     }
 
-    const logger = { warn: jest.fn() }
+    const logger = { warn: jest.fn(), error: jest.fn() }
     const { req } = makeRequest({
       rawBody,
       signature: sign(rawBody, "wrong-secret"),
@@ -534,9 +534,13 @@ describe("Brevo webhook HMAC middleware", () => {
     expect(functionSinkEvents).toHaveLength(1)
     expect(writeSinkEvents).toHaveLength(1)
     expect(appendSinkEvents).toHaveLength(1)
-    expect(logger.warn).toHaveBeenCalledWith(
-      "[brevo-hmac-validator] audit sink unavailable",
-      expect.objectContaining({ error_code: "BREVO_HMAC_SIGNATURE_MISMATCH" }),
+    // Story 6.6 AC3: niedostepny sink to JAWNY stan (error + nazwany kod), nie warning.
+    expect(logger.error).toHaveBeenCalledWith(
+      expect.stringContaining("error_code=BREVO_WEBHOOK_AUDIT_SINK_UNAVAILABLE"),
+      expect.objectContaining({
+        error_code: "BREVO_WEBHOOK_AUDIT_SINK_UNAVAILABLE",
+        rejected_error_code: "BREVO_HMAC_SIGNATURE_MISMATCH",
+      }),
     )
   })
 
@@ -660,6 +664,161 @@ describe("Brevo webhook HMAC middleware", () => {
     expect(serializedAudit).not.toContain(TEST_SECRET)
     expect(auditEvents[0]).toMatchObject({
       body_byte_length: Buffer.byteLength(rawBody),
+    })
+  })
+})
+
+/**
+ * Story 6.6 (ADR-213 A+C, DW-15-184, DW-15-185) — wariant A: sekret w sciezce.
+ *
+ * Koperta jest w ksztalcie z dokumentacji Brevo (webhook transakcyjny, zdarzenie
+ * `hard_bounce`): Brevo NIE wysyla naglowka podpisu, wiec do v1.15.0 kazde takie
+ * zadanie konczylo sie `401 BREVO_HMAC_HEADER_MISSING`.
+ */
+const REALISTIC_BREVO_HARD_BOUNCE = {
+  event: "hard_bounce",
+  email: "example@domain.com",
+  id: 123456,
+  date: "2026-11-14 08:00:00",
+  ts: 1794643200,
+  "message-id": "<202611140800.12345678901@smtp-relay.mailin.fr>",
+  ts_event: 1794643205,
+  subject: "Twoj voucher",
+  "X-Mailin-custom": "gp",
+  sending_ip: "185.41.28.109",
+  template_id: 22,
+  tags: ["voucher_purchase_confirmation"],
+  reason: "550 5.1.1 user unknown",
+  ts_epoch: 1794643205000,
+}
+const PATH_TOKEN = "story-6-6-path-token-0123456789abcdef"
+
+describe("Story 6.6 — ingress A+C: token w sciezce i jawna odmowa", () => {
+  const originalToken = process.env.BREVO_WEBHOOK_PATH_TOKEN
+  const originalSecret = process.env.BREVO_HMAC_SECRET
+
+  beforeEach(() => {
+    process.env.BREVO_WEBHOOK_PATH_TOKEN = PATH_TOKEN
+    process.env.BREVO_HMAC_SECRET = TEST_SECRET
+    __resetBrevoWebhookSecurityForTests()
+  })
+
+  afterAll(() => {
+    if (originalToken === undefined) delete process.env.BREVO_WEBHOOK_PATH_TOKEN
+    else process.env.BREVO_WEBHOOK_PATH_TOKEN = originalToken
+    if (originalSecret === undefined) delete process.env.BREVO_HMAC_SECRET
+    else process.env.BREVO_HMAC_SECRET = originalSecret
+  })
+
+  function pathRequest(token: string | null, ip = crypto.randomUUID()) {
+    const made = makeRequest({ rawBody: JSON.stringify(REALISTIC_BREVO_HARD_BOUNCE), ip })
+    ;(made.req as Record<string, unknown>).originalUrl =
+      token === null
+        ? "/hooks/notifications/brevo"
+        : `/hooks/notifications/brevo/${encodeURIComponent(token)}`
+    return made
+  }
+
+  it("kontrola DODATNIA — realistyczna koperta Brevo bez podpisu przechodzi z poprawnym tokenem", async () => {
+    const { req, logger } = pathRequest(PATH_TOKEN)
+    const { res, nextCalled } = await invokeFullChain(req)
+
+    expect(nextCalled).toBe(true)
+    expect(res.statusCode).toBe(200)
+    expect((req as Record<string, unknown>).body).toMatchObject({
+      event: "hard_bounce",
+      "message-id": REALISTIC_BREVO_HARD_BOUNCE["message-id"],
+    })
+    expect(logger.info).toHaveBeenCalledWith(
+      "[brevo-hmac-validator] accepted",
+      expect.objectContaining({ auth_variant: "path_token" }),
+    )
+  })
+
+  it("kontrola UJEMNA — zly token: 401 BREVO_WEBHOOK_PATH_TOKEN_MISMATCH, bez next()", async () => {
+    const { req, auditEvents } = pathRequest("not-the-token")
+    const { res, nextCalled } = await invokeFullChain(req)
+
+    expect(nextCalled).toBe(false)
+    expect(res.statusCode).toBe(401)
+    expect(res.payload).toMatchObject({ error_code: "BREVO_WEBHOOK_PATH_TOKEN_MISMATCH" })
+    expect(auditEvents).toHaveLength(1)
+  })
+
+  it("kontrola UJEMNA — bez tokenu i bez podpisu nadal 401 BREVO_HMAC_HEADER_MISSING", async () => {
+    const { req } = pathRequest(null)
+    const { res, nextCalled } = await invokeFullChain(req)
+
+    expect(nextCalled).toBe(false)
+    expect(res.statusCode).toBe(401)
+    expect(res.payload).toMatchObject({ error_code: "BREVO_HMAC_HEADER_MISSING" })
+  })
+
+  it("kontrola UJEMNA — token w sciezce przy nieskonfigurowanym sekrecie: 503 BREVO_WEBHOOK_PATH_TOKEN_UNSET", async () => {
+    delete process.env.BREVO_WEBHOOK_PATH_TOKEN
+    const { req } = pathRequest(PATH_TOKEN)
+    const { res, nextCalled } = await invokeFullChain(req)
+
+    expect(nextCalled).toBe(false)
+    expect(res.statusCode).toBe(503)
+    expect(res.payload).toMatchObject({ error_code: "BREVO_WEBHOOK_PATH_TOKEN_UNSET" })
+  })
+
+  it("AC3 — dwa powody odmowy daja dwa ROZNE nazwane kody z request id w logu, kopercie i odpowiedzi", async () => {
+    const missing = pathRequest(null)
+    const mismatch = pathRequest("not-the-token")
+    const first = await invokeFullChain(missing.req)
+    const second = await invokeFullChain(mismatch.req)
+
+    const results = [
+      { made: missing, res: first.res },
+      { made: mismatch, res: second.res },
+    ].map(({ made, res }) => {
+      const payload = res.payload as { error_code: string; request_id: string }
+      const audit = made.auditEvents[0] as { error_code: string; request_id: string }
+      const logged = made.logger.warn.mock.calls.find((call) =>
+        String(call[0]).startsWith("[brevo-hmac-validator] rejected"),
+      )
+      expect(logged).toBeDefined()
+      expect(String(logged![0])).toContain(`error_code=${payload.error_code}`)
+      expect(String(logged![0])).toContain(`request_id=${payload.request_id}`)
+      expect(audit.error_code).toBe(payload.error_code)
+      expect(audit.request_id).toBe(payload.request_id)
+      // Wariant A niesie sekret w sciezce — log nie moze go zawierac.
+      for (const call of made.logger.warn.mock.calls) {
+        expect(JSON.stringify(call)).not.toContain(PATH_TOKEN)
+      }
+      return payload
+    })
+
+    expect(results[0].error_code).toBe("BREVO_HMAC_HEADER_MISSING")
+    expect(results[1].error_code).toBe("BREVO_WEBHOOK_PATH_TOKEN_MISMATCH")
+    expect(results[0].request_id).not.toBe(results[1].request_id)
+  })
+
+  it("AC3 — niedostepny sink audytu jest jawnym stanem: kod w logu error, pole odpowiedzi i licznik", async () => {
+    const { getBrevoWebhookAuditSinkState } = jest.requireActual(
+      "../../api/middlewares/brevo-hmac-validator",
+    ) as typeof import("../../api/middlewares/brevo-hmac-validator")
+    const { req } = pathRequest("not-the-token")
+    const logger = { info: jest.fn(), warn: jest.fn(), error: jest.fn() }
+    req.scope.resolve = jest.fn<unknown, [string]>((key: string) => {
+      if (key === "logger") return logger
+      throw new Error(`Unknown container key: ${key}`)
+    })
+    expect(getBrevoWebhookAuditSinkState().state).toBe("available")
+
+    const { res } = await invokeFullChain(req)
+    const payload = res.payload as Record<string, unknown>
+
+    expect(payload.audit_state).toBe("BREVO_WEBHOOK_AUDIT_SINK_UNAVAILABLE")
+    expect(logger.error).toHaveBeenCalledWith(
+      expect.stringContaining(`request_id=${String(payload.request_id)}`),
+      expect.objectContaining({ error_code: "BREVO_WEBHOOK_AUDIT_SINK_UNAVAILABLE" }),
+    )
+    expect(getBrevoWebhookAuditSinkState()).toEqual({
+      state: "unavailable_observed",
+      unavailable_total: 1,
     })
   })
 })

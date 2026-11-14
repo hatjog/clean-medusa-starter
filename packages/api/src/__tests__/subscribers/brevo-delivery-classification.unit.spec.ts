@@ -31,6 +31,23 @@ import {
   getSystemMarketContextDenials,
 } from "../../lib/system-market-context"
 
+/** Kontekst systemowy poza HTTP wymaga jawnego instance_id (AD-21) — jak w produkcji. */
+process.env.GP_INSTANCE_ID = process.env.GP_INSTANCE_ID || "gp-test"
+// ADR-213 C: produkcyjny weryfikator powstaje z BREVO_API_KEY. Tu klucz jest
+// atrapa, a fabryka zwraca weryfikator potwierdzajacy — zadnego ruchu sieciowego.
+// Galezie odmowy weryfikacji mierzy `brevo-event-verification.unit.spec.ts`.
+process.env.BREVO_API_KEY = "test-only-not-a-key"
+jest.mock("../../lib/brevo-event-verification", () => ({
+  ...jest.requireActual("../../lib/brevo-event-verification"),
+  createBrevoDeliveryEventVerifier: () => ({
+    verify: async () => ({ outcome: "confirmed", statistics_event: "stub" }),
+  }),
+}))
+
+const CONFIRMING_VERIFIER = {
+  verify: jest.fn(async () => ({ outcome: "confirmed" as const, statistics_event: "stub" })),
+}
+
 type AuditEvent = Record<string, any>
 
 /**
@@ -92,6 +109,9 @@ function makeContainer(
     }
     // Hamulec ZWOLNIONY — inaczej sciezka konczy sie cichym `return` przed sinkiem.
     if (key === ContainerRegistrationKeys.PG_CONNECTION) return db
+    // ADR-213 C: weryfikacja zwrotna Brevo — tu potwierdzajaca; galezie odmowy ma
+    // `brevo-event-verification.unit.spec.ts` i test „bez weryfikatora”.
+    if (key === "brevo_delivery_event_verifier") return CONFIRMING_VERIFIER
     throw new Error(`Unknown container key: ${key}`)
   })
   return { auditEvents, logger, db, container: { resolve } }
@@ -503,7 +523,31 @@ describe("AC4 — kazda klasa ma WLASNA reakcje, wykonywana na realnej sciezce",
   })
 
   it("idempotencja — ten sam provider_event_id dwa razy daje JEDNA reakcje", async () => {
+    // Story 6.6: idempotencje rozstrzyga TRWALY ledger (atomowy UPDATE ... WHERE
+    // status <> $1), nie pamiec procesu. Atrapa odtwarza dokladnie ten kontrakt:
+    // pierwsze zastosowanie `updated`, kazde kolejne `duplicate`. Do v1.15.0
+    // replay dawal druga koperte z `escalate: true` — druga eskalacje.
     const ctx = makeContainer()
+    const applied = new Set<string>()
+    const ledgerCalls: Array<Record<string, unknown>> = []
+    const ledger = {
+      applyProviderDeliveryState: jest.fn(async (input: Record<string, unknown>) => {
+        ledgerCalls.push(input)
+        const key = String(input.provider_event_id)
+        const first = !applied.has(key)
+        applied.add(key)
+        return {
+          outcome: first ? "updated" : "duplicate",
+          dispatch_id: "dispatch-idem",
+          previous_status: first ? null : "failed",
+          status: "failed",
+        }
+      }),
+    }
+    const baseResolve = ctx.container.resolve
+    ctx.container.resolve = jest.fn((key: string) =>
+      key === "voucher_delivery_dispatch_ledger" ? ledger : baseResolve(key),
+    ) as typeof baseResolve
     const payload = {
       provider_id: "brevo",
       provider_event_id: "pe-idempotent",
@@ -519,6 +563,50 @@ describe("AC4 — kazda klasa ma WLASNA reakcje, wykonywana na realnej sciezce",
     // drugiej eskalacji ani drugiego zuzycia proby.
     expect(ctx.auditEvents).toHaveLength(1)
     expect(ctx.auditEvents[0].delivery_reaction.escalate).toBe(true)
+    // Trwale odbicie domyka budzet odbiorcy (droga wyczerpania budzetu) — ten
+    // sam nosnik przy obu dostawach; to UPDATE w ledgerze stosuje go raz.
+    expect(ledgerCalls).toHaveLength(2)
+    expect(ledgerCalls[0]).toMatchObject({
+      status: "failed",
+      error_code: "HARD_BOUNCE",
+      exhaust_recipient_budget: { max_attempt_count: 5 },
+    })
+    expect(ctx.logger.info).toHaveBeenCalledWith(
+      expect.stringContaining("outcome=replay_suppressed provider_event_id=pe-idempotent"),
+    )
+  })
+
+  it("Story 6.6 — tylko trwale odbicie domyka budzet; chwilowe/zablokowane/niepoprawny adres NIE", async () => {
+    const seen: Record<string, unknown> = {}
+    for (const [eventType, exhausts] of [
+      ["hard_bounce", true],
+      ["soft_bounce", false],
+      ["blocked", false],
+      ["invalid_email", false],
+    ] as const) {
+      const ctx = makeContainer()
+      const ledger = {
+        applyProviderDeliveryState: jest.fn(async (input: Record<string, unknown>) => {
+          seen[eventType] = input.exhaust_recipient_budget ?? null
+          return { outcome: "updated", dispatch_id: "d", previous_status: null, status: "failed" }
+        }),
+      }
+      const baseResolve = ctx.container.resolve
+      ctx.container.resolve = jest.fn((key: string) =>
+        key === "voucher_delivery_dispatch_ledger" ? ledger : baseResolve(key),
+      ) as typeof baseResolve
+      await run(
+        {
+          provider_id: "brevo",
+          provider_event_id: `pe-budget-${eventType}`,
+          market_id: "pl",
+          dispatch_id: `dispatch-budget-${eventType}`,
+          event_type: eventType,
+        },
+        ctx.container,
+      )
+      expect(seen[eventType] !== null).toBe(exhausts)
+    }
   })
 })
 
@@ -755,8 +843,14 @@ describe("hamulec sciezki pieniadza — stan ZACIAGNIETY", () => {
       ctx.container,
     )
 
-    // Cichy `return` PRZED `emitAuditEvent` — to jest zamierzone fail-closed.
+    // `return` PRZED `emitAuditEvent` — to jest zamierzone fail-closed (6.8),
+    // ale od Story 6.6 NIE jest cichy: nazwany kod, metryka i niesklasyfikowana klasa.
     expect(ctx.auditEvents).toHaveLength(0)
+    expect(ctx.logger.warn).toHaveBeenCalledWith(
+      expect.stringMatching(
+        /error_code=DELIVERY_PATH_BRAKE_ENGAGED metric=gp_brevo_delivery_brake_skipped_total outcome=skipped_unclassified market_id=pl brake=fr_9_delivery_idempotency provider_event_id=pe-brake-engaged/,
+      ),
+    )
     // ...ale odczyt hamulca MUSIAL sie odbyc. Bez tej asercji zniknieciecie
     // odczytu z produkcji zostawiloby ten test zielony na pustym sinku.
     expect(ctx.db.raw).toHaveBeenCalled()

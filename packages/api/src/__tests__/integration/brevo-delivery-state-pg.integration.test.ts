@@ -160,4 +160,77 @@ runOrSkip("Story 4.2 — Brevo delivery state na REALNYM PostgreSQL-u", () => {
       }),
     ).resolves.toMatchObject({ outcome: "duplicate" })
   })
+
+  /**
+   * Story 6.6 AC4 (DW-15-120): webhook odbicia aktualizuje TEN wiersz, a trwale
+   * odbicie eskaluje ta sama droga co wyczerpanie budzetu odbiorcy.
+   */
+  it("trwale odbicie domyka budzet raz, wiersz jest zajmowany do eskalacji; replay nie zmienia budzetu", async () => {
+    await seedSentRow()
+    const ledger = new PgDispatchLedger(db)
+    const before = await db.raw(
+      `SELECT attempt_count, non_recipient_failure_count FROM ${VOUCHER_DELIVERY_DISPATCH_TABLE}`,
+    )
+    const hardBounce = {
+      provider_event_id: PROVIDER_MESSAGE_ID,
+      provider: "brevo",
+      status: "failed" as const,
+      error_code: "HARD_BOUNCE",
+      exhaust_recipient_budget: { max_attempt_count: 5 },
+    }
+    await expect(ledger.applyProviderDeliveryState(hardBounce)).resolves.toMatchObject({
+      outcome: "updated",
+      dispatch_id: "dispatch-4-2",
+    })
+    const after = await db.raw(
+      `SELECT status, error_code, attempt_count, non_recipient_failure_count
+         FROM ${VOUCHER_DELIVERY_DISPATCH_TABLE}`,
+    )
+    expect(after.rows[0]).toMatchObject({ status: "failed", error_code: "HARD_BOUNCE" })
+    expect(
+      Number(after.rows[0].attempt_count) - Number(after.rows[0].non_recipient_failure_count),
+    ).toBe(5)
+    expect(Number(after.rows[0].attempt_count)).toBeGreaterThanOrEqual(
+      Number(before.rows[0].attempt_count),
+    )
+
+    await expect(ledger.applyProviderDeliveryState(hardBounce)).resolves.toMatchObject({
+      outcome: "duplicate",
+    })
+    const replay = await db.raw(`SELECT attempt_count FROM ${VOUCHER_DELIVERY_DISPATCH_TABLE}`)
+    expect(replay.rows[0].attempt_count).toBe(after.rows[0].attempt_count)
+
+    const claimed = await ledger.claimAttemptPolicyEscalations({
+      max_attempt_count: 5,
+      max_total_attempt_count: 40,
+      created_after: "2026-01-01T00:00:00.000Z",
+      limit: 10,
+    })
+    expect(claimed.map((row) => row.dispatch_id)).toEqual(["dispatch-4-2"])
+    expect(claimed[0].error_code).toBe("HARD_BOUNCE")
+  })
+
+  it("chwilowe odbicie NIE domyka budzetu i NIE eskaluje — wiersz zostaje do ponowienia", async () => {
+    await seedSentRow()
+    const ledger = new PgDispatchLedger(db)
+    await expect(
+      ledger.applyProviderDeliveryState({
+        provider_event_id: PROVIDER_MESSAGE_ID,
+        provider: "brevo",
+        status: "failed",
+        error_code: "SOFT_BOUNCE",
+      }),
+    ).resolves.toMatchObject({ outcome: "updated" })
+    const claimed = await ledger.claimAttemptPolicyEscalations({
+      max_attempt_count: 5,
+      max_total_attempt_count: 40,
+      created_after: "2026-01-01T00:00:00.000Z",
+      limit: 10,
+    })
+    expect(claimed).toEqual([])
+    const row = await db.raw(
+      `SELECT status, escalated_at FROM ${VOUCHER_DELIVERY_DISPATCH_TABLE}`,
+    )
+    expect(row.rows[0]).toMatchObject({ status: "failed", escalated_at: null })
+  })
 })
