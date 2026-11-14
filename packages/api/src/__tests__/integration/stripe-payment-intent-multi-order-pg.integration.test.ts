@@ -21,6 +21,11 @@ import { PAYMENT_INTENT_SUCCEEDED_EVENT } from "../../lib/payment/stripe-payment
 import { buildEventProcessedPurchaseQuery } from "../../modules/voucher/models/event-processed"
 import { marketContextStorage } from "../../lib/market-context"
 import { liveIssueEntitlementsWithinTx } from "../../workflows/entitlements/live-issue-from-payment-intent"
+import {
+  numericMinorStringToSafeInteger,
+  readDatabaseMinorIntegerStrict,
+  readNumericMinorString,
+} from "../../lib/payment/numeric-minor"
 
 // Story 3.1 C3-SEC-002: instancja RLS wyłącznie ze źródła serwerowego (GP_INSTANCE_ID),
 // bez domyślnego "gp" — testy ustawiają ją jawnie.
@@ -241,8 +246,34 @@ runOrSkip("F2 — multi-seller na realnej ścieżce PostgreSQL", () => {
          attempt_count integer NOT NULL DEFAULT 1,
          last_attempt_at timestamptz NOT NULL DEFAULT now(),
          resolution_state text NOT NULL DEFAULT 'open',
+         instance_id text,
+         owner_type text,
+         owner_id text,
+         deadline timestamptz,
+         closure_path text,
+         provenance_kind text,
+         provenance_source text,
          resolved_at timestamptz,
          resolved_by text
+       ) ON COMMIT DROP`,
+      // Story 4.2 (ADR-238 §7): FIND_OPEN_COMPENSATION_FAILURES_SQL czyta też
+      // kwarantannę zastanych wierszy — kształt lustrzany wobec migracji
+      // Migration20261114120000 (cf-create-quarantine).
+      `CREATE TEMP TABLE money_path_compensation_failure_backfill_quarantine (
+         source_failure_id text PRIMARY KEY,
+         source_row jsonb NOT NULL,
+         reason text NOT NULL,
+         quarantined_at timestamptz NOT NULL DEFAULT now(),
+         market_id text NOT NULL,
+         instance_id text NOT NULL,
+         instance_id_source text NOT NULL,
+         backfill_state text NOT NULL,
+         owner_type text NOT NULL,
+         owner_id text NOT NULL,
+         deadline timestamptz NOT NULL,
+         closed_at timestamptz,
+         closed_by text,
+         closure_evidence jsonb
        ) ON COMMIT DROP`,
       // `purchase_key` = kolumna klucza zakupu (Story 3.3 / AD-16 / ADR-190,
       // migracja 1779006000000). Kształt lustrzany wobec migracji modułu.
@@ -548,5 +579,40 @@ runOrSkip("F2 — multi-seller na realnej ścieżce PostgreSQL", () => {
     expect(delivery.res.statusCode).toBe(200)
     expect(delivery.res.body.emitted_count).toBe(2)
     expect(delivery.res.body.order_ids).toEqual([ORDER_A, ORDER_B])
+  })
+
+  // ── Story 3.5 AC1 (DW-15-134): realna kolumna NUMERIC przez node-pg ──
+  it("3.5 AC1: NUMERIC z node-pg jest stringiem i zostaje łańcuchem; zamiana dokładna albo odmowa", async () => {
+    await client.query(
+      `UPDATE order_line_item SET unit_price = '22000.00' WHERE id = 'li_seller_a'`
+    )
+    const raw = (
+      await client.query(`SELECT unit_price FROM order_line_item WHERE id = 'li_seller_a'`)
+    ).rows[0].unit_price
+    expect(typeof raw).toBe("string")
+    expect(raw).toBe("22000.00")
+    expect(readNumericMinorString(raw)).toBe("22000.00")
+    expect(readDatabaseMinorIntegerStrict(raw)).toBe(22000)
+
+    const big = (await client.query(`SELECT '9007199254740993'::numeric AS v`)).rows[0].v
+    expect(typeof big).toBe("string")
+    expect(readNumericMinorString(big)).toBe("9007199254740993")
+    // `Number(big)` dałoby 9007199254740992 — po cichu inna kwota.
+    expect(numericMinorStringToSafeInteger(readNumericMinorString(big))).toBeNull()
+
+    // Pełna ścieżka: cena linii '22000.00' (string z PG) → voucher 22000.
+    const first = await postThroughRealPath(client, stripeEvent())
+    expect(first.res.statusCode).toBe(200)
+    expect(
+      (
+        await client.query(
+          `SELECT order_id, (policy_snapshot->>'amount_minor')::integer AS amount_minor
+             FROM entitlement_instance ORDER BY order_id`
+        )
+      ).rows
+    ).toEqual([
+      { order_id: ORDER_A, amount_minor: 22000 },
+      { order_id: ORDER_B, amount_minor: 20000 },
+    ])
   })
 })

@@ -22,7 +22,7 @@ jest.mock("../../../../../lib/payment/stripe-payment-intent-metadata-stamp", () 
   stampPaymentIntentOrderFacts: jest.fn(async () => true),
 }))
 
-import { POST } from "../route"
+import { PAYMENT_INTENT_SUCCEEDED_EMIT_OPTIONS, POST } from "../route"
 import { STRIPE_SIGNATURE_HEADER } from "../helpers"
 import {
   ackStatusForVerdict,
@@ -178,7 +178,11 @@ function makeWorld(opts: { rlsHook?: boolean; settlementError?: string } = {}) {
   const rlsHook = opts.rlsHook ?? true
   const reservations = new Set<string>()
   const settled = new Set<string>()
-  const queue: { name: string; data: { payload: { payment_intent_id: string; order_id: string } } }[] = []
+  const queue: {
+    name: string
+    data: { payload: { payment_intent_id: string; order_id: string } }
+    options?: Record<string, unknown>
+  }[] = []
   const client = {
     query: async (sql: string, values: ReadonlyArray<unknown> = []) => {
       if (new RegExp(`INSERT INTO ${WEBHOOK_DELIVERY_BARRIER_TABLE}`, "i").test(sql)) {
@@ -325,6 +329,35 @@ describe("Story 3.1 AC3 — route Path Y steruje ACK werdyktem jednostek należn
   })
 })
 
+
+// ── Story 8.4 fix (checkpoint PO, MEDIUM): ponowienie należy do busa ─────────
+
+describe("Story 8.4 fix — emisja niesie attempts/backoff, ponowienie Stripe NIE re-emituje", () => {
+  beforeEach(() => {
+    process.env.STRIPE_WEBHOOK_SECRET = SECRET
+  })
+
+  it("każda koperta jest emitowana z nazwanymi opcjami ponowienia busa", async () => {
+    const world = makeWorld()
+    const first = await world.deliver("evt_s84_emit_opts")
+    expect(first.statusCode).toBe(200)
+    expect(world.queue).toHaveLength(2)
+    for (const e of world.queue) {
+      expect(e.options).toEqual({ ...PAYMENT_INTENT_SUCCEEDED_EMIT_OPTIONS })
+      expect(Number(e.options?.attempts)).toBeGreaterThan(1)
+    }
+  })
+
+  it("ponowienie Stripe po częściowym rozliczeniu daje 5xx i ZERO ponownych emisji (odzysk = bus, nie Stripe)", async () => {
+    const world = makeWorld()
+    await world.deliver("evt_s84_no_reemit")
+    world.consume([ORDER_A])
+    const retry = await world.deliver("evt_s84_no_reemit")
+    expect(retry.statusCode).toBeGreaterThanOrEqual(500)
+    expect((retry.body as { reason?: string }).reason).toBe("owed_units_unsettled")
+    expect(world.queue).toHaveLength(0)
+  })
+})
 
 // ── Story 3.1 fix C3-SEC-001 / C3-SEC-002 / C3-SEC-003 ──────────────────────
 

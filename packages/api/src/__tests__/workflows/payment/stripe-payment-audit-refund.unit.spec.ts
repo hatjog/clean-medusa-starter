@@ -880,6 +880,9 @@ describe("v1.9.0 wf5 H-6 — multi-line cart issues N entitlements", () => {
           profile_id: "voucher-kwotowy-365d",
           entitlement_type: "VOUCHER_AMOUNT",
           policy: { validity_months: 12 },
+          // Story 3.5 (ADR-166 pkt 8): kwota vouchera z profilu linii —
+          // fallback na kwotę PI z koperty jest usunięty.
+          amount_minor: 10000,
           line_item_id: "line_001",
         },
       })
@@ -893,6 +896,9 @@ describe("v1.9.0 wf5 H-6 — multi-line cart issues N entitlements", () => {
           profile_id: "voucher-rezerwacja-otwarta",
           entitlement_type: "VOUCHER_SERVICE",
           policy: { validity_months: 12 },
+          // Story 3.5 (ADR-166 pkt 8): kwota vouchera z profilu linii —
+          // fallback na kwotę PI z koperty jest usunięty.
+          amount_minor: 15000,
           line_item_id: "line_002",
         },
       })
