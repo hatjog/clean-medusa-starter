@@ -71,7 +71,7 @@ import {
   MissingEntitlementProfileError,
   VoucherIssuanceBlockedError,
 } from "../workflows/entitlements/issue-entitlement"
-import { liveIssueEntitlementsWithinTx } from "../workflows/entitlements/live-issue-from-payment-intent"
+import { liveIssueEntitlementsPerLineWithinTx } from "../workflows/entitlements/live-issue-from-payment-intent"
 import {
   numericMinorStringToSafeInteger,
   readNumericMinorString,
@@ -592,12 +592,37 @@ export default async function onOrderPlacedStripeRetry({
           try {
             if (row.provider === STRIPE_PATH_Y_WEBHOOK_PROVIDER) {
               const input = buildPathYRecoveryInput(row, orderId)
-              const result = await liveIssueEntitlementsWithinTx(
+              // Story 8.4 fix (checkpoint PO): odzysk Path Y jest ścieżką
+              // NORMALNĄ (wyścig payment_intent.succeeded × completeCart), więc
+              // idzie trybem izolacji per linia, nie all-or-nothing — porażka
+              // jednej pozycji nie cofa pozycji udanych.
+              const result = await liveIssueEntitlementsPerLineWithinTx(
                 client,
                 input,
                 new Date()
               )
-              await markDeferredResolved(client, row.event_id, orderId, new Date())
+              const partialFailure = result.failed_lines.length > 0
+              if (partialFailure) {
+                // Marker ZOSTAJE nierozwiązany (bez `markDeferredResolved`):
+                // to on jest nośnikiem populacji odzysku linii nieudanych
+                // (kontrakt gift-line-issue-outcome.v1 §Semantyka p.5). Linie
+                // udane są okablowane poniżej i commitują się z tą transakcją.
+                logger.error?.(
+                  `[on-order-placed-stripe-retry] order_id=${orderId} ` +
+                    `event_id=${row.event_id} Path Y częściowa porażka ` +
+                    `failed=${result.failed_lines.length}/${result.line_outcomes.length} ` +
+                    `— marker odroczony zostaje NIEROZWIĄZANY (populacja odzysku): ` +
+                    `line_outcomes=${JSON.stringify(
+                      result.line_outcomes.map((o) =>
+                        o.state === "failed"
+                          ? { line_item_id: o.line_item_id, state: o.state, reason: o.reason }
+                          : { line_item_id: o.line_item_id, state: o.state }
+                      )
+                    )}`
+                )
+              } else {
+                await markDeferredResolved(client, row.event_id, orderId, new Date())
+              }
 
               const appendAudit = makeTransitionAuditSink(logger)
               const issuedAt = new Date()
