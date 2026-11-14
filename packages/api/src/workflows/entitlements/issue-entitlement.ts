@@ -31,6 +31,7 @@ import {
   computeValidityEnd,
   issueVoucherCodeWithinTx,
 } from "./live-issue-from-payment-intent"
+import { readDatabaseMinorIntegerStrict } from "../../lib/payment/numeric-minor"
 
 type QueryResult<T> = Promise<{ rows: T[]; rowCount?: number | null }>
 export type PgClient = {
@@ -246,6 +247,31 @@ export class MissingVoucherLineContextError extends VoucherIssuanceBlockedError 
  * idą dodatkowo do maila do kupującej. Zgadywanie najemcy jest gorsze niż
  * odmowa wystawienia.
  */
+/**
+ * v1.16.0 Story 3.5 (FR-13, ADR-166 pkt 6/8).
+ *
+ * Linia bez kwoty (ani `amount_minor` profilu, ani czytelnej
+ * `order_line_item.unit_price`). Koperta niesie PEŁNĄ kwotę PaymentIntenta
+ * (ADR-166 pkt 6) — podstawienie jej pod kwotę vouchera dawało N voucherów
+ * na całe PI. Fail-closed PRZED zapisem; nie ma fallbacku na
+ * `payload.amount_minor` ani na zero.
+ */
+export class MissingVoucherLineAmountError extends VoucherIssuanceBlockedError {
+  constructor(orderId: string, lineItemId: string | null) {
+    super(
+      `issueSingleEntitlementRow: linia (order ${orderId}, linia ` +
+        `${lineItemId ?? "brak"}) nie niesie kwoty — ani amount_minor profilu, ` +
+        "ani czytelnej ceny linii. Kwota koperty jest kwotą CAŁEGO " +
+        "PaymentIntenta (ADR-166) i nie wolno jej podstawić. Fail-closed " +
+        "PRZED zapisem.",
+      "MissingVoucherLineAmountError",
+      "missing_line_amount",
+      orderId,
+      lineItemId
+    )
+  }
+}
+
 export class AmbiguousVoucherLineError extends VoucherIssuanceBlockedError {
   constructor(orderId: string) {
     super(
@@ -425,9 +451,11 @@ export async function issueEntitlementsForAllLineItems(
     {
       line_item_id: string
       metadata: Record<string, unknown> | null
+      line_unit_price: string | number | null
     } & VoucherLineContext
   >(
     `SELECT oli.id AS line_item_id, oli.metadata,
+            oli.unit_price AS line_unit_price,
             ${VOUCHER_LINE_CONTEXT_COLUMNS}
        FROM order_item oi
        JOIN order_line_item oli ON oli.id = oi.item_id
@@ -443,13 +471,19 @@ export async function issueEntitlementsForAllLineItems(
   const lineItemIds: (string | null)[] = []
 
   for (const line of lines.rows) {
-    const profile = extractProfileFromMetadata(
-      line.metadata,
-      payload.currency,
-      payload.amount_minor
-    )
-    if (!profile?.profile_id || !profile.entitlement_type || !profile.policy) {
+    const extracted = extractProfileFromMetadata(line.metadata, payload.currency)
+    if (!extracted?.profile_id || !extracted.entitlement_type || !extracted.policy) {
       continue // non-voucher SKU — skip
+    }
+    // Story 3.5 (ADR-166 pkt 8): kwota vouchera = kwota profilu albo cena
+    // TEJ linii (NUMERIC → dokładna liczba, bez float). Nigdy kwota koperty.
+    const lineAmountMinor =
+      extracted.amount_minor ??
+      readDatabaseMinorIntegerStrict(line.line_unit_price) ??
+      undefined
+    const profile: EntitlementProfilePayload = {
+      ...extracted,
+      amount_minor: lineAmountMinor,
     }
     const result = await issueSingleEntitlementRow(
       client,
@@ -614,7 +648,13 @@ async function issueSingleEntitlementRow(
     profile.entitlement_type as string | undefined
   )
   const currency = profile.currency ?? payload.currency ?? "PLN"
-  const amountMinor = profile.amount_minor ?? payload.amount_minor ?? 0
+  // Story 3.5 (FR-13, ADR-166 pkt 6/8): `payload.amount_minor` to kwota
+  // CAŁEGO PaymentIntenta — nie jest kwotą vouchera i nie jest fallbackiem.
+  // Brak kwoty linii ⇒ odmowa przed zapisem (bez cichego zera).
+  const amountMinor = profile.amount_minor
+  if (typeof amountMinor !== "number" || !Number.isSafeInteger(amountMinor)) {
+    throw new MissingVoucherLineAmountError(payload.order_id, lineItemId)
+  }
   const validityMonths = readNumber(profile.policy?.validity_months)
   let voucherCode: string | null = null
   if (isVoucherBacked) {
@@ -720,8 +760,7 @@ function readNumber(value: unknown): number | undefined {
 
 function extractProfileFromMetadata(
   metadata: Record<string, unknown> | null | undefined,
-  fallbackCurrency: string | null | undefined,
-  fallbackAmount: number | null | undefined
+  fallbackCurrency: string | null | undefined
 ): EntitlementProfilePayload | null {
   if (!metadata || typeof metadata !== "object") return null
 
@@ -752,7 +791,7 @@ function extractProfileFromMetadata(
     amount_minor:
       typeof (metadata as Record<string, unknown>).amount_minor === "number"
         ? ((metadata as Record<string, unknown>).amount_minor as number)
-        : fallbackAmount ?? undefined,
+        : undefined,
     line_item_id: readString((metadata as Record<string, unknown>).line_item_id),
     recipient_customer_id: readString(
       (metadata as Record<string, unknown>).recipient_customer_id
@@ -805,7 +844,7 @@ async function resolveEntitlementProfile(
     amount_minor:
       typeof metadata.amount_minor === "number"
         ? metadata.amount_minor
-        : payload.amount_minor ?? undefined,
+        : undefined,
     line_item_id: readString(metadata.line_item_id),
   }
 }

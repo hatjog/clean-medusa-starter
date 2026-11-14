@@ -656,6 +656,57 @@ describe("odzysk Path Y — paczka mieszana, domknięcie i replay", () => {
     expect(h.logger.error).not.toHaveBeenCalled()
   })
 
+  // ── Story 3.5 (FR-13, NFR-2, DW-15-134): NUMERIC z node-pg to STRING ──
+  it("3.5 AC1: payment.amount jako string \"12345.00\" przechodzi bez float do dokładnej liczby", async () => {
+    const liveIssue = liveIssueEntitlementsWithinTx as jest.Mock
+    liveIssue.mockReset()
+    liveIssue.mockResolvedValueOnce(issuedOnce())
+    const h = makeHarness([
+      pathYRow({ amount: "12345.00" as unknown as number }),
+    ])
+
+    await run(h.container, { id: "order_1" })
+
+    expect(liveIssue).toHaveBeenCalledTimes(1)
+    const amount = liveIssue.mock.calls[0][1].payload.amount_minor
+    expect(typeof amount).toBe("number")
+    expect(amount).toBe(12345)
+  })
+
+  it("3.5 AC1: string na granicy bezpiecznego zakresu jest dokładny (\"9007199254740991\")", async () => {
+    const liveIssue = liveIssueEntitlementsWithinTx as jest.Mock
+    liveIssue.mockReset()
+    liveIssue.mockResolvedValueOnce(issuedOnce())
+    const h = makeHarness([
+      pathYRow({ amount: "9007199254740991" as unknown as number }),
+    ])
+
+    await run(h.container, { id: "order_1" })
+
+    expect(liveIssue.mock.calls[0][1].payload.amount_minor).toBe(9007199254740991)
+  })
+
+  it("3.5 AC1: \"9007199254740993\" (poza double) jest odmową, nie cicho zaokrągloną kwotą", async () => {
+    // `Number("9007199254740993") === 9007199254740992` — stary mapper
+    // wystawiał marker z INNĄ kwotą niż w kolumnie, bez śladu.
+    const liveIssue = liveIssueEntitlementsWithinTx as jest.Mock
+    liveIssue.mockReset()
+    const h = makeHarness([
+      pathYRow({
+        event_id: "evt_big#deferred-issuance",
+        amount: "9007199254740993" as unknown as number,
+      }),
+    ])
+
+    await run(h.container, { id: "order_1" })
+
+    expect(liveIssue).not.toHaveBeenCalled()
+    expect(h.sent.some((q) => q.sql === MARK_DEFERRED_RESOLVED_SQL)).toBe(false)
+    expect(h.logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining("marker Path Y nieodtwarzalny")
+    )
+  })
+
   it("marker bez market_id jest pomijany, a nie wywraca paczki", async () => {
     const liveIssue = liveIssueEntitlementsWithinTx as jest.Mock
     liveIssue.mockReset()

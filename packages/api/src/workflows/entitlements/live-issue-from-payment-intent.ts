@@ -21,6 +21,7 @@ import {
   type VatClassification,
 } from "../../modules/voucher/vat-resolver"
 import { VoucherPostingInvariantError } from "../../modules/voucher/posting-profile"
+import { readDatabaseMinorIntegerStrict } from "../../lib/payment/numeric-minor"
 
 /**
  * live-issue-from-payment-intent.ts — Story 3.3 (v1.11.0 Epic 3) — RDZEŃ live-issue
@@ -1104,11 +1105,11 @@ function readNumber(value: unknown): number | undefined {
 }
 
 /** Koercja wyłącznie wartości SQL; pg zwraca NUMERIC jako string. */
+// Story 3.5 (FR-13, NFR-2): bez `Number(string)` — dokładna zamiana łańcucha
+// NUMERIC (BigInt); wartość poza bezpiecznym zakresem ⇒ `undefined`
+// (fail-loud w `assertPositiveIntegerMinor`), nie cicho zaokrąglona kwota.
 function readDatabaseNumber(value: unknown): number | undefined {
-  if (typeof value === "number") return Number.isFinite(value) ? value : undefined
-  if (typeof value !== "string" || !value.trim()) return undefined
-  const parsed = Number(value)
-  return Number.isFinite(parsed) ? parsed : undefined
+  return readDatabaseMinorIntegerStrict(value) ?? undefined
 }
 
 function readObject(value: unknown): Record<string, unknown> | undefined {
