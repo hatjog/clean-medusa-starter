@@ -42,6 +42,18 @@ import {
 import { scopeCustomerEmail } from "../../lib/customer-scoped-email";
 import { marketContextStorage } from "../../lib/market-context";
 
+// Story 11.2 (triage 7.1 poz. 2): od 11.1 kontekst rynku ma DRUGĄ oś scope —
+// instancję runtime wyłącznie z GP_INSTANCE_ID (bez domyślki gp-dev). Fixture
+// podaje ją jawnie; asercje rynku pozostają bez zmian.
+const PREVIOUS_GP_INSTANCE_ID = process.env.GP_INSTANCE_ID
+beforeEach(() => {
+  process.env.GP_INSTANCE_ID = "gp-test-instance"
+})
+afterAll(() => {
+  if (PREVIOUS_GP_INSTANCE_ID === undefined) delete process.env.GP_INSTANCE_ID
+  else process.env.GP_INSTANCE_ID = PREVIOUS_GP_INSTANCE_ID
+})
+
 function createResponse() {
   return {
     body: null as any,
@@ -93,7 +105,7 @@ describe("customer isolation middlewares", () => {
     } as any;
 
     await marketContextStorage.run(
-      { market_id: "bonbeauty", sales_channel_id: "sc_bb" },
+      { market_id: "bonbeauty", instance_id: "gp-test-instance", sales_channel_id: "sc_bb" },
       async () => {
         await customerScopedCustomerCreateMiddleware(
           req,
@@ -133,7 +145,7 @@ describe("customer isolation middlewares", () => {
     } as any;
 
     await marketContextStorage.run(
-      { market_id: "bonbeauty", sales_channel_id: "sc_bb" },
+      { market_id: "bonbeauty", instance_id: "gp-test-instance", sales_channel_id: "sc_bb" },
       async () => {
         await customerRegistrationMarketGuardMiddleware(
           req,
@@ -171,7 +183,7 @@ describe("customer isolation middlewares", () => {
     } as any;
 
     await marketContextStorage.run(
-      { market_id: "bonbeauty", sales_channel_id: "sc_bb" },
+      { market_id: "bonbeauty", instance_id: "gp-test-instance", sales_channel_id: "sc_bb" },
       async () => {
         await customerRegistrationMarketGuardMiddleware(
           req,
@@ -209,7 +221,7 @@ describe("customer isolation middlewares", () => {
     } as any;
 
     await marketContextStorage.run(
-      { market_id: "bonbeauty", sales_channel_id: "sc_bb" },
+      { market_id: "bonbeauty", instance_id: "gp-test-instance", sales_channel_id: "sc_bb" },
       async () => {
         await customerMarketGuardMiddleware(req, createResponse() as any, next);
       }
@@ -242,7 +254,7 @@ describe("customer isolation middlewares", () => {
     } as any;
 
     await marketContextStorage.run(
-      { market_id: "bonbeauty", sales_channel_id: "sc_bb" },
+      { market_id: "bonbeauty", instance_id: "gp-test-instance", sales_channel_id: "sc_bb" },
       async () => {
         await customerMarketGuardMiddleware(req, res as any, jest.fn());
       }
@@ -290,7 +302,7 @@ describe("customer isolation middlewares", () => {
     } as any;
 
     await marketContextStorage.run(
-      { market_id: "bonbeauty", sales_channel_id: "sc_bb" },
+      { market_id: "bonbeauty", instance_id: "gp-test-instance", sales_channel_id: "sc_bb" },
       async () => {
         await customerMarketGuardMiddleware(req, createResponse() as any, next);
       }
@@ -322,7 +334,7 @@ describe("customer isolation middlewares", () => {
     } as any;
 
     await marketContextStorage.run(
-      { market_id: "bonbeauty", sales_channel_id: "sc_bb" },
+      { market_id: "bonbeauty", instance_id: "gp-test-instance", sales_channel_id: "sc_bb" },
       async () => {
         await cartMarketGuardMiddleware(req, createResponse() as any, next);
       }
@@ -353,7 +365,7 @@ describe("customer isolation middlewares", () => {
     } as any;
 
     await marketContextStorage.run(
-      { market_id: "bonbeauty", sales_channel_id: "sc_bb" },
+      { market_id: "bonbeauty", instance_id: "gp-test-instance", sales_channel_id: "sc_bb" },
       async () => {
         await cartMarketGuardMiddleware(req, res as any, jest.fn());
       }

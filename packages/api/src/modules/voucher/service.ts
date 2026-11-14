@@ -8,6 +8,7 @@
  */
 
 import { randomUUID } from "node:crypto"
+import { requireRuntimeInstanceId } from "../../lib/runtime-instance-identity"
 import { ContainerRegistrationKeys, Modules } from "@medusajs/framework/utils"
 import {
   resolveRlsConnectionSource,
@@ -225,6 +226,38 @@ type EntitlementBookingCancelledPayload = {
   state: EntitlementInstanceState.ACTIVE
   booking_pointer: null
   entitlement_type: EntitlementType.VOUCHER_SERVICE
+}
+
+/**
+ * Story 5.4 fix (checkpoint PO, R-1/R-2): VOUCHER_SERVICE is redeemed in one act
+ * and keeps `remaining_amount = NULL` (no balance row). For a service entitlement
+ * that has already been consumed or closed, NULL means "nothing left", not "face
+ * value left" — the admin view shows 0, exactly as before 5.4 (NULL -> 0 at
+ * redemption). Amount vouchers and not-yet-redeemed service entitlements keep the
+ * previous projection (NULL -> face value).
+ */
+export const SERVICE_CONSUMED_OR_TERMINAL_STATES: ReadonlySet<string> = new Set([
+  EntitlementInstanceState.REDEEMED_FULL,
+  EntitlementInstanceState.SETTLED,
+  EntitlementInstanceState.CLOSED,
+  EntitlementInstanceState.VOIDED,
+  EntitlementInstanceState.EXPIRED,
+  EntitlementInstanceState.REFUNDED,
+])
+
+export function resolveAdminRemainingMinor(
+  row: Record<string, unknown>,
+  faceValue: number
+): number {
+  if (row.remaining_amount != null) return Number(row.remaining_amount)
+  if (
+    row.entitlement_type === EntitlementType.VOUCHER_SERVICE &&
+    typeof row.state === "string" &&
+    SERVICE_CONSUMED_OR_TERMINAL_STATES.has(row.state)
+  ) {
+    return 0
+  }
+  return faceValue
 }
 
 export class EntitlementExtensionError extends Error {
@@ -812,7 +845,10 @@ export class VoucherService {
       )
     }
     return {
-      instance_id: row.id,
+      // Story 11.2 (ADR-240, review R-1): instancja runtime z GP_INSTANCE_ID,
+      // nie id uprawnienia (to niesie `payload.entitlement_id`). Brak nośnika =
+      // odmowa (RuntimeInstanceIdentityError) — transakcja callera się wycofuje.
+      instance_id: requireRuntimeInstanceId("voucher-service:transition"),
       market_id: row.market_id,
       sales_channel_id: row.sales_channel_id ?? null,
       vendor_id: null,
@@ -1354,8 +1390,7 @@ export class VoucherService {
         : typeof policySnapshot.amount_minor === "number"
           ? (policySnapshot.amount_minor as number)
           : 0
-    const remaining =
-      row.remaining_amount != null ? Number(row.remaining_amount) : faceValue
+    const remaining = resolveAdminRemainingMinor(row, faceValue)
     const currency =
       (typeof row.currency_code === "string" ? (row.currency_code as string) : null) ??
       (typeof policySnapshot.currency === "string" ? (policySnapshot.currency as string) : "PLN")
@@ -2374,6 +2409,9 @@ export class VoucherService {
     const actor = input.actor ?? "system"
     const now = new Date()
     const idempotencyKey = `entitlement:${entitlementId}:refund_applied:${input.refund_id}`
+    // Story 11.2 (DW-15-183): scope.instance_id = instancja runtime; entitlement
+    // id niesie `payload.entitlement_id`. Brak GP_INSTANCE_ID = odmowa przed tx.
+    const runtimeInstanceId = requireRuntimeInstanceId("voucher-service:refund_request")
 
     const pool = this.getPool()
     const client = await pool.connect()
@@ -2403,8 +2441,7 @@ export class VoucherService {
           occurred_at: p.applied_at,
           actor,
           idempotency_key: idempotencyKey,
-          // F-01 fix: use actual entitlement instance ID, not hardcoded "gp-dev".
-          scope: { instance_id: entitlementId },
+          scope: { instance_id: runtimeInstanceId },
           payload: p,
         }
         return {
@@ -2566,8 +2603,7 @@ export class VoucherService {
         occurred_at: appliedAt,
         actor,
         idempotency_key: idempotencyKey,
-        // F-01 fix: use actual entitlement instance ID, not hardcoded "gp-dev".
-        scope: { instance_id: entitlementId },
+        scope: { instance_id: runtimeInstanceId },
         payload,
       }
 

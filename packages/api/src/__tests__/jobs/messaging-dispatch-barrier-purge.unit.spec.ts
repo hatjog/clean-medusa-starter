@@ -48,6 +48,18 @@ import {
   _resetSystemMarketContextMetrics,
 } from "../../lib/system-market-context"
 
+// Story 11.2 (triage 7.1 poz. 2): od 11.1 kontekst rynku ma DRUGĄ oś scope —
+// instancję runtime wyłącznie z GP_INSTANCE_ID (bez domyślki gp-dev). Fixture
+// podaje ją jawnie; asercje rynku pozostają bez zmian.
+const PREVIOUS_GP_INSTANCE_ID = process.env.GP_INSTANCE_ID
+beforeEach(() => {
+  process.env.GP_INSTANCE_ID = "gp-test-instance"
+})
+afterAll(() => {
+  if (PREVIOUS_GP_INSTANCE_ID === undefined) delete process.env.GP_INSTANCE_ID
+  else process.env.GP_INSTANCE_ID = PREVIOUS_GP_INSTANCE_ID
+})
+
 type Call = { sql: string; bindings: readonly unknown[] }
 
 function containerWith(raw: (sql: string, bindings?: readonly unknown[]) => Promise<unknown>) {

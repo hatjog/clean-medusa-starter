@@ -376,6 +376,8 @@ describe("extractPurchaseDeliveryTrigger", () => {
       to_state: "ISSUED",
       from_state: "__genesis__",
       instance_id: ENTITLEMENT_ID,
+      // Story 11.2 (ADR-240): occurred_at koperty wyznacza okno kopert zastanych.
+      occurred_at: "2026-07-26T12:00:00.000Z",
       market_id: MARKET_ID,
       // Story 4.4: ścieżka ZDARZENIOWA nie niesie celu — pełna matryca AD-7.
       dispatch_target: null,
@@ -394,6 +396,7 @@ describe("extractPurchaseDeliveryTrigger", () => {
       to_state: "ACTIVE",
       from_state: "ISSUED",
       instance_id: null,
+      occurred_at: null,
       market_id: null,
       dispatch_target: null,
     })
@@ -405,6 +408,7 @@ describe("extractPurchaseDeliveryTrigger", () => {
       to_state: null,
       from_state: null,
       instance_id: null,
+      occurred_at: null,
       market_id: null,
       dispatch_target: null,
     })

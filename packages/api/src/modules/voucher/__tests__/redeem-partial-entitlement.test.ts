@@ -349,7 +349,11 @@ describe("Story 4.1 AC1 — redeem partial obniża remaining (ten sam entitlemen
 
     expect(second.redemption_id).toBe(first.redemption_id)
     expect(second.outcome).toBe("REDEEMED_FULL")
-    expect(second.posting.deduped).toBe(true)
+    // v1.16.0 Story 5.4 (AD-34, ADR-237): gałąź usługowa nie ma postingu
+    // kwotowego, więc replay nie ma czego deduplikować — i nie udaje, że ma.
+    expect(second.posting.attempted).toBe(false)
+    expect(second.posting.deduped).toBe(false)
+    expect(second.posting.transaction_id).toBeUndefined()
     expect(events).toHaveLength(emittedAfterFirst)
   })
 
@@ -1129,8 +1133,13 @@ describe("C2-M-1/C2-M-4 — VOUCHER_SERVICE: posting i odwrót (ADR-212)", () =>
       ...overrides,
     })
 
-  it("C2-M-1: POSTING niesie redeemed_gross_to_date = 0 — cały VAT rozpoznany JEDNYM zdarzeniem", async () => {
-    const { op, fake } = makeOp({
+  it("Story 5.4 (AD-34): gałąź usługowa NIE produkuje postingu — nawet przy bramce włączonej i podpiętym writerze", async () => {
+    // Do v1.16.0 Story 5.4 stał tu test C2-M-1, który WYMAGAŁ postingu
+    // `REDEEMED` z całym VAT-em (ADR-212 §2). AD-34 i ADR-237 (`Proposed`)
+    // zdejmują posting kwotowy z gałęzi usługowej; kontrola jest odwrócona,
+    // a warunki (bramka ON, writer podpięty, VAT > 0) są te same — inaczej
+    // „brak postingu" mógłby wynikać z wyłączonej bramki, nie z gałęzi.
+    const { op, fake, store } = makeOp({
       rows: [serviceRow()],
       gate: GATE_BOTH_ON,
       wireWriter: true,
@@ -1138,22 +1147,35 @@ describe("C2-M-1/C2-M-4 — VOUCHER_SERVICE: posting i odwrót (ADR-212)", () =>
 
     const res = await op.redeem(svcVatInput())
 
-    expect(res.posting.activated).toBe(true)
+    expect(res.outcome).toBe("REDEEMED_FULL")
+    expect(res.posting.attempted).toBe(false)
+    expect(res.posting.activated).toBe(false)
+    expect(res.posting.persisted).toBe(false)
+    expect(fake.txRows).toHaveLength(0)
+    expect(fake.entryRows).toHaveLength(0)
+    // Bez wiersza salda: `remaining_amount` zostaje `null` (jak przy emisji).
+    expect(store.get("ent_amount_1")!.remaining_amount).toBeNull()
+  })
+
+  it("Story 5.4 (AD-34): kontrola przeciwna — gałąź KWOTOWA w tych samych warunkach produkuje posting", async () => {
+    const { op, fake } = makeOp({
+      rows: [makeEntitlement({ remaining_amount: SVC_GROSS })],
+      gate: GATE_BOTH_ON,
+      wireWriter: true,
+    })
+
+    const res = await op.redeem(
+      baseInput({
+        amount_minor: SVC_GROSS,
+        voucher_net_minor: SVC_NET,
+        voucher_vat_minor: SVC_VAT,
+        idempotency_key: "amt-posting-ctrl",
+      })
+    )
+
+    expect(res.posting.attempted).toBe(true)
     expect(res.posting.persisted).toBe(true)
     expect(fake.txRows).toHaveLength(1)
-    // Asercja czyta POSTING, nie zwrotkę `resolveRedeemSpend`. Rozpoznany VAT
-    // = proporcja(vat, prior+amount, gross) − proporcja(vat, prior, gross).
-    // Wartość CAŁEGO VAT-u jest osiągalna WYŁĄCZNIE przy `prior = 0`: każde
-    // inne `redeemed_gross_to_date` albo pomniejsza tę liczbę, albo wywraca
-    // generator na Σ-guardzie over-redeem.
-    const outputCredits = fake.entryRows
-      .filter((p) => p[2] === "vat:output")
-      .reduce((s, p) => s + Number(p[4]), 0)
-    expect(outputCredits).toBe(SVC_VAT)
-    const suspenseDebits = fake.entryRows
-      .filter((p) => p[2] === "vat:output:suspense")
-      .reduce((s, p) => s + Number(p[3]), 0)
-    expect(suspenseDebits).toBe(SVC_VAT)
   })
 
   it("C2-M-1: koperta niesie remaining_before = całe brutto emisji, remaining_after = 0", async () => {
@@ -1183,7 +1205,8 @@ describe("C2-M-1/C2-M-4 — VOUCHER_SERVICE: posting i odwrót (ADR-212)", () =>
     // dopiero realizacja ustawia tu liczbę. Zapamiętujemy ją, żeby porównanie
     // po odwrocie miało z czym być porównane.
     const remainingPoRealizacji = store.get("ent_amount_1")!.remaining_amount
-    expect(remainingPoRealizacji).toBe(0)
+    // v1.16.0 Story 5.4 (AD-34): realizacja usługowa nie pisze salda.
+    expect(remainingPoRealizacji).toBeNull()
 
     const res = await op.reverse({
       reverses_redemption_id: redeemed.redemption_id,

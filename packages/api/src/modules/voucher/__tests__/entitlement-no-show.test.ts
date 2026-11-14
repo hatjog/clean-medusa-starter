@@ -152,10 +152,13 @@ function noChargeClientResponses(selectRow: QueryRow): QueryResponse[] {
 
 beforeEach(() => {
   process.env.DATABASE_URL = "postgresql://postgres:postgres@localhost:5432/gp_mercur"
+  // Story 11.2 (ADR-240): tranzycje serwisu niosą instancję runtime z GP_INSTANCE_ID.
+  process.env.GP_INSTANCE_ID = "gp-test-instance"
 })
 
 afterEach(() => {
   delete process.env.DATABASE_URL
+  delete process.env.GP_INSTANCE_ID
 })
 
 // ---------------------------------------------------------------------------

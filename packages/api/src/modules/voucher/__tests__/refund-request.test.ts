@@ -10,13 +10,15 @@
  *      envelope + refund_channel + refunded_amount_minor + currency
  *  (f) idempotency — duplicate refund_id returns same result without re-applying
  *  (g) snapshot immutability (policy_snapshot.refund_channel immutable post-ISSUED)
- *  (h) review-fix F-01: scope.instance_id = entitlement instance ID (not "gp-dev")
+ *  (h) Story 11.2 (DW-15-183, zastępuje F-01): scope.instance_id = instancja
+ *      runtime z GP_INSTANCE_ID (nie "gp-dev" i nie entitlement id);
+ *      entitlement id w payload.entitlement_id
  *  (i) review-fix F-02: amount must be positive integer
  *  (j) review-fix F-05: currency must be 3-char uppercase ISO 4217
  *  (k) review-fix F-04: terminal/invalid state guard
  */
 
-import { describe, it, expect, beforeEach } from "@jest/globals"
+import { describe, it, expect, beforeEach, afterAll } from "@jest/globals"
 import { VoucherService, ENTITLEMENT_REFUND_APPLIED_EVENT } from ".."
 import {
   EntitlementInstanceState,
@@ -25,6 +27,17 @@ import {
   assertPolicySnapshotImmutable,
 } from "../models/entitlement"
 import { REFUND_CHANNELS } from "../entitlement-boundary"
+
+// Story 11.2: producent bierze instancję runtime WYŁĄCZNIE z GP_INSTANCE_ID.
+const TEST_INSTANCE_ID = "gp-test-instance"
+const PREVIOUS_GP_INSTANCE_ID = process.env.GP_INSTANCE_ID
+beforeEach(() => {
+  process.env.GP_INSTANCE_ID = TEST_INSTANCE_ID
+})
+afterAll(() => {
+  if (PREVIOUS_GP_INSTANCE_ID === undefined) delete process.env.GP_INSTANCE_ID
+  else process.env.GP_INSTANCE_ID = PREVIOUS_GP_INSTANCE_ID
+})
 
 // ---------------------------------------------------------------------------
 // Mock helpers
@@ -162,8 +175,11 @@ describe("refund_request — original_payment channel", () => {
     expect(env.payload.currency).toBe("PLN")
     expect(env.idempotency_key).toBe("entitlement:ent_test_001:refund_applied:refund_001")
 
-    // (h) review-fix F-01: scope.instance_id must be the entitlement instance ID
-    expect(env.scope.instance_id).toBe("ent_test_001")
+    // (h) Story 11.2: scope.instance_id = instancja runtime, entitlement id
+    // we własnym polu payloadu (DW-15-183; zastępuje F-01).
+    expect(env.scope.instance_id).toBe(TEST_INSTANCE_ID)
+    expect(env.scope.instance_id).not.toBe("ent_test_001")
+    expect(env.payload.entitlement_id).toBe("ent_test_001")
 
     // (a) NO Stripe refund.create call — assert no external HTTP call pattern
     // (structural: no stripe-related SQL or external call in captured queries)

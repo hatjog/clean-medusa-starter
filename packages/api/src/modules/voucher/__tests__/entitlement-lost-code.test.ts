@@ -13,7 +13,7 @@
  *         (recovery_id ⇒ jeden void+issue, replay no-op); taksonomia (D-5) niezmienna.
  */
 
-import { describe, it, expect } from "@jest/globals"
+import { describe, it, expect, beforeEach, afterAll, jest } from "@jest/globals"
 import {
   LOST_CODE_REPORT_WINDOW_DAYS,
   LOST_CODE_DECISION_WINDOW_DAYS,
@@ -52,6 +52,19 @@ import {
   type TransitionAuditEnvelope,
   type TransitionEventEnvelope,
 } from ".."
+
+// Story 11.2 (ADR-240, review R-1/R-2): instancja runtime producenta z
+// GP_INSTANCE_ID — celowo RÓŻNA od id uprawnień, żeby mutant przywracający
+// `instance_id = <entitlement id>` czerwienił asercje.
+const RUNTIME_INSTANCE = "gp-bonbeauty-lost-code"
+const PREVIOUS_GP_INSTANCE_ID = process.env.GP_INSTANCE_ID
+beforeEach(() => {
+  process.env.GP_INSTANCE_ID = RUNTIME_INSTANCE
+})
+afterAll(() => {
+  if (PREVIOUS_GP_INSTANCE_ID === undefined) delete process.env.GP_INSTANCE_ID
+  else process.env.GP_INSTANCE_ID = PREVIOUS_GP_INSTANCE_ID
+})
 
 const SCOPE = {
   instance_id: "ent_lost_001",
@@ -430,13 +443,15 @@ describe("buildLostCode*TransitionInput — krawędzie grafu (D-5) + posting pom
     ).toThrow(LostCodePreconditionError)
   })
 
-  it("issue: geneza → ISSUED, scope.instance_id = nowy id, posting pominięty", () => {
+  it("issue: geneza → ISSUED, scope.instance_id = instancja runtime (nie nowy id), posting pominięty", () => {
     const newId = deriveRecoveryEntitlementId(REC)
     const input = buildLostCodeReissueGenesisInput(wiring, newId)
     expect(input.from).toBe(ENTITLEMENT_GENESIS)
     expect(input.to).toBe(EntitlementInstanceState.ISSUED)
     expect(input.entitlement_id).toBe(newId)
-    expect(input.scope.instance_id).toBe(newId)
+    // Story 11.2 (review R-1/R-2): entitlement id NIE trafia do scope.instance_id.
+    expect(input.scope.instance_id).toBe(RUNTIME_INSTANCE)
+    expect(input.scope.instance_id).not.toBe(newId)
     expect(input.posting).toBeUndefined()
     expect(input.actor_hint).toContain("lost-code:issue")
     expect(input.actor_hint).toContain(`new=${newId}`)
@@ -496,6 +511,36 @@ describe("buildLostCodeRecoveryWiring — para audytowana + posting audit-only (
 
     // Nowy id deterministyczny z recovery_id.
     expect(res.new_entitlement_id).toBe(deriveRecoveryEntitlementId(REC))
+  })
+
+  it("Story 11.2 (R-1/R-2): koperta genezy ISSUED niesie instancję runtime, entitlement id w payload", async () => {
+    const res = await buildLostCodeRecoveryWiring(
+      { clock: () => new Date("2026-06-13T12:00:00.000Z"), invalidateVoucherCode: CODE_INVALIDATOR },
+      wiring
+    )
+    expect(res.issue.event.payload.to_state).toBe(EntitlementInstanceState.ISSUED)
+    expect(res.issue.event.scope.instance_id).toBe(RUNTIME_INSTANCE)
+    expect(res.issue.event.scope.instance_id).not.toBe(res.new_entitlement_id)
+    expect(res.issue.event.payload.entitlement_id).toBe(res.new_entitlement_id)
+  })
+
+  it("Story 11.2 (R-1/R-2): brak GP_INSTANCE_ID ⇒ odmowa PRZED void(old) — zero audytu, zero emisji", async () => {
+    delete process.env.GP_INSTANCE_ID
+    const appendAudit = jest.fn(async () => {})
+    const emitEvent = jest.fn(async () => {})
+    await expect(
+      buildLostCodeRecoveryWiring(
+        {
+          clock: () => new Date("2026-06-13T12:00:00.000Z"),
+          invalidateVoucherCode: CODE_INVALIDATOR,
+          appendAudit,
+          emitEvent,
+        },
+        wiring
+      )
+    ).rejects.toThrow("GP_INSTANCE_ID")
+    expect(appendAudit).not.toHaveBeenCalled()
+    expect(emitEvent).not.toHaveBeenCalled()
   })
 
   it("appendAudit wołany dla OBU nóg (void + issue) atomowo w tx callera", async () => {
