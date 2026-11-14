@@ -6,6 +6,23 @@ import brevoDeliveryTracker, {
   config,
 } from "../../subscribers/brevo-delivery-tracker"
 
+/** Kontekst systemowy poza HTTP wymaga jawnego instance_id (AD-21) — jak w produkcji. */
+process.env.GP_INSTANCE_ID = process.env.GP_INSTANCE_ID || "gp-test"
+// ADR-213 C: produkcyjny weryfikator powstaje z BREVO_API_KEY. Tu klucz jest
+// atrapa, a fabryka zwraca weryfikator potwierdzajacy — zadnego ruchu sieciowego.
+// Galezie odmowy weryfikacji mierzy `brevo-event-verification.unit.spec.ts`.
+process.env.BREVO_API_KEY = "test-only-not-a-key"
+jest.mock("../../lib/brevo-event-verification", () => ({
+  ...jest.requireActual("../../lib/brevo-event-verification"),
+  createBrevoDeliveryEventVerifier: () => ({
+    verify: async () => ({ outcome: "confirmed", statistics_event: "stub" }),
+  }),
+}))
+
+const CONFIRMING_VERIFIER = {
+  verify: jest.fn(async () => ({ outcome: "confirmed" as const, statistics_event: "stub" })),
+}
+
 type AuditEvent = Record<string, unknown>
 
 function makeContainer(options: {
@@ -55,6 +72,9 @@ function makeContainer(options: {
     if (key === "voucher_delivery_dispatch_ledger") return deliveryLedger
     if (key === "notification_delivery_audit_sink") return sink
     if (key === "__pg_connection__") return db
+    // ADR-213 C: weryfikacja zwrotna Brevo — tu potwierdzajaca; galezie odmowy ma
+    // `brevo-event-verification.unit.spec.ts` i test „bez weryfikatora”.
+    if (key === "brevo_delivery_event_verifier") return CONFIRMING_VERIFIER
     throw new Error(`Unknown container key: ${key}`)
   })
 

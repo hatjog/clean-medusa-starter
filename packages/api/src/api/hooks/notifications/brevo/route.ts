@@ -11,8 +11,25 @@ import {
 
 type BrevoPayload = Record<string, unknown>
 type EventBusLike = {
-  emit: (event: { name: string; data: BrevoPayload }) => Promise<unknown>
+  emit: (
+    event: { name: string; data: BrevoPayload },
+    options?: Record<string, unknown>,
+  ) => Promise<unknown>
 }
+
+/**
+ * R-4 (checkpoint 6.6): trasa odpowiada 202 PRZED subskrybentem, a
+ * `@medusajs/event-bus-redis` ma domyslnie `attempts: 1` — odmowa weryfikacji C
+ * (np. opozniony wpis w statystykach Brevo, 429/5xx) gubilaby zdarzenie
+ * trwale. Opcje zadania na poziomie emisji daja ponowienie z backoffem tylko
+ * dla zdarzen Brevo; szyna ponawia wylacznie subskrybentow, ktorzy rzucili.
+ */
+export const BREVO_DELIVERY_EVENT_JOB_OPTIONS = Object.freeze({
+  attempts: 6,
+  backoff: Object.freeze({ type: "exponential", delay: 30_000 }),
+  removeOnComplete: true,
+  removeOnFail: false,
+})
 type LoggerLike = {
   error?: (message: string) => void
 }
@@ -123,7 +140,9 @@ export async function POST(
     provider_event_id: providerEventId,
     event_type: eventName.replace(/^notification\./, ""),
   }
-  await eventBus.emit({ name: eventName, data: eventData })
+  await eventBus.emit({ name: eventName, data: eventData }, {
+    ...BREVO_DELIVERY_EVENT_JOB_OPTIONS,
+  })
 
   res.status(202).json({
     type: "emitted",

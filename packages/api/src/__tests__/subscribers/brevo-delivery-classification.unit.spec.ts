@@ -31,6 +31,23 @@ import {
   getSystemMarketContextDenials,
 } from "../../lib/system-market-context"
 
+/** Kontekst systemowy poza HTTP wymaga jawnego instance_id (AD-21) — jak w produkcji. */
+process.env.GP_INSTANCE_ID = process.env.GP_INSTANCE_ID || "gp-test"
+// ADR-213 C: produkcyjny weryfikator powstaje z BREVO_API_KEY. Tu klucz jest
+// atrapa, a fabryka zwraca weryfikator potwierdzajacy — zadnego ruchu sieciowego.
+// Galezie odmowy weryfikacji mierzy `brevo-event-verification.unit.spec.ts`.
+process.env.BREVO_API_KEY = "test-only-not-a-key"
+jest.mock("../../lib/brevo-event-verification", () => ({
+  ...jest.requireActual("../../lib/brevo-event-verification"),
+  createBrevoDeliveryEventVerifier: () => ({
+    verify: async () => ({ outcome: "confirmed", statistics_event: "stub" }),
+  }),
+}))
+
+const CONFIRMING_VERIFIER = {
+  verify: jest.fn(async () => ({ outcome: "confirmed" as const, statistics_event: "stub" })),
+}
+
 type AuditEvent = Record<string, any>
 
 /**
@@ -92,6 +109,9 @@ function makeContainer(
     }
     // Hamulec ZWOLNIONY — inaczej sciezka konczy sie cichym `return` przed sinkiem.
     if (key === ContainerRegistrationKeys.PG_CONNECTION) return db
+    // ADR-213 C: weryfikacja zwrotna Brevo — tu potwierdzajaca; galezie odmowy ma
+    // `brevo-event-verification.unit.spec.ts` i test „bez weryfikatora”.
+    if (key === "brevo_delivery_event_verifier") return CONFIRMING_VERIFIER
     throw new Error(`Unknown container key: ${key}`)
   })
   return { auditEvents, logger, db, container: { resolve } }
@@ -479,31 +499,62 @@ describe("AC4 — kazda klasa ma WLASNA reakcje, wykonywana na realnej sciezce",
     expect(ctx.auditEvents[0].market_id).toBe("ua")
   })
 
-  it("AD-21 kontrola NEGATYWNA — brak deklaracji rynku to ODMOWA, nie zapis dla wszystkich rynkow", async () => {
+  it("AD-21 kontrola NEGATYWNA — brak deklaracji rynku: zastany hamulec fail-closed, jawny kod, nic nie zapisane (R-8)", async () => {
+    // R-8 (checkpoint 6.6, PO D-4): przeplyw hamulca dla zdarzenia bez rynku
+    // jest ZASTANY (kontrakt 6.8) — odczyt dla `""` jest fail-closed i konczy
+    // obsluge PRZED kontekstem rynku. 6.6 nie zmienia tej semantyki; dodaje
+    // jedynie jawny kod DELIVERY_PATH_BRAKE_ENGAGED.
     const ctx = makeContainer(null)
 
-    await expect(
-      run(
-        {
-          provider_id: "brevo",
-          provider_event_id: "pe-no-market",
-          event_type: "hard_bounce",
-        },
-        ctx.container,
-        "notification.hard_bounce",
-      ),
-    ).rejects.toThrow(/AD-21/)
+    await run(
+      {
+        provider_id: "brevo",
+        provider_event_id: "pe-no-market",
+        event_type: "hard_bounce",
+      },
+      ctx.container,
+      "notification.hard_bounce",
+    )
 
     // Kluczowe: NIC nie zostalo zapisane.
     expect(ctx.auditEvents).toHaveLength(0)
-    // Odmowa jest policzona, nie tylko zalogowana.
+    expect(ctx.logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining(
+        "error_code=DELIVERY_PATH_BRAKE_ENGAGED metric=gp_brevo_delivery_brake_skipped_total outcome=skipped_unclassified market_id=missing",
+      ),
+    )
+    // Hamulec rozstrzyga przed kontekstem rynku — odmowy AD-21 tu nie ma.
     expect(
       getSystemMarketContextDenials({ reason: "markets_empty", surface: "subscriber" }),
-    ).toBe(1)
+    ).toBe(0)
   })
 
-  it("idempotencja — ten sam provider_event_id dwa razy daje JEDNA reakcje", async () => {
+  it("idempotencja — ten sam provider_event_id dwa razy: JEDEN skutek w ledgerze, koperta z TYM SAMYM audit_id (R-5)", async () => {
+    // Story 6.6: idempotencje rozstrzyga TRWALY ledger (atomowy UPDATE ... WHERE
+    // status <> $1), nie pamiec procesu. Atrapa odtwarza dokladnie ten kontrakt:
+    // pierwsze zastosowanie `updated`, kazde kolejne `duplicate`. Do v1.15.0
+    // replay dawal druga koperte z `escalate: true` — druga eskalacje.
     const ctx = makeContainer()
+    const applied = new Set<string>()
+    const ledgerCalls: Array<Record<string, unknown>> = []
+    const ledger = {
+      applyProviderDeliveryState: jest.fn(async (input: Record<string, unknown>) => {
+        ledgerCalls.push(input)
+        const key = String(input.provider_event_id)
+        const first = !applied.has(key)
+        applied.add(key)
+        return {
+          outcome: first ? "updated" : "duplicate",
+          dispatch_id: "dispatch-idem",
+          previous_status: first ? null : "failed",
+          status: "failed",
+        }
+      }),
+    }
+    const baseResolve = ctx.container.resolve
+    ctx.container.resolve = jest.fn((key: string) =>
+      key === "voucher_delivery_dispatch_ledger" ? ledger : baseResolve(key),
+    ) as typeof baseResolve
     const payload = {
       provider_id: "brevo",
       provider_event_id: "pe-idempotent",
@@ -515,10 +566,57 @@ describe("AC4 — kazda klasa ma WLASNA reakcje, wykonywana na realnej sciezce",
     await run(payload, ctx.container, "notification.hard_bounce")
     await run(payload, ctx.container, "notification.hard_bounce")
 
-    // Dostawca ponawia webhook do 7 dni — druga dostawa NIE moze wyprodukowac
-    // drugiej eskalacji ani drugiego zuzycia proby.
-    expect(ctx.auditEvents).toHaveLength(1)
+    // R-5: `duplicate` nie dowodzi, ze koperta dotarla (ledger zatwierdza stan
+    // przed sinkiem), wiec replay emituje ja ponownie — z TYM SAMYM
+    // deterministycznym audit_id (F-08), po ktorym deduplikuje sink. Skutek
+    // (budzet, eskalacja z predykatu wiersza) stosuje ledger raz.
+    expect(ctx.auditEvents).toHaveLength(2)
+    expect(ctx.auditEvents[1].audit_id).toBe(ctx.auditEvents[0].audit_id)
     expect(ctx.auditEvents[0].delivery_reaction.escalate).toBe(true)
+    // Trwale odbicie domyka budzet odbiorcy (droga wyczerpania budzetu) — ten
+    // sam nosnik przy obu dostawach; to UPDATE w ledgerze stosuje go raz.
+    expect(ledgerCalls).toHaveLength(2)
+    expect(ledgerCalls[0]).toMatchObject({
+      status: "failed",
+      error_code: "HARD_BOUNCE",
+      exhaust_recipient_budget: { max_attempt_count: 5 },
+    })
+    expect(ctx.logger.info).toHaveBeenCalledWith(
+      expect.stringContaining("outcome=replay_reemitted provider_event_id=pe-idempotent"),
+    )
+  })
+
+  it("Story 6.6 — tylko trwale odbicie domyka budzet; chwilowe/zablokowane/niepoprawny adres NIE", async () => {
+    const seen: Record<string, unknown> = {}
+    for (const [eventType, exhausts] of [
+      ["hard_bounce", true],
+      ["soft_bounce", false],
+      ["blocked", false],
+      ["invalid_email", false],
+    ] as const) {
+      const ctx = makeContainer()
+      const ledger = {
+        applyProviderDeliveryState: jest.fn(async (input: Record<string, unknown>) => {
+          seen[eventType] = input.exhaust_recipient_budget ?? null
+          return { outcome: "updated", dispatch_id: "d", previous_status: null, status: "failed" }
+        }),
+      }
+      const baseResolve = ctx.container.resolve
+      ctx.container.resolve = jest.fn((key: string) =>
+        key === "voucher_delivery_dispatch_ledger" ? ledger : baseResolve(key),
+      ) as typeof baseResolve
+      await run(
+        {
+          provider_id: "brevo",
+          provider_event_id: `pe-budget-${eventType}`,
+          market_id: "pl",
+          dispatch_id: `dispatch-budget-${eventType}`,
+          event_type: eventType,
+        },
+        ctx.container,
+      )
+      expect(seen[eventType] !== null).toBe(exhausts)
+    }
   })
 })
 
@@ -755,8 +853,14 @@ describe("hamulec sciezki pieniadza — stan ZACIAGNIETY", () => {
       ctx.container,
     )
 
-    // Cichy `return` PRZED `emitAuditEvent` — to jest zamierzone fail-closed.
+    // `return` PRZED `emitAuditEvent` — to jest zamierzone fail-closed (6.8),
+    // ale od Story 6.6 NIE jest cichy: nazwany kod, metryka i niesklasyfikowana klasa.
     expect(ctx.auditEvents).toHaveLength(0)
+    expect(ctx.logger.warn).toHaveBeenCalledWith(
+      expect.stringMatching(
+        /error_code=DELIVERY_PATH_BRAKE_ENGAGED metric=gp_brevo_delivery_brake_skipped_total outcome=skipped_unclassified market_id=pl brake=fr_9_delivery_idempotency provider_event_id=pe-brake-engaged/,
+      ),
+    )
     // ...ale odczyt hamulca MUSIAL sie odbyc. Bez tej asercji zniknieciecie
     // odczytu z produkcji zostawiloby ten test zielony na pustym sinku.
     expect(ctx.db.raw).toHaveBeenCalled()

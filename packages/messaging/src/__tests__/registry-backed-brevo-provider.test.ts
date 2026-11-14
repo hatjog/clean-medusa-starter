@@ -133,3 +133,47 @@ describe("RegistryBackedBrevoProvider", () => {
     expect(sendTransacEmail).toHaveBeenCalledTimes(1);
   });
 });
+
+/**
+ * Story v1.16.0/6.6 AC5 — link vouchera przechodzi przez REALNY rejestr szablonow
+ * (voucher_handoff_link, pl -> ID 2 z `notification-template-registry.generated.ts`)
+ * bajt w bajt, a odpowiedz dostawcy przy wysylce to `queued` (przyjete), NIE
+ * dostarczenie. Dostarczenie, odbicie i spam ustala dopiero webhook + weryfikacja
+ * zwrotna (ADR-213 C) — trzy rozlaczne wyniki. Realna wysylka = NEEDS-LIVE-RUN.
+ */
+describe("Story 6.6 AC5 — handoff link przez realny rejestr, accepted != delivered", () => {
+  it("handoff_url trafia do params bez przepisania; wynik wysylki to queued", async () => {
+    const handoffUrl =
+      "https://bonbeauty.example/pl/voucher/claim?token=abc123&utm_source=email";
+    const sendTransacEmail = jest
+      .fn()
+      .mockResolvedValue({ messageId: "<202611140800.1@smtp-relay.mailin.fr>" });
+    const provider = new RegistryBackedBrevoProvider(
+      { sendTransacEmail },
+      { senders: { bonbeauty: { email: "no-reply@example.test" } } },
+    );
+
+    const response = await provider.send(
+      intent({
+        template_key: NOTIFICATION_TEMPLATE_KEYS.VOUCHER_HANDOFF_LINK,
+        variables: {
+          customer_first_name: "Anna",
+          handoff_url: handoffUrl,
+          market_url: "https://bonbeauty.example/pl",
+          salon_address: "ul. Testowa 1",
+          salon_name: "Salon",
+          support_email: "support@example.test",
+          voucher_code: "ABC",
+          voucher_expires_at: "2027-11-14",
+        },
+      }),
+    );
+
+    expect(sendTransacEmail).toHaveBeenCalledTimes(1);
+    const payload = sendTransacEmail.mock.calls[0][0];
+    expect(payload.templateId).toBe(2);
+    expect(payload.params.handoff_url).toBe(handoffUrl);
+    expect(response.status).toBe("queued");
+    expect(response.status).not.toBe("delivered");
+  });
+});

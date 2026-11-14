@@ -13,6 +13,19 @@ export const BREVO_PROVIDER_ROUTE_PREFIX = "/hooks/notifications/brevo"
 export const BREVO_PROVIDER_ROUTE_MATCHER = `${BREVO_PROVIDER_ROUTE_PREFIX}*`
 export const BREVO_HMAC_SIGNATURE_HEADER = "x-mailin-custom-signature"
 export const BREVO_HMAC_SECRET_ENV = "BREVO_HMAC_SECRET"
+/**
+ * ADR-213 wariant A: sekret w ściezce URL webhooka
+ * (`/hooks/notifications/brevo/<token>`). Brevo nie podpisuje żądań, więc
+ * HMAC zostaje wyłącznie dla nadawców, którzy podpisują (legacy/testy), a
+ * prawdziwy webhook dostawcy przechodzi przez token w ścieżce. Token jest
+ * bearerem bez ochrony przed powtórzeniem — prawdę o stanie dostawy ustala
+ * wariant C (`lib/brevo-event-verification.ts`) w trackerze.
+ * Ścieżki z tokenem NIGDY nie logujemy w całości.
+ */
+export const BREVO_WEBHOOK_PATH_TOKEN_ENV = "BREVO_WEBHOOK_PATH_TOKEN"
+export const BREVO_WEBHOOK_AUDIT_SINK_UNAVAILABLE_CODE =
+  "BREVO_WEBHOOK_AUDIT_SINK_UNAVAILABLE"
+export const BREVO_WEBHOOK_REJECT_LOG_PREFIX = "[brevo-hmac-validator] rejected"
 export const brevoHmacCrypto = {
   timingSafeEqual: crypto.timingSafeEqual,
 }
@@ -40,6 +53,8 @@ export type BrevoWebhookRejectCode =
   | "BREVO_HMAC_RATE_LIMIT_EXCEEDED"
   | "BREVO_HMAC_CIRCUIT_OPEN"
   | "BREVO_HMAC_RAW_BODY_UNAVAILABLE"
+  | "BREVO_WEBHOOK_PATH_TOKEN_UNSET"
+  | "BREVO_WEBHOOK_PATH_TOKEN_MISMATCH"
 
 type LoggerLike = {
   info?: (message: string, metadata?: Record<string, unknown>) => void
@@ -100,6 +115,7 @@ export function __resetBrevoWebhookSecurityForTests(): void {
   assertTestEnvironment("__resetBrevoWebhookSecurityForTests")
   rateLimitWindows.clear()
   circuitStates.clear()
+  auditSinkUnavailableCount = 0
 }
 
 export async function brevoWebhookRateLimitMiddleware(
@@ -198,6 +214,12 @@ export async function brevoHmacValidatorMiddleware(
   res: MedusaResponse,
   next: MedusaNextFunction,
 ): Promise<void> {
+  const pathToken = readPathToken(req)
+  if (pathToken !== undefined) {
+    await authenticateByPathToken(req, res, next, pathToken)
+    return
+  }
+
   const secret = process.env[BREVO_HMAC_SECRET_ENV]
   if (!secret) {
     // Misconfiguration is operator-driven, not adversarial — do NOT count
@@ -255,6 +277,84 @@ export async function brevoHmacValidatorMiddleware(
   next()
 }
 
+/**
+ * Token z ostatniego segmentu ścieżki po prefiksie trasy. `undefined` = żądanie
+ * bez tokenu (gałąź HMAC). Pusty segment traktujemy jak brak tokenu.
+ */
+function readPathToken(req: MedusaRequest): string | undefined {
+  const request = req as BrevoWebhookRequest
+  const raw = request.originalUrl ?? request.url ?? request.path ?? ""
+  const pathOnly = raw.split("?")[0] ?? ""
+  const index = pathOnly.indexOf(BREVO_PROVIDER_ROUTE_PREFIX)
+  if (index < 0) return undefined
+  const rest = pathOnly.slice(index + BREVO_PROVIDER_ROUTE_PREFIX.length)
+  const segment = rest.replace(/^\/+/, "").split("/")[0] ?? ""
+  return segment ? decodeURIComponentSafe(segment) : undefined
+}
+
+function decodeURIComponentSafe(value: string): string {
+  try {
+    return decodeURIComponent(value)
+  } catch {
+    return value
+  }
+}
+
+async function authenticateByPathToken(
+  req: MedusaRequest,
+  res: MedusaResponse,
+  next: MedusaNextFunction,
+  presented: string,
+): Promise<void> {
+  const expected = process.env[BREVO_WEBHOOK_PATH_TOKEN_ENV]?.trim()
+  if (!expected) {
+    markCircuitSkip(res)
+    await rejectBrevoWebhook(req, res, 503, "BREVO_WEBHOOK_PATH_TOKEN_UNSET")
+    return
+  }
+  // Porównanie skrótów stałej długości — czas nie zależy od długości tokenu.
+  const a = crypto.createHash("sha256").update(expected).digest()
+  const b = crypto.createHash("sha256").update(presented).digest()
+  if (!brevoHmacCrypto.timingSafeEqual(a, b)) {
+    await rejectBrevoWebhook(req, res, 401, "BREVO_WEBHOOK_PATH_TOKEN_MISMATCH")
+    return
+  }
+
+  const request = req as BrevoWebhookRequest
+  const rawBody = resolveRawBody(req)
+  if (rawBody !== undefined) {
+    try {
+      request.body = JSON.parse(rawBody.toString("utf8"))
+    } catch {
+      await rejectBrevoWebhook(req, res, 400, "BREVO_HMAC_BODY_UNPARSEABLE")
+      return
+    }
+  } else if (!request.body || typeof request.body !== "object") {
+    markCircuitSkip(res)
+    await rejectBrevoWebhook(req, res, 503, "BREVO_HMAC_RAW_BODY_UNAVAILABLE")
+    return
+  }
+
+  resolveLogger(request)?.info?.("[brevo-hmac-validator] accepted", {
+    auth_variant: "path_token",
+    body_byte_length: rawBody?.byteLength ?? 0,
+  })
+  next()
+}
+
+let auditSinkUnavailableCount = 0
+
+/** Jawny stan środowiska: ile odmów nie trafiło do sinka audytu (AC3, DW-15-185). */
+export function getBrevoWebhookAuditSinkState(): {
+  state: "available" | "unavailable_observed"
+  unavailable_total: number
+} {
+  return {
+    state: auditSinkUnavailableCount > 0 ? "unavailable_observed" : "available",
+    unavailable_total: auditSinkUnavailableCount,
+  }
+}
+
 function markCircuitSkip(res: MedusaResponse): void {
   const target = res as unknown as { locals?: Record<string, unknown> }
   target.locals = target.locals ?? {}
@@ -276,12 +376,22 @@ async function rejectBrevoWebhook(
     errorCode,
   })
 
-  await emitAuditEvent(req, auditEvent)
+  // DW-15-185: odmowa jest WIDOCZNA w logu — nazwany kod + request id, ten sam
+  // co w kopercie audytu i odpowiedzi. Bez ścieżki (wariant A niesie w niej sekret).
+  resolveLogger(req as BrevoWebhookRequest)?.warn?.(
+    `${BREVO_WEBHOOK_REJECT_LOG_PREFIX} error_code=${errorCode} request_id=${requestId} status=${statusCode}`,
+    { error_code: errorCode, request_id: requestId, status_code: statusCode },
+  )
+
+  const auditDelivered = await emitAuditEvent(req, auditEvent)
 
   res.status(statusCode).json({
     message: "Brevo webhook rejected",
     error_code: errorCode,
     request_id: requestId,
+    ...(auditDelivered
+      ? {}
+      : { audit_state: BREVO_WEBHOOK_AUDIT_SINK_UNAVAILABLE_CODE }),
   })
 }
 
@@ -342,7 +452,7 @@ function buildRejectAuditEnvelope(
 async function emitAuditEvent(
   req: MedusaRequest,
   auditEvent: NotificationAuditEnvelope,
-): Promise<void> {
+): Promise<boolean> {
   const request = req as BrevoWebhookRequest
   const sink = resolveOptional<AuditSink | ((auditEvent: NotificationAuditEnvelope) => Promise<void> | void)>(
     request,
@@ -354,27 +464,45 @@ async function emitAuditEvent(
     ],
   )
 
-  if (typeof sink === "function") {
-    await sink(auditEvent)
-    return
-  }
-  if (sink?.record) {
-    await sink.record(auditEvent)
-    return
-  }
-  if (sink?.write) {
-    await sink.write(auditEvent)
-    return
-  }
-  if (sink?.append) {
-    await sink.append(auditEvent)
-    return
+  // R-6: wyjatek ZAREJESTROWANEGO sinka jest ta sama niedostepnoscia co brak
+  // bindingu — nie moze wyjsc z middleware'u przed odpowiedzia odmowy.
+  let sinkReason: "binding_missing" | "sink_threw" = "binding_missing"
+  try {
+    if (typeof sink === "function") {
+      await sink(auditEvent)
+      return true
+    }
+    if (sink?.record) {
+      await sink.record(auditEvent)
+      return true
+    }
+    if (sink?.write) {
+      await sink.write(auditEvent)
+      return true
+    }
+    if (sink?.append) {
+      await sink.append(auditEvent)
+      return true
+    }
+  } catch {
+    sinkReason = "sink_threw"
   }
 
-  resolveLogger(request)?.warn?.("[brevo-hmac-validator] audit sink unavailable", {
-    request_id: auditEvent.request_id,
-    error_code: auditEvent.error_code,
-  })
+  // AC3: niedostępny sink to JAWNY stan środowiska (kod, licznik, pole
+  // odpowiedzi), nie cichy warning.
+  auditSinkUnavailableCount += 1
+  resolveLogger(request)?.error?.(
+    `[brevo-hmac-validator] error_code=${BREVO_WEBHOOK_AUDIT_SINK_UNAVAILABLE_CODE} ` +
+      `reason=${sinkReason} ` +
+      `request_id=${auditEvent.request_id} rejected_error_code=${auditEvent.error_code}`,
+    {
+      error_code: BREVO_WEBHOOK_AUDIT_SINK_UNAVAILABLE_CODE,
+      reason: sinkReason,
+      request_id: auditEvent.request_id,
+      rejected_error_code: auditEvent.error_code,
+    },
+  )
+  return false
 }
 
 function timingSafeHexEqual(expectedHex: string, actualHex: string): boolean {

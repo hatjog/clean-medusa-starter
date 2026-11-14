@@ -26,6 +26,12 @@ import {
   createMoneyPathBrakeReader,
 } from "../lib/money-path-brakes"
 import {
+  createBrevoDeliveryEventVerifier,
+  DELIVERY_EVENT_VERIFICATION_UNAVAILABLE_CODE,
+  type BrevoDeliveryEventVerifier,
+} from "../lib/brevo-event-verification"
+import { VOUCHER_DELIVERY_MAX_ATTEMPT_COUNT } from "../modules/voucher-delivery/attempt-policy"
+import {
   requireMarketContext,
   runInSystemMarketContext,
 } from "../lib/system-market-context"
@@ -205,7 +211,8 @@ export default async function brevoDeliveryTracker({
       // zdarzenie znikalo bez bledu, bez metryki i bez zmiany stanu, a Medusa
       // uznawala je za obsluzone. Teraz odmowa jest GLOSNA: nazwany kod bledu,
       // przyrost licznika i propagacja wyjatku, wiec zdarzenie NIE jest
-      // potwierdzone jako obsluzone i wraca w ponowieniu dostawcy.
+      // potwierdzone jako obsluzone. Ponowienie daje szyna zdarzen (opcje
+      // zadania z trasy webhooka, R-4), nie dostawca — ten dostal juz 202.
       logger.error?.(
         `[brevo-delivery-tracker] error_code=${error.code} ` +
           `metric=${UNRECOGNIZED_DELIVERY_EVENT_METRIC} ` +
@@ -254,11 +261,22 @@ export default async function brevoDeliveryTracker({
       },
       logger,
     )
+    // R-8 (checkpoint 6.6): przeplyw hamulca jest ZASTANY — odczyt takze dla
+    // zdarzenia bez rynku (`""`, fail-closed). Semantyka hamulca to kontrakt
+    // 6.8 (PO D5/D8); 6.6 dodaje wylacznie jawny kod tam, gdzie hamulec jest
+    // zaciagniety.
     const deliveryBrake = await brakeReader.read(
       marketId ?? "",
       "fr_9_delivery_idempotency",
     )
     if (deliveryBrake.state !== "released") {
+      brakeSkippedCount += 1
+      logger.warn?.(
+        `[brevo-delivery-tracker] error_code=${DELIVERY_PATH_BRAKE_ENGAGED_CODE} ` +
+          `metric=${DELIVERY_PATH_BRAKE_ENGAGED_METRIC} outcome=skipped_unclassified ` +
+          `market_id=${marketId ?? "missing"} brake=fr_9_delivery_idempotency ` +
+          `provider_event_id=${normalized.provider_event_id} event_type=${normalized.event_type}`,
+      )
       logger.info?.(
         `[brevo-delivery-tracker] money path brake engaged market_id=${marketId ?? "missing"} brake=fr_9_delivery_idempotency`,
       )
@@ -276,6 +294,12 @@ export default async function brevoDeliveryTracker({
         )}`,
       )
       return
+    }
+
+    // ADR-213 wariant C: stan dostawy trafia do rejestru dopiero po
+    // potwierdzeniu przez API dostawcy. Bez weryfikatora — odmowa glosna.
+    if (marketId) {
+      await verifyWithProvider(runtimeContainer, normalized, logger)
     }
 
     await runInSystemMarketContext(
@@ -299,6 +323,19 @@ export default async function brevoDeliveryTracker({
           logger,
         )
         logDeliveryStateResult(normalized!, stateResult, logger)
+        if (stateResult.outcome === "duplicate") {
+          // R-5 (checkpoint 6.6): ledger zatwierdza stan PRZED koperta (bez
+          // wspolnej transakcji), wiec `duplicate` nie dowodzi, ze koperta
+          // dotarla — ponowienie po awarii sinka trafia wlasnie tutaj. Koperta
+          // jest emitowana ponownie z TYM SAMYM deterministycznym `audit_id`
+          // (F-08), a sink deduplikuje po nim. Idempotencja skutku (budzet,
+          // eskalacja) siedzi w ledgerze: drugi UPDATE niczego nie zmienia,
+          // a eskalacja idzie z predykatu wiersza (`escalated_at`), nie z koperty.
+          logger.info?.(
+            `[brevo-delivery-tracker] outcome=${DELIVERY_REPLAY_REEMITTED_OUTCOME} ` +
+              `provider_event_id=${normalized!.provider_event_id}`,
+          )
+        }
         const auditEvent = buildAuditEnvelope(normalized!, correlated)
 
         await emitAuditEvent(runtimeContainer, auditEvent, logger)
@@ -436,12 +473,20 @@ async function applyDeliveryState(
     }
   }
 
+  // AC4 / DW-15-120: trwale odbicie (terminalne + eskalujace) zamyka budzet
+  // odbiorcy, wiec wiersz spelnia predykat parkowania i eskaluje TA SAMA droga
+  // co wyczerpanie budzetu (`claimAttemptPolicyEscalations`, powod
+  // `recipient_budget`); ponowienie jest odciete przez ten sam predykat.
+  const reaction = reactionFor(normalized.event_type)
   return writer.applyProviderDeliveryState({
     provider_event_id: normalized.provider_event_id,
     status,
     provider: "brevo",
     error_code: normalized.error_code ?? null,
     occurred_at: normalized.occurred_at,
+    ...(reaction.terminal && reaction.escalate && reaction.consumes_recipient_attempt
+      ? { exhaust_recipient_budget: { max_attempt_count: VOUCHER_DELIVERY_MAX_ATTEMPT_COUNT } }
+      : {}),
   })
 }
 
@@ -501,6 +546,61 @@ export const config: SubscriberConfig = {
 export function __resetBrevoDeliveryTrackerForTests(): void {
   // Zachowane jako kompatybilny punkt resetu testów. Idempotencja nie jest już
   // stanem procesu — rozstrzyga ją trwały ledger.
+  brakeSkippedCount = 0
+}
+
+export const DELIVERY_PATH_BRAKE_ENGAGED_CODE = "DELIVERY_PATH_BRAKE_ENGAGED"
+export const DELIVERY_PATH_BRAKE_ENGAGED_METRIC =
+  "gp_brevo_delivery_brake_skipped_total"
+export const DELIVERY_REPLAY_REEMITTED_OUTCOME = "replay_reemitted"
+
+let brakeSkippedCount = 0
+
+/** Licznik zdarzen pominietych przy zaciagnietym hamulcu (obserwowalnosc, nie stan). */
+export function getBrevoDeliveryBrakeSkippedTotal(): number {
+  return brakeSkippedCount
+}
+
+const VERIFIER_KEYS = [
+  "brevo_delivery_event_verifier",
+  "brevoDeliveryEventVerifier",
+] as const
+
+function resolveVerifier(container: ResolveContainer): BrevoDeliveryEventVerifier | null {
+  const configured = resolveOptional<BrevoDeliveryEventVerifier>(container, VERIFIER_KEYS)
+  if (configured && typeof configured.verify === "function") return configured
+  const apiKey = process.env.BREVO_API_KEY?.trim()
+  return apiKey ? createBrevoDeliveryEventVerifier({ apiKey }) : null
+}
+
+async function verifyWithProvider(
+  container: ResolveContainer,
+  normalized: NormalizedBrevoDeliveryEvent,
+  logger: LoggerLike,
+): Promise<void> {
+  const verifier = resolveVerifier(container)
+  if (!verifier) {
+    logger.error?.(
+      `[brevo-delivery-tracker] error_code=${DELIVERY_EVENT_VERIFICATION_UNAVAILABLE_CODE} ` +
+        `provider_event_id=${normalized.provider_event_id} — brak weryfikatora ADR-213 C`,
+    )
+    throw new Error(
+      `${DELIVERY_EVENT_VERIFICATION_UNAVAILABLE_CODE}: brak weryfikacji zwrotnej Brevo (ADR-213 C)`,
+    )
+  }
+  const result = await verifier.verify({
+    provider_message_id: normalized.provider_event_id,
+    event_type: normalized.event_type,
+  })
+  if (result.outcome === "confirmed") return
+  logger.error?.(
+    `[brevo-delivery-tracker] error_code=${result.error_code} outcome=${result.outcome} ` +
+      `statistics_event=${result.statistics_event} provider_event_id=${normalized.provider_event_id}` +
+      ("http_status" in result && result.http_status ? ` http_status=${result.http_status}` : ""),
+  )
+  throw new Error(
+    `${result.error_code}: zdarzenie ${normalized.event_type} nie potwierdzone przez API Brevo`,
+  )
 }
 
 function normalizeDeliveryEvent(
@@ -642,12 +742,12 @@ async function lookupDispatch(
           market_id,
           template_key,
           locale,
-          consent_basis,
-          idempotency_key,
-          -- AD-23: numer proby pochodzi WYLACZNIE ze stanu systemu. Bez tej
-          -- kolumny w projekcji attempts bylo zawsze undefined, wiec drabina
-          -- ponowien startowala od nowa przy kazdym zdarzeniu.
-          attempts
+          -- R-2 (checkpoint 6.6): projekcja wylacznie z kolumn realnego
+          -- schematu voucher_delivery_dispatch. consent_basis i
+          -- idempotency_key tam nie istnieja (42703 => DISPATCH_LOOKUP_FAILED
+          -- => dispatch=null); licznik prob to attempt_count.
+          -- AD-23: numer proby pochodzi WYLACZNIE ze stanu systemu.
+          attempt_count AS attempts
         FROM voucher_delivery_dispatch
         WHERE provider_message_id = ?
         LIMIT 1
