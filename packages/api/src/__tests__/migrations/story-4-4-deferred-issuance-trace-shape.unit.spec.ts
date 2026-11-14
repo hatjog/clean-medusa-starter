@@ -17,6 +17,7 @@ import {
   assertDeferredIssuanceTraceSla,
   DEFERRED_ISSUANCE_TRACE_SLA,
   DEFERRED_ISSUANCE_TRACE_SLA_SECONDS,
+  type DeferredIssuanceTraceSlaConfig,
 } from "../../lib/recovery/recovery-config"
 
 function collectUp(): string[] {
@@ -91,9 +92,11 @@ describe("Story 4.4 — kształt deferred_issuance_trace", () => {
   it("R-1: brak albo niepoprawna wartość SLA = fail-loud, nigdy null/ciche pominięcie", () => {
     expect(() => assertDeferredIssuanceTraceSla(undefined)).toThrow(/recovery-config/)
     const ok = { owner_id: "ops-recovery", source: "D-35 p.9" }
-    for (const bad of [null, {}, { ...ok, seconds: 0 }, { ...ok, seconds: -1 }, { ...ok, seconds: 1.5 },
+    const badConfigs: Array<Partial<DeferredIssuanceTraceSlaConfig> | null> = [null, {}, { ...ok, seconds: 0 },
+      { ...ok, seconds: -1 }, { ...ok, seconds: 1.5 },
       { ...ok, seconds: "86400" as unknown as number }, { seconds: 86400, owner_id: "", source: "x" },
-      { seconds: 86400, owner_id: "ops-recovery", source: "" }]) {
+      { seconds: 86400, owner_id: "ops-recovery", source: "" }]
+    for (const bad of badConfigs) {
       expect(() => readDeferredIssuanceTraceSlaSeconds(bad)).toThrow(/recovery-config/)
       if (bad && "seconds" in bad && bad.seconds !== 86400) {
         expect(() => assertDeferredIssuanceTraceSla(bad)).toThrow(/seconds musi byc dodatnia/)
