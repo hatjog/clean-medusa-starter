@@ -46,6 +46,25 @@ const EVIDENCE_PATH = resolve(
   "../../_bmad-output/releases/v1.16.0/implementation-artifacts/evidence/3-6/canonical-state-provenance.json"
 )
 
+const FIXTURE_INSTANCE_ID = "instance_3_6"
+const PATH_Y_EFFECT_TIME = "2026-09-06T00:01:00.001Z"
+const NON_DATE_TIMERS = [
+  "hrtime",
+  "nextTick",
+  "performance",
+  "queueMicrotask",
+  "requestAnimationFrame",
+  "cancelAnimationFrame",
+  "requestIdleCallback",
+  "cancelIdleCallback",
+  "setImmediate",
+  "clearImmediate",
+  "setInterval",
+  "clearInterval",
+  "setTimeout",
+  "clearTimeout",
+] as const
+
 const FIXTURE = {
   orderId: "order_3_6_same_purchase",
   lineItemId: "li_3_6_same_purchase",
@@ -584,8 +603,11 @@ function assertMeasurementSet(rows: readonly Measurement[]): void {
   )
 }
 
-function assertEvidenceMatches(rows: readonly Measurement[]): void {
-  const evidence = JSON.parse(readFileSync(EVIDENCE_PATH, "utf8")) as {
+function assertEvidenceMatches(
+  rows: readonly Measurement[],
+  serialized: string = readFileSync(EVIDENCE_PATH, "utf8")
+): void {
+  const evidence = JSON.parse(serialized) as {
     fixture: Record<string, unknown>
     runs: Measurement[]
     differences: string[]
@@ -614,10 +636,12 @@ function assertEvidenceMatches(rows: readonly Measurement[]): void {
       expect.objectContaining({
         ...row,
         transaction_id: "<runtime>",
-        effect: expect.objectContaining({ ...row.effect, timestamp: expect.any(String) }),
+        effect: expect.objectContaining({ ...row.effect }),
       })
     )
     expect(recorded?.transaction_id).toBe("<runtime>")
+    // 3-6-C5-N001: the serialized effect timestamp must equal the persisted entitlement_instance.created_at.
+    expect(recorded?.effect.timestamp).toBe(row.effect.timestamp)
     expect(Date.parse(recorded?.effect.timestamp ?? "")).toBeGreaterThanOrEqual(
       Date.parse(recorded?.trigger.timestamp ?? "")
     )
@@ -762,13 +786,20 @@ function assertSerializedEvidence(value: string): void {
 
 runWithIsolatedDatabase("Story 3.6 AC1 — produkcyjne call-site'y na realnym PostgreSQL", () => {
   let basePool: Pool
+  let previousInstanceId: string | undefined
 
   beforeAll(() => {
     process.env.STRIPE_WEBHOOK_SECRET = "story_3_6_test_webhook_secret"
+    // Story 3.1 C3-SEC-002: Path Y refuses (500 instance_unconfigured) without a
+    // server-side GP_INSTANCE_ID; the harness sets the fixture instance explicitly.
+    previousInstanceId = process.env.GP_INSTANCE_ID
+    process.env.GP_INSTANCE_ID = FIXTURE_INSTANCE_ID
     basePool = new Pool({ connectionString: DATABASE_URL, max: 6 })
   })
 
   afterAll(async () => {
+    if (previousInstanceId === undefined) delete process.env.GP_INSTANCE_ID
+    else process.env.GP_INSTANCE_ID = previousInstanceId
     await basePool?.end()
   })
 
@@ -857,10 +888,18 @@ runWithIsolatedDatabase("Story 3.6 AC1 — produkcyjne call-site'y na realnym Po
             return {
               emit: async (event: { name: string; data: unknown }) => {
                 expect(event.name).toBe(PAYMENT_INTENT_SUCCEEDED_EVENT)
-                await voucherLiveIssueSubscriber({
-                  event: { name: event.name, data: event.data },
-                  container: subscriberContainer,
-                } as never)
+                // 3-6-C5-N001: the subscriber stamps entitlement_instance.created_at
+                // from `new Date()`; freeze only Date so the persisted effect time is
+                // deterministic and comparable byte-for-byte with serialized evidence.
+                jest.useFakeTimers({ now: new Date(PATH_Y_EFFECT_TIME), doNotFake: NON_DATE_TIMERS })
+                try {
+                  await voucherLiveIssueSubscriber({
+                    event: { name: event.name, data: event.data },
+                    container: subscriberContainer,
+                  } as never)
+                } finally {
+                  jest.useRealTimers()
+                }
               },
             }
           }
@@ -986,6 +1025,11 @@ runWithIsolatedDatabase("Story 3.6 AC1 — produkcyjne call-site'y na realnym Po
       const rows = [captured, pathY]
       assertMeasurementSet(rows)
       assertEvidenceMatches(rows)
+      // 3-6-C5-N001 mutant: a shifted effect date in serialized evidence must turn the comparison red.
+      const effectDateMutant = JSON.parse(readFileSync(EVIDENCE_PATH, "utf8")) as { runs: Measurement[] }
+      const mutatedEffect = effectDateMutant.runs[0].effect
+      mutatedEffect.timestamp = new Date(Date.parse(mutatedEffect.timestamp) + 1000).toISOString()
+      expect(() => assertEvidenceMatches(rows, JSON.stringify(effectDateMutant))).toThrow()
     } finally {
       await capturedFixture.client.query("RESET ROLE")
       await pathYFixture.client.query("RESET ROLE")
