@@ -118,6 +118,13 @@ if (process.env.TEST_TYPE === "integration:http") {
   module.exports.testMatch = [
     "**/packages/api/src/__tests__/integration/story-4-5-trace-age-snapshot-pg.integration.test.[jt]s",
   ];
+} else if (process.env.TEST_TYPE === "story-4-3-compensation-alarm-pg") {
+  // v1.16.0 Story 4.3 (FR-11, AD-32, AD-48) — runtime alarm compensation_failure po terminie
+  // (deadline < statement_timestamp()), pusta populacja mierzalna, kontrola dodatnia.
+  // DATABASE_URL musi wskazywac IZOLOWANA DB testowa (*_test).
+  module.exports.testMatch = [
+    "**/packages/api/src/__tests__/integration/story-4-3-compensation-alarm-pg.integration.test.[jt]s",
+  ];
 } else if (process.env.TEST_TYPE === "compensation-failure-pg") {
   // v1.15.0 Story 3.5 (FR-6c, NFR-3, AD-22) — rejestr nieudanych kompensacji
   // sciezki pieniadza wykonany przez sam modul na realnym Postgresie

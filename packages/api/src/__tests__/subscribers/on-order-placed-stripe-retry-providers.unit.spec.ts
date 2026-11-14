@@ -792,6 +792,9 @@ describe("Story 4.6 runda fix 1 (R-1/R-2/R-6) — porażka zapisu DLQ: bez rethr
       dlq_write_failures: [
         expect.objectContaining({ order_id: "order_1", cause: "db_error", message: expect.stringContaining("does not exist") }),
       ],
+      // Story 4.3 (DW-15-316): porażka zapisu DLQ idzie kanałem alarmu; bez
+      // GP_ALERT_CHANNELS wynik kanału jest nazwanym ERROR, nie ciszą.
+      dlq_write_failed_alarm: expect.objectContaining({ status: "failed", code: "ALERT_CHANNEL_NOT_CONFIGURED" }),
     })
     expect(h.sent.filter((q) => q.sql === FIND_DEFERRED_CAPTURES_SQL).map((q) => q.values[0])).toEqual([
       "order_1",

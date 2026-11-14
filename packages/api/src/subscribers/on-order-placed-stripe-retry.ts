@@ -93,6 +93,8 @@ import {
   type EventFailureClassification,
 } from "../lib/events/event-failure-classification"
 import { DeadLetterRefusedError, recordEventDeadLetter } from "../lib/events/event-dead-letter"
+import { deliverAlert, type AlertDeliveryResult, type DeliverAlertDeps } from "../lib/alert-channel"
+import { emitStructuredAlert, type StructuredAlertPayload } from "../lib/alert-emit"
 
 /** `source_job` wierszy DLQ z tego konsumenta (Story 4.6, ADR-239). */
 export const STRIPE_RETRY_DLQ_SOURCE = "subscriber:on-order-placed-stripe-retry"
@@ -116,7 +118,41 @@ export type DlqWriteFailure = {
   message: string
 }
 
-export type StripeRetryRunResult = { dlq_write_failures: DlqWriteFailure[] }
+export type StripeRetryRunResult = {
+  dlq_write_failures: DlqWriteFailure[]
+  /** Wynik dostarczenia alarmu `dlq_write_failed` kanałem 4.3; obecny tylko przy porażkach. */
+  dlq_write_failed_alarm?: AlertDeliveryResult
+}
+
+/** Kod alarmu kanału 4.3 dla porażki zapisu DLQ (DW-15-316). */
+export const DLQ_WRITE_FAILED_ALERT_CODE = "RECOVERY_DLQ_WRITE_FAILED" as const
+
+/**
+ * Story 4.3 (DW-15-316): porażki zapisu DLQ idą — oprócz `logger.error` —
+ * alarmem strukturalnym (ring buffer) i trwałym kanałem z fallbackiem
+ * (`deliverAlert`, D-33). Brak kanału = ERROR `ALERT_CHANNEL_*` z `deliverAlert`.
+ */
+export async function alarmDlqWriteFailures(
+  failures: DlqWriteFailure[],
+  deps: { emit?: (payload: StructuredAlertPayload) => void; deliver?: typeof deliverAlert; deliverDeps?: DeliverAlertDeps } = {}
+): Promise<AlertDeliveryResult | null> {
+  if (failures.length === 0) return null
+  const emit = deps.emit ?? emitStructuredAlert
+  const deliver = deps.deliver ?? deliverAlert
+  const payload: StructuredAlertPayload = {
+    severity: "ERROR",
+    code: DLQ_WRITE_FAILED_ALERT_CODE,
+    message: `${DLQ_WRITE_FAILED_CODE}: ${failures.length} porazek zapisu DLQ w ${STRIPE_RETRY_DLQ_SOURCE}`,
+    context: {
+      log_code: DLQ_WRITE_FAILED_CODE,
+      source_job: STRIPE_RETRY_DLQ_SOURCE,
+      count: failures.length,
+      failures: failures.map((f) => ({ order_id: f.order_id, event_id: f.event_id, cause: f.cause, event_class: f.event_class })),
+    },
+  }
+  emit(payload)
+  return deliver(payload, deps.deliverDeps ?? { emit })
+}
 
 function dlqWriteFailure(
   orderId: string,
@@ -1077,7 +1113,8 @@ export default async function onOrderPlacedStripeRetry({
         `order_ids=${[...new Set(dlqWriteFailures.map((f) => f.order_id))].join(",")}`
     )
   }
-  return { dlq_write_failures: dlqWriteFailures }
+  const dlqAlarm = await alarmDlqWriteFailures(dlqWriteFailures)
+  return dlqAlarm ? { dlq_write_failures: dlqWriteFailures, dlq_write_failed_alarm: dlqAlarm } : { dlq_write_failures: dlqWriteFailures }
 }
 
 type EventBusLike = {
