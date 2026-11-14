@@ -430,7 +430,11 @@ function makeVoucher(overrides: Partial<{
   status: "idle" | "consent_pending" | "claimed" | "withdrawn"
   expires_at: Date | null
   market_id: string | null
-  events: Array<{ event_type: string; occurred_at: Date }>
+  events: Array<{
+    event_type: string
+    occurred_at: Date
+    payload?: Record<string, unknown> | null
+  }>
 }> = {}) {
   return {
     code: overrides.code ?? VOUCHER_CODE,
@@ -1718,7 +1722,23 @@ describe("Story 6.2 — wpiecie nosnika NFR-11 w POST /vendor/vouchers/:code/red
 describe("Story 5.5 — odmowa realizacji czytelna dla sprzedawczyni", () => {
   const CLAIMED_AT = new Date("2026-05-24T10:00:00Z")
 
+  // Zdarzenie ze ścieżki vendor (`redeemForSeller`) niesie `payload.prior_status`.
   function claimedVoucher() {
+    return makeVoucher({
+      status: "claimed",
+      events: [
+        {
+          event_type: "claimed",
+          occurred_at: CLAIMED_AT,
+          payload: { prior_status: "idle" },
+        },
+      ],
+    })
+  }
+
+  // Claim publiczny (`POST /store/vouchers/:code/claim` → `claim(code)`)
+  // zapisuje zdarzenie `claimed` BEZ payloadu i bez sprzedawcy.
+  function publiclyClaimedVoucher() {
     return makeVoucher({
       status: "claimed",
       events: [{ event_type: "claimed", occurred_at: CLAIMED_AT }],
@@ -1777,6 +1797,64 @@ describe("Story 5.5 — odmowa realizacji czytelna dla sprzedawczyni", () => {
     expect(body.reason).toBe("already_redeemed")
     expect(body.redemption?.redeemed_at).toBe(CLAIMED_AT.toISOString())
     expect(body.redemption?.redeemed_by).toBe("own_seller")
+  })
+
+  it("AC1 — voucher zrealizowany claimem publicznym (bez realizacji vendor) ⇒ redeemed_by null, nie „Twój salon”", async () => {
+    const mock = voucherMock(publiclyClaimedVoucher())
+    const res = await redeemWith({
+      voucherService: mock,
+      redemptionDb: createRedemptionFakeDb({ entitlementState: "REDEEMED_FULL" }),
+    })
+    expect(res.statusCode).toBe(409)
+    const body = res.body as {
+      reason: string
+      redemption?: { redeemed_at: string | null; redeemed_by: string | null }
+    }
+    expect(body.reason).toBe("already_redeemed")
+    expect(body.redemption).toEqual({
+      redeemed_at: CLAIMED_AT.toISOString(),
+      redeemed_by: null,
+    })
+  })
+
+  it("AC1 — claim publiczny, potem przegrany wyścig w redeemForSeller ⇒ redeemed_by null", async () => {
+    const mock = voucherMock(makeVoucher(), {
+      status: "refused",
+      reason: "already_redeemed",
+      voucher: publiclyClaimedVoucher(),
+    })
+    const res = await redeemWith({ voucherService: mock })
+    expect(res.statusCode).toBe(409)
+    const body = res.body as {
+      redemption?: { redeemed_at: string | null; redeemed_by: string | null }
+    }
+    expect(body.redemption?.redeemed_by).toBeNull()
+  })
+
+  it("AC1 — claim publiczny wcześniej, realizacja vendor później ⇒ own_seller z czasem zdarzenia vendor", async () => {
+    const PUBLIC_AT = new Date("2026-05-20T08:00:00Z")
+    const mock = voucherMock(
+      makeVoucher({
+        status: "claimed",
+        events: [
+          { event_type: "claimed", occurred_at: PUBLIC_AT },
+          {
+            event_type: "claimed",
+            occurred_at: CLAIMED_AT,
+            payload: { prior_status: "idle" },
+          },
+        ],
+      }),
+    )
+    const res = await redeemWith({
+      voucherService: mock,
+      redemptionDb: createRedemptionFakeDb({ entitlementState: "REDEEMED_FULL" }),
+    })
+    expect(res.statusCode).toBe(409)
+    expect((res.body as { redemption?: unknown }).redemption).toEqual({
+      redeemed_at: CLAIMED_AT.toISOString(),
+      redeemed_by: "own_seller",
+    })
   })
 
   it("AC1 — odmowa innym powodem NIE dokleja faktu realizacji", async () => {

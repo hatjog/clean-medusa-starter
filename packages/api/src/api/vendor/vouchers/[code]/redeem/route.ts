@@ -973,27 +973,53 @@ class VoucherRefusedDuringRedeemError extends Error {
  * Fakt realizacji („kiedy i przez kogo”) dla odmowy `already_redeemed`
  * (v1.16.0 Story 5.5, AC1, FR-19).
  *
- * Źródło wyłącznie z danych ISTNIEJĄCYCH: czas to najwcześniejsze zdarzenie
- * `claimed` vouchera, a realizujący to SPRZEDAWCA, w którego zakresie voucher
- * jest odczytany (`getForSeller` / blokada `redeemForSeller`) — realizacja
- * jest możliwa wyłącznie w zakresie właściciela. Osoby (członka zespołu)
- * nie da się wyprowadzić bez nowej kolumny (`voucher_redemption` nie ma
- * kolumny aktora; D-35 p.16: bez migracji) — DW-15-328. Żadnego e-maila ani
- * danych innego najemcy w odpowiedzi.
+ * Źródło wyłącznie z danych ISTNIEJĄCYCH (bez migracji, D-35 p.16).
+ *
+ * Status `claimed` i zdarzenie `claimed` zapisują DWIE ścieżki:
+ *   - `redeemForSeller` (ta trasa, aktor vendor, zakres najemcy) — zdarzenie
+ *     z `payload.prior_status`;
+ *   - `voucherService.claim(code)` z publicznej trasy
+ *     `POST /store/vouchers/:code/claim` (bez sprzedawcy) — zdarzenie BEZ
+ *     payloadu.
+ * Atrybucja `own_seller` przysługuje WYŁĄCZNIE, gdy istnieje zdarzenie
+ * wyprowadzalne ze ścieżki vendor; wtedy czas to czas TEGO zdarzenia.
+ * W pozostałych przypadkach (claim odbiorczyni, realizacja sprzed 5.8)
+ * `redeemed_by: null`, a czas to najwcześniejsze zdarzenie `claimed` — fakt
+ * realizacji bez przypisywania go salonowi (review-fix 5.5, finding MEDIUM).
+ * Osoby (członka zespołu) nie da się wyprowadzić bez nowej kolumny —
+ * DW-15-328. Żadnego e-maila ani danych innego najemcy w odpowiedzi.
  */
 type RedemptionFact = {
   redeemed_at: string | null
-  redeemed_by: "own_seller"
+  redeemed_by: "own_seller" | null
+}
+
+type RedemptionFactEvent = {
+  event_type: string
+  occurred_at: Date | string
+  payload?: Record<string, unknown> | null
+}
+
+function earliestVendorClaimedAt(
+  events: RedemptionFactEvent[] | undefined,
+): string | null {
+  const vendorEvents = (events ?? []).filter(
+    (e) =>
+      e.event_type === "claimed" &&
+      typeof e.payload?.prior_status === "string" &&
+      Number.isFinite(new Date(e.occurred_at).getTime()),
+  )
+  return earliestClaimedAt(vendorEvents)
 }
 
 function redemptionFactFor(
   reason: RedeemRefusalReason,
-  events:
-    | Array<{ event_type: string; occurred_at: Date | string }>
-    | undefined,
+  events: RedemptionFactEvent[] | undefined,
 ): RedemptionFact | null {
   if (reason !== "already_redeemed") return null
-  return { redeemed_at: earliestClaimedAt(events), redeemed_by: "own_seller" }
+  const vendorAt = earliestVendorClaimedAt(events)
+  if (vendorAt) return { redeemed_at: vendorAt, redeemed_by: "own_seller" }
+  return { redeemed_at: earliestClaimedAt(events), redeemed_by: null }
 }
 
 /**
