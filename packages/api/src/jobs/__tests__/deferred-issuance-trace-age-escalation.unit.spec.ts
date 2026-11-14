@@ -117,3 +117,15 @@ describe("Story 4.5 AC2 — job deferred-issuance-trace-age-escalation", () => {
     expect(calls).toEqual([])
   })
 })
+
+describe("DEKLARACJA ISTNIEJE POZA KODEM (finding checkpointu, wzorzec R-4.1-H3)", () => {
+  it("`.env.example` niesie REALNE przypisanie zmiennej rynków z niepustą wartością", () => {
+    // Testy wyżej wstrzykują `env`, więc nie widzą, że zmienna nie istnieje
+    // w żadnym szablonie — wtedy job co przebieg odmawia markets_not_declared.
+    const envExample = readFileSync(join(__dirname, "../../../../../.env.example"), "utf8")
+    const line = envExample.split(/\r?\n/).find((l) => l.startsWith(`${MARKETS_ENV_VAR}=`))
+    expect(line).toBeDefined()
+    const value = (line as string).slice(MARKETS_ENV_VAR.length + 1).trim()
+    expect(value.split(",").map((m) => m.trim())).toContain("bonbeauty")
+  })
+})
