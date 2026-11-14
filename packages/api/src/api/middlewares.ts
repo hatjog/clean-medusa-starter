@@ -22,6 +22,7 @@ import { paymentStatusRateLimitMiddleware } from "./middlewares/payment-status-r
 import { storeEntitlementsRateLimitMiddleware } from "./middlewares/store-entitlements-rate-limit";
 import { upstreamOrderAccessGuardMiddleware } from "./middlewares/upstream-order-access-guard";
 import { cartCompletionAuthorizationGuardMiddleware } from "./middlewares/cart-completion-authorization-guard";
+import { cartCompletionPspAuthorityMiddleware } from "./middlewares/cart-completion-psp-authority";
 import {
   CUSTOMER_MARKET_FORBIDDEN_MESSAGE,
   isScopedToMarket,
@@ -996,7 +997,9 @@ export default defineMiddlewares({
     {
       method: ["POST"],
       matcher: "/store/carts/:id/complete",
-      middlewares: [cartCompletionAuthorizationGuardMiddleware],
+      // Story 8.2 (ADR-233): PSP authority + cross-instance fence BEFORE the
+      // guard, so a refusal never looks like an unreversed authorization.
+      middlewares: [cartCompletionPspAuthorityMiddleware, cartCompletionAuthorizationGuardMiddleware],
     },
     {
       method: ["POST"],
