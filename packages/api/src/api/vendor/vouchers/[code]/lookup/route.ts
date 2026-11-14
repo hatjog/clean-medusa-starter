@@ -39,6 +39,7 @@ import {
   VendorSellerContextError,
   type RequestWithSellerContext,
 } from "../../../../../lib/vendor-seller-context"
+import { runInVendorSellerMarketContext } from "../../../../../lib/vendor-seller-market-context"
 import {
   VOUCHER_MODULE,
   type VoucherService,
@@ -129,6 +130,21 @@ export const GET = async (
     throw error
   }
 
+  // Story 5.4 fix runda 2 (R-10/R-11): `/vendor/*` nie ma middleware kontekstu
+  // rynku, więc bez tego nośnika `getForSeller` pozyskałby połączenie bez
+  // `app.gp_market_id` i hook RLS odmówiłby (`missing_market_context`) — panel
+  // padał na pierwszym kroku przepływu. Rynek z uwierzytelnionego sprzedawcy.
+  await runInVendorSellerMarketContext(req, res, sellerId, async () => {
+    await lookupInSellerMarket(req, res, sellerId, code)
+  })
+}
+
+async function lookupInSellerMarket(
+  req: RequestWithSellerContext,
+  res: MedusaResponse,
+  sellerId: string,
+  code: string,
+): Promise<void> {
   const voucherService = req.scope.resolve(VOUCHER_MODULE) as VoucherService
 
   // JEDNA odpowiedź dla „nieznany" i dla „nie twój" — identyczna co do

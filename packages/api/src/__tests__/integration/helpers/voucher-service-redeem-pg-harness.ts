@@ -37,6 +37,7 @@ import knex, { Knex } from "knex"
 import { _resetRlsPoolHook, installRlsPoolHook } from "../../../lib/rls-pool-hook"
 import { VoucherService } from "../../../modules/voucher/service"
 import { POST as REDEEM_ROUTE } from "../../../api/vendor/vouchers/[code]/redeem/route"
+import { GET as LOOKUP_ROUTE } from "../../../api/vendor/vouchers/[code]/lookup/route"
 
 const { collectSqlFromClass } = require("../../../../../../scripts/story-2-1-migration-sql.cjs")
 
@@ -303,6 +304,44 @@ export async function callRedeemRoute(
     },
   }
   await REDEEM_ROUTE(req, res)
+  return captured
+}
+
+/**
+ * REALNY handler trasy lookupu (Story 5.4 fix runda 2) — BEZ owijania w
+ * `runInHttpMarketContext`: kontekst rynku musi założyć sama trasa.
+ */
+export async function callLookupRoute(
+  h: Harness,
+  code: string,
+  sellerId: string = SELLER,
+): Promise<CapturedResponse> {
+  const captured: CapturedResponse = { statusCode: 200, body: undefined }
+  const res: any = {
+    status(c: number) {
+      captured.statusCode = c
+      return res
+    },
+    json(payload: unknown) {
+      captured.body = payload
+      return res
+    },
+  }
+  const req: any = {
+    params: { code },
+    headers: { "x-seller-id": sellerId },
+    auth_context: { actor_type: "member", actor_id: MEMBER, auth_identity_id: "authid_story54" },
+    seller_context: { seller_id: sellerId },
+    scope: {
+      resolve: (key: string) => {
+        if (key === ContainerRegistrationKeys.PG_CONNECTION) return h.db
+        if (key === "gp_core") return { resolveVendorId: async () => VENDOR }
+        if (key === "voucher" || key === "voucherModuleService") return h.service
+        throw new Error(`not registered: ${key}`)
+      },
+    },
+  }
+  await LOOKUP_ROUTE(req, res)
   return captured
 }
 
