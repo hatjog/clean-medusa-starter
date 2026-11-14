@@ -199,3 +199,38 @@ describe("Story 4.6 runda fix 1 (R-7) — oś zakresu w kluczu i nazwana kolizja
     })
   })
 })
+
+describe("Story 4.6 runda fix 2 — błąd połączenia w kształcie z Knexa (`<sql> - <komunikat>`)", () => {
+  // Realny executeQuery z knex 3.2.8 — ten sam kod, który przepisuje err.message na ścieżce PG_CONNECTION.
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { executeQuery } = require("knex/lib/execution/internal/query-executioner")
+  const knexError = async (message: string): Promise<unknown> => {
+    const client = {
+      config: { compileSqlOnError: false },
+      _query: () => Promise.reject(new Error(message)),
+      emit: () => undefined,
+    }
+    try {
+      await executeQuery({}, { sql: "select 1", bindings: [] }, client)
+    } catch (err) {
+      return err
+    }
+    throw new Error("executeQuery nie odrzucił")
+  }
+
+  it.each([
+    ["Connection terminated unexpectedly"],
+    ["Connection terminated due to connection timeout"],
+    ["Client was closed and is not queryable"],
+    ["Client has encountered a connection error and is not queryable"],
+    ["timeout exceeded when trying to connect"],
+  ])("select 1 - %s → transient_retry", async (msg) => {
+    const err = (await knexError(msg)) as Error
+    expect(err.message).toBe(`select 1 - ${msg}`)
+    expect(classifyEventFailure(err).event_class).toBe("transient_retry")
+  })
+
+  it("tekst 'connection terminated' w środku SQL (bez separatora ` - `) nie jest retry — brak rozszerzenia na dowolny tekst", () => {
+    expect(classifyEventFailure(new Error("select 'xconnection terminated'")).event_class).toBe("unknown_fail_closed")
+  })
+})

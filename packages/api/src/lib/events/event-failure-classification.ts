@@ -75,9 +75,11 @@ export const TRANSIENT_SOCKET_ERROR_CODES = new Set([
 
 /** Komunikaty node-pg / pg-pool o zerwanym albo nienawiązanym połączeniu (bez `code`). */
 const TRANSIENT_CONNECTION_MESSAGES = [
-  /^connection terminated/i,
+  // Knex (executeQuery) przepisuje message na `<sql> - <komunikat>`: początek albo sufiks po ` - `.
+  /(?:^| - )connection terminated/i,
   /timeout exceeded when trying to connect/i,
   /client has encountered a connection error and is not queryable/i,
+  /client was closed and is not queryable/i,
 ]
 
 /** Kod błędu gniazda, gdy `err` jest utratą połączenia bez SQLSTATE; inaczej `null`. */
