@@ -93,12 +93,28 @@ export function transientConnectionSignal(err: unknown): string | null {
   return TRANSIENT_CONNECTION_MESSAGES.some((re) => re.test(message)) ? "connection_lost" : null
 }
 
+/** Kod bez treści: tylko `[A-Za-z0-9_.-]`, inne znaki → `_`, maks. 64 znaki. */
+function safeCode(value: string): string {
+  return value.replace(/[^A-Za-z0-9_.-]/g, "_").slice(0, 64) || "unnamed"
+}
+
+/** Nazwa TYPU błędu (np. `Error`, `PathYRecoveryInputError`), nie komunikat. */
+export function redactedErrorType(err: unknown): string {
+  if (err instanceof Error) return safeCode(err.name || "Error")
+  if (err === null) return "null"
+  return `thrown_${typeof err}`
+}
+
 export function classifyEventFailure(
   err: unknown,
   options: ClassifyOptions = {}
 ): EventFailureClassification {
   const dlq = classifyFailure(err)
-  const message = err instanceof Error ? `${err.name}: ${err.message}` : String(err)
+  // Story 4.7 (DW-15-321 p.2): `reason` niesie WYŁĄCZNIE kod klasy, nazwę typu
+  // błędu i SQLSTATE — nigdy treść komunikatu. Komunikaty PG klasy 22 cytują
+  // wartość wejścia (możliwe dane osobowe w kolumnie DLQ).
+  const errorType = redactedErrorType(err)
+  const sqlstateSuffix = dlq.sqlstate ? `:sqlstate_${dlq.sqlstate}` : ""
 
   const consumerCode =
     err instanceof PermanentEventDataDefectError
@@ -107,7 +123,7 @@ export function classifyEventFailure(
   if (consumerCode) {
     return {
       event_class: "permanent_data_defect",
-      reason: `permanent_data_defect:${consumerCode}: ${message}`,
+      reason: `permanent_data_defect:${safeCode(consumerCode)}:${errorType}${sqlstateSuffix}`,
       dlq: terminal(dlq),
     }
   }
@@ -116,26 +132,26 @@ export function classifyEventFailure(
   if (socket) {
     return {
       event_class: "transient_retry",
-      reason: `transient_retry: connection ${socket}: ${message}`,
+      reason: `transient_retry:connection_${safeCode(socket)}:${errorType}`,
       dlq: { ...dlq, tier: "transient", failure_mode: "FM-71-RT-7", is_retryable: true },
     }
   }
 
   if (dlq.tier === "transient") {
-    return { event_class: "transient_retry", reason: `transient_retry: ${dlq.reason}`, dlq }
+    return { event_class: "transient_retry", reason: `transient_retry:${dlq.failure_mode}:${errorType}${sqlstateSuffix}`, dlq }
   }
 
   if (dlq.sqlstate && DATA_DEFECT_SQLSTATE_CLASSES.has(dlq.sqlstate.slice(0, 2))) {
     return {
       event_class: "permanent_data_defect",
-      reason: `permanent_data_defect:sqlstate_${dlq.sqlstate}: ${message}`,
+      reason: `permanent_data_defect:sqlstate_${dlq.sqlstate}:${errorType}`,
       dlq,
     }
   }
 
   return {
     event_class: "unknown_fail_closed",
-    reason: `unknown_fail_closed: ${message}`,
+    reason: `unknown_fail_closed:${errorType}${sqlstateSuffix}`,
     dlq: terminal(dlq),
   }
 }

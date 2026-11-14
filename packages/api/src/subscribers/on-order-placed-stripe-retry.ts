@@ -92,7 +92,7 @@ import {
   classifyEventFailure,
   type EventFailureClassification,
 } from "../lib/events/event-failure-classification"
-import { DeadLetterRefusedError, recordEventDeadLetter } from "../lib/events/event-dead-letter"
+import { DeadLetterRefusedError, isEventDeadLettered, recordEventDeadLetter } from "../lib/events/event-dead-letter"
 
 /** `source_job` wierszy DLQ z tego konsumenta (Story 4.6, ADR-239). */
 export const STRIPE_RETRY_DLQ_SOURCE = "subscriber:on-order-placed-stripe-retry"
@@ -106,6 +106,12 @@ export const STRIPE_RETRY_DLQ_SOURCE = "subscriber:on-order-placed-stripe-retry"
  * w wyniku subskrybenta (Story 4.6, runda fix 1, R-1/R-2/R-6).
  */
 export const DLQ_WRITE_FAILED_CODE = "dlq_write_failed" as const
+
+/** Story 4.7 (DW-15-321): nazwany kod pominięcia zdarzenia, które ma wiersz DLQ. */
+export const DLQ_EXCLUDED_CODE = "dlq_excluded_from_work_selection" as const
+
+/** Story 4.7 (DW-15-320 p.4): domknięcie rekordu śladu dopasowało 0 wierszy. */
+export const TRACE_CLOSE_NO_MATCH_CODE = "deferred_issuance_trace_close_no_match" as const
 
 export type DlqWriteFailure = {
   order_id: string
@@ -670,6 +676,24 @@ export default async function onOrderPlacedStripeRetry({
         }
 
         for (const row of deferred) {
+          // Story 4.7 (DW-15-321 p.1): zdarzenie z wierszem DLQ tego konsumenta
+          // (poza `replayed`) jest wyłączone z wyboru pracy — należy do ops, nie
+          // do kolejnego `order.placed`. Sygnał nazwany, nie ciche pominięcie.
+          if (
+            await isEventDeadLettered(client, {
+              instance_id: resolveRuntimeInstanceId(),
+              market_id: row.market_id,
+              source_job: STRIPE_RETRY_DLQ_SOURCE,
+              event_id: row.event_id,
+              subject_id: orderId,
+            })
+          ) {
+            logger.warn?.(
+              `[on-order-placed-stripe-retry] code=${DLQ_EXCLUDED_CODE} order_id=${orderId} ` +
+                `event_id=${row.event_id} — zdarzenie w DLQ, pominięte w wyborze pracy`
+            )
+            continue
+          }
           try {
             if (row.provider === STRIPE_PATH_Y_WEBHOOK_PROVIDER) {
               const input = buildPathYRecoveryInput(row, orderId)
@@ -731,12 +755,19 @@ export default async function onOrderPlacedStripeRetry({
                     `[on-order-placed-stripe-retry] order_id=${orderId} trace=${row.event_id} ` +
                       `domkniecie rekordu deferred_issuance_trace NIEUDANE (wystawienie zachowane): ${closed.error}`
                   )
+                } else if (closed.version === null) {
+                  // Story 4.7 (DW-15-320 p.4): 0 dopasowań (rekord nieobecny, już
+                  // domknięty dla tego zamówienia albo rynek rekordu ≠ scope koperty)
+                  // — rekord zostaje w populacji; sygnał NAZWANY, nie info.
+                  logger.warn?.(
+                    `[on-order-placed-stripe-retry] code=${TRACE_CLOSE_NO_MATCH_CODE} order_id=${orderId} ` +
+                      `trace=${row.event_id} market_id=${input.scope.market_id} — domkniecie rekordu ` +
+                      `deferred_issuance_trace dopasowalo 0 wierszy`
+                  )
                 } else {
                   logger.info?.(
                     `[on-order-placed-stripe-retry] order_id=${orderId} trace=${row.event_id} ` +
-                      (closed.version === null
-                        ? "rekord deferred_issuance_trace nieobecny albo juz domkniety dla tego zamowienia"
-                        : `rekord deferred_issuance_trace domkniety (issued_after_link, version=${closed.version})`)
+                      `rekord deferred_issuance_trace domkniety (issued_after_link, version=${closed.version})`
                   )
                 }
               }
