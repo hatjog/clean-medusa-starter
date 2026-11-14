@@ -14,7 +14,7 @@
  * Fixture (tabele tymczasowe) jest kopią 1:1 z
  * `stripe-payment-intent-multi-order-pg.integration.test.ts` — celowo, żeby
  * kontrakt ACK był mierzony na TYM SAMYM kształcie danych co kontrakt ADR-166.
- * Wymaga jawnego `GP_STORY_3_1_TEST_DATABASE_URL` do IZOLOWANEJ DB z tabelą `money_path_compensation_failure`
+ * Wymaga `DATABASE_URL` (opcjonalnie zgodnego `GP_STORY_3_1_TEST_DATABASE_URL`) do IZOLOWANEJ DB `*_test` z tabelą `money_path_compensation_failure`
  * (route czyta rejestr kompensacji w gałęzi duplikatu). Bez izolowanego
  * `DATABASE_URL` suita kończy się błędem precondition — `skip` nie jest
  * wynikiem bramki AC3.
@@ -51,7 +51,12 @@ import {
 process.env.GP_INSTANCE_ID = "gp-test"
 
 const STORY_TEST_DATABASE_URL_ENV = "GP_STORY_3_1_TEST_DATABASE_URL"
-const DATABASE_URL = process.env[STORY_TEST_DATABASE_URL_ENV]
+// Story 11.1 C5-PG-001: profil przyjmuje każdą izolowaną bazę spełniającą wspólną
+// straż suity (integration-tests/setup.js, Story 7.2): lokalny PostgreSQL, nazwa
+// z sufiksem `_test`, odrębna od baz deweloperskich. Opcjonalny URL tej story,
+// jeśli podany, musi być identyczny z DATABASE_URL (jedno źródło celu).
+const DATABASE_URL = process.env[STORY_TEST_DATABASE_URL_ENV] ?? process.env.DATABASE_URL
+const DEVELOPMENT_DATABASES = new Set(["gp_mercur", "gp_core", "gp_portal"])
 
 function hasTrustedStoryTestDatabaseUrl(
   value: string | undefined,
@@ -64,7 +69,8 @@ function hasTrustedStoryTestDatabaseUrl(
     const databaseName = decodeURIComponent(url.pathname).replace(/^\//, "")
     return (
       (url.protocol === "postgres:" || url.protocol === "postgresql:") &&
-      databaseName === "gp_story_3_1_test" &&
+      /_test$/.test(databaseName) &&
+      !DEVELOPMENT_DATABASES.has(databaseName) &&
       ["localhost", "127.0.0.1", "::1"].includes(url.hostname)
     )
   } catch {
@@ -79,22 +85,23 @@ describe("Story 3.1 AC3 — precondition PostgreSQL", () => {
     expect(HAS_TRUSTED_STORY_TEST_DATABASE_URL).toBe(true)
   })
 
-  it("odrzuca URL produkcyjnego hosta lub obcej bazy nawet z sufiksem _test", () => {
-    const safe = "postgres://test_runner:secret@localhost:5432/gp_story_3_1_test"
-    expect(hasTrustedStoryTestDatabaseUrl(safe, safe)).toBe(true)
-    expect(
-      hasTrustedStoryTestDatabaseUrl(
-        "postgres://prod_role:secret@prod-db.internal:5432/gp_story_3_1_test",
-        "postgres://prod_role:secret@prod-db.internal:5432/gp_story_3_1_test"
-      )
-    ).toBe(false)
-    expect(
-      hasTrustedStoryTestDatabaseUrl(
-        "postgres://test_runner:secret@localhost:5432/gp_mercur_test",
-        "postgres://test_runner:secret@localhost:5432/gp_mercur_test"
-      )
-    ).toBe(false)
-    expect(hasTrustedStoryTestDatabaseUrl(safe, "postgres://test_runner:secret@localhost:5432/other_test")).toBe(false)
+  it("przyjmuje izolowaną bazę innej story spełniającą wspólną straż suity (C5-PG-001)", () => {
+    for (const name of ["gp_story_3_1_test", "gp_story_11_1_w0_test", "gp_mercur_test"]) {
+      const url = `postgres://test_runner@localhost:55432/${name}`
+      expect(hasTrustedStoryTestDatabaseUrl(url, url)).toBe(true)
+    }
+  })
+
+  it("odrzuca bazę deweloperską, nazwę bez sufiksu _test, obcy host i rozjazd z DATABASE_URL", () => {
+    for (const name of ["gp_mercur", "gp_core", "gp_portal", "gp_story_11_1_w0", "postgres"]) {
+      const url = `postgres://test_runner@localhost:55432/${name}`
+      expect(hasTrustedStoryTestDatabaseUrl(url, url)).toBe(false)
+    }
+    const remote = "postgres://prod_role@prod-db.internal:5432/gp_story_3_1_test"
+    expect(hasTrustedStoryTestDatabaseUrl(remote, remote)).toBe(false)
+    const safe = "postgres://test_runner@localhost:5432/gp_story_3_1_test"
+    expect(hasTrustedStoryTestDatabaseUrl(safe, "postgres://test_runner@localhost:5432/other_test")).toBe(false)
+    expect(hasTrustedStoryTestDatabaseUrl(undefined, safe)).toBe(false)
   })
 })
 
