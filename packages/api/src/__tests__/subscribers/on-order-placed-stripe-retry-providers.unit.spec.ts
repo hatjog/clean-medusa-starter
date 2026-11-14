@@ -51,10 +51,10 @@ jest.mock("../../workflows/entitlements/issue-entitlement", () => {
 
 jest.mock("../../workflows/entitlements/live-issue-from-payment-intent", () => ({
   __esModule: true,
-  liveIssueEntitlementsWithinTx: jest.fn(),
+  liveIssueEntitlementsPerLineWithinTx: jest.fn(),
 }))
 
-import { liveIssueEntitlementsWithinTx } from "../../workflows/entitlements/live-issue-from-payment-intent"
+import { liveIssueEntitlementsPerLineWithinTx } from "../../workflows/entitlements/live-issue-from-payment-intent"
 import onOrderPlacedStripeRetry, {
   buildFindDeferredCapturesBindings,
   buildMarkDeferredResolvedBindings,
@@ -360,9 +360,11 @@ describe("odzysk wystawienia — zachowanie na mockowanym kliencie", () => {
   })
 
   it("dla markera Path Y wraca do ISSUED i emituje genezę Path Y, nie captured ACTIVE", async () => {
-    const liveIssue = liveIssueEntitlementsWithinTx as jest.Mock
+    const liveIssue = liveIssueEntitlementsPerLineWithinTx as jest.Mock
     liveIssue.mockResolvedValueOnce({
       event_processed: true,
+      line_outcomes: [],
+      failed_lines: [],
       issued: [
         {
           entitlement_id: `ent_${"a".repeat(64)}`,
@@ -415,10 +417,12 @@ describe("odzysk wystawienia — zachowanie na mockowanym kliencie", () => {
     // `redeem-partial-entitlement.ts` przyjmuje wyłącznie
     // `{ACTIVE, REDEEMED_PARTIAL}`, więc gałąź natywna (wiersz od razu ACTIVE)
     // i gałąź Path Y MUSZĄ zbiegać się w tym samym stanie terminalnym.
-    const liveIssue = liveIssueEntitlementsWithinTx as jest.Mock
+    const liveIssue = liveIssueEntitlementsPerLineWithinTx as jest.Mock
     liveIssue.mockReset()
     liveIssue.mockResolvedValueOnce({
       event_processed: true,
+      line_outcomes: [],
+      failed_lines: [],
       issued: [
         {
           entitlement_id: `ent_${"a".repeat(64)}`,
@@ -464,10 +468,12 @@ describe("odzysk wystawienia — zachowanie na mockowanym kliencie", () => {
   it("gdy UPDATE nie dotknął wiersza, NIE emituje eventu ACTIVE", async () => {
     // Event bez zmiany stanu byłby fałszywym śladem w dzienniku tranzycji —
     // ta kontrola upada, gdy emit przestanie zależeć od wyniku `RETURNING`.
-    const liveIssue = liveIssueEntitlementsWithinTx as jest.Mock
+    const liveIssue = liveIssueEntitlementsPerLineWithinTx as jest.Mock
     liveIssue.mockReset()
     liveIssue.mockResolvedValueOnce({
       event_processed: true,
+      line_outcomes: [],
+      failed_lines: [],
       issued: [
         {
           entitlement_id: `ent_${"b".repeat(64)}`,
@@ -519,6 +525,8 @@ describe("odzysk Path Y — paczka mieszana, domknięcie i replay", () => {
 
   const issuedOnce = () => ({
     event_processed: true,
+    line_outcomes: [],
+    failed_lines: [],
     issued: [
       {
         entitlement_id: `ent_${"a".repeat(64)}`,
@@ -533,7 +541,7 @@ describe("odzysk Path Y — paczka mieszana, domknięcie i replay", () => {
     // `psp_occurred_at`, 4 są nierozwiązane. Przed poprawką goły `Error`
     // uciekał z `withTransaction` i ROLLBACK zabierał CAŁĄ paczkę zamówienia —
     // opłacony zakup kończył się zerem voucherów.
-    const liveIssue = liveIssueEntitlementsWithinTx as jest.Mock
+    const liveIssue = liveIssueEntitlementsPerLineWithinTx as jest.Mock
     liveIssue.mockReset()
     liveIssue.mockResolvedValueOnce(issuedOnce())
     const h = makeHarness([
@@ -561,7 +569,7 @@ describe("odzysk Path Y — paczka mieszana, domknięcie i replay", () => {
   })
 
   it("wystawienie Path Y domyka marker — inaczej byłby odzyskiwany w kółko", async () => {
-    const liveIssue = liveIssueEntitlementsWithinTx as jest.Mock
+    const liveIssue = liveIssueEntitlementsPerLineWithinTx as jest.Mock
     liveIssue.mockReset()
     liveIssue.mockResolvedValueOnce(issuedOnce())
     const h = makeHarness([pathYRow()])
@@ -575,10 +583,12 @@ describe("odzysk Path Y — paczka mieszana, domknięcie i replay", () => {
   })
 
   it("created:false (replay) NIE re-emituje zdarzenia przejścia", async () => {
-    const liveIssue = liveIssueEntitlementsWithinTx as jest.Mock
+    const liveIssue = liveIssueEntitlementsPerLineWithinTx as jest.Mock
     liveIssue.mockReset()
     liveIssue.mockResolvedValueOnce({
       event_processed: true,
+      line_outcomes: [],
+      failed_lines: [],
       issued: [
         {
           entitlement_id: `ent_${"b".repeat(64)}`,
@@ -600,7 +610,7 @@ describe("odzysk Path Y — paczka mieszana, domknięcie i replay", () => {
     // `payment.amount` jest kolumną `numeric`; `Number(r.amount)` potrafi dać
     // ułamek. Wystawienie tej wartości nie czyta — odmowa byłaby ryzykiem
     // bez zysku.
-    const liveIssue = liveIssueEntitlementsWithinTx as jest.Mock
+    const liveIssue = liveIssueEntitlementsPerLineWithinTx as jest.Mock
     liveIssue.mockReset()
     liveIssue.mockResolvedValueOnce(issuedOnce())
     const h = makeHarness([pathYRow({ amount: 25000.5 })])
@@ -619,7 +629,7 @@ describe("odzysk Path Y — paczka mieszana, domknięcie i replay", () => {
     // zewnętrznym: dziś `live-issue-from-payment-intent.ts` tego pola nie
     // czyta. Kontrola przypina odmowę do tego samego kanału, co pozostałe
     // nieczytelne pola: wiersz zostaje nierozwiązany, paczka żyje.
-    const liveIssue = liveIssueEntitlementsWithinTx as jest.Mock
+    const liveIssue = liveIssueEntitlementsPerLineWithinTx as jest.Mock
     liveIssue.mockReset()
     liveIssue.mockResolvedValueOnce(issuedOnce())
     const h = makeHarness([
@@ -640,7 +650,7 @@ describe("odzysk Path Y — paczka mieszana, domknięcie i replay", () => {
   })
 
   it("C2-L-3: amount nieczytelny (NaN po konwersji) też jest odmową", async () => {
-    const liveIssue = liveIssueEntitlementsWithinTx as jest.Mock
+    const liveIssue = liveIssueEntitlementsPerLineWithinTx as jest.Mock
     liveIssue.mockReset()
     const h = makeHarness([
       pathYRow({
@@ -657,7 +667,7 @@ describe("odzysk Path Y — paczka mieszana, domknięcie i replay", () => {
   })
 
   it("marker bez market_id jest pomijany, a nie wywraca paczki", async () => {
-    const liveIssue = liveIssueEntitlementsWithinTx as jest.Mock
+    const liveIssue = liveIssueEntitlementsPerLineWithinTx as jest.Mock
     liveIssue.mockReset()
     liveIssue.mockResolvedValueOnce(issuedOnce())
     const h = makeHarness([
@@ -670,5 +680,99 @@ describe("odzysk Path Y — paczka mieszana, domknięcie i replay", () => {
     expect(liveIssue).toHaveBeenCalledTimes(1)
     const updates = h.sent.filter((q) => q.sql === MARK_DEFERRED_RESOLVED_SQL)
     expect(updates.map((q) => q.values[0])).toEqual(["evt_ok#deferred-issuance"])
+  })
+})
+
+/**
+ * Story 8.4 fix (checkpoint PO, HIGH): odzysk Path Y to ścieżka NORMALNA
+ * (wyścig payment_intent.succeeded × completeCart). Do tej poprawki gałąź
+ * wołała `liveIssueEntitlementsWithinTx` (all-or-nothing): `LineIssueError`
+ * jednej pozycji przechodził przez wewnętrzny catch, `withTransaction` robił
+ * ROLLBACK całości (linie udane też), a zewnętrzny catch tylko logował.
+ * Kontrakt: specs/contracts/checkout/gift-line-issue-outcome.v1.md §Semantyka p.5.
+ */
+describe("Story 8.4 — odzysk Path Y z częściową porażką pozycji", () => {
+  const ent = (c: string) => ({
+    entitlement_id: `ent_${c.repeat(64)}`,
+    entitlement_dedupe_key: c.repeat(64),
+    created: true,
+  })
+
+  it("koszyk 3 pozycji, jedna zawodzi ⇒ 2 entitlementy (COMMIT) + 1 nierozwiązany marker", async () => {
+    const liveIssue = liveIssueEntitlementsPerLineWithinTx as jest.Mock
+    liveIssue.mockReset()
+    const failed = {
+      line_item_id: "li_2",
+      state: "failed",
+      reason: "issue_write_failed",
+      error_message: "Error: brak danych salonu",
+    }
+    liveIssue.mockResolvedValueOnce({
+      event_processed: false,
+      issued: [ent("a"), ent("c")],
+      line_outcomes: [
+        { line_item_id: "li_1", state: "issued", entitlements: [ent("a")] },
+        failed,
+        { line_item_id: "li_3", state: "issued", entitlements: [ent("c")] },
+      ],
+      failed_lines: [failed],
+    })
+    const h = makeHarness([
+      makeRow({
+        event_id: "evt_pathy3#deferred-issuance",
+        provider: STRIPE_PATH_Y_WEBHOOK_PROVIDER,
+        envelope: {
+          entitlement_issue_deferred_reason: "webhook_before_order",
+          psp_occurred_at: "2026-08-12T12:34:56.000Z",
+        },
+      }),
+    ])
+
+    await run(h.container, { id: "order_1" })
+
+    const tx = h.sent.map((q) => q.sql.trim().toUpperCase())
+    // Linie udane zostają: transakcja COMMIT, bez ROLLBACK całości.
+    expect(tx).toContain("COMMIT")
+    expect(tx).not.toContain("ROLLBACK")
+    // Dwa entitlementy aktywowane i okablowane (ISSUED + ACTIVE każdy).
+    const activations = h.sent.filter((q) => q.sql.includes(ACTIVATION_SQL_MARKER))
+    expect(activations.map((q) => q.values[0])).toEqual([
+      `ent_${"a".repeat(64)}`,
+      `ent_${"c".repeat(64)}`,
+    ])
+    expect(h.eventBus.emit).toHaveBeenCalledTimes(4)
+    // Marker odroczony NIEROZWIĄZANY — nośnik populacji odzysku linii li_2.
+    expect(h.sent.some((q) => q.sql === MARK_DEFERRED_RESOLVED_SQL)).toBe(false)
+    // Wynik per pozycja jawny w logu (nazwana przyczyna, nie zbiorczy komunikat).
+    const errors = h.logger.error.mock.calls.map((c) => String(c[0]))
+    expect(errors).toHaveLength(1)
+    expect(errors[0]).toContain("NIEROZWIĄZANY")
+    expect(errors[0]).toContain('"line_item_id":"li_2","state":"failed","reason":"issue_write_failed"')
+    expect(errors[0]).toContain('"line_item_id":"li_1","state":"issued"')
+  })
+
+  it("bez porażki pozycji marker jest domykany (kontrola odwrotna)", async () => {
+    const liveIssue = liveIssueEntitlementsPerLineWithinTx as jest.Mock
+    liveIssue.mockReset()
+    liveIssue.mockResolvedValueOnce({
+      event_processed: true,
+      issued: [ent("a")],
+      line_outcomes: [{ line_item_id: "li_1", state: "issued", entitlements: [ent("a")] }],
+      failed_lines: [],
+    })
+    const h = makeHarness([
+      makeRow({
+        provider: STRIPE_PATH_Y_WEBHOOK_PROVIDER,
+        envelope: {
+          entitlement_issue_deferred_reason: "webhook_before_order",
+          psp_occurred_at: "2026-08-12T12:34:56.000Z",
+        },
+      }),
+    ])
+
+    await run(h.container, { id: "order_1" })
+
+    expect(h.sent.some((q) => q.sql === MARK_DEFERRED_RESOLVED_SQL)).toBe(true)
+    expect(h.logger.error).not.toHaveBeenCalled()
   })
 })
