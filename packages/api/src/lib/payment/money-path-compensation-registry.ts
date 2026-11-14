@@ -105,7 +105,17 @@ export type RecordedCompensationFailure = {
  */
 export const COMPENSATION_FAILURE_OWNER = { owner_type: "operator_role", owner_id: "ops-recovery" } as const
 export const COMPENSATION_FAILURE_SLA_HOURS = 24
+/** Źródło `instance_id` wiersza runtime (opisane w ADR-238 §6; nie jest `provenance.source`). */
 export const COMPENSATION_FAILURE_INSTANCE_SOURCE = "env:GP_INSTANCE_ID" as const
+/**
+ * Proweniencja wiersza runtime wg `recovery-population.v1.schema.json`
+ * (`$defs.provenance`, ADR-221 §2): `kind` ze słownika kontraktu,
+ * `source` = nazwa producenta runtime.
+ */
+export const COMPENSATION_FAILURE_PROVENANCE = {
+  kind: "runtime_observed",
+  source: "money-path-compensation-registry",
+} as const
 
 export class CompensationFailureInstanceUnconfiguredError extends Error {
   constructor() {
@@ -123,7 +133,7 @@ export const RECORD_COMPENSATION_FAILURE_SQL = `
      provenance_source)
   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now(), 1, now(), 'open',
           $11, $12, $13, now() + make_interval(hours => $14::int), 'not_closed',
-          'runtime_writer', $15)
+          $15, $16)
   ON CONFLICT (failure_id) DO UPDATE
      SET attempt_count   = money_path_compensation_failure.attempt_count + 1,
          last_attempt_at = now(),
@@ -139,6 +149,11 @@ export const RECORD_COMPENSATION_FAILURE_SQL = `
  * `duplicate` i kończyło się `200 { received: true }` — czyli w tej samej
  * ciszy, którą AC3 zakazuje o dwie linie wyżej. `attempt_count` był wtedy
  * strukturalnie nieosiągalny powyżej 1 na realnej ścieżce.
+ *
+ * Story 4.2 (ADR-238 §7): wiersz zastany `open` przeniesiony do kwarantanny
+ * backfillu NADAL jest otwartą porażką tej dostawy — drugi człon `UNION ALL`
+ * czyta go z `source_row`, więc ponowienie Stripe'a dostaje `500
+ * compensation_failed/delivery_release_unresolved` jak przed migracją.
  */
 export const FIND_OPEN_COMPENSATION_FAILURES_SQL = `
   SELECT failure_id, attempt_count, order_id
@@ -146,6 +161,14 @@ export const FIND_OPEN_COMPENSATION_FAILURES_SQL = `
    WHERE delivery_path = $1
      AND stripe_event_id = $2
      AND resolution_state = 'open'
+  UNION ALL
+  SELECT q.source_failure_id AS failure_id,
+         (q.source_row->>'attempt_count')::int AS attempt_count,
+         q.source_row->>'order_id' AS order_id
+    FROM money_path_compensation_failure_backfill_quarantine q
+   WHERE q.source_row->>'delivery_path' = $1
+     AND q.source_row->>'stripe_event_id' = $2
+     AND q.source_row->>'resolution_state' = 'open'
 `
 
 export async function findOpenCompensationFailures(
@@ -282,7 +305,8 @@ export async function recordCompensationFailure(
       COMPENSATION_FAILURE_OWNER.owner_type,
       COMPENSATION_FAILURE_OWNER.owner_id,
       COMPENSATION_FAILURE_SLA_HOURS,
-      COMPENSATION_FAILURE_INSTANCE_SOURCE,
+      COMPENSATION_FAILURE_PROVENANCE.kind,
+      COMPENSATION_FAILURE_PROVENANCE.source,
     ]
   )
   const row = result.rows?.[0]

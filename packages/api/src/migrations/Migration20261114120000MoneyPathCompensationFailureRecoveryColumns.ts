@@ -120,7 +120,7 @@ export class Migration20261114120000MoneyPathCompensationFailureRecoveryColumns 
     this.addSql(`ALTER TABLE ${TABLE} DROP CONSTRAINT IF EXISTS money_path_compensation_failure_provenance_kind_check`)
     this.addSql(`
       ALTER TABLE ${TABLE} ADD CONSTRAINT money_path_compensation_failure_provenance_kind_check
-        CHECK (provenance_kind IN ('runtime_writer', 'backfilled_verified'))
+        CHECK (provenance_kind IN ('runtime_observed', 'backfilled_verified'))
     `)
 
     // cf-create-quarantine (kształt rozszerzony o D-35 p.9 — ADR-238 §2)
@@ -241,6 +241,11 @@ export class Migration20261114120000MoneyPathCompensationFailureRecoveryColumns 
     this.addSql(`ALTER TABLE ${TABLE} DISABLE ROW LEVEL SECURITY`)
     this.addSql(`REVOKE ALL PRIVILEGES ON ${TABLE} FROM ${RUNTIME_ROLE}`)
     this.addSql(`RESET ROLE`)
+    // Symetria z up() (ADR-238 §4): stan uprawnień sprzed 4.2 = właściciel to
+    // wykonawca migracji, a runtime ma szerokie granty provisioningu 003
+    // (SELECT, INSERT, UPDATE, DELETE, bez RLS).
+    this.addSql(`ALTER TABLE ${TABLE} OWNER TO CURRENT_USER`)
+    this.addSql(`GRANT SELECT, INSERT, UPDATE, DELETE ON ${TABLE} TO ${RUNTIME_ROLE}`)
     this.addSql(`DROP INDEX IF EXISTS idx_money_path_compensation_failure_scope`)
     // cf-unset-not-null
     this.addSql(`
