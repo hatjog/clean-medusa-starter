@@ -348,7 +348,34 @@ async function createFixtureSchema(client: PoolClient): Promise<void> {
       occurred_at timestamptz NOT NULL,
       attempt_count integer NOT NULL,
       last_attempt_at timestamptz NOT NULL,
-      resolution_state text NOT NULL
+      resolution_state text NOT NULL,
+      instance_id text,
+      owner_type text,
+      owner_id text,
+      deadline timestamptz,
+      closure_path text,
+      provenance_kind text,
+      provenance_source text
+    )
+  `)
+  // Story 4.2 (ADR-238 §7): FIND_OPEN_COMPENSATION_FAILURES_SQL czyta też
+  // kwarantannę zastanych wierszy (Migration20261114120000, cf-create-quarantine).
+  await client.query(`
+    CREATE TEMP TABLE money_path_compensation_failure_backfill_quarantine (
+      source_failure_id text PRIMARY KEY,
+      source_row jsonb NOT NULL,
+      reason text NOT NULL,
+      quarantined_at timestamptz NOT NULL DEFAULT now(),
+      market_id text NOT NULL,
+      instance_id text NOT NULL,
+      instance_id_source text NOT NULL,
+      backfill_state text NOT NULL,
+      owner_type text NOT NULL,
+      owner_id text NOT NULL,
+      deadline timestamptz NOT NULL,
+      closed_at timestamptz,
+      closed_by text,
+      closure_evidence jsonb
     )
   `)
   await client.query("INSERT INTO sales_channel (id, metadata) VALUES ('sc_3_6', $1::jsonb)", [

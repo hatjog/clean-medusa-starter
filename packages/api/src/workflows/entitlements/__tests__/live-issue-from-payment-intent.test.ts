@@ -16,6 +16,9 @@ import { describe, it, expect } from "@jest/globals"
 
 import {
   liveIssueEntitlementsWithinTx,
+  liveIssueEntitlementsPerLineWithinTx,
+  LINE_ISSUE_STATES,
+  LINE_ISSUE_FAILURE_REASONS,
   assertReferencePriceInvariant,
   type LiveIssueInput,
   type LiveIssuePgClient,
@@ -82,9 +85,53 @@ function makeFakeClient(order: OrderFixture, lines: LineFixture[]) {
   const entitlements = new Map<string, EntitlementRow>()
   const choiceSetItems = new Map<string, ChoiceSetRow>()
 
+  // Story 8.4: wierna semantyka SAVEPOINT / ROLLBACK TO / RELEASE (stos migawek
+  // stanu), żeby test dowodził, że porażka linii cofa WYŁĄCZNIE jej zapisy.
+  const savepoints: Array<{
+    name: string
+    eventProcessed: Set<string>
+    entitlements: Map<string, EntitlementRow>
+    choiceSetItems: Map<string, ChoiceSetRow>
+  }> = []
+  const sqlLog: string[] = []
+  const restore = <K, V>(target: Map<K, V>, from: Map<K, V>) => {
+    target.clear()
+    for (const [k, v] of from) target.set(k, v)
+  }
+
   const client: LiveIssuePgClient = {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     query: async <T = Record<string, unknown>>(sql: string, values: ReadonlyArray<unknown> = []): Promise<{ rows: T[]; rowCount: number }> => {
+      sqlLog.push(sql.trim())
+      const sp = /^SAVEPOINT (\w+)$/i.exec(sql.trim())
+      if (sp) {
+        savepoints.push({
+          name: sp[1],
+          eventProcessed: new Set(eventProcessed),
+          entitlements: new Map(entitlements),
+          choiceSetItems: new Map(choiceSetItems),
+        })
+        return { rows: [], rowCount: 0 }
+      }
+      const rb = /^ROLLBACK TO SAVEPOINT (\w+)$/i.exec(sql.trim())
+      if (rb) {
+        const idx = savepoints.map((x) => x.name).lastIndexOf(rb[1])
+        if (idx < 0) throw new Error(`fake: brak savepointu ${rb[1]}`)
+        const snap = savepoints[idx]
+        savepoints.length = idx + 1
+        eventProcessed.clear()
+        for (const k of snap.eventProcessed) eventProcessed.add(k)
+        restore(entitlements, snap.entitlements)
+        restore(choiceSetItems, snap.choiceSetItems)
+        return { rows: [], rowCount: 0 }
+      }
+      const rel = /^RELEASE SAVEPOINT (\w+)$/i.exec(sql.trim())
+      if (rel) {
+        const idx = savepoints.map((x) => x.name).lastIndexOf(rel[1])
+        if (idx < 0) throw new Error(`fake: brak savepointu ${rel[1]}`)
+        savepoints.length = idx
+        return { rows: [], rowCount: 0 }
+      }
       if (/INSERT INTO event_processed/i.test(sql)) {
         const key = `${values[0]}|${values[1]}`
         if (eventProcessed.has(key)) return { rows: [], rowCount: 0 }
@@ -154,7 +201,7 @@ function makeFakeClient(order: OrderFixture, lines: LineFixture[]) {
     },
   }
 
-  return { client, entitlements, choiceSetItems, eventProcessed }
+  return { client, entitlements, choiceSetItems, eventProcessed, sqlLog, savepoints }
 }
 
 const NOW = new Date("2026-06-02T10:15:30.000Z")
@@ -687,5 +734,146 @@ describe("Story 3.3 M2 — market_id fail-loud w writerze (defense-in-depth)", (
       liveIssueEntitlementsWithinTx(client, input, NOW)
     ).rejects.toThrow(/market_id nierozwiązywalny/)
     expect(entitlements.size).toBe(0)
+  })
+})
+
+// ===========================================================================
+// Story 8.4 (v1.16.0, FR-16, AD-19, NFR-4) — częściowa porażka pozycji
+// prezentowych: wynik per pozycja, bez cofania pozycji udanych.
+// Kontrakt: specs/contracts/checkout/gift-line-issue-outcome.v1.md
+// ===========================================================================
+describe("Story 8.4 — częściowa porażka pozycji prezentowych (wynik per pozycja)", () => {
+  function giftLine(lineId: string, recipientId: string, sellerName: string | null = "Salon Bon Beauty"): LineFixture {
+    return {
+      line_item_id: lineId,
+      line_title: "Masaż relaksacyjny 60 min",
+      seller_id: "sel_bonbeauty_1",
+      seller_name: sellerName,
+      seller_handle: "bon-beauty",
+      metadata: {
+        entitlement_profile_id: "voucher-rezerwacja-otwarta",
+        entitlement_type: "VOUCHER_SERVICE",
+        policy: { validity_months: 12, vat_rate_uniqueness: true },
+        recipients: [{ customer_id: recipientId }],
+      },
+    }
+  }
+  const ORDER = { sales_channel_id: "sc_bonbeauty", metadata: { gp: { market_id: "bonbeauty" } } }
+
+  function threeLinesMiddleFails() {
+    // Linia 2: brak `seller_name` ⇒ geneza kodu vouchera rzuca PO INSERT-cie
+    // entitlementu — dowodzi, że savepoint cofa też zapis wykonany przed błędem.
+    return [
+      giftLine("li_gift_1", "cus_a"),
+      // pusty string: fixture `makeFakeClient` podstawia domyślnego sprzedawcę za `null`.
+      { ...giftLine("li_gift_2", "cus_b"), seller_name: "" },
+      giftLine("li_gift_3", "cus_c"),
+    ]
+  }
+
+  it("3 linie, jedna zawodzi ⇒ 3 wpisy per pozycja z rozłącznym stanem; 2 udane mają entitlement_instance", async () => {
+    const { client, entitlements } = makeFakeClient(ORDER, threeLinesMiddleFails())
+    const result = await liveIssueEntitlementsPerLineWithinTx(client, baseInput(), NOW)
+
+    expect(result.line_outcomes.map((o) => [o.line_item_id, o.state])).toEqual([
+      ["li_gift_1", "issued"],
+      ["li_gift_2", "failed"],
+      ["li_gift_3", "issued"],
+    ])
+    const persistedLines = [...entitlements.values()].map((e) => e.line_item_id).sort()
+    expect(persistedLines).toEqual(["li_gift_1", "li_gift_3"])
+    expect(result.issued.map((e) => e.line_item_id).sort()).toEqual(["li_gift_1", "li_gift_3"])
+    expect(result.failed_lines).toHaveLength(1)
+    expect(result.failed_lines[0]).toMatchObject({
+      line_item_id: "li_gift_2",
+      state: "failed",
+      reason: "issue_write_failed",
+    })
+    expect(result.failed_lines[0].error_message).toMatch(/seller_name/)
+  })
+
+  it("częściowa porażka NIE konsumuje eventu ⇒ retry wraca do linii nieudanej, udane są no-op", async () => {
+    const lines = threeLinesMiddleFails()
+    const { client, entitlements, eventProcessed } = makeFakeClient(ORDER, lines)
+    const first = await liveIssueEntitlementsPerLineWithinTx(client, baseInput(), NOW)
+    expect(first.event_processed).toBe(false)
+    expect(eventProcessed.size).toBe(0)
+
+    // Naprawa danych linii 2 ⇒ ponowna dostawa tego samego eventu.
+    lines[1] = giftLine("li_gift_2", "cus_b")
+    const retry = await liveIssueEntitlementsPerLineWithinTx(client, baseInput(), NOW)
+    expect(retry.event_processed).toBe(true)
+    expect(retry.failed_lines).toEqual([])
+    expect(retry.line_outcomes.map((o) => [o.line_item_id, o.state])).toEqual([
+      ["li_gift_1", "already_issued"],
+      ["li_gift_2", "issued"],
+      ["li_gift_3", "already_issued"],
+    ])
+    expect(entitlements.size).toBe(3)
+    expect(eventProcessed.size).toBe(1)
+  })
+
+  it("każda pozycja ma stan z zamkniętego zbioru; porażka ma nazwany reason (bez stanu domyślnego)", async () => {
+    const lines: LineFixture[] = [
+      ...threeLinesMiddleFails(),
+      // linia z markerem, ale niekompletnym profilem
+      { line_item_id: "li_gift_4", metadata: { entitlement_type: "VOUCHER_SERVICE" } },
+      // linia non-voucher (zero markerów)
+      { line_item_id: "li_plain_5", metadata: { color: "red" } },
+    ]
+    const { client } = makeFakeClient(ORDER, lines)
+    const result = await liveIssueEntitlementsPerLineWithinTx(client, baseInput(), NOW)
+
+    expect(result.line_outcomes).toHaveLength(lines.length)
+    expect(result.line_outcomes.map((o) => o.line_item_id)).toEqual(lines.map((l) => l.line_item_id))
+    for (const outcome of result.line_outcomes) {
+      expect(LINE_ISSUE_STATES).toContain(outcome.state)
+      if (outcome.state === "failed") {
+        expect(LINE_ISSUE_FAILURE_REASONS).toContain(outcome.reason)
+        expect(outcome.error_message.length).toBeGreaterThan(0)
+      }
+      if (outcome.state === "issued" || outcome.state === "already_issued") {
+        expect(outcome.entitlements.length).toBeGreaterThan(0)
+      }
+    }
+    const byId = Object.fromEntries(result.line_outcomes.map((o) => [o.line_item_id, o]))
+    expect(byId.li_gift_4).toMatchObject({ state: "failed", reason: "incomplete_voucher_profile" })
+    expect(byId.li_plain_5).toEqual({ line_item_id: "li_plain_5", state: "not_voucher" })
+  })
+
+  it("nazwane przyczyny: nieaktywny typ, multi-recipient, brak sales_channel_id", async () => {
+    const lines: LineFixture[] = [
+      { ...giftLine("li_t", "cus_t"), metadata: { ...giftLine("li_t", "x").metadata, entitlement_type: "SUBSCRIPTION_B2C" } },
+      { ...giftLine("li_m", "cus_m"), metadata: { ...giftLine("li_m", "x").metadata, recipients: [{ customer_id: "a" }, { customer_id: "b" }] } },
+    ]
+    const { client } = makeFakeClient(ORDER, lines)
+    const result = await liveIssueEntitlementsPerLineWithinTx(client, baseInput(), NOW)
+    expect(result.failed_lines.map((f) => [f.line_item_id, f.reason])).toEqual([
+      ["li_t", "entitlement_type_not_issuable"],
+      ["li_m", "multi_recipient_per_line"],
+    ])
+
+    const noChannel = makeFakeClient({ sales_channel_id: null, metadata: ORDER.metadata }, [giftLine("li_s", "cus_s")])
+    const r2 = await liveIssueEntitlementsPerLineWithinTx(noChannel.client, baseInput(), NOW)
+    expect(r2.failed_lines.map((f) => f.reason)).toEqual(["scope_unresolved"])
+  })
+
+  it("wszystkie linie udane ⇒ event skonsumowany, wszystkie `issued`, savepointy zwolnione", async () => {
+    const { client, entitlements, eventProcessed, savepoints } = makeFakeClient(ORDER, [
+      giftLine("li_ok_1", "cus_a"),
+      giftLine("li_ok_2", "cus_b"),
+    ])
+    const result = await liveIssueEntitlementsPerLineWithinTx(client, baseInput(), NOW)
+    expect(result.event_processed).toBe(true)
+    expect(result.failed_lines).toEqual([])
+    expect(result.line_outcomes.map((o) => o.state)).toEqual(["issued", "issued"])
+    expect(entitlements.size).toBe(2)
+    expect(eventProcessed.size).toBe(1)
+    expect(savepoints).toEqual([])
+  })
+
+  it("tryb all-or-nothing (liveIssueEntitlementsWithinTx) jawnie rzuca przy porażce linii", async () => {
+    const { client } = makeFakeClient(ORDER, threeLinesMiddleFails())
+    await expect(liveIssueEntitlementsWithinTx(client, baseInput(), NOW)).rejects.toThrow(/seller_name/)
   })
 })

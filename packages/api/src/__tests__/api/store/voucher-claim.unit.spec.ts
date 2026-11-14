@@ -28,6 +28,7 @@ import {
   _clearAuditLog,
   _clearBindingStore,
   _getAuditLog,
+  ClaimMarketContextRequiredError,
 } from "../../../api/store/vouchers/[code]/claim/helpers"
 import { Modules } from "@medusajs/framework/utils"
 import { VoucherService, type VoucherWithEvents } from "../../../modules/voucher"
@@ -42,7 +43,13 @@ type MockVoucherService = {
   claim: jest.Mock | ((code: string, opts?: Record<string, unknown>) => Promise<unknown>)
 }
 
+// Story 11.1 AI-Verify-C4-NEW-002: runtime claimu wymaga OBU osi scope
+// (helpers.ts requireClaimScope) — kontekst testu niesie market_id i instance_id.
 async function runInTestMarket<T>(work: () => Promise<T>): Promise<T> {
+  return marketContextStorage.run({ market_id: "market-test", instance_id: "gp-test" }, work)
+}
+
+async function runInMarketWithoutInstance<T>(work: () => Promise<T>): Promise<T> {
   return marketContextStorage.run({ market_id: "market-test" }, work)
 }
 
@@ -591,6 +598,33 @@ describe("POST /store/vouchers/:code/claim", () => {
     expect(pg.claimUpdates).toBe(1)
     expect(_getAuditLog()).toHaveLength(0)
     expect(pg.audits.map((row) => row.outcome)).toEqual(["ok", "idempotent_replay"])
+  })
+
+  it("Story 11.1 — durable claim bez instance_id jest odmową fail-closed bez mutacji i bez zapisu", async () => {
+    const body = validBody()
+    const pg = new FakeClaimPg([IDLE_VOUCHER])
+    const service = makePgVoucherService(pg)
+    const scope = {
+      resolve: (key: string) => {
+        if (key === "__pg_pool__") return pg
+        throw new Error(`unexpected resolve: ${key}`)
+      },
+    }
+
+    const res = makeRes()
+    let thrown: unknown
+    try {
+      await runInMarketWithoutInstance(() => POST(
+        makeReq(IDLE_VOUCHER.code, body, "127.0.0.1", service, scope) as never,
+        res as never
+      ))
+    } catch (error) {
+      thrown = error
+    }
+    expect(thrown).toBeInstanceOf(ClaimMarketContextRequiredError)
+    expect(res._status).not.toBe(200)
+    expect(pg.claimUpdates).toBe(0)
+    expect(pg.audits).toHaveLength(0)
   })
 
   it("Story 6.1 AC1 — PG replay mismatch writes durable audit and does not mutate twice", async () => {

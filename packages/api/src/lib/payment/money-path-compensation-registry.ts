@@ -32,6 +32,7 @@
 import { createHash } from "node:crypto"
 
 import { emitStructuredAlert } from "../alert-emit"
+import { resolveRuntimeInstanceId } from "../market-context"
 import type { PaymentLinkQueryClient } from "./stripe-payment-intent-link"
 import { acquireFreshPgConnection } from "./stripe-payment-intent-transport"
 
@@ -97,12 +98,42 @@ export type RecordedCompensationFailure = {
   order_id: string | null
 }
 
+/**
+ * Story 4.2 (AD-32): właściciel i termin nowego wiersza. Owner to rola
+ * operatorska `ops-recovery` (ADR-221 §owner: `operator_role`), termin = SLA
+ * 24 h od zapisu (D-35 p.9). `instance_id` wyłącznie ze źródła serwerowego.
+ */
+export const COMPENSATION_FAILURE_OWNER = { owner_type: "operator_role", owner_id: "ops-recovery" } as const
+export const COMPENSATION_FAILURE_SLA_HOURS = 24
+/** Źródło `instance_id` wiersza runtime (opisane w ADR-238 §6; nie jest `provenance.source`). */
+export const COMPENSATION_FAILURE_INSTANCE_SOURCE = "env:GP_INSTANCE_ID" as const
+/**
+ * Proweniencja wiersza runtime wg `recovery-population.v1.schema.json`
+ * (`$defs.provenance`, ADR-221 §2): `kind` ze słownika kontraktu,
+ * `source` = nazwa producenta runtime.
+ */
+export const COMPENSATION_FAILURE_PROVENANCE = {
+  kind: "runtime_observed",
+  source: "money-path-compensation-registry",
+} as const
+
+export class CompensationFailureInstanceUnconfiguredError extends Error {
+  constructor() {
+    super("money_path_compensation_failure: GP_INSTANCE_ID nie jest skonfigurowany — zapis odmówiony (fail-closed)")
+    this.name = "CompensationFailureInstanceUnconfiguredError"
+  }
+}
+
 export const RECORD_COMPENSATION_FAILURE_SQL = `
   INSERT INTO money_path_compensation_failure
     (failure_id, market_id, compensation_kind, delivery_path, stripe_event_id,
      payment_intent_id, order_id, purchase_correlation_key, failure_code,
-     failure_detail, occurred_at, attempt_count, last_attempt_at, resolution_state)
-  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now(), 1, now(), 'open')
+     failure_detail, occurred_at, attempt_count, last_attempt_at, resolution_state,
+     instance_id, owner_type, owner_id, deadline, closure_path, provenance_kind,
+     provenance_source)
+  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now(), 1, now(), 'open',
+          $11, $12, $13, now() + make_interval(hours => $14::int), 'not_closed',
+          $15, $16)
   ON CONFLICT (failure_id) DO UPDATE
      SET attempt_count   = money_path_compensation_failure.attempt_count + 1,
          last_attempt_at = now(),
@@ -118,6 +149,18 @@ export const RECORD_COMPENSATION_FAILURE_SQL = `
  * `duplicate` i kończyło się `200 { received: true }` — czyli w tej samej
  * ciszy, którą AC3 zakazuje o dwie linie wyżej. `attempt_count` był wtedy
  * strukturalnie nieosiągalny powyżej 1 na realnej ścieżce.
+ *
+ * Story 4.2 (ADR-238 §7): wiersz zastany `open` przeniesiony do kwarantanny
+ * backfillu NADAL jest otwartą porażką tej dostawy — drugi człon `UNION ALL`
+ * czyta go z `source_row`, więc ponowienie Stripe'a dostaje `500
+ * compensation_failed/delivery_release_unresolved` jak przed migracją.
+ *
+ * Runda fix 2 D-31: wiersz kwarantanny przestaje być liczony jako otwarty,
+ *  - gdy w populacji istnieje wiersz z tym samym `failure_id` (`NOT EXISTS`) —
+ *    o stanie rozstrzyga wtedy populacja (brak duplikatu w `registry_failure_ids`,
+ *    `resolved_manually` w populacji odblokowuje dostawę),
+ *  - gdy ops-recovery zamknął go stanem terminalnym `closed_by_ops_recovery`
+ *    (`backfill_state`; fakt `source_row` zostaje, wiersz nie jest kasowany).
  */
 export const FIND_OPEN_COMPENSATION_FAILURES_SQL = `
   SELECT failure_id, attempt_count, order_id
@@ -125,6 +168,20 @@ export const FIND_OPEN_COMPENSATION_FAILURES_SQL = `
    WHERE delivery_path = $1
      AND stripe_event_id = $2
      AND resolution_state = 'open'
+  UNION ALL
+  SELECT q.source_failure_id AS failure_id,
+         (q.source_row->>'attempt_count')::int AS attempt_count,
+         q.source_row->>'order_id' AS order_id
+    FROM money_path_compensation_failure_backfill_quarantine q
+   WHERE q.source_row->>'delivery_path' = $1
+     AND q.source_row->>'stripe_event_id' = $2
+     AND q.source_row->>'resolution_state' = 'open'
+     AND q.backfill_state = 'quarantined_pending_review'
+     AND NOT EXISTS (
+       SELECT 1
+         FROM money_path_compensation_failure c
+        WHERE c.failure_id = q.source_failure_id
+     )
 `
 
 export async function findOpenCompensationFailures(
@@ -240,6 +297,10 @@ export async function recordCompensationFailure(
   record: CompensationFailureRecord
 ): Promise<RecordedCompensationFailure> {
   const failureId = buildCompensationFailureId(record)
+  const instanceId = resolveRuntimeInstanceId()
+  if (!instanceId) {
+    throw new CompensationFailureInstanceUnconfiguredError()
+  }
   const result = await client.query<RecordedCompensationFailure>(
     RECORD_COMPENSATION_FAILURE_SQL,
     [
@@ -253,6 +314,12 @@ export async function recordCompensationFailure(
       record.purchase_correlation_key,
       record.failure_code,
       record.failure_detail,
+      instanceId,
+      COMPENSATION_FAILURE_OWNER.owner_type,
+      COMPENSATION_FAILURE_OWNER.owner_id,
+      COMPENSATION_FAILURE_SLA_HOURS,
+      COMPENSATION_FAILURE_PROVENANCE.kind,
+      COMPENSATION_FAILURE_PROVENANCE.source,
     ]
   )
   const row = result.rows?.[0]
