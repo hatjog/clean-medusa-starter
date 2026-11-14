@@ -104,6 +104,13 @@ if (process.env.TEST_TYPE === "integration:http") {
   module.exports.testMatch = [
     "**/packages/api/src/__tests__/rls/voucher-redeem-for-seller.integration.spec.[jt]s",
   ];
+} else if (process.env.TEST_TYPE === "story-4-4-deferred-trace-pg") {
+  // v1.16.0 Story 4.4 (FR-12, AD-32) — trwaly rekord deferred_issuance_trace
+  // na realnym Postgresie (migracja up/down, RLS market_isolation, domkniecie).
+  // DATABASE_URL musi wskazywac IZOLOWANA DB testowa (*_test).
+  module.exports.testMatch = [
+    "**/packages/api/src/__tests__/integration/story-4-4-deferred-issuance-trace-pg.integration.test.[jt]s",
+  ];
 } else if (process.env.TEST_TYPE === "compensation-failure-pg") {
   // v1.15.0 Story 3.5 (FR-6c, NFR-3, AD-22) — rejestr nieudanych kompensacji
   // sciezki pieniadza wykonany przez sam modul na realnym Postgresie

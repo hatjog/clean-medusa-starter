@@ -54,7 +54,14 @@ import { ContainerRegistrationKeys, Modules } from "@medusajs/framework/utils"
 
 import { toKnexPositionalSql } from "../lib/knex-positional-sql"
 import { PAYMENT_INTENT_SUCCEEDED_EVENT } from "../lib/payment/stripe-payment-intent-event"
-import { STRIPE_PATH_Y_WEBHOOK_PROVIDER } from "../lib/payment/stripe-payment-intent-transport"
+import {
+  DEFERRED_ISSUANCE_EVENT_SUFFIX,
+  STRIPE_PATH_Y_WEBHOOK_PROVIDER,
+} from "../lib/payment/stripe-payment-intent-transport"
+import {
+  closeDeferredIssuanceTraceGuarded,
+  DEFERRED_ISSUANCE_TRACE_CLOSURE_ORDER_PLACED,
+} from "../lib/recovery/deferred-issuance-trace"
 import { resolveRuntimeInstanceId } from "../lib/market-context"
 import {
   buildGenesisActiveTransition,
@@ -590,6 +597,42 @@ export default async function onOrderPlacedStripeRetry({
                 new Date()
               )
               await markDeferredResolved(client, row.event_id, orderId, new Date())
+
+              // Story 4.4 (AC2): domknięcie TRWAŁEGO rekordu śladu w tej samej
+              // transakcji co wystawienie — stan terminalny z zapisaną ścieżką
+              // i evidence; wiersz zostaje (historia czytelna). Marker
+              // Path Y ma klucz `<evt>#deferred-issuance` = `trace_id`.
+              const stripeEventId = row.event_id.endsWith(DEFERRED_ISSUANCE_EVENT_SUFFIX)
+                ? row.event_id.slice(0, -DEFERRED_ISSUANCE_EVENT_SUFFIX.length)
+                : null
+              if (stripeEventId) {
+                const closed = await closeDeferredIssuanceTraceGuarded(client, {
+                  stripe_event_id: stripeEventId,
+                  instance_id: input.scope.instance_id,
+                  market_id: input.scope.market_id,
+                  order_id: orderId,
+                  closure_path: DEFERRED_ISSUANCE_TRACE_CLOSURE_ORDER_PLACED,
+                  evidence: {
+                    resolver: "subscriber:on-order-placed-stripe-retry",
+                    payment_intent_id: input.payload.payment_intent_id,
+                    entitlements_issued: result.issued.length,
+                    resolved_at: new Date().toISOString(),
+                  },
+                })
+                if (!closed.ok) {
+                  logger.warn?.(
+                    `[on-order-placed-stripe-retry] order_id=${orderId} trace=${row.event_id} ` +
+                      `domkniecie rekordu deferred_issuance_trace NIEUDANE (wystawienie zachowane): ${closed.error}`
+                  )
+                } else {
+                  logger.info?.(
+                    `[on-order-placed-stripe-retry] order_id=${orderId} trace=${row.event_id} ` +
+                      (closed.version === null
+                        ? "rekord deferred_issuance_trace nieobecny albo juz domkniety dla tego zamowienia"
+                        : `rekord deferred_issuance_trace domkniety (issued_after_link, version=${closed.version})`)
+                  )
+                }
+              }
 
               const appendAudit = makeTransitionAuditSink(logger)
               const issuedAt = new Date()

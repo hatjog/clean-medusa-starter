@@ -64,6 +64,7 @@ import {
   type PaymentIntentLinkResolution,
 } from "../../../../lib/payment/stripe-payment-intent-link"
 import { stampPaymentIntentOrderFacts } from "../../../../lib/payment/stripe-payment-intent-metadata-stamp"
+import { recordWebhookDeferredIssuanceTrace } from "../../../../lib/recovery/deferred-issuance-trace-runtime"
 import {
   persistDeferredIssuanceMarker,
   queryUnderMarketContext,
@@ -339,6 +340,18 @@ export async function POST(
         `[stripe/payment-intent] ${resolution.reason}: ${resolution.detail}; ` +
           `event_age_seconds=${eventAgeSeconds ?? "unknown"}; retryable_link_race=${retryableLinkRace}`,
       )
+      // Story 4.4: przy wyścigu przejściowym ślad jest TAKŻE trwałym rekordem
+      // z właścicielem (AD-32 (b)), obok markera transportu; wywołanie nie rzuca.
+      if (resolution.reason === "link_unresolved" && retryableLinkRace) {
+        await recordWebhookDeferredIssuanceTrace(req.scope, handle.client, logger, {
+          stripe_event_id: deliveryEventId,
+          payment_intent_id: paymentIntentId,
+          instance_id: instanceId,
+          session_id: identifiers.session_id ?? null,
+          metadata_market_id: identifiers.market_id ?? null,
+          read_psp_occurred_at: () => readDeferredPspOccurredAt(stripeEvent),
+        })
+      }
       // Ślad deferral TYLKO dla wyścigu przejściowego. `link_ambiguous` i reszta
       // są trwałe — ponowienie ich nie naprawi, a ślad zamieniłby się w pętlę
       // odzysku wołaną przy każdym `order.placed` tego zamówienia.
