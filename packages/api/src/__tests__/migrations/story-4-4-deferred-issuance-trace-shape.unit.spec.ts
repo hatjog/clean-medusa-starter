@@ -90,10 +90,14 @@ describe("Story 4.4 — kształt deferred_issuance_trace", () => {
 
   it("R-1: brak albo niepoprawna wartość SLA = fail-loud, nigdy null/ciche pominięcie", () => {
     expect(() => assertDeferredIssuanceTraceSla(undefined)).toThrow(/recovery-config/)
-    for (const bad of [null, {}, { seconds: 0 }, { seconds: -1 }, { seconds: 1.5 },
-      { seconds: "86400" as unknown as number }, { seconds: 86400, owner_id: "", source: "x" },
+    const ok = { owner_id: "ops-recovery", source: "D-35 p.9" }
+    for (const bad of [null, {}, { ...ok, seconds: 0 }, { ...ok, seconds: -1 }, { ...ok, seconds: 1.5 },
+      { ...ok, seconds: "86400" as unknown as number }, { seconds: 86400, owner_id: "", source: "x" },
       { seconds: 86400, owner_id: "ops-recovery", source: "" }]) {
       expect(() => readDeferredIssuanceTraceSlaSeconds(bad)).toThrow(/recovery-config/)
+      if (bad && "seconds" in bad && bad.seconds !== 86400) {
+        expect(() => assertDeferredIssuanceTraceSla(bad)).toThrow(/seconds musi byc dodatnia/)
+      }
       expect(() => assertDeferredIssuanceTraceSla(bad)).toThrow(/recovery-config/)
     }
   })
