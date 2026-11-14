@@ -9,6 +9,10 @@ import {
 } from "../workflows/payment/stripe-payment-audit"
 import { failPaymentWorkflow } from "../workflows/payment/fail-payment"
 import { extractStripeFailureDetails } from "../lib/payment/failure-classification"
+import {
+  isRuntimeInstanceIdentityError,
+  RUNTIME_INSTANCE_UNCONFIGURED_ERROR_CODE,
+} from "../lib/runtime-instance-identity"
 
 export const MISSING_FAILURE_METADATA_CODE = "support_required_missing_failure_metadata"
 
@@ -66,6 +70,18 @@ export default async function stripePaymentAuditSubscriber({
     )
   } catch (err) {
     const error = err as Error
+    // Story 11.2 (ADR-240, review R-5): odmowa przy braku GP_INSTANCE_ID pada
+    // PRZED transakcją workflow — zero wiersza dedupe, zero uprawnień. Nazwana
+    // klasa, osobny log z kodem; zdarzenie zostaje do ponowienia po
+    // konfiguracji instancji (rzut dalej), bez częściowego zapisu.
+    if (isRuntimeInstanceIdentityError(err)) {
+      logger.error?.(
+        `[stripe-payment-audit] ${eventName} refused: ` +
+          `error_code=${RUNTIME_INSTANCE_UNCONFIGURED_ERROR_CODE} ` +
+          `(GP_INSTANCE_ID nieskonfigurowany) — zero zapisów, zdarzenie do ponowienia`
+      )
+      throw err
+    }
     logger.error?.(
       `[stripe-payment-audit] ${eventName} failed: ${error.name}: ${error.message}; ` +
         `payload_keys=${Object.keys(event.data ?? {}).sort().join(",")}`

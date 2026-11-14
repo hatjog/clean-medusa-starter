@@ -6,7 +6,7 @@
  * ⇒ no-op), config.event = kontrakt Story 3.1. Side-effecty issue żyją w rdzeniu;
  * tu sprawdzamy warstwę subscribera (tx + mapowanie + delegacja Path Y).
  */
-import { describe, it, expect } from "@jest/globals"
+import { describe, it, expect, beforeEach, afterAll } from "@jest/globals"
 
 import subscriber, {
   config,
@@ -15,6 +15,18 @@ import subscriber, {
 } from "../voucher-live-issue"
 import { LiveIssuePartialFailureError } from "../../workflows/entitlements/live-issue-from-payment-intent"
 import { marketContextStorage } from "../../lib/market-context"
+
+// Story 11.2 (ADR-240): producent `entitlement_state_changed` bierze
+// `scope.instance_id` WYŁĄCZNIE z GP_INSTANCE_ID; brak = odmowa emisji.
+// Fixture podaje instancję jawnie (oś scope uzupełniona, asercje bez zmian).
+const PREVIOUS_GP_INSTANCE_ID = process.env.GP_INSTANCE_ID
+beforeEach(() => {
+  process.env.GP_INSTANCE_ID = "gp-test-instance"
+})
+afterAll(() => {
+  if (PREVIOUS_GP_INSTANCE_ID === undefined) delete process.env.GP_INSTANCE_ID
+  else process.env.GP_INSTANCE_ID = PREVIOUS_GP_INSTANCE_ID
+})
 
 describe("Story 3.3 — toLiveIssueInput (mapowanie envelope.v1, fail-loud NFR4)", () => {
   const envelope = {

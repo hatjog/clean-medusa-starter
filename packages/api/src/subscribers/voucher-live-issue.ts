@@ -29,6 +29,7 @@ import type { SubscriberArgs, SubscriberConfig } from "@medusajs/framework"
 import { ContainerRegistrationKeys, Modules } from "@medusajs/framework/utils"
 
 import { runInSystemMarketContext } from "../lib/system-market-context"
+import { requireRuntimeInstanceId } from "../lib/runtime-instance-identity"
 
 import {
   liveIssueEntitlementsPerLineWithinTx,
@@ -265,6 +266,15 @@ export default async function voucherLiveIssueSubscriber({
   // źródło scope audytu/eventu okablowania (spójne z market_id użytym do INSERT).
   const marketId = String(input.scope.market_id)
   const instanceId = String(input.scope.instance_id)
+  // Story 11.2: tożsamość instancji producenta z autorytatywnego nośnika
+  // (GP_INSTANCE_ID). Brak = odmowa PRZED otwarciem tx (zero issue, zero emisji).
+  let runtimeInstanceId: string
+  try {
+    runtimeInstanceId = requireRuntimeInstanceId("voucher-live-issue")
+  } catch (err) {
+    logger.error?.(`[voucher-live-issue] ${(err as Error).message}`)
+    throw err
+  }
 
   try {
     // ── (A) issue + OKABLOWANIE GENEZY ISSUED w JEDNEJ DB-tx (atomicity) ──────
@@ -322,7 +332,8 @@ export default async function voucherLiveIssueSubscriber({
           buildGenesisIssuedTransition({
             entitlement_id: issuedRow.entitlement_id,
             scope: {
-              instance_id: issuedRow.entitlement_id,
+              // Story 11.2 (DW-15-183): instancja runtime, nie id uprawnienia.
+              instance_id: runtimeInstanceId,
               market_id: marketId,
               sales_channel_id: null,
               vendor_id: input.scope.vendor_id ?? null,

@@ -170,10 +170,13 @@ const ENTITLEMENT_REBOOK_ROW: EntitlementTestRow = {
 beforeEach(() => {
   // DATABASE_URL is not needed for injected-pool tests, but set for safety
   process.env.DATABASE_URL = "postgresql://postgres:postgres@localhost:5432/gp_mercur"
+  // Story 11.2 (ADR-240): tranzycje serwisu niosą instancję runtime z GP_INSTANCE_ID.
+  process.env.GP_INSTANCE_ID = "gp-test-instance"
 })
 
 afterEach(() => {
   delete process.env.DATABASE_URL
+  delete process.env.GP_INSTANCE_ID
 })
 
 function makeService(pool: Pool): VoucherService {

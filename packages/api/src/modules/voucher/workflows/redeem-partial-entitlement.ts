@@ -144,6 +144,31 @@ const BUNDLE_REDEEMABLE_TYPE = EntitlementType.BUNDLE
  */
 const UNIT_REDEEMABLE_TYPE = EntitlementType.VOUCHER_SERVICE
 
+/**
+ * v1.16.0 Story 5.4 (FR-19, AD-34, ADR-237 `Proposed`) — gałęzie realizacji są
+ * ROZŁĄCZNE wg typu uprawnienia. `VOUCHER_SERVICE` kończy się stanem
+ * terminalnym JEDNYM aktem, bez wiersza salda (`entitlement_instance.remaining_amount`
+ * nie jest zapisywane — zostaje `NULL`, tak jak przy emisji) i bez postingu
+ * kwotowego (krok 2 nie niesie payloadu `posting`, więc hook nie produkuje
+ * transakcji ledgera ani przy bramce wyłączonej, ani włączonej).
+ *
+ * ZMIERZONE PRZED zmianą (evidence/5-4/ac1-service-single-act.md): gałąź
+ * usługowa szła wspólnym torem z kwotową — `remaining_amount: NULL → 0`
+ * i posting `REDEEMED` z `attempted: true` (przy bramce włączonej: wiersze
+ * w `voucher_ledger_*`). To właśnie AD-34 nazywa „rozliczaniem usługi jak kwoty,
+ * której nie ma".
+ *
+ * Co ZOSTAJE wspólne (ADR-212 §1, §3, §5 — nie cofane): punkt okablowania
+ * przejścia, allow-lista stanów, niepodzielność, wiersz kanoniczny
+ * `voucher_redemption` jako ŚLAD aktu (AD-17) i podstawa prowizji, reguła
+ * bilansu, idempotencja i odwrót na wierszu kanonicznym.
+ */
+export function isQuantitativeRedemptionBranch(
+  entitlementType: EntitlementType
+): boolean {
+  return entitlementType !== UNIT_REDEEMABLE_TYPE
+}
+
 /** Wynik dyskryminacji redeemu: pełny (`remaining`→0) vs partial (saldo > 0). */
 export type RedeemOutcome =
   | EntitlementInstanceState.REDEEMED_PARTIAL
@@ -1315,6 +1340,7 @@ export class RedeemPartialEntitlementOperation {
           kind: "replay" as const,
           record: prior,
           replayAvailableChoiceSetItemIds,
+          quantitative: isQuantitativeRedemptionBranch(ent.entitlement_type),
         }
       }
 
@@ -1469,13 +1495,25 @@ export class RedeemPartialEntitlementOperation {
       if (spend.choiceSetItemId) {
         await tx.consumeChoiceSetItem(spend.choiceSetItemId, redemptionId, now)
       }
-      await tx.updateEntitlementRemainingAndState(
-        ent.id,
-        EntitlementInstanceState.REDEMPTION_REQUESTED,
-        outcome,
-        remainingAfter,
-        now
-      )
+      // v1.16.0 Story 5.4 (AD-34): gałąź usługowa NIE pisze salda — jedno
+      // `UPDATE` stanu pod blokadą `FOR UPDATE` z `resolveRedeemTarget`.
+      const quantitative = isQuantitativeRedemptionBranch(ent.entitlement_type)
+      if (quantitative) {
+        await tx.updateEntitlementRemainingAndState(
+          ent.id,
+          EntitlementInstanceState.REDEMPTION_REQUESTED,
+          outcome,
+          remainingAfter,
+          now
+        )
+      } else {
+        await tx.updateEntitlementState(
+          ent.id,
+          EntitlementInstanceState.REDEMPTION_REQUESTED,
+          outcome,
+          now
+        )
+      }
 
       // ── M6: PROJEKCJA po fakcie, w tej samej transakcji ───────────────────
       // Dopiero tutaj — wiersz kanoniczny już istnieje. Odwrotna kolejność
@@ -1508,18 +1546,25 @@ export class RedeemPartialEntitlementOperation {
         actor_hint: actorHint,
         occurred_at: occurredAt,
         transition_seq: `${redemptionId}:redeem`,
-        posting: {
-          entitlement_type: ent.entitlement_type,
-          lifecycle_event: "REDEEMED",
-          vat_classification: vatClassification,
-          net_minor: netMinor,
-          vat_minor: vatMinor,
-          redeemed_gross_minor: amount,
-          redeemed_gross_to_date_minor: priorRedeemedGross,
-          redemption_id: redemptionId,
-          currency,
-          expected_currency: ent.issued_amount_currency ?? currency,
-        },
+        // v1.16.0 Story 5.4 (AD-34, ADR-237): posting kwotowy WYŁĄCZNIE
+        // w gałęzi kwotowej. Gałąź usługowa przechodzi ten sam punkt
+        // okablowania (audyt + zdarzenie), ale bez payloadu finansowego.
+        ...(quantitative
+          ? {
+              posting: {
+                entitlement_type: ent.entitlement_type,
+                lifecycle_event: "REDEEMED" as const,
+                vat_classification: vatClassification,
+                net_minor: netMinor,
+                vat_minor: vatMinor,
+                redeemed_gross_minor: amount,
+                redeemed_gross_to_date_minor: priorRedeemedGross,
+                redemption_id: redemptionId,
+                currency,
+                expected_currency: ent.issued_amount_currency ?? currency,
+              },
+            }
+          : {}),
       })
 
       return {
@@ -1536,11 +1581,30 @@ export class RedeemPartialEntitlementOperation {
       // Replay domeny: skutek pierwszego redeemu, ZERO ponownego obniżenia salda,
       // ZERO ponownego eventu/postingu (jeden derecognition posting, NIE podwaja).
       const rec = txOut.record
-      const txId = deriveLedgerTransactionId({
-        entitlement_id: rec.entitlement_id,
-        lifecycle_event: "REDEEMED",
-        redemption_id: rec.redemption_id,
-      })
+      // v1.16.0 Story 5.4 (AD-34): replay gałęzi usługowej nie ma czego
+      // deduplikować — pierwsza realizacja nie miała postingu kwotowego.
+      const replayPosting: TransitionPostingResult = txOut.quantitative
+        ? {
+            attempted: false,
+            activated: false,
+            persisted: false,
+            deduped: true,
+            transaction_id: deriveLedgerTransactionId({
+              entitlement_id: rec.entitlement_id,
+              lifecycle_event: "REDEEMED",
+              redemption_id: rec.redemption_id,
+            }),
+            reason:
+              "domain replay — redeem już zaksięgowany (idempotency_key+entitlement_id); jeden derecognition posting (NIE podwaja, AC2)",
+          }
+        : {
+            attempted: false,
+            activated: false,
+            persisted: false,
+            deduped: false,
+            reason:
+              "domain replay — gałąź usługowa (VOUCHER_SERVICE) nie ma postingu kwotowego (AD-34, ADR-237)",
+          }
       return {
         entitlement_id: rec.entitlement_id,
         redemption_id: rec.redemption_id,
@@ -1560,15 +1624,7 @@ export class RedeemPartialEntitlementOperation {
         withdrawal_right_extinguished: isWithdrawalRightExtinguished(
           rec.resulting_state
         ),
-        posting: {
-          attempted: false,
-          activated: false,
-          persisted: false,
-          deduped: true,
-          transaction_id: txId,
-          reason:
-            "domain replay — redeem już zaksięgowany (idempotency_key+entitlement_id); jeden derecognition posting (NIE podwaja, AC2)",
-        },
+        posting: replayPosting,
         idempotent: true,
         emit_failed: false,
       }
@@ -1845,20 +1901,27 @@ export class RedeemPartialEntitlementOperation {
         actor_hint: actorHint,
         occurred_at: occurredAt,
         transition_seq: `${reversalId}:reversal`,
-        posting: {
-          entitlement_type: ent.entitlement_type,
-          lifecycle_event: "REFUNDED",
-          vat_classification: vatClassification,
-          net_minor: reversalNetVat.netMinor,
-          vat_minor: reversalNetVat.vatMinor,
-          reversed_gross_minor: target.amount_minor,
-          reversed_gross_to_date_minor: priorTotals.reversed_minor,
-          redeemed_gross_total_minor: priorTotals.redeemed_minor,
-          // Dyskryminator = redemption_id WIERSZA ODWRACAJĄCEGO (ADR-178 §2.3).
-          redemption_id: reversalId,
-          currency,
-          expected_currency: ent.issued_amount_currency ?? currency,
-        },
+        // v1.16.0 Story 5.4 (ADR-237): realizacja usługowa nie ma postingu
+        // `REDEEMED`, więc odwrót nie może księgować jego odwrócenia —
+        // `REFUNDED` bez rozpoznania byłby wpisem bez pary w ledgerze.
+        ...(isQuantitativeRedemptionBranch(ent.entitlement_type)
+          ? {
+              posting: {
+                entitlement_type: ent.entitlement_type,
+                lifecycle_event: "REFUNDED" as const,
+                vat_classification: vatClassification,
+                net_minor: reversalNetVat.netMinor,
+                vat_minor: reversalNetVat.vatMinor,
+                reversed_gross_minor: target.amount_minor,
+                reversed_gross_to_date_minor: priorTotals.reversed_minor,
+                redeemed_gross_total_minor: priorTotals.redeemed_minor,
+                // Dyskryminator = redemption_id WIERSZA ODWRACAJĄCEGO (ADR-178 §2.3).
+                redemption_id: reversalId,
+                currency,
+                expected_currency: ent.issued_amount_currency ?? currency,
+              },
+            }
+          : {}),
       })
 
       const baseAfter = await tx.getCommissionBaseMinor(target.entitlement_id)

@@ -6,6 +6,7 @@
  * Nie wolno kierować tego testu do współdzielonej bazy dev.
  */
 import { createHmac } from "node:crypto"
+import { writeFileSync } from "node:fs"
 
 import { afterAll, beforeAll, beforeEach, describe, expect, it, jest } from "@jest/globals"
 import { Modules } from "@medusajs/framework/utils"
@@ -21,6 +22,10 @@ import { PAYMENT_INTENT_SUCCEEDED_EVENT } from "../../lib/payment/stripe-payment
 import { buildEventProcessedPurchaseQuery } from "../../modules/voucher/models/event-processed"
 import { marketContextStorage } from "../../lib/market-context"
 import { liveIssueEntitlementsWithinTx } from "../../workflows/entitlements/live-issue-from-payment-intent"
+import {
+  RESOLVE_ORDER_BY_PAYMENT_LINK_SQL,
+  resolvePaymentIntentLink,
+} from "../../lib/payment/stripe-payment-intent-link"
 import {
   numericMinorStringToSafeInteger,
   readDatabaseMinorIntegerStrict,
@@ -620,5 +625,80 @@ runOrSkip("F2 — multi-seller na realnej ścieżce PostgreSQL", () => {
       { order_id: ORDER_A, amount_minor: 22000 },
       { order_id: ORDER_B, amount_minor: 20000 },
     ])
+  })
+
+  // ── v1.16.0 Story 8.5 AC2 (FR-17, AD-16): order-set jednorynkowy ≠ link_ambiguous ──
+  // Kontrola dodatnia: zapytanie o zakup zwraca NIEPUSTY wynik na przygotowanym
+  // order-secie i ten wynik jest zapisywany do evidence (gdy ustawiono
+  // STORY_8_5_POSITIVE_CONTROL_OUT) ZANIM wykonamy zapytanie dające pustkę.
+  it("Story 8.5 AC2: order-set N=3 w jednym rynku → ok z N zamówieniami, nigdy link_ambiguous; kontrola dodatnia przed pustką", async () => {
+    const ORDER_C = "order_f2_seller_c"
+    await client.query(
+      `INSERT INTO "order" (id, sales_channel_id, metadata) VALUES ($1, 'sc_seller_a', NULL)`,
+      [ORDER_C]
+    )
+    await client.query(
+      `INSERT INTO order_payment_collection (order_id, payment_collection_id) VALUES ($1, $2)`,
+      [ORDER_C, COLLECTION_ID]
+    )
+
+    const linked = await client.query<{ order_id: string }>(RESOLVE_ORDER_BY_PAYMENT_LINK_SQL, [
+      SESSION_ID,
+      PAYMENT_INTENT_ID,
+    ])
+    const positiveIds = linked.rows.map((row) => row.order_id)
+    expect(positiveIds.length).toBeGreaterThan(0)
+    expect(positiveIds).toEqual([ORDER_A, ORDER_B, ORDER_C])
+
+    const resolution = await resolvePaymentIntentLink(client, {
+      payment_intent_id: PAYMENT_INTENT_ID,
+      session_id: SESSION_ID,
+    })
+    expect(resolution).not.toMatchObject({ reason: "link_ambiguous" })
+    expect(resolution.ok).toBe(true)
+    if (!resolution.ok) throw new Error(`oczekiwano ok, jest ${resolution.reason}`)
+    expect(resolution.orders.map((order) => order.order_id)).toEqual([ORDER_A, ORDER_B, ORDER_C])
+    expect(new Set(resolution.orders.map((order) => order.market_id))).toEqual(new Set([MARKET_ID]))
+
+    const out = process.env.STORY_8_5_POSITIVE_CONTROL_OUT
+    if (out) {
+      writeFileSync(
+        out,
+        JSON.stringify(
+          {
+            story: "8.5",
+            ac: "AC2",
+            query: "RESOLVE_ORDER_BY_PAYMENT_LINK_SQL + resolvePaymentIntentLink",
+            payment_intent_id: PAYMENT_INTENT_ID,
+            positive_control: { n: positiveIds.length, order_ids: positiveIds },
+            resolution: {
+              ok: resolution.ok,
+              order_ids: resolution.orders.map((order) => order.order_id),
+              markets: [...new Set(resolution.orders.map((order) => order.market_id))],
+            },
+            written_before_empty_query: true,
+          },
+          null,
+          2
+        ) + "\n"
+      )
+    }
+
+    // Dopiero po kontroli dodatniej: zakup bez zamówień daje pustkę i nazwaną klasę.
+    const empty = await client.query(RESOLVE_ORDER_BY_PAYMENT_LINK_SQL, [
+      "payses_bez_zamowien",
+      "pi_bez_zamowien",
+    ])
+    expect(empty.rows).toHaveLength(0)
+    const unresolved = await resolvePaymentIntentLink(client, {
+      payment_intent_id: "pi_bez_zamowien",
+      session_id: "payses_bez_zamowien",
+    })
+    expect(unresolved).toMatchObject({ ok: false, reason: "link_unresolved" })
+
+    const delivery = await postThroughRealPath(client, stripeEvent("evt_8_5_order_set_n3"))
+    expect(delivery.res.statusCode).toBe(200)
+    expect(delivery.res.body.reason).not.toBe("link_ambiguous")
+    expect(delivery.res.body.order_ids).toEqual([ORDER_A, ORDER_B, ORDER_C])
   })
 })

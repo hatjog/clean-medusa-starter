@@ -59,13 +59,8 @@
 
 import type { MedusaRequest, MedusaResponse } from "@medusajs/framework/http"
 import { ContainerRegistrationKeys } from "@medusajs/framework/utils"
-import type { Knex } from "knex"
 import { randomUUID } from "node:crypto"
-import {
-  HttpMarketContextError,
-  resolveSellerMarketId,
-  runInHttpMarketContext,
-} from "../../../../../lib/http-market-context"
+import { runInVendorSellerMarketContext } from "../../../../../lib/vendor-seller-market-context"
 import { resolveRlsConnectionSource } from "../../../../../lib/rls-connection-source"
 import {
   resolveVendorForSeller,
@@ -649,32 +644,24 @@ const handleRedeemRequest = async (
   // wierszy: `getByCode` zwróciłby `null` („voucher nie istnieje"), a `claim`
   // zostałby odrzucony przez `WITH CHECK`. Rynek pochodzi z uwierzytelnionego
   // sprzedawcy — vendor nie może go podać nagłówkiem, więc nie da się go podmienić.
-  const db = req.scope.resolve(ContainerRegistrationKeys.PG_CONNECTION) as Knex
-  let sellerMarketId: string
-  try {
-    sellerMarketId = await resolveSellerMarketId(db, authenticatedSellerId)
-  } catch (error) {
-    if (error instanceof HttpMarketContextError) {
-      res.status(409).json({
-        code: "MARKET_CONTEXT_REQUIRED",
-        message: error.message,
+  // Story 5.4 fix runda 2: jeden nośnik dla całego poddrzewa `/vendor/vouchers/*`
+  // (`runInVendorSellerMarketContext`) — ten sam co w trasie lookupu.
+  await runInVendorSellerMarketContext(
+    req,
+    res,
+    authenticatedSellerId,
+    async (sellerMarketId) => {
+      await redeemInSellerMarket(req, res, {
+        code,
+        vendorId,
+        authenticatedSellerId,
+        sellerMarketId,
+        idempotencyKeyHeader,
       })
-      return
-    }
-    throw error
-  }
-  // Rynek jest znany DOPIERO tutaj — to jedyne miejsce, w ktorym go publikujemy.
-  publishMarketId(sellerMarketId)
-
-  await runInHttpMarketContext(sellerMarketId, async () => {
-    await redeemInSellerMarket(req, res, {
-      code,
-      vendorId,
-      authenticatedSellerId,
-      sellerMarketId,
-      idempotencyKeyHeader,
-    })
-  })
+    },
+    // Rynek jest znany DOPIERO tutaj — to jedyne miejsce, w ktorym go publikujemy.
+    { onMarketResolved: publishMarketId },
+  )
 }
 
 async function redeemInSellerMarket(
