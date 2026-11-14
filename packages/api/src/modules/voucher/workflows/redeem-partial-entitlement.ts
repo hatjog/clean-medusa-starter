@@ -81,7 +81,7 @@ import type { VoucherStatus } from "../models/types"
  * Graf (3.4) prowadzi OBA przez `REDEMPTION_REQUESTED` → `REDEEMED_PARTIAL`/
  * `REDEEMED_FULL` (krawędzie istnieją; NIE zmieniamy taksonomii, D-5).
  */
-const REDEEMABLE_SOURCE_STATES: ReadonlySet<EntitlementInstanceState> = new Set([
+export const REDEEMABLE_SOURCE_STATES: ReadonlySet<EntitlementInstanceState> = new Set([
   EntitlementInstanceState.ACTIVE,
   EntitlementInstanceState.REDEEMED_PARTIAL,
 ])

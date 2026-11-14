@@ -3,10 +3,12 @@
  * (ADR-219 §4 człon 2, decyzja PO D-1: raportująca, nazwana).
  */
 import { describe, it, expect } from "@jest/globals"
-import { readFileSync } from "fs"
-import { join } from "path"
+import { execFileSync } from "child_process"
+import { existsSync, readFileSync } from "fs"
+import { join, resolve } from "path"
 import {
   checkGiftGenesis,
+  type KnownDivergenceEntry,
   GIFT_GENESIS_KNOWN_DIVERGENCE,
   type GenesisObservation,
 } from "../../../workflows/entitlements/gift-genesis-route-check"
@@ -22,16 +24,24 @@ const obs = (o: Partial<GenesisObservation>): GenesisObservation => ({
   ...o,
 })
 
-/** Stan genezy odczytany ze źródła: pierwszy `EntitlementInstanceState.X` po literale SQL `INSERT INTO entitlement_instance`. */
-function genesisStateFromSource(rel: string): string | null {
-  const text = readFileSync(join(__dirname, "../../../..", rel), "utf8")
-  // Literał SQL (backtick), nie wzmianka w komentarzu.
-  const at = /`\s*INSERT INTO entitlement_instance(?!`)/.exec(text)
-  if (!at) return null
-  const i = at.index
-  const m = /EntitlementInstanceState\.([A-Z_]+)/.exec(text.slice(i, i + 2500))
-  return m ? m[1] : null
+/**
+ * Review-fix R-9 (checkpoint 2026-11-14, D-6): jedno źródło przypadków reguł
+ * oceny dla TS i Pythona, plus JEDEN ekstraktor stanu (bramka Pythona) — test
+ * realnego źródła porównuje werdykty `checkGiftGenesis` z `--json` bramki,
+ * zamiast trzymać drugi ekstraktor (okno 2500 znaków) w TS.
+ */
+type Case = {
+  name: string
+  observations: GenesisObservation[]
+  allowlist: KnownDivergenceEntry[]
+  expected: [string, string][]
 }
+const CASES: Case[] = JSON.parse(
+  readFileSync(join(__dirname, "fixtures/gift-genesis-cases.json"), "utf8")
+).cases
+
+const REPO_ROOT = resolve(__dirname, "../../../../../../../..")
+const VALIDATOR = join(REPO_ROOT, "_grow/tools/validate_voucher_genesis_activation_contract.py")
 
 describe("Story 3.8 AC2 — gift + ACTIVE czerwieni z nazwą trasy", () => {
   it("fikstura: gift + ACTIVE na trasie spoza allowlisty ⇒ FAIL z nazwą trasy", () => {
@@ -115,21 +125,45 @@ describe("Story 3.8 AC2 — gift + ACTIVE czerwieni z nazwą trasy", () => {
     expect(r.ok).toBe(true)
   })
 
-  it("realne źródło: captured-path tworzy ACTIVE, Path Y tworzy ISSUED ⇒ jeden wiersz KNOWN-DIVERGENCE", () => {
-    const captured = genesisStateFromSource(CAPTURED)
-    const pathY = genesisStateFromSource(PATH_Y)
-    expect(captured).toBe("ACTIVE")
-    expect(pathY).toBe("ISSUED")
-    const r = checkGiftGenesis([
-      obs({ genesis_state: captured! }),
-      obs({ route: "path-y-live-issue", producer: PATH_Y, genesis_state: pathY! }),
-    ])
-    expect(r.ok).toBe(true)
-    expect(r.rows.filter((x) => x.verdict === "KNOWN-DIVERGENCE").map((x) => x.route)).toEqual([
+  it.each(CASES.map((c) => [c.name, c] as const))(
+    "parytet reguł TS ↔ Python (wspólna fikstura): %s",
+    (_name, c) => {
+      const r = checkGiftGenesis(c.observations, c.allowlist)
+      expect(r.rows.map((x) => [x.verdict, x.route])).toEqual(c.expected)
+    }
+  )
+
+  // Poza super-repo (samodzielny checkout submodułu) bramki Pythona nie ma —
+  // wtedy test jest jawnie pominięty z nazwą, nie zielony.
+  const realIt = existsSync(VALIDATOR) ? it : it.skip
+  realIt("realne źródło: werdykty TS == werdykty bramki Pythona; KNOWN-DIVERGENCE tylko captured-path", () => {
+    let out: string
+    try {
+      out = execFileSync("python3", [VALIDATOR, "--root", REPO_ROOT, "--json"], { encoding: "utf8" })
+    } catch (e) {
+      // exit 1 = FAIL w pomiarze — JSON i tak jest na stdout.
+      out = (e as { stdout?: string }).stdout ?? ""
+    }
+    const py = JSON.parse(out) as {
+      observations: GenesisObservation[]
+      allowlist: KnownDivergenceEntry[]
+      rows: { verdict: string; route: string }[]
+    }
+    expect(py.observations.length).toBeGreaterThanOrEqual(2)
+    expect(py.allowlist).toEqual(
+      GIFT_GENESIS_KNOWN_DIVERGENCE.map((e) => ({ ...e, refs: [...e.refs] }))
+    )
+    const ts = checkGiftGenesis(py.observations)
+    expect(ts.rows.map((x) => [x.verdict, x.route])).toEqual(
+      py.rows.map((x) => [x.verdict, x.route])
+    )
+    expect(ts.rows.filter((x) => x.verdict === "KNOWN-DIVERGENCE").map((x) => x.route)).toEqual([
       "captured-path",
     ])
+    const pathY = py.observations.find((o) => o.route === "path-y-live-issue")
+    expect(pathY?.genesis_state).toBe("ISSUED")
     // Wyjście kontroli — widoczne w logu przebiegu (evidence).
     // eslint-disable-next-line no-console
-    console.log(r.rows.map((x) => x.line).join("\n"))
+    console.log(ts.rows.map((x) => x.line).join("\n"))
   })
 })

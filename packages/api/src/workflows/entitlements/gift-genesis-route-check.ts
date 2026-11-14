@@ -25,9 +25,15 @@ export type GenesisObservation = {
   route: string
   /** Plik producenta genezy, względem `GP/backend/packages/api/`. */
   producer: string
-  purchase_mode: GenesisPurchaseMode
-  /** Stan, w którym producent tworzy wiersz `entitlement_instance`. */
-  genesis_state: string
+  /** `null` = tryb NIEZMIERZONY (producent rozgałęzia po trybie) ⇒ FAIL (R-6). */
+  purchase_mode: GenesisPurchaseMode | null
+  /** Stan, w którym producent tworzy wiersz `entitlement_instance`; `null` = nierozpoznany ⇒ FAIL (R-4). */
+  genesis_state: string | null
+  /**
+   * Zmierzony powód, dla którego trasa nie dotyczy genezy prezentu (np. następca,
+   * którego zbiór stanów źródła wyklucza `ISSUED`). Brak = trasa dotyczy (R-2/R-3).
+   */
+  not_applicable_reason?: string | null
 }
 
 export type KnownDivergenceEntry = {
@@ -85,7 +91,10 @@ function allowlistProblems(
 }
 
 /**
- * Ocena obserwacji genezy. Reguły:
+ * Ocena obserwacji genezy. Reguły (parytet z `evaluate()` bramki Pythona na
+ * wspólnych fiksturach `__tests__/workflows/entitlements/fixtures/gift-genesis-cases.json`, R-9):
+ *  - stan genezy albo `purchase_mode` nierozpoznany (`null`) → FAIL (fail-closed, R-4/R-6);
+ *  - zmierzony `not_applicable_reason` → PASS z nazwanym powodem;
  *  - gift + ACTIVE na trasie z allowlisty (route ORAZ producer) → KNOWN-DIVERGENCE;
  *  - gift + ACTIVE na każdej innej trasie → FAIL z nazwą trasy;
  *  - self + ACTIVE → PASS (kontrola mierzy domenę, nie trasę);
@@ -107,6 +116,25 @@ export function checkGiftGenesis(
   const usedAllowlist = new Set<KnownDivergenceEntry>()
 
   for (const o of observations) {
+    if (o.genesis_state == null || o.purchase_mode == null) {
+      const what = o.genesis_state == null ? "stan genezy" : "purchase_mode"
+      rows.push({
+        verdict: "FAIL",
+        route: o.route,
+        producer: o.producer,
+        line: `FAIL route=${o.route} producer=${o.producer}: ${what} NIEROZPOZNANY — kontrola nie zakłada stanu (fail-closed)`,
+      })
+      continue
+    }
+    if (o.not_applicable_reason) {
+      rows.push({
+        verdict: "PASS",
+        route: o.route,
+        producer: o.producer,
+        line: `PASS route=${o.route} producer=${o.producer} purchase_mode=${o.purchase_mode} genesis=${o.genesis_state} nie dotyczy genezy prezentu: ${o.not_applicable_reason}`,
+      })
+      continue
+    }
     const isGiftActive = o.purchase_mode === "gift" && o.genesis_state === ACTIVE
     if (!isGiftActive) {
       rows.push({
