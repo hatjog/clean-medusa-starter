@@ -21,6 +21,7 @@ import {
   type VatClassification,
 } from "../../modules/voucher/vat-resolver"
 import { VoucherPostingInvariantError } from "../../modules/voucher/posting-profile"
+import { readDatabaseMinorIntegerStrict } from "../../lib/payment/numeric-minor"
 
 /**
  * live-issue-from-payment-intent.ts — Story 3.3 (v1.11.0 Epic 3) — RDZEŃ live-issue
@@ -120,6 +121,107 @@ export type LiveIssueResult = {
   issued: LiveIssuedEntitlement[]
 }
 
+/**
+ * Story 8.4 (FR-16, AD-19, NFR-4) — zamknięty zbiór stanów wyniku pozycji.
+ * Kontrakt: `specs/contracts/checkout/gift-line-issue-outcome.v1.md`.
+ *   - `issued`         — co najmniej jeden entitlement linii powstał w TYM przebiegu;
+ *   - `already_issued` — wszystkie entitlementy linii już istniały (dedupe no-op);
+ *   - `not_voucher`    — linia bez żadnego markera entitlement (legalne pominięcie);
+ *   - `failed`         — wystawienie linii zawiodło; `reason` jest NAZWANY.
+ * Brak stanu domyślnego: każda linia zamówienia dostaje DOKŁADNIE jeden wpis.
+ */
+export const LINE_ISSUE_STATES = ["issued", "already_issued", "not_voucher", "failed"] as const
+export type LineIssueState = (typeof LINE_ISSUE_STATES)[number]
+
+/** Zamknięty zbiór nazwanych przyczyn porażki pozycji (bez wartości domyślnej). */
+export const LINE_ISSUE_FAILURE_REASONS = [
+  "incomplete_voucher_profile",
+  "entitlement_type_not_issuable",
+  "scope_unresolved",
+  "multi_recipient_per_line",
+  "posting_invariant_violated",
+  "issue_write_failed",
+] as const
+export type LineIssueFailureReason = (typeof LINE_ISSUE_FAILURE_REASONS)[number]
+
+export type LineIssueOutcome =
+  | {
+      line_item_id: string
+      state: "issued" | "already_issued"
+      entitlements: LiveIssuedEntitlement[]
+    }
+  | { line_item_id: string; state: "not_voucher" }
+  | {
+      line_item_id: string
+      state: "failed"
+      reason: LineIssueFailureReason
+      error_message: string
+    }
+
+/**
+ * Wynik trybu izolacji per linia. `event_processed` = event SKONSUMOWANY przez
+ * ten przebieg (wiersz `event_processed` zapisany). Przy częściowej porażce event
+ * NIE jest konsumowany (wiersz wycofany do savepointu), więc ponowna dostawa
+ * wraca do linii nieudanych, a linie udane są no-opem (`already_issued`).
+ */
+export type LiveIssuePerLineResult = LiveIssueResult & {
+  line_outcomes: LineIssueOutcome[]
+  failed_lines: Extract<LineIssueOutcome, { state: "failed" }>[]
+}
+
+/** Błąd pozycji z nazwaną przyczyną (klasyfikacja AC2 — bez domyślnej). */
+export class LineIssueError extends Error {
+  readonly reason: LineIssueFailureReason
+  readonly line_item_id: string
+  constructor(reason: LineIssueFailureReason, lineItemId: string, message: string) {
+    super(message)
+    this.name = "LineIssueError"
+    this.reason = reason
+    this.line_item_id = lineItemId
+  }
+}
+
+/**
+ * Częściowa porażka zakupu prezentowego (Story 8.4). Rzucana przez subscriber
+ * PO commicie linii udanych, żeby Medusa ponowiła event (retry/DLQ) — niesie
+ * pełny wynik per pozycja, nie zbiorczy komunikat.
+ */
+export class LiveIssuePartialFailureError extends Error {
+  readonly line_outcomes: LineIssueOutcome[]
+  readonly failed_lines: Extract<LineIssueOutcome, { state: "failed" }>[]
+  constructor(paymentIntentId: string, orderId: string, result: LiveIssuePerLineResult) {
+    super(
+      `live-issue: częściowa porażka (payment_intent ${paymentIntentId}, order ${orderId}) — ` +
+        `failed=${result.failed_lines.length}/${result.line_outcomes.length}: ` +
+        result.failed_lines
+          .map((f) => `${f.line_item_id}:${f.reason}`)
+          .join(", ")
+    )
+    this.name = "LiveIssuePartialFailureError"
+    this.line_outcomes = result.line_outcomes
+    this.failed_lines = result.failed_lines
+  }
+}
+
+/**
+ * Klasyfikacja błędu linii do zamkniętego zbioru przyczyn. Każdy błąd spoza
+ * nazwanych klas trafia do `issue_write_failed` z zachowanym komunikatem —
+ * to nazwana przyczyna („zapis linii zawiódł”), nie cichy fallback.
+ */
+function classifyLineError(err: unknown): LineIssueFailureReason {
+  if (err instanceof LineIssueError) return err.reason
+  if (err instanceof VoucherPostingInvariantError) return "posting_invariant_violated"
+  return "issue_write_failed"
+}
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? `${err.name}: ${err.message}` : String(err)
+}
+
+/** Nazwy savepointów (stałe — identyfikatory SQL, bez danych wejściowych). */
+const SAVEPOINT_EVENT = "gp_live_issue_event"
+const SAVEPOINT_LINE = "gp_live_issue_line"
+
 /** Surowy wiersz line-item z metadanymi (kształt jak w issue-entitlement.ts). */
 type OrderLineRow = {
   line_item_id: string
@@ -184,6 +286,90 @@ export async function liveIssueEntitlementsWithinTx(
   input: LiveIssueInput,
   now: Date
 ): Promise<LiveIssueResult> {
+  // Tryb all-or-nothing (zachowanie sprzed Story 8.4, jawnie nazwane w
+  // kontrakcie gift-line-issue-outcome.v1): pierwszy błąd linii rzuca ORYGINALNY
+  // wyjątek ⇒ caller wycofuje CAŁĄ tx. Ścieżka produkcyjna Path Y (subscriber)
+  // używa trybu izolacji `liveIssueEntitlementsPerLineWithinTx`.
+  const result = await runLiveIssue(client, input, now, "all_or_nothing")
+  return { event_processed: result.event_processed, issued: result.issued }
+}
+
+/**
+ * Story 8.4 (FR-16, AD-19) — tryb izolacji per linia. Każda linia voucherowa
+ * w osobnym SAVEPOINT: porażka linii cofa WYŁĄCZNIE jej zapisy, linie udane
+ * zostają. Przy jakiejkolwiek porażce wiersz `event_processed` NIE zostaje
+ * zapisany (rola runtime ma na nim tylko INSERT, więc cofnięcie idzie przez
+ * savepoint sprzed INSERT-u i ponowne, idempotentne wystawienie linii udanych),
+ * dzięki czemu retry eventu wraca do linii nieudanych. Caller MUSI po commicie
+ * potraktować `failed_lines.length > 0` jako porażkę (fail-loud, retry/DLQ).
+ */
+export async function liveIssueEntitlementsPerLineWithinTx(
+  client: LiveIssuePgClient,
+  input: LiveIssueInput,
+  now: Date
+): Promise<LiveIssuePerLineResult> {
+  const first = await runLiveIssue(client, input, now, "isolate_lines")
+  // Replay (event-level no-op) — savepoint już zwolniony w runLiveIssue.
+  if (!first.event_processed) return first
+  if (first.failed_lines.length === 0) {
+    await client.query(`RELEASE SAVEPOINT ${SAVEPOINT_EVENT}`)
+    return first
+  }
+
+  // Częściowa porażka: wycofaj CAŁY przebieg do savepointu sprzed INSERT-u
+  // event_processed (event zostaje NIEskonsumowany), po czym wystaw ponownie
+  // WYŁĄCZNIE linie, które się udały — bez zapisu event_processed.
+  await client.query(`ROLLBACK TO SAVEPOINT ${SAVEPOINT_EVENT}`)
+  const succeeded = new Set(
+    first.line_outcomes
+      .filter((o) => o.state === "issued" || o.state === "already_issued")
+      .map((o) => o.line_item_id)
+  )
+  const second = await runLiveIssue(client, input, now, "isolate_lines", {
+    onlyLineIds: succeeded,
+    skipEventInsert: true,
+  })
+  await client.query(`RELEASE SAVEPOINT ${SAVEPOINT_EVENT}`)
+
+  // Scal: wynik linii udanych z drugiego przebiegu (realny stan po rollbacku),
+  // porażki z pierwszego; kolejność = kolejność linii zamówienia.
+  const secondById = new Map(second.line_outcomes.map((o) => [o.line_item_id, o]))
+  const line_outcomes: LineIssueOutcome[] = first.line_outcomes.map((o) =>
+    succeeded.has(o.line_item_id) ? requireOutcome(secondById, o.line_item_id) : o
+  )
+  const failed_lines = line_outcomes.filter(
+    (o): o is Extract<LineIssueOutcome, { state: "failed" }> => o.state === "failed"
+  )
+  return {
+    event_processed: false,
+    issued: second.issued,
+    line_outcomes,
+    failed_lines,
+  }
+}
+
+function requireOutcome(
+  byId: Map<string, LineIssueOutcome>,
+  lineItemId: string
+): LineIssueOutcome {
+  const outcome = byId.get(lineItemId)
+  if (!outcome) {
+    throw new Error(
+      `liveIssueEntitlementsPerLineWithinTx: brak wyniku linii ${lineItemId} w przebiegu ponownym`
+    )
+  }
+  return outcome
+}
+
+type LiveIssueMode = "all_or_nothing" | "isolate_lines"
+
+async function runLiveIssue(
+  client: LiveIssuePgClient,
+  input: LiveIssueInput,
+  now: Date,
+  mode: LiveIssueMode,
+  options: { onlyLineIds?: ReadonlySet<string>; skipEventInsert?: boolean } = {}
+): Promise<LiveIssuePerLineResult> {
   const { payload, scope, event_type } = input
 
   if (!payload.order_id) {
@@ -217,10 +403,18 @@ export async function liveIssueEntitlementsWithinTx(
     // przez parsowanie `external_id` po separatorze.
     purchase_key: payload.payment_intent_id,
   })
-  const dedupe = await client.query(dedupeInsert.sql, dedupeInsert.params)
-  if ((dedupe.rowCount ?? 0) === 0) {
-    // event już skonsumowany (retry webhooka / multi-replica) ⇒ no-op.
-    return { event_processed: false, issued: [] }
+  if (!options.skipEventInsert) {
+    if (mode === "isolate_lines") {
+      await client.query(`SAVEPOINT ${SAVEPOINT_EVENT}`)
+    }
+    const dedupe = await client.query(dedupeInsert.sql, dedupeInsert.params)
+    if ((dedupe.rowCount ?? 0) === 0) {
+      // event już skonsumowany (retry webhooka / multi-replica) ⇒ no-op.
+      if (mode === "isolate_lines") {
+        await client.query(`RELEASE SAVEPOINT ${SAVEPOINT_EVENT}`)
+      }
+      return { event_processed: false, issued: [], line_outcomes: [], failed_lines: [] }
+    }
   }
 
   // ── kontekst orderu: sales_channel_id + market_id (ontologia 3.2) ──────────
@@ -266,8 +460,62 @@ export async function liveIssueEntitlementsWithinTx(
   )
 
   const issued: LiveIssuedEntitlement[] = []
+  const line_outcomes: LineIssueOutcome[] = []
 
   for (const line of lines.rows) {
+    if (options.onlyLineIds && !options.onlyLineIds.has(line.line_item_id)) continue
+    if (mode === "all_or_nothing") {
+      const outcome = await issueOrderLine(client, line, payload, scope, salesChannelId, marketId, now)
+      line_outcomes.push(outcome)
+      if (outcome.state === "issued" || outcome.state === "already_issued") {
+        issued.push(...outcome.entitlements)
+      }
+      continue
+    }
+    // isolate_lines: SAVEPOINT per linia — porażka cofa tylko zapisy TEJ linii.
+    await client.query(`SAVEPOINT ${SAVEPOINT_LINE}`)
+    try {
+      const outcome = await issueOrderLine(client, line, payload, scope, salesChannelId, marketId, now)
+      await client.query(`RELEASE SAVEPOINT ${SAVEPOINT_LINE}`)
+      line_outcomes.push(outcome)
+      if (outcome.state === "issued" || outcome.state === "already_issued") {
+        issued.push(...outcome.entitlements)
+      }
+    } catch (err) {
+      // NFR-4: catch MA skutek — cofnięcie zapisów linii + nazwany stan `failed`
+      // z przyczyną z zamkniętego zbioru; caller rzuca po commicie (retry/DLQ).
+      await client.query(`ROLLBACK TO SAVEPOINT ${SAVEPOINT_LINE}`)
+      await client.query(`RELEASE SAVEPOINT ${SAVEPOINT_LINE}`)
+      line_outcomes.push({
+        line_item_id: line.line_item_id,
+        state: "failed",
+        reason: classifyLineError(err),
+        error_message: errorMessage(err),
+      })
+    }
+  }
+
+  const failed_lines = line_outcomes.filter(
+    (o): o is Extract<LineIssueOutcome, { state: "failed" }> => o.state === "failed"
+  )
+  return { event_processed: !options.skipEventInsert, issued, line_outcomes, failed_lines }
+}
+
+/**
+ * Wystawienie JEDNEJ linii zamówienia (Story 8.4: wyodrębnione z pętli, żeby
+ * tryb izolacji mógł objąć linię savepointem). Rzuca `LineIssueError` z nazwaną
+ * przyczyną; zwraca wynik linii z zamkniętego zbioru stanów.
+ */
+async function issueOrderLine(
+  client: LiveIssuePgClient,
+  line: OrderLineRow,
+  payload: PaymentIntentSucceededPayload,
+  scope: LiveIssueScope,
+  salesChannelId: string | null,
+  marketId: string | null,
+  now: Date
+): Promise<LineIssueOutcome> {
+  {
     const profile =
       extractProfile(line.metadata, payload) ??
       extractProductProfile(line.product_metadata, payload)
@@ -283,7 +531,9 @@ export async function liveIssueEntitlementsWithinTx(
         hasVoucherIntent(line.metadata) ||
         hasProductVoucherIntent(line.product_metadata)
       ) {
-        throw new Error(
+        throw new LineIssueError(
+          "incomplete_voucher_profile",
+          line.line_item_id,
           `liveIssueEntitlementsWithinTx: linia voucherowa ${line.line_item_id} ` +
             `(payment_intent ${payload.payment_intent_id}) niesie markery entitlement ` +
             `w linii albo produkcie, ale profil jest NIEKOMPLETNY ` +
@@ -291,7 +541,9 @@ export async function liveIssueEntitlementsWithinTx(
             `fail-loud (retry/DLQ), NIE ciche pominięcie`
         )
       }
-      continue // linia faktycznie non-voucher (zero markerów) — legalne pominięcie
+      // linia faktycznie non-voucher (zero markerów) — legalne pominięcie, ale
+      // z JAWNYM stanem (AC2: żadna pozycja bez stanu).
+      return { line_item_id: line.line_item_id, state: "not_voucher" }
     }
 
     // L4: entitlement_type MUSI być znanym, AKTYWNYM typem PRZED INSERT — zła
@@ -338,7 +590,9 @@ export async function liveIssueEntitlementsWithinTx(
     // FR10 happy-path (N recipientów na RÓŻNYCH liniach = różny `line_item_id`)
     // działa normalnie — każda linia to osobny (order_id, line_item_id).
     if (recipients.length > 1) {
-      throw new Error(
+      throw new LineIssueError(
+        "multi_recipient_per_line",
+        line.line_item_id,
         `liveIssueEntitlementsWithinTx: multi-recipient-per-line NIEOBSŁUGIWANY ` +
           `(C1 deferowany) — linia ${line.line_item_id} (order ${payload.order_id}, ` +
           `payment_intent ${payload.payment_intent_id}) niesie ${recipients.length} ` +
@@ -349,6 +603,7 @@ export async function liveIssueEntitlementsWithinTx(
       )
     }
 
+    const lineIssued: LiveIssuedEntitlement[] = []
     for (const recipient of recipients) {
       const issuedRow = await issueSingleIssuedRow(
         client,
@@ -369,11 +624,22 @@ export async function liveIssueEntitlementsWithinTx(
         },
         now
       )
-      issued.push(issuedRow)
+      lineIssued.push(issuedRow)
+    }
+    if (lineIssued.length === 0) {
+      // Linia voucherowa bez recipientów nie może dać stanu „pustego sukcesu”.
+      throw new LineIssueError(
+        "incomplete_voucher_profile",
+        line.line_item_id,
+        `liveIssueEntitlementsWithinTx: linia voucherowa ${line.line_item_id} nie dała żadnego entitlementu`
+      )
+    }
+    return {
+      line_item_id: line.line_item_id,
+      state: lineIssued.some((e) => e.created) ? "issued" : "already_issued",
+      entitlements: lineIssued,
     }
   }
-
-  return { event_processed: true, issued }
 }
 
 /**
@@ -418,14 +684,18 @@ function assertIssuableEntitlementType(
   payload: PaymentIntentSucceededPayload
 ): void {
   if (!isEntitlementType(entitlementType)) {
-    throw new Error(
+    throw new LineIssueError(
+      "entitlement_type_not_issuable",
+      lineItemId,
       `liveIssueEntitlementsWithinTx: nieznany entitlement_type "${entitlementType}" ` +
         `(linia ${lineItemId}, payment_intent ${payload.payment_intent_id}) — odrzucony ` +
         `fail-closed przed INSERT (poza taksonomią ADR-099)`
     )
   }
   if (!isActiveEntitlementType(entitlementType as EntitlementType)) {
-    throw new Error(
+    throw new LineIssueError(
+      "entitlement_type_not_issuable",
+      lineItemId,
       `liveIssueEntitlementsWithinTx: entitlement_type "${entitlementType}" jest NIEAKTYWNY ` +
         `(linia ${lineItemId}, payment_intent ${payload.payment_intent_id}) — live-issue ` +
         `dozwolony wyłącznie dla aktywnych typów (bonbeauty SPV/MPV); hard-gate'y ` +
@@ -447,7 +717,9 @@ function assertScopeResolved(
 ): string {
   const resolved = readString(value)
   if (!resolved) {
-    throw new Error(
+    throw new LineIssueError(
+      "scope_unresolved",
+      lineItemId,
       `liveIssueEntitlementsWithinTx: ${field} nierozwiązywalny na ścieżce live ` +
         `(linia ${lineItemId}, order ${payload.order_id}, payment_intent ` +
         `${payload.payment_intent_id}) — fail-loud przed INSERT (retry), NIE zapis ` +
@@ -1104,11 +1376,11 @@ function readNumber(value: unknown): number | undefined {
 }
 
 /** Koercja wyłącznie wartości SQL; pg zwraca NUMERIC jako string. */
+// Story 3.5 (FR-13, NFR-2): bez `Number(string)` — dokładna zamiana łańcucha
+// NUMERIC (BigInt); wartość poza bezpiecznym zakresem ⇒ `undefined`
+// (fail-loud w `assertPositiveIntegerMinor`), nie cicho zaokrąglona kwota.
 function readDatabaseNumber(value: unknown): number | undefined {
-  if (typeof value === "number") return Number.isFinite(value) ? value : undefined
-  if (typeof value !== "string" || !value.trim()) return undefined
-  const parsed = Number(value)
-  return Number.isFinite(parsed) ? parsed : undefined
+  return readDatabaseMinorIntegerStrict(value) ?? undefined
 }
 
 function readObject(value: unknown): Record<string, unknown> | undefined {

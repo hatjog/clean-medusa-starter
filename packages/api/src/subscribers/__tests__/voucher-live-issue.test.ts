@@ -13,6 +13,7 @@ import subscriber, {
   PAYMENT_INTENT_SUCCEEDED_EVENT,
   toLiveIssueInput,
 } from "../voucher-live-issue"
+import { LiveIssuePartialFailureError } from "../../workflows/entitlements/live-issue-from-payment-intent"
 import { marketContextStorage } from "../../lib/market-context"
 
 describe("Story 3.3 — toLiveIssueInput (mapowanie envelope.v1, fail-loud NFR4)", () => {
@@ -275,5 +276,149 @@ describe("Story 3.4 — subscriber okablowuje genezę ISSUED (event + audit; pos
     const { container } = makeFakeContainer() // resolve('event_bus') rzuca → bus null
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await expect(subscriber({ event: envelopeEvent(), container } as any)).resolves.toBeUndefined()
+  })
+})
+
+// ===========================================================================
+// Story 8.4 (v1.16.0, FR-16, AD-19, NFR-4) — warstwa subskrybenta przy
+// częściowej porażce pozycji prezentowych: COMMIT linii udanych (brak ROLLBACK),
+// okablowanie tylko udanych, potem fail-loud z wynikiem per pozycja.
+// ===========================================================================
+function makePartialFailureContainer() {
+  const eventProcessed = new Set<string>()
+  const entitlements = new Map<string, string>()
+  const txLog: string[] = []
+  const log: string[] = []
+  const emitted: Array<{ name: string; data: unknown }> = []
+  const savepoints: Array<{ name: string; ev: Set<string>; ent: Map<string, string> }> = []
+
+  const line = (id: string, sellerName: string) => ({
+    line_item_id: id,
+    line_unit_price: "24900",
+    line_title: "Masaż relaksacyjny 60 min",
+    seller_id: "sel_bonbeauty_1",
+    seller_name: sellerName,
+    seller_handle: "bon-beauty",
+    metadata: {
+      entitlement_profile_id: "p",
+      entitlement_type: "VOUCHER_SERVICE",
+      policy: { vat_rate_uniqueness: true },
+      recipients: [{ customer_id: `cus_${id}` }],
+    },
+  })
+  // Linia 2 bez nazwy salonu ⇒ geneza kodu vouchera rzuca PO INSERT entitlementu.
+  const lines = [line("li_a", "Salon"), line("li_b", ""), line("li_c", "Salon")]
+
+  const client = {
+    query: async (sql: string, values: ReadonlyArray<unknown> = []) => {
+      const t = sql.trim()
+      if (/^(BEGIN|COMMIT|ROLLBACK)$/i.test(t)) {
+        txLog.push(t.toUpperCase())
+        return { rows: [], rowCount: 0 }
+      }
+      let m = /^SAVEPOINT (\w+)$/i.exec(t)
+      if (m) {
+        savepoints.push({ name: m[1], ev: new Set(eventProcessed), ent: new Map(entitlements) })
+        return { rows: [], rowCount: 0 }
+      }
+      m = /^ROLLBACK TO SAVEPOINT (\w+)$/i.exec(t)
+      if (m) {
+        const idx = savepoints.map((s) => s.name).lastIndexOf(m[1])
+        const snap = savepoints[idx]
+        savepoints.length = idx + 1
+        eventProcessed.clear()
+        snap.ev.forEach((k) => eventProcessed.add(k))
+        entitlements.clear()
+        snap.ent.forEach((v, k) => entitlements.set(k, v))
+        return { rows: [], rowCount: 0 }
+      }
+      m = /^RELEASE SAVEPOINT (\w+)$/i.exec(t)
+      if (m) {
+        savepoints.length = savepoints.map((s) => s.name).lastIndexOf(m[1])
+        return { rows: [], rowCount: 0 }
+      }
+      if (/INSERT INTO event_processed/i.test(sql)) {
+        const key = `${values[0]}|${values[1]}`
+        if (eventProcessed.has(key)) return { rows: [], rowCount: 0 }
+        eventProcessed.add(key)
+        return { rows: [], rowCount: 1 }
+      }
+      if (/FROM "order"/i.test(sql)) {
+        return { rows: [{ sales_channel_id: "sc_x", metadata: { gp: { market_id: "bonbeauty" } } }], rowCount: 1 }
+      }
+      if (/FROM order_item/i.test(sql)) return { rows: lines, rowCount: lines.length }
+      if (/INSERT INTO entitlement_instance/i.test(sql)) {
+        const key = values[11] as string
+        if (entitlements.has(key)) return { rows: [], rowCount: 0 }
+        entitlements.set(key, values[4] as string)
+        return { rows: [{ id: values[0] }], rowCount: 1 }
+      }
+      return { rows: [], rowCount: 0 }
+    },
+    release: () => undefined,
+  }
+  const container = {
+    resolve: (key: string) => {
+      if (key === "__pg_pool__") return { connect: async () => client }
+      if (key === "event_bus") {
+        return {
+          emit: async (e: { name: string; data: unknown }) => {
+            txLog.push("EMIT")
+            emitted.push(e)
+          },
+        }
+      }
+      if (key === "logger") {
+        return {
+          info: (msg: string) => log.push(`info:${msg}`),
+          warn: (msg: string) => log.push(`warn:${msg}`),
+          error: (msg: string) => log.push(`error:${msg}`),
+        }
+      }
+      throw new Error(`unresolved ${key}`)
+    },
+  }
+  return { container, entitlements, eventProcessed, txLog, log, emitted, lines, line }
+}
+
+describe("Story 8.4 — subscriber przy częściowej porażce pozycji prezentowych", () => {
+  it("COMMIT linii udanych (brak ROLLBACK), okablowanie 2 udanych, potem rzut z wynikiem per pozycja", async () => {
+    const { container, entitlements, eventProcessed, txLog, emitted, log } = makePartialFailureContainer()
+    let caught: unknown
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await subscriber({ event: envelopeEvent(), container } as any)
+    } catch (err) {
+      caught = err
+    }
+    expect(caught).toBeInstanceOf(LiveIssuePartialFailureError)
+    const failure = caught as LiveIssuePartialFailureError
+    expect(failure.line_outcomes.map((o) => [o.line_item_id, o.state])).toEqual([
+      ["li_a", "issued"],
+      ["li_b", "failed"],
+      ["li_c", "issued"],
+    ])
+    expect(failure.failed_lines[0]).toMatchObject({ line_item_id: "li_b", reason: "issue_write_failed" })
+
+    expect(txLog).toEqual(["BEGIN", "COMMIT", "EMIT", "EMIT"])
+    expect([...entitlements.values()].sort()).toEqual(["li_a", "li_c"])
+    expect(emitted).toHaveLength(2)
+    // Event NIE skonsumowany ⇒ retry/DLQ wraca do linii nieudanej.
+    expect(eventProcessed.size).toBe(0)
+    expect(log.some((l) => l.startsWith("error:") && l.includes('"reason":"issue_write_failed"'))).toBe(true)
+  })
+
+  it("retry po naprawie linii ⇒ tylko linia nieudana okablowana, event skonsumowany", async () => {
+    const ctx = makePartialFailureContainer()
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await expect(subscriber({ event: envelopeEvent(), container: ctx.container } as any)).rejects.toBeInstanceOf(
+      LiveIssuePartialFailureError
+    )
+    ctx.lines[1] = ctx.line("li_b", "Salon")
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await subscriber({ event: envelopeEvent(), container: ctx.container } as any)
+    expect(ctx.entitlements.size).toBe(3)
+    expect(ctx.emitted).toHaveLength(3)
+    expect(ctx.eventProcessed.size).toBe(1)
   })
 })

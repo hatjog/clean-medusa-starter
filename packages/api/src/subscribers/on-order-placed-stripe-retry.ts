@@ -54,7 +54,14 @@ import { ContainerRegistrationKeys, Modules } from "@medusajs/framework/utils"
 
 import { toKnexPositionalSql } from "../lib/knex-positional-sql"
 import { PAYMENT_INTENT_SUCCEEDED_EVENT } from "../lib/payment/stripe-payment-intent-event"
-import { STRIPE_PATH_Y_WEBHOOK_PROVIDER } from "../lib/payment/stripe-payment-intent-transport"
+import {
+  DEFERRED_ISSUANCE_EVENT_SUFFIX,
+  STRIPE_PATH_Y_WEBHOOK_PROVIDER,
+} from "../lib/payment/stripe-payment-intent-transport"
+import {
+  closeDeferredIssuanceTraceGuarded,
+  DEFERRED_ISSUANCE_TRACE_CLOSURE_ORDER_PLACED,
+} from "../lib/recovery/deferred-issuance-trace"
 import { resolveRuntimeInstanceId } from "../lib/market-context"
 import {
   buildGenesisActiveTransition,
@@ -71,7 +78,11 @@ import {
   MissingEntitlementProfileError,
   VoucherIssuanceBlockedError,
 } from "../workflows/entitlements/issue-entitlement"
-import { liveIssueEntitlementsWithinTx } from "../workflows/entitlements/live-issue-from-payment-intent"
+import { liveIssueEntitlementsPerLineWithinTx } from "../workflows/entitlements/live-issue-from-payment-intent"
+import {
+  numericMinorStringToSafeInteger,
+  readNumericMinorString,
+} from "../lib/payment/numeric-minor"
 
 /**
  * Wartości `webhook_event_processed.provider`, które mogą nieść ślad deferral.
@@ -350,7 +361,11 @@ export type DeferredCaptureRow = {
   market_id: string | null
   payment_intent_id: string | null
   envelope: Record<string, unknown>
-  amount_minor: number | null
+  /**
+   * Story 3.5 (DW-15-134): `payment.amount` jest NUMERIC, node-pg zwraca go
+   * jako STRING — wartość zostaje łańcuchem (jednostki minor), bez `Number()`.
+   */
+  amount_minor: string | null
   currency: string | null
   payment_id: string | null
 }
@@ -375,7 +390,7 @@ async function findDeferredCapturesForOrder(
     provider: string
     market_id: string | null
     envelope: Record<string, unknown>
-    amount: number | null
+    amount: string | number | null
     currency_code: string | null
     payment_id: string | null
     payment_intent_id: string | null
@@ -394,12 +409,10 @@ async function findDeferredCapturesForOrder(
     // brak kwoty stawał się kwotą zerową już tutaj, o jeden poziom przed
     // walidacją. Brak wartości zostaje `null` i jest odrzucany tam, gdzie
     // odrzucane są pozostałe nieczytelne pola.
-    amount_minor:
-      typeof r.amount === "number"
-        ? r.amount
-        : r.amount === null || r.amount === undefined
-          ? null
-          : Number(r.amount),
+    //
+    // Story 3.5 (DW-15-134): bez `Number(r.amount)` — NUMERIC zostaje
+    // łańcuchem; nieczytelny ⇒ `null` (odmowa niżej, nie zero).
+    amount_minor: readNumericMinorString(r.amount),
     currency: r.currency_code?.toUpperCase() ?? null,
     payment_id: r.payment_id,
   }))
@@ -521,7 +534,10 @@ export function buildPathYRecoveryInput(
   // legalną kwotą, więc cicha domyślna jest tu nieodróżnialna od pomiaru;
   // odmowa jest odróżnialna i ląduje w tym samym kanale, co pozostałe pola
   // (wiersz zostaje NIEROZWIĄZANY, `logger.warn` niesie `field`).
-  if (amountMinor === null || !Number.isFinite(amountMinor)) {
+  // Story 3.5: zamiana łańcucha na liczbę kontraktu koperty jest DOKŁADNA
+  // (BigInt) — wartość poza bezpiecznym zakresem jest odmową, nie zaokrągleniem.
+  const normalizedAmountMinor = numericMinorStringToSafeInteger(amountMinor)
+  if (normalizedAmountMinor === null) {
     throw new PathYRecoveryInputError(
       row.event_id,
       "amount_minor",
@@ -530,7 +546,6 @@ export function buildPathYRecoveryInput(
         "zamiast cichego zera"
     )
   }
-  const normalizedAmountMinor = Math.trunc(amountMinor)
   if (normalizedAmountMinor < 0) {
     throw new PathYRecoveryInputError(
       row.event_id,
@@ -584,12 +599,73 @@ export default async function onOrderPlacedStripeRetry({
           try {
             if (row.provider === STRIPE_PATH_Y_WEBHOOK_PROVIDER) {
               const input = buildPathYRecoveryInput(row, orderId)
-              const result = await liveIssueEntitlementsWithinTx(
+              // Story 8.4 fix (checkpoint PO): odzysk Path Y jest ścieżką
+              // NORMALNĄ (wyścig payment_intent.succeeded × completeCart), więc
+              // idzie trybem izolacji per linia, nie all-or-nothing — porażka
+              // jednej pozycji nie cofa pozycji udanych.
+              const result = await liveIssueEntitlementsPerLineWithinTx(
                 client,
                 input,
                 new Date()
               )
-              await markDeferredResolved(client, row.event_id, orderId, new Date())
+              const partialFailure = result.failed_lines.length > 0
+              if (partialFailure) {
+                // Marker ZOSTAJE nierozwiązany (bez `markDeferredResolved`):
+                // to on jest nośnikiem populacji odzysku linii nieudanych
+                // (kontrakt gift-line-issue-outcome.v1 §Semantyka p.5). Linie
+                // udane są okablowane poniżej i commitują się z tą transakcją.
+                logger.error?.(
+                  `[on-order-placed-stripe-retry] order_id=${orderId} ` +
+                    `event_id=${row.event_id} Path Y częściowa porażka ` +
+                    `failed=${result.failed_lines.length}/${result.line_outcomes.length} ` +
+                    `— marker odroczony zostaje NIEROZWIĄZANY (populacja odzysku): ` +
+                    `line_outcomes=${JSON.stringify(
+                      result.line_outcomes.map((o) =>
+                        o.state === "failed"
+                          ? { line_item_id: o.line_item_id, state: o.state, reason: o.reason }
+                          : { line_item_id: o.line_item_id, state: o.state }
+                      )
+                    )}`
+                )
+              } else {
+                await markDeferredResolved(client, row.event_id, orderId, new Date())
+              }
+
+              // Story 4.4 (AC2): domknięcie TRWAŁEGO rekordu śladu w tej samej
+              // transakcji co wystawienie — stan terminalny z zapisaną ścieżką
+              // i evidence; wiersz zostaje (historia czytelna). Marker
+              // Path Y ma klucz `<evt>#deferred-issuance` = `trace_id`.
+              const stripeEventId = row.event_id.endsWith(DEFERRED_ISSUANCE_EVENT_SUFFIX)
+                ? row.event_id.slice(0, -DEFERRED_ISSUANCE_EVENT_SUFFIX.length)
+                : null
+              if (stripeEventId) {
+                const closed = await closeDeferredIssuanceTraceGuarded(client, {
+                  stripe_event_id: stripeEventId,
+                  instance_id: input.scope.instance_id,
+                  market_id: input.scope.market_id,
+                  order_id: orderId,
+                  closure_path: DEFERRED_ISSUANCE_TRACE_CLOSURE_ORDER_PLACED,
+                  evidence: {
+                    resolver: "subscriber:on-order-placed-stripe-retry",
+                    payment_intent_id: input.payload.payment_intent_id,
+                    entitlements_issued: result.issued.length,
+                    resolved_at: new Date().toISOString(),
+                  },
+                })
+                if (!closed.ok) {
+                  logger.warn?.(
+                    `[on-order-placed-stripe-retry] order_id=${orderId} trace=${row.event_id} ` +
+                      `domkniecie rekordu deferred_issuance_trace NIEUDANE (wystawienie zachowane): ${closed.error}`
+                  )
+                } else {
+                  logger.info?.(
+                    `[on-order-placed-stripe-retry] order_id=${orderId} trace=${row.event_id} ` +
+                      (closed.version === null
+                        ? "rekord deferred_issuance_trace nieobecny albo juz domkniety dla tego zamowienia"
+                        : `rekord deferred_issuance_trace domkniety (issued_after_link, version=${closed.version})`)
+                  )
+                }
+              }
 
               const appendAudit = makeTransitionAuditSink(logger)
               const issuedAt = new Date()
@@ -662,7 +738,9 @@ export default async function onOrderPlacedStripeRetry({
                 payment_id: row.payment_id ?? undefined,
                 payment_intent_id: row.payment_intent_id ?? undefined,
                 market_id: row.market_id,
-                amount_minor: row.amount_minor,
+                // Story 3.5: kwota PI nie jest kwotą vouchera — wystawienie
+                // bierze kwotę z linii; tu tylko dokładna liczba albo `null`.
+                amount_minor: numericMinorStringToSafeInteger(row.amount_minor),
                 currency: row.currency,
                 entitlement_profile: null,
               },

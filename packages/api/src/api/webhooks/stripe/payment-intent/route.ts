@@ -64,6 +64,7 @@ import {
   type PaymentIntentLinkResolution,
 } from "../../../../lib/payment/stripe-payment-intent-link"
 import { stampPaymentIntentOrderFacts } from "../../../../lib/payment/stripe-payment-intent-metadata-stamp"
+import { recordWebhookDeferredIssuanceTrace } from "../../../../lib/recovery/deferred-issuance-trace-runtime"
 import {
   persistDeferredIssuanceMarker,
   queryUnderMarketContext,
@@ -108,8 +109,33 @@ type LoggerLike = {
   error?: (message: string) => void
 }
 
+/**
+ * Story 8.4 fix (checkpoint PO, MEDIUM): opcje zadania event busa dla emisji
+ * `gp.stripe.payment_intent_succeeded.v1`.
+ *
+ * `@medusajs/event-bus-redis` buduje zadanie z domyślnym `attempts: 1`; bez tej
+ * stałej rzut `LiveIssuePartialFailureError` z subskrybenta `voucher-live-issue`
+ * kończył się ostrzeżeniem „Retrying is not configured" i linia nieudana NIGDY
+ * nie była ponawiana. Ponowienie Stripe'a tego nie zastępuje: po trafieniu
+ * rezerwacji route zwraca 5xx `owed_units_unsettled` BEZ ponownej emisji
+ * (kontrakt `gift-line-issue-outcome.v1` §Ponowienie). Ponowienie busa
+ * dotyczy WYŁĄCZNIE subskrybentów, którzy padli (`completedSubscriberIds`).
+ *
+ * Harmonogram wykładniczy 30 s → 60 s → 120 s → 240 s (łącznie ~7,5 min po
+ * pierwszej próbie). Po wyczerpaniu prób jednostka zostaje nierozliczona
+ * (brak wiersza `event_processed`) — populacja odzysku opisana w kontrakcie.
+ */
+export const PAYMENT_INTENT_SUCCEEDED_EMIT_OPTIONS = Object.freeze({
+  attempts: 5,
+  backoff: Object.freeze({ type: "exponential" as const, delay: 30_000 }),
+})
+
 type EventBusLike = {
-  emit: (event: { name: string; data: unknown }) => Promise<unknown> | unknown
+  emit: (event: {
+    name: string
+    data: unknown
+    options?: Record<string, unknown>
+  }) => Promise<unknown> | unknown
 }
 
 type RawBodyRequest = MedusaRequest & {
@@ -339,6 +365,18 @@ export async function POST(
         `[stripe/payment-intent] ${resolution.reason}: ${resolution.detail}; ` +
           `event_age_seconds=${eventAgeSeconds ?? "unknown"}; retryable_link_race=${retryableLinkRace}`,
       )
+      // Story 4.4: przy wyścigu przejściowym ślad jest TAKŻE trwałym rekordem
+      // z właścicielem (AD-32 (b)), obok markera transportu; wywołanie nie rzuca.
+      if (resolution.reason === "link_unresolved" && retryableLinkRace) {
+        await recordWebhookDeferredIssuanceTrace(req.scope, handle.client, logger, {
+          stripe_event_id: deliveryEventId,
+          payment_intent_id: paymentIntentId,
+          instance_id: instanceId,
+          session_id: identifiers.session_id ?? null,
+          metadata_market_id: identifiers.market_id ?? null,
+          read_psp_occurred_at: () => readDeferredPspOccurredAt(stripeEvent),
+        })
+      }
       // Ślad deferral TYLKO dla wyścigu przejściowego. `link_ambiguous` i reszta
       // są trwałe — ponowienie ich nie naprawi, a ślad zamieniłby się w pętlę
       // odzysku wołaną przy każdym `order.placed` tego zamówienia.
@@ -622,7 +660,11 @@ export async function POST(
     try {
       const eventBus = req.scope.resolve(Modules.EVENT_BUS) as EventBusLike
       for (const envelope of envelopes) {
-        await eventBus.emit({ name: PAYMENT_INTENT_SUCCEEDED_EVENT, data: envelope })
+        await eventBus.emit({
+          name: PAYMENT_INTENT_SUCCEEDED_EVENT,
+          data: envelope,
+          options: { ...PAYMENT_INTENT_SUCCEEDED_EMIT_OPTIONS },
+        })
       }
     } catch (err) {
       const error = err as Error

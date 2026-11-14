@@ -21,6 +21,11 @@ import { PAYMENT_INTENT_SUCCEEDED_EVENT } from "../../lib/payment/stripe-payment
 import { buildEventProcessedPurchaseQuery } from "../../modules/voucher/models/event-processed"
 import { marketContextStorage } from "../../lib/market-context"
 import { liveIssueEntitlementsWithinTx } from "../../workflows/entitlements/live-issue-from-payment-intent"
+import {
+  numericMinorStringToSafeInteger,
+  readDatabaseMinorIntegerStrict,
+  readNumericMinorString,
+} from "../../lib/payment/numeric-minor"
 
 // Story 3.1 C3-SEC-002: instancja RLS wyłącznie ze źródła serwerowego (GP_INSTANCE_ID),
 // bez domyślnego "gp" — testy ustawiają ją jawnie.
@@ -555,5 +560,40 @@ runOrSkip("F2 — multi-seller na realnej ścieżce PostgreSQL", () => {
     expect(delivery.res.statusCode).toBe(200)
     expect(delivery.res.body.emitted_count).toBe(2)
     expect(delivery.res.body.order_ids).toEqual([ORDER_A, ORDER_B])
+  })
+
+  // ── Story 3.5 AC1 (DW-15-134): realna kolumna NUMERIC przez node-pg ──
+  it("3.5 AC1: NUMERIC z node-pg jest stringiem i zostaje łańcuchem; zamiana dokładna albo odmowa", async () => {
+    await client.query(
+      `UPDATE order_line_item SET unit_price = '22000.00' WHERE id = 'li_seller_a'`
+    )
+    const raw = (
+      await client.query(`SELECT unit_price FROM order_line_item WHERE id = 'li_seller_a'`)
+    ).rows[0].unit_price
+    expect(typeof raw).toBe("string")
+    expect(raw).toBe("22000.00")
+    expect(readNumericMinorString(raw)).toBe("22000.00")
+    expect(readDatabaseMinorIntegerStrict(raw)).toBe(22000)
+
+    const big = (await client.query(`SELECT '9007199254740993'::numeric AS v`)).rows[0].v
+    expect(typeof big).toBe("string")
+    expect(readNumericMinorString(big)).toBe("9007199254740993")
+    // `Number(big)` dałoby 9007199254740992 — po cichu inna kwota.
+    expect(numericMinorStringToSafeInteger(readNumericMinorString(big))).toBeNull()
+
+    // Pełna ścieżka: cena linii '22000.00' (string z PG) → voucher 22000.
+    const first = await postThroughRealPath(client, stripeEvent())
+    expect(first.res.statusCode).toBe(200)
+    expect(
+      (
+        await client.query(
+          `SELECT order_id, (policy_snapshot->>'amount_minor')::integer AS amount_minor
+             FROM entitlement_instance ORDER BY order_id`
+        )
+      ).rows
+    ).toEqual([
+      { order_id: ORDER_A, amount_minor: 22000 },
+      { order_id: ORDER_B, amount_minor: 20000 },
+    ])
   })
 })
