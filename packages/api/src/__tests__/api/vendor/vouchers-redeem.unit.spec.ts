@@ -1710,3 +1710,133 @@ describe("Story 6.2 — wpiecie nosnika NFR-11 w POST /vendor/vouchers/:code/red
     expect(warn).toHaveBeenCalledTimes(HOT_PATH_WARN_CLASS_BUDGET)
   })
 })
+
+/**
+ * v1.16.0 Story 5.5 — odmowa ponownej realizacji z komunikatem czytelnym
+ * (FR-19, AD-34, NFR-4; ADR-219 §4 człon 3, DW-15-210; ADR-243 `Proposed`).
+ */
+describe("Story 5.5 — odmowa realizacji czytelna dla sprzedawczyni", () => {
+  const CLAIMED_AT = new Date("2026-05-24T10:00:00Z")
+
+  function claimedVoucher() {
+    return makeVoucher({
+      status: "claimed",
+      events: [{ event_type: "claimed", occurred_at: CLAIMED_AT }],
+    })
+  }
+
+  async function redeemWith(
+    opts: Parameters<typeof makeRequest>[0],
+    headers: Record<string, string> = {},
+  ) {
+    const req = makeRequest(opts) as unknown as {
+      headers: Record<string, string>
+    }
+    Object.assign(req.headers, headers)
+    const res = makeRes()
+    await redeemPOST(req as never, res as never)
+    return res
+  }
+
+  it("AC1 — drugi redeem (warstwa uprawnienia odmawia pierwsza) ⇒ 409 already_redeemed + kiedy i przez kogo", async () => {
+    const mock = voucherMock(claimedVoucher())
+    const res = await redeemWith({
+      voucherService: mock,
+      redemptionDb: createRedemptionFakeDb({ entitlementState: "REDEEMED_FULL" }),
+    })
+    expect(res.statusCode).toBe(409)
+    const body = res.body as {
+      code: string
+      reason: string
+      redemption?: { redeemed_at: string | null; redeemed_by: string }
+    }
+    expect(body.code).toBe("VOUCHER_ALREADY_REDEEMED")
+    expect(body.reason).toBe("already_redeemed")
+    expect(body.redemption).toEqual({
+      redeemed_at: CLAIMED_AT.toISOString(),
+      redeemed_by: "own_seller",
+    })
+    // Bez PII i bez danych innego najemcy.
+    expect(JSON.stringify(body)).not.toMatch(/@/)
+    expect(JSON.stringify(body)).not.toContain(OTHER_SELLER_ID)
+  })
+
+  it("AC1 — odmowa z blokady redeemForSeller (przegrany wyścig) też niesie fakt realizacji", async () => {
+    const claimed = claimedVoucher()
+    const mock = voucherMock(makeVoucher(), {
+      status: "refused",
+      reason: "already_redeemed",
+      voucher: claimed,
+    })
+    const res = await redeemWith({ voucherService: mock })
+    expect(res.statusCode).toBe(409)
+    const body = res.body as {
+      reason: string
+      redemption?: { redeemed_at: string | null; redeemed_by: string }
+    }
+    expect(body.reason).toBe("already_redeemed")
+    expect(body.redemption?.redeemed_at).toBe(CLAIMED_AT.toISOString())
+    expect(body.redemption?.redeemed_by).toBe("own_seller")
+  })
+
+  it("AC1 — odmowa innym powodem NIE dokleja faktu realizacji", async () => {
+    const expired = makeVoucher({ expires_at: new Date(Date.now() - 86_400_000) })
+    const mock = voucherMock(expired, {
+      status: "refused",
+      reason: "expired",
+      voucher: expired,
+    })
+    const res = await redeemWith({ voucherService: mock })
+    expect(res.statusCode).toBe(410)
+    expect((res.body as Record<string, unknown>).redemption).toBeUndefined()
+  })
+
+  it("AC2 — reason maszynowy niezależny od Accept-Language, status != 500", async () => {
+    const reasons = new Set<string>()
+    for (const lang of ["pl-PL", "en-US", "de-DE", "xx"]) {
+      const mock = voucherMock(claimedVoucher())
+      const res = await redeemWith(
+        {
+          voucherService: mock,
+          redemptionDb: createRedemptionFakeDb({ entitlementState: "REDEEMED_FULL" }),
+        },
+        { "accept-language": lang },
+      )
+      expect(res.statusCode).toBe(409)
+      expect(res.statusCode).not.toBe(500)
+      reasons.add((res.body as { reason: string }).reason)
+    }
+    expect([...reasons]).toEqual(["already_redeemed"])
+  })
+
+  it("AC3 — prezent ISSUED przed aktywacją ⇒ 422 REDEMPTION_REFUSED, reason not_yet_active, bez wewnętrznego id", async () => {
+    const mock = voucherMock(makeVoucher({ status: "idle" }))
+    const res = await redeemWith({
+      voucherService: mock,
+      redemptionDb: createRedemptionFakeDb({ entitlementState: "ISSUED" }),
+    })
+    expect(res.statusCode).toBe(422)
+    const body = res.body as { code: string; reason?: string; message: string }
+    expect(body.code).toBe("REDEMPTION_REFUSED")
+    expect(body.reason).toBe("not_yet_active")
+    expect(typeof body.message).toBe("string")
+    expect(body.message.length).toBeGreaterThan(0)
+    expect(body.message).not.toContain(ENTITLEMENT_ID)
+    expect(body.message).not.toContain(VOUCHER_CODE)
+    expect(body.message).not.toMatch(/entitlement|ISSUED/)
+    // Mutacja nie zaszła.
+    expect(mock.redeemForSeller).not.toHaveBeenCalled()
+  })
+
+  it("AC3 — kontrola: inny stan uprawnienia przy voucherze idle NIE dostaje not_yet_active", async () => {
+    const mock = voucherMock(makeVoucher({ status: "idle" }))
+    const res = await redeemWith({
+      voucherService: mock,
+      redemptionDb: createRedemptionFakeDb({ entitlementState: "VOIDED" }),
+    })
+    expect(res.statusCode).toBe(422)
+    const body = res.body as { code: string; reason?: string }
+    expect(body.code).toBe("REDEMPTION_REFUSED")
+    expect(body.reason).toBeUndefined()
+  })
+})

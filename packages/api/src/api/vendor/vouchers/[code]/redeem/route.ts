@@ -85,7 +85,12 @@ import {
 } from "../../../../../lib/instrumentation/posthog-metrics-client"
 import { maskActorId } from "../../../../../lib/instrumentation/posthog-canary"
 import { resolveMeasurementContext } from "../../../../../lib/instrumentation/track"
-import { REDEEM_REFUSALS } from "../../../../../modules/voucher/models/types"
+import {
+  ENTITLEMENT_STATE_REFUSALS,
+  REDEEM_REFUSALS,
+  resolveEntitlementStateRefusalReason,
+  type EntitlementStateRefusalReason,
+} from "../../../../../modules/voucher/models/types"
 import { VOUCHER_NOT_FOUND_BODY } from "../lookup/route"
 import {
   buildAuditLogIdFromIdempotencyKey,
@@ -740,7 +745,11 @@ async function redeemInSellerMarket(
         throw new VoucherNotFoundDuringRedeemError(context.voucher_code)
       }
       if (result.status === "refused") {
-        throw new VoucherRefusedDuringRedeemError(result.reason, context.voucher_code)
+        throw new VoucherRefusedDuringRedeemError(
+          result.reason,
+          context.voucher_code,
+          redemptionFactFor(result.reason, result.voucher.events),
+        )
       }
       priorStatus = result.prior_status
       claimedAt =
@@ -791,7 +800,26 @@ async function redeemInSellerMarket(
       if (reason) {
         respondToRedemptionError(
           res,
-          new VoucherRefusedDuringRedeemError(reason, code),
+          new VoucherRefusedDuringRedeemError(
+            reason,
+            code,
+            redemptionFactFor(reason, current.events),
+          ),
+        )
+        return
+      }
+      // v1.16.0 Story 5.5 (AC3, ADR-219 §4 człon 3): stan vouchera realizację
+      // dopuszcza, a odmawia STAN UPRAWNIENIA (prezent `ISSUED` przed
+      // aktywacją). Do 5.5 ta gałąź spadała do ogólnego `REDEMPTION_REFUSED`
+      // z surowym `error.message` (identyfikator uprawnienia w treści) i bez
+      // `reason` — sprzedawczyni nie miała czego przeczytać.
+      const entitlementReason = resolveEntitlementStateRefusalReason(
+        error.entitlement_state,
+      )
+      if (entitlementReason) {
+        respondToRedemptionError(
+          res,
+          new EntitlementStateRefusedDuringRedeemError(entitlementReason),
         )
         return
       }
@@ -925,14 +953,71 @@ class VoucherRefusedDuringRedeemError extends Error {
   readonly reason: RedeemRefusalReason
   readonly error_code: string
   readonly http_status: number
+  readonly redemption: RedemptionFact | null
 
-  constructor(reason: RedeemRefusalReason, code: string) {
+  constructor(
+    reason: RedeemRefusalReason,
+    code: string,
+    redemption: RedemptionFact | null = null,
+  ) {
     super(`voucher '${code}': ${REFUSAL_MESSAGES[reason]}`)
     this.name = "VoucherRefusedDuringRedeemError"
     this.reason = reason
+    this.redemption = redemption
     this.error_code = REDEEM_REFUSALS[reason].api_code
     this.http_status = REDEEM_REFUSALS[reason].http_status
   }
+}
+
+/**
+ * Fakt realizacji („kiedy i przez kogo”) dla odmowy `already_redeemed`
+ * (v1.16.0 Story 5.5, AC1, FR-19).
+ *
+ * Źródło wyłącznie z danych ISTNIEJĄCYCH: czas to najwcześniejsze zdarzenie
+ * `claimed` vouchera, a realizujący to SPRZEDAWCA, w którego zakresie voucher
+ * jest odczytany (`getForSeller` / blokada `redeemForSeller`) — realizacja
+ * jest możliwa wyłącznie w zakresie właściciela. Osoby (członka zespołu)
+ * nie da się wyprowadzić bez nowej kolumny (`voucher_redemption` nie ma
+ * kolumny aktora; D-35 p.16: bez migracji) — DW-15-328. Żadnego e-maila ani
+ * danych innego najemcy w odpowiedzi.
+ */
+type RedemptionFact = {
+  redeemed_at: string | null
+  redeemed_by: "own_seller"
+}
+
+function redemptionFactFor(
+  reason: RedeemRefusalReason,
+  events:
+    | Array<{ event_type: string; occurred_at: Date | string }>
+    | undefined,
+): RedemptionFact | null {
+  if (reason !== "already_redeemed") return null
+  return { redeemed_at: earliestClaimedAt(events), redeemed_by: "own_seller" }
+}
+
+/**
+ * Odmowa STANU UPRAWNIENIA (v1.16.0 Story 5.5, AC3). Kod i status z
+ * `ENTITLEMENT_STATE_REFUSALS`; `message` jest stałym zdaniem diagnostycznym
+ * BEZ identyfikatora uprawnienia i bez kodu vouchera.
+ */
+class EntitlementStateRefusedDuringRedeemError extends Error {
+  readonly reason: EntitlementStateRefusalReason
+  readonly error_code: string
+  readonly http_status: number
+
+  constructor(reason: EntitlementStateRefusalReason) {
+    super(ENTITLEMENT_REFUSAL_MESSAGES[reason])
+    this.name = "EntitlementStateRefusedDuringRedeemError"
+    this.reason = reason
+    this.error_code = ENTITLEMENT_STATE_REFUSALS[reason].api_code
+    this.http_status = ENTITLEMENT_STATE_REFUSALS[reason].http_status
+  }
+}
+
+const ENTITLEMENT_REFUSAL_MESSAGES: Record<EntitlementStateRefusalReason, string> = {
+  not_yet_active:
+    "ten voucher nie jest jeszcze aktywny — prezent nie został aktywowany, więc nie można go zrealizować",
 }
 
 /**
@@ -975,6 +1060,17 @@ function respondToRedemptionError(res: MedusaResponse, error: unknown): void {
   // v1.15.0 Story 5.8 (AC7): odmowa niesie ROZRÓŻNIALNY powód jako pole
   // `reason` obok kodu — panel mapuje je na zdanie po polsku.
   if (error instanceof VoucherRefusedDuringRedeemError) {
+    res.status(error.http_status).json({
+      code: error.error_code,
+      reason: error.reason,
+      message: error.message,
+      // v1.16.0 Story 5.5 (AC1): „kiedy i przez kogo” — tylko przy
+      // `already_redeemed`; pozostałe odmowy nie mają faktu realizacji.
+      ...(error.redemption ? { redemption: error.redemption } : {}),
+    })
+    return
+  }
+  if (error instanceof EntitlementStateRefusedDuringRedeemError) {
     res.status(error.http_status).json({
       code: error.error_code,
       reason: error.reason,

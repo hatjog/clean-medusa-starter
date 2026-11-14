@@ -114,6 +114,36 @@ export const REDEEM_REFUSALS = {
 export type RedeemRefusalReason = keyof typeof REDEEM_REFUSALS
 
 /**
+ * v1.16.0 Story 5.5 (AC3, ADR-219 §4 człon 3, ADR-243 `Proposed`): powód
+ * odmowy wynikający ze STANU UPRAWNIENIA, gdy stan vouchera sam z siebie
+ * realizację dopuszcza (np. prezent `ISSUED` przed aktywacją: voucher `idle`,
+ * uprawnienie jeszcze nieaktywne).
+ *
+ * Osobna oś, a NIE pozycja `REDEEM_REFUSALS`: kod odpowiedzi zostaje
+ * `REDEMPTION_REFUSED`/422 (wymóg AC3), a schemat słownika v3 dopuszcza w
+ * `refusal_reasons[].api_code` wyłącznie `VOUCHER_*` — włączenie tej osi do
+ * kontraktu wymaga majora v4 (DW-15-327).
+ */
+export const ENTITLEMENT_STATE_REFUSALS = {
+  not_yet_active: { api_code: "REDEMPTION_REFUSED", http_status: 422 },
+} as const
+
+export type EntitlementStateRefusalReason =
+  keyof typeof ENTITLEMENT_STATE_REFUSALS
+
+/**
+ * Stany uprawnienia, dla których odmowa ma powód z `ENTITLEMENT_STATE_REFUSALS`.
+ * Pozostałe stany spoza `REDEEMABLE_SOURCE_STATES` tłumaczy stan vouchera
+ * (`resolveRedeemRefusalReason`) albo zostają ogólnym `REDEMPTION_REFUSED`.
+ */
+export function resolveEntitlementStateRefusalReason(
+  entitlementState: string | null | undefined,
+): EntitlementStateRefusalReason | null {
+  if (entitlementState === "ISSUED") return "not_yet_active"
+  return null
+}
+
+/**
  * Wynik JEDNEJ operacji domenowej przyjmującej najemcę
  * (`VoucherService.redeemForSeller`, v1.15.0 Story 5.8, AD-20).
  *
