@@ -36,10 +36,10 @@ jest.mock("../../workflows/entitlements/issue-entitlement", () => {
 
 jest.mock("../../workflows/entitlements/live-issue-from-payment-intent", () => ({
   __esModule: true,
-  liveIssueEntitlementsWithinTx: jest.fn(),
+  liveIssueEntitlementsPerLineWithinTx: jest.fn(),
 }))
 
-import { liveIssueEntitlementsWithinTx } from "../../workflows/entitlements/live-issue-from-payment-intent"
+import { liveIssueEntitlementsPerLineWithinTx } from "../../workflows/entitlements/live-issue-from-payment-intent"
 import onOrderPlacedStripeRetry, {
   FIND_DEFERRED_CAPTURES_SQL,
 } from "../../subscribers/on-order-placed-stripe-retry"
@@ -100,8 +100,8 @@ function closes(sent: SentQuery[]) {
 }
 
 beforeEach(() => {
-  ;(liveIssueEntitlementsWithinTx as jest.Mock).mockReset()
-  ;(liveIssueEntitlementsWithinTx as jest.Mock).mockResolvedValue({ event_processed: true, issued: [] })
+  ;(liveIssueEntitlementsPerLineWithinTx as jest.Mock).mockReset()
+  ;(liveIssueEntitlementsPerLineWithinTx as jest.Mock).mockResolvedValue({ event_processed: true, issued: [], line_outcomes: [], failed_lines: [] })
 })
 
 describe("Story 4.4 — domknięcie rekordu w on-order-placed-stripe-retry", () => {
@@ -189,7 +189,7 @@ describe("Story 4.4 R-5 — domknięcie rekordu w voucher-live-issue (ponowienie
   })
 
   it("replay (event_processed=false) nie domyka; porażka domknięcia zostawia warn i nie rzuca", async () => {
-    ;(liveIssueEntitlementsWithinTx as jest.Mock).mockResolvedValueOnce({ event_processed: false, issued: [] })
+    ;(liveIssueEntitlementsPerLineWithinTx as jest.Mock).mockResolvedValueOnce({ event_processed: false, issued: [], line_outcomes: [], failed_lines: [] })
     const replay = makeHarness()
     await runLive(replay, envelope)
     expect(closes(replay.sent)).toHaveLength(0)

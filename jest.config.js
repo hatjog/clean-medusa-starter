@@ -160,6 +160,12 @@ if (process.env.TEST_TYPE === "integration:http") {
     "**/packages/api/src/__tests__/integration/story-11-1-retention-inventory-pg.integration.test.[jt]s",
     "**/packages/api/src/__tests__/integration/story-11-1-runtime-writers-pg.integration.test.[jt]s",
   ];
+} else if (process.env.TEST_TYPE === "story-8-4-partial-line-failure-pg") {
+  // v1.16.0 Story 8.4 — częściowa porażka pozycji prezentowych (SAVEPOINT per
+  // linia) na realnym PG; DATABASE_URL musi wskazywać bazę `*_test`.
+  module.exports.testMatch = [
+    "**/packages/api/src/__tests__/integration/story-8-4-partial-line-failure-pg.integration.test.[jt]s",
+  ];
 } else if (process.env.TEST_TYPE === "unit") {
   module.exports.testMatch = [
     "**/packages/api/src/**/__tests__/**/*.unit.spec.[jt]s",
