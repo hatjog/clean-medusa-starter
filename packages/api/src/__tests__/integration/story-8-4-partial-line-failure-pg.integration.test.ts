@@ -80,7 +80,7 @@ runOrSkip("Story 8.4 — częściowa porażka pozycji prezentowych na realnym PG
       `CREATE TEMP TABLE "order" (id text PRIMARY KEY, sales_channel_id text, metadata jsonb, deleted_at timestamptz)`,
       `CREATE TEMP TABLE order_line_item (id text PRIMARY KEY, product_id text, unit_price numeric NOT NULL,
          title text, metadata jsonb, deleted_at timestamptz)`,
-      `CREATE TEMP TABLE order_item (order_id text NOT NULL, item_id text NOT NULL,
+      `CREATE TEMP TABLE order_item (order_id text NOT NULL, item_id text NOT NULL, quantity numeric NOT NULL DEFAULT 1,
          created_at timestamptz NOT NULL, deleted_at timestamptz)`,
       `CREATE TEMP TABLE product (id text PRIMARY KEY, title text, metadata jsonb, deleted_at timestamptz)`,
       `CREATE TEMP TABLE product_product_seller_seller (product_id text NOT NULL, seller_id text NOT NULL, deleted_at timestamptz)`,
@@ -92,6 +92,12 @@ runOrSkip("Story 8.4 — częściowa porażka pozycji prezentowych na realnym PG
       `CREATE TEMP TABLE event_processed (external_id text NOT NULL, event_type text NOT NULL,
          processed_at bigint NOT NULL, purchase_key text, market_id text, instance_id text,
          PRIMARY KEY (external_id, event_type))`,
+      `CREATE TEMP TABLE owed_unit_effect_barrier (
+         -- Story 3.3: lustro Migration20261114140000SharedIdempotencyBarrier (klucz bez event_type).
+         owed_business_unit_key text PRIMARY KEY, payment_intent_id text NOT NULL,
+         order_id text NOT NULL, instance_id text NOT NULL, market_id text NOT NULL,
+         claimed_by_path text NOT NULL, claimed_at timestamptz NOT NULL DEFAULT now()
+       )`,
       `CREATE TEMP TABLE entitlement_instance (id text PRIMARY KEY, entitlement_profile_id text NOT NULL,
          entitlement_type text NOT NULL, order_id text NOT NULL, line_item_id text NOT NULL,
          state text NOT NULL, policy_snapshot jsonb NOT NULL, market_id text NOT NULL,

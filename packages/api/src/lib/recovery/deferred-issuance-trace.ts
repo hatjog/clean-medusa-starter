@@ -14,8 +14,14 @@
  *     zero joinów; zmiana/usunięcie markera transportu nie zmienia wyniku.
  *
  * Właściciel: rola operatorska `ops-recovery` (D-35 p.9). Termin (`deadline`)
- * liczy się z SLA w config-as-code (`recovery-config.ts`) — progu wieku nie
- * ustala ta story (należy do 4.5), więc w tym pliku nie ma literału okresu.
+ * liczy się z SLA w config-as-code (`recovery-config.ts`); próg wieku (4.5)
+ * też mieszka w `recovery-config.ts` — w tym pliku nie ma literału okresu.
+ *
+ *  4. ODCZYT populacji ponad progiem wieku (Story 4.5) —
+ *     `listDeferredIssuanceTracesOverAgeThreshold`: wiek liczony w BAZIE
+ *     z jednej migawki (`statement_timestamp()` w jednej instrukcji), próg
+ *     przez binding z `DEFERRED_ISSUANCE_TRACE_AGE_THRESHOLD`; zero
+ *     parametrów czasu z aplikacji.
  *
  * Tożsamość rekordu = klucz markera (`<event_id>#deferred-issuance`), ten sam,
  * którym posługuje się krok `dit-backfill` planu migracji. Zapis żywy
@@ -31,8 +37,11 @@ import {
   RECOVERY_MIGRATION_PLAN,
 } from "./recovery-migration-plan"
 import {
+  assertDeferredIssuanceTraceAgeThreshold,
   assertDeferredIssuanceTraceSla,
+  DEFERRED_ISSUANCE_TRACE_AGE_THRESHOLD,
   DEFERRED_ISSUANCE_TRACE_SLA,
+  type DeferredIssuanceTraceAgeThresholdConfig,
   type DeferredIssuanceTraceSlaConfig,
 } from "./recovery-config"
 
@@ -282,6 +291,68 @@ export async function listDeferredIssuanceTracePopulation(client: TraceQueryClie
     []
   )
   return result.rows
+}
+
+/**
+ * Populacja ponad progiem wieku (Story 4.5, AD-32). JEDNA instrukcja, JEDNA
+ * migawka czasu: `statement_timestamp()` jest stały w obrębie instrukcji, więc
+ * kolumna `age_seconds`, `measured_at` i predykat `WHERE` widzą ten sam
+ * „teraz". Jedyny binding to próg w sekundach (`$1`) — czas aplikacji nie
+ * wchodzi do zapytania. Wiek liczony od `psp_occurred_at` (czas zdarzenia
+ * PSP), zgodnie z `age_source = 'database_now_minus_occurred_at'`.
+ * Zakres zawęża RLS (`market_isolation`) — wołający ustawia kontekst rynku.
+ */
+export const LIST_DEFERRED_ISSUANCE_TRACES_OVER_AGE_THRESHOLD_SQL = `
+  SELECT trace_id, instance_id, market_id, state, owner_type, owner_id, deadline,
+         occurred_at, psp_occurred_at, payment_intent_id, stripe_event_id, age_source,
+         statement_timestamp() AS measured_at,
+         EXTRACT(EPOCH FROM (statement_timestamp() - psp_occurred_at))::bigint AS age_seconds
+    FROM ${DEFERRED_ISSUANCE_TRACE_TABLE}
+   WHERE state = 'awaiting_order'
+     AND statement_timestamp() - psp_occurred_at > make_interval(secs => $1::double precision)
+   ORDER BY psp_occurred_at ASC, trace_id ASC
+`
+
+export type DeferredIssuanceTraceOverAgeRow = {
+  trace_id: string
+  instance_id: string
+  market_id: string
+  state: string
+  owner_type: string
+  owner_id: string
+  deadline: unknown
+  occurred_at: unknown
+  psp_occurred_at: unknown
+  payment_intent_id: string | null
+  stripe_event_id: string | null
+  age_source: string
+  measured_at: unknown
+  age_seconds: string | number
+}
+
+/** Próg wieku w sekundach z config-as-code (fail-loud). */
+export function readDeferredIssuanceTraceAgeThresholdSeconds(
+  config:
+    | Partial<DeferredIssuanceTraceAgeThresholdConfig>
+    | null
+    | undefined = DEFERRED_ISSUANCE_TRACE_AGE_THRESHOLD
+): number {
+  return assertDeferredIssuanceTraceAgeThreshold(config)
+}
+
+export async function listDeferredIssuanceTracesOverAgeThreshold(
+  client: TraceQueryClient,
+  config:
+    | Partial<DeferredIssuanceTraceAgeThresholdConfig>
+    | null
+    | undefined = DEFERRED_ISSUANCE_TRACE_AGE_THRESHOLD
+): Promise<{ threshold_seconds: number; rows: DeferredIssuanceTraceOverAgeRow[] }> {
+  const thresholdSeconds = readDeferredIssuanceTraceAgeThresholdSeconds(config)
+  const result = await client.query<DeferredIssuanceTraceOverAgeRow>(
+    LIST_DEFERRED_ISSUANCE_TRACES_OVER_AGE_THRESHOLD_SQL,
+    [thresholdSeconds]
+  )
+  return { threshold_seconds: thresholdSeconds, rows: result.rows }
 }
 
 export type GuardedCloseOutcome =
