@@ -166,7 +166,12 @@ export type SyncSummary = {
   ok: boolean
   instance_id: string
   market_id: string
-  vendors: { created: number; updated: number; skipped: number }
+  vendors: { created: number; updated: number; skipped: number; rejected: number }
+  /**
+   * Story 7.9 (NFR-4) — odmowy zamkniętego katalogu statusów vendora. Typowany
+   * kanał: odmowa nie istnieje wyłącznie jako tekst w `warnings`.
+   */
+  vendor_status_rejections: VendorStatusRejection[]
   vendor_seller_mappings: { created: number; updated: number; failed: number }
   vendor_seller_mapping_failures: Array<{ vendor_id: string; seller_id: string; reason: string }>
   spl: { created: number; skipped: number; missing_products: number; pruned: number }
@@ -720,25 +725,42 @@ export async function resolveProductByFixture(
   }
 }
 
-function vendorStatusToSellerStatus(status: string | undefined): string {
+/**
+ * Story 7.9 (DW-15-177, FR-8, NFR-4) — zamknięty katalog statusów vendora.
+ * Wartość spoza katalogu (literówka, brak pola) NIE jest mapowana na `open`:
+ * fail-closed, rekord jest odrzucany przez synchronizację.
+ */
+export const VENDOR_STATUS_UNRECOGNIZED = "vendor_status_unrecognized" as const
+
+export type VendorStatusMapping =
+  | { ok: true; status: "pending_approval" | "open" | "suspended" | "terminated" }
+  | { ok: false; reason: typeof VENDOR_STATUS_UNRECOGNIZED }
+
+export type VendorStatusRejection = {
+  vendor_id: string
+  status: string | null
+  reason: typeof VENDOR_STATUS_UNRECOGNIZED
+}
+
+export function vendorStatusToSellerStatus(status: string | undefined): VendorStatusMapping {
   switch (status) {
     case "pending_approval":
     case "pending":
-      return "pending_approval"
+      return { ok: true, status: "pending_approval" }
     case "open":
     case "onboarded":
     case "active":
-      return "open"
+      return { ok: true, status: "open" }
     case "suspended":
     case "paused":
     case "inactive":
-      return "suspended"
+      return { ok: true, status: "suspended" }
     case "terminated":
     case "archived":
     case "disabled":
-      return "terminated"
+      return { ok: true, status: "terminated" }
     default:
-      return "open"
+      return { ok: false, reason: VENDOR_STATUS_UNRECOGNIZED }
   }
 }
 
@@ -937,11 +959,18 @@ export async function upsertSeller(
   }
 
   const { match: existingSeller, reason: matchReason } = selectSellerMatch(existingSellers, marketId)
-  const sellerStatus = vendorStatusToSellerStatus(vendor.status)
+  const sellerStatusMapping = vendorStatusToSellerStatus(vendor.status)
 
   if (matchReason) {
     return { sellerId: null, action: "skipped", note: matchReason }
   }
+
+  // Story 7.9 — druga linia obrony dla wywołań spoza pętli synchronizacji:
+  // nierozpoznany status nigdy nie tworzy ani nie aktualizuje sprzedawcy.
+  if (!sellerStatusMapping.ok) {
+    return { sellerId: null, action: "skipped", note: sellerStatusMapping.reason }
+  }
+  const sellerStatus = sellerStatusMapping.status
 
   if (!existingSeller) {
     // ---- CREATE: fresh vendor ----
@@ -1350,7 +1379,8 @@ export default async function gpConfigSyncVendors({ container, args }: ExecArgs)
   /** ADR-165 §4 / cykl 5 — co `--force` faktycznie zniszczył. */
   const vendorOverwritten: VendorContentOverwrite[] = []
 
-  const vendorCounts = { created: 0, updated: 0, skipped: 0 }
+  const vendorCounts = { created: 0, updated: 0, skipped: 0, rejected: 0 }
+  const vendorStatusRejections: VendorStatusRejection[] = []
   // DW-15-173: mapowanie sprzedawca Mercura -> vendor GP. Liczone OSOBNO od
   // sprzedawcow, bo „sprzedawca zsynchronizowany" i „sprzedawca zmapowany" to
   // dwa rozne stany — a przez cale wydanie mylily sie w jeden.
@@ -1375,6 +1405,30 @@ export default async function gpConfigSyncVendors({ container, args }: ExecArgs)
         note: "missing slug",
       })
       vendorCounts.skipped++
+      continue
+    }
+
+    // Story 7.9 — fail-closed: status spoza katalogu = odmowa per rekord,
+    // przed jakimkolwiek zapisem sprzedawcy; pozostałe rekordy biegną dalej.
+    const statusMapping = vendorStatusToSellerStatus(vendor.status)
+    if (!statusMapping.ok) {
+      vendorStatusRejections.push({
+        vendor_id: vendor.vendor_id,
+        status: vendor.status ?? null,
+        reason: statusMapping.reason,
+      })
+      vendorCounts.rejected++
+      pushUniqueWarning(
+        warnings,
+        seenWarnings,
+        `Vendor '${vendor.vendor_id}': ${statusMapping.reason} (status='${vendor.status ?? ""}'); skipping`
+      )
+      collector?.add({
+        entityType: "seller",
+        handle: vendor.slug.trim(),
+        action: "skip",
+        note: statusMapping.reason,
+      })
       continue
     }
 
@@ -1516,7 +1570,7 @@ export default async function gpConfigSyncVendors({ container, args }: ExecArgs)
       }
 
       // SellerProductLink sync — skip for suspended vendors
-      const isSuspended = vendorStatusToSellerStatus(vendor.status) === "suspended"
+      const isSuspended = statusMapping.status === "suspended"
       if (isSuspended) {
         pushUniqueWarning(
           warnings,
@@ -1832,6 +1886,7 @@ export default async function gpConfigSyncVendors({ container, args }: ExecArgs)
     instance_id: instanceId,
     market_id: marketId,
     vendors: vendorCounts,
+    vendor_status_rejections: vendorStatusRejections,
     // DW-15-173: mapowanie jest OSOBNYM kanalem wyniku, nie przypisem do sprzedawcow.
     // „Zsynchronizowany sprzedawca bez mapowania" jest stanem, ktory przez cale
     // wydanie wygladal na sukces, a konczyl sie `403` przy pierwszym zadaniu z panelu.
