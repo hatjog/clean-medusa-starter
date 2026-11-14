@@ -27,6 +27,9 @@
  * więc kopia nie ma jak się rozjechać z produkcją.
  */
 
+// Story 11.1 REG-C5-001: Path Y bierze instancję wyłącznie z GP_INSTANCE_ID.
+process.env.GP_INSTANCE_ID = "gp-test"
+
 import { readFileSync } from "node:fs"
 import { join } from "node:path"
 
@@ -394,7 +397,7 @@ describe("odzysk wystawienia — zachowanie na mockowanym kliencie", () => {
           amount_minor: 25000,
           psp_occurred_at: "2026-08-12T12:34:56.000Z",
         },
-        scope: { market_id: "bonbeauty" },
+        scope: { instance_id: "gp-test", market_id: "bonbeauty" },
       },
       expect.any(Date),
     )

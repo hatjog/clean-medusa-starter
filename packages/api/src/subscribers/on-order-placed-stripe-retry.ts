@@ -55,6 +55,7 @@ import { ContainerRegistrationKeys, Modules } from "@medusajs/framework/utils"
 import { toKnexPositionalSql } from "../lib/knex-positional-sql"
 import { PAYMENT_INTENT_SUCCEEDED_EVENT } from "../lib/payment/stripe-payment-intent-event"
 import { STRIPE_PATH_Y_WEBHOOK_PROVIDER } from "../lib/payment/stripe-payment-intent-transport"
+import { resolveRuntimeInstanceId } from "../lib/market-context"
 import {
   buildGenesisActiveTransition,
   buildGenesisIssuedTransition,
@@ -343,7 +344,7 @@ async function withTransaction<T>(
   return db.transaction(async (trx) => handler(createKnexPgClient(trx)))
 }
 
-type DeferredCaptureRow = {
+export type DeferredCaptureRow = {
   event_id: string
   provider: string
   market_id: string | null
@@ -449,10 +450,23 @@ export class PathYRecoveryInputError extends Error {
   }
 }
 
-function buildPathYRecoveryInput(
+export function buildPathYRecoveryInput(
   row: DeferredCaptureRow,
   orderId: string
 ) {
+  // Story 11.1 REG-C5-001 (spójnie z 3.1 C3-SEC-002): business dedupe wymaga obu
+  // osi scope. Instancja WYŁĄCZNIE z `GP_INSTANCE_ID` — bez fallbacku "gp"
+  // i bez odczytu z metadata/envelope. Brak = nazwana odmowa, wiersz zostaje
+  // nierozwiązany (ten sam kanał co pozostałe pola wejścia).
+  const instanceId = resolveRuntimeInstanceId()
+  if (!instanceId) {
+    throw new PathYRecoveryInputError(
+      row.event_id,
+      "instance_id",
+      `[on-order-placed-stripe-retry] Path Y marker ${row.event_id}: GP_INSTANCE_ID ` +
+        "nie jest skonfigurowany — odmowa fail-closed (instance_unconfigured)"
+    )
+  }
   const pspOccurredAt = row.envelope.psp_occurred_at
   const amountMinor = row.amount_minor
   if (typeof pspOccurredAt !== "string" || !pspOccurredAt.trim()) {
@@ -535,7 +549,7 @@ function buildPathYRecoveryInput(
       amount_minor: normalizedAmountMinor,
       psp_occurred_at: pspOccurredAt,
     },
-    scope: { market_id: row.market_id },
+    scope: { instance_id: instanceId, market_id: row.market_id },
   }
 }
 

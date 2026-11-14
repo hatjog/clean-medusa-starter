@@ -11,8 +11,21 @@ const inventory = JSON.parse(fs.readFileSync(
   "utf8"
 )) as {
   measurement_status: string
-  carriers: Array<{ carrier: string; table: string; mechanism: string; remaining_count: string; relation_present: boolean }>
+  measured_at: string
+  database: string
+  migration_revision: string
+  carriers: Array<{
+    carrier: string
+    table: string
+    fields: string[]
+    writer: string
+    mechanism: string
+    cutoff: string
+    remaining_count: string
+    relation_present: boolean
+  }>
 }
+const API_SRC = path.join(REPO_ROOT, "GP/backend/packages/api/src")
 
 const RELATIONS: Record<string, string> = {
   voucher_recipient_pii: "voucher_recipient_pii",
@@ -42,6 +55,44 @@ function assertReadOnlyInventory(candidate: typeof inventory): void {
   }
 }
 
+/**
+ * Story 11.1 AI-Verify-C4-NEW-001/002: walidacja SEMANTYCZNA artefaktu. Writer
+ * musi wskazywać istniejący plik (i symbol, gdy podany), fields — niepustą listę
+ * nazw kolumn, cutoff — niepustą wartość (UNSPECIFIED, gdy brak decyzji; nie
+ * wymyślamy wartości, DW-15-248), measured_at — pełny znacznik ISO z godziną,
+ * database — izolowaną bazę `*_test`, migration_revision — migrację 11.1.
+ */
+function assertSemanticInventory(candidate: typeof inventory): void {
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/.test(candidate.measured_at ?? "") || Number.isNaN(Date.parse(candidate.measured_at))) {
+    throw new Error("retention inventory: measured_at nie jest znacznikiem ISO z godziną")
+  }
+  if (!/_test$/.test(candidate.database ?? "")) {
+    throw new Error("retention inventory: database nie jest izolowaną bazą *_test")
+  }
+  if (candidate.migration_revision !== "1779016000000_runtime_recovery_rls_boundary") {
+    throw new Error("retention inventory: brak rewizji migracji Story 11.1")
+  }
+  for (const entry of candidate.carriers) {
+    const writer = typeof entry.writer === "string" ? entry.writer.trim() : ""
+    const match = writer.match(/^([A-Za-z0-9_./\[\]-]+\.ts)(?::([A-Za-z0-9_/]+))?/)
+    if (!match) throw new Error(`retention inventory: writer bez ścieżki pliku dla ${entry.carrier}`)
+    const file = path.join(API_SRC, match[1]!)
+    if (!fs.existsSync(file)) throw new Error(`retention inventory: writer ${match[1]} nie istnieje (${entry.carrier})`)
+    if (match[2]) {
+      const source = fs.readFileSync(file, "utf8")
+      for (const symbol of match[2].split("/")) {
+        if (!source.includes(symbol)) throw new Error(`retention inventory: symbol ${symbol} nie występuje w ${match[1]}`)
+      }
+    }
+    if (!Array.isArray(entry.fields) || entry.fields.length === 0 || entry.fields.some((f) => !/^[a-z_][a-z0-9_]*$/.test(f))) {
+      throw new Error(`retention inventory: fields puste albo niepoprawne dla ${entry.carrier}`)
+    }
+    if (typeof entry.cutoff !== "string" || entry.cutoff.trim() === "") {
+      throw new Error(`retention inventory: brak cutoff dla ${entry.carrier}`)
+    }
+  }
+}
+
 function assertRecordedCount(entry: (typeof inventory.carriers)[number], measured: string): void {
   if (entry.remaining_count !== measured) {
     throw new Error(
@@ -66,6 +117,24 @@ describe("Story 11.1 — read-only retention inventory", () => {
         expect(entry.remaining_count).toBe("ABSENT")
       }
     }
+  })
+
+  it("waliduje semantycznie writer, fields, cutoff, measured_at, bazę i rewizję migracji", () => {
+    expect(() => assertSemanticInventory(inventory)).not.toThrow()
+  })
+
+  it.each([
+    ["writer usunięty", (m: typeof inventory) => { m.carriers[0]!.writer = "" }, /writer/],
+    ["writer wskazuje nieistniejący plik", (m: typeof inventory) => { m.carriers[0]!.writer = "modules/nope/missing.ts:x" }, /nie istnieje/],
+    ["cutoff usunięty", (m: typeof inventory) => { m.carriers[1]!.cutoff = "" }, /cutoff/],
+    ["fields puste", (m: typeof inventory) => { m.carriers[2]!.fields = [] }, /fields/],
+    ["measured_at bez godziny", (m: typeof inventory) => { m.measured_at = "2026-09-07" }, /measured_at/],
+    ["baza współdzielona bez _test", (m: typeof inventory) => { m.database = "gp_mercur" }, /database/],
+    ["brak rewizji migracji", (m: typeof inventory) => { m.migration_revision = "" }, /rewizji/],
+  ])("odrzuca mutant: %s", (_name, mutate, pattern) => {
+    const mutant = structuredClone(inventory)
+    mutate(mutant)
+    expect(() => assertSemanticInventory(mutant)).toThrow(pattern)
   })
 
   it("odrzuca mutant z mutacją retencji w read-only inventory", () => {
@@ -107,7 +176,10 @@ describe("Story 11.1 — read-only retention inventory", () => {
 
   it("mierzy każdy nośnik tylko przez SELECT COUNT(*) i wiąże wynik z artefaktem", async () => {
     const database = await client.query<{ current_database: string }>("SELECT current_database()")
-    expect(database.rows[0]?.current_database).toEqual(expect.any(String))
+    // Tożsamość bazy: pomiar wiąże się wyłącznie z bazą zapisaną w artefakcie.
+    expect(database.rows[0]?.current_database).toBe(inventory.database)
+    const revision = await client.query("SELECT 1 FROM mikro_orm_migrations WHERE name = $1", [inventory.migration_revision])
+    expect(revision.rowCount).toBe(1)
     for (const entry of inventory.carriers) {
       const relation = RELATIONS[entry.table]
       expect(relation).toBeDefined()
@@ -128,6 +200,12 @@ describe("Story 11.1 — read-only retention inventory", () => {
       const measured = count.rows[0]?.remaining_count
       expect(measured).toMatch(/^\d+$/)
       assertRecordedCount(entry, measured!)
+      const columns = await client.query<{ column_name: string }>(
+        "SELECT column_name FROM information_schema.columns WHERE table_schema = 'public' AND table_name = $1",
+        [entry.table]
+      )
+      const present = new Set(columns.rows.map((row) => row.column_name))
+      expect(entry.fields.filter((field) => !present.has(field))).toEqual([])
     }
   })
 })

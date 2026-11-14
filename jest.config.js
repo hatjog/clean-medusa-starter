@@ -151,6 +151,7 @@ if (process.env.TEST_TYPE === "integration:http") {
     "**/packages/api/src/__tests__/integration/story-11-1-runtime-recovery-boundary-pg.integration.test.[jt]s",
     "**/packages/api/src/__tests__/integration/story-11-1-provenance-inventory-pg.integration.test.[jt]s",
     "**/packages/api/src/__tests__/integration/story-11-1-retention-inventory-pg.integration.test.[jt]s",
+    "**/packages/api/src/__tests__/integration/story-11-1-runtime-writers-pg.integration.test.[jt]s",
   ];
 } else if (process.env.TEST_TYPE === "unit") {
   module.exports.testMatch = [
