@@ -72,6 +72,31 @@ import {
   VoucherIssuanceBlockedError,
 } from "../workflows/entitlements/issue-entitlement"
 import { liveIssueEntitlementsWithinTx } from "../workflows/entitlements/live-issue-from-payment-intent"
+import {
+  classifyEventFailure,
+  type EventFailureClassification,
+} from "../lib/events/event-failure-classification"
+import { recordEventDeadLetter } from "../lib/events/event-dead-letter"
+
+/** `source_job` wierszy DLQ z tego konsumenta (Story 4.6, ADR-239). */
+export const STRIPE_RETRY_DLQ_SOURCE = "subscriber:on-order-placed-stripe-retry"
+
+/**
+ * Porażka wiersza, której klasa idzie do DLQ, a której NIE da się zapisać
+ * w bieżącej transakcji (błąd PG ją przerwał). Niesie scope wiersza do
+ * zewnętrznego `catch`, który zapisuje DLQ w NOWEJ transakcji.
+ */
+export class DeadLetterPendingError extends Error {
+  constructor(
+    readonly row: { event_id: string; market_id: string | null },
+    readonly order_id: string,
+    readonly classification: EventFailureClassification,
+    readonly original: unknown
+  ) {
+    super(classification.reason)
+    this.name = "DeadLetterPendingError"
+  }
+}
 
 /**
  * Wartości `webhook_event_processed.provider`, które mogą nieść ślad deferral.
@@ -760,6 +785,51 @@ export default async function onOrderPlacedStripeRetry({
             // v1.9.0, które odzyskują się poprawnie — są przetwarzane dalej,
             // zamiast wywracać się razem z tym jednym.
             if (err instanceof PathYRecoveryInputError) {
+              // Story 4.6 (AD-32): trwała wada danych markera → wiersz DLQ w TEJ
+              // transakcji (pod savepointem, żeby porażka zapisu nie wywróciła
+              // odzyskanych sąsiadów). Marker zostaje nierozwiązany (backfill
+              // nadal możliwy), ale powtórka nie mnoży wpisów: DLQ jest idempotentny.
+              // Brak instance_id/market_id = brak scope'u nośnika pod RLS —
+              // wtedy jedynym skutkiem jest głośny log (DW, populacja globalna).
+              if (err.field !== "instance_id" && err.field !== "market_id") {
+                const classification = classifyEventFailure(err, {
+                  permanentDefectCode: (e) =>
+                    e instanceof PathYRecoveryInputError ? `path_y_marker_${e.field}` : null,
+                })
+                await client.query("SAVEPOINT gp_dlq_entry")
+                try {
+                  const written = await recordEventDeadLetter(client, {
+                    instance_id: resolveRuntimeInstanceId(),
+                    market_id: row.market_id,
+                    source_job: STRIPE_RETRY_DLQ_SOURCE,
+                    event_id: row.event_id,
+                    subject_id: orderId,
+                    classification,
+                    occurred_at: new Date(),
+                  })
+                  await client.query("RELEASE SAVEPOINT gp_dlq_entry")
+                  logger.warn?.(
+                    `[on-order-placed-stripe-retry] order_id=${orderId} ` +
+                      `event_id=${row.event_id} marker Path Y nieodtwarzalny ` +
+                      `(brakujące/niepoprawne pole: ${err.field}) — ten marker POMINIĘTY, ` +
+                      `class=${classification.event_class} ` +
+                      `dlq_entry_id=${written.dlq_entry_id} inserted=${written.inserted}: ${err.message}`
+                  )
+                } catch (dlqErr) {
+                  await client.query("ROLLBACK TO SAVEPOINT gp_dlq_entry")
+                  logger.error?.(
+                    `[on-order-placed-stripe-retry] order_id=${orderId} ` +
+                      `event_id=${row.event_id} dlq_write_failed ` +
+                      `class=${classification.event_class}: ${(dlqErr as Error).message}`
+                  )
+                }
+                continue
+              }
+              logger.error?.(
+                `[on-order-placed-stripe-retry] order_id=${orderId} ` +
+                  `event_id=${row.event_id} class=permanent_data_defect ` +
+                  `dlq_unscoped (field=${err.field}) — brak scope'u nośnika DLQ`
+              )
               logger.warn?.(
                 `[on-order-placed-stripe-retry] order_id=${orderId} ` +
                   `event_id=${row.event_id} marker Path Y nieodtwarzalny ` +
@@ -769,11 +839,52 @@ export default async function onOrderPlacedStripeRetry({
               )
               continue
             }
-            throw err
+            // Story 4.6: brak klasy domyślnej „spróbuj jeszcze raz”. Przejściowa
+            // → rethrow (ROLLBACK, marker nierozwiązany = nośnik ponowienia);
+            // trwała / nieznana → DLQ w nowej transakcji (ta jest przerwana).
+            const classification = classifyEventFailure(err)
+            if (classification.event_class === "transient_retry") throw err
+            throw new DeadLetterPendingError(row, orderId, classification, err)
           }
         }
       })
     } catch (err) {
+      if (err instanceof DeadLetterPendingError) {
+        try {
+          const written = await withTransaction(db, (client) =>
+            recordEventDeadLetter(client, {
+              instance_id: resolveRuntimeInstanceId(),
+              market_id: err.row.market_id,
+              source_job: STRIPE_RETRY_DLQ_SOURCE,
+              event_id: err.row.event_id,
+              subject_id: err.order_id,
+              classification: err.classification,
+              occurred_at: new Date(),
+            })
+          )
+          logger.error?.(
+            `[on-order-placed-stripe-retry] order_id=${orderId} ` +
+              `event_id=${err.row.event_id} class=${err.classification.event_class} ` +
+              `dlq_entry_id=${written.dlq_entry_id} inserted=${written.inserted}: ${err.message}`
+          )
+        } catch (dlqErr) {
+          logger.error?.(
+            `[on-order-placed-stripe-retry] order_id=${orderId} ` +
+              `event_id=${err.row.event_id} dlq_write_failed ` +
+              `class=${err.classification.event_class}: ${(dlqErr as Error).message}`
+          )
+          // Utrata nośnika DLQ nie może być cicha (NFR-4): fail-loud.
+          throw dlqErr
+        }
+        continue
+      }
+      if (classifyEventFailure(err).event_class === "transient_retry") {
+        logger.warn?.(
+          `[on-order-placed-stripe-retry] order_id=${orderId} class=transient_retry ` +
+            `— marker zostaje nierozwiązany do ponowienia: ${(err as Error).message}`
+        )
+        continue
+      }
       const error = err as Error
       logger.error?.(
         `[on-order-placed-stripe-retry] order_id=${orderId} failed: ` +

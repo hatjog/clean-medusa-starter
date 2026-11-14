@@ -140,6 +140,12 @@ if (process.env.TEST_TYPE === "integration:http") {
   module.exports.testMatch = [
     "**/packages/api/src/__tests__/integration/story-3-6-canonical-state-provenance-pg.integration.test.[jt]s",
   ];
+} else if (process.env.TEST_TYPE === "story-4-6-dlq-pg") {
+  // v1.16.0 Story 4.6 — nośnik DLQ (mor_policy_dlq_entry) pod RLS na realnym
+  // PostgreSQL; wyłącznie własna suita (DATABASE_URL = izolowana DB *_test).
+  module.exports.testMatch = [
+    "**/packages/api/src/__tests__/integration/story-4-6-dlq-pg.integration.test.[jt]s",
+  ];
 } else if (process.env.TEST_TYPE === "story-11-1-runtime-recovery-pg") {
   // Story 11.1 — profil musi wskazywać wyłącznie własne suity. Bez tego
   // nieznany TEST_TYPE pozostawia domyślny discovery Jesta i miesza dowód
