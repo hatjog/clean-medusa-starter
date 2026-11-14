@@ -36,6 +36,12 @@ export type GenesisObservation = {
    * którego zbiór stanów źródła wyklucza `ISSUED`). Brak = trasa dotyczy (R-2/R-3).
    */
   not_applicable_reason?: string | null
+  /**
+   * Zbiór stanów źródła następcy NIEROZPOZNANY (graf brak, nieczytelny albo
+   * częściowy — R-11/R-18, D-23) ⇒ FAIL; nigdy PASS „nie dotyczy” ani STALE.
+   * Parytet z bramką Pythona (to samo pole w `--json`).
+   */
+  source_states_unrecognized?: string | null
 }
 
 export type KnownDivergenceEntry = {
@@ -145,6 +151,8 @@ function allowlistProblems(
  * Ocena obserwacji genezy. Reguły (parytet z `evaluate()` bramki Pythona na
  * wspólnych fiksturach `__tests__/workflows/entitlements/fixtures/gift-genesis-cases.json`, R-9):
  *  - stan genezy albo `purchase_mode` nierozpoznany (`null`) → FAIL (fail-closed, R-4/R-6);
+ *  - zbiór źródeł następcy nierozpoznany (`source_states_unrecognized`) → FAIL (R-11, D-23);
+ *    w obu przypadkach wpis allowlisty tej trasy NIE dostaje STALE (brak pomiaru);
  *  - zmierzony `not_applicable_reason` → PASS z nazwanym powodem;
  *  - gift + ACTIVE na trasie z allowlisty (route ORAZ producer) → KNOWN-DIVERGENCE;
  *  - gift + ACTIVE na każdej innej trasie → FAIL z nazwą trasy;
@@ -170,14 +178,33 @@ export function checkGiftGenesis(
 
   const usedAllowlist = new Set<KnownDivergenceEntry>()
 
+  const markMeasuredless = (o: GenesisObservation) => {
+    for (const e of admitted) {
+      if (e.route === o.route && e.producer === o.producer) usedAllowlist.add(e)
+    }
+  }
+
   for (const o of observations) {
     if (o.genesis_state == null || o.purchase_mode == null) {
+      markMeasuredless(o)
       const what = o.genesis_state == null ? "stan genezy" : "purchase_mode"
       rows.push({
         verdict: "FAIL",
         route: o.route,
         producer: o.producer,
         line: `FAIL route=${o.route} producer=${o.producer}: ${what} NIEROZPOZNANY — kontrola nie zakłada stanu (fail-closed)`,
+      })
+      continue
+    }
+    if (o.source_states_unrecognized) {
+      markMeasuredless(o)
+      rows.push({
+        verdict: "FAIL",
+        route: o.route,
+        producer: o.producer,
+        line:
+          `FAIL route=${o.route} producer=${o.producer}: zbiór źródeł NIEROZPOZNANY — ` +
+          `${o.source_states_unrecognized}; kontrola nie zakłada „nie dotyczy” (fail-closed, R-11)`,
       })
       continue
     }

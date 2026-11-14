@@ -809,6 +809,117 @@
           "lost-code-reissue"
         ]
       ]
+    },
+    {
+      "name": "D-23 graf czesciowy: nastepca z allowlisty => FAIL NIEROZPOZNANY, nie STALE",
+      "observations": [
+        {
+          "route": "lost-code-reissue",
+          "producer": "src/modules/voucher/workflows/reissue-lost-code.ts",
+          "purchase_mode": "gift",
+          "genesis_state": "ACTIVE",
+          "not_applicable_reason": null,
+          "source_states_unrecognized": "graf GP/backend/packages/api/src/modules/voucher/models/entitlement.ts: wpis NIEROZPOZNANY [\"ISSUED\"]"
+        },
+        {
+          "route": "retention-issue",
+          "producer": "src/modules/voucher/workflows/issue-retention.ts",
+          "purchase_mode": "gift",
+          "genesis_state": "ACTIVE",
+          "not_applicable_reason": null
+        }
+      ],
+      "allowlist": [
+        {
+          "route": "lost-code-reissue",
+          "producer": "src/modules/voucher/workflows/reissue-lost-code.ts",
+          "refs": [
+            "DW-15-281"
+          ]
+        },
+        {
+          "route": "retention-issue",
+          "producer": "src/modules/voucher/workflows/issue-retention.ts",
+          "refs": [
+            "DW-15-281"
+          ]
+        }
+      ],
+      "expected": [
+        [
+          "FAIL",
+          "lost-code-reissue"
+        ],
+        [
+          "KNOWN-DIVERGENCE",
+          "retention-issue"
+        ]
+      ]
+    },
+    {
+      "name": "D-23 graf czesciowy: nastepca spoza allowlisty => FAIL NIEROZPOZNANY, nie PASS nie dotyczy",
+      "observations": [
+        {
+          "route": "new-successor",
+          "producer": "src/modules/voucher/workflows/new-successor.ts",
+          "purchase_mode": "gift",
+          "genesis_state": "ACTIVE",
+          "not_applicable_reason": "falszywy powod",
+          "source_states_unrecognized": "graf GP/backend/packages/api/src/modules/voucher/models/entitlement.ts: wpis NIEROZPOZNANY [\"ISSUED\"]"
+        }
+      ],
+      "allowlist": [],
+      "expected": [
+        [
+          "FAIL",
+          "new-successor"
+        ]
+      ]
+    },
+    {
+      "name": "D-23 wywolanie NIEROZPOZNANE (stan null) na trasie z allowlisty => FAIL, nie STALE",
+      "observations": [
+        {
+          "route": "lost-code-reissue",
+          "producer": "src/modules/voucher/workflows/reissue-lost-code.ts",
+          "purchase_mode": "gift",
+          "genesis_state": null,
+          "not_applicable_reason": null
+        },
+        {
+          "route": "retention-issue",
+          "producer": "src/modules/voucher/workflows/issue-retention.ts",
+          "purchase_mode": "gift",
+          "genesis_state": "ACTIVE",
+          "not_applicable_reason": null
+        }
+      ],
+      "allowlist": [
+        {
+          "route": "lost-code-reissue",
+          "producer": "src/modules/voucher/workflows/reissue-lost-code.ts",
+          "refs": [
+            "DW-15-281"
+          ]
+        },
+        {
+          "route": "retention-issue",
+          "producer": "src/modules/voucher/workflows/issue-retention.ts",
+          "refs": [
+            "DW-15-281"
+          ]
+        }
+      ],
+      "expected": [
+        [
+          "FAIL",
+          "lost-code-reissue"
+        ],
+        [
+          "KNOWN-DIVERGENCE",
+          "retention-issue"
+        ]
+      ]
     }
   ]
 }
