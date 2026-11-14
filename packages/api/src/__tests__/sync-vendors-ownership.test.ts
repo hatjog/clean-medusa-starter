@@ -282,6 +282,7 @@ describe('upsertSeller — vendor reverted description matches config → re-see
       vendor_id: 'kremidotyk',
       slug: 'kremidotyk',
       description: 'Masaże ciała',  // config value (same as DB)
+      status: 'onboarded',
     }
 
     const result = await upsertSeller(sellerService, vendor, false, 'bonbeauty')

@@ -32,6 +32,11 @@ import {
   issueVoucherCodeWithinTx,
 } from "./live-issue-from-payment-intent"
 import { readDatabaseMinorIntegerStrict } from "../../lib/payment/numeric-minor"
+import {
+  isSupportedVoucherLineQuantity,
+  isVoucherLine,
+  VOUCHER_LINE_QUANTITY_ISSUE_REASON,
+} from "../../lib/payment/voucher-line-quantity"
 
 type QueryResult<T> = Promise<{ rows: T[]; rowCount?: number | null }>
 export type PgClient = {
@@ -195,6 +200,32 @@ export class MissingVoucherIssuanceMarketError extends VoucherIssuanceBlockedErr
       orderId,
       lineItemId
     )
+  }
+}
+
+/**
+ * v1.16.0 Story 3.3 AC2 — runda fix 2 (ADR-242 §Decyzja p.5).
+ *
+ * Linia voucherowa z quantity≠1 na trasie captured. Wystawca tworzy JEDEN
+ * entitlement na linię, więc wystawienie dla quantity=N oznaczałoby cicho
+ * jedno uprawnienie za N opłaconych sztuk. Ten sam `reason` co Path Y
+ * (`quantity_per_line_unsupported`, kontrakt `gift-line-issue-outcome.v1`).
+ * Rzucany w przebiegu WSTĘPNYM, przed jakimkolwiek INSERT-em zamówienia.
+ */
+export class VoucherLineQuantityUnsupportedError extends VoucherIssuanceBlockedError {
+  readonly quantity: unknown
+  constructor(orderId: string, lineItemId: string | null, quantity: unknown) {
+    super(
+      `issueEntitlementsForAllLineItems: linia voucherowa (order ${orderId}, linia ` +
+        `${lineItemId ?? "brak"}) ma quantity=${String(quantity)}; kontrakt wystawienia ` +
+        "egzekwuje quantity=1 per linia (ADR-242 p.5) — fail-loud PRZED zapisem, " +
+        "NIE jedno uprawnienie za N sztuk.",
+      "VoucherLineQuantityUnsupportedError",
+      VOUCHER_LINE_QUANTITY_ISSUE_REASON,
+      orderId,
+      lineItemId
+    )
+    this.quantity = quantity
   }
 }
 
@@ -452,10 +483,14 @@ export async function issueEntitlementsForAllLineItems(
       line_item_id: string
       metadata: Record<string, unknown> | null
       line_unit_price: string | number | null
+      line_quantity: string | number | null
+      line_product_metadata: Record<string, unknown> | null
     } & VoucherLineContext
   >(
     `SELECT oli.id AS line_item_id, oli.metadata,
             oli.unit_price AS line_unit_price,
+            oi.quantity AS line_quantity,
+            p.metadata AS line_product_metadata,
             ${VOUCHER_LINE_CONTEXT_COLUMNS}
        FROM order_item oi
        JOIN order_line_item oli ON oli.id = oi.item_id
@@ -466,6 +501,26 @@ export async function issueEntitlementsForAllLineItems(
       ORDER BY oi.created_at ASC`,
     [payload.order_id]
   )
+
+  // Story 3.3 AC2 runda fix 2 (ADR-242 p.5): przebieg WSTĘPNY krotności przed
+  // jakimkolwiek INSERT-em — linia voucherowa (marker w metadanych linii, to
+  // ALBO profil produktu — to samo kryterium co Path Y) z quantity≠1 blokuje wystawienie CAŁEGO
+  // zamówienia nazwanym powodem, zamiast cicho wystawić 1 za N.
+  for (const line of lines.rows) {
+    if (
+      // `order_item.quantity` jest NOT NULL w Medusa — brak kolumny w wierszu
+      // (lustro testowe bez kolumny) nie jest wartością ≠1 (parytet z Path Y).
+      line.line_quantity !== undefined &&
+      isVoucherLine(line.metadata, line.line_product_metadata) &&
+      !isSupportedVoucherLineQuantity(line.line_quantity)
+    ) {
+      throw new VoucherLineQuantityUnsupportedError(
+        payload.order_id,
+        line.line_item_id,
+        line.line_quantity
+      )
+    }
+  }
 
   const results: IssueEntitlementResult[] = []
   const lineItemIds: (string | null)[] = []

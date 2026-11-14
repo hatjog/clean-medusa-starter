@@ -111,6 +111,13 @@ if (process.env.TEST_TYPE === "integration:http") {
   module.exports.testMatch = [
     "**/packages/api/src/__tests__/integration/story-4-4-deferred-issuance-trace-pg.integration.test.[jt]s",
   ];
+} else if (process.env.TEST_TYPE === "story-4-5-trace-age-pg") {
+  // v1.16.0 Story 4.5 (FR-12, AD-32) — wiek sladu z jednej migawki bazy
+  // (statement_timestamp() - psp_occurred_at) i prog z recovery-config.ts.
+  // DATABASE_URL musi wskazywac IZOLOWANA DB testowa (*_test).
+  module.exports.testMatch = [
+    "**/packages/api/src/__tests__/integration/story-4-5-trace-age-snapshot-pg.integration.test.[jt]s",
+  ];
 } else if (process.env.TEST_TYPE === "compensation-failure-pg") {
   // v1.15.0 Story 3.5 (FR-6c, NFR-3, AD-22) — rejestr nieudanych kompensacji
   // sciezki pieniadza wykonany przez sam modul na realnym Postgresie
@@ -152,6 +159,12 @@ if (process.env.TEST_TYPE === "integration:http") {
 } else if (process.env.TEST_TYPE === "story-3-6-canonical-state-pg") {
   module.exports.testMatch = [
     "**/packages/api/src/__tests__/integration/story-3-6-canonical-state-provenance-pg.integration.test.[jt]s",
+  ];
+} else if (process.env.TEST_TYPE === "story-3-3-shared-barrier-pg") {
+  // v1.16.0 Story 3.3 (FR-9, AD-33) — wspolna bariera skutku per nalezna
+  // jednostka na realnym PostgreSQL (DATABASE_URL = izolowana *_test).
+  module.exports.testMatch = [
+    "**/packages/api/src/__tests__/integration/story-3-3-shared-barrier-atomic-pg.integration.test.[jt]s",
   ];
 } else if (process.env.TEST_TYPE === "voucher-service-redeem-pg") {
   // v1.16.0 Story 5.4 (FR-19, AD-34) — realizacja VOUCHER_SERVICE jednym aktem,
