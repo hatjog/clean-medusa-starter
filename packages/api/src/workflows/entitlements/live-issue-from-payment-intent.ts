@@ -137,6 +137,7 @@ export const LINE_ISSUE_FAILURE_REASONS = [
   "entitlement_type_not_issuable",
   "scope_unresolved",
   "multi_recipient_per_line",
+  "quantity_per_line_unsupported",
   "posting_invariant_violated",
   "issue_write_failed",
 ] as const
@@ -227,6 +228,11 @@ type OrderLineRow = {
   product_metadata: Record<string, unknown> | null
   /** pg zwraca NUMERIC jako string; nie ufamy deklaracji TypeScript na granicy SQL. */
   line_unit_price: unknown
+  /**
+   * Story 3.3 AC2 (ADR-242 §Krotność): `order_item.quantity` (NUMERIC NOT NULL
+   * w Medusa) — kontrakt wystawienia egzekwuje quantity=1 per linia voucherowa.
+   */
+  line_quantity?: unknown
   /**
    * Dane sprzedawcy i tytuł usługi — nośnik `voucher.seller_*` / `product_title`
    * przy genezie kodu (patrz `issueVoucherCodeWithinTx`). Kolumny są NOT NULL w
@@ -448,6 +454,7 @@ async function runLiveIssue(
             oli.metadata,
             p.metadata AS product_metadata,
             oli.unit_price AS line_unit_price,
+            oi.quantity AS line_quantity,
             COALESCE(oli.title, p.title) AS line_title,
             s.id     AS seller_id,
             s.name   AS seller_name,
@@ -581,6 +588,24 @@ async function issueOrderLine(
       line.line_item_id,
       payload
     )
+
+    // Story 3.3 AC2 (ADR-242 §Krotność, AR-03): klucz jednostki należnej to
+    // `payment_intent_id:order_id`, a wystawca tworzy entitlement per
+    // (linia × recipient) — NIE per sztuka. Kontrakt egzekwuje więc quantity=1
+    // na linii voucherowej: quantity≠1 ⇒ FAIL-LOUD przed INSERT, zamiast cicho
+    // wystawić JEDNO uprawnienie za N opłaconych sztuk. Story nie dodaje obsługi
+    // quantity>1 (AC2); `order_item.quantity` jest NOT NULL w Medusa — brak
+    // kolumny w wierszu (lustro testowe bez kolumny) nie jest wartością ≠1.
+    if (line.line_quantity !== undefined && readDatabaseNumber(line.line_quantity) !== 1) {
+      throw new LineIssueError(
+        "quantity_per_line_unsupported",
+        line.line_item_id,
+        `liveIssueEntitlementsWithinTx: linia voucherowa ${line.line_item_id} ` +
+          `(order ${payload.order_id}, payment_intent ${payload.payment_intent_id}) ma ` +
+          `quantity=${String(line.line_quantity)}; kontrakt wystawienia egzekwuje quantity=1 ` +
+          `per linia (ADR-242 §Krotność) — fail-loud przed INSERT, NIE jedno uprawnienie za N sztuk`
+      )
+    }
 
     const recipients = extractFrozenRecipients(line.metadata)
 

@@ -295,7 +295,7 @@ async function createFixtureSchema(client: PoolClient): Promise<void> {
       id text PRIMARY KEY, sales_channel_id text, metadata jsonb, deleted_at timestamptz
     );
     CREATE TEMP TABLE order_item (
-      order_id text NOT NULL, item_id text NOT NULL,
+      order_id text NOT NULL, item_id text NOT NULL, quantity numeric NOT NULL DEFAULT 1,
       created_at timestamptz NOT NULL, deleted_at timestamptz
     );
     CREATE TEMP TABLE order_line_item (

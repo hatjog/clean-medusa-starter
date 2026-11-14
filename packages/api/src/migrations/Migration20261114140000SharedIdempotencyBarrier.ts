@@ -20,6 +20,14 @@ import { Migration } from "@medusajs/framework/mikro-orm/migrations"
  * scope (NULL = UNKNOWN, 11.1) NIE są przenoszone — nadal chroni je
  * `event_processed` (PK `(external_id, event_type)`).
  *
+ * Strażnik widoczności (fix po checkpoincie 3.3, AC3; precedens fail-loud
+ * `1779010000000`, ADR-197): `event_processed` jest pod FORCE RLS (właściciel
+ * `gp_runtime_recovery_migrator`, polityka tylko dla `medusa_store`), więc rola
+ * bez BYPASSRLS/superusera widzi 0 wierszy i backfill skończyłby się ZIELONO,
+ * nie przenosząc niczego. Migracja odmawia wtedy startu PRZED jakimkolwiek
+ * zapisem, a po backfillu sprawdza post-warunek źródło ⊆ cel (każdy
+ * kwalifikowany klucz `event_processed` ma wiersz bariery).
+ *
  * Rollback: `down` usuwa wyłącznie nową tabelę; `event_processed` nietknięta
  * (forward-fix — plan migracji w ADR-242).
  */
@@ -29,8 +37,47 @@ const MARKET_SETTING = "current_setting('app.gp_market_id', true)"
 const INSTANCE_SETTING = "current_setting('app.gp_instance_id', true)"
 const PATH_Y_EVENT_TYPE = "gp.stripe.payment_intent_succeeded.v1"
 
+/**
+ * Predykat populacji źródłowej backfillu — JEDNO wyrażenie dla INSERT i dla
+ * post-warunku (dwie kopie rozjechałyby się cicho).
+ */
+const BACKFILL_SOURCE_PREDICATE = `ep.event_type = '${PATH_Y_EVENT_TYPE}'
+             AND ep.purchase_key IS NOT NULL
+             AND ep.instance_id IS NOT NULL AND length(btrim(ep.instance_id)) > 0
+             AND ep.market_id IS NOT NULL AND length(btrim(ep.market_id)) > 0
+             AND length(ep.external_id) > length(ep.purchase_key) + 1
+             AND left(ep.external_id, length(ep.purchase_key) + 1) = ep.purchase_key || ':'`
+
 export class Migration20261114140000SharedIdempotencyBarrier extends Migration {
   async up(): Promise<void> {
+    // ── STRAŻNIK WIDOCZNOŚCI — PRZED jakimkolwiek zapisem ──────────────────
+    this.addSql(`
+      DO $$
+      DECLARE
+        v_bypass boolean;
+        v_super  boolean;
+        v_forced boolean;
+      BEGIN
+        SELECT rolbypassrls, rolsuper INTO v_bypass, v_super
+          FROM pg_roles WHERE rolname = current_user;
+        SELECT c.relforcerowsecurity INTO v_forced
+          FROM pg_class c WHERE c.oid = to_regclass('event_processed');
+        IF COALESCE(v_forced, false)
+           AND NOT COALESCE(v_bypass, false)
+           AND NOT COALESCE(v_super, false) THEN
+          RAISE EXCEPTION
+            'GP_OWED_UNIT_BARRIER_BACKFILL_BLIND: rola migracyjna % nie ma ani BYPASSRLS, '
+            'ani superusera, a event_processed jest pod FORCE ROW LEVEL SECURITY (FORCE '
+            'obejmuje takze wlasciciela). Taka rola widzi co najwyzej jeden rynek, a bez '
+            'app.gp_market_id ZERO wierszy: backfill bariery konczylby sie zielono bez '
+            'przeniesienia rozliczonych jednostek (ADR-242, plan migracji). Uruchom '
+            'migracje rola z BYPASSRLS albo superuserem.',
+            current_user;
+        END IF;
+      END
+      $$
+    `)
+
     this.addSql(`
       CREATE TABLE IF NOT EXISTS ${TABLE} (
         owed_business_unit_key TEXT PRIMARY KEY,
@@ -55,6 +102,8 @@ export class Migration20261114140000SharedIdempotencyBarrier extends Migration {
 
     this.addSql(`
       DO $$
+      DECLARE
+        v_missing bigint;
       BEGIN
         IF EXISTS (SELECT FROM information_schema.tables
                     WHERE table_schema = current_schema() AND table_name = 'event_processed')
@@ -71,13 +120,21 @@ export class Migration20261114140000SharedIdempotencyBarrier extends Migration {
                  'backfill:event_processed',
                  to_timestamp(ep.processed_at / 1000.0)
             FROM event_processed ep
-           WHERE ep.event_type = '${PATH_Y_EVENT_TYPE}'
-             AND ep.purchase_key IS NOT NULL
-             AND ep.instance_id IS NOT NULL AND length(btrim(ep.instance_id)) > 0
-             AND ep.market_id IS NOT NULL AND length(btrim(ep.market_id)) > 0
-             AND length(ep.external_id) > length(ep.purchase_key) + 1
-             AND left(ep.external_id, length(ep.purchase_key) + 1) = ep.purchase_key || ':'
+           WHERE ${BACKFILL_SOURCE_PREDICATE}
           ON CONFLICT (owed_business_unit_key) DO NOTHING;
+
+          -- Post-warunek źródło ⊆ cel: każdy kwalifikowany klucz event_processed
+          -- MUSI mieć wiersz bariery (z backfillu albo zastany).
+          SELECT count(*) INTO v_missing
+            FROM event_processed ep
+           WHERE ${BACKFILL_SOURCE_PREDICATE}
+             AND NOT EXISTS (SELECT 1 FROM ${TABLE} b
+                              WHERE b.owed_business_unit_key = ep.external_id);
+          IF v_missing > 0 THEN
+            RAISE EXCEPTION
+              'GP_OWED_UNIT_BARRIER_BACKFILL_INCOMPLETE: % rozliczonych jednostek event_processed bez wiersza bariery',
+              v_missing;
+          END IF;
         END IF;
       END
       $$

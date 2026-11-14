@@ -223,7 +223,7 @@ runOrSkip("F2 — multi-seller na realnej ścieżce PostgreSQL", () => {
          updated_at timestamptz NOT NULL
        ) ON COMMIT DROP`,
       `CREATE TEMP TABLE order_item (
-         order_id text NOT NULL, item_id text NOT NULL,
+         order_id text NOT NULL, item_id text NOT NULL, quantity numeric NOT NULL DEFAULT 1,
          created_at timestamptz NOT NULL, deleted_at timestamptz
        ) ON COMMIT DROP`,
       `CREATE TEMP TABLE webhook_event_processed (

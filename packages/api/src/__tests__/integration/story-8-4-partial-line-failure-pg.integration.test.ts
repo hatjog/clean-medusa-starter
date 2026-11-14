@@ -80,7 +80,7 @@ runOrSkip("Story 8.4 — częściowa porażka pozycji prezentowych na realnym PG
       `CREATE TEMP TABLE "order" (id text PRIMARY KEY, sales_channel_id text, metadata jsonb, deleted_at timestamptz)`,
       `CREATE TEMP TABLE order_line_item (id text PRIMARY KEY, product_id text, unit_price numeric NOT NULL,
          title text, metadata jsonb, deleted_at timestamptz)`,
-      `CREATE TEMP TABLE order_item (order_id text NOT NULL, item_id text NOT NULL,
+      `CREATE TEMP TABLE order_item (order_id text NOT NULL, item_id text NOT NULL, quantity numeric NOT NULL DEFAULT 1,
          created_at timestamptz NOT NULL, deleted_at timestamptz)`,
       `CREATE TEMP TABLE product (id text PRIMARY KEY, title text, metadata jsonb, deleted_at timestamptz)`,
       `CREATE TEMP TABLE product_product_seller_seller (product_id text NOT NULL, seller_id text NOT NULL, deleted_at timestamptz)`,
