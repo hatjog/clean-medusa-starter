@@ -50,7 +50,7 @@
 import type { MedusaRequest, MedusaResponse } from "@medusajs/framework/http"
 import { Modules } from "@medusajs/framework/utils"
 
-import { marketContextStorage } from "../../../../lib/market-context"
+import { resolveRuntimeInstanceId } from "../../../../lib/market-context"
 import {
   buildPaymentIntentSucceededEnvelope,
   PAYMENT_INTENT_SUCCEEDED_EVENT,
@@ -66,12 +66,18 @@ import {
 import { stampPaymentIntentOrderFacts } from "../../../../lib/payment/stripe-payment-intent-metadata-stamp"
 import {
   persistDeferredIssuanceMarker,
+  queryUnderMarketContext,
   releaseWebhookDelivery,
   reserveWebhookDelivery,
   resolveWebhookPgHandle,
   STRIPE_PATH_Y_WEBHOOK_PROVIDER,
   type WebhookPgHandle,
 } from "../../../../lib/payment/stripe-payment-intent-transport"
+
+/** Stały kod błędu odczytu jednostek poziomu 2 (C3-SEC-003; szczegół tylko w logu). */
+export const SETTLEMENT_READ_ERROR_CODE = "settlement_read_failed" as const
+/** Nazwany kod odmowy przy braku `GP_INSTANCE_ID` (C3-SEC-002). */
+export const INSTANCE_UNCONFIGURED_REASON = "gp_instance_id_missing" as const
 import {
   buildPurchaseCorrelationKey,
   findOpenCompensationFailures,
@@ -260,6 +266,18 @@ export async function POST(
   }
   const deliveryEventId = submittedEventId
 
+  // C3-SEC-002: instancja na granicy RLS WYŁĄCZNIE ze źródła serwerowego
+  // (`GP_INSTANCE_ID`). Brak = odmowa fail-closed z nazwanym kodem; 5xx, bo to
+  // defekt konfiguracji, a nie danych — Stripe ma ponowić po naprawie.
+  const instanceId = resolveRuntimeInstanceId()
+  if (!instanceId) {
+    logger.error?.(
+      "[stripe/payment-intent] GP_INSTANCE_ID nie jest skonfigurowany — odmowa"
+    )
+    res.status(500).json({ type: "instance_unconfigured", reason: INSTANCE_UNCONFIGURED_REASON })
+    return
+  }
+
   let handle: WebhookPgHandle | null
   try {
     handle = await resolveWebhookPgHandle(req.scope)
@@ -400,6 +418,7 @@ export async function POST(
         buildPaymentIntentSucceededEnvelope(stripeEvent, occurredAt, {
           order_id: order.order_id,
           market_id: order.market_id,
+          instance_id: instanceId,
         })
       )
     } catch (err) {
@@ -530,16 +549,13 @@ export async function POST(
       let settlementReadError: Error | null = null
       try {
         const purchaseQuery = buildEventProcessedPurchaseQuery(paymentIntentId)
-        const result = await marketContextStorage.run(
-          {
-            market_id: marketId,
-            instance_id: envelopes[0].scope.instance_id,
-          },
-          () =>
-            handle.client.query<{ external_id: string }>(
-              purchaseQuery.sql,
-              purchaseQuery.params
-            )
+        // C3-SEC-001: połączenie brane WEWNĄTRZ kontekstu RLS (hook ustawia GUC
+        // tylko przy acquire), nie `handle.client` pobrany przed kontekstem.
+        const result = await queryUnderMarketContext<{ external_id: string }>(
+          req.scope,
+          { market_id: marketId, instance_id: instanceId },
+          purchaseQuery.sql,
+          purchaseQuery.params
         )
         settledUnits = result.rows.map((row) => row.external_id)
       } catch (err) {
@@ -566,7 +582,8 @@ export async function POST(
             `[${ackEvaluation.missing_units.join(",")}]; unexpected_units=` +
             `[${ackEvaluation.unexpected_units.join(",")}]` +
             (settlementReadError
-              ? `; settlement_read_error=${settlementReadError.message}`
+              ? `; settlement_read_error_code=${SETTLEMENT_READ_ERROR_CODE}` +
+                `; settlement_read_error=${settlementReadError.message}`
               : "")
         )
         res.status(status).json({
@@ -577,9 +594,9 @@ export async function POST(
           settled_units: ackEvaluation.settled_units,
           missing_units: ackEvaluation.missing_units,
           unexpected_units: ackEvaluation.unexpected_units,
-          ...(settlementReadError
-            ? { settlement_read_error: settlementReadError.message }
-            : {}),
+          // C3-SEC-003: publiczna trasa zwraca wyłącznie STAŁY kod; szczegół
+          // błędu odczytu trafia tylko do kontrolowanego logu powyżej.
+          ...(settlementReadError ? { error_code: SETTLEMENT_READ_ERROR_CODE } : {}),
         })
         return
       }

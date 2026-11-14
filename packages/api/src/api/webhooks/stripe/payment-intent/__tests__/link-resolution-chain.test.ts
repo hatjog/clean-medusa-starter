@@ -56,6 +56,10 @@ import {
 import { EntitlementInstanceState } from "../../../../../modules/voucher/models/entitlement"
 import { Modules } from "@medusajs/framework/utils"
 
+// Story 3.1 C3-SEC-002: instancja RLS wyłącznie ze źródła serwerowego (GP_INSTANCE_ID),
+// bez domyślnego "gp" — testy ustawiają ją jawnie.
+process.env.GP_INSTANCE_ID = "gp-test"
+
 const SECRET = "whsec_test_chain"
 
 // Fakty z realnego incydentu (2026-07-28) — celowo te same identyfikatory.
@@ -614,7 +618,7 @@ describe("Story 5.1 AC4 — rozłączne klasy odrzucenia (zero emisji, czytelny 
 })
 
 describe("Story 5.1 AC4 — idempotencja obu warstw po naprawie", () => {
-  it("ponowna dostawa TEGO SAMEGO zdarzenia ⇒ 200 duplicate, druga emisja NIE zachodzi", async () => {
+  it("ponowna dostawa TEGO SAMEGO zdarzenia bez settlement ⇒ 500 (D-35 p.4), druga emisja NIE zachodzi", async () => {
     const pg = makeFixturePg()
 
     const first = await post(makeReq(incidentEvent(), pg).req)
@@ -623,9 +627,12 @@ describe("Story 5.1 AC4 — idempotencja obu warstw po naprawie", () => {
     const second = makeReq(incidentEvent(), pg)
     const res = await post(second.req)
 
-    expect(res.statusCode).toBe(200)
-    expect(res.body.duplicate).toBe(true)
-    expect(res.body.reason).toBe("delivery_already_processed")
+    // D-35 p.4: konsument nie rozliczył jednostki, więc duplikat nie dostaje ACK.
+    expect(res.statusCode).toBe(500)
+    expect(res.body.type).toBe("owed_unit_ack_incomplete")
+    // Harness nie emuluje hooka RLS, więc odczyt poziomu 2 kończy się odmową
+    // fail-closed (UNKNOWN) — w obu przypadkach ACK jest wstrzymany.
+    expect(["owed_units_unsettled", "owed_units_unreadable"]).toContain(res.body.reason)
     expect(second.emitted).toHaveLength(0)
     expect(pg.webhookDeliveries.size).toBe(1)
   })

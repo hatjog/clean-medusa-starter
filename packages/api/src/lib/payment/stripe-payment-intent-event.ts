@@ -1,4 +1,5 @@
 import { createHmac, timingSafeEqual } from "node:crypto"
+import { resolveRuntimeInstanceId } from "../market-context"
 
 import {
   assertEventEnvelopeMatchesContract,
@@ -167,6 +168,12 @@ export function readPaymentIntentIdentifiers(
 export type ResolvedPaymentIntentFacts = {
   order_id?: string | null
   market_id?: string | null
+  /**
+   * Instancja runtime ze ŹRÓDŁA SERWEROWEGO (`GP_INSTANCE_ID`, Story 3.1
+   * C3-SEC-002). Nigdy z `payment_intent.metadata` — metadata są mutowalne
+   * z zewnątrz przez Stripe API i nie mogą wybierać instancji na granicy RLS.
+   */
+  instance_id?: string | null
 }
 
 /**
@@ -175,8 +182,9 @@ export type ResolvedPaymentIntentFacts = {
  * BEZ raw provider error / sekretów (zgodnie z payload-schema). `order_id` i
  * `market_id` pochodzą z `resolved` (fakty wyliczone przez wołającego z
  * powiązania płatność→zamówienie; Story 5.1 AC4, ADR-190), a `payment_intent.metadata`
- * są FALLBACKIEM na wypadek, gdy wołający nic nie przekazał. `instance_id` nadal
- * z metadata (nie jest faktem rezolucji). Rzuca `StripeEventMappingError` przy
+ * są FALLBACKIEM na wypadek, gdy wołający nic nie przekazał. `instance_id`
+ * pochodzi wyłącznie ze źródła serwerowego (`resolved.instance_id` albo
+ * `GP_INSTANCE_ID`), nigdy z metadata ani z domyślki. Rzuca `StripeEventMappingError` przy
  * brakach / złym typie.
  *
  * Dlaczego `resolved` w ogóle istnieje: sesja płatności powstaje ZANIM zamówienie
@@ -228,7 +236,17 @@ export function buildPaymentIntentSucceededEnvelope(
       `payment_intent ${paymentIntentId} bez nieujemnego amount`
     )
   }
-  const instanceId = readString(metadata.instance_id) ?? "gp"
+  // Story 3.1 C3-SEC-002 (zamyka też 3-6-C5-N002): instancja wyłącznie ze
+  // źródła serwerowego, bez domyślnego "gp" i bez metadata PaymentIntentu —
+  // kontrakt `lib/market-context.ts` zabrania domyślnej instancji na granicy RLS.
+  const instanceId =
+    readString(resolved.instance_id) ?? resolveRuntimeInstanceId()
+  if (!instanceId) {
+    throw new StripeEventMappingError(
+      `payment_intent ${paymentIntentId} bez instance_id — GP_INSTANCE_ID ` +
+        "nie jest skonfigurowany (brak domyślnej instancji na granicy RLS)"
+    )
+  }
   // ADR-190: jak wyżej — `resolved` przed metadata (kontrola A bramki).
   const marketId =
     readString(resolved.market_id) ??

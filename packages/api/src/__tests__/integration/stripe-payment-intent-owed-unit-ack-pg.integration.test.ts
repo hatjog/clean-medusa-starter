@@ -32,12 +32,23 @@ import { POST } from "../../api/webhooks/stripe/payment-intent/route"
 import { STRIPE_SIGNATURE_HEADER } from "../../api/webhooks/stripe/payment-intent/helpers"
 import { buildEventProcessedPurchaseQuery } from "../../modules/voucher/models/event-processed"
 import { liveIssueEntitlementsWithinTx } from "../../workflows/entitlements/live-issue-from-payment-intent"
+import { marketContextStorage } from "../../lib/market-context"
+import { installRlsPoolHook, RlsMarketContextRequiredError } from "../../lib/rls-pool-hook"
+import {
+  queryUnderMarketContext,
+  RLS_CONTEXT_NOT_APPLIED,
+  RlsScopedReadError,
+} from "../../lib/payment/stripe-payment-intent-transport"
 import {
   ackStatusForVerdict,
   buildOwedBusinessUnits,
   evaluateOwedUnitAck,
   STRIPE_PATH_Y_WEBHOOK_PROVIDER,
 } from "../../lib/payment/stripe-webhook-barrier-contract"
+
+// Story 3.1 C3-SEC-002: instancja RLS wyłącznie ze źródła serwerowego (GP_INSTANCE_ID),
+// bez domyślnego "gp" — testy ustawiają ją jawnie.
+process.env.GP_INSTANCE_ID = "gp-test"
 
 const STORY_TEST_DATABASE_URL_ENV = "GP_STORY_3_1_TEST_DATABASE_URL"
 const DATABASE_URL = process.env[STORY_TEST_DATABASE_URL_ENV]
@@ -169,7 +180,21 @@ async function deliver(client: PoolClient, queue: QueuedEnvelope[], event = stri
         if (key === "logger") return { info() {}, warn() {}, error() {} }
         if (key === "__pg_pool__") {
           return {
-            connect: async () => ({ query: client.query.bind(client), release: () => {} }),
+            // Lustro hooka RLS: GUC rynku/instancji ustawiany W CHWILI acquire
+            // z kontekstu ALS (jak `installRlsPoolHook`); bez kontekstu — RESET.
+            // Tabele tymczasowe nie mają polityk, więc realny RLS mierzy osobny
+            // `describe` niżej na prawdziwej tabeli `event_processed`.
+            connect: async () => {
+              const ctx = marketContextStorage.getStore()
+              if (ctx?.market_id && ctx.instance_id) {
+                await client.query(`SELECT set_config('app.gp_market_id', $1, false)`, [ctx.market_id])
+                await client.query(`SELECT set_config('app.gp_instance_id', $1, false)`, [ctx.instance_id])
+              } else {
+                await client.query(`RESET app.gp_market_id`)
+                await client.query(`RESET app.gp_instance_id`)
+              }
+              return { query: client.query.bind(client), release: () => {} }
+            },
           }
         }
         if (key === Modules.EVENT_BUS) {
@@ -271,12 +296,33 @@ runWithIsolatedDatabase("Story 3.1 AC3 — kontrakt ACK vs jednostki należne na
          envelope jsonb NOT NULL, received_at timestamptz NOT NULL,
          PRIMARY KEY (event_id, provider)
        ) ON COMMIT DROP`,
+      // Story 3.1 fix C3-AC2-001: rejestr kompensacji (czytany w gałęzi duplikatu)
+      // nie istnieje w gp_story_3_1_test — kształt 1:1 z multi-order.
+      `CREATE TEMP TABLE money_path_compensation_failure (
+         failure_id text PRIMARY KEY,
+         market_id text NOT NULL,
+         compensation_kind text NOT NULL,
+         delivery_path text NOT NULL,
+         stripe_event_id text NOT NULL,
+         payment_intent_id text NOT NULL,
+         order_id text,
+         purchase_correlation_key text NOT NULL,
+         failure_code text NOT NULL,
+         failure_detail text NOT NULL,
+         occurred_at timestamptz NOT NULL DEFAULT now(),
+         attempt_count integer NOT NULL DEFAULT 1,
+         last_attempt_at timestamptz NOT NULL DEFAULT now(),
+         resolution_state text NOT NULL DEFAULT 'open',
+         resolved_at timestamptz,
+         resolved_by text
+       ) ON COMMIT DROP`,
       // `purchase_key` = kolumna klucza zakupu (Story 3.3 / AD-16 / ADR-190,
       // migracja 1779006000000). Kształt lustrzany wobec migracji modułu.
       `CREATE TEMP TABLE event_processed (
          external_id text NOT NULL, event_type text NOT NULL,
          processed_at bigint NOT NULL,
          purchase_key text CHECK (purchase_key IS NULL OR char_length(purchase_key) > 0),
+         market_id text, instance_id text,
          PRIMARY KEY (external_id, event_type)
        ) ON COMMIT DROP`,
       `CREATE TEMP TABLE entitlement_instance (
@@ -463,5 +509,134 @@ runWithIsolatedDatabase("Story 3.1 AC3 — kontrakt ACK vs jednostki należne na
     const v = evaluateOwedUnitAck({ owed_units: owed, settled_units: settled })
     expect(v.verdict).toBe("UNKNOWN")
     expect(ackStatusForVerdict(v.verdict)).not.toBe(200)
+  })
+})
+
+
+// ── Story 3.1 fix C3-SEC-001 — odczyt poziomu 2 na REALNEJ tabeli z RLS ───────
+//
+// `event_processed` w bazie testowej ma FORCE ROW LEVEL SECURITY z polityką
+// `market_isolation` (instance_id + market_id vs GUC). Hook RLS jest tu
+// instalowany na prawdziwym sterowniku (pg Pool), więc test mierzy ten sam
+// mechanizm co produkcja: GUC ustawiany wyłącznie przy acquire połączenia.
+runWithIsolatedDatabase("Story 3.1 fix C3-SEC-001 — odczyt jednostek pod kontekstem RLS na realnym PostgreSQL", () => {
+  const PROBE_PI = "pi_3_1_rls_probe"
+  const ROWS = [
+    { external_id: `${PROBE_PI}:order_bb`, market_id: "bonbeauty", instance_id: "gp-test" },
+    { external_id: `${PROBE_PI}:order_mercur`, market_id: "mercur", instance_id: "gp-test" },
+    { external_id: `${PROBE_PI}:order_other_instance`, market_id: "bonbeauty", instance_id: "gp-other" },
+  ]
+  let pool: Pool
+  let scope: { resolve: (key: string) => unknown }
+  let driver: {
+    acquireConnection: () => Promise<PoolClient>
+    releaseConnection: (c: PoolClient) => Promise<void>
+    destroyRawConnection: (c: PoolClient) => Promise<void>
+  }
+
+  async function cleanup() {
+    await pool.query(`DELETE FROM event_processed WHERE purchase_key = $1`, [PROBE_PI])
+  }
+
+  beforeAll(async () => {
+    pool = new Pool({ connectionString: DATABASE_URL, max: 2 })
+    await cleanup()
+    for (const row of ROWS) {
+      await pool.query(
+        `INSERT INTO event_processed (external_id, event_type, processed_at, purchase_key, market_id, instance_id)
+         VALUES ($1, 'payment_intent_succeeded', 1790000000, $2, $3, $4)`,
+        [row.external_id, PROBE_PI, row.market_id, row.instance_id]
+      )
+    }
+    driver = {
+      acquireConnection: () => pool.connect(),
+      releaseConnection: async (c) => c.release(),
+      destroyRawConnection: async (c) => c.release(true),
+    }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    installRlsPoolHook({ client: driver as any })
+    scope = {
+      resolve: (key: string) => {
+        if (key === "__pg_pool__") throw new Error("unresolved __pg_pool__")
+        return { raw: async () => ({ rows: [] }), client: driver }
+      },
+    }
+  })
+
+  afterAll(async () => {
+    await cleanup().catch(() => undefined)
+    await pool?.end()
+  })
+
+  const purchaseQuery = () => buildEventProcessedPurchaseQuery(PROBE_PI)
+
+  it("kontekst bonbeauty/gp-test widzi WYŁĄCZNIE własną jednostkę (cross-market i cross-instance odfiltrowane)", async () => {
+    const q = purchaseQuery()
+    const result = await queryUnderMarketContext<{ external_id: string }>(
+      scope,
+      { market_id: "bonbeauty", instance_id: "gp-test" },
+      q.sql,
+      q.params
+    )
+    expect(result.rows.map((r) => r.external_id)).toEqual([`${PROBE_PI}:order_bb`])
+  })
+
+  it("kontekst obcego rynku (mercur) NIE widzi jednostki bonbeauty", async () => {
+    const q = purchaseQuery()
+    const result = await queryUnderMarketContext<{ external_id: string }>(
+      scope,
+      { market_id: "mercur", instance_id: "gp-test" },
+      q.sql,
+      q.params
+    )
+    expect(result.rows.map((r) => r.external_id)).toEqual([`${PROBE_PI}:order_mercur`])
+  })
+
+  it("kontekst obcej instancji (cross-instance) NIE widzi jednostek gp-test", async () => {
+    const q = purchaseQuery()
+    const result = await queryUnderMarketContext<{ external_id: string }>(
+      scope,
+      { market_id: "bonbeauty", instance_id: "gp-other" },
+      q.sql,
+      q.params
+    )
+    expect(result.rows.map((r) => r.external_id)).toEqual([`${PROBE_PI}:order_other_instance`])
+  })
+
+  it("połączenie pobrane PRZED kontekstem (stary błąd) jest odmową hooka, nie odczytem bez filtra", async () => {
+    // Hookowany sterownik: acquire bez kontekstu ALS ⇒ odmowa nazwanym błędem.
+    await expect(driver.acquireConnection()).rejects.toBeInstanceOf(RlsMarketContextRequiredError)
+  })
+
+  it("połączenie wzięte w kontekście A i użyte w kontekście B nie zmienia GUC (dlatego acquire musi być W kontekście)", async () => {
+    const conn = await marketContextStorage.run({ market_id: "mercur", instance_id: "gp-test" }, () =>
+      driver.acquireConnection()
+    )
+    try {
+      const q = purchaseQuery()
+      const rows = await marketContextStorage.run({ market_id: "bonbeauty", instance_id: "gp-test" }, () =>
+        conn.query<{ external_id: string }>(q.sql, q.params)
+      )
+      // To jest zmierzona luka C3-SEC-001: owinięcie zapytania w `run` po
+      // acquire nie przestawia kontekstu — sesja nadal widzi rynek A.
+      expect(rows.rows.map((r) => r.external_id)).toEqual([`${PROBE_PI}:order_mercur`])
+    } finally {
+      await driver.releaseConnection(conn)
+    }
+  })
+
+  it("ścieżka BEZ hooka (surowa pula) ⇒ odmowa fail-closed rls_context_not_applied", async () => {
+    const rawScope = {
+      resolve: (key: string) => {
+        if (key === "__pg_pool__") return { connect: () => pool.connect() }
+        throw new Error(`unresolved ${key}`)
+      },
+    }
+    const q = purchaseQuery()
+    const attempt = queryUnderMarketContext(rawScope, { market_id: "bonbeauty", instance_id: "gp-test" }, q.sql, q.params)
+    await expect(attempt).rejects.toBeInstanceOf(RlsScopedReadError)
+    await expect(
+      queryUnderMarketContext(rawScope, { market_id: "bonbeauty", instance_id: "gp-test" }, q.sql, q.params)
+    ).rejects.toMatchObject({ code: RLS_CONTEXT_NOT_APPLIED })
   })
 })

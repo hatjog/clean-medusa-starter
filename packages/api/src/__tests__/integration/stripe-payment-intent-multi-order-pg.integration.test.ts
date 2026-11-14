@@ -19,7 +19,12 @@ import { POST } from "../../api/webhooks/stripe/payment-intent/route"
 import { STRIPE_SIGNATURE_HEADER } from "../../api/webhooks/stripe/payment-intent/helpers"
 import { PAYMENT_INTENT_SUCCEEDED_EVENT } from "../../lib/payment/stripe-payment-intent-event"
 import { buildEventProcessedPurchaseQuery } from "../../modules/voucher/models/event-processed"
+import { marketContextStorage } from "../../lib/market-context"
 import { liveIssueEntitlementsWithinTx } from "../../workflows/entitlements/live-issue-from-payment-intent"
+
+// Story 3.1 C3-SEC-002: instancja RLS wyłącznie ze źródła serwerowego (GP_INSTANCE_ID),
+// bez domyślnego "gp" — testy ustawiają ją jawnie.
+process.env.GP_INSTANCE_ID = "gp-test"
 
 const DATABASE_URL = process.env.DATABASE_URL
 const runOrSkip = DATABASE_URL ? describe : describe.skip
@@ -107,10 +112,19 @@ async function postThroughRealPath(client: PoolClient, event: unknown) {
         }
         if (key === "__pg_pool__") {
           return {
-            connect: async () => ({
-              query: client.query.bind(client),
-              release() {},
-            }),
+            // Lustro hooka RLS (Story 3.1 fix C3-SEC-001): GUC ustawiany przy acquire
+            // z kontekstu ALS; bez kontekstu — RESET.
+            connect: async () => {
+              const ctx = marketContextStorage.getStore()
+              if (ctx?.market_id && ctx.instance_id) {
+                await client.query(`SELECT set_config('app.gp_market_id', $1, false)`, [ctx.market_id])
+                await client.query(`SELECT set_config('app.gp_instance_id', $1, false)`, [ctx.instance_id])
+              } else {
+                await client.query(`RESET app.gp_market_id`)
+                await client.query(`RESET app.gp_instance_id`)
+              }
+              return { query: client.query.bind(client), release() {} }
+            },
           }
         }
         if (key === Modules.EVENT_BUS) {
@@ -236,6 +250,9 @@ runOrSkip("F2 — multi-seller na realnej ścieżce PostgreSQL", () => {
          external_id text NOT NULL, event_type text NOT NULL,
          processed_at bigint NOT NULL,
          purchase_key text CHECK (purchase_key IS NULL OR char_length(purchase_key) > 0),
+         -- Story 3.1 fix C3-AC2-001: konsument INSERT-uje market_id i instance_id
+         -- (migracja RLS event_processed); bez nich suita była 4 failed / 2 passed.
+         market_id text, instance_id text,
          PRIMARY KEY (external_id, event_type)
        ) ON COMMIT DROP`,
       `CREATE TEMP TABLE entitlement_instance (

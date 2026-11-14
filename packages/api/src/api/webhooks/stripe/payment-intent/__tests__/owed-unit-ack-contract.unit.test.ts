@@ -15,7 +15,7 @@
  * ten sam scenariusz na realnym PostgreSQL:
  * `__tests__/integration/stripe-payment-intent-owed-unit-ack-pg.integration.test.ts`.
  */
-import { describe, it, expect, jest } from "@jest/globals"
+import { describe, it, expect, jest, beforeEach, afterEach } from "@jest/globals"
 import { createHmac } from "node:crypto"
 
 jest.mock("../../../../../lib/payment/stripe-payment-intent-metadata-stamp", () => ({
@@ -33,6 +33,32 @@ import {
   WEBHOOK_DELIVERY_BARRIER_TABLE,
 } from "../../../../../lib/payment/stripe-webhook-barrier-contract"
 import { Modules } from "@medusajs/framework/utils"
+import { marketContextStorage } from "../../../../../lib/market-context"
+
+// Story 3.1 C3-SEC-002: instancja RLS wyłącznie ze źródła serwerowego (GP_INSTANCE_ID),
+// bez domyślnego "gp" — testy ustawiają ją jawnie.
+process.env.GP_INSTANCE_ID = "gp-test"
+
+/**
+ * Lustro hooka RLS (C3-SEC-001): kontekst rynku/instancji jest przypinany do
+ * połączenia W CHWILI `connect()`, tak jak `installRlsPoolHook` ustawia GUC
+ * tylko przy acquire. Odczyt GUC zwraca stan z chwili pobrania połączenia.
+ */
+function withAcquiredRlsContext<C extends { query: (sql: string, values?: ReadonlyArray<unknown>) => Promise<unknown> }>(client: C) {
+  const ctx = marketContextStorage.getStore()
+  return {
+    ...client,
+    query: async (sql: string, values: ReadonlyArray<unknown> = []) => {
+      if (/current_setting\('app\.gp_market_id'/i.test(sql)) {
+        return {
+          rows: [{ market_id: ctx?.market_id ?? null, instance_id: ctx?.instance_id ?? null }],
+          rowCount: 1,
+        }
+      }
+      return client.query(sql, values)
+    },
+  }
+}
 
 const PI = "pi_3_1_ack"
 const ORDER_A = "order_3_1_ack_a"
@@ -121,7 +147,7 @@ function stripeEvent(eventId: string) {
         amount_received: 30000,
         currency: "pln",
         created: 1_790_000_100,
-        metadata: { session_id: "payses_ack" },
+        metadata: { session_id: "payses_ack", instance_id: "gp-evil" },
       },
     },
   }
@@ -148,7 +174,8 @@ function makeRes(): FakeRes {
  * emit tylko kolejkuje, a subscriber pracuje osobno i może paść na jednej
  * z N kopert.
  */
-function makeWorld() {
+function makeWorld(opts: { rlsHook?: boolean; settlementError?: string } = {}) {
+  const rlsHook = opts.rlsHook ?? true
   const reservations = new Set<string>()
   const settled = new Set<string>()
   const queue: { name: string; data: { payload: { payment_intent_id: string; order_id: string } } }[] = []
@@ -176,6 +203,7 @@ function makeWorld() {
         }
       }
       if (/FROM event_processed/i.test(sql)) {
+        if (opts.settlementError) throw new Error(opts.settlementError)
         expect(values).toEqual([PI])
         return {
           rows: [...settled].sort().map((external_id) => ({ external_id })),
@@ -194,7 +222,9 @@ function makeWorld() {
       scope: {
         resolve: (key: string) => {
           if (key === "logger") return { info() {}, warn() {}, error() {} }
-          if (key === "__pg_pool__") return { connect: async () => client }
+          if (key === "__pg_pool__") {
+            return { connect: async () => (rlsHook ? withAcquiredRlsContext(client) : client) }
+          }
           if (key === Modules.EVENT_BUS) {
             return { emit: async (e: (typeof queue)[number]) => queue.push(e) }
           }
@@ -292,5 +322,77 @@ describe("Story 3.1 AC3 — route Path Y steruje ACK werdyktem jednostek należn
     const retry = await world.deliver("evt_ack_2")
     expect(retry.statusCode).toBe(ackStatusForVerdict(complete.verdict))
     expect((retry.body as { duplicate?: boolean }).duplicate).toBe(true)
+  })
+})
+
+
+// ── Story 3.1 fix C3-SEC-001 / C3-SEC-002 / C3-SEC-003 ──────────────────────
+
+describe("Story 3.1 fix — odczyt poziomu 2 pod kontekstem RLS i bez wycieku", () => {
+  beforeEach(() => {
+    process.env.STRIPE_WEBHOOK_SECRET = SECRET
+    process.env.GP_INSTANCE_ID = "gp-test"
+  })
+  afterEach(() => {
+    process.env.GP_INSTANCE_ID = "gp-test"
+  })
+
+  it("C3-SEC-001: połączenie BEZ kontekstu RLS (brak GUC) ⇒ odmowa fail-closed UNKNOWN, nie odczyt bez filtra", async () => {
+    const world = makeWorld({ rlsHook: false })
+    await world.deliver("evt_sec_1")
+    world.consume([ORDER_A, ORDER_B])
+    const retry = await world.deliver("evt_sec_1")
+    // Komplet jednostek JEST rozliczony, ale odczyt na połączeniu bez kontekstu
+    // nie może dać PASS — inaczej ACK zależałby od zapytania bez filtra RLS.
+    expect(retry.statusCode).toBeGreaterThanOrEqual(500)
+    expect(retry.body).toMatchObject({
+      type: "owed_unit_ack_incomplete",
+      reason: "owed_units_unreadable",
+      verdict: "UNKNOWN",
+      error_code: "settlement_read_failed",
+    })
+  })
+
+  it("C3-SEC-001 kontrola dodatnia: ten sam świat Z kontekstem przypiętym przy acquire ⇒ 200 PASS", async () => {
+    const world = makeWorld({ rlsHook: true })
+    await world.deliver("evt_sec_2")
+    world.consume([ORDER_A, ORDER_B])
+    const retry = await world.deliver("evt_sec_2")
+    expect(retry.statusCode).toBe(200)
+    expect((retry.body as { duplicate?: boolean }).duplicate).toBe(true)
+  })
+
+  it("C3-SEC-002: brak GP_INSTANCE_ID ⇒ 500 z nazwanym kodem, zero rezerwacji i zero emisji (bez domyślnego 'gp')", async () => {
+    delete process.env.GP_INSTANCE_ID
+    const world = makeWorld()
+    const res = await world.deliver("evt_sec_3")
+    expect(res.statusCode).toBe(500)
+    expect(res.body).toEqual({ type: "instance_unconfigured", reason: "gp_instance_id_missing" })
+    expect(world.queue).toHaveLength(0)
+  })
+
+  it("C3-SEC-002: metadata.instance_id NIE wybiera instancji — koperta niesie instancję serwerową", async () => {
+    process.env.GP_INSTANCE_ID = "gp-server"
+    const world = makeWorld()
+    const res = await world.deliver("evt_sec_4")
+    expect(res.statusCode).toBe(200)
+    for (const delivery of world.queue as unknown as { data: { scope: { instance_id: string } } }[]) {
+      expect(delivery.data.scope.instance_id).toBe("gp-server")
+    }
+    expect(world.queue).toHaveLength(2)
+  })
+
+  it("C3-SEC-003: przy UNKNOWN odpowiedź publiczna niesie stały kod, NIE treść błędu bazy", async () => {
+    const secret = 'relation "event_processed" does not exist; host=db-internal.gp role=medusa_store'
+    const world = makeWorld({ settlementError: secret })
+    await world.deliver("evt_sec_5")
+    world.consume([ORDER_A, ORDER_B])
+    const retry = await world.deliver("evt_sec_5")
+    expect(retry.statusCode).toBeGreaterThanOrEqual(500)
+    expect(retry.body).toMatchObject({ verdict: "UNKNOWN", error_code: "settlement_read_failed" })
+    const serialized = JSON.stringify(retry.body)
+    expect(serialized).not.toContain("does not exist")
+    expect(serialized).not.toContain("db-internal")
+    expect(serialized).not.toContain("settlement_read_error")
   })
 })

@@ -36,6 +36,10 @@ import {
 } from "../../../../../lib/payment/stripe-payment-intent-event"
 import { Modules } from "@medusajs/framework/utils"
 
+// Story 3.1 C3-SEC-002: instancja RLS wyłącznie ze źródła serwerowego (GP_INSTANCE_ID),
+// bez domyślnego "gp" — testy ustawiają ją jawnie.
+process.env.GP_INSTANCE_ID = "gp-test"
+
 const SECRET = "whsec_test_123"
 
 function signedHeader(rawBody: string, secret = SECRET, ts = Math.floor(Date.now() / 1000)): string {

@@ -39,6 +39,32 @@ import {
   WEBHOOK_DELIVERY_BARRIER_TABLE,
 } from "../../../../lib/payment/stripe-webhook-barrier-contract"
 import { Modules } from "@medusajs/framework/utils"
+import { marketContextStorage } from "../../../../lib/market-context"
+
+// Story 3.1 C3-SEC-002: instancja RLS wyłącznie ze źródła serwerowego (GP_INSTANCE_ID),
+// bez domyślnego "gp" — testy ustawiają ją jawnie.
+process.env.GP_INSTANCE_ID = "gp-test"
+
+/**
+ * Lustro hooka RLS (C3-SEC-001): kontekst rynku/instancji jest przypinany do
+ * połączenia W CHWILI `connect()`, tak jak `installRlsPoolHook` ustawia GUC
+ * tylko przy acquire. Odczyt GUC zwraca stan z chwili pobrania połączenia.
+ */
+function withAcquiredRlsContext<C extends { query: (sql: string, values?: ReadonlyArray<unknown>) => Promise<unknown> }>(client: C) {
+  const ctx = marketContextStorage.getStore()
+  return {
+    ...client,
+    query: async (sql: string, values: ReadonlyArray<unknown> = []) => {
+      if (/current_setting\('app\.gp_market_id'/i.test(sql)) {
+        return {
+          rows: [{ market_id: ctx?.market_id ?? null, instance_id: ctx?.instance_id ?? null }],
+          rowCount: 1,
+        }
+      }
+      return client.query(sql, values)
+    },
+  }
+}
 
 const SECRET = "whsec_contract_3_1"
 const PI = "pi_3_1_contract"
@@ -138,7 +164,7 @@ function makeWorld(orderIds: string[]) {
       scope: {
         resolve: (key: string) => {
           if (key === "logger") return { info() {}, warn() {}, error() {} }
-          if (key === "__pg_pool__") return { connect: async () => client }
+          if (key === "__pg_pool__") return { connect: async () => withAcquiredRlsContext(client) }
           if (key === Modules.EVENT_BUS) {
             return { emit: async (e: { name: string; data: unknown }) => emitted.push(e) }
           }
