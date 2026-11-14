@@ -51,6 +51,9 @@ class FakeSql implements DispatchLedgerSql {
         entitlement_id,
         template_key,
         recipient_hash,
+        // Story 11.2 (triage 7.1 poz. 2): oś pomiaru env + instance_id (AD-25).
+        env,
+        instance_id,
         market_id,
         from_status,
         to_status,
@@ -61,6 +64,8 @@ class FakeSql implements DispatchLedgerSql {
         entitlement_id,
         template_key,
         recipient_hash,
+        env,
+        instance_id,
         market_id,
         from_status,
         to_status,
@@ -70,13 +75,16 @@ class FakeSql implements DispatchLedgerSql {
     }
 
     if (q.includes("INSERT INTO voucher_delivery_dispatch")) {
-      const [d, e, t, h, m, f, l, now] = bindings as string[]
+      // Story 11.2: kolejność kolumn INSERT-u z osią env + instance_id (AD-25).
+      const [d, e, t, h, env, instance_id, m, f, l, now] = bindings as string[]
       if (this.find(e, t, h)) return { rows: [] }
       const row: Row = {
         dispatch_id: d,
         entitlement_id: e,
         template_key: t,
         recipient_hash: h,
+        env,
+        instance_id,
         market_id: m,
         flow_id: f,
         locale: l,
@@ -103,7 +111,10 @@ class FakeSql implements DispatchLedgerSql {
         // correlation_token, sent_at, updated_at, dispatch_id) — pozycyjne
         // `[, , , , id]` trafialo w znacznik czasu, wiec UPDATE NIGDY nie
         // znajdowal wiersza i status zostawal `queued`.
-        const [provider, messageId, , , , id] = bindings as string[]
+        // Liczymy `dispatch_id` OD KOŃCA: `$4` występuje dwa razy, więc po
+        // ekspansji Knexa bindingów jest siedem, a guard WHERE jest ostatni.
+        const [provider, messageId] = bindings as string[]
+        const id = bindings[bindings.length - 1] as string
         const row = this.byId(id)
         if (!row || row.status !== "queued") return { rows: [] }
         Object.assign(row, {
@@ -128,7 +139,9 @@ class FakeSql implements DispatchLedgerSql {
         })
         return { rows: [{ ...row }] }
       }
-      const [, , locale, market_id, flow_id, id, ...allowed] = bindings as string[]
+      // Story 11.2: przejęcie przepisuje też oś env + instance_id (AD-25).
+      const [, , locale, market_id, flow_id, env, instance_id, id, ...allowed] =
+        bindings as string[]
       const row = this.byId(id)
       if (!row || !allowed.includes(row.status as string)) return { rows: [] }
       Object.assign(row, {
@@ -138,6 +151,8 @@ class FakeSql implements DispatchLedgerSql {
         locale,
         market_id,
         flow_id,
+        env,
+        instance_id,
       })
       return { rows: [{ ...row }] }
     }

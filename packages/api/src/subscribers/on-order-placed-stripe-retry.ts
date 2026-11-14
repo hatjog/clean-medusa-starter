@@ -56,6 +56,7 @@ import { toKnexPositionalSql } from "../lib/knex-positional-sql"
 import { PAYMENT_INTENT_SUCCEEDED_EVENT } from "../lib/payment/stripe-payment-intent-event"
 import { STRIPE_PATH_Y_WEBHOOK_PROVIDER } from "../lib/payment/stripe-payment-intent-transport"
 import { resolveRuntimeInstanceId } from "../lib/market-context"
+import { requireRuntimeInstanceId } from "../lib/runtime-instance-identity"
 import {
   buildGenesisActiveTransition,
   buildGenesisIssuedTransition,
@@ -600,7 +601,9 @@ export default async function onOrderPlacedStripeRetry({
                   buildGenesisIssuedTransition({
                     entitlement_id: issued.entitlement_id,
                     scope: {
-                      instance_id: issued.entitlement_id,
+                      // Story 11.2 (DW-15-183/DW-15-298 p.4): instancja runtime
+                      // z `buildPathYRecoveryInput` (GP_INSTANCE_ID), nie id uprawnienia.
+                      instance_id: input.scope.instance_id,
                       market_id: input.scope.market_id,
                       sales_channel_id: null,
                       vendor_id: null,
@@ -630,7 +633,7 @@ export default async function onOrderPlacedStripeRetry({
                     buildGenesisActiveTransition({
                       entitlement_id: issued.entitlement_id,
                       scope: {
-                        instance_id: issued.entitlement_id,
+                        instance_id: input.scope.instance_id,
                         market_id: input.scope.market_id,
                         sales_channel_id: null,
                         vendor_id: null,
@@ -685,6 +688,10 @@ export default async function onOrderPlacedStripeRetry({
             // (`idempotent=false`) — powtórka nie re-audytuje i nie re-emituje.
             const appendAudit = makeTransitionAuditSink(logger)
             const issuedAt = new Date()
+            // Story 11.2: koperta niesie instancję runtime; brak nośnika = odmowa emisji.
+            const runtimeInstanceId = requireRuntimeInstanceId(
+              "on-order-placed-stripe-retry"
+            )
             for (const issued of result.results) {
               if (issued.idempotent) continue
               const { event } = await wireEntitlementTransitionPersisted(
@@ -692,7 +699,7 @@ export default async function onOrderPlacedStripeRetry({
                 buildGenesisActiveTransition({
                   entitlement_id: issued.entitlement_id,
                   scope: {
-                    instance_id: issued.entitlement_id,
+                    instance_id: runtimeInstanceId,
                     // Ten sam precedens defensywny co w ścieżce webhooka: brak
                     // market_id nie może wywrócić transakcji biznesowej.
                     market_id: row.market_id ?? "unknown",

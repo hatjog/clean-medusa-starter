@@ -8,6 +8,7 @@
  */
 
 import { randomUUID } from "node:crypto"
+import { requireRuntimeInstanceId } from "../../lib/runtime-instance-identity"
 import { ContainerRegistrationKeys, Modules } from "@medusajs/framework/utils"
 import {
   resolveRlsConnectionSource,
@@ -2374,6 +2375,9 @@ export class VoucherService {
     const actor = input.actor ?? "system"
     const now = new Date()
     const idempotencyKey = `entitlement:${entitlementId}:refund_applied:${input.refund_id}`
+    // Story 11.2 (DW-15-183): scope.instance_id = instancja runtime; entitlement
+    // id niesie `payload.entitlement_id`. Brak GP_INSTANCE_ID = odmowa przed tx.
+    const runtimeInstanceId = requireRuntimeInstanceId("voucher-service:refund_request")
 
     const pool = this.getPool()
     const client = await pool.connect()
@@ -2403,8 +2407,7 @@ export class VoucherService {
           occurred_at: p.applied_at,
           actor,
           idempotency_key: idempotencyKey,
-          // F-01 fix: use actual entitlement instance ID, not hardcoded "gp-dev".
-          scope: { instance_id: entitlementId },
+          scope: { instance_id: runtimeInstanceId },
           payload: p,
         }
         return {
@@ -2566,8 +2569,7 @@ export class VoucherService {
         occurred_at: appliedAt,
         actor,
         idempotency_key: idempotencyKey,
-        // F-01 fix: use actual entitlement instance ID, not hardcoded "gp-dev".
-        scope: { instance_id: entitlementId },
+        scope: { instance_id: runtimeInstanceId },
         payload,
       }
 

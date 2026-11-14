@@ -38,6 +38,7 @@ import {
   type TransitionEventEnvelope,
 } from "../../modules/voucher/entitlement-transition-wiring"
 import { redactFailureCode } from "../../lib/payment/failure-classification"
+import { requireRuntimeInstanceId } from "../../lib/runtime-instance-identity"
 
 export const STRIPE_PAYMENT_EVENTS = [
   "payment.captured",
@@ -311,6 +312,8 @@ export class StripePaymentAuditWorkflow {
           // wierszy (`idempotent=false`) — replay nie re-audytuje / nie re-emituje.
           // Posting hook bez payloadu finansowego (attempted=false, no-op).
           const appendAudit = this.makeTransitionAuditSink()
+          // Story 11.2: instancja runtime z GP_INSTANCE_ID; brak = odmowa emisji.
+          const runtimeInstanceId = requireRuntimeInstanceId("stripe-payment-audit")
           for (const issued of multi.results) {
             if (issued.idempotent) continue
             const { event } = await wireEntitlementTransitionPersisted(
@@ -318,7 +321,7 @@ export class StripePaymentAuditWorkflow {
               buildGenesisActiveTransition({
                 entitlement_id: issued.entitlement_id,
                 scope: {
-                  instance_id: issued.entitlement_id,
+                  instance_id: runtimeInstanceId,
                   // Precedens defensywny tego pliku (emit entitlement_issued.v1):
                   // brak market_id NIE może failować transakcji biznesowej.
                   market_id: payload.market_id ?? "unknown",

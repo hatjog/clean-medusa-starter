@@ -63,6 +63,10 @@
  * do locale domyślnego (R-2.3-M6).
  */
 
+import {
+  classifyEnvelopeInstance,
+  RUNTIME_INSTANCE_MISMATCH_ERROR_CODE,
+} from "../lib/runtime-instance-identity"
 import type { SubscriberArgs, SubscriberConfig } from "@medusajs/framework"
 import { ContainerRegistrationKeys, Modules } from "@medusajs/framework/utils"
 
@@ -617,6 +621,44 @@ export async function handleVoucherPurchaseDelivery(
       error_code: errorCode,
       handoff: null,
     }
+  }
+
+  // ── Story 11.2 (AD-49, DW-15-183): strażnik tożsamości instancji ──────────
+  // `scope.instance_id` koperty to instancja runtime PRODUCENTA. Konsument
+  // przyjmuje wyłącznie zdarzenia własnej instancji; koperta zastana (sprzed
+  // 11.2: entitlement id w `instance_id`) i trigger bez scope (sweep) przechodzą
+  // wg zasady kompatybilności ze schematu. Odmowa PRZED jakimkolwiek zapisem.
+  const instanceVerdict = classifyEnvelopeInstance({
+    envelope_instance_id: trigger.instance_id,
+    entitlement_id: entitlementId,
+    runtime_instance_id: measurementContext.instance_id,
+  })
+  if (instanceVerdict === "mismatch") {
+    deps.logger?.error?.(
+      "[voucher-purchase-delivery] odmowa: koperta z obcej instancji runtime",
+      {
+        entitlement_id: entitlementId,
+        market_id: marketId,
+        error_code: RUNTIME_INSTANCE_MISMATCH_ERROR_CODE,
+        envelope_instance_id: trigger.instance_id,
+        runtime_instance_id: measurementContext.instance_id,
+      },
+    )
+    return {
+      outcome: "failed",
+      entitlement_id: entitlementId,
+      dispatch_id: null,
+      market_id: marketId,
+      locale: null,
+      error_code: RUNTIME_INSTANCE_MISMATCH_ERROR_CODE,
+      handoff: null,
+    }
+  }
+  if (instanceVerdict === "legacy_entitlement_scoped") {
+    deps.logger?.warn?.(
+      "[voucher-purchase-delivery] koperta zastana: scope.instance_id = entitlement id (sprzed Story 11.2)",
+      { entitlement_id: entitlementId, market_id: marketId },
+    )
   }
 
   const recipientEmail = nonEmpty(source.buyer_email)

@@ -25,6 +25,19 @@ const ORIGIN: SystemExecutionOrigin = {
   name: "test-consumer",
 }
 
+// Story 11.2 (triage 7.1 poz. 2): od 11.1 nośnik wymaga DRUGIEJ osi scope —
+// instancji runtime z GP_INSTANCE_ID (bez domyślki gp-dev). Fixture podaje ją
+// jawnie; brak osi jest osobnym przypadkiem negatywnym niżej.
+const TEST_INSTANCE_ID = "gp-test-instance"
+const PREVIOUS_INSTANCE_ID = process.env.GP_INSTANCE_ID
+beforeEach(() => {
+  process.env.GP_INSTANCE_ID = TEST_INSTANCE_ID
+})
+afterAll(() => {
+  if (PREVIOUS_INSTANCE_ID === undefined) delete process.env.GP_INSTANCE_ID
+  else process.env.GP_INSTANCE_ID = PREVIOUS_INSTANCE_ID
+})
+
 function makeLogger() {
   const errors: Array<{ message: string; meta?: Record<string, unknown> }> = []
   return {
@@ -39,18 +52,21 @@ describe("runInSystemMarketContext — kontrola dodatnia", () => {
 
   it("uruchamia pracę w kontekście o tym samym kształcie co łańcuch /store/*", async () => {
     const seen: Array<string | undefined> = []
+    const seenInstance: Array<string | undefined> = []
 
     const results = await runInSystemMarketContext(
       { markets: ["bonbeauty"], origin: ORIGIN },
       async (marketId) => {
         // DOKŁADNIE ten sam nośnik, który czyta rls-pool-hook.
         seen.push(marketContextStorage.getStore()?.market_id)
+        seenInstance.push(marketContextStorage.getStore()?.instance_id)
         return `done:${marketId}`
       },
     )
 
     expect(seen).toEqual(["bonbeauty"])
     expect(results).toEqual(["done:bonbeauty"])
+    expect(seenInstance).toEqual([TEST_INSTANCE_ID])
     expect(getSystemMarketContextDenials()).toBe(0)
   })
 
@@ -142,6 +158,20 @@ describe("runInSystemMarketContext — kontrola negatywna (odmowa, nie dostęp d
     // Walidacja idzie PRZED pierwszym przebiegiem — inaczej połowa pracy
     // wykonałaby się przed odmową.
     expect(work).not.toHaveBeenCalled()
+  })
+})
+
+describe("runInSystemMarketContext — druga oś scope (Story 11.2)", () => {
+  beforeEach(() => _resetSystemMarketContextMetrics())
+
+  it("odmawia, gdy brak GP_INSTANCE_ID — bez domyślki gp-dev", async () => {
+    delete process.env.GP_INSTANCE_ID
+    const work = jest.fn(async () => undefined)
+    await expect(
+      runInSystemMarketContext({ markets: ["bonbeauty"], origin: ORIGIN }, work),
+    ).rejects.toMatchObject({ reason: "instance_id_invalid" })
+    expect(work).not.toHaveBeenCalled()
+    expect(getSystemMarketContextDenials({ reason: "instance_id_invalid" })).toBe(1)
   })
 })
 

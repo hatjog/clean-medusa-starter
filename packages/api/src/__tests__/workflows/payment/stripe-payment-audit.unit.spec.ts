@@ -10,6 +10,18 @@ import {
   hydrateStripePaymentAuditPayload,
 } from "../../../subscribers/stripe-payment-audit"
 
+// Story 11.2 (ADR-240): producent `entitlement_state_changed` bierze
+// `scope.instance_id` WYŁĄCZNIE z GP_INSTANCE_ID; brak = odmowa emisji.
+// Fixture podaje instancję jawnie (oś scope uzupełniona, asercje bez zmian).
+const PREVIOUS_GP_INSTANCE_ID = process.env.GP_INSTANCE_ID
+beforeEach(() => {
+  process.env.GP_INSTANCE_ID = "gp-test-instance"
+})
+afterAll(() => {
+  if (PREVIOUS_GP_INSTANCE_ID === undefined) delete process.env.GP_INSTANCE_ID
+  else process.env.GP_INSTANCE_ID = PREVIOUS_GP_INSTANCE_ID
+})
+
 function refundPayload(overrides: Record<string, unknown> = {}) {
   return {
     event_id: "evt_ref_1",

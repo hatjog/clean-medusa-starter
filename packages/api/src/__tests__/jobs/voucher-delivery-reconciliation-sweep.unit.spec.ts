@@ -205,6 +205,10 @@ class FakeSql implements DispatchLedgerSql {
       entitlement_id: seed.entitlement_id,
       template_key: seed.template_key ?? TEMPLATE_KEY,
       recipient_hash: hashRecipientEmail(seed.recipient_email ?? BUYER_EMAIL),
+      // Story 11.2 (triage 7.1 poz. 2): wiersz ledgera niesie oś pomiaru
+      // env + instance_id (AD-25) — ten sam kontekst co `deps.env` uprzęży.
+      env: "test",
+      instance_id: "gp-test",
       market_id: seed.market_id === undefined ? MARKET_ID : seed.market_id,
       flow_id: "voucher_purchase_delivery",
       locale: "pl",
@@ -243,6 +247,10 @@ class FakeSql implements DispatchLedgerSql {
         entitlement_id,
         template_key,
         recipient_hash,
+        // Story 11.2 (triage 7.1 poz. 2): wiersz audytu niesie oś pomiaru
+        // env + instance_id (AD-25) przed market_id — fake modeluje ją jawnie.
+        env,
+        instance_id,
         market_id,
         from_status,
         to_status,
@@ -255,6 +263,8 @@ class FakeSql implements DispatchLedgerSql {
         entitlement_id,
         template_key,
         recipient_hash,
+        env,
+        instance_id,
         market_id,
         from_status,
         to_status,
@@ -266,7 +276,8 @@ class FakeSql implements DispatchLedgerSql {
     }
 
     if (q.includes(`INSERT INTO ${VOUCHER_DELIVERY_DISPATCH_TABLE}`)) {
-      const [d, e, t, h, m, f, l, now] = bindings as string[]
+      // Story 11.2: kolejność kolumn INSERT-u z osią env + instance_id (AD-25).
+      const [d, e, t, h, env, instance_id, m, f, l, now] = bindings as string[]
       // UNIQUE + ON CONFLICT DO NOTHING.
       if (this.find(e, t, h)) return { rows: [] }
       const row: Row = {
@@ -274,6 +285,8 @@ class FakeSql implements DispatchLedgerSql {
         entitlement_id: e,
         template_key: t,
         recipient_hash: h,
+        env,
+        instance_id,
         market_id: m,
         flow_id: f,
         locale: l,
@@ -443,7 +456,8 @@ class FakeSql implements DispatchLedgerSql {
       }
 
       // Przejęcie retry (2.3): guard `status IN (?, ?)`.
-      const [now, , locale, market_id, flow_id, id, ...allowed] =
+      // Story 11.2: przejęcie przepisuje też oś env + instance_id (AD-25).
+      const [now, , locale, market_id, flow_id, env, instance_id, id, ...allowed] =
         bindings as string[]
       const row = this.byId(id)
       if (!row || !allowed.includes(row.status as string)) return { rows: [] }
@@ -456,6 +470,8 @@ class FakeSql implements DispatchLedgerSql {
         locale,
         market_id,
         flow_id,
+        env,
+        instance_id,
       })
       return { rows: [{ ...row }] }
     }
