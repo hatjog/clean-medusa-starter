@@ -228,6 +228,38 @@ type EntitlementBookingCancelledPayload = {
   entitlement_type: EntitlementType.VOUCHER_SERVICE
 }
 
+/**
+ * Story 5.4 fix (checkpoint PO, R-1/R-2): VOUCHER_SERVICE is redeemed in one act
+ * and keeps `remaining_amount = NULL` (no balance row). For a service entitlement
+ * that has already been consumed or closed, NULL means "nothing left", not "face
+ * value left" — the admin view shows 0, exactly as before 5.4 (NULL -> 0 at
+ * redemption). Amount vouchers and not-yet-redeemed service entitlements keep the
+ * previous projection (NULL -> face value).
+ */
+export const SERVICE_CONSUMED_OR_TERMINAL_STATES: ReadonlySet<string> = new Set([
+  EntitlementInstanceState.REDEEMED_FULL,
+  EntitlementInstanceState.SETTLED,
+  EntitlementInstanceState.CLOSED,
+  EntitlementInstanceState.VOIDED,
+  EntitlementInstanceState.EXPIRED,
+  EntitlementInstanceState.REFUNDED,
+])
+
+export function resolveAdminRemainingMinor(
+  row: Record<string, unknown>,
+  faceValue: number
+): number {
+  if (row.remaining_amount != null) return Number(row.remaining_amount)
+  if (
+    row.entitlement_type === EntitlementType.VOUCHER_SERVICE &&
+    typeof row.state === "string" &&
+    SERVICE_CONSUMED_OR_TERMINAL_STATES.has(row.state)
+  ) {
+    return 0
+  }
+  return faceValue
+}
+
 export class EntitlementExtensionError extends Error {
   readonly code: string
   readonly details: Record<string, unknown>
@@ -1358,8 +1390,7 @@ export class VoucherService {
         : typeof policySnapshot.amount_minor === "number"
           ? (policySnapshot.amount_minor as number)
           : 0
-    const remaining =
-      row.remaining_amount != null ? Number(row.remaining_amount) : faceValue
+    const remaining = resolveAdminRemainingMinor(row, faceValue)
     const currency =
       (typeof row.currency_code === "string" ? (row.currency_code as string) : null) ??
       (typeof policySnapshot.currency === "string" ? (policySnapshot.currency as string) : "PLN")

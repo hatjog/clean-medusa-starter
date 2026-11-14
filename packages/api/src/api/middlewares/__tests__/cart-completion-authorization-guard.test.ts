@@ -13,6 +13,9 @@ import { describe, it, expect, beforeEach } from "@jest/globals"
 import { EventEmitter } from "node:events"
 
 import { cartCompletionAuthorizationGuardMiddleware } from "../cart-completion-authorization-guard"
+
+// Story 4.2: writer rejestru bierze `instance_id` wyłącznie z GP_INSTANCE_ID (fail-closed).
+process.env.GP_INSTANCE_ID = process.env.GP_INSTANCE_ID || "gp-test"
 import { getRingBuffer, _resetRingBuffer } from "../../../lib/alert-emit"
 import { COMPENSATION_FAILURE_ALERT_CODE } from "../../../lib/payment/money-path-compensation-registry"
 import {

@@ -104,6 +104,13 @@ if (process.env.TEST_TYPE === "integration:http") {
   module.exports.testMatch = [
     "**/packages/api/src/__tests__/rls/voucher-redeem-for-seller.integration.spec.[jt]s",
   ];
+} else if (process.env.TEST_TYPE === "story-4-4-deferred-trace-pg") {
+  // v1.16.0 Story 4.4 (FR-12, AD-32) — trwaly rekord deferred_issuance_trace
+  // na realnym Postgresie (migracja up/down, RLS market_isolation, domkniecie).
+  // DATABASE_URL musi wskazywac IZOLOWANA DB testowa (*_test).
+  module.exports.testMatch = [
+    "**/packages/api/src/__tests__/integration/story-4-4-deferred-issuance-trace-pg.integration.test.[jt]s",
+  ];
 } else if (process.env.TEST_TYPE === "compensation-failure-pg") {
   // v1.15.0 Story 3.5 (FR-6c, NFR-3, AD-22) — rejestr nieudanych kompensacji
   // sciezki pieniadza wykonany przez sam modul na realnym Postgresie
@@ -112,6 +119,12 @@ if (process.env.TEST_TYPE === "integration:http") {
   // `money_path_compensation_failure`.
   module.exports.testMatch = [
     "**/packages/api/src/__tests__/integration/money-path-compensation-failure-pg.integration.test.[jt]s",
+  ];
+} else if (process.env.TEST_TYPE === "story-4-2-compensation-failure-pg") {
+  // v1.16.0 Story 4.2 (FR-11, AD-32) — migracja kolumn recovery tabeli
+  // money_path_compensation_failure (backfill do kwarantanny, RLS) na realnym PG.
+  module.exports.testMatch = [
+    "**/packages/api/src/__tests__/integration/story-4-2-compensation-failure-migration-pg.integration.test.[jt]s",
   ];
 } else if (process.env.TEST_TYPE === "dispatch-barrier-pg") {
   // v1.15.0 Story 4.1 — bariera idempotencji wysylki wykonana przez sam modul
@@ -140,6 +153,21 @@ if (process.env.TEST_TYPE === "integration:http") {
   module.exports.testMatch = [
     "**/packages/api/src/__tests__/integration/story-3-6-canonical-state-provenance-pg.integration.test.[jt]s",
   ];
+} else if (process.env.TEST_TYPE === "voucher-service-redeem-pg") {
+  // v1.16.0 Story 5.4 (FR-19, AD-34) — realizacja VOUCHER_SERVICE jednym aktem,
+  // atomowość aktu i śladu, rozłączność gałęzi. DATABASE_URL musi wskazywać
+  // IZOLOWANĄ DB `*_test`: suity DROP-ują i odtwarzają tabele modułu voucher.
+  module.exports.testMatch = [
+    "**/packages/api/src/__tests__/integration/voucher-service-redeem-single-act.integration.spec.[jt]s",
+    "**/packages/api/src/__tests__/integration/voucher-service-redeem-atomicity.integration.spec.[jt]s",
+    "**/packages/api/src/__tests__/integration/voucher-redeem-branch-disjointness.integration.spec.[jt]s",
+  ];
+} else if (process.env.TEST_TYPE === "story-4-6-dlq-pg") {
+  // v1.16.0 Story 4.6 — nośnik DLQ (mor_policy_dlq_entry) pod RLS na realnym
+  // PostgreSQL; wyłącznie własna suita (DATABASE_URL = izolowana DB *_test).
+  module.exports.testMatch = [
+    "**/packages/api/src/__tests__/integration/story-4-6-dlq-pg.integration.test.[jt]s",
+  ];
 } else if (process.env.TEST_TYPE === "story-11-1-runtime-recovery-pg") {
   // Story 11.1 — profil musi wskazywać wyłącznie własne suity. Bez tego
   // nieznany TEST_TYPE pozostawia domyślny discovery Jesta i miesza dowód
@@ -152,6 +180,12 @@ if (process.env.TEST_TYPE === "integration:http") {
     "**/packages/api/src/__tests__/integration/story-11-1-provenance-inventory-pg.integration.test.[jt]s",
     "**/packages/api/src/__tests__/integration/story-11-1-retention-inventory-pg.integration.test.[jt]s",
     "**/packages/api/src/__tests__/integration/story-11-1-runtime-writers-pg.integration.test.[jt]s",
+  ];
+} else if (process.env.TEST_TYPE === "story-8-4-partial-line-failure-pg") {
+  // v1.16.0 Story 8.4 — częściowa porażka pozycji prezentowych (SAVEPOINT per
+  // linia) na realnym PG; DATABASE_URL musi wskazywać bazę `*_test`.
+  module.exports.testMatch = [
+    "**/packages/api/src/__tests__/integration/story-8-4-partial-line-failure-pg.integration.test.[jt]s",
   ];
 } else if (process.env.TEST_TYPE === "unit") {
   module.exports.testMatch = [

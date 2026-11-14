@@ -54,7 +54,14 @@ import { ContainerRegistrationKeys, Modules } from "@medusajs/framework/utils"
 
 import { toKnexPositionalSql } from "../lib/knex-positional-sql"
 import { PAYMENT_INTENT_SUCCEEDED_EVENT } from "../lib/payment/stripe-payment-intent-event"
-import { STRIPE_PATH_Y_WEBHOOK_PROVIDER } from "../lib/payment/stripe-payment-intent-transport"
+import {
+  DEFERRED_ISSUANCE_EVENT_SUFFIX,
+  STRIPE_PATH_Y_WEBHOOK_PROVIDER,
+} from "../lib/payment/stripe-payment-intent-transport"
+import {
+  closeDeferredIssuanceTraceGuarded,
+  DEFERRED_ISSUANCE_TRACE_CLOSURE_ORDER_PLACED,
+} from "../lib/recovery/deferred-issuance-trace"
 import { resolveRuntimeInstanceId } from "../lib/market-context"
 import {
   isRuntimeInstanceIdentityError,
@@ -76,7 +83,79 @@ import {
   MissingEntitlementProfileError,
   VoucherIssuanceBlockedError,
 } from "../workflows/entitlements/issue-entitlement"
-import { liveIssueEntitlementsWithinTx } from "../workflows/entitlements/live-issue-from-payment-intent"
+import { liveIssueEntitlementsPerLineWithinTx } from "../workflows/entitlements/live-issue-from-payment-intent"
+import {
+  numericMinorStringToSafeInteger,
+  readNumericMinorString,
+} from "../lib/payment/numeric-minor"
+import {
+  classifyEventFailure,
+  type EventFailureClassification,
+} from "../lib/events/event-failure-classification"
+import { DeadLetterRefusedError, recordEventDeadLetter } from "../lib/events/event-dead-letter"
+
+/** `source_job` wierszy DLQ z tego konsumenta (Story 4.6, ADR-239). */
+export const STRIPE_RETRY_DLQ_SOURCE = "subscriber:on-order-placed-stripe-retry"
+
+/**
+ * Nazwany kod kanału fail-loud: zapis wiersza DLQ się NIE udał (odmowa
+ * `scope_missing` albo błąd bazy). Subskrybent NIE rzuca (ponowienie trwałej
+ * wady niczego nie naprawia i przerwałoby odzysk pozostałych zamówień) —
+ * zamiast tego `logger.error` z tym kodem per porażka, `logger.error` z kodem
+ * `dlq_write_failed_summary` na końcu przebiegu i `dlq_write_failures`
+ * w wyniku subskrybenta (Story 4.6, runda fix 1, R-1/R-2/R-6).
+ */
+export const DLQ_WRITE_FAILED_CODE = "dlq_write_failed" as const
+
+export type DlqWriteFailure = {
+  order_id: string
+  event_id: string
+  event_class: EventFailureClassification["event_class"]
+  /** Odmowa writera (`DeadLetterRefusedError.refusal`) albo `db_error`. */
+  cause: DeadLetterRefusedError["refusal"] | "db_error"
+  message: string
+}
+
+export type StripeRetryRunResult = { dlq_write_failures: DlqWriteFailure[] }
+
+function dlqWriteFailure(
+  orderId: string,
+  eventId: string,
+  classification: EventFailureClassification,
+  dlqErr: unknown
+): DlqWriteFailure {
+  return {
+    order_id: orderId,
+    event_id: eventId,
+    event_class: classification.event_class,
+    cause: dlqErr instanceof DeadLetterRefusedError ? dlqErr.refusal : "db_error",
+    message: dlqErr instanceof Error ? dlqErr.message : String(dlqErr),
+  }
+}
+
+function logDlqWriteFailure(logger: { error?: (msg: string) => void }, f: DlqWriteFailure): void {
+  logger.error?.(
+    `[on-order-placed-stripe-retry] code=${DLQ_WRITE_FAILED_CODE} order_id=${f.order_id} ` +
+      `event_id=${f.event_id} cause=${f.cause} class=${f.event_class}: ${f.message}`
+  )
+}
+
+/**
+ * Porażka wiersza, której klasa idzie do DLQ, a której NIE da się zapisać
+ * w bieżącej transakcji (błąd PG ją przerwał). Niesie scope wiersza do
+ * zewnętrznego `catch`, który zapisuje DLQ w NOWEJ transakcji.
+ */
+export class DeadLetterPendingError extends Error {
+  constructor(
+    readonly row: { event_id: string; market_id: string | null },
+    readonly order_id: string,
+    readonly classification: EventFailureClassification,
+    readonly original: unknown
+  ) {
+    super(classification.reason)
+    this.name = "DeadLetterPendingError"
+  }
+}
 
 /**
  * Wartości `webhook_event_processed.provider`, które mogą nieść ślad deferral.
@@ -355,7 +434,11 @@ export type DeferredCaptureRow = {
   market_id: string | null
   payment_intent_id: string | null
   envelope: Record<string, unknown>
-  amount_minor: number | null
+  /**
+   * Story 3.5 (DW-15-134): `payment.amount` jest NUMERIC, node-pg zwraca go
+   * jako STRING — wartość zostaje łańcuchem (jednostki minor), bez `Number()`.
+   */
+  amount_minor: string | null
   currency: string | null
   payment_id: string | null
 }
@@ -380,7 +463,7 @@ async function findDeferredCapturesForOrder(
     provider: string
     market_id: string | null
     envelope: Record<string, unknown>
-    amount: number | null
+    amount: string | number | null
     currency_code: string | null
     payment_id: string | null
     payment_intent_id: string | null
@@ -399,12 +482,10 @@ async function findDeferredCapturesForOrder(
     // brak kwoty stawał się kwotą zerową już tutaj, o jeden poziom przed
     // walidacją. Brak wartości zostaje `null` i jest odrzucany tam, gdzie
     // odrzucane są pozostałe nieczytelne pola.
-    amount_minor:
-      typeof r.amount === "number"
-        ? r.amount
-        : r.amount === null || r.amount === undefined
-          ? null
-          : Number(r.amount),
+    //
+    // Story 3.5 (DW-15-134): bez `Number(r.amount)` — NUMERIC zostaje
+    // łańcuchem; nieczytelny ⇒ `null` (odmowa niżej, nie zero).
+    amount_minor: readNumericMinorString(r.amount),
     currency: r.currency_code?.toUpperCase() ?? null,
     payment_id: r.payment_id,
   }))
@@ -526,7 +607,10 @@ export function buildPathYRecoveryInput(
   // legalną kwotą, więc cicha domyślna jest tu nieodróżnialna od pomiaru;
   // odmowa jest odróżnialna i ląduje w tym samym kanale, co pozostałe pola
   // (wiersz zostaje NIEROZWIĄZANY, `logger.warn` niesie `field`).
-  if (amountMinor === null || !Number.isFinite(amountMinor)) {
+  // Story 3.5: zamiana łańcucha na liczbę kontraktu koperty jest DOKŁADNA
+  // (BigInt) — wartość poza bezpiecznym zakresem jest odmową, nie zaokrągleniem.
+  const normalizedAmountMinor = numericMinorStringToSafeInteger(amountMinor)
+  if (normalizedAmountMinor === null) {
     throw new PathYRecoveryInputError(
       row.event_id,
       "amount_minor",
@@ -535,7 +619,6 @@ export function buildPathYRecoveryInput(
         "zamiast cichego zera"
     )
   }
-  const normalizedAmountMinor = Math.trunc(amountMinor)
   if (normalizedAmountMinor < 0) {
     throw new PathYRecoveryInputError(
       row.event_id,
@@ -561,11 +644,12 @@ export function buildPathYRecoveryInput(
 export default async function onOrderPlacedStripeRetry({
   event,
   container,
-}: SubscriberArgs<OrderPlacedPayload>): Promise<void> {
+}: SubscriberArgs<OrderPlacedPayload>): Promise<StripeRetryRunResult> {
   const logger = resolveLogger(container as unknown as Record<string, unknown>)
+  const dlqWriteFailures: DlqWriteFailure[] = []
   const orderIds = extractOrderIds(event.data)
   if (orderIds.length === 0) {
-    return
+    return { dlq_write_failures: dlqWriteFailures }
   }
 
   const scope = container as unknown as { resolve: (key: string) => unknown }
@@ -589,12 +673,73 @@ export default async function onOrderPlacedStripeRetry({
           try {
             if (row.provider === STRIPE_PATH_Y_WEBHOOK_PROVIDER) {
               const input = buildPathYRecoveryInput(row, orderId)
-              const result = await liveIssueEntitlementsWithinTx(
+              // Story 8.4 fix (checkpoint PO): odzysk Path Y jest ścieżką
+              // NORMALNĄ (wyścig payment_intent.succeeded × completeCart), więc
+              // idzie trybem izolacji per linia, nie all-or-nothing — porażka
+              // jednej pozycji nie cofa pozycji udanych.
+              const result = await liveIssueEntitlementsPerLineWithinTx(
                 client,
                 input,
                 new Date()
               )
-              await markDeferredResolved(client, row.event_id, orderId, new Date())
+              const partialFailure = result.failed_lines.length > 0
+              if (partialFailure) {
+                // Marker ZOSTAJE nierozwiązany (bez `markDeferredResolved`):
+                // to on jest nośnikiem populacji odzysku linii nieudanych
+                // (kontrakt gift-line-issue-outcome.v1 §Semantyka p.5). Linie
+                // udane są okablowane poniżej i commitują się z tą transakcją.
+                logger.error?.(
+                  `[on-order-placed-stripe-retry] order_id=${orderId} ` +
+                    `event_id=${row.event_id} Path Y częściowa porażka ` +
+                    `failed=${result.failed_lines.length}/${result.line_outcomes.length} ` +
+                    `— marker odroczony zostaje NIEROZWIĄZANY (populacja odzysku): ` +
+                    `line_outcomes=${JSON.stringify(
+                      result.line_outcomes.map((o) =>
+                        o.state === "failed"
+                          ? { line_item_id: o.line_item_id, state: o.state, reason: o.reason }
+                          : { line_item_id: o.line_item_id, state: o.state }
+                      )
+                    )}`
+                )
+              } else {
+                await markDeferredResolved(client, row.event_id, orderId, new Date())
+              }
+
+              // Story 4.4 (AC2): domknięcie TRWAŁEGO rekordu śladu w tej samej
+              // transakcji co wystawienie — stan terminalny z zapisaną ścieżką
+              // i evidence; wiersz zostaje (historia czytelna). Marker
+              // Path Y ma klucz `<evt>#deferred-issuance` = `trace_id`.
+              const stripeEventId = row.event_id.endsWith(DEFERRED_ISSUANCE_EVENT_SUFFIX)
+                ? row.event_id.slice(0, -DEFERRED_ISSUANCE_EVENT_SUFFIX.length)
+                : null
+              if (stripeEventId) {
+                const closed = await closeDeferredIssuanceTraceGuarded(client, {
+                  stripe_event_id: stripeEventId,
+                  instance_id: input.scope.instance_id,
+                  market_id: input.scope.market_id,
+                  order_id: orderId,
+                  closure_path: DEFERRED_ISSUANCE_TRACE_CLOSURE_ORDER_PLACED,
+                  evidence: {
+                    resolver: "subscriber:on-order-placed-stripe-retry",
+                    payment_intent_id: input.payload.payment_intent_id,
+                    entitlements_issued: result.issued.length,
+                    resolved_at: new Date().toISOString(),
+                  },
+                })
+                if (!closed.ok) {
+                  logger.warn?.(
+                    `[on-order-placed-stripe-retry] order_id=${orderId} trace=${row.event_id} ` +
+                      `domkniecie rekordu deferred_issuance_trace NIEUDANE (wystawienie zachowane): ${closed.error}`
+                  )
+                } else {
+                  logger.info?.(
+                    `[on-order-placed-stripe-retry] order_id=${orderId} trace=${row.event_id} ` +
+                      (closed.version === null
+                        ? "rekord deferred_issuance_trace nieobecny albo juz domkniety dla tego zamowienia"
+                        : `rekord deferred_issuance_trace domkniety (issued_after_link, version=${closed.version})`)
+                  )
+                }
+              }
 
               const appendAudit = makeTransitionAuditSink(logger)
               const issuedAt = new Date()
@@ -675,7 +820,9 @@ export default async function onOrderPlacedStripeRetry({
                 payment_id: row.payment_id ?? undefined,
                 payment_intent_id: row.payment_intent_id ?? undefined,
                 market_id: row.market_id,
-                amount_minor: row.amount_minor,
+                // Story 3.5: kwota PI nie jest kwotą vouchera — wystawienie
+                // bierze kwotę z linii; tu tylko dokładna liczba albo `null`.
+                amount_minor: numericMinorStringToSafeInteger(row.amount_minor),
                 currency: row.currency,
                 entitlement_profile: null,
               },
@@ -787,6 +934,49 @@ export default async function onOrderPlacedStripeRetry({
               continue
             }
             if (err instanceof PathYRecoveryInputError) {
+              // Story 4.6 (AD-32): trwała wada danych markera → wiersz DLQ w TEJ
+              // transakcji (pod savepointem, żeby porażka zapisu nie wywróciła
+              // odzyskanych sąsiadów). Marker zostaje nierozwiązany (backfill
+              // nadal możliwy), ale powtórka nie mnoży wpisów: DLQ jest idempotentny.
+              // Brak instance_id/market_id = brak scope'u nośnika pod RLS —
+              // wtedy jedynym skutkiem jest głośny log (DW, populacja globalna).
+              if (err.field !== "instance_id" && err.field !== "market_id") {
+                const classification = classifyEventFailure(err, {
+                  permanentDefectCode: (e) =>
+                    e instanceof PathYRecoveryInputError ? `path_y_marker_${e.field}` : null,
+                })
+                await client.query("SAVEPOINT gp_dlq_entry")
+                try {
+                  const written = await recordEventDeadLetter(client, {
+                    instance_id: resolveRuntimeInstanceId(),
+                    market_id: row.market_id,
+                    source_job: STRIPE_RETRY_DLQ_SOURCE,
+                    event_id: row.event_id,
+                    subject_id: orderId,
+                    classification,
+                    occurred_at: new Date(),
+                  })
+                  await client.query("RELEASE SAVEPOINT gp_dlq_entry")
+                  logger.warn?.(
+                    `[on-order-placed-stripe-retry] order_id=${orderId} ` +
+                      `event_id=${row.event_id} marker Path Y nieodtwarzalny ` +
+                      `(brakujące/niepoprawne pole: ${err.field}) — ten marker POMINIĘTY, ` +
+                      `class=${classification.event_class} ` +
+                      `dlq_entry_id=${written.dlq_entry_id} inserted=${written.inserted}: ${err.message}`
+                  )
+                } catch (dlqErr) {
+                  const failure = dlqWriteFailure(orderId, row.event_id, classification, dlqErr)
+                  dlqWriteFailures.push(failure)
+                  logDlqWriteFailure(logger, failure)
+                  await client.query("ROLLBACK TO SAVEPOINT gp_dlq_entry")
+                }
+                continue
+              }
+              logger.error?.(
+                `[on-order-placed-stripe-retry] order_id=${orderId} ` +
+                  `event_id=${row.event_id} class=permanent_data_defect ` +
+                  `dlq_unscoped (field=${err.field}) — brak scope'u nośnika DLQ`
+              )
               logger.warn?.(
                 `[on-order-placed-stripe-retry] order_id=${orderId} ` +
                   `event_id=${row.event_id} marker Path Y nieodtwarzalny ` +
@@ -796,11 +986,51 @@ export default async function onOrderPlacedStripeRetry({
               )
               continue
             }
-            throw err
+            // Story 4.6: brak klasy domyślnej „spróbuj jeszcze raz”. Przejściowa
+            // → rethrow (ROLLBACK, marker nierozwiązany = nośnik ponowienia);
+            // trwała / nieznana → DLQ w nowej transakcji (ta jest przerwana).
+            const classification = classifyEventFailure(err)
+            if (classification.event_class === "transient_retry") throw err
+            throw new DeadLetterPendingError(row, orderId, classification, err)
           }
         }
       })
     } catch (err) {
+      if (err instanceof DeadLetterPendingError) {
+        try {
+          const written = await withTransaction(db, (client) =>
+            recordEventDeadLetter(client, {
+              instance_id: resolveRuntimeInstanceId(),
+              market_id: err.row.market_id,
+              source_job: STRIPE_RETRY_DLQ_SOURCE,
+              event_id: err.row.event_id,
+              subject_id: err.order_id,
+              classification: err.classification,
+              occurred_at: new Date(),
+            })
+          )
+          logger.error?.(
+            `[on-order-placed-stripe-retry] order_id=${orderId} ` +
+              `event_id=${err.row.event_id} class=${err.classification.event_class} ` +
+              `dlq_entry_id=${written.dlq_entry_id} inserted=${written.inserted}: ${err.message}`
+          )
+        } catch (dlqErr) {
+          // Utrata nośnika DLQ nie może być cicha (NFR-4): fail-loud NAZWANYM
+          // kanałem, bez rethrow — rethrow ponawiałby trwałą wadę i przerywał
+          // odzysk pozostałych zamówień (runda fix 1, R-1/R-2).
+          const failure = dlqWriteFailure(err.order_id, err.row.event_id, err.classification, dlqErr)
+          dlqWriteFailures.push(failure)
+          logDlqWriteFailure(logger, failure)
+        }
+        continue
+      }
+      if (classifyEventFailure(err).event_class === "transient_retry") {
+        logger.warn?.(
+          `[on-order-placed-stripe-retry] order_id=${orderId} class=transient_retry ` +
+            `— marker zostaje nierozwiązany do ponowienia: ${(err as Error).message}`
+        )
+        continue
+      }
       const error = err as Error
       logger.error?.(
         `[on-order-placed-stripe-retry] order_id=${orderId} failed: ` +
@@ -839,6 +1069,15 @@ export default async function onOrderPlacedStripeRetry({
       )
     }
   }
+
+  if (dlqWriteFailures.length > 0) {
+    logger.error?.(
+      `[on-order-placed-stripe-retry] code=${DLQ_WRITE_FAILED_CODE}_summary ` +
+        `count=${dlqWriteFailures.length} ` +
+        `order_ids=${[...new Set(dlqWriteFailures.map((f) => f.order_id))].join(",")}`
+    )
+  }
+  return { dlq_write_failures: dlqWriteFailures }
 }
 
 type EventBusLike = {

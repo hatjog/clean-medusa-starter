@@ -20,7 +20,7 @@ const ROW: DeferredCaptureRow = {
   market_id: "bonbeauty",
   payment_intent_id: "pi_11_1_path_y",
   envelope: { psp_occurred_at: "2026-11-14T12:00:00.000Z" },
-  amount_minor: 25000,
+  amount_minor: "25000",
   currency: "PLN",
   payment_id: "pay_11_1",
 }

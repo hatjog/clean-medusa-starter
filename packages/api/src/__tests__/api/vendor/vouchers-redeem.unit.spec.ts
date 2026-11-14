@@ -450,6 +450,45 @@ function makeVoucher(overrides: Partial<{
 }
 
 describe("cc-4 F-05 — GET /vendor/vouchers/:code/lookup", () => {
+  // Story 5.4 fix runda 2: lookup wchodzi w kontekst rynku sprzedawcy
+  // (`runInHttpMarketContext`), który wymaga jawnej instancji runtime.
+  let savedInstanceId: string | undefined
+  beforeEach(() => {
+    savedInstanceId = process.env.GP_INSTANCE_ID
+    process.env.GP_INSTANCE_ID = "gp_unit_lookup"
+  })
+  afterEach(() => {
+    if (savedInstanceId === undefined) delete process.env.GP_INSTANCE_ID
+    else process.env.GP_INSTANCE_ID = savedInstanceId
+  })
+
+  it("L15 — lookup czyta voucher WEWNĄTRZ kontekstu rynku sprzedawcy (5.4 R-10)", async () => {
+    const { marketContextStorage } = require("../../../lib/market-context")
+    const voucher = makeVoucher()
+    const mock = voucherMock(voucher)
+    let seen: unknown
+    mock.getForSeller.mockImplementation(async () => {
+      seen = marketContextStorage.getStore()
+      return voucher
+    })
+    const res = makeRes()
+    await lookupGET(makeRequest({ voucherService: mock }) as never, res as never)
+    expect(res.statusCode).toBe(200)
+    expect(seen).toEqual({ market_id: "bonbeauty", instance_id: "gp_unit_lookup" })
+  })
+
+  it("L16 — sprzedawca BEZ rynku: lookup ⇒ 409 MARKET_CONTEXT_REQUIRED, voucher nietknięty", async () => {
+    const mock = voucherMock(makeVoucher())
+    const res = makeRes()
+    await lookupGET(
+      makeRequest({ voucherService: mock, sellerMarketId: null }) as never,
+      res as never,
+    )
+    expect(res.statusCode).toBe(409)
+    expect((res.body as { code: string }).code).toBe("MARKET_CONTEXT_REQUIRED")
+    expect(mock.getForSeller).not.toHaveBeenCalled()
+  })
+
   it("L1 — returns 200 + vendor view for owner seller", async () => {
     const voucher = makeVoucher()
     const mock = voucherMock(voucher)
