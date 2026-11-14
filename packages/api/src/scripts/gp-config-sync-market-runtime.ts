@@ -273,6 +273,107 @@ export function normalizeMoneyPathBrakes(raw: unknown): Record<string, string> {
   return normalized
 }
 
+/**
+ * v1.16.0 Story 6.8 (AC2) — round-trip `money_path_brakes` source↔runtime.
+ *
+ * Porównuje blok ze źródła (market.yaml) z blokiem odczytanym z
+ * `market_runtime_config` PO normalizacji obu stron. Brak wiersza albo bloku
+ * po stronie runtime jest ROZJAZDEM (nie `released` i nie „zgodne, bo
+ * domyślne"): wynik `ok=false` i wywołujący odmawia (fail-closed).
+ * Funkcja niczego nie zwalnia i nie tworzy wartości — brak wpisu w źródle
+ * normalizuje się do `engaged` (ADR-177), nigdy do `released`.
+ */
+export type MoneyPathBrakesRoundTrip = {
+  market_id: string
+  ok: boolean
+  source: Record<string, string>
+  runtime: Record<string, string> | null
+  mismatches: string[]
+}
+
+export class MoneyPathBrakesDriftError extends Error {
+  constructor(public readonly roundTrip: MoneyPathBrakesRoundTrip) {
+    super(
+      `money_path_brakes drift for market '${roundTrip.market_id}': ${roundTrip.mismatches.join("; ")}`,
+    )
+    this.name = "MoneyPathBrakesDriftError"
+  }
+}
+
+export function compareMoneyPathBrakesRoundTrip(
+  marketId: string,
+  sourceBlock: unknown,
+  runtimeBlock: unknown,
+): MoneyPathBrakesRoundTrip {
+  const source = normalizeMoneyPathBrakes(sourceBlock)
+  const parsedRuntime =
+    typeof runtimeBlock === "string" ? safeJsonParse(runtimeBlock) : runtimeBlock
+
+  if (
+    parsedRuntime === null ||
+    parsedRuntime === undefined ||
+    typeof parsedRuntime !== "object" ||
+    Array.isArray(parsedRuntime)
+  ) {
+    return {
+      market_id: marketId,
+      ok: false,
+      source,
+      runtime: null,
+      mismatches: ["runtime: brak bloku money_path_brakes"],
+    }
+  }
+
+  const runtimeRecord = parsedRuntime as Record<string, unknown>
+  const mismatches: string[] = []
+  const runtime: Record<string, string> = {}
+  for (const key of Object.keys(runtimeRecord)) {
+    if (!(MONEY_PATH_BRAKE_SWITCHES as readonly string[]).includes(key)) {
+      mismatches.push(`runtime: przelacznik spoza ADR-177 '${key}'`)
+    }
+  }
+  for (const name of MONEY_PATH_BRAKE_SWITCHES) {
+    const value = runtimeRecord[name]
+    if (typeof value !== "string") {
+      mismatches.push(`${name}: runtime brak wpisu (source '${source[name]}')`)
+      continue
+    }
+    runtime[name] = value
+    if (value !== source[name]) {
+      mismatches.push(`${name}: source '${source[name]}' != runtime '${value}'`)
+    }
+  }
+
+  return { market_id: marketId, ok: mismatches.length === 0, source, runtime, mismatches }
+}
+
+export function assertMoneyPathBrakesRoundTrip(
+  marketId: string,
+  sourceBlock: unknown,
+  runtimeBlock: unknown,
+): MoneyPathBrakesRoundTrip {
+  const result = compareMoneyPathBrakesRoundTrip(marketId, sourceBlock, runtimeBlock)
+  if (!result.ok) {
+    throw new MoneyPathBrakesDriftError(result)
+  }
+  return result
+}
+
+export async function readRuntimeMoneyPathBrakes(
+  db: Knex,
+  marketId: string,
+): Promise<unknown> {
+  const result = await db.raw(
+    `SELECT money_path_brakes
+       FROM market_runtime_config
+      WHERE market_id = ?
+      LIMIT 1`,
+    [marketId],
+  )
+  const rows = extractRows<{ money_path_brakes: unknown }>(result)
+  return rows.length === 0 ? null : rows[0]?.money_path_brakes ?? null
+}
+
 export function buildMarketRuntimeRecord(
   marketId: string,
   marketYaml: Record<string, unknown>,
@@ -427,6 +528,21 @@ export default async function gpConfigSyncMarketRuntime({
     await applyMarketRuntimeSync(db, record)
   }
 
+  // Story 6.8 (AC2): po apply runtime MUSI odtwarzac source dokladnie;
+  // rozjazd przerywa etap (fail-closed). Dry-run tylko raportuje rozjazd.
+  const runtimeBrakes = await readRuntimeMoneyPathBrakes(db, record.market_id)
+  const brakesRoundTrip = parsedArgs.dryRun
+    ? compareMoneyPathBrakesRoundTrip(
+        record.market_id,
+        marketYaml.money_path_brakes,
+        runtimeBrakes,
+      )
+    : assertMoneyPathBrakesRoundTrip(
+        record.market_id,
+        marketYaml.money_path_brakes,
+        runtimeBrakes,
+      )
+
   // Raport bez sekretów: `support_email` to adres kontaktowy rynku publikowany
   // w stopce maila, a nie dana wrażliwa; żadnych kluczy API tu nie ma.
   const summary = {
@@ -441,6 +557,10 @@ export default async function gpConfigSyncMarketRuntime({
     market_url: record.market_url,
     support_email: record.support_email,
     locales_default: record.locales.default,
+    money_path_brakes_round_trip: {
+      ok: brakesRoundTrip.ok,
+      mismatches: brakesRoundTrip.mismatches,
+    },
   }
 
   console.log(JSON.stringify(summary, null, 2))

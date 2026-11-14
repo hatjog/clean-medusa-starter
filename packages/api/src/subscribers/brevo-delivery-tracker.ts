@@ -21,7 +21,10 @@ import {
   UNRECOGNIZED_DELIVERY_EVENT_METRIC,
   type DeliveryEventReaction,
 } from "../lib/delivery-event-classification"
-import { createMoneyPathBrakeReader } from "../lib/money-path-brakes"
+import {
+  buildMoneyPathBrakeEngagedTrace,
+  createMoneyPathBrakeReader,
+} from "../lib/money-path-brakes"
 import {
   requireMarketContext,
   runInSystemMarketContext,
@@ -251,13 +254,26 @@ export default async function brevoDeliveryTracker({
       },
       logger,
     )
-    const deliveryPathReleased = await brakeReader.isReleased(
+    const deliveryBrake = await brakeReader.read(
       marketId ?? "",
       "fr_9_delivery_idempotency",
     )
-    if (!deliveryPathReleased) {
+    if (deliveryBrake.state !== "released") {
       logger.info?.(
         `[brevo-delivery-tracker] money path brake engaged market_id=${marketId ?? "missing"} brake=fr_9_delivery_idempotency`,
+      )
+      // Story 6.8 (DW-15-155): slad zachowania `engaged` — cichy `return`
+      // przed klasyfikacja musi byc odroznialny od braku wywolania.
+      logger.info?.(
+        `[brevo-delivery-tracker] money_path_brake_engaged_trace ${JSON.stringify(
+          buildMoneyPathBrakeEngagedTrace({
+            marketId,
+            brake: "fr_9_delivery_idempotency",
+            read: deliveryBrake,
+            consumer: "brevo-delivery-tracker",
+            behavior: "skip_before_classification",
+          }),
+        )}`,
       )
       return
     }

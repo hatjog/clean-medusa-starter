@@ -11,6 +11,8 @@
 import {
   MONEY_PATH_BRAKE_SAFE_STATE,
   MONEY_PATH_BRAKE_SWITCHES,
+  MONEY_PATH_BRAKE_ENGAGED_TRACE_EVENT,
+  buildMoneyPathBrakeEngagedTrace,
   createMoneyPathBrakeReader,
   type MoneyPathBrakesSql,
 } from "../../lib/money-path-brakes"
@@ -110,5 +112,66 @@ describe("fail-closed — każda luka daje wartość bezpieczną I raport", () =
     const read = await reader.read("", "fr_14_market_isolation")
     expect(read.state).toBe("engaged")
     expect(raw).not.toHaveBeenCalled()
+  })
+})
+
+describe("Story 6.8 — kontrakt engaged/released fr_9_delivery_idempotency", () => {
+  it("brak wiersza => engaged (degraded), isReleased=false", async () => {
+    const reader = createMoneyPathBrakeReader(sqlReturning([]))
+    const read = await reader.read("bonbeauty", "fr_9_delivery_idempotency")
+    expect(read).toMatchObject({ state: "engaged", degraded: true })
+    expect(await reader.isReleased("bonbeauty", "fr_9_delivery_idempotency")).toBe(false)
+  })
+
+  it("brak wpisu fr_9 w bloku => engaged, nie released", async () => {
+    const reader = createMoneyPathBrakeReader(
+      sqlReturning([{ money_path_brakes: { fr_10_panel_redemption: "released" } }]),
+    )
+    const read = await reader.read("bonbeauty", "fr_9_delivery_idempotency")
+    expect(read.state).toBe("engaged")
+    expect(read.degraded).toBe(true)
+  })
+
+  it("błąd odczytu => engaged z powodem", async () => {
+    const reader = createMoneyPathBrakeReader({
+      raw: async () => {
+        throw new Error("connection refused")
+      },
+    })
+    const read = await reader.read("bonbeauty", "fr_9_delivery_idempotency")
+    expect(read.state).toBe("engaged")
+    expect(read.reason).toMatch(/connection refused/)
+  })
+
+  it("ślad engaged niesie rynek, hamulec, degradację i zachowanie", () => {
+    const trace = buildMoneyPathBrakeEngagedTrace({
+      marketId: "bonbeauty",
+      brake: "fr_9_delivery_idempotency",
+      read: { state: "engaged", degraded: true, reason: "brak wiersza" },
+      consumer: "brevo-delivery-tracker",
+      behavior: "skip_before_classification",
+    })
+    expect(trace).toEqual({
+      event: MONEY_PATH_BRAKE_ENGAGED_TRACE_EVENT,
+      market_id: "bonbeauty",
+      brake: "fr_9_delivery_idempotency",
+      state: "engaged",
+      degraded: true,
+      reason: "brak wiersza",
+      behavior: "skip_before_classification",
+      consumer: "brevo-delivery-tracker",
+    })
+  })
+
+  it("ślad engaged odmawia dla stanu released (nie da się nim zamaskować zwolnienia)", () => {
+    expect(() =>
+      buildMoneyPathBrakeEngagedTrace({
+        marketId: "bonbeauty",
+        brake: "fr_9_delivery_idempotency",
+        read: { state: "released", degraded: false, reason: null },
+        consumer: "x",
+        behavior: "y",
+      }),
+    ).toThrow(/nie jest engaged/)
   })
 })

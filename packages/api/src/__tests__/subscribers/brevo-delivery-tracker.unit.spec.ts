@@ -237,6 +237,58 @@ describe("brevoDeliveryTracker", () => {
     )
   })
 
+  it("Story 6.8: zaciagniety hamulec zostawia slad engaged (DW-15-155)", async () => {
+    const ctx = makeContainer({ brakeState: "engaged" })
+
+    await handleDelivery(
+      {
+        provider_id: "brevo",
+        provider_event_id: "brevo-braked-trace-1",
+        dispatch_id: "dispatch-braked-trace-1",
+        event_type: "delivered",
+        market_id: "pl",
+      },
+      ctx.container,
+    )
+
+    const traceLines = (ctx.logger.info.mock.calls as unknown[][])
+      .map((call) => String(call[0]))
+      .filter((line) => line.includes("money_path_brake_engaged_trace"))
+    expect(traceLines).toHaveLength(1)
+    const trace = JSON.parse(traceLines[0].slice(traceLines[0].indexOf("{")))
+    expect(trace).toMatchObject({
+      event: "gp.money_path_brake.engaged",
+      market_id: "pl",
+      brake: "fr_9_delivery_idempotency",
+      state: "engaged",
+      degraded: false,
+      behavior: "skip_before_classification",
+      consumer: "brevo-delivery-tracker",
+    })
+    expect(ctx.auditEvents).toHaveLength(0)
+    expect(ctx.deliveryLedger.applyProviderDeliveryState).not.toHaveBeenCalled()
+  })
+
+  it("Story 6.8: zwolniony hamulec NIE zostawia sladu engaged", async () => {
+    const ctx = makeContainer({ brakeState: "released" })
+
+    await handleDelivery(
+      {
+        provider_id: "brevo",
+        provider_event_id: "brevo-released-trace-1",
+        dispatch_id: "dispatch-released-trace-1",
+        event_type: "delivered",
+        market_id: "pl",
+      },
+      ctx.container,
+    ).catch(() => undefined)
+
+    const traceLines = (ctx.logger.info.mock.calls as unknown[][])
+      .map((call) => String(call[0]))
+      .filter((line) => line.includes("money_path_brake_engaged_trace"))
+    expect(traceLines).toHaveLength(0)
+  })
+
   it("hard_bounce mapuje outcome failed i HARD_BOUNCE", async () => {
     const ctx = makeContainer()
 

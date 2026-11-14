@@ -167,3 +167,54 @@ export function createMoneyPathBrakeReader(
     },
   }
 }
+
+/**
+ * v1.16.0 Story 6.8 (AC1, DW-15-155) — ślad audytowy zachowania `engaged`.
+ *
+ * Konsument, który przy zaciągniętym hamulcu pomija nowe zachowanie, MUSI
+ * zostawić ten ślad: inaczej „hamulec zadziałał" i „ścieżka w ogóle nie
+ * została wywołana" są nieodróżnialne. Ślad jest strukturalnym wpisem logu
+ * (nie zdarzeniem audytu domeny), bo zdarzenie audytu dostawy powstaje
+ * dopiero po klasyfikacji, której przy `engaged` celowo nie ma.
+ *
+ * Ślad NIE zmienia stanu hamulca i nie jest drogą do jego zwolnienia —
+ * zmiana stanu idzie wyłącznie przez `gp-ops brake set` (bramka ludzka).
+ */
+export const MONEY_PATH_BRAKE_ENGAGED_TRACE_EVENT = "gp.money_path_brake.engaged" as const
+
+export type MoneyPathBrakeEngagedTrace = {
+  event: typeof MONEY_PATH_BRAKE_ENGAGED_TRACE_EVENT
+  market_id: string | null
+  brake: MoneyPathBrakeSwitch
+  state: "engaged"
+  /** `true` = stan wynika z wartości bezpiecznej (brak wpisu / błąd odczytu). */
+  degraded: boolean
+  reason: string | null
+  /** Co konsument zrobił zamiast nowego zachowania. */
+  behavior: string
+  consumer: string
+}
+
+export function buildMoneyPathBrakeEngagedTrace(input: {
+  marketId: string | null | undefined
+  brake: MoneyPathBrakeSwitch
+  read: MoneyPathBrakeRead
+  consumer: string
+  behavior: string
+}): MoneyPathBrakeEngagedTrace {
+  if (input.read.state !== "engaged") {
+    throw new Error(
+      `money path brake trace: '${input.brake}' nie jest engaged (stan '${input.read.state}')`,
+    )
+  }
+  return {
+    event: MONEY_PATH_BRAKE_ENGAGED_TRACE_EVENT,
+    market_id: input.marketId ? input.marketId : null,
+    brake: input.brake,
+    state: "engaged",
+    degraded: input.read.degraded,
+    reason: input.read.reason,
+    behavior: input.behavior,
+    consumer: input.consumer,
+  }
+}
