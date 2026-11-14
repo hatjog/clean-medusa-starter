@@ -256,6 +256,25 @@ runOrSkip("F2 — multi-seller na realnej ścieżce PostgreSQL", () => {
          resolved_at timestamptz,
          resolved_by text
        ) ON COMMIT DROP`,
+      // Story 4.2 (ADR-238 §7): FIND_OPEN_COMPENSATION_FAILURES_SQL czyta też
+      // kwarantannę zastanych wierszy — kształt lustrzany wobec migracji
+      // Migration20261114120000 (cf-create-quarantine).
+      `CREATE TEMP TABLE money_path_compensation_failure_backfill_quarantine (
+         source_failure_id text PRIMARY KEY,
+         source_row jsonb NOT NULL,
+         reason text NOT NULL,
+         quarantined_at timestamptz NOT NULL DEFAULT now(),
+         market_id text NOT NULL,
+         instance_id text NOT NULL,
+         instance_id_source text NOT NULL,
+         backfill_state text NOT NULL,
+         owner_type text NOT NULL,
+         owner_id text NOT NULL,
+         deadline timestamptz NOT NULL,
+         closed_at timestamptz,
+         closed_by text,
+         closure_evidence jsonb
+       ) ON COMMIT DROP`,
       // `purchase_key` = kolumna klucza zakupu (Story 3.3 / AD-16 / ADR-190,
       // migracja 1779006000000). Kształt lustrzany wobec migracji modułu.
       `CREATE TEMP TABLE event_processed (
