@@ -156,6 +156,12 @@ if (process.env.TEST_TYPE === "integration:http") {
   module.exports.testMatch = [
     "**/packages/api/src/__tests__/integration/dispatch-window-provider.integration.test.[jt]s",
   ];
+} else if (process.env.TEST_TYPE === "addressing-axis-pg") {
+  // v1.16.0 Story 6.4 (AC2) — oś (a) adresowania z kontrolą dodatnią na realnym
+  // PostgreSQL (DATABASE_URL = izolowana gp_story_6_4_test; własny schemat).
+  module.exports.testMatch = [
+    "**/packages/api/src/__tests__/integration/addressing-axis-pg.integration.test.[jt]s",
+  ];
 } else if (process.env.TEST_TYPE === "story-3-6-canonical-state-pg") {
   module.exports.testMatch = [
     "**/packages/api/src/__tests__/integration/story-3-6-canonical-state-provenance-pg.integration.test.[jt]s",
