@@ -56,7 +56,11 @@ import { toKnexPositionalSql } from "../lib/knex-positional-sql"
 import { PAYMENT_INTENT_SUCCEEDED_EVENT } from "../lib/payment/stripe-payment-intent-event"
 import { STRIPE_PATH_Y_WEBHOOK_PROVIDER } from "../lib/payment/stripe-payment-intent-transport"
 import { resolveRuntimeInstanceId } from "../lib/market-context"
-import { requireRuntimeInstanceId } from "../lib/runtime-instance-identity"
+import {
+  isRuntimeInstanceIdentityError,
+  requireRuntimeInstanceId,
+  RUNTIME_INSTANCE_UNCONFIGURED_ERROR_CODE,
+} from "../lib/runtime-instance-identity"
 import {
   buildGenesisActiveTransition,
   buildGenesisIssuedTransition,
@@ -657,6 +661,12 @@ export default async function onOrderPlacedStripeRetry({
               continue
             }
 
+            // Story 11.2 (ADR-240, review R-5): tożsamość instancji ustalana
+            // PRZED wystawieniem — brak GP_INSTANCE_ID odmawia temu wierszowi,
+            // zanim cokolwiek zostanie zapisane (obsługa w `catch` niżej).
+            const runtimeInstanceId = requireRuntimeInstanceId(
+              "on-order-placed-stripe-retry"
+            )
             const result = await issueEntitlementsForAllLineItems(
               client,
               {
@@ -688,10 +698,6 @@ export default async function onOrderPlacedStripeRetry({
             // (`idempotent=false`) — powtórka nie re-audytuje i nie re-emituje.
             const appendAudit = makeTransitionAuditSink(logger)
             const issuedAt = new Date()
-            // Story 11.2: koperta niesie instancję runtime; brak nośnika = odmowa emisji.
-            const runtimeInstanceId = requireRuntimeInstanceId(
-              "on-order-placed-stripe-retry"
-            )
             for (const issued of result.results) {
               if (issued.idempotent) continue
               const { event } = await wireEntitlementTransitionPersisted(
@@ -766,6 +772,20 @@ export default async function onOrderPlacedStripeRetry({
             // pozostałe markery tej samej paczki — w tym markery pokolenia
             // v1.9.0, które odzyskują się poprawnie — są przetwarzane dalej,
             // zamiast wywracać się razem z tym jednym.
+            // Story 11.2 (review R-5): brak GP_INSTANCE_ID — nazwana odmowa
+            // PRZED wystawieniem. Wiersz zostaje nierozwiązany (bez
+            // `markDeferredResolved`) do ponowienia po konfiguracji instancji;
+            // pozostałe wiersze paczki przetwarzane dalej.
+            if (isRuntimeInstanceIdentityError(err)) {
+              logger.error?.(
+                `[on-order-placed-stripe-retry] order_id=${orderId} ` +
+                  `event_id=${row.event_id} RuntimeInstanceIdentityError ` +
+                  `(${RUNTIME_INSTANCE_UNCONFIGURED_ERROR_CODE}) — uprawnienie NIE ` +
+                  `wystawione, zero zapisów, wiersz odroczony zostaje do ponowienia: ` +
+                  `${err.message}`
+              )
+              continue
+            }
             if (err instanceof PathYRecoveryInputError) {
               logger.warn?.(
                 `[on-order-placed-stripe-retry] order_id=${orderId} ` +

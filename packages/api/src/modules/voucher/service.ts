@@ -813,7 +813,10 @@ export class VoucherService {
       )
     }
     return {
-      instance_id: row.id,
+      // Story 11.2 (ADR-240, review R-1): instancja runtime z GP_INSTANCE_ID,
+      // nie id uprawnienia (to niesie `payload.entitlement_id`). Brak nośnika =
+      // odmowa (RuntimeInstanceIdentityError) — transakcja callera się wycofuje.
+      instance_id: requireRuntimeInstanceId("voucher-service:transition"),
       market_id: row.market_id,
       sales_channel_id: row.sales_channel_id ?? null,
       vendor_id: null,

@@ -210,6 +210,11 @@ export type PurchaseDeliveryTrigger = {
   instance_id: string | null
   market_id: string | null
   /**
+   * Story 11.2 (ADR-240): `occurred_at` koperty — wyznacza okno kompatybilności
+   * kopert zastanych. Opcjonalne: trigger sweepu go nie niesie.
+   */
+  occurred_at?: string | null
+  /**
    * Story 4.4 — cel dosyłki. `null` w ścieżce ZDARZENIOWEJ: subscriber nadal
    * realizuje pełną matrycę AD-7, bo zgubiony event dotyczy wszystkich szablonów.
    */
@@ -421,6 +426,7 @@ export function extractPurchaseDeliveryTrigger(
     to_state: nonEmpty(payload?.to_state),
     from_state: nonEmpty(payload?.from_state),
     instance_id: nonEmpty(scope?.instance_id),
+    occurred_at: nonEmpty(envelope.occurred_at),
     // `scope.market_id` JEST w kopercie eventu (2.1) — to pierwszy, najtańszy
     // nośnik rynku z danych domenowych (R-2.2-M4 / AC6b).
     market_id: nonEmpty(scope?.market_id),
@@ -632,6 +638,7 @@ export async function handleVoucherPurchaseDelivery(
     envelope_instance_id: trigger.instance_id,
     entitlement_id: entitlementId,
     runtime_instance_id: measurementContext.instance_id,
+    occurred_at: trigger.occurred_at ?? null,
   })
   if (instanceVerdict === "mismatch") {
     deps.logger?.error?.(

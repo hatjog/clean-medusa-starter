@@ -69,6 +69,7 @@
 
 import { createHash } from "node:crypto"
 
+import { requireRuntimeInstanceId } from "../../lib/runtime-instance-identity"
 import { LOST_CODE_REISSUE_WINDOW_DAYS } from "./entitlement-boundary"
 import {
   EntitlementInstanceState,
@@ -676,11 +677,14 @@ export function buildLostCodeVoidTransitionInput(
  */
 export function buildLostCodeReissueGenesisInput(
   input: BuildLostCodeWiringInput,
-  newEntitlementId: string
+  newEntitlementId: string,
+  // Story 11.2 (ADR-240, review R-1/R-2): instancja runtime z GP_INSTANCE_ID —
+  // NIE nowy id uprawnienia (ten niesie `payload.entitlement_id`).
+  runtimeInstanceId: string = requireRuntimeInstanceId("entitlement-lost-code:reissue")
 ): TransitionInput {
   return buildGenesisIssuedTransition({
     entitlement_id: newEntitlementId,
-    scope: { ...input.scope, instance_id: newEntitlementId },
+    scope: { ...input.scope, instance_id: runtimeInstanceId },
     actor: input.actor ?? "admin",
     actor_hint: lostCodeReissueActorHint(
       input.operator_id ?? null,
@@ -823,6 +827,9 @@ export async function buildLostCodeRecoveryWiring(
 
   const newEntitlementId =
     input.new_entitlement_id ?? deriveRecoveryEntitlementId(input.recovery_id)
+  // Story 11.2: tożsamość instancji ustalona PRZED void(old) — brak
+  // GP_INSTANCE_ID odmawia, zanim cokolwiek zostanie zapisane.
+  const runtimeInstanceId = requireRuntimeInstanceId("entitlement-lost-code:reissue")
 
   const writeSeam = buildLostCodeAtomicWriteSeam(input, newEntitlementId)
 
@@ -859,7 +866,11 @@ export async function buildLostCodeRecoveryWiring(
   }
 
   // ── (2) issue(new) PO void — nowy kod genezą → ISSUED z przeniesionym saldem. ──
-  const issueInput = buildLostCodeReissueGenesisInput(input, newEntitlementId)
+  const issueInput = buildLostCodeReissueGenesisInput(
+    input,
+    newEntitlementId,
+    runtimeInstanceId
+  )
   const issueWired = await wireEntitlementTransitionPersisted(
     persistDeps,
     issueInput

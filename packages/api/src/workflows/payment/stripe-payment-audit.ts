@@ -247,6 +247,15 @@ export class StripePaymentAuditWorkflow {
     assertNativeStripePayload(eventType, payload)
     const envelope = buildPaymentAuditEnvelope(eventType, payload, now)
     const eventId = payload.event_id as string
+    // Story 11.2 (ADR-240, review R-5): tożsamość instancji runtime ustalana
+    // PRZED otwarciem transakcji — brak GP_INSTANCE_ID to nazwana odmowa
+    // (`RuntimeInstanceIdentityError`, GP_RUNTIME_INSTANCE_UNCONFIGURED) zanim
+    // powstanie wiersz dedupe albo jakiekolwiek uprawnienie. Wywołujący
+    // (subscriber `stripe-payment-audit`) rozpoznaje tę klasę osobno.
+    const runtimeInstanceId =
+      eventType === "payment.captured" && payload.order_id
+        ? requireRuntimeInstanceId("stripe-payment-audit")
+        : null
 
     return this.withTransaction(async (client) => {
       let entitlement: IssueEntitlementResult | undefined
@@ -312,8 +321,6 @@ export class StripePaymentAuditWorkflow {
           // wierszy (`idempotent=false`) — replay nie re-audytuje / nie re-emituje.
           // Posting hook bez payloadu finansowego (attempted=false, no-op).
           const appendAudit = this.makeTransitionAuditSink()
-          // Story 11.2: instancja runtime z GP_INSTANCE_ID; brak = odmowa emisji.
-          const runtimeInstanceId = requireRuntimeInstanceId("stripe-payment-audit")
           for (const issued of multi.results) {
             if (issued.idempotent) continue
             const { event } = await wireEntitlementTransitionPersisted(
@@ -321,7 +328,8 @@ export class StripePaymentAuditWorkflow {
               buildGenesisActiveTransition({
                 entitlement_id: issued.entitlement_id,
                 scope: {
-                  instance_id: runtimeInstanceId,
+                  // Story 11.2: ustalona przed tx (gałąź captured+order_id).
+                  instance_id: runtimeInstanceId as string,
                   // Precedens defensywny tego pliku (emit entitlement_issued.v1):
                   // brak market_id NIE może failować transakcji biznesowej.
                   market_id: payload.market_id ?? "unknown",

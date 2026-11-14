@@ -220,19 +220,31 @@ describe("Story 11.2 AC1 — on-order-placed-stripe-retry (genesis Path Y + odzy
     expectRuntimeIdentity(stateChanged(h.eventBus.emit))
   })
 
-  it("odzysk captured bez GP_INSTANCE_ID: odmowa emisji, głośny log, zero eventów", async () => {
+  it("odzysk captured bez GP_INSTANCE_ID: nazwana odmowa PRZED wystawieniem, wiersz nierozwiązany, zero eventów", async () => {
     delete process.env.GP_INSTANCE_ID
     ;(issueEntitlementsForAllLineItems as jest.Mock).mockResolvedValueOnce({
       results: [{ entitlement_id: ENT, idempotent: false }],
     })
-    const h = makeContainer(genericClient([{ ...pathYRow, provider: "stripe" }]))
+    const client = genericClient([{ ...pathYRow, provider: "stripe" }])
+    const h = makeContainer(client)
     await (onOrderPlacedStripeRetry as unknown as (a: unknown) => Promise<void>)({
       event: { data: { id: "order_1" } },
       container: h.container,
     })
     expect(stateChanged(h.eventBus.emit)).toHaveLength(0)
+    // Review R-5: kontrola PRZED wystawieniem — zero uprawnień, zero
+    // `markDeferredResolved`, a transakcja paczki dochodzi do COMMIT (klasa
+    // obsłużona w pętli wierszy, nie wywrotka całej paczki).
+    expect(issueEntitlementsForAllLineItems).not.toHaveBeenCalled()
+    const sqls = (client.query.mock.calls as Array<[string]>).map(([sql]) => sql)
+    expect(sqls.some((sql) => /UPDATE\s+webhook_event_processed/i.test(sql))).toBe(false)
+    expect(sqls).toContain("COMMIT")
+    expect(sqls).not.toContain("ROLLBACK")
     expect(h.logger.error).toHaveBeenCalledWith(
       expect.stringContaining("RuntimeInstanceIdentityError")
+    )
+    expect(h.logger.error).toHaveBeenCalledWith(
+      expect.stringContaining(RUNTIME_INSTANCE_UNCONFIGURED_ERROR_CODE)
     )
   })
 })
@@ -264,8 +276,9 @@ describe("Story 11.2 AC1 — stripe-payment-audit (captured instant-issue)", () 
     const client = genericClient()
     const eventBus = { emit: jest.fn().mockResolvedValue(undefined) }
     const logger = { info: jest.fn(), warn: jest.fn(), error: jest.fn() }
-    const wf = new StripePaymentAuditWorkflow({ connect: async () => client } as never, eventBus, logger)
-    return { wf, eventBus }
+    const connect = jest.fn(async () => client)
+    const wf = new StripePaymentAuditWorkflow({ connect } as never, eventBus, logger)
+    return { wf, eventBus, connect, client }
   }
 
   it("geneza ACTIVE: scope.instance_id = GP_INSTANCE_ID", async () => {
@@ -282,11 +295,81 @@ describe("Story 11.2 AC1 — stripe-payment-audit (captured instant-issue)", () 
     ;(issueEntitlementsForAllLineItems as jest.Mock).mockResolvedValueOnce({
       results: [{ entitlement_id: ENT, idempotent: false }],
     })
-    const { wf, eventBus } = workflow()
+    const { wf, eventBus, connect, client } = workflow()
     await expect(wf.process("payment.captured", payload() as never)).rejects.toBeInstanceOf(
       RuntimeInstanceIdentityError
     )
     expect(stateChanged(eventBus.emit)).toHaveLength(0)
+    // Review R-5: odmowa PRZED transakcją — brak połączenia, brak wiersza
+    // dedupe i brak wystawienia uprawnień (fail-closed zanim cokolwiek się zapisze).
+    expect(connect).not.toHaveBeenCalled()
+    expect(client.query).not.toHaveBeenCalled()
+    expect(issueEntitlementsForAllLineItems).not.toHaveBeenCalled()
+  })
+
+  it("brak GP_INSTANCE_ID nie blokuje zdarzeń bez wystawienia (captured bez order_id)", async () => {
+    delete process.env.GP_INSTANCE_ID
+    const { wf, connect } = workflow()
+    const noOrder = { ...payload(), order_id: undefined }
+    await wf.process("payment.captured", noOrder as never)
+    expect(connect).toHaveBeenCalled()
+    expect(issueEntitlementsForAllLineItems).not.toHaveBeenCalled()
+  })
+})
+
+describe("Story 11.2 (review R-5) — subscriber stripe-payment-audit obsługuje nazwaną odmowę", () => {
+  it("RuntimeInstanceIdentityError z workflow ⇒ osobny log z kodem i rzut dalej (bez częściowego zapisu)", async () => {
+    const refused = new RuntimeInstanceIdentityError("stripe-payment-audit")
+    const run = jest.fn().mockRejectedValue(refused)
+    const logger = { info: jest.fn(), warn: jest.fn(), error: jest.fn() }
+    let subscriber: (a: unknown) => Promise<void> = async () => undefined
+    jest.isolateModules(() => {
+      jest.doMock("../../workflows/payment/stripe-payment-audit", () => ({
+        ...jest.requireActual("../../workflows/payment/stripe-payment-audit"),
+        __esModule: true,
+        stripePaymentAuditWorkflow: () => ({ run }),
+      }))
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      subscriber = require("../../subscribers/stripe-payment-audit").default
+    })
+    await expect(
+      subscriber({
+        event: {
+          name: "payment.captured",
+          data: { event_id: "evt_1", payment_intent_id: "pi_1", request_id: "req_1" },
+        },
+        container: { logger },
+      })
+    ).rejects.toBe(refused)
+    expect(logger.error).toHaveBeenCalledWith(
+      expect.stringContaining(`error_code=${RUNTIME_INSTANCE_UNCONFIGURED_ERROR_CODE}`)
+    )
+    expect(logger.error).not.toHaveBeenCalledWith(expect.stringContaining("failed:"))
+  })
+})
+
+describe("Story 11.2 (review R-1) — VoucherService.resolveTransitionScope (cancel_booking → ACTIVE i pozostałe tranzycje serwisu)", () => {
+  type ScopeBuilder = {
+    resolveTransitionScope: (row: { id: string; market_id: string; sales_channel_id?: string | null }) => {
+      instance_id: string
+      market_id: string
+    }
+  }
+
+  it("scope.instance_id = GP_INSTANCE_ID, nie id uprawnienia", () => {
+    const svc = new VoucherService({}, {}) as unknown as ScopeBuilder
+    const scope = svc.resolveTransitionScope({ id: ENT, market_id: "bonbeauty" })
+    expect(scope.instance_id).toBe(RUNTIME)
+    expect(scope.instance_id).not.toBe(ENT)
+    expect(scope.market_id).toBe("bonbeauty")
+  })
+
+  it("brak GP_INSTANCE_ID ⇒ RuntimeInstanceIdentityError (bez domyślki)", () => {
+    delete process.env.GP_INSTANCE_ID
+    const svc = new VoucherService({}, {}) as unknown as ScopeBuilder
+    expect(() => svc.resolveTransitionScope({ id: ENT, market_id: "bonbeauty" })).toThrow(
+      RuntimeInstanceIdentityError
+    )
   })
 })
 

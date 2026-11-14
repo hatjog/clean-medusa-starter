@@ -13,7 +13,10 @@
 import fs from "node:fs"
 import path from "node:path"
 
-import { classifyEnvelopeInstance } from "../../lib/runtime-instance-identity"
+import {
+  classifyEnvelopeInstance,
+  LEGACY_ENTITLEMENT_SCOPED_CUTOFF_AT,
+} from "../../lib/runtime-instance-identity"
 import { LiteValidator, type JsonSchema } from "./json-schema-lite"
 
 const REPO_ROOT = path.resolve(__dirname, "../../../../../../..")
@@ -28,6 +31,7 @@ function readJson<T = unknown>(rel: string): T {
 }
 
 type Envelope = {
+  occurred_at: string
   event_type: string
   scope: { instance_id: string; market_id: string }
   payload: { entitlement_id: string }
@@ -74,8 +78,26 @@ describe("Story 11.2 — kontrakt koperty entitlement_state_changed (ADR-240)", 
         envelope_instance_id: legacy.scope.instance_id,
         entitlement_id: legacy.payload.entitlement_id,
         runtime_instance_id: current.scope.instance_id,
+        occurred_at: legacy.occurred_at,
       })
     ).toBe("legacy_entitlement_scoped")
+  })
+
+  it("okno kompatybilności ma nazwany koniec zapisany w kontrakcie (review R-3/R-4)", () => {
+    const schema = readJson<{
+      properties: { scope: { properties: { instance_id: { description?: string } } } }
+    }>(`schemas/${ENVELOPE}`)
+    const description = schema.properties.scope.properties.instance_id.description ?? ""
+    expect(description).toContain(LEGACY_ENTITLEMENT_SCOPED_CUTOFF_AT)
+    // Ta sama koperta zastana, ale z occurred_at w punkcie odcięcia = odmowa.
+    expect(
+      classifyEnvelopeInstance({
+        envelope_instance_id: legacy.scope.instance_id,
+        entitlement_id: legacy.payload.entitlement_id,
+        runtime_instance_id: current.scope.instance_id,
+        occurred_at: LEGACY_ENTITLEMENT_SCOPED_CUTOFF_AT,
+      })
+    ).toBe("mismatch")
   })
 
   it("schema opisuje lifecycle i kompatybilność historyczną scope.instance_id", () => {

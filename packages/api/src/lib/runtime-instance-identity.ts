@@ -20,7 +20,12 @@
  *                                         rekonsyliacyjny / płaski payload — nie
  *                                         deklaruje cudzej tożsamości),
  *        - równa `payload.entitlement_id` → koperta ZASTANA sprzed 11.2
- *                                         (kompatybilność historyczna, `warn`),
+ *                                         (kompatybilność historyczna, `warn`)
+ *                                         WYŁĄCZNIE gdy `occurred_at` koperty
+ *                                         leży przed punktem odcięcia
+ *                                         `LEGACY_ENTITLEMENT_SCOPED_CUTOFF_AT`;
+ *                                         po nim (albo bez czytelnego
+ *                                         `occurred_at`) → `mismatch`,
  *        - inna                         → ODRZUCONA (`GP_RUNTIME_INSTANCE_MISMATCH`).
  *
  * @module lib/runtime-instance-identity
@@ -33,6 +38,15 @@ export const RUNTIME_INSTANCE_UNCONFIGURED_ERROR_CODE =
 
 export const RUNTIME_INSTANCE_MISMATCH_ERROR_CODE =
   "GP_RUNTIME_INSTANCE_MISMATCH" as const
+
+/**
+ * Koniec okna kompatybilności kopert zastanych (ADR-240, kontrakt
+ * `envelope.v1` `scope.instance_id`). Koperta w kształcie zastanym
+ * (`scope.instance_id === payload.entitlement_id`) jest przyjmowana wyłącznie,
+ * gdy jej `occurred_at` jest WCZEŚNIEJSZY niż ten punkt. Ta sama wartość jest
+ * zapisana w opisie schematu i w ADR-240 — zmiana wymaga zmiany kontraktu.
+ */
+export const LEGACY_ENTITLEMENT_SCOPED_CUTOFF_AT = "2026-11-15T00:00:00.000Z" as const
 
 /** Producent odmawia emisji, bo nie zna swojej instancji runtime. */
 export class RuntimeInstanceIdentityError extends Error {
@@ -47,6 +61,22 @@ export class RuntimeInstanceIdentityError extends Error {
     this.name = "RuntimeInstanceIdentityError"
     this.producer = producer
   }
+}
+
+/**
+ * Rozpoznanie nazwanej klasy błędu także po przejściu przez granicę workflow
+ * Medusy (która potrafi zgubić prototyp): `instanceof`, kod albo nazwa.
+ */
+export function isRuntimeInstanceIdentityError(
+  err: unknown
+): err is RuntimeInstanceIdentityError {
+  if (err instanceof RuntimeInstanceIdentityError) return true
+  if (!err || typeof err !== "object") return false
+  const candidate = err as { error_code?: unknown; name?: unknown }
+  return (
+    candidate.error_code === RUNTIME_INSTANCE_UNCONFIGURED_ERROR_CODE ||
+    candidate.name === "RuntimeInstanceIdentityError"
+  )
 }
 
 /**
@@ -76,6 +106,8 @@ export function classifyEnvelopeInstance(input: {
   envelope_instance_id: string | null | undefined
   entitlement_id: string | null | undefined
   runtime_instance_id: string
+  /** `occurred_at` koperty — decyduje o oknie kompatybilności kopert zastanych. */
+  occurred_at?: string | null
 }): EnvelopeInstanceVerdict {
   const claimed =
     typeof input.envelope_instance_id === "string"
@@ -85,8 +117,28 @@ export function classifyEnvelopeInstance(input: {
   if (claimed === input.runtime_instance_id) return "match"
   const entitlementId =
     typeof input.entitlement_id === "string" ? input.entitlement_id.trim() : ""
-  if (entitlementId && claimed === entitlementId) {
+  if (
+    entitlementId &&
+    claimed === entitlementId &&
+    isWithinLegacyCompatibilityWindow(input.occurred_at)
+  ) {
     return "legacy_entitlement_scoped"
   }
   return "mismatch"
+}
+
+/**
+ * Czy koperta mieści się w oknie kompatybilności kopert zastanych. Brak albo
+ * nieczytelny `occurred_at` = poza oknem (fail-closed: wyjątek nie może zależeć
+ * od pola, którego nie ma).
+ */
+export function isWithinLegacyCompatibilityWindow(
+  occurredAt: string | null | undefined,
+  cutoffAt: string = LEGACY_ENTITLEMENT_SCOPED_CUTOFF_AT
+): boolean {
+  if (typeof occurredAt !== "string" || !occurredAt.trim()) return false
+  const occurred = Date.parse(occurredAt)
+  const cutoff = Date.parse(cutoffAt)
+  if (!Number.isFinite(occurred) || !Number.isFinite(cutoff)) return false
+  return occurred < cutoff
 }
