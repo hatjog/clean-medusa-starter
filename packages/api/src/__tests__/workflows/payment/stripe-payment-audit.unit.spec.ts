@@ -9,6 +9,7 @@ import {
   MISSING_FAILURE_METADATA_CODE,
   hydrateStripePaymentAuditPayload,
 } from "../../../subscribers/stripe-payment-audit"
+import { handleOwedUnitBarrierSql } from "./owed-unit-barrier-fake"
 
 // Story 11.2 (ADR-240): producent `entitlement_state_changed` bierze
 // `scope.instance_id` WYŁĄCZNIE z GP_INSTANCE_ID; brak = odmowa emisji.
@@ -57,6 +58,9 @@ class FakeClient {
 
   async query<T = Record<string, unknown>>(sql: string, params: ReadonlyArray<unknown> = []) {
     this.queries.push(sql)
+    // Story 3.4 (DW-15-318): wspólna bariera skutku na trasie natywnej.
+    const owedUnitBarrier = handleOwedUnitBarrierSql(this, sql, params)
+    if (owedUnitBarrier) return owedUnitBarrier as unknown as { rows: T[]; rowCount: number }
     if (sql.includes("INSERT INTO webhook_event_processed")) {
       const key = `${params[0]}:stripe`
       if (this.rows.has(key)) return { rows: [] as T[], rowCount: 0 }

@@ -168,6 +168,200 @@ export async function releaseWebhookDelivery(
   ])
 }
 
+/**
+ * Story 3.4 (FR-10, AD-33, DW-15-201): klucz w kopercie rezerwacji
+ * `webhook_event_processed`, pod którym UTRWALANY jest stan rozliczenia jednostek
+ * należnych dostawy. Rezerwacja transportu nie jest dowodem skutku — ten wpis
+ * odróżnia w ZAPISIE (nie w logu) dostawę z nierozliczonymi jednostkami
+ * (`state: 'unsettled'`) od dostawy, której skutek jest kompletny. Pisze go route
+ * (gałąź `reserved=false`) ORAZ konsument Path Y przy własnej porażce.
+ */
+export const OWED_UNIT_SETTLEMENT_ENVELOPE_KEY = "owed_unit_settlement" as const
+
+/**
+ * Story 3.4 (AC4): nazwa alarmu-bramki niezgodności rezerwacja transportu ↔
+ * skutek biznesowy. Bramka = utrwalony stan w rezerwacji (+ nie-2xx na trasie);
+ * log i alarm strukturalny są dodatkiem, nie nośnikiem.
+ */
+export const OWED_UNIT_RESERVATION_MISMATCH_ALARM =
+  "owed_unit_reservation_mismatch" as const
+
+/** Źródło stempla zapisanego przez konsumenta (odróżnialne od stempla route'u). */
+export const OWED_UNIT_CONSUMER_FAILURE_SOURCE = "consumer_failure" as const
+
+/**
+ * Story 3.4 fix (checkpoint PO, AC1/AC4): stempel porażki KONSUMENTA Path Y.
+ *
+ * Pierwsza dostawa dostaje `200` zanim subscriber skonsumuje kopertę, a Stripe
+ * po 200 nie ponawia — gałąź `reserved=false` route'u nie jest więc wyzwalaczem
+ * na realnej ścieżce. Ten zapis biegnie w ścieżce porażki subscribera (każda
+ * próba busa), poza wycofaną tx skutku: rezerwacja przestaje świadczyć „przyjęte”
+ * — dostaje `state: 'unsettled'` i zbiór jednostek, których konsumpcja padła.
+ * Scalanie z istniejącym kluczem (`||`) zachowuje pola stempla route'u; zbiór
+ * jednostek jest sumą (DISTINCT), licznik prób rośnie — łącznie
+ * (`consumer_failure_attempts`) i per jednostka (`consumer_unit_attempts`).
+ * Licznik per jednostka jest numerem próby, którego bus Medusy subskrybentowi
+ * nie przekazuje (`job.attemptsMade` zostaje w workerze `event-bus-redis`), więc
+ * to on rozstrzyga, czy porażka jest ostateczna (runda fix 2, R-9/R-11, ADR-246
+ * p.6). Brak wiersza (dostawa nie pochodzi z route'u) = `rowCount 0`, wołający
+ * raportuje to jawnie.
+ */
+export const STAMP_CONSUMER_FAILURE_SQL = `
+  UPDATE webhook_event_processed
+     SET envelope = envelope || jsonb_build_object(
+           '${OWED_UNIT_SETTLEMENT_ENVELOPE_KEY}',
+           COALESCE(envelope->'${OWED_UNIT_SETTLEMENT_ENVELOPE_KEY}', '{}'::jsonb) || jsonb_build_object(
+             'state', 'unsettled',
+             'alarm', $3::text,
+             'source', '${OWED_UNIT_CONSUMER_FAILURE_SOURCE}',
+             'consumer_failed_units', COALESCE((
+               SELECT jsonb_agg(DISTINCT u ORDER BY u)
+                 FROM jsonb_array_elements_text(
+                        COALESCE(envelope->'${OWED_UNIT_SETTLEMENT_ENVELOPE_KEY}'->'consumer_failed_units', '[]'::jsonb)
+                        || jsonb_build_array($4::text)
+                      ) AS failed(u)
+             ), '[]'::jsonb),
+             'consumer_failure_attempts',
+             COALESCE((envelope->'${OWED_UNIT_SETTLEMENT_ENVELOPE_KEY}'->>'consumer_failure_attempts')::int, 0) + 1,
+             'consumer_unit_attempts',
+             COALESCE(envelope->'${OWED_UNIT_SETTLEMENT_ENVELOPE_KEY}'->'consumer_unit_attempts', '{}'::jsonb)
+               || jsonb_build_object(
+                    $4::text,
+                    COALESCE((envelope->'${OWED_UNIT_SETTLEMENT_ENVELOPE_KEY}'->'consumer_unit_attempts'->>$4::text)::int, 0) + 1
+                  ),
+             'last_consumer_error', $5::text,
+             'consumer_failed_at', NOW()
+           )
+         )
+   WHERE event_id = $1
+     AND provider = $2
+  RETURNING (envelope->'${OWED_UNIT_SETTLEMENT_ENVELOPE_KEY}'->'consumer_unit_attempts'->>$4::text)::int AS unit_attempts
+`
+
+/**
+ * Utrwala porażkę konsumenta Path Y w rezerwacji dostawy. `true` = wiersz
+ * rezerwacji ostemplowany; `false` = brak wiersza tej dostawy. Błąd SQL jest
+ * rzucany — wołający nazywa go w alarmie.
+ */
+export async function stampPathYConsumerFailure(
+  client: PaymentLinkQueryClient,
+  input: { event_id: string; owed_unit: string; error_name: string }
+): Promise<{ stamped: boolean; unit_attempts: number | null }> {
+  const result = await client.query<{ unit_attempts: number | string | null }>(STAMP_CONSUMER_FAILURE_SQL, [
+    input.event_id,
+    STRIPE_PATH_Y_WEBHOOK_PROVIDER,
+    OWED_UNIT_RESERVATION_MISMATCH_ALARM,
+    input.owed_unit,
+    input.error_name,
+  ])
+  const stamped = (result.rowCount ?? 0) > 0
+  const raw = result.rows?.[0]?.unit_attempts
+  const attempts = raw === null || raw === undefined ? null : Number(raw)
+  return { stamped, unit_attempts: stamped && Number.isFinite(attempts) ? attempts : null }
+}
+
+/**
+ * Story 3.4 runda fix 2 (R-9, AC1/AC4): liczba prób busa dla koperty Path Y.
+ * JEDEN nośnik — route emituje z `attempts` równym tej stałej, a konsument
+ * porównuje z nią własny licznik prób per jednostka, by odróżnić porażkę
+ * przejściową (WARN) od ostatecznej (CRITICAL).
+ */
+export const PATH_Y_CONSUMER_MAX_ATTEMPTS = 5 as const
+
+/** Źródło rozliczenia stempla: udana konsumpcja Path Y. */
+export const OWED_UNIT_RECOVERY_CONSUMER_SUCCESS = "consumer_success" as const
+/** Źródło rozliczenia stempla: dostawa z pełną równością zbiorów (gałąź PASS route'u). */
+export const OWED_UNIT_RECOVERY_DELIVERY_ACK = "delivery_ack" as const
+
+/**
+ * Story 3.4 runda fix 2 (R-9/R-11, ADR-246 p.6): zdjęcie stempla po rozliczeniu.
+ *
+ * Jednostki z `$3` (rozliczone, tablica JSON) znikają z `consumer_failed_units` i z
+ * `missing_units` oraz z mapy prób per jednostka; gdy oba zbiory są puste, stan
+ * przechodzi na `settled` z `consumer_recovered_at` i źródłem rozliczenia.
+ * Ślad prób zostaje (`consumer_failure_attempts`, `last_consumer_error`,
+ * `consumer_failed_at`, `repair_attempts`), a rozliczone jednostki są dopisywane
+ * do `recovered_units` — zapis odróżnia samonaprawę od dostawy bez porażki.
+ * Działa WYŁĄCZNIE na stemplu `unsettled` (brak stempla = `rowCount 0`, no-op).
+ */
+export const SETTLE_OWED_UNIT_STAMP_SQL = `
+  UPDATE webhook_event_processed AS w
+     SET envelope = w.envelope || jsonb_build_object(
+           '${OWED_UNIT_SETTLEMENT_ENVELOPE_KEY}',
+           (w.envelope->'${OWED_UNIT_SETTLEMENT_ENVELOPE_KEY}')
+             || jsonb_build_object(
+                  'consumer_failed_units', calc.failed,
+                  'missing_units', calc.missing,
+                  'consumer_unit_attempts',
+                  COALESCE((SELECT jsonb_object_agg(a.key, a.value)
+                              FROM jsonb_each(COALESCE(w.envelope->'${OWED_UNIT_SETTLEMENT_ENVELOPE_KEY}'->'consumer_unit_attempts', '{}'::jsonb)) AS a
+                             WHERE NOT jsonb_exists($3::jsonb, a.key)), '{}'::jsonb),
+                  'recovered_units', calc.recovered,
+                  'state',
+                  CASE WHEN jsonb_array_length(calc.failed) = 0 AND jsonb_array_length(calc.missing) = 0
+                       THEN 'settled' ELSE 'unsettled' END
+                )
+             || CASE WHEN jsonb_array_length(calc.failed) = 0 AND jsonb_array_length(calc.missing) = 0
+                     THEN jsonb_build_object('consumer_recovered_at', NOW(), 'recovered_by', $4::text)
+                     ELSE '{}'::jsonb END
+         )
+    FROM (
+      SELECT i.event_id, i.provider,
+             COALESCE((SELECT jsonb_agg(u ORDER BY u)
+                         FROM jsonb_array_elements_text(
+                                COALESCE(i.envelope->'${OWED_UNIT_SETTLEMENT_ENVELOPE_KEY}'->'consumer_failed_units', '[]'::jsonb)
+                              ) AS f(u)
+                        WHERE NOT jsonb_exists($3::jsonb, u)), '[]'::jsonb) AS failed,
+             COALESCE((SELECT jsonb_agg(u ORDER BY u)
+                         FROM jsonb_array_elements_text(
+                                COALESCE(i.envelope->'${OWED_UNIT_SETTLEMENT_ENVELOPE_KEY}'->'missing_units', '[]'::jsonb)
+                              ) AS m(u)
+                        WHERE NOT jsonb_exists($3::jsonb, u)), '[]'::jsonb) AS missing,
+             COALESCE((SELECT jsonb_agg(DISTINCT u ORDER BY u)
+                         FROM jsonb_array_elements_text(
+                                COALESCE(i.envelope->'${OWED_UNIT_SETTLEMENT_ENVELOPE_KEY}'->'recovered_units', '[]'::jsonb)
+                                || (SELECT COALESCE(jsonb_agg(x), '[]'::jsonb)
+                                      FROM jsonb_array_elements_text(
+                                             COALESCE(i.envelope->'${OWED_UNIT_SETTLEMENT_ENVELOPE_KEY}'->'consumer_failed_units', '[]'::jsonb)
+                                             || COALESCE(i.envelope->'${OWED_UNIT_SETTLEMENT_ENVELOPE_KEY}'->'missing_units', '[]'::jsonb)
+                                           ) AS c(x)
+                                     WHERE jsonb_exists($3::jsonb, x))
+                              ) AS r(u)), '[]'::jsonb) AS recovered
+        FROM webhook_event_processed AS i
+       WHERE i.event_id = $1 AND i.provider = $2
+    ) AS calc
+   WHERE w.event_id = calc.event_id
+     AND w.provider = calc.provider
+     AND w.envelope->'${OWED_UNIT_SETTLEMENT_ENVELOPE_KEY}'->>'state' = 'unsettled'
+  RETURNING w.envelope->'${OWED_UNIT_SETTLEMENT_ENVELOPE_KEY}'->>'state' AS state
+`
+
+/**
+ * Zdejmuje rozliczone jednostki ze stempla rezerwacji. `null` = stempla
+ * `unsettled` nie było (no-op); inaczej stan po zapisie. Błąd SQL jest
+ * rzucany — wołający nazywa go w logu ERROR (NFR-4).
+ */
+export async function settleOwedUnitStamp(
+  client: PaymentLinkQueryClient,
+  input: {
+    event_id: string
+    settled_units: ReadonlyArray<string>
+    recovered_by: typeof OWED_UNIT_RECOVERY_CONSUMER_SUCCESS | typeof OWED_UNIT_RECOVERY_DELIVERY_ACK
+  }
+): Promise<"settled" | "unsettled" | null> {
+  if (input.settled_units.length === 0) return null
+  const result = await client.query<{ state: string }>(SETTLE_OWED_UNIT_STAMP_SQL, [
+    input.event_id,
+    STRIPE_PATH_Y_WEBHOOK_PROVIDER,
+    // JSON, nie tablica: `createKnexQueryClient` rozwija tablicę w listę `?`.
+    JSON.stringify(input.settled_units),
+    input.recovered_by,
+  ])
+  const state = result.rows?.[0]?.state
+  if ((result.rowCount ?? 0) === 0 || !state) return null
+  return state === "settled" ? "settled" : "unsettled"
+}
+
 type PgPoolLike = { connect: () => Promise<PgClientLike> }
 type PgClientLike = PaymentLinkQueryClient & { release?: () => void }
 type KnexDriverLike = {
