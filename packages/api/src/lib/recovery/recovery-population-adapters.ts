@@ -24,8 +24,20 @@ import {
 
 export const RECOVERY_POPULATION_ADAPTER_MISSING = "RECOVERY_POPULATION_ADAPTER_MISSING" as const
 
+/**
+ * Źródło wiersza populacji: tabela 4.2 albo kwarantanna backfillu 4.2
+ * (ADR-238 §7: zastany wiersz w kwarantannie nadal jest otwartą porażką).
+ */
+export const COMPENSATION_FAILURE_SOURCE_TABLE = "compensation_failure" as const
+export const COMPENSATION_FAILURE_SOURCE_QUARANTINE = "backfill_quarantine" as const
+export type RecoveryAlarmSource =
+  | typeof COMPENSATION_FAILURE_SOURCE_TABLE
+  | typeof COMPENSATION_FAILURE_SOURCE_QUARANTINE
+
 export type RecoveryAlarm = {
   population_type: RecoveryPopulationType
+  /** Rozróżnialne źródło wiersza w ładunku alarmu. */
+  source: RecoveryAlarmSource
   /** Bezpieczny identyfikator wiersza (klucz techniczny, bez PII). */
   failure_id: string
   instance_id: string
@@ -85,20 +97,43 @@ export const COMPENSATION_FAILURE_ALARMABLE_STATES: readonly string[] = Object.k
 
 export const ALERT_CODE_COMPENSATION_FAILURE_OVERDUE = "RECOVERY_COMPENSATION_FAILURE_OVERDUE" as const
 
+/** Stan kwarantanny 4.2 liczony jako otwarta porażka (ADR-238 §7). */
+export const QUARANTINE_ALARMABLE_BACKFILL_STATE = "quarantined_pending_review" as const
+
 /**
  * Termin porównuje BAZA (`statement_timestamp()`); jedyny binding to lista
- * stanów nieterminalnych. Zakres rynku/instancji daje RLS `market_isolation`.
+ * stanów nieterminalnych. Zakres rynku/instancji daje RLS `market_isolation`
+ * — także na kwarantannie backfillu 4.2 (runtime ma SELECT, ADR-238 §5).
+ * Wiersz kwarantanny z odpowiednikiem w tabeli głównej nie jest liczony
+ * drugi raz (jak `FIND_OPEN_COMPENSATION_FAILURES_SQL`).
  */
 export const LIST_OVERDUE_COMPENSATION_FAILURES_SQL = `
-  SELECT failure_id, instance_id, market_id, owner_type, owner_id,
+  SELECT source, failure_id, instance_id, market_id, owner_type, owner_id,
          deadline, resolution_state
-    FROM money_path_compensation_failure
-   WHERE resolution_state = ANY($1::text[])
-     AND deadline < statement_timestamp()
+    FROM (
+      SELECT '${COMPENSATION_FAILURE_SOURCE_TABLE}'::text AS source,
+             failure_id, instance_id, market_id, owner_type, owner_id,
+             deadline, resolution_state
+        FROM money_path_compensation_failure
+       WHERE resolution_state = ANY($1::text[])
+         AND deadline < statement_timestamp()
+      UNION ALL
+      SELECT '${COMPENSATION_FAILURE_SOURCE_QUARANTINE}'::text AS source,
+             q.source_failure_id AS failure_id, q.instance_id, q.market_id,
+             q.owner_type, q.owner_id, q.deadline, q.backfill_state AS resolution_state
+        FROM money_path_compensation_failure_backfill_quarantine q
+       WHERE q.backfill_state = '${QUARANTINE_ALARMABLE_BACKFILL_STATE}'
+         AND q.deadline < statement_timestamp()
+         AND NOT EXISTS (
+           SELECT 1 FROM money_path_compensation_failure c WHERE c.failure_id = q.source_failure_id
+         )
+    ) overdue
    ORDER BY deadline ASC, failure_id ASC
 `
 
 export type OverdueCompensationFailureRow = {
+  /** Brak kolumny (stary kształt) = tabela główna. */
+  source?: RecoveryAlarmSource
   failure_id: string
   instance_id: string
   market_id: string
@@ -124,6 +159,7 @@ export const COMPENSATION_FAILURE_ADAPTER: RecoveryPopulationAdapter<OverdueComp
   deadlineOf: (row) => toIso(row.deadline),
   toAlarm: (row) => ({
     population_type: "compensation_failure",
+    source: row.source ?? COMPENSATION_FAILURE_SOURCE_TABLE,
     failure_id: row.failure_id,
     instance_id: row.instance_id,
     market_id: row.market_id,

@@ -43,6 +43,10 @@ export type AlertChannelKind = (typeof ALERT_CHANNEL_KINDS)[number]
 
 export const ALERT_CODE_CHANNEL_ALL_FAILED = "ALERT_CHANNEL_ALL_FAILED" as const
 export const ALERT_CODE_CHANNEL_NOT_CONFIGURED = "ALERT_CHANNEL_NOT_CONFIGURED" as const
+/** INFO: alarm dostarczony pierwszą próbą (zapis wyniku dostarczenia, nie tylko wartość zwracana). */
+export const ALERT_CODE_CHANNEL_DELIVERED = "ALERT_CHANNEL_DELIVERED" as const
+/** WARN: alarm dostarczony dopiero po porażce wcześniejszej próby (np. fallback po podstawowym). */
+export const ALERT_CODE_CHANNEL_DELIVERED_AFTER_FAILURE = "ALERT_CHANNEL_DELIVERED_AFTER_FAILURE" as const
 
 const DEFAULT_TIMEOUT_MS = 5000
 
@@ -194,6 +198,11 @@ export function resolveAlertChannels(
   return { channels, config_errors }
 }
 
+/** Kod błędu próby bez sekretów: URL/DSN w treści błędu są zastępowane znacznikiem. */
+export function sanitizeAttemptError(message: string): string {
+  return message.replace(/[a-z][a-z0-9+.-]*:\/\/\S+/gi, "<url>").slice(0, 200)
+}
+
 export type DeliverAlertDeps = {
   env?: NodeJS.ProcessEnv
   fetch?: FetchLike
@@ -219,19 +228,32 @@ export async function deliverAlert(
       ? (e.channel as AlertChannelKind)
       : ("unknown" as const),
     ok: false as const,
-    error: e.error,
+    error: sanitizeAttemptError(e.error),
   }))
 
   for (const channel of resolved.channels) {
     try {
       await channel.deliver(alert)
       attempts.push({ channel: channel.kind, ok: true })
+      // AC3: wynik dostarczenia jest ZAPISANY (log + ring buffer), a porażka
+      // wcześniejszej próby przy sukcesie fallbacku zostawia nazwany ślad WARN.
+      const afterFailure = attempts.some((a) => !a.ok)
+      emit({
+        severity: afterFailure ? "WARN" : "INFO",
+        code: afterFailure ? ALERT_CODE_CHANNEL_DELIVERED_AFTER_FAILURE : ALERT_CODE_CHANNEL_DELIVERED,
+        message: afterFailure
+          ? `Alarm ${alert.code} dostarczony kanalem ${channel.kind} dopiero po porazce ${attempts.length - 1} wczesniejszej proby`
+          : `Alarm ${alert.code} dostarczony kanalem ${channel.kind}`,
+        context: { alert_code: alert.code, alert_severity: alert.severity, delivered_via: channel.kind, attempts },
+      })
       return { status: "delivered", delivered_via: channel.kind, attempts }
     } catch (err) {
       attempts.push({
         channel: channel.kind,
         ok: false,
-        error: err instanceof Error ? (err.name === "AbortError" ? "timeout" : err.message) : String(err),
+        error: sanitizeAttemptError(
+          err instanceof Error ? (err.name === "AbortError" ? "timeout" : err.message) : String(err)
+        ),
       })
     }
   }

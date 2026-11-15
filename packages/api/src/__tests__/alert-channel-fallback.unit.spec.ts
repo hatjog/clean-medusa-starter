@@ -13,6 +13,8 @@ import { join } from "node:path"
 import {
   ALERT_CHANNEL_ENV_VARS,
   ALERT_CODE_CHANNEL_ALL_FAILED,
+  ALERT_CODE_CHANNEL_DELIVERED,
+  ALERT_CODE_CHANNEL_DELIVERED_AFTER_FAILURE,
   ALERT_CODE_CHANNEL_NOT_CONFIGURED,
   deliverAlert,
   parseSentryDsn,
@@ -79,7 +81,48 @@ describe("Story 4.3 AC3 — deliverAlert przez lokalny odbiornik HTTP", () => {
     expect(received.map((r) => r.path)).toEqual(["/api/down/store/", "/hook"])
     expect(received[0].headers["x-sentry-auth"]).toMatch(/sentry_key=pubkey/)
     expect(received[1].body).toEqual(expect.objectContaining({ code: ALERT.code, context: ALERT.context }))
-    expect(emitted).toEqual([])
+    // Fix R1: porażka podstawowego przy sukcesie fallbacku zostawia nazwany ślad WARN (log + ring buffer).
+    expect(emitted).toEqual([
+      expect.objectContaining({
+        severity: "WARN",
+        code: ALERT_CODE_CHANNEL_DELIVERED_AFTER_FAILURE,
+        context: expect.objectContaining({
+          alert_code: ALERT.code,
+          delivered_via: "webhook",
+          attempts: [
+            { channel: "sentry", ok: false, error: "http_status_503" },
+            { channel: "webhook", ok: true },
+          ],
+        }),
+      }),
+    ])
+    // bez sekretów: DSN (klucz, host) nie trafia do śladu
+    expect(JSON.stringify(emitted)).not.toMatch(/pubkey|127\.0\.0\.1/)
+  })
+
+  it("dostarczenie pierwszą próbą = INFO z delivered_via i attempts", async () => {
+    const emitted: StructuredAlertPayload[] = []
+    const result = await deliverAlert(ALERT, { env: { GP_ALERT_CHANNELS: "webhook", GP_ALERT_WEBHOOK_URL: `${base}/hook` }, emit: (p) => emitted.push(p) })
+    expect(result.status).toBe("delivered")
+    expect(emitted).toEqual([
+      expect.objectContaining({
+        severity: "INFO",
+        code: ALERT_CODE_CHANNEL_DELIVERED,
+        context: expect.objectContaining({ delivered_via: "webhook", attempts: [{ channel: "webhook", ok: true }] }),
+      }),
+    ])
+  })
+
+  it("błąd próby zawierający URL z sekretem jest zredagowany", async () => {
+    const leaky: FetchLike = async (url) => {
+      throw new Error(`connect failed ${url}`)
+    }
+    const result = await deliverAlert(ALERT, {
+      env: { GP_ALERT_CHANNELS: "sentry", GP_ALERT_SENTRY_DSN: "https://secretkey@sentry.example/42" },
+      fetch: leaky,
+      emit: () => undefined,
+    })
+    expect(result.attempts).toEqual([{ channel: "sentry", ok: false, error: "connect failed <url>" }])
   })
 
   it("oba kanały padają ⇒ nazwany ERROR ALERT_CHANNEL_ALL_FAILED, nie cisza", async () => {

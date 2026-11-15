@@ -93,6 +93,19 @@ describeOrNotRun("Story 4.3 — alarm kompensacji po terminie (PG)", () => {
     )
   }
 
+  async function seedQuarantine(failureId: string, deadlineOffsetSeconds: number, market = MARKET_A) {
+    await client.query(
+      `INSERT INTO money_path_compensation_failure_backfill_quarantine
+         (source_failure_id, source_row, reason, market_id, instance_id, instance_id_source,
+          backfill_state, owner_type, owner_id, deadline)
+       VALUES ($1, jsonb_build_object('failure_id', $1::text, 'resolution_state', 'open'),
+               'story-4-3 legacy row', $2, $3, 'GP_INSTANCE_ID',
+               'quarantined_pending_review', 'operator_role', 'ops-recovery',
+               now() + make_interval(secs => $4::double precision))`,
+      [failureId, market, INSTANCE, deadlineOffsetSeconds]
+    )
+  }
+
   async function run(alerts: StructuredAlertPayload[], markets = MARKET_A) {
     const delivered: AlertDeliveryResult = { status: "delivered", delivered_via: "webhook", attempts: [{ channel: "webhook", ok: true }] }
     return runCompensationFailureRecoveryAlarm({ resolve: () => { throw new Error("no container") } } as never, {
@@ -127,6 +140,7 @@ describeOrNotRun("Story 4.3 — alarm kompensacji po terminie (PG)", () => {
 
   beforeEach(async () => {
     await client.query("DELETE FROM money_path_compensation_failure")
+    await client.query("DELETE FROM money_path_compensation_failure_backfill_quarantine")
   })
 
   it("AC4: pusta populacja = wykonanie zapisane jako evaluated:true, overdue_count:0", async () => {
@@ -157,6 +171,7 @@ describeOrNotRun("Story 4.3 — alarm kompensacji po terminie (PG)", () => {
     expect(alerts[0].code).toBe(ALERT_CODE_COMPENSATION_FAILURE_OVERDUE)
     expect(ctx).toEqual({
       population_type: "compensation_failure",
+      source: "compensation_failure",
       failure_id: "mpcf_4_3_overdue",
       instance_id: INSTANCE,
       market_id: MARKET_A,
@@ -183,5 +198,36 @@ describeOrNotRun("Story 4.3 — alarm kompensacji po terminie (PG)", () => {
       [MARKET_A, "mpcf_4_3_overdue"],
       [MARKET_B, "mpcf_4_3_other_market"],
     ])
+  })
+
+  it("fix R2: zastany wiersz kwarantanny 4.2 po terminie ⇒ alarm (source=backfill_quarantine); przed terminem ⇒ brak", async () => {
+    await seedQuarantine("mpcf_4_3_legacy_overdue", -3600)
+    await seedQuarantine("mpcf_4_3_legacy_future", 3600)
+    await seedQuarantine("mpcf_4_3_legacy_other_market", -3600, MARKET_B)
+    const alerts: StructuredAlertPayload[] = []
+    const result = await run(alerts)
+    expect(result.evaluated).toBe(true)
+    expect(result.overdue_count).toBe(1)
+    expect(alerts).toHaveLength(1)
+    expect(alerts[0].code).toBe(ALERT_CODE_COMPENSATION_FAILURE_OVERDUE)
+    expect(alerts[0].context).toEqual({
+      population_type: "compensation_failure",
+      source: "backfill_quarantine",
+      failure_id: "mpcf_4_3_legacy_overdue",
+      instance_id: INSTANCE,
+      market_id: MARKET_A,
+      owner_type: "operator_role",
+      owner_id: "ops-recovery",
+      deadline: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/),
+      state: "quarantined_pending_review",
+    })
+  })
+
+  it("fix R2: kwarantanna tylko przed terminem ⇒ pusta populacja", async () => {
+    await seedQuarantine("mpcf_4_3_legacy_future", 3600)
+    const alerts: StructuredAlertPayload[] = []
+    const result = await run(alerts)
+    expect(result.overdue_count).toBe(0)
+    expect(alerts).toEqual([])
   })
 })
