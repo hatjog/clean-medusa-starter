@@ -59,7 +59,12 @@ import {
 import { buildPathYRecoveryInput } from "../../subscribers/on-order-placed-stripe-retry"
 import voucherLiveIssueSubscriber from "../../subscribers/voucher-live-issue"
 import { _resetRingBuffer, getRingBuffer, injectLogger } from "../../lib/alert-emit"
-import { OWED_UNIT_CONSUMER_FAILURE_SOURCE } from "../../lib/payment/stripe-payment-intent-transport"
+import {
+  OWED_UNIT_CONSUMER_FAILURE_SOURCE,
+  OWED_UNIT_RECOVERY_CONSUMER_SUCCESS,
+  OWED_UNIT_RECOVERY_DELIVERY_ACK,
+  PATH_Y_CONSUMER_MAX_ATTEMPTS,
+} from "../../lib/payment/stripe-payment-intent-transport"
 import { Migration20261114140000SharedIdempotencyBarrier } from "../../migrations/Migration20261114140000SharedIdempotencyBarrier"
 
 const INSTANCE_ID = "gp_test"
@@ -521,6 +526,14 @@ describeOrNotRun("Story 3.4 — rezerwacja transportu nie wyprzedza konsumpcji (
       const ack = await deliverPathY(client, queue, "evt_3_4_redelivery")
       expect(ack.statusCode).toBe(200)
       expect(queue).toHaveLength(0)
+      // Runda fix 2 (R-9): gałąź PASS zdejmuje stempel route'u, ślad prób zostaje.
+      expect((await state(client)).reservations[0].envelope[OWED_UNIT_SETTLEMENT_ENVELOPE_KEY]).toMatchObject({
+        state: "settled",
+        missing_units: [],
+        recovered_units: [unit(ORDER_C)],
+        recovered_by: OWED_UNIT_RECOVERY_DELIVERY_ACK,
+        repair_attempts: 1,
+      })
     })
 
     it("AC1 (fix checkpointu): pierwsza dostawa 200, konsument pada, BEZ redelivery ⇒ rezerwacja ostemplowana 'unsettled' + alarm", async () => {
@@ -549,9 +562,16 @@ describeOrNotRun("Story 3.4 — rezerwacja transportu nie wyprzedza konsumpcji (
       })
       const alarms = getRingBuffer().filter((a) => a.code === OWED_UNIT_RESERVATION_MISMATCH_ALARM)
       expect(alarms).toHaveLength(1)
+      // Runda fix 2 (R-11): próba 1 z 5 jest przejściowa ⇒ WARN, nie CRITICAL.
       expect(alarms[0]).toMatchObject({
-        severity: "CRITICAL",
-        context: { stripe_event_id: "evt_3_4_no_redelivery", owed_unit: unit(ORDER_C), stamp_persisted: true },
+        severity: "WARN",
+        context: {
+          stripe_event_id: "evt_3_4_no_redelivery",
+          owed_unit: unit(ORDER_C),
+          stamp_persisted: true,
+          unit_attempt: 1,
+          final: false,
+        },
       })
 
       // Kolejna próba busa (attempts:5) pada znowu ⇒ licznik rośnie, zbiór bez duplikatu.
@@ -573,6 +593,126 @@ describeOrNotRun("Story 3.4 — rezerwacja transportu nie wyprzedza konsumpcji (
       const resend = await deliverPathY(client, queue, "evt_3_4_no_redelivery")
       expect(resend.statusCode).toBe(200)
       expect(queue).toHaveLength(0)
+      expect((await state(client)).reservations[0].envelope[OWED_UNIT_SETTLEMENT_ENVELOPE_KEY]).toMatchObject({
+        state: "settled",
+        consumer_failed_units: [],
+        consumer_failure_attempts: 2,
+        recovered_by: OWED_UNIT_RECOVERY_DELIVERY_ACK,
+      })
+    })
+
+    const retryEnvelopeFor = async (orderId: string): Promise<QueuedEnvelope> => {
+      const envelope = ((await state(client)).reservations[0].envelope as { envelopes: QueuedEnvelope["data"][] })
+        .envelopes.find((e) => e.payload.order_id === orderId)
+      expect(envelope).toBeDefined()
+      return { name: "gp.stripe.payment_intent_succeeded.v1", data: envelope as QueuedEnvelope["data"] }
+    }
+
+    it("R-9 (runda fix 2): próba 1 pada, próba 2 busa się udaje ⇒ stempel 'settled' + ślad prób, zero CRITICAL", async () => {
+      injectLogger({ info() {}, warn() {}, error() {} })
+      _resetRingBuffer()
+      await seed(client, { [ORDER_A]: 1, [ORDER_B]: 1, [ORDER_C]: 1 })
+      const queue: QueuedEnvelope[] = []
+      expect((await deliverPathY(client, queue, "evt_3_4_self_heal")).statusCode).toBe(200)
+      expect(await consumeViaSubscriber(client, queue, [ORDER_C])).toEqual([ORDER_C])
+      expect((await state(client)).reservations[0].envelope[OWED_UNIT_SETTLEMENT_ENVELOPE_KEY]).toMatchObject({
+        state: "unsettled",
+        consumer_failed_units: [unit(ORDER_C)],
+      })
+
+      // Druga próba busa TEJ SAMEJ koperty — bez awarii.
+      queue.push(await retryEnvelopeFor(ORDER_C))
+      expect(await consumeViaSubscriber(client, queue)).toEqual([])
+
+      const after = await state(client)
+      expect(after.barrier).toEqual(ORDERS.map(unit))
+      const stamp = after.reservations[0].envelope[OWED_UNIT_SETTLEMENT_ENVELOPE_KEY] as Record<string, unknown>
+      expect(stamp.state).not.toBe("unsettled")
+      expect(stamp).toMatchObject({
+        state: "settled",
+        consumer_failed_units: [],
+        consumer_unit_attempts: {},
+        recovered_units: [unit(ORDER_C)],
+        recovered_by: OWED_UNIT_RECOVERY_CONSUMER_SUCCESS,
+        // Ślad prób zostaje — samonaprawa jest odróżnialna od dostawy bez porażki.
+        consumer_failure_attempts: 1,
+        last_consumer_error: "Error",
+        source: OWED_UNIT_CONSUMER_FAILURE_SOURCE,
+      })
+      expect(typeof stamp.consumer_recovered_at).toBe("string")
+      expect(typeof stamp.consumer_failed_at).toBe("string")
+      const alarms = getRingBuffer().filter((a) => a.code === OWED_UNIT_RESERVATION_MISMATCH_ALARM)
+      expect(alarms.map((a) => a.severity)).toEqual(["WARN"])
+      // Resend po samonaprawie: 200 i stempel dalej 'settled'.
+      expect((await deliverPathY(client, queue, "evt_3_4_self_heal")).statusCode).toBe(200)
+      expect(((await state(client)).reservations[0].envelope[OWED_UNIT_SETTLEMENT_ENVELOPE_KEY] as { state: string }).state)
+        .toBe("settled")
+    })
+
+    it("R-9/R-11 (runda fix 2): porażka bez sukcesu ⇒ 'unsettled' zostaje; CRITICAL dopiero przy próbie ostatecznej", async () => {
+      injectLogger({ info() {}, warn() {}, error() {} })
+      _resetRingBuffer()
+      await seed(client, { [ORDER_A]: 1, [ORDER_B]: 1, [ORDER_C]: 1 })
+      const queue: QueuedEnvelope[] = []
+      expect((await deliverPathY(client, queue, "evt_3_4_exhausted")).statusCode).toBe(200)
+      expect(await consumeViaSubscriber(client, queue, [ORDER_C])).toEqual([ORDER_C])
+      for (let attempt = 2; attempt <= PATH_Y_CONSUMER_MAX_ATTEMPTS; attempt += 1) {
+        queue.push(await retryEnvelopeFor(ORDER_C))
+        expect(await consumeViaSubscriber(client, queue, [ORDER_C])).toEqual([ORDER_C])
+      }
+      const after = await state(client)
+      expect(after.barrier).toEqual([unit(ORDER_A), unit(ORDER_B)])
+      expect(after.reservations[0].envelope[OWED_UNIT_SETTLEMENT_ENVELOPE_KEY]).toMatchObject({
+        state: "unsettled",
+        consumer_failed_units: [unit(ORDER_C)],
+        consumer_failure_attempts: PATH_Y_CONSUMER_MAX_ATTEMPTS,
+        consumer_unit_attempts: { [unit(ORDER_C)]: PATH_Y_CONSUMER_MAX_ATTEMPTS },
+      })
+      const alarms = getRingBuffer().filter((a) => a.code === OWED_UNIT_RESERVATION_MISMATCH_ALARM)
+      expect(alarms.map((a) => a.severity)).toEqual([
+        ...Array(PATH_Y_CONSUMER_MAX_ATTEMPTS - 1).fill("WARN"),
+        "CRITICAL",
+      ])
+      expect(alarms[alarms.length - 1].context).toMatchObject({ final: true, unit_attempt: PATH_Y_CONSUMER_MAX_ATTEMPTS })
+    })
+
+    it("R-12 (runda fix 2): porażka przed głównym try (brak GP_INSTANCE_ID) też stempluje rezerwację", async () => {
+      injectLogger({ info() {}, warn() {}, error() {} })
+      _resetRingBuffer()
+      await seed(client, { [ORDER_A]: 1, [ORDER_B]: 1, [ORDER_C]: 1 })
+      const queue: QueuedEnvelope[] = []
+      expect((await deliverPathY(client, queue, "evt_3_4_early_failure")).statusCode).toBe(200)
+      const saved = process.env.GP_INSTANCE_ID
+      let failures: string[]
+      try {
+        delete process.env.GP_INSTANCE_ID
+        failures = await consumeViaSubscriber(client, queue)
+      } finally {
+        process.env.GP_INSTANCE_ID = saved
+      }
+      expect(failures.sort()).toEqual([...ORDERS].sort())
+      expect((await state(client)).reservations[0].envelope[OWED_UNIT_SETTLEMENT_ENVELOPE_KEY]).toMatchObject({
+        state: "unsettled",
+        source: OWED_UNIT_CONSUMER_FAILURE_SOURCE,
+        consumer_failed_units: ORDERS.map(unit),
+      })
+    })
+
+    it("R-12 (runda fix 2): koperta odrzucona przez toLiveIssueInput (z causation i id) też stempluje rezerwację", async () => {
+      injectLogger({ info() {}, warn() {}, error() {} })
+      _resetRingBuffer()
+      await seed(client, { [ORDER_A]: 1, [ORDER_B]: 1, [ORDER_C]: 1 })
+      const queue: QueuedEnvelope[] = []
+      expect((await deliverPathY(client, queue, "evt_3_4_invalid_envelope")).statusCode).toBe(200)
+      const broken = queue.filter((d) => d.data.payload.order_id === ORDER_B)
+      queue.splice(0)
+      const data = { ...broken[0].data, payload: { ...broken[0].data.payload, currency: undefined } }
+      queue.push({ name: broken[0].name, data: data as unknown as QueuedEnvelope["data"] })
+      expect(await consumeViaSubscriber(client, queue)).toEqual([ORDER_B])
+      expect((await state(client)).reservations[0].envelope[OWED_UNIT_SETTLEMENT_ENVELOPE_KEY]).toMatchObject({
+        state: "unsettled",
+        consumer_failed_units: [unit(ORDER_B)],
+      })
     })
 
     it("cross-route-partial-ack-preserves-owed-unit-parity", async () => {

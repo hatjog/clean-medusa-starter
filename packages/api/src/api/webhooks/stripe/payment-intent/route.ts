@@ -75,7 +75,10 @@ import {
   queryUnderMarketContext,
   OWED_UNIT_RESERVATION_MISMATCH_ALARM,
   OWED_UNIT_SETTLEMENT_ENVELOPE_KEY,
+  OWED_UNIT_RECOVERY_DELIVERY_ACK,
+  PATH_Y_CONSUMER_MAX_ATTEMPTS,
   releaseWebhookDelivery,
+  settleOwedUnitStamp,
   reserveWebhookDelivery,
   resolveWebhookPgHandle,
   STRIPE_PATH_Y_WEBHOOK_PROVIDER,
@@ -149,7 +152,8 @@ type LoggerLike = {
  * (brak wiersza `event_processed`) — populacja odzysku opisana w kontrakcie.
  */
 export const PAYMENT_INTENT_SUCCEEDED_EMIT_OPTIONS = Object.freeze({
-  attempts: 5,
+  // Story 3.4 runda fix 2: jeden nośnik z licznikiem prób konsumenta (WARN/CRITICAL).
+  attempts: PATH_Y_CONSUMER_MAX_ATTEMPTS,
   backoff: Object.freeze({ type: "exponential" as const, delay: 30_000 }),
 })
 
@@ -754,6 +758,22 @@ export async function POST(
       // Druga warstwa (`event_processed` po payment_intent_id + order_id) i tak
       // nie dopuści drugiego kompletu voucherów, ale zatrzymanie tutaj oszczędza
       // cały przebieg.
+      // Story 3.4 runda fix 2 (R-9, ADR-246 p.6): równość zbiorów = jednostki
+      // rozliczone, więc stempel `unsettled` tej rezerwacji (route albo
+      // konsument) przechodzi na `settled` z zachowanym śladem prób. Porażka
+      // zapisu nie zmienia werdyktu (skutek jest kompletny), ale jest nazwana.
+      try {
+        await settleOwedUnitStamp(handle.client, {
+          event_id: deliveryEventId,
+          settled_units: ackEvaluation.owed_units,
+          recovered_by: OWED_UNIT_RECOVERY_DELIVERY_ACK,
+        })
+      } catch (err) {
+        logger.error(
+          `[stripe/payment-intent] owed_unit_stamp_settle_failed dla ${deliveryEventId}: ` +
+            `${(err as Error).message}`
+        )
+      }
       logger.info?.(
         `[stripe/payment-intent] dostawa ${deliveryEventId} już przyjęta — ACK bez emisji`
       )
