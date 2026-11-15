@@ -19,8 +19,13 @@ import { Migration } from "@medusajs/framework/mikro-orm/migrations"
  *  3. Rola runtime `medusa_store` (bez BYPASSRLS) dostaje DML na tabeli, żeby
  *     barierą była polityka RLS, a nie przypadkowy brak uprawnienia.
  *
- * Down przywraca stan poprzedni: politykę z castem `::uuid` i brak uprawnień
- * `medusa_store` na tabeli.
+ * Down przywraca poprzednią politykę z castem `::uuid`. Uprawnień `medusa_store`
+ * down NIE odbiera (fix review 6.5, LOW [migracja]): w środowiskach po
+ * `infra/postgres/migrations/003-rls-market-isolation.sql` (GRANT ON ALL TABLES +
+ * DEFAULT PRIVILEGES) rola miała DML na tabeli PRZED `up()`, więc bezwarunkowy
+ * REVOKE nie przywracałby stanu sprzed migracji, tylko psuł go. GRANT w `up()`
+ * jest idempotentny, a pozostawienie go po rollbacku nie otwiera danych —
+ * barierą jest RLS (ENABLE + FORCE), który down zostawia włączony.
  */
 export const VOUCHER_RECIPIENT_PII_SLUG_POLICY_MIGRATION =
   "Migration20261115140000VoucherRecipientPiiMarketSlugPolicy" as const
@@ -30,11 +35,8 @@ export const VOUCHER_RECIPIENT_PII_RUNTIME_ROLE = "medusa_store" as const
 
 const MARKET_SETTING = "NULLIF(current_setting('app.gp_market_id', true), '')"
 
-function grantRuntimeRole(statement: "GRANT" | "REVOKE"): string {
-  const sql =
-    statement === "GRANT"
-      ? `GRANT SELECT, INSERT, UPDATE, DELETE ON ${VOUCHER_RECIPIENT_PII_TABLE} TO ${VOUCHER_RECIPIENT_PII_RUNTIME_ROLE}`
-      : `REVOKE SELECT, INSERT, UPDATE, DELETE ON ${VOUCHER_RECIPIENT_PII_TABLE} FROM ${VOUCHER_RECIPIENT_PII_RUNTIME_ROLE}`
+function grantRuntimeRole(): string {
+  const sql = `GRANT SELECT, INSERT, UPDATE, DELETE ON ${VOUCHER_RECIPIENT_PII_TABLE} TO ${VOUCHER_RECIPIENT_PII_RUNTIME_ROLE}`
   return `
       DO $$
       BEGIN
@@ -56,11 +58,11 @@ export class Migration20261115140000VoucherRecipientPiiMarketSlugPolicy extends 
         USING (market_id = ${MARKET_SETTING})
         WITH CHECK (market_id = ${MARKET_SETTING})
     `)
-    this.addSql(grantRuntimeRole("GRANT"))
+    this.addSql(grantRuntimeRole())
   }
 
   async down(): Promise<void> {
-    this.addSql(grantRuntimeRole("REVOKE"))
+    // Bez REVOKE: up() nie był jedynym źródłem tego uprawnienia (patrz nagłówek).
     this.addSql(`DROP POLICY IF EXISTS ${VOUCHER_RECIPIENT_PII_POLICY} ON ${VOUCHER_RECIPIENT_PII_TABLE}`)
     this.addSql(`
       CREATE POLICY ${VOUCHER_RECIPIENT_PII_POLICY}

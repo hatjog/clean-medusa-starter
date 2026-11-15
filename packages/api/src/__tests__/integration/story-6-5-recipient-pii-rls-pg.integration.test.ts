@@ -10,7 +10,7 @@
  *     rynku B w sesji A dostaje NAZWANĄ odmowę (`market_mismatch`), nie 0 wierszy;
  *     brak kontekstu rynku ⇒ `missing_market_context`; WITH CHECK odrzuca zapis
  *     wiersza obcego rynku;
- *   - migracja `20261115140000`: up idempotentny, down przywraca poprzednią politykę.
+ *   - migracja `20261115140000`: up idempotentny, down przywraca poprzednią politykę i nie odbiera zastanego grantu.
  *
  * Każdy przypadek runtime biegnie w transakcji z ROLLBACK (`SET LOCAL ROLE
  * medusa_store`); seed rynku B jest sprzątany w `afterAll` (profil `-pg`).
@@ -208,11 +208,24 @@ maybe("Story 6.5 — RLS na danych osobowych obdarowanego (realny PG, rynki A/B)
     for (const sql of collectSql("down")) await db.raw(sql)
     const down = await db.raw(`SELECT qual FROM pg_policies WHERE tablename = 'voucher_recipient_pii'`)
     expect(down.rows[0].qual).toMatch(/uuid/)
-    const grants = await db.raw(
-      `SELECT count(*)::int AS n FROM information_schema.role_table_grants
-        WHERE grantee = 'medusa_store' AND table_name = 'voucher_recipient_pii'`
+    await applyUp()
+    const up = await db.raw(`SELECT qual FROM pg_policies WHERE tablename = 'voucher_recipient_pii'`)
+    expect(up.rows[0].qual).not.toMatch(/uuid/)
+  })
+
+  it("migracja 20261115140000 (fix LOW): grant medusa_store istniejący PRZED up() przeżywa up→down", async () => {
+    // Stan jak po infra/postgres/migrations/003-rls-market-isolation.sql: rola ma DML przed up().
+    await db.raw(`GRANT SELECT, INSERT, UPDATE, DELETE ON voucher_recipient_pii TO medusa_store`)
+    await applyUp()
+    for (const sql of collectSql("down")) await db.raw(sql)
+    for (const sql of collectSql("down")) expect(sql).not.toMatch(/REVOKE/i)
+    const priv = await db.raw(
+      `SELECT has_table_privilege('medusa_store', 'voucher_recipient_pii', 'SELECT') AS s,
+              has_table_privilege('medusa_store', 'voucher_recipient_pii', 'INSERT') AS i,
+              has_table_privilege('medusa_store', 'voucher_recipient_pii', 'UPDATE') AS u,
+              has_table_privilege('medusa_store', 'voucher_recipient_pii', 'DELETE') AS d`
     )
-    expect(grants.rows[0].n).toBe(0)
+    expect(priv.rows[0]).toEqual({ s: true, i: true, u: true, d: true })
     await applyUp()
     const up = await db.raw(`SELECT qual FROM pg_policies WHERE tablename = 'voucher_recipient_pii'`)
     expect(up.rows[0].qual).not.toMatch(/uuid/)
