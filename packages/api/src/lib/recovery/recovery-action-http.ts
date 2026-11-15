@@ -31,6 +31,7 @@ import {
   type RecoveryStepRequest,
   type RecoveryStepResult,
 } from "./recovery-action-runtime"
+import { publicDomainAdapterResult } from "./recovery-domain-adapters"
 
 export const RECOVERY_ACTION_CODES = {
   marketRequired: "recovery_market_required",
@@ -203,7 +204,9 @@ export async function handleRecoveryStep(
         ? proposeRecoveryAction(client, session, parsed.request, stepDeps)
         : approveRecoveryAction(client, session, parsed.request, stepDeps)
     )
-    res.status(httpStatusForStepOutcome(result.outcome)).json(result)
+    // R-13: szczegół adaptera (`detail`) nie wychodzi do klienta — zostaje w audycie kroku.
+    const body = result.domain_adapter ? { ...result, domain_adapter: publicDomainAdapterResult(result.domain_adapter) } : result
+    res.status(httpStatusForStepOutcome(result.outcome)).json(body)
   } catch (err) {
     const code = (err as { code?: unknown }).code
     log.error?.(

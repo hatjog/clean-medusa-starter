@@ -10,7 +10,7 @@
  * → `defaultRecoveryTransaction` (Knex z `installRlsPoolHook`, `SET ROLE medusa_store`
  * + GUC rynku/instancji) → kernel 4.1 z trwałym store/ledgerem/weryfikatorem.
  */
-import { afterAll, beforeAll, describe, expect, it } from "@jest/globals"
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from "@jest/globals"
 import knexFactory, { type Knex } from "knex"
 import { Pool, type PoolClient } from "pg"
 import { ContainerRegistrationKeys } from "@medusajs/framework/utils"
@@ -42,6 +42,7 @@ const MKT_A = "mkt_11_3_a"
 const MKT_B = "mkt_11_3_b"
 const ACTOR = "user_11_3_a"
 const OTHER_ACTOR = "user_11_3_other"
+const THROW_SECRET = "SECRET_DETAIL_11_3"
 
 type MigrationLike = { up(): Promise<void>; down(): Promise<void> }
 async function collectSql(ctor: { prototype: object }, direction: "up" | "down"): Promise<string[]> {
@@ -191,7 +192,7 @@ describeOrNotRun("Story 11.3 — akcje recovery pod RLS (PG)", () => {
    * Adaptery domenowe testu (R-1): skutek biznesowy = wiersz `story_11_3_domain_effect`
    * zapisany W transakcji akcji (pod rolą runtime). Zachowanie per wiersz populacji.
    */
-  const behavior: Record<string, "succeed" | "partial" | "fail"> = {}
+  const behavior: Record<string, "succeed" | "partial" | "fail" | "throw"> = {}
   const testAdapter = (population: RecoveryPopulationType): RecoveryDomainAdapter => ({
     population_type: population,
     capability: RECOVERY_RETRY_CAPABILITY[population],
@@ -204,6 +205,7 @@ describeOrNotRun("Story 11.3 — akcje recovery pod RLS (PG)", () => {
         reference,
         mode,
       ])
+      if (mode === "throw") throw new Error(`pg: relation secret_internal_table violates constraint ${THROW_SECRET}`)
       if (mode === "fail") return { status: "failed", reason: "test_adapter_failed" }
       if (mode === "partial") return { status: "partial", reason: "test_adapter_partial", reference }
       return { status: "succeeded", reference }
@@ -214,6 +216,19 @@ describeOrNotRun("Story 11.3 — akcje recovery pod RLS (PG)", () => {
     testAdapter("deferred_issuance_trace"),
     testAdapter("dlq_entry"),
   ])
+  /**
+   * R-12/R-15 (runda fix 2): retry compensation_failure doprowadzony do `recovery_in_progress` v2
+   * idempotentnie — testy zależne od tego stanu przygotowują go same (przechodzą z `-t`).
+   */
+  async function ensureCompensationRetried(id: string): Promise<void> {
+    const cur = await admin.query("SELECT version FROM money_path_compensation_failure WHERE failure_id = $1", [id])
+    if (cur.rows[0].version !== 1) return
+    const body = { action: "retry", target_state: "recovery_in_progress", expected_version: 1 }
+    const p = await call("propose", "compensation_failure", id, body)
+    expect([201, 200]).toContain(p.statusCode)
+    const a = await call("approve", "compensation_failure", id, body)
+    expect(["applied", "replayed"]).toContain(a.body.outcome)
+  }
   async function effects(populationId: string) {
     const r = await admin.query("SELECT reference, mode FROM story_11_3_domain_effect WHERE population_id = $1 ORDER BY id", [populationId])
     return r.rows as Array<{ reference: string; mode: string }>
@@ -247,9 +262,16 @@ describeOrNotRun("Story 11.3 — akcje recovery pod RLS (PG)", () => {
       await seed(MKT_A, n)
       await seed(MKT_B, n)
     }
+    // R-12/R-15: wiersze własne testu rejestru produkcyjnego (4) i wyjątku adaptera (5).
+    for (const n of ["4", "5"]) await seed(MKT_A, n)
     knex = knexFactory({ client: "pg", connection: process.env.DATABASE_URL, pool: { min: 0, max: 4 } })
     installRlsPoolHook(knex as never, logger)
     __setKnexForAdminMarketTests(knexFactory({ client: "pg", connection: process.env.DATABASE_URL, pool: { min: 0, max: 2 } }))
+  })
+
+  // R-12/R-15: rejestr testowy ustawiany przed KAŻDYM testem, nie jako skutek uboczny poprzedniego.
+  beforeEach(() => {
+    __setRecoveryDomainAdaptersForTests(TEST_ADAPTERS)
   })
 
   afterAll(async () => {
@@ -297,9 +319,12 @@ describeOrNotRun("Story 11.3 — akcje recovery pod RLS (PG)", () => {
   })
 
   it("R-1: produkcyjny rejestr (bez mechanizmu w zakresie 11.3) ⇒ 503 refused_domain_adapter_unavailable; brak przejścia stanu", async () => {
+    // R-12/R-15: rejestr produkcyjny przełączany w SAMYM teście; wiersze własne (n=4), trzy populacje.
+    __setRecoveryDomainAdaptersForTests(undefined)
     for (const [population, id, target, table, col, key] of [
-      ["compensation_failure", cfId(MKT_A, "1"), "recovery_in_progress", "money_path_compensation_failure", "resolution_state", "failure_id"],
-      ["dlq_entry", await dlqPopulationId(MKT_A, "1"), "replayed", "mor_policy_dlq_entry", "state", "population_id"],
+      ["compensation_failure", cfId(MKT_A, "4"), "recovery_in_progress", "money_path_compensation_failure", "resolution_state", "failure_id"],
+      ["deferred_issuance_trace", ditId(MKT_A, "4"), "escalated", "deferred_issuance_trace", "state", "trace_id"],
+      ["dlq_entry", await dlqPopulationId(MKT_A, "4"), "replayed", "mor_policy_dlq_entry", "state", "population_id"],
     ] as const) {
       const body = { action: "retry", target_state: target, expected_version: 1 }
       expect((await call("propose", population, id, body)).statusCode).toBe(201)
@@ -310,8 +335,8 @@ describeOrNotRun("Story 11.3 — akcje recovery pod RLS (PG)", () => {
       const row = await admin.query(`SELECT ${col} AS state, version FROM ${table} WHERE ${key} = $1`, [id])
       expect(row.rows[0].version).toBe(1)
       expect(row.rows[0].state).not.toBe(target)
+      expect(await effects(id)).toEqual([])
     }
-    __setRecoveryDomainAdaptersForTests(TEST_ADAPTERS)
   })
 
   describe("compensation_failure — retry_compensation / resolve_compensation", () => {
@@ -319,10 +344,9 @@ describeOrNotRun("Story 11.3 — akcje recovery pod RLS (PG)", () => {
 
     it("retry: propose → approve ⇒ recovery_in_progress, retry_count 1, audyt obu kroków z aktorem sesji", async () => {
       const body = { action: "retry", target_state: "recovery_in_progress", expected_version: 1 }
-      // Propozycja tej wersji została przyjęta w teście rejestru produkcyjnego — powtórka.
       const p = await call("propose", "compensation_failure", id(), body)
-      expect(p.statusCode).toBe(200)
-      expect(p.body).toEqual(expect.objectContaining({ outcome: "replayed", domain_effects: 0, step_key: `propose:compensation_failure:${id()}:retry:1:recovery_in_progress` }))
+      expect(p.statusCode).toBe(201)
+      expect(p.body).toEqual(expect.objectContaining({ outcome: "proposed", domain_effects: 0, step_key: `propose:compensation_failure:${id()}:retry:1:recovery_in_progress` }))
       const unchanged = await admin.query("SELECT resolution_state, version FROM money_path_compensation_failure WHERE failure_id = $1", [id()])
       expect(unchanged.rows[0]).toEqual({ resolution_state: "open", version: 1 })
 
@@ -335,30 +359,32 @@ describeOrNotRun("Story 11.3 — akcje recovery pod RLS (PG)", () => {
       const row = await admin.query("SELECT resolution_state, version, retry_count FROM money_path_compensation_failure WHERE failure_id = $1", [id()])
       expect(row.rows[0]).toEqual({ resolution_state: "recovery_in_progress", version: 2, retry_count: 1 })
       const s = await steps(id())
-      // pierwszy approve tej wersji (test produkcyjnego rejestru) był odmową bez claimu.
       expect(s.map((x) => [x.step, x.outcome, x.actor_id])).toEqual([
         ["propose", "proposed", ACTOR],
-        ["approve", "refused_domain_adapter_unavailable", ACTOR],
-        ["propose", "replayed", ACTOR],
         ["approve", "applied", ACTOR],
       ])
       expect(s[0].step_key).toBe(`propose:compensation_failure:${id()}:retry:1:recovery_in_progress`)
-      s.splice(1, 2)
       expect(s[0].step_key).not.toBe(s[1].step_key)
     })
 
     it("AC-4 replay approve ⇒ replayed, brak drugiego skutku, osobny wiersz audytu", async () => {
+      await ensureCompensationRetried(id())
+      const before = (await steps(id())).length
       const a = await call("approve", "compensation_failure", id(), { action: "retry", target_state: "recovery_in_progress", expected_version: 1 })
       expect(a.statusCode).toBe(200)
       expect(a.body.outcome).toBe("replayed")
       expect(a.body.domain_effects).toBe(0)
       const row = await admin.query("SELECT version, retry_count FROM money_path_compensation_failure WHERE failure_id = $1", [id()])
       expect(row.rows[0]).toEqual({ version: 2, retry_count: 1 })
-      expect((await steps(id())).map((x) => x.outcome)).toEqual(["proposed", "refused_domain_adapter_unavailable", "replayed", "applied", "replayed"])
+      const s = await steps(id())
+      expect(s).toHaveLength(before + 1)
+      expect(s[s.length - 1]).toEqual(expect.objectContaining({ step: "approve", outcome: "replayed", step_key: null }))
+      expect(s.filter((x) => x.outcome === "applied")).toHaveLength(1)
       expect(await effects(id())).toHaveLength(1)
     })
 
     it("AC-3 częściowy skutek (recovery_in_progress) nie uruchamia ślepego retry ⇒ 422", async () => {
+      await ensureCompensationRetried(id())
       const p = await call("propose", "compensation_failure", id(), { action: "retry", target_state: "recovery_in_progress", expected_version: 2 })
       expect(p.statusCode).toBe(422)
       expect(p.body.outcome).toBe("refused_invalid_transition")
@@ -437,7 +463,7 @@ describeOrNotRun("Story 11.3 — akcje recovery pod RLS (PG)", () => {
       // Evidence operatora dla retry jest odrzucane — dowód wytwarza adapter.
       const wrong = await call("propose", "dlq_entry", id, { ...body, evidence: { kind: "replayed_successfully", reference: dlqEvent(MKT_A, "1") } })
       expect(wrong.statusCode).toBe(422)
-      expect((await call("propose", "dlq_entry", id, body)).statusCode).toBe(200)
+      expect((await call("propose", "dlq_entry", id, body)).statusCode).toBe(201)
       const a = await call("approve", "dlq_entry", id, body)
       expect(a.body.outcome).toBe("applied")
       const ref = `effect_dlq_entry_${id.replace(/[^A-Za-z0-9]/g, "_")}`
@@ -486,6 +512,25 @@ describeOrNotRun("Story 11.3 — akcje recovery pod RLS (PG)", () => {
       delete behavior[id]
     })
 
+    it("R-13 wyjątek adaptera ⇒ 502 z nazwanym kodem adapter_threw; treść wyjątku tylko w audycie kroku", async () => {
+      const id = ditId(MKT_A, "5")
+      behavior[id] = "throw"
+      const body = { action: "retry", target_state: "escalated", expected_version: 1 }
+      expect((await call("propose", "deferred_issuance_trace", id, body)).statusCode).toBe(201)
+      const a = await call("approve", "deferred_issuance_trace", id, body)
+      delete behavior[id]
+      expect(a.statusCode).toBe(502)
+      expect(a.body).toEqual(expect.objectContaining({ outcome: "retry_failed", domain_effects: 0 }))
+      expect(a.body.domain_adapter).toEqual({ status: "failed", reason: "adapter_threw" })
+      expect(JSON.stringify(a.body)).not.toContain(THROW_SECRET)
+      expect(JSON.stringify(a.body)).not.toContain("secret_internal_table")
+      const audit = await admin.query(
+        "SELECT audit->'domain_adapter'->'detail'->>'error_message' AS msg FROM recovery_action_step WHERE population_id = $1 AND step = 'approve'",
+        [id]
+      )
+      expect(audit.rows[0].msg).toContain(THROW_SECRET)
+    })
+
     it("R-4 partial_effect: częściowy skutek ⇒ jawny stan nieterminalny; ślepy retry i resolve odrzucone; jedyny następca dlq_pending_ops_review", async () => {
       const id = await dlqPopulationId(MKT_A, "3")
       behavior[id] = "partial"
@@ -493,10 +538,14 @@ describeOrNotRun("Story 11.3 — akcje recovery pod RLS (PG)", () => {
       expect((await call("propose", "dlq_entry", id, retry)).statusCode).toBe(201)
       const a = await call("approve", "dlq_entry", id, retry)
       expect(a.statusCode).toBe(200)
-      expect(a.body).toEqual(expect.objectContaining({ outcome: "partial_effect", domain_effects: 1, record: { state: "partial_effect", version: 2 } }))
+      // R-10 (runda fix 2): odpowiedź = stan FAKTYCZNIE zapisany w wierszu; częściowy skutek osobnym polem.
+      expect(a.body).toEqual(
+        expect.objectContaining({ outcome: "partial_effect", pending_partial_effect: true, domain_effects: 1, record: { state: "dlq_pending_retry", version: 2 } })
+      )
       expect(await effects(id)).toHaveLength(1)
       const row = await admin.query("SELECT state, version, retry_count, resolution_evidence FROM mor_policy_dlq_entry WHERE population_id = $1", [id])
       expect(row.rows[0]).toEqual({ state: "dlq_pending_retry", version: 2, retry_count: 1, resolution_evidence: null })
+      expect(a.body.record).toEqual({ state: row.rows[0].state, version: row.rows[0].version })
       delete behavior[id]
 
       const blind = await call("propose", "dlq_entry", id, { ...retry, expected_version: 2 })
@@ -557,9 +606,21 @@ describeOrNotRun("Story 11.3 — akcje recovery pod RLS (PG)", () => {
       expect(a.body.outcome).toBe("applied")
       const row = await admin.query("SELECT state, resolution_evidence->>'reference' AS ref FROM deferred_issuance_trace WHERE trace_id = $1", [id])
       expect(row.rows[0]).toEqual({ state: "closed_order_never_created", ref: "INC-11-3-0004" })
-      // Druga propozycja tej samej intencji nie wykona drugiego skutku (jeden klucz approve).
+      // R-9 (runda fix 2): approve INNEGO celu tej samej intencji po zastosowanym approve ⇒ 409, nie `replayed`.
       const second = await call("approve", "deferred_issuance_trace", id, { action: "resolve", target_state: "issued_after_link", expected_version: 1 })
-      expect(second.body.domain_effects).toBe(0)
+      expect(second.statusCode).toBe(409)
+      expect(second.body).toEqual(expect.objectContaining({ outcome: "refused_idempotency_payload_mismatch", domain_effects: 0 }))
+      // Ta sama treść ⇒ `replayed` (200), bez drugiego skutku.
+      const same2 = await call("approve", "deferred_issuance_trace", id, { action: "resolve", target_state: "closed_order_never_created", expected_version: 1 })
+      expect(same2.statusCode).toBe(200)
+      expect(same2.body).toEqual(expect.objectContaining({ outcome: "replayed", domain_effects: 0 }))
+      const after = await admin.query("SELECT state, version, resolution_evidence->>'reference' AS ref FROM deferred_issuance_trace WHERE trace_id = $1", [id])
+      expect(after.rows[0]).toEqual({ state: "closed_order_never_created", version: 2, ref: "INC-11-3-0004" })
+      const s = await steps(id)
+      expect(s.slice(-2).map((x) => [x.step, x.outcome, x.step_key])).toEqual([
+        ["approve", "refused_idempotency_payload_mismatch", null],
+        ["approve", "replayed", null],
+      ])
     })
   })
 

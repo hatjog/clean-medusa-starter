@@ -443,6 +443,11 @@ export type RecoveryStepResult = {
   domain_effects: 0 | 1
   /** Wynik adaptera domenowego (tylko `approve` akcji `retry`). */
   domain_adapter?: RecoveryDomainAdapterResult
+  /**
+   * R-10: częściowy skutek oczekuje na następcę z kontraktu. `record.state` pozostaje
+   * stanem kolumny wiersza (np. `dlq_pending_retry`), nie `partial_effect`.
+   */
+  pending_partial_effect?: true
 }
 
 export type RecoveryStepDeps = {
@@ -482,6 +487,18 @@ export function isExposedTarget(population: RecoveryPopulationType, action: Expo
  */
 export function proposeStepKey(intentKey: string, targetState: string): string {
   return `${stepKey("propose", intentKey)}:${targetState}`
+}
+
+/** R-9: claim `approve` vs żądanie — ten sam cel; dla resolve także to samo evidence propozycji. */
+function sameApprovePayload(
+  prior: RecoveryStepRow,
+  request: RecoveryStepRequest,
+  proposal: RecoveryStepRow | null
+): boolean {
+  if (prior.target_state !== request.target_state) return false
+  // Retry: dowód wytwarza adapter (referencja wyniku), nie operator — porównujemy tylko cel.
+  if (request.action === "retry") return true
+  return sameEvidence(prior.resolution_evidence, proposal?.resolution_evidence ?? null)
 }
 
 function sameEvidence(a: ResolutionEvidence | null | undefined, b: ResolutionEvidence | null | undefined): boolean {
@@ -717,6 +734,17 @@ export async function approveRecoveryAction(
   if (authorization.decision === "granted") {
     if (!proposal || proposal.target_state !== request.target_state) return refuseStep("refused_proposal_missing")
     if (proposal.actor_id !== actor.actor_id) return refuseStep("refused_proposal_actor_mismatch")
+    // R-9 (runda fix 2): klucz `approve:<intencja>` nie zawiera celu, więc istniejący claim
+    // porównujemy z treścią żądania. Inny cel (albo inne evidence resolve) ⇒ jawny 409,
+    // nie `replayed` — propozycja innego celu nigdy nie została zastosowana.
+    await lockStepKey(client, scope, key)
+    const priorApprove = await readClaimed(client, scope, key)
+    if (priorApprove && !sameApprovePayload(priorApprove, request, proposal)) {
+      return refuseStep("refused_idempotency_payload_mismatch", {
+        prior_audit_id: priorApprove.audit_id,
+        prior_target_state: priorApprove.target_state,
+      })
+    }
   }
 
   const pending = authorization.decision === "granted" ? await readPendingPartialEffect(client, record) : null
@@ -759,15 +787,26 @@ export async function approveRecoveryAction(
         if (adapterResult.status === "unavailable") return refuseStep("refused_domain_adapter_unavailable", adapterAudit)
         if (adapterResult.status === "failed") return refuseStep("retry_failed", adapterAudit)
         if (adapterResult.status === "partial") {
-          const next = { state: PARTIAL_EFFECT_STATE, version: record.version + 1 }
+          // R-10 (runda fix 2): kolumna stanu wiersza się NIE zmienia (słownik populacji nie zna
+          // `partial_effect`, ADR-247 Proposed / DW-15-355). Odpowiedź oddaje stan FAKTYCZNIE
+          // zapisany w wierszu, a częściowy skutek idzie osobnym, nazwanym polem.
+          const next = { state: record.state, version: record.version + 1 }
           await client.query(bumpVersionSql(request.population_type), [
             record.population_id,
             record.version,
             next.version,
             record.retry_count + 1,
           ])
-          const auditId = await writeStep("partial_effect", adapterAudit, true, next)
-          return { ...base, outcome: "partial_effect", audit_id: auditId, record: next, domain_effects: 1, domain_adapter: adapterResult }
+          const auditId = await writeStep("partial_effect", { ...adapterAudit, pending_partial_effect: true }, true, next)
+          return {
+            ...base,
+            outcome: "partial_effect",
+            audit_id: auditId,
+            record: next,
+            pending_partial_effect: true,
+            domain_effects: 1,
+            domain_adapter: adapterResult,
+          }
         }
         extraAudit = adapterAudit
         if (isTerminalState(request.population_type, request.target_state)) {

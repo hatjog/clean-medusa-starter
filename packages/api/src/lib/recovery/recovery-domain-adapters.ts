@@ -108,6 +108,18 @@ export function activeRecoveryDomainAdapters(): RecoveryDomainAdapterRegistry {
   return activeRegistry
 }
 
+/** Nazwany kod porażki adaptera, który rzucił wyjątek (R-13). */
+export const RECOVERY_DOMAIN_ADAPTER_THREW_REASON = "adapter_threw"
+
+/**
+ * R-13: widok wyniku adaptera dla ciała HTTP — bez `detail` (szczegół tylko w audycie kroku).
+ */
+export function publicDomainAdapterResult(result: RecoveryDomainAdapterResult): RecoveryDomainAdapterResult {
+  if (!("detail" in result)) return result
+  const { detail: _detail, ...rest } = result
+  return rest as RecoveryDomainAdapterResult
+}
+
 /** Szew testowy (jak `__setKnexForAdminMarketTests`); `undefined` przywraca rejestr domyślny. */
 export function __setRecoveryDomainAdaptersForTests(registry: RecoveryDomainAdapterRegistry | undefined): void {
   activeRegistry = registry ?? DEFAULT_RECOVERY_DOMAIN_ADAPTERS
@@ -130,7 +142,13 @@ export async function invokeRecoveryDomainAdapter(
     result = await adapter.retry(input)
   } catch (err) {
     await client.query("ROLLBACK TO SAVEPOINT recovery_domain_adapter", [])
-    return { status: "failed", reason: `adapter_threw: ${err instanceof Error ? err.message : String(err)}`.slice(0, 500) }
+    // R-13 (runda fix 2): do odpowiedzi idzie tylko nazwany kod; treść wyjątku (np. komunikat
+    // PG/PSP) zostaje w `detail`, który trafia wyłącznie do audytu kroku (HTTP go zdejmuje).
+    return {
+      status: "failed",
+      reason: RECOVERY_DOMAIN_ADAPTER_THREW_REASON,
+      detail: { error_message: (err instanceof Error ? err.message : String(err)).slice(0, 500) },
+    }
   }
   if (result.status === "failed") await client.query("ROLLBACK TO SAVEPOINT recovery_domain_adapter", [])
   else await client.query("RELEASE SAVEPOINT recovery_domain_adapter", [])
