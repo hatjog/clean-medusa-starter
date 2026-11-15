@@ -105,7 +105,9 @@ export async function handleRecoveryRead(
   const scope = { instance_id: instanceId, market_id: requested }
   try {
     const result = await readRecoveryPopulations((deps.queryFor ?? defaultQueryFor)(req, scope), scope)
-    res.status(200).json(result)
+    // Story 4.8 (AD-31): odpowiedź 200 niesie aktora, w którego imieniu wykonano
+    // odczyt — klient (gp-cli) traktuje 200 bez `actor_id` jako FAIL.
+    res.status(200).json({ ...result, actor_id: ctx.actor_id })
   } catch (err) {
     const code = (err as { code?: unknown }).code
     log.error?.(

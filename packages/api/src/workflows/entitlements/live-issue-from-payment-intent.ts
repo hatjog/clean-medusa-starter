@@ -105,6 +105,13 @@ export type LiveIssueInput = {
   event_type: string
   payload: PaymentIntentSucceededPayload
   scope: LiveIssueScope
+  /**
+   * Story 3.4 (DW-15-331 p.3): ślad trasy rozliczającej jednostkę w barierze
+   * (`owed_unit_effect_barrier.claimed_by_path`). Domyślnie `LIVE_ISSUE_PATH`
+   * (subscriber `voucher-live-issue`); odzysk `on-order-placed-stripe-retry`
+   * podaje `PATH_Y_RECOVERY_PATH`. Ślad, nie część klucza.
+   */
+  claimed_by_path?: string
 }
 
 /** Pojedynczy wystawiony (lub idempotentnie pominięty) entitlement. */
@@ -272,6 +279,9 @@ type ChoiceSetSnapshotItem = {
  */
 export const LIVE_ISSUE_PATH = "path-y:subscriber:gp.stripe.payment_intent_succeeded.v1" as const
 
+/** Story 3.4 (DW-15-331 p.3): ślad odzysku Path Y w barierze skutku. */
+export const PATH_Y_RECOVERY_PATH = "path-y:recovery:order.placed" as const
+
 /**
  * Jednostka konsumpcji biznesowej po ADR-166: jedno zdarzenie Stripe może
  * odpowiadać N zamówieniom Mercur (po jednym per seller), więc sam PI nie
@@ -422,7 +432,7 @@ async function runLiveIssue(
     order_id: payload.order_id,
     instance_id: dedupeInstanceId,
     market_id: dedupeMarketId,
-    claimed_by_path: LIVE_ISSUE_PATH,
+    claimed_by_path: input.claimed_by_path ?? LIVE_ISSUE_PATH,
   })
   if (!options.skipEventInsert) {
     if (mode === "isolate_lines") {

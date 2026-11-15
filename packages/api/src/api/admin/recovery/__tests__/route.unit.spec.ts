@@ -121,6 +121,8 @@ describe("Story 4.7 — kontrola rynku przed zapytaniem", () => {
       queryFor: () => async () => ({ rows: [] }),
     })
     expect(ok.statusCode).toBe(200)
+    // Story 4.8 AC1 (AD-31): 200 niesie aktora odczytu.
+    expect((ok.body as { actor_id?: string }).actor_id).toBe("user_a")
     expect(Object.keys((ok.body as { populations: object }).populations).sort()).toEqual([
       "compensation_failure",
       "deferred_issuance_trace",

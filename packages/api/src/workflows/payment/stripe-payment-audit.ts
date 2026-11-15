@@ -23,6 +23,7 @@ import {
   issueEntitlementsForAllLineItems,
   MissingEntitlementProfileError,
   revokeEntitlementsOnRefund,
+  MissingVoucherIssuanceMarketError,
   VoucherIssuanceBlockedError,
   type IssueEntitlementResult,
   type MultiLineEntitlementResult,
@@ -39,6 +40,16 @@ import {
 } from "../../modules/voucher/entitlement-transition-wiring"
 import { redactFailureCode } from "../../lib/payment/failure-classification"
 import { requireRuntimeInstanceId } from "../../lib/runtime-instance-identity"
+import { buildOwedUnitEffectBarrierInsert } from "../../lib/payment/owed-unit-effect-barrier"
+
+/**
+ * Story 3.4 (DW-15-318, ADR-242 Proposed): ślad trasy natywnej w
+ * `owed_unit_effect_barrier.claimed_by_path` (ślad, nie część klucza).
+ */
+export const NATIVE_CAPTURED_PATH = "native:/hooks/payment/stripe:payment.captured" as const
+
+/** Savepoint obejmujący rezerwację jednostki w barierze i jej skutek. */
+const NATIVE_OWED_UNIT_SAVEPOINT = "gp_native_owed_unit"
 
 export const STRIPE_PAYMENT_EVENTS = [
   "payment.captured",
@@ -101,6 +112,12 @@ export type PaymentAuditEnvelope = {
   // the structured key is the durable, queryable failure signal — replaces the
   // previous silent warn that violated Story 1.3 "Fail-loud, NIE silent".
   entitlement_issue_failed_reason?: string
+  /**
+   * Story 3.4 (DW-15-318): klucz jednostki `payment_intent_id:order_id`, którą
+   * wspólna bariera skutku miała już rozliczoną (inna trasa / wcześniejsza
+   * dostawa) — ta dostawa natywna nie wystawiła drugiego skutku.
+   */
+  owed_unit_already_settled?: string
   /**
    * v1.9.0 wf5 (H-2 / F-CC1-003): set when payment.captured arrived BEFORE
    * the storefront finalized the order (no `order_id` on the payload). A
@@ -290,98 +307,178 @@ export class StripePaymentAuditWorkflow {
       }
 
       if (eventType === "payment.captured" && payload.order_id) {
+        // ── Story 3.4 (DW-15-318, ADR-242 Proposed): wspólna bariera skutku ──
+        // Rezerwacja klucza jednostki `payment_intent_id:order_id` w
+        // `owed_unit_effect_barrier` + znacznik `event_processed` to JEDNA
+        // instrukcja w TEJ SAMEJ tx co INSERT-y uprawnień. Savepoint obejmuje
+        // rezerwację i skutek: nazwana odmowa wystawienia (blok niżej) cofa
+        // rezerwację jednostki, więc odmowa NIE wygląda w barierze jak skutek.
+        // `payment_intent_id` jest polem wymaganym (`assertNativeStripePayload`),
+        // więc klucz jednostki jest zawsze wyliczalny.
+        await client.query(`SAVEPOINT ${NATIVE_OWED_UNIT_SAVEPOINT}`)
+        let unitClaimed = false
         try {
-          // v1.9.0 wf5 H-6 fix: iterate ALL voucher line items (multi-line
-          // carts) rather than collapsing to LIMIT 1.
-          const multi: MultiLineEntitlementResult =
-            await issueEntitlementsForAllLineItems(
-              client,
-              {
-                event_id: payload.event_id as string,
-                order_id: payload.order_id as string,
-                payment_id: payload.payment_id,
-                payment_intent_id: payload.payment_intent_id,
-                market_id: payload.market_id,
-                amount_minor: payload.amount_minor,
-                currency: payload.currency,
-                entitlement_profile: payload.entitlement_profile,
-              },
-              now
+          const nativeMarketId =
+            typeof payload.market_id === "string" ? payload.market_id.trim() : ""
+          if (!nativeMarketId) {
+            // Bariera (i RLS) wymaga rynku — brak to ta sama nazwana odmowa,
+            // którą wystawca rzuca dla linii voucherowej bez rynku.
+            throw new MissingVoucherIssuanceMarketError(
+              payload.order_id as string,
+              null,
+              "owed_unit_effect_barrier"
             )
-          if (multi.results.length === 0) {
-            throw new MissingEntitlementProfileError(payload.order_id as string)
           }
-          entitlementsAll = multi.results
-          entitlement = multi.results[0]
-
-          // Story 2.1 (v1.14.0, AD-7): geneza ACTIVE przechodzi przez JEDNOLITY
-          // punkt okablowania — dokładnie wg wzorca ISSUED (voucher-live-issue):
-          // audit append-only W TEJ tx, event zebrany i emitowany DOPIERO
-          // post-commit w `emit()`. Wiring wołany WYŁĄCZNIE dla nowo utworzonych
-          // wierszy (`idempotent=false`) — replay nie re-audytuje / nie re-emituje.
-          // Posting hook bez payloadu finansowego (attempted=false, no-op).
-          const appendAudit = this.makeTransitionAuditSink()
-          for (const issued of multi.results) {
-            if (issued.idempotent) continue
-            const { event } = await wireEntitlementTransitionPersisted(
-              { appendAudit, clock: () => now },
-              buildGenesisActiveTransition({
-                entitlement_id: issued.entitlement_id,
-                scope: {
-                  // Story 11.2: ustalona przed tx (gałąź captured+order_id).
-                  instance_id: runtimeInstanceId as string,
-                  // Precedens defensywny tego pliku (emit entitlement_issued.v1):
-                  // brak market_id NIE może failować transakcji biznesowej.
-                  market_id: payload.market_id ?? "unknown",
-                  sales_channel_id: null,
-                  vendor_id: null,
-                  location_id: null,
-                },
-                actor: "system",
-                actor_hint: "workflow:stripe-payment-audit:captured-instant-issue",
-                occurred_at: now.toISOString(),
-                // Dyskryminator wystąpienia: deterministyczny entitlement_id
-                // (sha256 z order_id+event_id+line_item_id) — geneza jednorazowa,
-                // klucz stabilny i nie-kolidujący.
-                transition_seq: issued.entitlement_id,
-              })
+          // Kształt ADR-166 (`payment_intent_id:order_id`) — ten sam co
+          // `buildPaymentIntentOrderExternalId`; egzekwuje go CHECK
+          // `owed_unit_effect_barrier_key_shape_check` w bazie.
+          const unitKey = `${payload.payment_intent_id as string}:${payload.order_id as string}`
+          const barrierInsert = buildOwedUnitEffectBarrierInsert(
+            {
+              external_id: unitKey,
+              event_type: eventType,
+              processed_at: now.getTime(),
+              purchase_key: payload.payment_intent_id as string,
+              instance_id: runtimeInstanceId as string,
+              market_id: nativeMarketId,
+            },
+            {
+              owed_business_unit_key: unitKey,
+              payment_intent_id: payload.payment_intent_id as string,
+              order_id: payload.order_id as string,
+              instance_id: runtimeInstanceId as string,
+              market_id: nativeMarketId,
+              claimed_by_path: NATIVE_CAPTURED_PATH,
+            }
+          )
+          const claim = await client.query(barrierInsert.sql, barrierInsert.params)
+          unitClaimed = (claim.rowCount ?? 0) > 0
+          if (!unitClaimed) {
+            // Jednostka rozliczona wcześniej (inną trasą albo tą samą) ⇒ no-op
+            // skutku: wcześniej udany skutek NIE jest duplikowany. Ślad trwały
+            // w kopercie audytu, nie tylko w logu.
+            envelope.owed_unit_already_settled = unitKey
+            this.logger?.info?.(
+              `[stripe-payment-audit] payment.captured order_id=${payload.order_id} ` +
+                `jednostka ${unitKey} juz rozliczona we wspolnej barierze — bez skutku`
             )
-            transitionEvents.push(event)
           }
         } catch (err) {
-          // v1.15.0 Story 5.9 review-fix cyklu 3 (REG-HIGH-2):
-          // `VoucherIssuanceBlockedError` obsługiwany TAK SAMO jak brak
-          // profilu — nazwany powód w kopercie audytu zamiast wywrócenia całej
-          // transakcji webhooka.
-          //
-          // Bez tego rzut z nowej kontroli danych salonu (dołożonej w cyklu 2)
-          // wywracał transakcję razem z wierszem dedupe, więc Stripe ponawiał
-          // webhook w kółko, a każde ponowienie wywracało się identycznie —
-          // ścieżka, która PRZED cyklem 2 przechodziła. Uprawnienie nadal NIE
-          // powstaje (fail-closed zostaje, SM-7 nie rośnie); zmienia się to,
-          // że odmowa jest utrwalona i jednorazowa zamiast być pętlą.
-          if (
-            !(err instanceof MissingEntitlementProfileError) &&
-            !(err instanceof VoucherIssuanceBlockedError)
-          ) {
-            throw err
-          }
+          await client.query(`ROLLBACK TO SAVEPOINT ${NATIVE_OWED_UNIT_SAVEPOINT}`)
+          if (!(err instanceof VoucherIssuanceBlockedError)) throw err
           envelope.entitlement_issue_failed_reason = err.message
-          if (err instanceof VoucherIssuanceBlockedError) {
-            envelope.entitlement_issue_blocked_reason = err.reason
-          }
+          envelope.entitlement_issue_blocked_reason = err.reason
           await persistAuditFailureKey(
             client,
             payload.event_id as string,
             err.message,
-            err instanceof VoucherIssuanceBlockedError ? err.reason : undefined
+            err.reason
           )
           this.logger?.error?.(
             `[stripe-payment-audit] ${eventType} order_id=${payload.order_id} ` +
-              `entitlement_issue_failed: ${err.message} — audit row persisted ` +
-              `with envelope.entitlement_issue_failed_reason; investigate ` +
-              `catalog→checkout entitlement_profile propagation (Story 1.10.1)`
+              `owed_unit_barrier_refused: ${err.message} — audit row persisted`
           )
+        }
+        if (unitClaimed) {
+          try {
+            // v1.9.0 wf5 H-6 fix: iterate ALL voucher line items (multi-line
+            // carts) rather than collapsing to LIMIT 1.
+            const multi: MultiLineEntitlementResult =
+              await issueEntitlementsForAllLineItems(
+                client,
+                {
+                  event_id: payload.event_id as string,
+                  order_id: payload.order_id as string,
+                  payment_id: payload.payment_id,
+                  payment_intent_id: payload.payment_intent_id,
+                  market_id: payload.market_id,
+                  amount_minor: payload.amount_minor,
+                  currency: payload.currency,
+                  entitlement_profile: payload.entitlement_profile,
+                },
+                now
+              )
+            if (multi.results.length === 0) {
+              throw new MissingEntitlementProfileError(payload.order_id as string)
+            }
+            entitlementsAll = multi.results
+            entitlement = multi.results[0]
+
+            // Story 2.1 (v1.14.0, AD-7): geneza ACTIVE przechodzi przez JEDNOLITY
+            // punkt okablowania — dokładnie wg wzorca ISSUED (voucher-live-issue):
+            // audit append-only W TEJ tx, event zebrany i emitowany DOPIERO
+            // post-commit w `emit()`. Wiring wołany WYŁĄCZNIE dla nowo utworzonych
+            // wierszy (`idempotent=false`) — replay nie re-audytuje / nie re-emituje.
+            // Posting hook bez payloadu finansowego (attempted=false, no-op).
+            const appendAudit = this.makeTransitionAuditSink()
+            for (const issued of multi.results) {
+              if (issued.idempotent) continue
+              const { event } = await wireEntitlementTransitionPersisted(
+                { appendAudit, clock: () => now },
+                buildGenesisActiveTransition({
+                  entitlement_id: issued.entitlement_id,
+                  scope: {
+                    // Story 11.2: ustalona przed tx (gałąź captured+order_id).
+                    instance_id: runtimeInstanceId as string,
+                    // Precedens defensywny tego pliku (emit entitlement_issued.v1):
+                    // brak market_id NIE może failować transakcji biznesowej.
+                    market_id: payload.market_id ?? "unknown",
+                    sales_channel_id: null,
+                    vendor_id: null,
+                    location_id: null,
+                  },
+                  actor: "system",
+                  actor_hint: "workflow:stripe-payment-audit:captured-instant-issue",
+                  occurred_at: now.toISOString(),
+                  // Dyskryminator wystąpienia: deterministyczny entitlement_id
+                  // (sha256 z order_id+event_id+line_item_id) — geneza jednorazowa,
+                  // klucz stabilny i nie-kolidujący.
+                  transition_seq: issued.entitlement_id,
+                })
+              )
+              transitionEvents.push(event)
+            }
+            await client.query(`RELEASE SAVEPOINT ${NATIVE_OWED_UNIT_SAVEPOINT}`)
+          } catch (err) {
+            // v1.15.0 Story 5.9 review-fix cyklu 3 (REG-HIGH-2):
+            // `VoucherIssuanceBlockedError` obsługiwany TAK SAMO jak brak
+            // profilu — nazwany powód w kopercie audytu zamiast wywrócenia całej
+            // transakcji webhooka.
+            //
+            // Bez tego rzut z nowej kontroli danych salonu (dołożonej w cyklu 2)
+            // wywracał transakcję razem z wierszem dedupe, więc Stripe ponawiał
+            // webhook w kółko, a każde ponowienie wywracało się identycznie —
+            // ścieżka, która PRZED cyklem 2 przechodziła. Uprawnienie nadal NIE
+            // powstaje (fail-closed zostaje, SM-7 nie rośnie); zmienia się to,
+            // że odmowa jest utrwalona i jednorazowa zamiast być pętlą.
+            if (
+              !(err instanceof MissingEntitlementProfileError) &&
+              !(err instanceof VoucherIssuanceBlockedError)
+            ) {
+              throw err
+            }
+            // Story 3.4 (AC1): nazwana odmowa cofa rezerwację jednostki w barierze
+            // (savepoint) — stan porażki zostaje w kopercie audytu, a jednostka
+            // pozostaje NIEROZLICZONA, więc Path Y / odzysk mogą ją jeszcze domknąć.
+            await client.query(`ROLLBACK TO SAVEPOINT ${NATIVE_OWED_UNIT_SAVEPOINT}`)
+            unitClaimed = false
+            envelope.entitlement_issue_failed_reason = err.message
+            if (err instanceof VoucherIssuanceBlockedError) {
+              envelope.entitlement_issue_blocked_reason = err.reason
+            }
+            await persistAuditFailureKey(
+              client,
+              payload.event_id as string,
+              err.message,
+              err instanceof VoucherIssuanceBlockedError ? err.reason : undefined
+            )
+            this.logger?.error?.(
+              `[stripe-payment-audit] ${eventType} order_id=${payload.order_id} ` +
+                `entitlement_issue_failed: ${err.message} — audit row persisted ` +
+                `with envelope.entitlement_issue_failed_reason; investigate ` +
+                `catalog→checkout entitlement_profile propagation (Story 1.10.1)`
+            )
+          }
         }
       }
 

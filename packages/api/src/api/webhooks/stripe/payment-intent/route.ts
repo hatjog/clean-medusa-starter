@@ -12,6 +12,11 @@
  *   4. rezerwuje dostawę w `webhook_event_processed` (idempotencja transportu);
  *   5. EMITUJE kopertę na event bus.
  *
+ * Story 3.4 (FR-10): rezerwacja z kroku 4 NIE jest dowodem skutku. Ponowienie
+ * trafiające w rezerwację porównuje zbiór jednostek należnych ze wspólną
+ * barierą skutku; przy braku utrwala alarm w rezerwacji, emituje ponownie
+ * koperty brakujących jednostek i odpowiada 500 (ACK dopiero po równości).
+ *
  * ZERO biznes-logiki nadal obowiązuje: route NIE tworzy entitlementu, NIE woła
  * service'ów domenowych, NIE otwiera transakcji biznesowej i NIE dotyka tabel
  * entitlementów. Cała logika live-issue → ISSUED jest w `@MedusaSubscriber`
@@ -68,7 +73,12 @@ import { recordWebhookDeferredIssuanceTrace } from "../../../../lib/recovery/def
 import {
   persistDeferredIssuanceMarker,
   queryUnderMarketContext,
+  OWED_UNIT_RESERVATION_MISMATCH_ALARM,
+  OWED_UNIT_SETTLEMENT_ENVELOPE_KEY,
+  OWED_UNIT_RECOVERY_DELIVERY_ACK,
+  PATH_Y_CONSUMER_MAX_ATTEMPTS,
   releaseWebhookDelivery,
+  settleOwedUnitStamp,
   reserveWebhookDelivery,
   resolveWebhookPgHandle,
   STRIPE_PATH_Y_WEBHOOK_PROVIDER,
@@ -86,9 +96,10 @@ import {
   type CompensationFailureRecord,
   type RecordedCompensationFailure,
 } from "../../../../lib/payment/money-path-compensation-registry"
-import { buildEventProcessedPurchaseQuery } from "../../../../modules/voucher/models/event-processed"
+import { buildOwedUnitEffectBarrierPurchaseQuery } from "../../../../lib/payment/owed-unit-effect-barrier"
 import {
   ackStatusForVerdict,
+  buildOwedBusinessUnitKey,
   buildOwedBusinessUnits,
   evaluateOwedUnitAck,
   isAckAllowed,
@@ -99,6 +110,21 @@ import {
 } from "./helpers"
 
 export const AUTHENTICATE = false
+
+// Story 3.4: klucz stempla i nazwa alarmu mają JEDEN nośnik (transport lib),
+// bo piszą je dwie strony — route (`reserved=false`) i konsument Path Y.
+export { OWED_UNIT_RESERVATION_MISMATCH_ALARM, OWED_UNIT_SETTLEMENT_ENVELOPE_KEY }
+
+const PERSIST_OWED_UNIT_SETTLEMENT_SQL =
+  `UPDATE webhook_event_processed
+      SET envelope = envelope || jsonb_build_object(
+            '${OWED_UNIT_SETTLEMENT_ENVELOPE_KEY}',
+            $3::jsonb || jsonb_build_object(
+              'repair_attempts',
+              COALESCE((envelope->'${OWED_UNIT_SETTLEMENT_ENVELOPE_KEY}'->>'repair_attempts')::int, 0) + 1
+            )
+          )
+    WHERE event_id = $1 AND provider = $2`
 
 /** Retry only the bounded race between Stripe success and completeCart. */
 export const LINK_UNRESOLVED_RETRY_WINDOW_SECONDS = 15 * 60
@@ -126,7 +152,8 @@ type LoggerLike = {
  * (brak wiersza `event_processed`) — populacja odzysku opisana w kontrakcie.
  */
 export const PAYMENT_INTENT_SUCCEEDED_EMIT_OPTIONS = Object.freeze({
-  attempts: 5,
+  // Story 3.4 runda fix 2: jeden nośnik z licznikiem prób konsumenta (WARN/CRITICAL).
+  attempts: PATH_Y_CONSUMER_MAX_ATTEMPTS,
   backoff: Object.freeze({ type: "exponential" as const, delay: 30_000 }),
 })
 
@@ -586,16 +613,19 @@ export async function POST(
       let settledUnits: string[] | null
       let settlementReadError: Error | null = null
       try {
-        const purchaseQuery = buildEventProcessedPurchaseQuery(paymentIntentId)
+        // Story 3.4 (DW-15-318 R-4): rozliczone jednostki czytane ze WSPÓLNEJ
+        // bariery skutku (klucz bez `event_type`), nie z `event_processed` —
+        // jednostka rozliczona trasą natywną jest tu tak samo rozliczona.
+        const purchaseQuery = buildOwedUnitEffectBarrierPurchaseQuery(paymentIntentId)
         // C3-SEC-001: połączenie brane WEWNĄTRZ kontekstu RLS (hook ustawia GUC
         // tylko przy acquire), nie `handle.client` pobrany przed kontekstem.
-        const result = await queryUnderMarketContext<{ external_id: string }>(
+        const result = await queryUnderMarketContext<{ owed_business_unit_key: string }>(
           req.scope,
           { market_id: marketId, instance_id: instanceId },
           purchaseQuery.sql,
           purchaseQuery.params
         )
-        settledUnits = result.rows.map((row) => row.external_id)
+        settledUnits = result.rows.map((row) => row.owed_business_unit_key)
       } catch (err) {
         settledUnits = null
         settlementReadError = err as Error
@@ -614,11 +644,86 @@ export async function POST(
           ackEvaluation.verdict === "UNKNOWN"
             ? "owed_units_unreadable"
             : "owed_units_unsettled"
+
+        // ── Story 3.4 (FR-10, AC1/AC4, DW-15-201) ─────────────────────────────
+        // Werdykt FAIL = rezerwacja transportu ŻYJE, a skutek biznesowy jest
+        // niekompletny. Do v1.16.0 ta gałąź tylko odmawiała ACK, więc po
+        // wyczerpaniu prób busa każde ponowienie Stripe'a kończyło się tym
+        // samym 500 bez naprawy — awaria przejściowa stawała się trwałym
+        // brakiem uprawnienia. Teraz:
+        //   (1) ALARM-BRAMKA: stan niezgodności zostaje UTRWALONY w kopercie
+        //       rezerwacji (`owed_unit_settlement.state = 'unsettled'`) i
+        //       odpowiedź jest nie-2xx — ACK nie wyprzedza równości zbiorów;
+        //   (2) NAPRAWA: rezerwacja przestaje blokować — koperty WYŁĄCZNIE
+        //       brakujących jednostek są emitowane ponownie. Wspólna bariera
+        //       skutku (Story 3.3) czyni to idempotentnym: jednostka już
+        //       rozliczona (dowolną trasą) daje no-op, więc wcześniej udany
+        //       skutek nie jest duplikowany.
+        // UNKNOWN (stanu nie da się odczytać) nie naprawia i nie stempluje —
+        // nie wiadomo, czego brakuje.
+        let repairDispatchedUnits: string[] = []
+        let repairErrorCode: string | null = null
+        let alarmPersisted: boolean | null = null
+        if (ackEvaluation.verdict === "FAIL") {
+          const missing = new Set(ackEvaluation.missing_units)
+          // `envelopes[i]` odpowiada `resolution.orders[i]` (krok 3).
+          const repairTargets = resolution.orders
+            .map((order, index) => ({
+              unit: buildOwedBusinessUnitKey({
+                payment_intent_id: paymentIntentId,
+                order_id: order.order_id,
+              }),
+              envelope: envelopes[index],
+            }))
+            .filter((target) => missing.has(target.unit))
+          try {
+            const stamped = await handle.client.query(PERSIST_OWED_UNIT_SETTLEMENT_SQL, [
+              deliveryEventId,
+              STRIPE_PATH_Y_WEBHOOK_PROVIDER,
+              JSON.stringify({
+                state: "unsettled",
+                alarm: OWED_UNIT_RESERVATION_MISMATCH_ALARM,
+                missing_units: ackEvaluation.missing_units,
+                unexpected_units: ackEvaluation.unexpected_units,
+                repair_dispatched_units: repairTargets.map((target) => target.unit),
+                checked_at: new Date().toISOString(),
+              }),
+            ])
+            alarmPersisted = (stamped.rowCount ?? 0) > 0
+          } catch (err) {
+            // Brak trwałego zapisu alarmu NIE zmienia bramki (odpowiedź i tak
+            // jest 500), ale jest jawnie w odpowiedzi i w logu ERROR niżej.
+            alarmPersisted = false
+            logger.error(
+              `[stripe/payment-intent] alarm ${OWED_UNIT_RESERVATION_MISMATCH_ALARM} ` +
+                `dla ${deliveryEventId} NIE zostal utrwalony: ${(err as Error).message}`
+            )
+          }
+          try {
+            const eventBus = req.scope.resolve(Modules.EVENT_BUS) as EventBusLike
+            for (const target of repairTargets) {
+              await eventBus.emit({
+                name: PAYMENT_INTENT_SUCCEEDED_EVENT,
+                data: target.envelope,
+                options: { ...PAYMENT_INTENT_SUCCEEDED_EMIT_OPTIONS },
+              })
+              repairDispatchedUnits.push(target.unit)
+            }
+          } catch (err) {
+            repairErrorCode = "repair_emit_failed"
+            logger.error(
+              `[stripe/payment-intent] naprawa ${deliveryEventId} (ponowna emisja ` +
+                `brakujacych jednostek) nieudana: ${(err as Error).message}`
+            )
+          }
+        }
+
         logger.error(
           `[stripe/payment-intent] dostawa ${deliveryEventId} nie może dostać ACK: ` +
             `verdict=${ackEvaluation.verdict}; missing_units=` +
             `[${ackEvaluation.missing_units.join(",")}]; unexpected_units=` +
             `[${ackEvaluation.unexpected_units.join(",")}]` +
+            `; repair_dispatched_units=[${repairDispatchedUnits.join(",")}]` +
             (settlementReadError
               ? `; settlement_read_error_code=${SETTLEMENT_READ_ERROR_CODE}` +
                 `; settlement_read_error=${settlementReadError.message}`
@@ -632,6 +737,14 @@ export async function POST(
           settled_units: ackEvaluation.settled_units,
           missing_units: ackEvaluation.missing_units,
           unexpected_units: ackEvaluation.unexpected_units,
+          ...(ackEvaluation.verdict === "FAIL"
+            ? {
+                alarm: OWED_UNIT_RESERVATION_MISMATCH_ALARM,
+                alarm_persisted: alarmPersisted,
+                repair_dispatched_units: repairDispatchedUnits,
+                ...(repairErrorCode ? { repair_error_code: repairErrorCode } : {}),
+              }
+            : {}),
           // C3-SEC-003: publiczna trasa zwraca wyłącznie STAŁY kod; szczegół
           // błędu odczytu trafia tylko do kontrolowanego logu powyżej.
           ...(settlementReadError ? { error_code: SETTLEMENT_READ_ERROR_CODE } : {}),
@@ -645,6 +758,22 @@ export async function POST(
       // Druga warstwa (`event_processed` po payment_intent_id + order_id) i tak
       // nie dopuści drugiego kompletu voucherów, ale zatrzymanie tutaj oszczędza
       // cały przebieg.
+      // Story 3.4 runda fix 2 (R-9, ADR-246 p.6): równość zbiorów = jednostki
+      // rozliczone, więc stempel `unsettled` tej rezerwacji (route albo
+      // konsument) przechodzi na `settled` z zachowanym śladem prób. Porażka
+      // zapisu nie zmienia werdyktu (skutek jest kompletny), ale jest nazwana.
+      try {
+        await settleOwedUnitStamp(handle.client, {
+          event_id: deliveryEventId,
+          settled_units: ackEvaluation.owed_units,
+          recovered_by: OWED_UNIT_RECOVERY_DELIVERY_ACK,
+        })
+      } catch (err) {
+        logger.error(
+          `[stripe/payment-intent] owed_unit_stamp_settle_failed dla ${deliveryEventId}: ` +
+            `${(err as Error).message}`
+        )
+      }
       logger.info?.(
         `[stripe/payment-intent] dostawa ${deliveryEventId} już przyjęta — ACK bez emisji`
       )

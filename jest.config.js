@@ -82,6 +82,8 @@ if (process.env.TEST_TYPE === "integration:http") {
   // bramka `test-db-isolation` (DW-15-138) czerwienila ja jako suite bezprofilowa.
   module.exports.testMatch = [
     "**/packages/api/src/api/middlewares/__tests__/cart-completion-psp-authority-pg.integration.test.[jt]s",
+    // Story 8.3 AC2: retry after an interrupted return reuses the SAME PaymentIntent.
+    "**/packages/api/src/api/middlewares/__tests__/cart-completion-psp-authority.retry.integration.test.[jt]s",
   ];
 } else if (process.env.TEST_TYPE === "voucher-rls-pg") {
   // v1.15.0 Story 2.6 (FR-14e) — moduł voucher pod RLS na REALNYM Postgresie.
@@ -187,6 +189,12 @@ if (process.env.TEST_TYPE === "integration:http") {
   // jednostka na realnym PostgreSQL (DATABASE_URL = izolowana *_test).
   module.exports.testMatch = [
     "**/packages/api/src/__tests__/integration/story-3-3-shared-barrier-atomic-pg.integration.test.[jt]s",
+  ];
+} else if (process.env.TEST_TYPE === "story-3-4-transport-reservation-pg") {
+  // v1.16.0 Story 3.4 (FR-10, AD-33) — rezerwacja transportu nie wyprzedza
+  // konsumpcji biznesowej; obie trasy webhooka na realnym PostgreSQL (*_test).
+  module.exports.testMatch = [
+    "**/packages/api/src/__tests__/integration/story-3-4-transport-reservation-after-consumption-pg.integration.test.[jt]s",
   ];
 } else if (process.env.TEST_TYPE === "voucher-service-redeem-pg") {
   // v1.16.0 Story 5.4 (FR-19, AD-34) — realizacja VOUCHER_SERVICE jednym aktem,
