@@ -110,6 +110,7 @@ type AppendCall = { input: Record<string, unknown> }
  */
 type VoucherMock = {
   getForSeller: jest.Mock
+  getRedemptionTrailForSeller: jest.Mock
   redeemForSeller: jest.Mock
 }
 
@@ -126,6 +127,10 @@ function voucherMock(
   return {
     getForSeller: jest.fn(async (sellerId: string) =>
       voucher && voucher.seller_id === sellerId ? voucher : null,
+    ),
+    // v1.16.0 Story 5.7 (AC1): lookup dokłada ślad realizacji z kanonicznej.
+    getRedemptionTrailForSeller: jest.fn(async (sellerId: string) =>
+      voucher && voucher.seller_id === sellerId ? [] : null,
     ),
     redeemForSeller: jest.fn(async (sellerId: string) => {
       if (!voucher || voucher.seller_id !== sellerId) {
@@ -1913,8 +1918,14 @@ describe("Story 5.5 — odmowa realizacji czytelna dla sprzedawczyni", () => {
       redemptionDb: createRedemptionFakeDb({ entitlementState: "VOIDED" }),
     })
     expect(res.statusCode).toBe(422)
-    const body = res.body as { code: string; reason?: string }
+    const body = res.body as { code: string; reason?: string; message?: string }
     expect(body.code).toBe("REDEMPTION_REFUSED")
-    expect(body.reason).toBeUndefined()
+    expect(body.reason).not.toBe("not_yet_active")
+    // v1.16.0 Story 5.7 (DW-15-335): stały powód i stałe zdanie dla całej
+    // gałęzi stanowej — bez identyfikatora uprawnienia w `message`.
+    expect(body.reason).toBe("entitlement_not_redeemable")
+    expect(body.message).toBe("tego vouchera nie można zrealizować w jego obecnym stanie")
+    expect(body.message).not.toContain(ENTITLEMENT_ID)
+    expect(body.message).not.toContain("VOIDED")
   })
 })

@@ -158,5 +158,10 @@ async function lookupInSellerMarket(
   }
 
   const view = projectVendorView(voucher)
-  res.status(200).json({ voucher: view })
+  // v1.16.0 Story 5.7 (AC1, FR-19a, AD-34): ślad realizacji po kodzie —
+  // moment, aktor (poziom salonu) i rynek z kanonicznej `voucher_redemption`,
+  // zapisanej tą samą transakcją co akt. Odczyt w zakresie najemcy.
+  const trail =
+    (await voucherService.getRedemptionTrailForSeller(sellerId, code)) ?? []
+  res.status(200).json({ voucher: view, redemption_trail: trail })
 }

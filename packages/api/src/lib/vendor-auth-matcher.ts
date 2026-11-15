@@ -75,6 +75,7 @@ export const VENDOR_GP_OWNED_ROUTES: readonly string[] = [
   "/vendor/training-cert/upload",
   "/vendor/vouchers/:code/lookup",
   "/vendor/vouchers/:code/redeem",
+  "/vendor/vouchers/:code/reverse-redemption",
 ]
 
 export const VENDOR_HMAC_EXEMPT_ROUTES: readonly VendorHmacExemption[] = [
@@ -122,6 +123,15 @@ export const VENDOR_HMAC_EXEMPT_ROUTES: readonly VendorHmacExemption[] = [
       "vendor-panel voucher redeem — same browser transport as the lookup above; the " +
       "redeem route resolves the tenant from req.seller_context and hands it to " +
       "VoucherService.redeemForSeller (AD-20: one tenant-taking domain operation).",
+  },
+  // v1.16.0 Story 5.7 (AC2, D-36): korekta pomyłkowej realizacji z panelu.
+  {
+    matcher: "/vendor/vouchers/:code/reverse-redemption",
+    transport: "mercur-seller-context",
+    reason:
+      "vendor-panel redemption correction — same browser transport as lookup/redeem; " +
+      "the tenant comes from req.seller_context and is enforced in the voucher-code " +
+      "state producer (seller_id predicate) inside the correction transaction.",
   },
 ]
 

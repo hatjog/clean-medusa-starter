@@ -118,6 +118,10 @@ export enum EntitlementInstanceState {
   DISPUTED = "DISPUTED",
   // --- Story 2.7 BE-6: vendor-decision no-show holding state ---
   PENDING_VENDOR_DECISION = "PENDING_VENDOR_DECISION",
+  // --- v1.16.0 Story 5.7 (D-36, ADR-245 Proposed): korekta pomyłkowej realizacji ---
+  // Różny od ACTIVE („nigdy nie zrealizowany") i od REDEEMED_FULL („zrealizowany");
+  // nie terminalny — voucher jest po nim ZNÓW realizowalny.
+  REDEMPTION_REVERSED = "REDEMPTION_REVERSED",
 }
 
 /** All instance states (DB CHECK constraint source-of-truth). */
@@ -136,6 +140,7 @@ export const ALL_ENTITLEMENT_INSTANCE_STATES: readonly EntitlementInstanceState[
     EntitlementInstanceState.REFUNDED,
     EntitlementInstanceState.DISPUTED,
     EntitlementInstanceState.PENDING_VENDOR_DECISION,
+    EntitlementInstanceState.REDEMPTION_REVERSED,
   ]
 
 /** Terminal states — no outbound transitions. */
@@ -184,6 +189,17 @@ export const ALLOWED_ENTITLEMENT_TRANSITIONS: Readonly<
   ],
   [EntitlementInstanceState.REDEEMED_FULL]: [
     EntitlementInstanceState.SETTLED,
+    EntitlementInstanceState.REFUND_REQUESTED,
+    EntitlementInstanceState.DISPUTED,
+    EntitlementInstanceState.REDEMPTION_REVERSED, // v1.16.0 Story 5.7: korekta pomyłki (D-36)
+  ],
+  // v1.16.0 Story 5.7 (D-36, ADR-245): po korekcie uprawnienie zachowuje się jak
+  // ACTIVE (ponowna realizacja, wygaśnięcie, unieważnienie, zwrot, spór), ale
+  // stan pozostaje odróżnialny od „nigdy nie zrealizowany".
+  [EntitlementInstanceState.REDEMPTION_REVERSED]: [
+    EntitlementInstanceState.REDEMPTION_REQUESTED,
+    EntitlementInstanceState.EXPIRED,
+    EntitlementInstanceState.VOIDED,
     EntitlementInstanceState.REFUND_REQUESTED,
     EntitlementInstanceState.DISPUTED,
   ],

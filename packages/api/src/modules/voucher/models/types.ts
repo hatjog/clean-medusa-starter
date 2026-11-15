@@ -126,6 +126,13 @@ export type RedeemRefusalReason = keyof typeof REDEEM_REFUSALS
  */
 export const ENTITLEMENT_STATE_REFUSALS = {
   not_yet_active: { api_code: "REDEMPTION_REFUSED", http_status: 422 },
+  /**
+   * v1.16.0 Story 5.7 (DW-15-335): KAŻDY inny stan uprawnienia spoza
+   * `REDEEMABLE_SOURCE_STATES` (np. `VOIDED`) — stały powód i stałe zdanie,
+   * bez wewnętrznego identyfikatora w `message`. Ten sam kod 422 (oś ADR-243;
+   * włączenie do słownika powodów v4 — DW-15-327).
+   */
+  entitlement_not_redeemable: { api_code: "REDEMPTION_REFUSED", http_status: 422 },
 } as const
 
 export type EntitlementStateRefusalReason =
@@ -140,8 +147,25 @@ export function resolveEntitlementStateRefusalReason(
   entitlementState: string | null | undefined,
 ): EntitlementStateRefusalReason | null {
   if (entitlementState === "ISSUED") return "not_yet_active"
+  // v1.16.0 Story 5.7 (DW-15-335): gałąź stanowa jest wyczerpana — stan
+  // nieznany/pusty to brak informacji (wołający zostaje przy odmowie ogólnej).
+  if (typeof entitlementState === "string" && entitlementState.length > 0) {
+    return "entitlement_not_redeemable"
+  }
   return null
 }
+
+/**
+ * v1.16.0 Story 5.7 (AC2, ADR-245 `Proposed` §4): odmowy KOREKTY realizacji.
+ * Oś osobna od `REDEEM_REFUSALS` (słownik v3 dopuszcza tam tylko `VOUCHER_*`).
+ */
+export const CORRECTION_REFUSALS = {
+  already_reversed: { api_code: "REDEMPTION_ALREADY_REVERSED", http_status: 409 },
+  not_redeemed: { api_code: "VOUCHER_NOT_REDEEMED", http_status: 409 },
+  not_correctable: { api_code: "REDEMPTION_NOT_CORRECTABLE", http_status: 422 },
+} as const
+
+export type CorrectionRefusalApiReason = keyof typeof CORRECTION_REFUSALS
 
 /**
  * Wynik JEDNEJ operacji domenowej przyjmującej najemcę

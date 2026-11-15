@@ -172,7 +172,7 @@ describe("Story 3.8 AC1 — bramka stanu uprawnienia przed projekcją voucher_st
 })
 
 describe("Story 3.8 R-15 — REDEEMABLE_SOURCE_STATES niemutowalny w runtime", () => {
-  it("add/delete/clear rzucają, a zbiór zostaje {ACTIVE, REDEEMED_PARTIAL}", () => {
+  it("add/delete/clear rzucają, a zbiór zostaje {ACTIVE, REDEEMED_PARTIAL, REDEMPTION_REVERSED} (5.7, D-36)", () => {
     const gate = REDEEMABLE_SOURCE_STATES as Set<EntitlementInstanceState>
     expect(() => gate.add(EntitlementInstanceState.ISSUED)).toThrow(TypeError)
     expect(() => gate.delete(EntitlementInstanceState.ACTIVE)).toThrow(TypeError)
@@ -181,7 +181,11 @@ describe("Story 3.8 R-15 — REDEEMABLE_SOURCE_STATES niemutowalny w runtime", (
       ;(gate as { add: unknown }).add = Set.prototype.add
     }).toThrow(TypeError)
     expect([...REDEEMABLE_SOURCE_STATES].sort()).toEqual(
-      [EntitlementInstanceState.ACTIVE, EntitlementInstanceState.REDEEMED_PARTIAL].sort()
+      [
+        EntitlementInstanceState.ACTIVE,
+        EntitlementInstanceState.REDEEMED_PARTIAL,
+        EntitlementInstanceState.REDEMPTION_REVERSED,
+      ].sort()
     )
     expect(REDEEMABLE_SOURCE_STATES.has(EntitlementInstanceState.ISSUED)).toBe(false)
   })

@@ -54,7 +54,25 @@ import {
 import {
   claimVoucherCode,
   invalidateVoucherCode,
+  restoreVoucherCodeAfterCorrection,
 } from "./voucher-code-state"
+
+/**
+ * v1.16.0 Story 5.7 (AC1, FR-19a, AD-34) — wpis śladu realizacji po kodzie
+ * vouchera, wywiedziony z kanonicznej `voucher_redemption` (ten sam wiersz,
+ * który powstaje w transakcji aktu). Bez identyfikatorów wewnętrznych i bez PII.
+ *
+ * `actor`: poziom SALONU (`own_seller`) wyłącznie dla wpisów z panelu —
+ * realizacja z kluczem panelowym (`PANEL-…`) i korekta (`REDEMPTION_REVERSED`,
+ * produkowana tylko przez trasę panelu). Atrybucja osoby — DW-15-328.
+ */
+export type RedemptionTrailEntry = {
+  kind: "redemption" | "correction" | "refund_reversal"
+  at: string
+  actor: "own_seller" | null
+  market_id: string
+  redemption_market_id: string
+}
 
 // Local minimal shape for admin search projection (Layer 4-aware).
 // Mirrors fields from `lib/contracts/admin#EntitlementAdminView` that are
@@ -2238,6 +2256,85 @@ export class VoucherService {
       throw new Error(`VoucherService.redeemForSeller: failed to read back ${code}`)
     }
     return { status: "redeemed", prior_status: priorStatus!, voucher: updated }
+  }
+
+  /**
+   * v1.16.0 Story 5.7 (AC1) — ślad realizacji po kodzie w zakresie najemcy.
+   * `null` dla kodu nieznanego i cudzego (ta sama gałąź co `getForSeller`).
+   */
+  async getRedemptionTrailForSeller(
+    sellerId: string,
+    code: string
+  ): Promise<RedemptionTrailEntry[] | null> {
+    const scope = await this.getPool().query<{ seller_id: string }>(
+      `SELECT seller_id FROM voucher WHERE code = $1`,
+      [code]
+    )
+    if (scope.rows.length === 0) return null
+    if (scope.rows[0].seller_id !== sellerId) return null
+    const res = await this.getPool().query<Record<string, unknown>>(
+      `SELECT vr.kind, vr.resulting_state, vr.idempotency_key, vr.created_at,
+              vr.market_id, vr.redemption_market_id
+         FROM voucher_redemption vr
+         JOIN entitlement_instance ei ON ei.id = vr.entitlement_id
+        WHERE ei.policy_snapshot->>'voucher_code' = $1
+        ORDER BY vr.created_at, vr.kind`,
+      [code]
+    )
+    return res.rows.map((row) => {
+      const isReversal = row.kind === "REVERSAL"
+      const isCorrection =
+        isReversal && row.resulting_state === "REDEMPTION_REVERSED"
+      const panel =
+        isCorrection ||
+        (!isReversal && String(row.idempotency_key ?? "").startsWith("PANEL-"))
+      return {
+        kind: isCorrection
+          ? "correction"
+          : isReversal
+            ? "refund_reversal"
+            : "redemption",
+        // `bigint` z node-pg wraca STRINGIEM (ADR-166).
+        at: new Date(Number(row.created_at)).toISOString(),
+        actor: panel ? "own_seller" : null,
+        market_id: String(row.market_id),
+        redemption_market_id: String(row.redemption_market_id),
+      }
+    })
+  }
+
+  /**
+   * v1.16.0 Story 5.7 (AC2, D-36) — projekcja KOREKTY na stanie kodu, w
+   * transakcji wołającego (`client`). Kod wraca do stanu sprzed realizacji
+   * (`payload.prior_status` najnowszego zdarzenia `claimed` ścieżki vendor),
+   * a przy jego braku do `idle`. Rzuca, gdy kod nie jest `claimed` tego sprzedawcy.
+   */
+  async restoreAfterCorrectionForSeller(
+    sellerId: string,
+    code: string,
+    opts: { client: Queryable; now: Date }
+  ): Promise<VoucherStatus> {
+    const prior = await opts.client.query<{ prior: string | null }>(
+      `SELECT payload->>'prior_status' AS prior
+         FROM voucher_event
+        WHERE voucher_code = $1 AND event_type = 'claimed'
+        ORDER BY occurred_at DESC
+        LIMIT 1`,
+      [code]
+    )
+    const candidate = prior.rows[0]?.prior as VoucherStatus | null | undefined
+    const restoreTo: VoucherStatus =
+      candidate && VOUCHER_REDEMPTION_INPUT_STATES.has(candidate)
+        ? candidate
+        : "idle"
+    await restoreVoucherCodeAfterCorrection(opts.client, {
+      code,
+      seller_id: sellerId,
+      restoreTo,
+      inputStates: VOUCHER_REDEMPTION_INPUT_STATES,
+      now: opts.now,
+    })
+    return restoreTo
   }
 
   async extend(

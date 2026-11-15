@@ -84,6 +84,7 @@ import type { VoucherStatus } from "../models/types"
 export const REDEEMABLE_SOURCE_STATES: ReadonlySet<EntitlementInstanceState> = new Set([
   EntitlementInstanceState.ACTIVE,
   EntitlementInstanceState.REDEEMED_PARTIAL,
+  EntitlementInstanceState.REDEMPTION_REVERSED,
 ])
 
 /**
@@ -626,6 +627,46 @@ export type ReverseRedemptionResult = {
   emit_failed: boolean
 }
 
+/**
+ * v1.16.0 Story 5.7 (AC2, D-36, ADR-245 `Proposed`) — KOREKTA pomyłkowej
+ * realizacji przy stanowisku. Różni się od zwrotu ({@link
+ * RedeemPartialEntitlementOperation.reverse}) intencją i skutkiem: uprawnienie
+ * przechodzi do nazwanego `REDEMPTION_REVERSED` i jest ZNÓW realizowalne.
+ */
+export type CorrectRedemptionInput = {
+  /** Kod vouchera — most M1 rozwiązuje go do uprawnienia pod `FOR UPDATE`. */
+  voucher_code: string
+  actor?: TransitionActor
+  actor_hint?: string
+  vendor_id?: string | null
+  now?: Date
+}
+
+export type CorrectRedemptionResult = {
+  entitlement_id: string
+  /** `redemption_id` wiersza KOREKTY (`kind='REVERSAL'`). */
+  redemption_id: string
+  /** `redemption_id` korygowanej realizacji — wiersz NIENARUSZONY. */
+  reverses_redemption_id: string
+  entitlement_state_after: EntitlementInstanceState
+  corrected_at: string
+  market_id: string
+}
+
+/** Powody ODMOWY korekty — rozłączne, nazwane (ADR-245 §4). */
+export type CorrectionRefusalReason =
+  | "already_reversed"
+  | "not_redeemed"
+  | "not_correctable"
+
+export class RedemptionCorrectionRefusedError extends Error {
+  readonly error_code = "REDEMPTION_CORRECTION_REFUSED"
+  constructor(readonly reason: CorrectionRefusalReason) {
+    super(`korekta realizacji odmówiona: ${reason}`)
+    this.name = "RedemptionCorrectionRefusedError"
+  }
+}
+
 export type RedeemPartialResult = {
   entitlement_id: string
   redemption_id: string
@@ -766,6 +807,13 @@ export interface RedeemPartialTx {
   findAnyRedemptionByEntitlementId(
     entitlementId: string
   ): Promise<RedemptionRecord | null>
+  /**
+   * v1.16.0 Story 5.7 (AC2): WSZYSTKIE wiersze kanonicznej uprawnienia, w
+   * kolejności zapisu — korekta szuka ostatniej NIEODWRÓCONEJ realizacji.
+   */
+  listRedemptionsByEntitlementId(
+    entitlementId: string
+  ): Promise<RedemptionRecord[]>
   getChoiceSetItemsForUpdate(
     entitlementId: string
   ): Promise<RedeemableChoiceSetItem[]>
@@ -866,6 +914,15 @@ export type RedeemPartialDeps = {
    * odmowa realizacji.
    */
   writeProjection?: (
+    client: ProjectionQueryable,
+    context: { voucher_code: string; entitlement_id: string; now: Date }
+  ) => Promise<void>
+  /**
+   * v1.16.0 Story 5.7 (AC2, D-36): PROJEKCJA korekty — przywrócenie stanu kodu
+   * vouchera do realizowalnego. Ta sama reguła co {@link writeProjection}:
+   * w TEJ SAMEJ transakcji, PO wierszu `REVERSAL`; rzut wycofuje całość.
+   */
+  writeCorrectionProjection?: (
     client: ProjectionQueryable,
     context: { voucher_code: string; entitlement_id: string; now: Date }
   ) => Promise<void>
@@ -1999,6 +2056,144 @@ export class RedeemPartialEntitlementOperation {
       emit_failed: emitFailed,
     }
   }
+
+  /**
+   * v1.16.0 Story 5.7 (AC2, D-36, ADR-245 `Proposed`) — KOREKTA pomyłkowej
+   * realizacji. Jedna transakcja (AD-34): blokada uprawnienia, wiersz
+   * `REVERSAL` (`reverses_redemption_id` = korygowana realizacja,
+   * `resulting_state = REDEMPTION_REVERSED`), przejście `REDEEMED_FULL →
+   * REDEMPTION_REVERSED` z audytem i projekcja stanu kodu. Pierwotny wiersz
+   * `REDEMPTION` NIE jest ani kasowany, ani aktualizowany (ADR-178 §2.3).
+   *
+   * Zakres: wyłącznie `VOUCHER_SERVICE` (realizacja niepodzielna, bez postingu
+   * kwotowego — ADR-237). Korekta gałęzi kwotowej wymagałaby odwrócenia
+   * postingu i przywrócenia salda — poza zakresem (`not_correctable`).
+   */
+  async correct(input: CorrectRedemptionInput): Promise<CorrectRedemptionResult> {
+    const now = input.now ?? this.deps.clock?.() ?? new Date()
+
+    const txOut = await this.deps.store.withTransaction(async (tx) => {
+      const ent = await resolveRedeemTarget(tx, { voucher_code: input.voucher_code })
+
+      if (ent.entitlement_type !== UNIT_REDEEMABLE_TYPE) {
+        throw new RedemptionCorrectionRefusedError("not_correctable")
+      }
+      if (ent.state === EntitlementInstanceState.REDEMPTION_REVERSED) {
+        throw new RedemptionCorrectionRefusedError("already_reversed")
+      }
+      if (ent.state !== EntitlementInstanceState.REDEEMED_FULL) {
+        throw new RedemptionCorrectionRefusedError("not_redeemed")
+      }
+
+      const rows = await tx.listRedemptionsByEntitlementId(ent.id)
+      const reversed = new Set(
+        rows
+          .filter((r) => r.kind === REDEMPTION_KIND_REVERSAL)
+          .map((r) => r.reverses_redemption_id)
+      )
+      const target = [...rows]
+        .reverse()
+        .find(
+          (r) =>
+            r.kind === REDEMPTION_KIND_REDEMPTION && !reversed.has(r.redemption_id)
+        )
+      if (!target) {
+        // Stan mówi „zrealizowany", a kanoniczna nie ma nieodwróconej
+        // realizacji — odmowa, nie zmyślony wiersz.
+        throw new RedemptionCorrectionRefusedError("not_redeemed")
+      }
+
+      const baseBefore = await tx.getCommissionBaseMinor(ent.id)
+      assertCommissionBaseWithinBounds(
+        ent.id,
+        baseBefore - target.amount_minor,
+        target.issued_gross_minor
+      )
+
+      const correctionId = buildRedemptionId(
+        ent.id,
+        target.idempotency_key,
+        REDEMPTION_KIND_REVERSAL
+      )
+      const scope: TransitionScope = {
+        instance_id: ent.id,
+        market_id: target.market_id,
+        sales_channel_id: ent.sales_channel_id ?? null,
+        vendor_id: input.vendor_id ?? ent.vendor_id ?? null,
+        location_id: ent.location_id ?? null,
+      }
+      const wiringDeps = {
+        appendAudit: tx.appendAudit.bind(tx),
+        clock: () => now,
+      }
+
+      const record: RedemptionRecord = {
+        entitlement_id: ent.id,
+        idempotency_key: target.idempotency_key,
+        redemption_id: correctionId,
+        amount_minor: target.amount_minor,
+        resulting_state:
+          EntitlementInstanceState.REDEMPTION_REVERSED as unknown as RedeemOutcome,
+        // Jednostka usługi WRACA — po korekcie voucher jest znów realizowalny.
+        remaining_after_minor: target.amount_minor + target.remaining_after_minor,
+        issued_gross_minor: target.issued_gross_minor,
+        created_at: now.getTime(),
+        kind: REDEMPTION_KIND_REVERSAL,
+        reverses_redemption_id: target.redemption_id,
+        market_id: target.market_id,
+        purchase_market_id: target.purchase_market_id,
+        redemption_market_id: target.redemption_market_id,
+      }
+      const ins = await tx.insertRedemption(record)
+      if (!ins.inserted) {
+        // PK (entitlement, key, REVERSAL) zajęty: realizacja już odwrócona.
+        throw new RedemptionCorrectionRefusedError("already_reversed")
+      }
+
+      const step = await wireEntitlementTransitionPersisted(wiringDeps, {
+        from: ent.state,
+        to: EntitlementInstanceState.REDEMPTION_REVERSED,
+        entitlement_id: ent.id,
+        scope,
+        actor: input.actor ?? "vendor",
+        actor_hint: input.actor_hint ?? "vendor:panel-correction",
+        occurred_at: now.toISOString(),
+        transition_seq: `${correctionId}:correction`,
+      })
+      await tx.updateEntitlementState(
+        ent.id,
+        ent.state,
+        EntitlementInstanceState.REDEMPTION_REVERSED,
+        now
+      )
+
+      const projectionClient = tx.projectionClient()
+      if (this.deps.writeCorrectionProjection && projectionClient) {
+        await this.deps.writeCorrectionProjection(projectionClient, {
+          voucher_code: input.voucher_code,
+          entitlement_id: ent.id,
+          now,
+        })
+      }
+
+      return { record, target, event: step.event }
+    })
+
+    const emitFailed = await emitTransitionEventAfterCommit(
+      this.deps.events.emit,
+      txOut.event
+    )
+    void emitFailed // best-effort po COMMIT; kompletność — reconciliation (ADR-137)
+
+    return {
+      entitlement_id: txOut.record.entitlement_id,
+      redemption_id: txOut.record.redemption_id,
+      reverses_redemption_id: txOut.target.redemption_id,
+      entitlement_state_after: EntitlementInstanceState.REDEMPTION_REVERSED,
+      corrected_at: now.toISOString(),
+      market_id: txOut.record.market_id,
+    }
+  }
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -2260,6 +2455,19 @@ class PostgresRedeemPartialTx implements RedeemPartialTx {
     const row = res.rows[0]
     if (!row) return null
     return mapRedemptionRow(row)
+  }
+
+  async listRedemptionsByEntitlementId(
+    entitlementId: string
+  ): Promise<RedemptionRecord[]> {
+    const res = await this.client.query<Record<string, unknown>>(
+      `SELECT ${REDEMPTION_COLUMNS}
+         FROM ${VOUCHER_REDEMPTION_TABLE}
+        WHERE entitlement_id = $1
+        ORDER BY created_at, kind`,
+      [entitlementId]
+    )
+    return res.rows.map((row) => mapRedemptionRow(row))
   }
 
   async getChoiceSetItemsForUpdate(
@@ -2666,6 +2874,15 @@ class InMemoryRedeemPartialTx implements RedeemPartialTx {
       if (record.entitlement_id === entitlementId) return { ...record }
     }
     return null
+  }
+
+  async listRedemptionsByEntitlementId(
+    entitlementId: string
+  ): Promise<RedemptionRecord[]> {
+    return [...this.redemptions.values()]
+      .filter((record) => record.entitlement_id === entitlementId)
+      .map((record) => ({ ...record }))
+      .sort((a, b) => a.created_at - b.created_at || a.kind.localeCompare(b.kind))
   }
 
   async getChoiceSetItemsForUpdate(

@@ -1044,6 +1044,9 @@ class EntitlementStateRefusedDuringRedeemError extends Error {
 const ENTITLEMENT_REFUSAL_MESSAGES: Record<EntitlementStateRefusalReason, string> = {
   not_yet_active:
     "ten voucher nie jest jeszcze aktywny — prezent nie został aktywowany, więc nie można go zrealizować",
+  // v1.16.0 Story 5.7 (DW-15-335): stałe zdanie bez identyfikatora uprawnienia.
+  entitlement_not_redeemable:
+    "tego vouchera nie można zrealizować w jego obecnym stanie",
 }
 
 /**

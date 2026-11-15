@@ -241,6 +241,12 @@ if (process.env.TEST_TYPE === "integration:http") {
   module.exports.testMatch = [
     "**/packages/api/src/__tests__/integration/story-8-4-partial-line-failure-pg.integration.test.[jt]s",
   ];
+} else if (process.env.TEST_TYPE === "story-5-7-redemption-trail-pg") {
+  // v1.16.0 Story 5.7 (FR-19a, AD-34, D-36) — slad realizacji i korekta na
+  // realnym PG; DATABASE_URL musi wskazywac baze `*_test` (suita kasuje wlasne dane).
+  module.exports.testMatch = [
+    "**/packages/api/src/__tests__/integration/story-5-7-redemption-trail-pg.integration.test.[jt]s",
+  ];
 } else if (process.env.TEST_TYPE === "unit") {
   module.exports.testMatch = [
     "**/packages/api/src/**/__tests__/**/*.unit.spec.[jt]s",

@@ -628,3 +628,43 @@ export function renderVoucherStatusInClause(
     .join(", ")
   return `${column} IN (${values})`
 }
+
+/**
+ * v1.16.0 Story 5.7 (AC2, D-36, ADR-245 `Proposed`) — PRZYWRÓCENIE stanu kodu
+ * po KOREKCIE pomyłkowej realizacji: `claimed` → stan realizowalny sprzed
+ * realizacji (`idle` / `consent_pending`). Jedyny producent `UPDATE voucher SET
+ * status` zostaje w tym pliku; szew transakcyjny jest klientem WOŁAJĄCEGO.
+ *
+ * Fail-closed: `restoreTo` spoza allow-listy wejściowej realizacji albo zero
+ * przestawionych wierszy (kod nie jest `claimed` w zakresie tego sprzedawcy)
+ * RZUCA — wołający wycofuje całą transakcję korekty, łącznie z wierszem
+ * `REVERSAL` (fakt bez projekcji jest gorszy niż odmowa).
+ */
+export async function restoreVoucherCodeAfterCorrection(
+  client: VoucherCodeStateClient,
+  input: {
+    code: string
+    seller_id: string
+    restoreTo: VoucherStatus
+    inputStates: ReadonlySet<VoucherStatus>
+    now: Date
+  }
+): Promise<void> {
+  if (!input.inputStates.has(input.restoreTo)) {
+    throw new Error(
+      `restoreVoucherCodeAfterCorrection: stan '${input.restoreTo}' nie jest ` +
+        "stanem wejściowym realizacji — korekta przywraca wyłącznie kod realizowalny"
+    )
+  }
+  const res = await client.query(
+    `UPDATE voucher SET status = $4, updated_at = $3
+      WHERE code = $1 AND seller_id = $2 AND status = 'claimed'`,
+    [input.code, input.seller_id, input.now, input.restoreTo]
+  )
+  if ((res.rowCount ?? 0) !== 1) {
+    throw new Error(
+      `restoreVoucherCodeAfterCorrection: kod nie jest 'claimed' w zakresie ` +
+        `sprzedawcy (przestawiono ${res.rowCount ?? 0} wierszy, oczekiwano 1)`
+    )
+  }
+}
