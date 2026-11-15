@@ -622,6 +622,39 @@ describeOrNotRun("Story 11.3 — akcje recovery pod RLS (PG)", () => {
         ["approve", "replayed", null],
       ])
     })
+
+    it("Story 11.4 (runda fix 1): propose → approve → propose → approve tej samej komendy ⇒ replayed na obu krokach powtórki, jeden skutek", async () => {
+      await seed(MKT_A, "6")
+      const id = ditId(MKT_A, "6")
+      const intended = {
+        action: "resolve",
+        target_state: "closed_order_never_created",
+        expected_version: 1,
+        evidence: { kind: "written_off_with_approval", reference: "INC-11-4-0001" },
+      }
+      const approveBody = { action: "resolve", target_state: "closed_order_never_created", expected_version: 1 }
+      expect((await call("propose", "deferred_issuance_trace", id, intended)).statusCode).toBe(201)
+      expect((await call("approve", "deferred_issuance_trace", id, approveBody)).body.outcome).toBe("applied")
+      // Powtórka po zgubionej odpowiedzi approve: wersja wiersza = 2, komenda niesie 1.
+      const p2 = await call("propose", "deferred_issuance_trace", id, intended)
+      expect(p2.statusCode).toBe(200)
+      expect(p2.body).toEqual(expect.objectContaining({ outcome: "replayed", domain_effects: 0 }))
+      const a2 = await call("approve", "deferred_issuance_trace", id, approveBody)
+      expect(a2.statusCode).toBe(200)
+      expect(a2.body).toEqual(expect.objectContaining({ outcome: "replayed", domain_effects: 0 }))
+      // Inne evidence przy zastosowanej intencji ⇒ nadal jawny konflikt treści, nie replayed.
+      const other = await call("propose", "deferred_issuance_trace", id, { ...intended, evidence: { kind: "written_off_with_approval", reference: "INC-11-4-9999" } })
+      expect(other.statusCode).toBe(409)
+      expect(other.body.outcome).toBe("refused_idempotency_payload_mismatch")
+      // Inny cel tej samej intencji po zastosowaniu ⇒ kontrola wersji jak dotąd.
+      const otherTarget = await call("propose", "deferred_issuance_trace", id, { ...intended, target_state: "issued_after_link", evidence: { kind: "entitlement_issued", reference: `pi_dit_${MKT_A}_6` } })
+      expect(otherTarget.statusCode).toBe(409)
+      expect(otherTarget.body.outcome).toBe("refused_version_conflict")
+      const s = await steps(id)
+      expect(s.filter((x) => x.outcome === "applied")).toHaveLength(1)
+      const row = await admin.query("SELECT state, version FROM deferred_issuance_trace WHERE trace_id = $1", [id])
+      expect(row.rows[0]).toEqual({ state: "closed_order_never_created", version: 2 })
+    })
   })
 
   describe("AC-4 — idempotencja, konflikt, cross-market", () => {
