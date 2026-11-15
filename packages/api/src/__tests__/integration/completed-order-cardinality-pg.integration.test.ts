@@ -21,6 +21,10 @@
  * kolumny, których dotyka zapytanie trasy. To świadomie zawężony fixture, nie
  * odwzorowanie schematu rdzenia.
  *
+ * v1.16.0 Story 8.6: fixture żyje w OSOBNYM schemacie (`search_path`), bo na
+ * zmigrowanej bazie `*_test` tabele rdzenia istnieją w `public` z kluczami
+ * obcymi i `TRUNCATE` na nich odmawiał (zastana czerwień 7/7 z baseline).
+ *
  * ── Uruchomienie ───────────────────────────────────────────────────────────
  *   DATABASE_URL=postgres://… pnpm test:integration:completed-order-pg
  * Bez `DATABASE_URL` suita jest POMIJANA (`describe.skip`) — nie „zielona".
@@ -42,6 +46,7 @@ const ORDER_A = "order_01STORY36SELLERA"
 const ORDER_B = "order_01STORY36SELLERB"
 const ORDER_SOLO = "order_01STORY36SOLO"
 const GROUP_ID = "ordgrp_01STORY36GROUP"
+const FIXTURE_SCHEMA = "story36_completed_order_fixture"
 
 type CapturedResponse = {
   statusCode: number
@@ -88,40 +93,54 @@ runOrSkip("Story 3.6 — endpoint mostkowy niesie KOLEKCJĘ zamówień (realny P
     db = knexFactory({
       client: "pg",
       connection: DATABASE_URL as string,
+      searchPath: [FIXTURE_SCHEMA],
       pool: { min: 0, max: 2 },
     })
 
     await db.raw(`
-      CREATE TABLE IF NOT EXISTS "order" (
+      CREATE SCHEMA IF NOT EXISTS ${FIXTURE_SCHEMA};
+      CREATE TABLE IF NOT EXISTS ${FIXTURE_SCHEMA}."order" (
         id text PRIMARY KEY,
+        status text NOT NULL DEFAULT 'pending',
         created_at timestamptz NOT NULL DEFAULT now(),
         deleted_at timestamptz NULL
       );
-      CREATE TABLE IF NOT EXISTS order_cart (
+      CREATE TABLE IF NOT EXISTS ${FIXTURE_SCHEMA}.order_cart (
         order_id text NOT NULL,
         cart_id text NOT NULL,
         deleted_at timestamptz NULL
       );
-      CREATE TABLE IF NOT EXISTS order_group (
+      CREATE TABLE IF NOT EXISTS ${FIXTURE_SCHEMA}.order_group (
         id text PRIMARY KEY,
         cart_id text NULL
       );
-      CREATE TABLE IF NOT EXISTS order_group_order (
+      CREATE TABLE IF NOT EXISTS ${FIXTURE_SCHEMA}.order_group_order (
         order_id text NOT NULL,
-        order_group_id text NOT NULL
+        order_group_id text NOT NULL,
+        deleted_at timestamptz NULL
+      );
+      CREATE TABLE IF NOT EXISTS ${FIXTURE_SCHEMA}.payment_collection (
+        id text PRIMARY KEY,
+        status text NOT NULL,
+        deleted_at timestamptz NULL
+      );
+      CREATE TABLE IF NOT EXISTS ${FIXTURE_SCHEMA}.order_payment_collection (
+        order_id text NOT NULL,
+        payment_collection_id text NOT NULL,
+        deleted_at timestamptz NULL
       );
     `)
   })
 
   afterAll(async () => {
-    await db.raw(
-      `DROP TABLE IF EXISTS order_group_order, order_group, order_cart, "order"`
-    )
+    await db.raw(`DROP SCHEMA IF EXISTS ${FIXTURE_SCHEMA} CASCADE`)
     await db.destroy()
   })
 
   beforeEach(async () => {
-    await db.raw(`TRUNCATE order_group_order, order_group, order_cart, "order"`)
+    await db.raw(
+      `TRUNCATE order_payment_collection, payment_collection, order_group_order, order_group, order_cart, "order"`
+    )
 
     // Koszyk DWUSPRZEDAWCOWY: dwa zamówienia w jednej grupie, różne `created_at`
     // — bo to sortowanie po `created_at` wybierało dotąd jedno z nich.
@@ -230,6 +249,68 @@ runOrSkip("Story 3.6 — endpoint mostkowy niesie KOLEKCJĘ zamówień (realny P
 
     expect(captured.statusCode).toBe(404)
     expect(captured.body).toMatchObject({ type: "not_found" })
+  })
+
+  // ── v1.16.0 Story 8.6 (AC1, AC2) — zbiór identyfikatorów i stan per zamówienie ──
+  it("8.6 AC2: wszystkie zamówienia terminalne ⇒ zbiór oczekiwany == otrzymany, `purchase_state` complete", async () => {
+    await db("payment_collection").insert([
+      { id: "pc_a", status: "authorized" },
+      { id: "pc_b", status: "completed" },
+    ])
+    await db("order_payment_collection").insert([
+      { order_id: ORDER_A, payment_collection_id: "pc_a" },
+      { order_id: ORDER_B, payment_collection_id: "pc_b" },
+    ])
+    const body = (await callRoute(db, CART_TWO_SELLERS)).body as {
+      orders: Array<{ order_id: string; terminal: boolean }>
+      expected_order_ids: string[]
+      open_order_ids: string[]
+      purchase_state: string
+    }
+    expect(new Set(body.expected_order_ids)).toEqual(new Set([ORDER_A, ORDER_B]))
+    expect(body.orders.every((o) => o.terminal)).toBe(true)
+    expect(body.open_order_ids).toEqual([])
+    expect(body.purchase_state).toBe("complete")
+  })
+
+  it("8.6 AC2: zgodna LICZBA, różny ZBIÓR id ⇒ nie `complete`, brakujący element nazwany", async () => {
+    // Grupa zakupu oczekuje {A, C}; koszyk wyprodukował {A, B}. 2 == 2, zbiory różne.
+    const ORDER_C = "order_01STORY86SELLERC"
+    await db("order").insert([{ id: ORDER_C, created_at: new Date("2026-08-06T10:00:03Z") }])
+    await db("order_group_order").where({ order_id: ORDER_B }).delete()
+    await db("order_group_order").insert([{ order_id: ORDER_C, order_group_id: GROUP_ID }])
+
+    const body = (await callRoute(db, CART_TWO_SELLERS)).body as {
+      order_count: number
+      expected_order_ids: string[]
+      open_order_ids: string[]
+      purchase_state: string
+    }
+    expect(body.order_count).toBe(2)
+    expect(body.expected_order_ids.length).toBe(2)
+    expect(new Set(body.expected_order_ids)).toEqual(new Set([ORDER_A, ORDER_C]))
+    expect(body.open_order_ids).toEqual([ORDER_C])
+    expect(body.purchase_state).toBe("incomplete")
+  })
+
+  it("8.6 AC1: jedno zamówienie order-setu nieterminalne ⇒ `incomplete` i wskazane otwarte zamówienie", async () => {
+    await db("payment_collection").insert([
+      { id: "pc_a", status: "authorized" },
+      { id: "pc_b", status: "awaiting" },
+    ])
+    await db("order_payment_collection").insert([
+      { order_id: ORDER_A, payment_collection_id: "pc_a" },
+      { order_id: ORDER_B, payment_collection_id: "pc_b" },
+    ])
+    const body = (await callRoute(db, CART_TWO_SELLERS)).body as {
+      orders: Array<{ order_id: string; terminal: boolean }>
+      open_order_ids: string[]
+      purchase_state: string
+    }
+    expect(body.orders.find((o) => o.order_id === ORDER_A)?.terminal).toBe(true)
+    expect(body.orders.find((o) => o.order_id === ORDER_B)?.terminal).toBe(false)
+    expect(body.open_order_ids).toEqual([ORDER_B])
+    expect(body.purchase_state).toBe("incomplete")
   })
 
   it("brak identyfikatora koszyka → 400 `invalid_request`", async () => {
