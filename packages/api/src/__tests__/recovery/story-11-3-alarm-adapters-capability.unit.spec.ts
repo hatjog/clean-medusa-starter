@@ -31,6 +31,10 @@ import {
   type OverduePopulationRow,
 } from "../../lib/recovery/recovery-population-adapters"
 import { ALERT_CODE_RUN_FAILED, runRecoveryPopulationAlarm, MARKETS_ENV_VAR } from "../../jobs/recovery-population-alarm"
+import {
+  MARKETS_ENV_VAR as COMPENSATION_MARKETS_ENV_VAR,
+  runCompensationFailureRecoveryAlarm,
+} from "../../jobs/compensation-failure-recovery-alarm"
 
 function client(rows: Record<string, unknown>[], seen: Array<{ sql: string; values: unknown[] }> = []) {
   return {
@@ -66,6 +70,26 @@ describe("Story 11.3 AC-2 — test zdolności: compensation_failure", () => {
     expect(seen[0].values).toEqual([["open", "recovery_in_progress"]])
     expect(COMPENSATION_FAILURE_ADAPTER.deadlineOf(rows[0])).toBe("2026-11-14T00:00:00.000Z")
     expect(DEFAULT_RECOVERY_POPULATION_ADAPTERS.get("compensation_failure")).toBe(COMPENSATION_FAILURE_ADAPTER)
+  })
+
+  it("compensation_failure (R-3): eskalacja ERROR / >24h po terminie CRITICAL, deduplikacja tabela+kwarantanna, rejestr startu", () => {
+    const base = { failure_id: "mpcf_1", instance_id: "gp_test", market_id: "mkt_a", owner_type: "operator_role" as const, owner_id: "ops-recovery", deadline: "2026-11-14T00:00:00Z", resolution_state: "open" }
+    expect(typeof COMPENSATION_FAILURE_ADAPTER.escalationOf).toBe("function")
+    expect(typeof COMPENSATION_FAILURE_ADAPTER.dedupKeyOf).toBe("function")
+    expect(COMPENSATION_FAILURE_ADAPTER.escalationOf!({ ...base, overdue_seconds: 60 })).toBe("ERROR")
+    expect(COMPENSATION_FAILURE_ADAPTER.escalationOf!({ ...base, overdue_seconds: "90000" })).toBe("CRITICAL")
+    const agg = aggregateRecoveryAlarm(
+      COMPENSATION_FAILURE_ADAPTER,
+      [{ ...base, overdue_seconds: 60 }, { ...base, source: "backfill_quarantine", overdue_seconds: 90000 }, { ...base, failure_id: "mpcf_2", overdue_seconds: 60 }],
+      { market_id: "mkt_a", instance_id: "gp_test" }
+    )
+    expect(agg).toEqual(expect.objectContaining({ population_type: "compensation_failure", overdue_count: 2, population_ids: ["mpcf_1", "mpcf_2"], severity: "ERROR" }))
+    expect(DEFAULT_RECOVERY_ALARM_ADAPTERS.get("compensation_failure")).toBe(COMPENSATION_FAILURE_ADAPTER)
+    expect(() => validateRecoveryAlarmRegistryAtStartup(DEFAULT_RECOVERY_ALARM_ADAPTERS)).not.toThrow()
+    const { dedupKeyOf: _d, ...noDedup } = COMPENSATION_FAILURE_ADAPTER
+    expect(() =>
+      validateRecoveryAlarmRegistryAtStartup(createRecoveryPopulationAdapterRegistry([noDedup, DEFERRED_ISSUANCE_TRACE_ADAPTER, DLQ_ENTRY_ADAPTER]))
+    ).toThrow(RecoveryPopulationAdapterMissingError)
   })
 })
 
@@ -115,7 +139,7 @@ describe("Story 11.3 AC-2 — walidacja rejestru przy starcie i agregacja per pr
       validateRecoveryAlarmRegistryAtStartup(partial)
     } catch (err) {
       expect((err as RecoveryPopulationAdapterMissingError).code).toBe(RECOVERY_POPULATION_ADAPTER_MISSING)
-      expect((err as RecoveryPopulationAdapterMissingError).missing).toEqual(["dlq_entry"])
+      expect((err as RecoveryPopulationAdapterMissingError).missing).toEqual(["compensation_failure", "dlq_entry"])
     }
   })
 
@@ -208,5 +232,24 @@ describe("Story 11.3 AC-2 — kanał alarmu bez żywego env GP_ALERT_*", () => {
     })
     expect(calls).toEqual(["sentry"])
     expect(result.status).toBe("delivered")
+  })
+})
+
+describe("Story 11.3 R-3 — job 4.3 deduplikuje i eskaluje compensation_failure", () => {
+  it("compensation_failure job 4.3: duplikat failure_id ⇒ jeden alarm; >24h po terminie ⇒ CRITICAL", async () => {
+    const alerts: StructuredAlertPayload[] = []
+    const base = { failure_id: "mpcf_9", instance_id: "gp_test", market_id: "mkt_a", owner_type: "operator_role", owner_id: "ops-recovery", deadline: "2026-11-01T00:00:00Z", resolution_state: "open", overdue_seconds: 1209600 }
+    const result = await runCompensationFailureRecoveryAlarm(
+      { resolve: (k: string) => (k === "logger" ? { info: () => undefined, warn: () => undefined, error: () => undefined } : undefined) } as never,
+      {
+        env: { [COMPENSATION_MARKETS_ENV_VAR]: "mkt_a", GP_INSTANCE_ID: "gp_test" },
+        emit: (p) => alerts.push(p),
+        deliver: async () => ({ status: "delivered", delivered_via: "webhook", attempts: [{ channel: "webhook", ok: true }] }),
+        clientForMarket: () => client([base, { ...base, source: "backfill_quarantine" }]),
+      }
+    )
+    expect(result.alarms).toHaveLength(1)
+    expect(result.overdue_count).toBe(1)
+    expect(alerts.map((a) => a.severity)).toEqual(["CRITICAL"])
   })
 })

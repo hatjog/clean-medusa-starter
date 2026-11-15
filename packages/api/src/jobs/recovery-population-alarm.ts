@@ -33,7 +33,7 @@ import type { RecoveryPopulationType } from "../lib/recovery/recovery-action-con
 import {
   aggregateRecoveryAlarm,
   DEFAULT_RECOVERY_ALARM_ADAPTERS,
-  RECOVERY_ALARM_REQUIRED_POPULATIONS,
+  RECOVERY_POPULATION_ALARM_JOB_POPULATIONS,
   validateRecoveryAlarmRegistryAtStartup,
   type AggregatedRecoveryAlarm,
   type RecoveryPopulationAdapterRegistry,
@@ -101,7 +101,7 @@ export async function runRecoveryPopulationAlarm(
   deps: RecoveryPopulationAlarmDeps = {}
 ): Promise<RecoveryPopulationAlarmRunResult> {
   const registry = deps.registry ?? DEFAULT_RECOVERY_ALARM_ADAPTERS
-  validateRecoveryAlarmRegistryAtStartup(registry)
+  validateRecoveryAlarmRegistryAtStartup(registry, RECOVERY_POPULATION_ALARM_JOB_POPULATIONS)
   const emit = deps.emit ?? emitStructuredAlert
   const deliver = deps.deliver ?? deliverAlert
   const env = deps.env ?? process.env
@@ -127,7 +127,7 @@ export async function runRecoveryPopulationAlarm(
   try {
     await runInSystemMarketContext(scope, async (marketId) => {
       const instanceId = marketContextStorage.getStore()?.instance_id ?? ""
-      for (const population of RECOVERY_ALARM_REQUIRED_POPULATIONS) {
+      for (const population of RECOVERY_POPULATION_ALARM_JOB_POPULATIONS) {
         const adapter = registry.get(population)!
         try {
           if (!instanceId) throw new Error(`brak instance_id w kontekscie rynku ${marketId}`)

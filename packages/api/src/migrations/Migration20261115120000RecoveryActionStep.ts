@@ -48,7 +48,16 @@ export const RECOVERY_ACTION_STEP_OUTCOMES = [
   "refused_missing_evidence",
   "refused_proposal_missing",
   "refused_proposal_actor_mismatch",
+  // Runda fix 1 (R-1, R-2, R-4): wynik adaptera domenowego i konflikt treści klucza.
+  "refused_idempotency_payload_mismatch",
+  "refused_partial_effect_pending",
+  "refused_domain_adapter_unavailable",
+  "retry_failed",
+  "partial_effect",
 ] as const
+
+/** Wyniki zajmujące claim kroku (`step_key IS NOT NULL`); `partial_effect` = jawny stan nieterminalny. */
+export const RECOVERY_ACTION_STEP_CLAIMED_OUTCOMES = ["proposed", "applied", "partial_effect"] as const
 
 export class Migration20261115120000RecoveryActionStep extends Migration {
   async up(): Promise<void> {
@@ -84,7 +93,7 @@ export class Migration20261115120000RecoveryActionStep extends Migration {
         audit             JSONB NOT NULL,
         recorded_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
         CONSTRAINT ${TABLE}_claim_check CHECK (
-          (step_key IS NULL) = (outcome NOT IN ('proposed', 'applied'))
+          (step_key IS NULL) = (outcome NOT IN (${RECOVERY_ACTION_STEP_CLAIMED_OUTCOMES.map((o) => `'${o}'`).join(", ")}))
         )
       )
     `)

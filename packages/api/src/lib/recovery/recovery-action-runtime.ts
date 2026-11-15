@@ -41,6 +41,14 @@ import {
   type ResolutionEvidenceVerifier,
   type SessionActor,
 } from "./recovery-action-contract"
+import {
+  activeRecoveryDomainAdapters,
+  invokeRecoveryDomainAdapter,
+  PARTIAL_EFFECT_STATE,
+  PARTIAL_EFFECT_SUCCESSOR,
+  type RecoveryDomainAdapterRegistry,
+  type RecoveryDomainAdapterResult,
+} from "./recovery-domain-adapters"
 import type { OperatorAuthContext } from "../../middlewares/with-operator-auth"
 import type { AdminMarketContextResult } from "../admin-market-context"
 
@@ -324,7 +332,11 @@ export async function insertStepAudit(client: RecoveryActionClient, row: StepAud
     row.instance_id,
     row.market_id,
     row.step,
-    row.claimed ? stepKey(row.step, row.intent_key) : null,
+    row.claimed
+      ? row.step === "propose"
+        ? proposeStepKey(row.intent_key, row.target_state ?? "")
+        : stepKey(row.step, row.intent_key)
+      : null,
     row.intent_key,
     row.population_type,
     row.population_id,
@@ -348,7 +360,7 @@ export async function insertStepAudit(client: RecoveryActionClient, row: StepAud
  */
 export function createDbIdempotencyLedger(
   client: RecoveryActionClient,
-  meta: { target_state: string; actor: SessionActor }
+  meta: { target_state: string; actor: SessionActor; extraAudit?: Record<string, unknown> }
 ): IdempotencyLedger {
   return {
     executeOnce: async (scope, idempotencyKey, operation) => {
@@ -363,7 +375,7 @@ export function createDbIdempotencyLedger(
         claimed: result.outcome === "applied",
         target_state: meta.target_state,
         actor: meta.actor,
-        audit: result.audit as unknown as Record<string, unknown>,
+        audit: { ...(result.audit as unknown as Record<string, unknown>), ...(meta.extraAudit ?? {}) },
       })
       return { created: true, result }
     },
@@ -414,6 +426,11 @@ export type RecoveryStepOutcome =
   | "refused_missing_evidence"
   | "refused_proposal_missing"
   | "refused_proposal_actor_mismatch"
+  | "refused_idempotency_payload_mismatch"
+  | "refused_partial_effect_pending"
+  | "refused_domain_adapter_unavailable"
+  | "retry_failed"
+  | "partial_effect"
   | "not_found"
 
 export type RecoveryStepResult = {
@@ -424,11 +441,15 @@ export type RecoveryStepResult = {
   step_key: string
   record: { state: string; version: number } | null
   domain_effects: 0 | 1
+  /** Wynik adaptera domenowego (tylko `approve` akcji `retry`). */
+  domain_adapter?: RecoveryDomainAdapterResult
 }
 
 export type RecoveryStepDeps = {
   now: () => string
   newAuditId: () => string
+  /** Domyślnie rejestr aktywny modułu (`recovery-domain-adapters.ts`). */
+  domainAdapters?: RecoveryDomainAdapterRegistry
 }
 
 function deriveActor(session: RecoveryStepSession): SessionActor {
@@ -452,9 +473,68 @@ export function isExposedTarget(population: RecoveryPopulationType, action: Expo
 }
 
 /**
+ * R-2 (runda fix 1): klucz kroku `propose` zawiera stan docelowy —
+ * `propose:<klucz intencji>:<target_state>`. Propozycja innego celu dla tej samej
+ * intencji jest OSOBNĄ propozycją (droga wyjścia z błędnego celu), a `approve`
+ * wybiera propozycję po stanie docelowym. Ponowne użycie klucza z innym evidence
+ * = jawny konflikt `refused_idempotency_payload_mismatch` (409), nie `replayed`.
+ * Klucz `approve:<klucz intencji>` pozostaje jeden — wykona się co najwyżej jeden skutek.
+ */
+export function proposeStepKey(intentKey: string, targetState: string): string {
+  return `${stepKey("propose", intentKey)}:${targetState}`
+}
+
+function sameEvidence(a: ResolutionEvidence | null | undefined, b: ResolutionEvidence | null | undefined): boolean {
+  if (!a || !b) return !a && !b
+  return a.kind === b.kind && a.reference === b.reference
+}
+
+/**
+ * R-4: ostatni PRZYJĘTY krok `approve` wiersza. `partial_effect` = wiersz jest w jawnym
+ * stanie nieterminalnym częściowego skutku, dopóki następca z kontraktu go nie zdejmie.
+ */
+export const SELECT_LAST_CLAIMED_APPROVE_SQL = `
+  SELECT audit_id, outcome
+    FROM recovery_action_step
+   WHERE instance_id = $1 AND market_id = $2 AND population_type = $3 AND population_id = $4
+     AND step = 'approve' AND step_key IS NOT NULL
+   ORDER BY recorded_at DESC, audit_id DESC
+   LIMIT 1`
+
+export async function readPendingPartialEffect(
+  client: RecoveryActionClient,
+  record: RecoveryRecordView
+): Promise<{ audit_id: string } | null> {
+  const { rows } = await client.query<{ audit_id: string; outcome: string }>(SELECT_LAST_CLAIMED_APPROVE_SQL, [
+    record.instance_id,
+    record.market_id,
+    record.population_type,
+    record.population_id,
+  ])
+  return rows[0]?.outcome === PARTIAL_EFFECT_STATE ? { audit_id: rows[0].audit_id } : null
+}
+
+/** Blokada wiersza na oczekiwanej wersji przed adapterem (równoległy krok czeka, potem dostaje 409). */
+export function lockRowAtVersionSql(population: RecoveryPopulationType): string {
+  const t = RECOVERY_POPULATION_TABLES[population]
+  return `SELECT ${t.id} AS population_id FROM ${t.table} WHERE ${t.id} = $1 AND version = $2 FOR UPDATE`
+}
+
+/** Skutek bez zmiany kolumny stanu (częściowy skutek / zdjęcie `partial_effect` na tym samym stanie). */
+export function bumpVersionSql(population: RecoveryPopulationType): string {
+  const t = RECOVERY_POPULATION_TABLES[population]
+  return `UPDATE ${t.table} SET version = $3, retry_count = $4 WHERE ${t.id} = $1 AND version = $2 RETURNING ${t.id} AS population_id`
+}
+
+/**
  * Krok 1 (`propose`): pełna walidacja bez skutku domenowego (autoryzacja rynku,
  * wersja, para akcja→stan, przejście 4.1, evidence i jego wiązanie). Przyjęta
- * propozycja zajmuje klucz `propose:<intencja>`; powtórka oddaje poprzedni wynik.
+ * propozycja zajmuje klucz `propose:<intencja>:<cel>`; powtórka z tą samą treścią
+ * oddaje poprzedni wynik, z inną treścią — jawny konflikt.
+ *
+ * Retry nie przyjmuje evidence operatora: dowód skutku retry wytwarza adapter
+ * domenowy w kroku `approve` (R-1/R-6). Przy oczekującym `partial_effect` jedyną
+ * dopuszczalną propozycją jest następca z kontraktu (R-4).
  */
 export async function proposeRecoveryAction(
   client: RecoveryActionClient,
@@ -469,7 +549,7 @@ export async function proposeRecoveryAction(
     action: request.action,
     expected_version: request.expected_version,
   })
-  const key = stepKey("propose", intentKey)
+  const key = proposeStepKey(intentKey, request.target_state)
   const loaded = await loadRecoveryRecord(client, request.population_type, request.population_id)
   const base = { step: "propose" as const, intent_key: intentKey, step_key: key }
   if (!loaded) return { ...base, outcome: "not_found", audit_id: null, record: null, domain_effects: 0 }
@@ -487,11 +567,19 @@ export async function proposeRecoveryAction(
     : null
 
   let outcome: RecoveryStepOutcome = "proposed"
+  const pending = authorization.decision === "granted" ? await readPendingPartialEffect(client, record) : null
   if (authorization.decision !== "granted") outcome = "refused_market_forbidden"
-  else if (!isExposedTarget(request.population_type, request.action, request.target_state)) outcome = "refused_invalid_transition"
+  else if (pending) {
+    if (request.action !== "retry" || request.target_state !== PARTIAL_EFFECT_SUCCESSOR[request.population_type]) {
+      outcome = "refused_partial_effect_pending"
+    } else if (record.version !== request.expected_version) outcome = "refused_version_conflict"
+    else if (evidence) outcome = "refused_invalid_transition"
+  } else if (!isExposedTarget(request.population_type, request.action, request.target_state)) outcome = "refused_invalid_transition"
   else if (record.version !== request.expected_version) outcome = "refused_version_conflict"
   else if (!isAllowedTransition(request.population_type, record.state, request.target_state)) outcome = "refused_invalid_transition"
-  else {
+  else if (request.action === "retry") {
+    if (evidence) outcome = "refused_invalid_transition"
+  } else {
     const terminal = isTerminalState(request.population_type, request.target_state)
     if (terminal && !evidence) outcome = "refused_missing_evidence"
     else if (!terminal && evidence) outcome = "refused_invalid_transition"
@@ -505,15 +593,19 @@ export async function proposeRecoveryAction(
     const prior = await readClaimed(client, scope, key)
     if (prior) {
       const auditId = deps.newAuditId()
+      if (!sameEvidence(prior.resolution_evidence, evidence)) {
+        await insertStepAudit(client, stepRow(auditId, "refused_idempotency_payload_mismatch", false, { prior_audit_id: prior.audit_id }))
+        return { ...base, outcome: "refused_idempotency_payload_mismatch", audit_id: auditId, record: snapshotOf(record), domain_effects: 0 }
+      }
       await insertStepAudit(client, stepRow(auditId, "replayed", false))
       return { ...base, outcome: "replayed", audit_id: prior.audit_id, record: snapshotOf(record), domain_effects: 0 }
     }
   }
   const auditId = deps.newAuditId()
-  await insertStepAudit(client, stepRow(auditId, outcome, outcome === "proposed"))
+  await insertStepAudit(client, stepRow(auditId, outcome, outcome === "proposed", pending ? { partial_effect_audit_id: pending.audit_id } : {}))
   return { ...base, outcome, audit_id: auditId, record: snapshotOf(record), domain_effects: 0 }
 
-  function stepRow(auditId: string, stepOutcome: string, claimed: boolean): StepAuditInput {
+  function stepRow(auditId: string, stepOutcome: string, claimed: boolean, extra: Record<string, unknown> = {}): StepAuditInput {
     return {
       audit_id: auditId,
       step: "propose",
@@ -534,6 +626,7 @@ export async function proposeRecoveryAction(
         step: "propose",
         authorization: { market_access: authorization.market_access, decision: authorization.decision },
         before: { state: record.state, version: record.version },
+        ...extra,
       },
       recorded_at: now,
     }
@@ -548,6 +641,11 @@ function snapshotOf(record: RecoveryRecordView) {
  * Krok 2 (`approve`): wymaga przyjętej propozycji TEGO SAMEGO aktora dla tej
  * samej intencji i stanu docelowego; skutek wykonuje kernel 4.1
  * (`applyRecoveryIntent`) z trwałym store, ledgerem i weryfikatorem.
+ *
+ * Akcja `retry` (R-1): pod blokadą klucza `approve` i blokadą wiersza na oczekiwanej
+ * wersji wywoływany jest adapter domenowy populacji; przejście stanu następuje
+ * WYŁĄCZNIE po zmierzonym sukcesie (`succeeded`). `partial` ⇒ `partial_effect`,
+ * `failed`/`unavailable` ⇒ brak przejścia, nazwana przyczyna w audycie.
  */
 export async function approveRecoveryAction(
   client: RecoveryActionClient,
@@ -575,13 +673,19 @@ export async function approveRecoveryAction(
     sessionInstanceId: session.instanceId,
     record,
   })
-  const proposal = authorization.decision === "granted" ? await readClaimed(client, scope, stepKey("propose", intentKey)) : null
-  const refuseStep = async (outcome: RecoveryStepOutcome): Promise<RecoveryStepResult> => {
+  const proposal =
+    authorization.decision === "granted" ? await readClaimed(client, scope, proposeStepKey(intentKey, request.target_state)) : null
+  const writeStep = async (
+    outcome: RecoveryStepOutcome,
+    extra: Record<string, unknown> = {},
+    claimed = false,
+    after: { state: string; version: number } | null = null
+  ): Promise<string> => {
     const auditId = deps.newAuditId()
     await insertStepAudit(client, {
       audit_id: auditId,
       step: "approve",
-      claimed: false,
+      claimed,
       intent_key: intentKey,
       population_type: request.population_type,
       population_id: record.population_id,
@@ -593,14 +697,86 @@ export async function approveRecoveryAction(
       actor,
       outcome,
       resolution_evidence: null,
-      audit: { contract_version: RECOVERY_CONTRACT_VERSION, step: "approve", reason: outcome },
+      audit: {
+        contract_version: RECOVERY_CONTRACT_VERSION,
+        step: "approve",
+        reason: outcome,
+        before: snapshotOf(record),
+        ...(after ? { after } : {}),
+        ...extra,
+      },
       recorded_at: deps.now(),
     })
-    return { ...base, outcome, audit_id: auditId, record: snapshotOf(record), domain_effects: 0 }
+    return auditId
+  }
+  const refuseStep = async (outcome: RecoveryStepOutcome, extra: Record<string, unknown> = {}): Promise<RecoveryStepResult> => {
+    const auditId = await writeStep(outcome, extra)
+    const adapter = extra.domain_adapter as RecoveryDomainAdapterResult | undefined
+    return { ...base, outcome, audit_id: auditId, record: snapshotOf(record), domain_effects: 0, ...(adapter ? { domain_adapter: adapter } : {}) }
   }
   if (authorization.decision === "granted") {
     if (!proposal || proposal.target_state !== request.target_state) return refuseStep("refused_proposal_missing")
     if (proposal.actor_id !== actor.actor_id) return refuseStep("refused_proposal_actor_mismatch")
+  }
+
+  const pending = authorization.decision === "granted" ? await readPendingPartialEffect(client, record) : null
+  const successor = PARTIAL_EFFECT_SUCCESSOR[request.population_type]
+  if (pending && (request.action !== "retry" || request.target_state !== successor)) {
+    return refuseStep("refused_partial_effect_pending", { partial_effect_audit_id: pending.audit_id })
+  }
+
+  let extraAudit: Record<string, unknown> = {}
+  let adapterEvidence: ResolutionEvidence | null = null
+  let adapterResult: RecoveryDomainAdapterResult | undefined
+  if (authorization.decision === "granted" && request.action === "retry") {
+    await lockStepKey(client, scope, key)
+    const alreadyApproved = await readClaimed(client, scope, key)
+    if (!alreadyApproved) {
+      if (record.version !== request.expected_version) return refuseStep("refused_version_conflict")
+      const locked = await client.query(lockRowAtVersionSql(request.population_type), [record.population_id, request.expected_version])
+      if (locked.rows.length !== 1) return refuseStep("refused_version_conflict")
+
+      if (pending) {
+        // Następca `partial_effect` (kontrakt: jedyny dozwolony) — bez ponownego skutku domenowego.
+        extraAudit = { partial_effect_cleared: pending.audit_id }
+        if (record.state === successor) {
+          const next = { state: successor, version: record.version + 1 }
+          await client.query(bumpVersionSql(request.population_type), [record.population_id, record.version, next.version, record.retry_count])
+          const auditId = await writeStep("applied", extraAudit, true, next)
+          return { ...base, outcome: "applied", audit_id: auditId, record: next, domain_effects: 1 }
+        }
+      } else {
+        const registry = deps.domainAdapters ?? activeRecoveryDomainAdapters()
+        adapterResult = await invokeRecoveryDomainAdapter(registry.get(request.population_type), {
+          client,
+          record,
+          binding: loaded.binding,
+          actor,
+          intent_key: intentKey,
+          now: deps.now(),
+        })
+        const adapterAudit = { domain_adapter: adapterResult }
+        if (adapterResult.status === "unavailable") return refuseStep("refused_domain_adapter_unavailable", adapterAudit)
+        if (adapterResult.status === "failed") return refuseStep("retry_failed", adapterAudit)
+        if (adapterResult.status === "partial") {
+          const next = { state: PARTIAL_EFFECT_STATE, version: record.version + 1 }
+          await client.query(bumpVersionSql(request.population_type), [
+            record.population_id,
+            record.version,
+            next.version,
+            record.retry_count + 1,
+          ])
+          const auditId = await writeStep("partial_effect", adapterAudit, true, next)
+          return { ...base, outcome: "partial_effect", audit_id: auditId, record: next, domain_effects: 1, domain_adapter: adapterResult }
+        }
+        extraAudit = adapterAudit
+        if (isTerminalState(request.population_type, request.target_state)) {
+          const kind = (EVIDENCE_KINDS_BY_TARGET[request.target_state] ?? [])[0]
+          if (!kind) return refuseStep("refused_missing_evidence", adapterAudit)
+          adapterEvidence = { kind, reference: adapterResult.reference, recorded_at: deps.now(), recorded_by: actor }
+        }
+      }
+    }
   }
 
   const recoverySession = establishRecoveryServerSession({
@@ -608,8 +784,9 @@ export async function approveRecoveryAction(
     marketContext: session.marketContext,
     sessionInstanceId: session.instanceId,
   })
-  const ledger = createDbIdempotencyLedger(client, { target_state: request.target_state, actor })
+  const ledger = createDbIdempotencyLedger(client, { target_state: request.target_state, actor, extraAudit })
   const now = deps.now()
+  const retryReference = adapterEvidence?.reference
   const result: ApplyRecoveryIntentResult = await applyRecoveryIntent({
     intent: {
       action: request.action,
@@ -618,13 +795,25 @@ export async function approveRecoveryAction(
       target_state: request.target_state,
       expected_version: request.expected_version,
       idempotency_key: intentKey,
-      resolution_evidence: proposal?.resolution_evidence
-        ? { ...proposal.resolution_evidence, recorded_by: actor }
-        : null,
+      resolution_evidence:
+        request.action === "retry"
+          ? adapterEvidence
+          : proposal?.resolution_evidence
+            ? { ...proposal.resolution_evidence, recorded_by: actor }
+            : null,
     },
     recoverySession,
     recordStore: createDbRecoveryRecordStore(client, loaded, actor),
-    evidenceVerifier: createBindingEvidenceVerifier(loaded),
+    // R-6: dowód retry jest związany z identyfikatorem WYNIKU adaptera, nie z faktem wiersza.
+    evidenceVerifier:
+      request.action === "retry"
+        ? {
+            verifies: ({ evidence, target_state }) =>
+              typeof retryReference === "string" &&
+              evidence.reference === retryReference &&
+              (EVIDENCE_KINDS_BY_TARGET[target_state] ?? []).includes(evidence.kind),
+          }
+        : createBindingEvidenceVerifier(loaded),
     ledger,
     now,
     auditId: deps.newAuditId(),
@@ -646,6 +835,7 @@ export async function approveRecoveryAction(
     audit_id: result.audit.audit_id,
     record: snapshotOf(result.record),
     domain_effects: result.domain_effects,
+    ...(adapterResult ? { domain_adapter: adapterResult } : {}),
   }
 }
 
@@ -657,15 +847,23 @@ export function httpStatusForStepOutcome(outcome: RecoveryStepOutcome): number {
     case "applied":
     case "replayed":
       return 200
+    case "partial_effect":
+      return 200
     case "refused_market_forbidden":
     case "refused_proposal_actor_mismatch":
       return 403
     case "refused_version_conflict":
     case "refused_proposal_missing":
+    case "refused_idempotency_payload_mismatch":
       return 409
     case "refused_invalid_transition":
     case "refused_missing_evidence":
+    case "refused_partial_effect_pending":
       return 422
+    case "retry_failed":
+      return 502
+    case "refused_domain_adapter_unavailable":
+      return 503
     case "not_found":
       return 404
     default: {

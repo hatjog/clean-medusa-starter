@@ -37,9 +37,10 @@ import { marketContextStorage } from "../lib/market-context"
 import { queryUnderMarketContext } from "../lib/payment/stripe-payment-intent-transport"
 import type { TraceQueryClient } from "../lib/recovery/deferred-issuance-trace"
 import {
-  assertRecoveryPopulationAdapters,
   COMPENSATION_ALARM_REQUIRED_POPULATIONS,
+  DEFAULT_RECOVERY_ALARM_ADAPTERS,
   DEFAULT_RECOVERY_POPULATION_ADAPTERS,
+  validateRecoveryAlarmRegistryAtStartup,
   type RecoveryAlarm,
   type RecoveryPopulationAdapterRegistry,
 } from "../lib/recovery/recovery-population-adapters"
@@ -49,6 +50,9 @@ import {
   type SystemExecutionOrigin,
   type SystemMarketScope,
 } from "../lib/system-market-context"
+
+// Story 11.3 R-3: walidacja rejestru przy STARCIE (ładowanie modułu) obejmuje trzy populacje.
+validateRecoveryAlarmRegistryAtStartup(DEFAULT_RECOVERY_ALARM_ADAPTERS)
 
 export const SCHEDULE_NAME = "compensation-failure-recovery-alarm" as const
 /** Co 15 minut — opóźnienie alarmu ≪ SLA 24 h (D-35 p.9). */
@@ -150,7 +154,8 @@ export async function runCompensationFailureRecoveryAlarm(
 ): Promise<CompensationAlarmRunResult> {
   const registry = deps.registry ?? DEFAULT_RECOVERY_POPULATION_ADAPTERS
   // AC1: brak adaptera zatrzymuje start — PRZED jakimkolwiek odczytem.
-  assertRecoveryPopulationAdapters(registry, COMPENSATION_ALARM_REQUIRED_POPULATIONS)
+  // Story 11.3 R-3: adapter bez eskalacji/deduplikacji też zatrzymuje start.
+  validateRecoveryAlarmRegistryAtStartup(registry, COMPENSATION_ALARM_REQUIRED_POPULATIONS)
   const adapter = registry.get("compensation_failure")!
 
   const logger = resolveLogger(container)
@@ -203,11 +208,19 @@ export async function runCompensationFailureRecoveryAlarm(
       try {
         const instanceId = marketContextStorage.getStore()?.instance_id
         if (!instanceId) throw new Error(`brak instance_id w kontekscie rynku ${marketId}`)
-        const rows = await adapter.loader(clientForMarket(container, { market_id: marketId, instance_id: instanceId }))
+        const loaded = await adapter.loader(clientForMarket(container, { market_id: marketId, instance_id: instanceId }))
+        // Story 11.3 R-3: deduplikacja per przebieg (jeden alarm na klucz) i eskalacja wiersza.
+        const seen = new Set<string>()
+        const rows = loaded.filter((row) => {
+          const key = adapter.dedupKeyOf!(row)
+          if (seen.has(key)) return false
+          seen.add(key)
+          return true
+        })
         for (const row of rows) {
           const alarm = adapter.toAlarm(row)
           const payload: StructuredAlertPayload = {
-            severity: "ERROR",
+            severity: adapter.escalationOf!(row),
             code: adapter.alarmCode,
             message:
               `Kompensacja ${alarm.failure_id} po terminie ${alarm.deadline} ` +

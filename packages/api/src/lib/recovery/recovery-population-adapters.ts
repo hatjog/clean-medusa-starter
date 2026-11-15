@@ -121,7 +121,8 @@ export const QUARANTINE_ALARMABLE_BACKFILL_STATE = "quarantined_pending_review" 
  */
 export const LIST_OVERDUE_COMPENSATION_FAILURES_SQL = `
   SELECT source, failure_id, instance_id, market_id, owner_type, owner_id,
-         deadline, resolution_state
+         deadline, resolution_state,
+         EXTRACT(EPOCH FROM (statement_timestamp() - deadline))::bigint AS overdue_seconds
     FROM (
       SELECT '${COMPENSATION_FAILURE_SOURCE_TABLE}'::text AS source,
              failure_id, instance_id, market_id, owner_type, owner_id,
@@ -153,6 +154,8 @@ export type OverdueCompensationFailureRow = {
   owner_id: string
   deadline: string | Date
   resolution_state: string
+  /** Story 11.3 R-3: wiek po terminie liczony w bazie (brak = baseline ERROR). */
+  overdue_seconds?: number | string | null
 }
 
 function toIso(value: string | Date): string {
@@ -169,6 +172,17 @@ export const COMPENSATION_FAILURE_ADAPTER: RecoveryPopulationAdapter<OverdueComp
     return result.rows
   },
   deadlineOf: (row) => toIso(row.deadline),
+  // Story 11.3 R-3: eskalacja — porażka kompensacji jest pieniężna (baseline ERROR),
+  // po terminie dłużej niż SLA 24 h ⇒ CRITICAL.
+  escalationOf: (row) => {
+    const overdue = Number(row.overdue_seconds)
+    return row.overdue_seconds !== undefined && row.overdue_seconds !== null && Number.isFinite(overdue) &&
+      overdue >= RECOVERY_ALARM_CRITICAL_OVERDUE_SECONDS
+      ? "CRITICAL"
+      : "ERROR"
+  },
+  // Klucz bez `source`: ten sam failure_id z tabeli i z kwarantanny = jeden alarm.
+  dedupKeyOf: (row) => `compensation_failure:${row.instance_id}:${row.market_id}:${row.failure_id}`,
   toAlarm: (row) => ({
     population_type: "compensation_failure",
     source: row.source ?? COMPENSATION_FAILURE_SOURCE_TABLE,
@@ -285,10 +299,20 @@ export const DLQ_ENTRY_ADAPTER = overdueAdapter(
   "dlq_pending_ops_review"
 )
 
-/** Populacje alarmu runtime 11.3 (compensation_failure ma własny scheduler 4.3). */
-export const RECOVERY_ALARM_REQUIRED_POPULATIONS: readonly RecoveryPopulationType[] = ["deferred_issuance_trace", "dlq_entry"]
+/**
+ * Story 11.3 R-3: eskalacja i deduplikacja są obowiązkowe dla WSZYSTKICH trzech
+ * populacji; walidacja rejestru przy starcie obejmuje trzy.
+ */
+export const RECOVERY_ALARM_REQUIRED_POPULATIONS: readonly RecoveryPopulationType[] = [
+  "compensation_failure",
+  "deferred_issuance_trace",
+  "dlq_entry",
+]
+/** Populacje alarmowane przez job 11.3 (compensation_failure alarmuje scheduler 4.3). */
+export const RECOVERY_POPULATION_ALARM_JOB_POPULATIONS: readonly RecoveryPopulationType[] = ["deferred_issuance_trace", "dlq_entry"]
 
 export const DEFAULT_RECOVERY_ALARM_ADAPTERS = createRecoveryPopulationAdapterRegistry([
+  COMPENSATION_FAILURE_ADAPTER,
   DEFERRED_ISSUANCE_TRACE_ADAPTER,
   DLQ_ENTRY_ADAPTER,
 ])
