@@ -6,8 +6,13 @@ import { runInSystemMarketContext } from "../lib/system-market-context";
 import {
   formatRetentionCarrierLog,
   runRecipientRetentionForMarket,
-  type RecipientRetentionResult,
 } from "../modules/voucher-pii/recipient-retention-runtime";
+import { resolveRetentionMarkets } from "../modules/voucher-pii/recipient-retention-markets";
+import {
+  emptyRetentionJobRun,
+  retentionErrorCode,
+  type RetentionJobRun,
+} from "./voucher-pii-retention-sweep";
 
 /**
  * voucher-pii-orphan-cleanup — STORY-2-2 D-70 orphan PII detection.
@@ -61,40 +66,38 @@ function resolveLogger(container: MedusaContainer | undefined): JobLogger {
  * `voucher_pii.purgeExpiredPii` (klucz nierejestrowany w runtime — martwe
  * wiring) z pustym „sentinel” rynkiem, czyli BEZ kontekstu rynku: pod hookiem
  * RLS taka praca jest odmową. Teraz: te same rynki co sweep dzienny
- * (`VOUCHER_PII_RETENTION_MARKETS`), `runInSystemMarketContext`, rola
+ * (projekcja gp-config instancji, fix R-1; env = zawężenie), `runInSystemMarketContext`, rola
  * `medusa_store`; cutoff = epoch, więc składowe terminowe są no-opem, a liczy
  * się wyłącznie `voucher_recipient_pii.orphans`.
  */
 export default async function voucherPiiOrphanCleanup(
   container: MedusaContainer
-): Promise<RecipientRetentionResult[]> {
+): Promise<RetentionJobRun> {
   const logger = resolveLogger(container);
+  const run = emptyRetentionJobRun();
   let db: Knex | null = null;
   try {
     db = (container?.resolve?.(ContainerRegistrationKeys.PG_CONNECTION) as Knex | undefined) ?? null;
   } catch (err) {
     logger.error("GP_RECIPIENT_RETENTION_NO_PG_CONNECTION: orphan cleanup NOT executed", err);
-    return [];
+    return run;
   }
   if (!db) {
     logger.error("GP_RECIPIENT_RETENTION_NO_PG_CONNECTION: orphan cleanup NOT executed");
-    return [];
+    return run;
   }
-  const markets = (process.env.VOUCHER_PII_RETENTION_MARKETS ?? "")
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean);
-  if (markets.length === 0) {
-    logger.warn(
-      "GP_RECIPIENT_RETENTION_NO_MARKETS: VOUCHER_PII_RETENTION_MARKETS empty — orphan cleanup skipped"
-    );
-    return [];
+  const resolution = await resolveRetentionMarkets({ logger });
+  run.markets = resolution.markets;
+  run.markets_source = resolution.source;
+  run.alarms.narrowing_rejected = resolution.narrowing_rejected.length;
+  if (resolution.no_markets) {
+    run.alarms.no_markets = 1;
+    return run;
   }
-  const results: RecipientRetentionResult[] = [];
   const pg = db;
   await runInSystemMarketContext(
     {
-      markets,
+      markets: resolution.markets,
       instanceId: process.env.GP_INSTANCE_ID,
       origin: { surface: "job", name: SCHEDULE_NAME },
       logger,
@@ -106,15 +109,17 @@ export default async function voucherPiiOrphanCleanup(
           cutoff: new Date(0),
           batch_size: 10_000,
         });
-        results.push(result);
+        run.results.push(result);
         logger.info(formatRetentionCarrierLog(result));
       } catch (err) {
-        const code = (err as { error_code?: string })?.error_code ?? (err as Error)?.name;
+        const code = retentionErrorCode(err);
+        run.markets_failed += 1;
+        run.failures.push({ market_id, error_code: code });
         logger.error(`market=${market_id} orphan cleanup error error_code=${code}`, err);
       }
     }
   );
-  return results;
+  return run;
 }
 
 export const config = {

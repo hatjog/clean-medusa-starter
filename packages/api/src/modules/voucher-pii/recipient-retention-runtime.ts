@@ -29,6 +29,9 @@
  *     `gift_recipient_email|name|message` po terminie; wiersz zostaje (zamówienie
  *     jest zapisem rozliczeniowym). Rynek z `entitlement_instance.market_id`
  *     (tabela pod RLS) — core Medusy nie ma kolumny rynku;
+ *   - `cart_line_item.metadata` (fix R-2) — REDAKCJA tych samych kluczy na
+ *     pozycjach koszyka (także porzuconego) po terminie `updated_at`; rynek
+ *     z `sales_channel.metadata.gp_market_id` koszyka;
  *   - `notification.data` (DW-15-049) — REDAKCJA kluczy `customer_first_name`
  *     i `salon_address` po terminie, rynek z `data.market_id`.
  * Retriable handoff link: jedynym silnikiem retry jest
@@ -66,6 +69,7 @@ export const RETENTION_CARRIERS = {
   recipientPiiPurged: "voucher_recipient_pii.purged",
   recipientPiiOrphans: "voucher_recipient_pii.orphans",
   lineItemMetadata: "order_line_item.metadata.gift_recipient",
+  cartLineItemMetadata: "cart_line_item.metadata.gift_recipient",
   notificationData: "notification.data.customer_first_name_salon_address",
 } as const
 
@@ -73,13 +77,52 @@ export type RecipientRetentionCarrierCounts = {
   [RETENTION_CARRIERS.recipientPiiPurged]: number
   [RETENTION_CARRIERS.recipientPiiOrphans]: number
   [RETENTION_CARRIERS.lineItemMetadata]: number
+  [RETENTION_CARRIERS.cartLineItemMetadata]: number
   [RETENTION_CARRIERS.notificationData]: number
+}
+
+/**
+ * Fix R-3: sonda sesji zmierzona WEWNĄTRZ transakcji joba, po przypięciu roli
+ * i rynku — dowód, że praca biegła jako `medusa_store` z aktywnym RLS, a nie
+ * jako właściciel połączenia (superuser omija RLS).
+ */
+export type RecipientRetentionSessionProbe = {
+  current_user: string
+  row_security_active: boolean
+  market_setting: string | null
 }
 
 export type RecipientRetentionResult = {
   market_id: string
   cutoff: string
   carriers: RecipientRetentionCarrierCounts
+  session: RecipientRetentionSessionProbe
+}
+
+/** Tabela, na której sonda mierzy `row_security_active` (ENABLE + FORCE z 6.5). */
+export const RETENTION_PROBE_RLS_TABLE = "voucher_recipient_pii" as const
+
+export class RecipientRetentionRuntimeError extends Error {
+  constructor(
+    readonly error_code:
+      | "GP_RECIPIENT_RETENTION_PERMISSION_DENIED"
+      | "GP_RECIPIENT_RETENTION_RUNTIME_ROLE_MISMATCH",
+    message: string
+  ) {
+    super(message)
+    this.name = "RecipientRetentionRuntimeError"
+  }
+}
+
+export async function probeRetentionSession(
+  trx: Knex.Transaction
+): Promise<RecipientRetentionSessionProbe> {
+  const r = (await trx.raw(
+    `SELECT current_user::text AS current_user,
+            row_security_active('${RETENTION_PROBE_RLS_TABLE}') AS row_security_active,
+            NULLIF(current_setting('${GP_MARKET_SESSION_VAR}', true), '') AS market_setting`
+  )) as { rows: RecipientRetentionSessionProbe[] }
+  return r.rows[0]
 }
 
 function rowCount(result: unknown): number {
@@ -143,6 +186,37 @@ export async function redactNotificationDataPii(
 }
 
 /**
+ * Fix R-2: redakcja kluczy obdarowanej w `cart_line_item.metadata` (koszyk,
+ * także porzucony — storefront `updateGiftRecipientCartItems`). Rynek koszyka:
+ * `cart.sales_channel_id` → `sales_channel.metadata.gp_market_id` (ten sam
+ * nośnik co `loaders/market-context-cache.ts`). Termin liczony od `updated_at`
+ * (dane obdarowanej dopisuje aktualizacja pozycji, nie jej utworzenie).
+ */
+export async function redactCartLineItemGiftRecipientPii(
+  trx: Knex.Transaction,
+  args: { market_id: string; cutoff: Date; batch_size: number }
+): Promise<number> {
+  const keys = LINE_ITEM_GIFT_RECIPIENT_PII_KEYS
+  const result = await trx.raw(
+    `UPDATE cart_line_item AS cli
+        SET metadata = ${removeKeysSql("cli.metadata", keys)}
+                       || jsonb_build_object('${RECIPIENT_PII_REDACTED_MARKER}', to_jsonb(now()))
+      WHERE cli.id IN (
+        SELECT cli2.id
+          FROM cart_line_item AS cli2
+          JOIN cart AS c ON c.id = cli2.cart_id
+          JOIN sales_channel AS sc ON sc.id = c.sales_channel_id
+         WHERE (sc.metadata ->> 'gp_market_id') = ?
+           AND cli2.updated_at < ?
+           AND ${anyKeyPresentSql("cli2.metadata", keys)}
+         LIMIT ?
+      )`,
+    [args.market_id, args.cutoff, args.batch_size]
+  )
+  return rowCount(result)
+}
+
+/**
  * Jeden przebieg retencji dla JEDNEGO rynku. Wymaga kontekstu ALS z tym samym
  * rynkiem (wołane z `runInSystemMarketContext`); brak albo rozjazd = nazwana
  * odmowa `RecipientPiiMarketAccessDeniedError`, nic nie jest usuwane.
@@ -155,31 +229,59 @@ export async function runRecipientRetentionForMarket(
   if (!ctxMarket) throw new RecipientPiiMarketAccessDeniedError("missing_market_context")
   if (ctxMarket !== args.market_id) throw new RecipientPiiMarketAccessDeniedError("market_mismatch")
 
-  return db.transaction(async (trx) => {
-    await trx.raw(`SET LOCAL ROLE ${RECIPIENT_RETENTION_RUNTIME_ROLE}`)
-    await trx.raw(`SELECT set_config('${GP_MARKET_SESSION_VAR}', ?, true)`, [args.market_id])
+  try {
+    return await db.transaction(async (trx) => {
+      await trx.raw(`SET LOCAL ROLE ${RECIPIENT_RETENTION_RUNTIME_ROLE}`)
+      await trx.raw(`SELECT set_config('${GP_MARKET_SESSION_VAR}', ?, true)`, [args.market_id])
 
-    const pii = new PgVoucherPiiAdapter(trx)
-    const purged = await pii.purgeByMarketBefore(args)
-    const orphans = await pii.cleanupOrphans({ batch_size: args.batch_size })
-    const lineItems = await redactLineItemGiftRecipientPii(trx, args)
-    const notifications = await redactNotificationDataPii(trx, args)
+      const session = await probeRetentionSession(trx)
+      if (
+        session.current_user !== RECIPIENT_RETENTION_RUNTIME_ROLE ||
+        session.row_security_active !== true ||
+        session.market_setting !== args.market_id
+      ) {
+        throw new RecipientRetentionRuntimeError(
+          "GP_RECIPIENT_RETENTION_RUNTIME_ROLE_MISMATCH",
+          `retention session is not ${RECIPIENT_RETENTION_RUNTIME_ROLE} with active RLS ` +
+            `(current_user=${session.current_user} row_security_active=${session.row_security_active})`
+        )
+      }
 
-    return {
-      market_id: args.market_id,
-      cutoff: args.cutoff.toISOString(),
-      carriers: {
-        [RETENTION_CARRIERS.recipientPiiPurged]: purged.rows_deleted,
-        [RETENTION_CARRIERS.recipientPiiOrphans]: orphans.rows_deleted,
-        [RETENTION_CARRIERS.lineItemMetadata]: lineItems,
-        [RETENTION_CARRIERS.notificationData]: notifications,
-      },
+      const pii = new PgVoucherPiiAdapter(trx)
+      const purged = await pii.purgeByMarketBefore(args)
+      const orphans = await pii.cleanupOrphans({ batch_size: args.batch_size })
+      const lineItems = await redactLineItemGiftRecipientPii(trx, args)
+      const cartLineItems = await redactCartLineItemGiftRecipientPii(trx, args)
+      const notifications = await redactNotificationDataPii(trx, args)
+
+      return {
+        market_id: args.market_id,
+        cutoff: args.cutoff.toISOString(),
+        carriers: {
+          [RETENTION_CARRIERS.recipientPiiPurged]: purged.rows_deleted,
+          [RETENTION_CARRIERS.recipientPiiOrphans]: orphans.rows_deleted,
+          [RETENTION_CARRIERS.lineItemMetadata]: lineItems,
+          [RETENTION_CARRIERS.cartLineItemMetadata]: cartLineItems,
+          [RETENTION_CARRIERS.notificationData]: notifications,
+        },
+        session,
+      }
+    })
+  } catch (err) {
+    // Fix R-3: `permission denied` (SQLSTATE 42501) nie jest połykany ani
+    // gubiony jako anonimowy `error` — wraca jako nazwany błąd joba.
+    if ((err as { code?: string })?.code === "42501") {
+      throw new RecipientRetentionRuntimeError(
+        "GP_RECIPIENT_RETENTION_PERMISSION_DENIED",
+        `retention under ${RECIPIENT_RETENTION_RUNTIME_ROLE} denied: ${(err as Error).message}`
+      )
     }
-  })
+    throw err
+  }
 }
 
-/** Linia logu bez PII: wyłącznie rynek i liczniki per nośnik. */
+/** Linia logu bez PII: wyłącznie rynek, rola sesji i liczniki per nośnik. */
 export function formatRetentionCarrierLog(result: RecipientRetentionResult): string {
   const parts = Object.entries(result.carriers).map(([k, v]) => `${k}=${v}`)
-  return `market=${result.market_id} cutoff=${result.cutoff} ${parts.join(" ")}`
+  return `market=${result.market_id} cutoff=${result.cutoff} role=${result.session?.current_user ?? "unknown"} ${parts.join(" ")}`
 }

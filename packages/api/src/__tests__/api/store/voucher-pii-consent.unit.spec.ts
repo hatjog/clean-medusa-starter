@@ -14,7 +14,7 @@
 import { describe, it, expect, jest, beforeEach, afterEach } from "@jest/globals"
 
 const vi = jest
-import { POST } from "../../../api/store/voucher-pii-consent/route"
+import { POST, RECIPIENT_PII_DENIAL_LOG } from "../../../api/store/voucher-pii-consent/route"
 import * as marketContextModule from "../../../lib/market-context"
 import { RecipientPiiMarketAccessDeniedError } from "../../../modules/voucher-pii/recipient-pii-market-guard"
 
@@ -723,4 +723,56 @@ describe("POST /store/voucher-pii-consent — recipient PII market denial (Story
       expect(service.recordConsentTransaction).toHaveBeenCalledTimes(1)
     }
   )
+})
+
+describe("POST /store/voucher-pii-consent — log odmowy rynku PII (Story 11.6 fix R-5, DW-15-362 p.2)", () => {
+  const PII_EMAIL = "gift-recipient@example.invalid"
+  const body = {
+    market_id: "testmarketb",
+    order_id: "ord_abc",
+    entitlement_id: "ent_xyz",
+    locale: "pl",
+    is_gift: true,
+    recipient_email: PII_EMAIL,
+  }
+
+  it("odmowa market_mismatch ⇒ logger.warn z error_code i rynkiem kontekstu, bez PII i bez body", async () => {
+    marketContextSpy.mockReturnValue({ market_id: "bonbeauty", sales_channel_id: "sc_b" } as never)
+    const warn = vi.fn()
+    const req = makeReq(body, makeService())
+    const scope = (req as unknown as { scope: { resolve: ReturnType<typeof vi.fn> } }).scope
+    scope.resolve.mockImplementation((key: string) => (key === "logger" ? { warn } : undefined))
+    const res = makeRes()
+    ;(res as unknown as { req: unknown }).req = req
+    await POST(req, res)
+    expect(res._calls.status).toBe(403)
+    expect(warn).toHaveBeenCalledTimes(1)
+    expect(warn.mock.calls[0][0]).toBe(RECIPIENT_PII_DENIAL_LOG)
+    expect(warn.mock.calls[0][1]).toEqual({
+      error_code: "GP_RECIPIENT_PII_MARKET_ACCESS_DENIED",
+      reason: "market_mismatch",
+      context_market_id: "bonbeauty",
+    })
+    expect(JSON.stringify(warn.mock.calls)).not.toContain(PII_EMAIL)
+  })
+
+  it("odmowa z adaptera bez loggera w scope ⇒ console.warn z error_code (ślad nie ginie), bez PII", async () => {
+    const consoleWarn = vi.spyOn(console, "warn").mockImplementation(() => undefined)
+    try {
+      const service = makeService({
+        recordConsentTransaction: vi.fn(async () => {
+          throw new RecipientPiiMarketAccessDeniedError("missing_market_context")
+        }),
+      })
+      const res = makeRes()
+      await POST(makeReq(body, service), res)
+      expect(res._calls.status).toBe(403)
+      const calls = consoleWarn.mock.calls.filter((c) => c[0] === RECIPIENT_PII_DENIAL_LOG)
+      expect(calls).toHaveLength(1)
+      expect(calls[0][1]).toMatchObject({ error_code: "GP_RECIPIENT_PII_MARKET_ACCESS_DENIED", reason: "missing_market_context" })
+      expect(JSON.stringify(consoleWarn.mock.calls)).not.toContain(PII_EMAIL)
+    } finally {
+      consoleWarn.mockRestore()
+    }
+  })
 })

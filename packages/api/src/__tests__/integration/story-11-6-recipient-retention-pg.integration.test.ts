@@ -21,6 +21,8 @@
 import { afterAll, beforeAll, describe, expect, it } from "@jest/globals"
 import { ContainerRegistrationKeys } from "@medusajs/framework/utils"
 import knexFactory, { type Knex } from "knex"
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import os from "node:os"
 import path from "node:path"
 
 import voucherPiiOrphanCleanup from "../../jobs/voucher-pii-orphan-cleanup"
@@ -31,7 +33,11 @@ import {
   VOUCHER_PII_COMPANION_TABLES,
 } from "../../migrations/Migration20261115160000VoucherPiiCompanionTablesRls"
 import { evaluateGiftHandoff } from "../../modules/voucher-delivery/gift-handoff"
-import { RETENTION_CARRIERS } from "../../modules/voucher-pii/recipient-retention-runtime"
+import {
+  RETENTION_CARRIERS,
+  runRecipientRetentionForMarket,
+} from "../../modules/voucher-pii/recipient-retention-runtime"
+import { RETENTION_NO_MARKETS_ERROR_CODE } from "../../modules/voucher-pii/recipient-retention-markets"
 
 const DATABASE_URL = process.env.DATABASE_URL ?? ""
 const isTestDb = /\/[A-Za-z0-9_]*_test(\?|$)/.test(DATABASE_URL)
@@ -52,15 +58,44 @@ function collectSql(direction: "up" | "down"): string[] {
   return sqls
 }
 
-type Seeded = { pii: Record<string, string>; lineItems: Record<string, string>; notifications: Record<string, string> }
+type Seeded = {
+  pii: Record<string, string>
+  lineItems: Record<string, string>
+  cartLineItems: Record<string, string>
+  notifications: Record<string, string>
+}
+
+/**
+ * Fix R-1: źródło rynków = realna ścieżka konfiguracji instancji
+ * (`<GP_CONFIG_ROOT>/<GP_INSTANCE_ID>/markets/<m>/market.yaml`), bez env
+ * `VOUCHER_PII_RETENTION_MARKETS`. Każdy wariant to osobny katalog-projekcja.
+ */
+function makeConfigRoot(base: string, name: string, markets: string[]): string {
+  const root = path.join(base, name)
+  const marketsDir = path.join(root, "gp_test", "markets")
+  mkdirSync(marketsDir, { recursive: true })
+  for (const m of markets) {
+    mkdirSync(path.join(marketsDir, m), { recursive: true })
+    writeFileSync(path.join(marketsDir, m, "market.yaml"), `market_id: ${m}\n`)
+  }
+  return root
+}
 
 maybe("Story 11.6 — retencja danych obdarowanego (realny PG, rynki A/B, rola medusa_store)", () => {
   let db: Knex
   const logs: string[] = []
-  const seeded: Seeded = { pii: {}, lineItems: {}, notifications: {} }
+  const seeded: Seeded = { pii: {}, lineItems: {}, cartLineItems: {}, notifications: {} }
   const savedEnv = {
     markets: process.env.VOUCHER_PII_RETENTION_MARKETS,
     instance: process.env.GP_INSTANCE_ID,
+    configRoot: process.env.GP_CONFIG_ROOT,
+    days: process.env.VOUCHER_PII_RETENTION_DAYS,
+  }
+  const tmpBase = mkdtempSync(path.join(os.tmpdir(), "s116-gp-config-"))
+  const configRoots = {
+    onlyA: makeConfigRoot(tmpBase, "only-a", [MARKET_A]),
+    onlyB: makeConfigRoot(tmpBase, "only-b", [MARKET_B]),
+    empty: makeConfigRoot(tmpBase, "empty", []),
   }
 
   const container = {
@@ -152,6 +187,38 @@ maybe("Story 11.6 — retencja danych obdarowanego (realny PG, rynki A/B, rola m
       })
       seeded.notifications[`${tag}_${age}`] = nId
     }
+
+    // Fix R-2: koszyk (także porzucony) z danymi obdarowanej; rynek koszyka
+    // przez sales_channel.metadata.gp_market_id.
+    const scId = `${RUN}_${tag}_sc`
+    await db("sales_channel").insert({ id: scId, name: `s116 ${tag}`, metadata: JSON.stringify({ gp_market_id: market }) })
+    const cartId = `${RUN}_${tag}_cart`
+    await db("cart").insert({ id: cartId, currency_code: "pln", sales_channel_id: scId })
+    for (const age of ["old", "recent"] as const) {
+      const cliId = `${RUN}_${tag}_cli_${age}`
+      await db("cart_line_item").insert({
+        id: cliId,
+        cart_id: cartId,
+        title: "s116",
+        quantity: 1,
+        unit_price: 1,
+        raw_unit_price: JSON.stringify({ value: "1" }),
+        created_at: age === "old" ? OLD : RECENT,
+        updated_at: age === "old" ? OLD : RECENT,
+        metadata: JSON.stringify({
+          purchase_mode: "gift",
+          gift_recipient_email: `${tag}-${age}-cart@example.invalid`,
+          gift_recipient_name: `Name ${tag}`,
+          gift_recipient_message: `Msg ${tag}`,
+        }),
+      })
+      seeded.cartLineItems[`${tag}_${age}`] = cliId
+    }
+  }
+
+  async function cartMeta(): Promise<Record<string, Record<string, unknown>>> {
+    const rows = await db("cart_line_item").where("id", "like", `${RUN}%`).select("id", "metadata")
+    return Object.fromEntries(rows.map((x: { id: string; metadata: Record<string, unknown> }) => [x.id, x.metadata]))
   }
 
   beforeAll(async () => {
@@ -160,6 +227,8 @@ maybe("Story 11.6 — retencja danych obdarowanego (realny PG, rynki A/B, rola m
     await seedMarket(MARKET_A, "a")
     await seedMarket(MARKET_B, "b")
     process.env.GP_INSTANCE_ID = "gp_test"
+    delete process.env.VOUCHER_PII_RETENTION_MARKETS
+    delete process.env.VOUCHER_PII_RETENTION_DAYS
   })
 
   afterAll(async () => {
@@ -167,6 +236,11 @@ maybe("Story 11.6 — retencja danych obdarowanego (realny PG, rynki A/B, rola m
     else process.env.VOUCHER_PII_RETENTION_MARKETS = savedEnv.markets
     if (savedEnv.instance === undefined) delete process.env.GP_INSTANCE_ID
     else process.env.GP_INSTANCE_ID = savedEnv.instance
+    if (savedEnv.configRoot === undefined) delete process.env.GP_CONFIG_ROOT
+    else process.env.GP_CONFIG_ROOT = savedEnv.configRoot
+    if (savedEnv.days === undefined) delete process.env.VOUCHER_PII_RETENTION_DAYS
+    else process.env.VOUCHER_PII_RETENTION_DAYS = savedEnv.days
+    rmSync(tmpBase, { recursive: true, force: true })
     await db.transaction(async (trx) => {
       // Tabele append-only mają triggery niezmienności — sprzątanie WŁASNYCH
       // wierszy suity wyłącznie w tej transakcji (replica = triggery wyłączone).
@@ -178,6 +252,9 @@ maybe("Story 11.6 — retencja danych obdarowanego (realny PG, rynki A/B, rola m
     await db("entitlement_instance").where("id", "like", `${RUN}%`).delete()
     await db("order_line_item").where("id", "like", `${RUN}%`).delete()
     await db("notification").where("id", "like", `${RUN}%`).delete()
+    await db("cart_line_item").where("id", "like", `${RUN}%`).delete()
+    await db("cart").where("id", "like", `${RUN}%`).delete()
+    await db("sales_channel").where("id", "like", `${RUN}%`).delete()
     await db.destroy()
   })
 
@@ -237,16 +314,59 @@ maybe("Story 11.6 — retencja danych obdarowanego (realny PG, rynki A/B, rola m
     }
   })
 
-  it("AC2.a/b/c: sweep dzienny dla rynku A — wynik per nośnik, rynek B i horyzont retry nienaruszone", async () => {
-    process.env.VOUCHER_PII_RETENTION_MARKETS = MARKET_A
-    const results = await voucherPiiRetentionSweep(container as never)
+  it.each(["abc", "0", "3"])(
+    "R-4: VOUCHER_PII_RETENTION_DAYS=%s ⇒ nazwana odmowa, zero redakcji na realnym PG",
+    async (days) => {
+      process.env.GP_CONFIG_ROOT = configRoots.onlyA
+      process.env.VOUCHER_PII_RETENTION_DAYS = days
+      logs.length = 0
+      try {
+        const run = await voucherPiiRetentionSweep(container as never)
+        expect(run.results).toEqual([])
+        expect(run.alarms.term_invalid).toBe(1)
+        expect(run.term_refusal?.error_code).toBe("GP_RECIPIENT_RETENTION_TERM_INVALID")
+        expect(logs.some((l) => l.startsWith("error") && l.includes("GP_RECIPIENT_RETENTION_TERM_INVALID"))).toBe(true)
+      } finally {
+        delete process.env.VOUCHER_PII_RETENTION_DAYS
+      }
+      const left = await db("voucher_recipient_pii").whereIn("id", [seeded.pii.a_old_tomb, seeded.pii.a_orphan]).count<{ n: string }[]>({ n: "*" })
+      expect(Number(left[0].n)).toBe(2)
+      const li = await db("order_line_item").where("id", seeded.lineItems.a_recent).first("metadata")
+      expect(li.metadata.gift_recipient_email).toBe("a-recent-gift@example.invalid")
+      expect((await cartMeta())[seeded.cartLineItems.a_old].gift_recipient_email).toBe("a-old-cart@example.invalid")
+    }
+  )
+
+  it("R-1: puste źródło rynków (projekcja bez rynków) ⇒ nazwany alarm error, licznik w wyniku, zero pracy", async () => {
+    process.env.GP_CONFIG_ROOT = configRoots.empty
+    logs.length = 0
+    const run = await voucherPiiRetentionSweep(container as never)
+    expect(run.results).toEqual([])
+    expect(run.markets).toEqual([])
+    expect(run.alarms.no_markets).toBe(1)
+    expect(run.markets_source).toBe("gp_config_projection")
+    expect(logs.some((l) => l.startsWith("error") && l.includes(RETENTION_NO_MARKETS_ERROR_CODE))).toBe(true)
+  })
+
+  it("AC2.a/b/c: sweep dzienny BEZ env rynków (źródło: projekcja gp-config z rynkiem A) — wynik per nośnik, rola medusa_store, rynek B i horyzont retry nienaruszone", async () => {
+    delete process.env.VOUCHER_PII_RETENTION_MARKETS
+    process.env.GP_CONFIG_ROOT = configRoots.onlyA
+    logs.length = 0
+    const run = await voucherPiiRetentionSweep(container as never)
+    expect(run.markets_source).toBe("gp_config_projection")
+    expect(run.markets).toEqual([MARKET_A])
+    expect(run.alarms.no_markets).toBe(0)
+    const results = run.results
     expect(results).toHaveLength(1)
     const [r] = results
     expect(r.market_id).toBe(MARKET_A)
+    // Fix R-3: sonda zmierzona wewnątrz transakcji joba.
+    expect(r.session).toEqual({ current_user: "medusa_store", row_security_active: true, market_setting: MARKET_A })
     expect(r.carriers).toEqual({
       [RETENTION_CARRIERS.recipientPiiPurged]: 1,
       [RETENTION_CARRIERS.recipientPiiOrphans]: 1,
       [RETENTION_CARRIERS.lineItemMetadata]: 1,
+      [RETENTION_CARRIERS.cartLineItemMetadata]: 1,
       [RETENTION_CARRIERS.notificationData]: 1,
     })
     expect(logs.some((l) => l.startsWith("error"))).toBe(false)
@@ -285,19 +405,53 @@ maybe("Story 11.6 — retencja danych obdarowanego (realny PG, rynki A/B, rola m
     expect(data[seeded.notifications.a_recent].customer_first_name).toBe("First a")
     expect(data[seeded.notifications.b_old].customer_first_name).toBe("First b")
 
-    console.log(`S116_RESULT ${JSON.stringify({ job: "voucher-pii-retention-sweep", results, retry_horizon_days: SWEEP_GAP_LOOKBACK_MS / DAY, retention_days: 365, market_b_untouched: true })}`)
+    const carts = await cartMeta()
+    expect(carts[seeded.cartLineItems.a_old].gift_recipient_email).toBeUndefined()
+    expect(carts[seeded.cartLineItems.a_old].gift_recipient_name).toBeUndefined()
+    expect(carts[seeded.cartLineItems.a_old].gift_recipient_message).toBeUndefined()
+    expect(carts[seeded.cartLineItems.a_old].gp_recipient_pii_redacted_at).toBeDefined()
+    expect(carts[seeded.cartLineItems.a_old].purchase_mode).toBe("gift")
+    expect(carts[seeded.cartLineItems.a_recent].gift_recipient_email).toBe("a-recent-cart@example.invalid")
+    expect(carts[seeded.cartLineItems.b_old].gift_recipient_email).toBe("b-old-cart@example.invalid")
+
+    console.log(`S116_RESULT ${JSON.stringify({ job: "voucher-pii-retention-sweep", markets_source: run.markets_source, markets_env_set: false, results, retry_horizon_days: SWEEP_GAP_LOOKBACK_MS / DAY, retention_days: 365, market_b_untouched: true })}`)
   })
 
   it("AC2.b: drugi przebieg jest idempotentny (zero na każdym nośniku)", async () => {
-    process.env.VOUCHER_PII_RETENTION_MARKETS = MARKET_A
-    const [r] = await voucherPiiRetentionSweep(container as never)
-    expect(Object.values(r.carriers)).toEqual([0, 0, 0, 0])
+    process.env.GP_CONFIG_ROOT = configRoots.onlyA
+    const [r] = (await voucherPiiRetentionSweep(container as never)).results
+    expect(Object.values(r.carriers)).toEqual([0, 0, 0, 0, 0])
+  })
+
+  it("R-3: odebrany GRANT na tabeli towarzyszącej ⇒ nazwany błąd joba GP_RECIPIENT_RETENTION_PERMISSION_DENIED (nie połknięty)", async () => {
+    process.env.GP_CONFIG_ROOT = configRoots.onlyA
+    logs.length = 0
+    await db.raw("REVOKE SELECT ON voucher_pii_consent_audit FROM medusa_store")
+    try {
+      const run = await voucherPiiRetentionSweep(container as never)
+      expect(run.results).toEqual([])
+      expect(run.markets_failed).toBe(1)
+      expect(run.failures).toEqual([{ market_id: MARKET_A, error_code: "GP_RECIPIENT_RETENTION_PERMISSION_DENIED" }])
+      expect(logs.some((l) => l.startsWith("error") && l.includes("error_code=GP_RECIPIENT_RETENTION_PERMISSION_DENIED"))).toBe(true)
+    } finally {
+      await applyUp()
+    }
+    const priv = await db.raw(`SELECT has_table_privilege('medusa_store', 'voucher_pii_consent_audit', 'SELECT') AS s`)
+    expect(priv.rows[0].s).toBe(true)
+  })
+
+  it("R-3: runtime bez kontekstu ALS odmawia (missing_market_context) przed jakąkolwiek pracą", async () => {
+    await expect(
+      runRecipientRetentionForMarket(db, { market_id: MARKET_A, cutoff: new Date(), batch_size: 1 })
+    ).rejects.toMatchObject({ reason: "missing_market_context" })
   })
 
   it("AC2.a (DW-15-360 scope_extension_6_5): orphan cleanup dla rynku B pod medusa_store bez permission denied", async () => {
-    process.env.VOUCHER_PII_RETENTION_MARKETS = MARKET_B
+    process.env.GP_CONFIG_ROOT = configRoots.onlyB
     logs.length = 0
-    const results = await voucherPiiOrphanCleanup(container as never)
+    const run = await voucherPiiOrphanCleanup(container as never)
+    expect(run.markets).toEqual([MARKET_B])
+    const results = run.results
     expect(logs.filter((l) => l.startsWith("error"))).toEqual([])
     expect(results).toHaveLength(1)
     // Cutoff = epoch: termin jest no-opem, więc oba tombstony rynku B bez audytu są sierotami.
@@ -309,12 +463,18 @@ maybe("Story 11.6 — retencja danych obdarowanego (realny PG, rynki A/B, rola m
     console.log(`S116_ORPHAN ${JSON.stringify({ job: "voucher-pii-orphan-cleanup", results })}`)
   })
 
-  it("AC2.c: brak deklaracji rynków ⇒ zero pracy i nazwany warn (nie przekrojowy sweep)", async () => {
-    delete process.env.VOUCHER_PII_RETENTION_MARKETS
+  it("AC2.c: zawężenie env do rynku spoza konfiguracji ⇒ zero pracy, nazwany alarm error (nie przekrojowy sweep)", async () => {
+    process.env.GP_CONFIG_ROOT = configRoots.onlyA
+    process.env.VOUCHER_PII_RETENTION_MARKETS = MARKET_B
     logs.length = 0
-    const results = await voucherPiiRetentionSweep(container as never)
-    expect(results).toEqual([])
-    expect(logs.some((l) => l.includes("GP_RECIPIENT_RETENTION_NO_MARKETS"))).toBe(true)
+    try {
+      const run = await voucherPiiRetentionSweep(container as never)
+      expect(run.results).toEqual([])
+      expect(run.alarms).toMatchObject({ no_markets: 1, narrowing_rejected: 1 })
+      expect(logs.some((l) => l.startsWith("error") && l.includes("GP_RECIPIENT_RETENTION_NO_MARKETS"))).toBe(true)
+    } finally {
+      delete process.env.VOUCHER_PII_RETENTION_MARKETS
+    }
   })
 
   it("migracja 20261115160000: up idempotentny, down zdejmuje RLS i polityki, ponowny up przywraca", async () => {

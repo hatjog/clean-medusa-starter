@@ -85,7 +85,7 @@ describe("findRecipientPiiRows — schemat, nie wspomnienie o schemacie", () => 
 
   it("odmawia bez wystarczajacych argumentow — cichy pusty eksport bylby gorszy", async () => {
     const { db } = makeDb()
-    await expect(findRecipientPiiRows(db, {})).rejects.toThrow(/--voucher.*--email/s)
+    await expect(findRecipientPiiRows(db, {})).rejects.toThrow(/market=<market_id>.*voucher=<kod>.*email=<email>/s)
     await expect(findRecipientPiiRows(db, { email: "a@b.pl" })).rejects.toThrow()
   })
 })

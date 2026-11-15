@@ -7,7 +7,7 @@
  *
  *   pnpm --ignore-workspace exec medusa exec \
  *     ./packages/api/src/scripts/data-export-recipient.ts \
- *     subject=recipient voucher=<voucher_code>
+ *     subject=recipient voucher=<voucher_code> market=<market_id>
  *
  *   pnpm --ignore-workspace exec medusa exec \
  *     ./packages/api/src/scripts/data-export-recipient.ts \
@@ -149,7 +149,7 @@ export async function findRecipientPiiRows(
   }
 
   throw new Error(
-    "[data-export-recipient] Podaj --voucher=<kod> ALBO --email=<email> --market=<market_id>"
+    "[data-export-recipient] Podaj market=<market_id> (wymagany od 11.6) oraz voucher=<kod> ALBO email=<email>"
   );
 }
 

@@ -25,6 +25,10 @@ import { Migration } from "@medusajs/framework/mikro-orm/migrations"
  *     rola i tak ma DML tabelowe. Izolację rynku na tych dwóch tabelach daje
  *     PREDYKAT redakcji (rynek z `entitlement_instance` pod RLS albo
  *     `notification.data.market_id`), nie polityka — core nie ma kolumny rynku.
+ *     Fix R-2 (runda 1): `cart_line_item (id, cart_id, updated_at, metadata)`
+ *     SELECT + UPDATE(metadata), `cart (id, sales_channel_id)` SELECT,
+ *     `sales_channel (id, metadata)` SELECT — redakcja danych obdarowanej na
+ *     pozycjach koszyka (rynek z `sales_channel.metadata.gp_market_id`).
  *
  * Down: zdejmuje polityki i RLS z tabel towarzyszących (stan sprzed up());
  * uprawnień NIE odbiera — ta sama racja co w 6.5 (grant mógł istnieć przed up(),
@@ -50,6 +54,11 @@ export const VOUCHER_PII_COMPANION_TABLES = [
 export const VOUCHER_PII_REDACTION_COLUMN_GRANTS = [
   { table: "order_line_item", sql: "GRANT SELECT (id, created_at, metadata), UPDATE (metadata) ON order_line_item" },
   { table: "notification", sql: "GRANT SELECT (id, created_at, data), UPDATE (data) ON notification" },
+  // Fix R-2: redakcja `cart_line_item.metadata`; rynek koszyka przez
+  // `cart.sales_channel_id` → `sales_channel.metadata.gp_market_id`.
+  { table: "cart_line_item", sql: "GRANT SELECT (id, cart_id, updated_at, metadata), UPDATE (metadata) ON cart_line_item" },
+  { table: "cart", sql: "GRANT SELECT (id, sales_channel_id) ON cart" },
+  { table: "sales_channel", sql: "GRANT SELECT (id, metadata) ON sales_channel" },
 ] as const
 
 const MARKET_SETTING = "NULLIF(current_setting('app.gp_market_id', true), '')"
