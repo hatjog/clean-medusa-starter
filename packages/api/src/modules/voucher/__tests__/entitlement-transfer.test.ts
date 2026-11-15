@@ -597,8 +597,10 @@ describe("AC3 — transfer/claim = binding-only, posting GATED, taksonomia niezm
     expect(writes).toBe(0) // ZERO zapisu — binding-only nie woła writera
   })
 
-  it("taksonomia 13 stanów + tranzycja ISSUED→ACTIVE niezmienne (D-5, regresja)", () => {
-    expect(ALL_ENTITLEMENT_INSTANCE_STATES).toHaveLength(13)
+  it("taksonomia 14 stanów (D-5 + ADR-245) + tranzycja ISSUED→ACTIVE niezmienne (regresja)", () => {
+    expect(ALL_ENTITLEMENT_INSTANCE_STATES).toHaveLength(14)
+    // Ścisła lista: jedynym stanem ponad baseline D-5 jest REDEMPTION_REVERSED (ADR-245).
+    expect(ALL_ENTITLEMENT_INSTANCE_STATES[13]).toBe("REDEMPTION_REVERSED")
     // claim używa ISTNIEJĄCEJ krawędzi ISSUED → ACTIVE (nie dodaje stanu/krawędzi).
     expect(
       ALLOWED_ENTITLEMENT_TRANSITIONS[EntitlementInstanceState.ISSUED]

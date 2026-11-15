@@ -335,7 +335,7 @@ describe("Story 3.4 — posting hook bez payloadu (tranzycja niefinansowa)", () 
 // ===========================================================================
 
 describe("Story 3.4 AC3 — inwariant taksonomii (wyłącznie okablowanie, D-5)", () => {
-  it("ALL_ENTITLEMENT_INSTANCE_STATES = dokładnie 13 stanów w stałej kolejności", () => {
+  it("ALL_ENTITLEMENT_INSTANCE_STATES = dokładnie 14 stanów w stałej kolejności (D-5 + REDEMPTION_REVERSED z ADR-245)", () => {
     expect(ALL_ENTITLEMENT_INSTANCE_STATES).toEqual([
       "ISSUED",
       "ACTIVE",
@@ -350,10 +350,12 @@ describe("Story 3.4 AC3 — inwariant taksonomii (wyłącznie okablowanie, D-5)"
       "REFUNDED",
       "DISPUTED",
       "PENDING_VENDOR_DECISION",
+      // v1.16.0 Story 5.7 / D-36 / ADR-245: JEDYNY stan dodany od baseline D-5.
+      "REDEMPTION_REVERSED",
     ])
   })
 
-  it("graf ALLOWED_ENTITLEMENT_TRANSITIONS = baseline D-5 + JEDNA krawędź z ADR-198", () => {
+  it("graf ALLOWED_ENTITLEMENT_TRANSITIONS = baseline D-5 + krawędź ADR-198 + krawędzie korekty ADR-245", () => {
     // Snapshot baseline (models/entitlement.ts @ baseline_commit) — okablowanie 3.4
     // NIE zmieniło semantyki żadnej tranzycji ani nie dodało/usunęło stanu.
     //
@@ -388,7 +390,17 @@ describe("Story 3.4 AC3 — inwariant taksonomii (wyłącznie okablowanie, D-5)"
         "REFUND_REQUESTED",
         "DISPUTED",
       ],
-      REDEEMED_FULL: ["SETTLED", "REFUND_REQUESTED", "DISPUTED"],
+      // ADR-245 (v1.16.0 Story 5.7, D-36): REDEEMED_FULL → REDEMPTION_REVERSED
+      // (korekta pomyłkowej realizacji) oraz krawędzie wyjściowe nowego stanu —
+      // voucher znów realizowalny; REDEMPTION_REVERSED → REFUND_REQUESTED.
+      REDEEMED_FULL: ["SETTLED", "REFUND_REQUESTED", "DISPUTED", "REDEMPTION_REVERSED"],
+      REDEMPTION_REVERSED: [
+        "REDEMPTION_REQUESTED",
+        "EXPIRED",
+        "VOIDED",
+        "REFUND_REQUESTED",
+        "DISPUTED",
+      ],
       SETTLED: ["CLOSED", "REFUND_REQUESTED", "DISPUTED"],
       CLOSED: [],
       VOIDED: [],

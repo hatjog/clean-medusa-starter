@@ -622,7 +622,9 @@ describe("buildCancellationWiring — CR-4: posting no-op z bramką ON (brak pay
 // ---------------------------------------------------------------------------
 
 describe("granice D-5 — taksonomia stanów niezmieniona", () => {
-  it("ALL_ENTITLEMENT_INSTANCE_STATES nadal liczy 13 stanów (4.6 NIE dodaje stanu)", () => {
-    expect(ALL_ENTITLEMENT_INSTANCE_STATES).toHaveLength(13)
+  it("ALL_ENTITLEMENT_INSTANCE_STATES liczy 14 stanów (4.6 NIE dodaje stanu; D-5 + ADR-245)", () => {
+    expect(ALL_ENTITLEMENT_INSTANCE_STATES).toHaveLength(14)
+    // Ścisła lista: jedynym stanem ponad baseline D-5 jest REDEMPTION_REVERSED (ADR-245).
+    expect(ALL_ENTITLEMENT_INSTANCE_STATES[13]).toBe("REDEMPTION_REVERSED")
   })
 })

@@ -286,7 +286,9 @@ type FakeRedemption = {
   idempotency_key: string
   amount_minor: number
   issued_gross_minor: number
-  resulting_state: "REDEEMED_PARTIAL" | "REDEEMED_FULL"
+  // v1.16.0 Story 5.7 (D-36, ADR-245): wiersz REVERSAL korekty pomyłki niesie
+  // `REDEMPTION_REVERSED`; odwrócenie ZWROTEM niesie REDEEMED_* odwracanej raty.
+  resulting_state: "REDEEMED_PARTIAL" | "REDEEMED_FULL" | "REDEMPTION_REVERSED"
   remaining_after_minor: number
   created_at: number
   market_id: string
@@ -323,30 +325,75 @@ class RedemptionRefundFakeClient extends RefundFakeClient {
     })
   }
 
+  /** Korekta pomyłkowej realizacji (Story 5.7): REVERSAL z `REDEMPTION_REVERSED`. */
+  seedCorrection(opts: { redemption_id: string; reverses_redemption_id: string }) {
+    const original = this.redemptions.find(
+      (row) => row.redemption_id === opts.reverses_redemption_id
+    )
+    if (!original) throw new Error("seedCorrection: brak realizacji do korekty")
+    this.redemptions.push({
+      ...original,
+      redemption_id: opts.redemption_id,
+      redemption_kind: "REVERSAL",
+      reverses_redemption_id: opts.reverses_redemption_id,
+      idempotency_key: `correct:${opts.redemption_id}`,
+      resulting_state: "REDEMPTION_REVERSED",
+      created_at: original.created_at + 1000,
+    })
+  }
+
   override async query<T = Record<string, unknown>>(
     sql: string,
     params: ReadonlyArray<unknown> = []
   ): Promise<{ rows: T[]; rowCount?: number | null }> {
+    // `revokeEntitlementsOnRefund` (runda fix 1 5.7): rozróżnia odwrócenie
+    // ZWROTEM (`refund_reversed`: REVERSAL z resulting_state IS DISTINCT FROM
+    // 'REDEMPTION_REVERSED') od KOREKTY (`corrected`: REVERSAL z resulting_state
+    // = 'REDEMPTION_REVERSED') — wiernie wobec SQL producenta.
     if (
       sql.includes("FROM voucher_redemption redemption") &&
-      sql.includes("already_reversed")
+      sql.includes("AS refund_reversed") &&
+      sql.includes("AS corrected")
     ) {
       const entitlementId = params[0] as string
+      const reversalsOf = (redemptionId: string) =>
+        this.redemptions.filter(
+          (candidate) =>
+            candidate.redemption_kind === "REVERSAL" &&
+            candidate.reverses_redemption_id === redemptionId
+        )
       const rows = this.redemptions
         .filter(
           (row) =>
             row.entitlement_id === entitlementId &&
             row.redemption_kind === "REDEMPTION"
         )
+        .sort(
+          (a, b) =>
+            a.created_at - b.created_at ||
+            a.redemption_id.localeCompare(b.redemption_id)
+        )
         .map((row) => ({
           redemption_id: row.redemption_id,
-          already_reversed: this.redemptions.some(
-            (candidate) =>
-              candidate.redemption_kind === "REVERSAL" &&
-              candidate.reverses_redemption_id === row.redemption_id
+          refund_reversed: reversalsOf(row.redemption_id).some(
+            (candidate) => candidate.resulting_state !== "REDEMPTION_REVERSED"
+          ),
+          corrected: reversalsOf(row.redemption_id).some(
+            (candidate) => candidate.resulting_state === "REDEMPTION_REVERSED"
           ),
         }))
       return { rows: rows as T[], rowCount: rows.length }
+    }
+    // Fail-closed: zapytanie o odwrócenia realizacji w nierozpoznanym kształcie
+    // (np. powrót starego aliasu `already_reversed`) NIE może cicho spaść do
+    // ogólnych gałęzi atrapy.
+    if (
+      sql.includes("FROM voucher_redemption redemption") &&
+      sql.includes("reverses_redemption_id = redemption.redemption_id")
+    ) {
+      throw new Error(
+        "RedemptionRefundFakeClient: nierozpoznane zapytanie o odwrócenia realizacji"
+      )
     }
 
     if (
@@ -462,7 +509,7 @@ class RedemptionRefundFakeClient extends RefundFakeClient {
         idempotency_key: idempotencyKey,
         amount_minor: params[3] as number,
         issued_gross_minor: params[6] as number,
-        resulting_state: params[4] as "REDEEMED_PARTIAL" | "REDEEMED_FULL",
+        resulting_state: params[4] as FakeRedemption["resulting_state"],
         remaining_after_minor: params[5] as number,
         created_at: params[7] as number,
         market_id: params[10] as string,
@@ -576,6 +623,44 @@ describe("v1.9.0 wf5 H-3 / F-CC1-002 — refund path → entitlement REFUNDED", 
     expect(client.entitlementRows.get("ent_installments")?.state).toBe("REFUNDED")
     expect(replay.deduplicated).toBe(true)
     expect(replay.refundRevocation).toBeUndefined()
+  })
+
+  it("realizacja → korekta → zwrot: REFUNDED bez odwrócenia kwotowego (Story 5.7, D-36)", async () => {
+    const client = new RedemptionRefundFakeClient()
+    client.seedEntitlement({
+      id: "ent_corrected",
+      order_id: "ord_refund_1",
+      state: "REDEMPTION_REVERSED",
+    })
+    client.seedRedemption({
+      redemption_id: "red_mistaken",
+      entitlement_id: "ent_corrected",
+      gross_amount_minor: 19900,
+    })
+    client.seedCorrection({
+      redemption_id: "red_correction",
+      reverses_redemption_id: "red_mistaken",
+    })
+    const eventBus = { emit: jest.fn().mockResolvedValue(undefined) }
+    const workflow = new StripePaymentAuditWorkflow(
+      { connect: async () => client },
+      eventBus
+    )
+
+    const result = await workflow.process("payment.refunded", refundPayload())
+
+    // Korekta NIE jest zwrotem: brak nowego wiersza REVERSAL (jedyny to korekta).
+    const reversals = client.redemptions.filter(
+      (row) => row.redemption_kind === "REVERSAL"
+    )
+    expect(reversals.map((row) => row.redemption_id)).toEqual(["red_correction"])
+    expect(result.refundRevocation?.reversal_redemption_ids ?? []).toEqual([])
+    expect(result.refundRevocation?.revoked_entitlement_ids).toEqual([
+      "ent_corrected",
+    ])
+    // Uprawnienie domknięte maszyną stanów REDEMPTION_REVERSED → REFUND_REQUESTED → REFUNDED.
+    expect(client.entitlementRows.get("ent_corrected")?.state).toBe("REFUNDED")
+    expect(client.voucherStatus).toBe("refunded")
   })
 
   it("transitions a single ACTIVE entitlement to REFUNDED on payment.refunded", async () => {

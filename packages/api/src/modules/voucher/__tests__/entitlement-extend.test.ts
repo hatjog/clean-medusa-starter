@@ -391,8 +391,10 @@ describe("extend posting deferral + idempotency", () => {
 // ---------------------------------------------------------------------------
 
 describe("inwariant taksonomii (D-5)", () => {
-  it("ALL_ENTITLEMENT_INSTANCE_STATES = 13 stanów (extend NIE dodaje stanu)", () => {
-    expect(ALL_ENTITLEMENT_INSTANCE_STATES).toHaveLength(13)
+  it("ALL_ENTITLEMENT_INSTANCE_STATES = 14 stanów (extend NIE dodaje stanu; D-5 + ADR-245)", () => {
+    expect(ALL_ENTITLEMENT_INSTANCE_STATES).toHaveLength(14)
+    // Ścisła lista: jedynym stanem ponad baseline D-5 jest REDEMPTION_REVERSED (ADR-245).
+    expect(ALL_ENTITLEMENT_INSTANCE_STATES[13]).toBe("REDEMPTION_REVERSED")
   })
 })
 
