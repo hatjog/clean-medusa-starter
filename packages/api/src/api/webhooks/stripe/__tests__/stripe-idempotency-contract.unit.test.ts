@@ -145,9 +145,10 @@ function makeWorld(orderIds: string[]) {
           rowCount: orderIds.length,
         }
       }
-      if (/FROM event_processed/i.test(sql)) {
+      // Story 3.4 (DW-15-318 R-4): ACK poziomu 2 czyta wspólną barierę skutku.
+      if (/FROM owed_unit_effect_barrier/i.test(sql)) {
         return {
-          rows: [...settled].sort().map((external_id) => ({ external_id })),
+          rows: [...settled].sort().map((owed_business_unit_key) => ({ owed_business_unit_key })),
           rowCount: settled.size,
         }
       }

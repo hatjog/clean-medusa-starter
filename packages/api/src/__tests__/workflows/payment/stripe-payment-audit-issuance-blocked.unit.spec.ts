@@ -23,6 +23,7 @@
  *     zwracanej (kontrole 6, 7).
  */
 import { StripePaymentAuditWorkflow } from "../../../workflows/payment/stripe-payment-audit"
+import { handleOwedUnitBarrierSql } from "./owed-unit-barrier-fake"
 
 // Story 11.2 (ADR-240): producent `entitlement_state_changed` bierze
 // `scope.instance_id` WYŁĄCZNIE z GP_INSTANCE_ID; brak = odmowa emisji.
@@ -154,6 +155,9 @@ class BlockedIssuanceFakeClient {
       rowCount: list.length,
     })
 
+    // Story 3.4 (DW-15-318): wspólna bariera skutku na trasie natywnej.
+    const owedUnitBarrier = handleOwedUnitBarrierSql(this, sql, params)
+    if (owedUnitBarrier) return owedUnitBarrier as unknown as { rows: T[]; rowCount: number }
     if (sql.includes("INSERT INTO webhook_event_processed")) {
       const key = `${params[0]}:stripe`
       if (this.webhookRows.has(key)) return rows([])

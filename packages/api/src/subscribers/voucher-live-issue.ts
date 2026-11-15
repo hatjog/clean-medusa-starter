@@ -47,7 +47,17 @@ import {
   type TransitionEventEnvelope,
   type TransitionAuditEnvelope,
 } from "../modules/voucher/entitlement-transition-wiring"
-import { DEFERRED_ISSUANCE_EVENT_SUFFIX } from "../lib/payment/stripe-payment-intent-transport"
+import {
+  DEFERRED_ISSUANCE_EVENT_SUFFIX,
+  OWED_UNIT_RECOVERY_CONSUMER_SUCCESS,
+  OWED_UNIT_RESERVATION_MISMATCH_ALARM,
+  PATH_Y_CONSUMER_MAX_ATTEMPTS,
+  resolveWebhookPgHandle,
+  settleOwedUnitStamp,
+  stampPathYConsumerFailure,
+} from "../lib/payment/stripe-payment-intent-transport"
+import { buildOwedBusinessUnitKey } from "../lib/payment/stripe-webhook-barrier-contract"
+import { emitStructuredAlert } from "../lib/alert-emit"
 import {
   closeDeferredIssuanceTraceGuarded,
   DEFERRED_ISSUANCE_TRACE_CLOSURE_WEBHOOK_LIVE_ISSUE,
@@ -242,6 +252,193 @@ export function toLiveIssueInput(
   }
 }
 
+/** Kod stempla porażki konsumenta, gdy w kontenerze nie ma dostępu do PG. */
+export const CONSUMER_FAILURE_STAMP_PG_UNAVAILABLE = "consumer_failure_stamp_pg_unavailable" as const
+/** Kod stempla porażki konsumenta, gdy zapis SQL rzucił. */
+export const CONSUMER_FAILURE_STAMP_FAILED = "consumer_failure_stamp_failed" as const
+/** Kod stempla porażki konsumenta, gdy rezerwacji tej dostawy nie ma. */
+export const CONSUMER_FAILURE_STAMP_NO_RESERVATION = "consumer_failure_stamp_no_reservation" as const
+
+/**
+ * Story 3.4 fix (checkpoint PO, AC1/AC4, ADR-246 p.6): ścieżka porażki
+ * konsumenta Path Y na REALNEJ ścieżce, bez redelivery.
+ *
+ * Route odpowiada Stripe'owi `200` po emisji, PRZED konsumpcją; Stripe po 200
+ * nie ponawia, więc naprawa w gałęzi `reserved=false` route'u odpala tylko przy
+ * ręcznym `stripe events resend`. Tu — w każdej nieudanej próbie busa — rezerwacja
+ * dostawy (`webhook_event_processed`) dostaje stempel `owed_unit_settlement.state
+ * = 'unsettled'` z jednostką, której konsumpcja padła, a operator dostaje alarm
+ * strukturalny `owed_unit_reservation_mismatch` (kanał `lib/alert-emit`). Kolejna
+ * dostawa (resend, trasa natywna `payment.captured`) albo odzysk rozlicza
+ * jednostkę; wspólna bariera Story 3.3 chroni przed podwójnym skutkiem.
+ *
+ * Zapis biegnie POZA wycofaną tx skutku, na uchwycie route'u
+ * (`resolveWebhookPgHandle` = rola bazowa połączenia `PG_CONNECTION`, poza
+ * kontekstem rynku) — tym samym, którym route rezerwuje i stempluje; `medusa_store`
+ * nie ma uprawnień do `webhook_event_processed`, więc nie potrzeba nowego grantu
+ * ani migracji. Porażka stempla NIE maskuje porażki konsumenta (wołający i tak
+ * rzuca), ale jest nazwana w alarmie i w logu ERROR (NFR-4).
+ *
+ * Koperty spoza route'u (odzysk `#deferred-issuance`, inni emitenci) nie mają
+ * rezerwacji dostawy — `null`, bez stempla i bez alarmu tej klasy (mają własne
+ * rejestry: `deferred_issuance_trace`, `money_path_compensation_failure`).
+ */
+export async function recordPathYConsumerFailure(
+  scope: { resolve: (key: string) => unknown },
+  logger: LoggerLike,
+  input: { causation_id: unknown; payment_intent_id: string; order_id: string; error: Error }
+): Promise<{
+  stamped: boolean
+  stamp_error_code: string | null
+  unit_attempt: number | null
+  final: boolean
+} | null> {
+  const stripeEventId = stripeEventIdFromCausation(input.causation_id)
+  if (!stripeEventId) return null
+  const owedUnit = buildOwedBusinessUnitKey({
+    payment_intent_id: input.payment_intent_id,
+    order_id: input.order_id,
+  })
+
+  let stamped = false
+  let unitAttempt: number | null = null
+  let stampErrorCode: string | null = null
+  try {
+    const handle = await resolveWebhookPgHandle(scope)
+    if (!handle) {
+      stampErrorCode = CONSUMER_FAILURE_STAMP_PG_UNAVAILABLE
+    } else {
+      try {
+        ;({ stamped, unit_attempts: unitAttempt } = await stampPathYConsumerFailure(handle.client, {
+          event_id: stripeEventId,
+          owed_unit: owedUnit,
+          error_name: input.error.name || "Error",
+        }))
+        if (!stamped) stampErrorCode = CONSUMER_FAILURE_STAMP_NO_RESERVATION
+      } finally {
+        handle.release()
+      }
+    }
+  } catch (err) {
+    stampErrorCode = CONSUMER_FAILURE_STAMP_FAILED
+    logger.error?.(
+      `[voucher-live-issue] stempel porazki konsumenta dla ${stripeEventId} ` +
+        `(${owedUnit}) NIE zostal utrwalony: ${(err as Error).message}`
+    )
+  }
+
+  // Runda fix 2 (R-9/R-11, ADR-246 p.6): bus nie podaje numeru próby, więc
+  // numerem jest licznik prób TEJ jednostki w stemplu. Próba < max = porażka
+  // przejściowa (WARN; bus ponowi, sukces zdejmie stempel). Próba >= max albo
+  // licznik nieznany (stempel nieutrwalony) = porażka ostateczna (CRITICAL).
+  const final = unitAttempt === null || unitAttempt >= PATH_Y_CONSUMER_MAX_ATTEMPTS
+  emitStructuredAlert({
+    severity: final ? "CRITICAL" : "WARN",
+    code: OWED_UNIT_RESERVATION_MISMATCH_ALARM,
+    message:
+      `Konsumpcja Path Y nieudana po ACK transportu: rezerwacja ${stripeEventId} ` +
+      `ma nierozliczona jednostke ${owedUnit}` +
+      (final ? " (porazka ostateczna)" : ` (proba ${unitAttempt}/${PATH_Y_CONSUMER_MAX_ATTEMPTS}, bus ponowi)`),
+    context: {
+      stripe_event_id: stripeEventId,
+      owed_unit: owedUnit,
+      error_name: input.error.name || "Error",
+      stamp_persisted: stamped,
+      unit_attempt: unitAttempt,
+      max_attempts: PATH_Y_CONSUMER_MAX_ATTEMPTS,
+      final,
+      ...(stampErrorCode ? { stamp_error_code: stampErrorCode } : {}),
+    },
+  })
+  return { stamped, stamp_error_code: stampErrorCode, unit_attempt: unitAttempt, final }
+}
+
+/** Kod logu ERROR, gdy zdjęcie stempla po udanej konsumpcji padło. */
+export const CONSUMER_RECOVERY_SETTLE_FAILED = "consumer_recovery_settle_failed" as const
+/** Kod logu ERROR, gdy porażki konsumenta nie da się ostemplować (brak causation/payloadu). */
+export const CONSUMER_FAILURE_UNSTAMPABLE = "consumer_failure_unstampable" as const
+
+/**
+ * Story 3.4 runda fix 2 (R-9, AC1/AC4, ADR-246 p.6): udana konsumpcja Path Y
+ * (event_processed albo replay/no-op — skutek jednostki istnieje) zdejmuje
+ * jednostkę ze stempla rezerwacji; pusty zbiór = `state: 'settled'` z
+ * `consumer_recovered_at`, ślad prób zostaje. Zapis po commicie skutku, na
+ * uchwycie route'u (jak stempel porażki). Porażka zapisu nie cofa skutku,
+ * jest nazwana w logu ERROR (NFR-4); kolejna dostawa z PASS i tak rozlicza.
+ */
+export async function recordPathYConsumerRecovery(
+  scope: { resolve: (key: string) => unknown },
+  logger: LoggerLike,
+  input: { causation_id: unknown; payment_intent_id: string; order_id: string }
+): Promise<{ state: "settled" | "unsettled" | null; error_code: string | null } | null> {
+  const stripeEventId = stripeEventIdFromCausation(input.causation_id)
+  if (!stripeEventId) return null
+  const owedUnit = buildOwedBusinessUnitKey({
+    payment_intent_id: input.payment_intent_id,
+    order_id: input.order_id,
+  })
+  try {
+    const handle = await resolveWebhookPgHandle(scope)
+    if (!handle) {
+      logger.error?.(
+        `[voucher-live-issue] ${CONSUMER_RECOVERY_SETTLE_FAILED}: brak PG dla ${stripeEventId} (${owedUnit})`
+      )
+      return { state: null, error_code: CONSUMER_RECOVERY_SETTLE_FAILED }
+    }
+    try {
+      const state = await settleOwedUnitStamp(handle.client, {
+        event_id: stripeEventId,
+        settled_units: [owedUnit],
+        recovered_by: OWED_UNIT_RECOVERY_CONSUMER_SUCCESS,
+      })
+      return { state, error_code: null }
+    } finally {
+      handle.release()
+    }
+  } catch (err) {
+    logger.error?.(
+      `[voucher-live-issue] ${CONSUMER_RECOVERY_SETTLE_FAILED}: ${stripeEventId} (${owedUnit}): ` +
+        `${(err as Error).message}`
+    )
+    return { state: null, error_code: CONSUMER_RECOVERY_SETTLE_FAILED }
+  }
+}
+
+/**
+ * R-12: porażka PRZED głównym `try` (walidacja koperty, tożsamość instancji)
+ * też stempluje rezerwację, gdy causation i identyfikatory są dostępne; inaczej
+ * nazwany log ERROR `consumer_failure_unstampable`.
+ */
+async function recordEarlyConsumerFailure(
+  scope: { resolve: (key: string) => unknown },
+  logger: LoggerLike,
+  data: unknown,
+  error: Error
+): Promise<void> {
+  const envelope = (data ?? {}) as { causation_id?: unknown; payload?: Record<string, unknown> }
+  const pi = envelope.payload?.payment_intent_id
+  const order = envelope.payload?.order_id
+  if (
+    stripeEventIdFromCausation(envelope.causation_id) &&
+    typeof pi === "string" && pi.length > 0 &&
+    typeof order === "string" && order.length > 0
+  ) {
+    await recordPathYConsumerFailure(scope, logger, {
+      causation_id: envelope.causation_id,
+      payment_intent_id: pi,
+      order_id: order,
+      error,
+    })
+    return
+  }
+  if (typeof envelope.causation_id === "string" && envelope.causation_id.length > 0) {
+    logger.error?.(
+      `[voucher-live-issue] ${CONSUMER_FAILURE_UNSTAMPABLE}: causation=${envelope.causation_id} ` +
+        `bez payment_intent_id/order_id albo spoza route'u — rezerwacji nie da sie ostemplowac`
+    )
+  }
+}
+
 export default async function voucherLiveIssueSubscriber({
   event,
   container,
@@ -256,6 +453,13 @@ export default async function voucherLiveIssueSubscriber({
     const error = err as Error
     // Fail-loud: rzucamy, by Medusa zarządziła retry/DLQ (NIE silent-swallow).
     logger.error?.(`[voucher-live-issue] ${error.message}`)
+    // Story 3.4 runda fix 2 (R-12): także ta porażka stempluje rezerwację.
+    await recordEarlyConsumerFailure(
+      container as unknown as { resolve: (key: string) => unknown },
+      logger,
+      event.data,
+      error
+    )
     throw err
   }
 
@@ -273,6 +477,13 @@ export default async function voucherLiveIssueSubscriber({
     runtimeInstanceId = requireRuntimeInstanceId("voucher-live-issue")
   } catch (err) {
     logger.error?.(`[voucher-live-issue] ${(err as Error).message}`)
+    // Story 3.4 runda fix 2 (R-12): błędny GP_INSTANCE_ID też stempluje rezerwację.
+    await recordPathYConsumerFailure(scope, logger, {
+      causation_id: event.data?.causation_id,
+      payment_intent_id: input.payload.payment_intent_id,
+      order_id: input.payload.order_id,
+      error: err as Error,
+    })
     throw err
   }
 
@@ -363,6 +574,12 @@ export default async function voucherLiveIssueSubscriber({
         `[voucher-live-issue] payment_intent=${input.payload.payment_intent_id} ` +
           `replay/no-op (event-level dedupe) — zero issue`
       )
+      // Story 3.4 runda fix 2 (R-9): skutek jednostki istnieje ⇒ zdejmij stempel.
+      await recordPathYConsumerRecovery(scope, logger, {
+        causation_id: event.data?.causation_id,
+        payment_intent_id: input.payload.payment_intent_id,
+        order_id: input.payload.order_id,
+      })
       return
     }
 
@@ -393,6 +610,16 @@ export default async function voucherLiveIssueSubscriber({
         `emit_failed=${emitFailures}`
     )
 
+    // Story 3.4 runda fix 2 (R-9, ADR-246 p.6): udana konsumpcja (bez porażki
+    // linii) zdejmuje jednostkę ze stempla — samonaprawa ≠ trwały brak w ZAPISIE.
+    if (!partialFailure) {
+      await recordPathYConsumerRecovery(scope, logger, {
+        causation_id: event.data?.causation_id,
+        payment_intent_id: input.payload.payment_intent_id,
+        order_id: input.payload.order_id,
+      })
+    }
+
     // ── (D) częściowa porażka (Story 8.4) — fail-loud PO commicie linii udanych ─
     // Linie udane są zacommitowane i okablowane; event NIE został skonsumowany,
     // więc rzut przekazuje Medusie retry/DLQ dla linii nieudanych (retry linii
@@ -420,6 +647,12 @@ export default async function voucherLiveIssueSubscriber({
       `[voucher-live-issue] payment_intent=${input.payload.payment_intent_id} ` +
         `failed: ${error.name}: ${error.message}`
     )
+    await recordPathYConsumerFailure(scope, logger, {
+      causation_id: event.data?.causation_id,
+      payment_intent_id: input.payload.payment_intent_id,
+      order_id: input.payload.order_id,
+      error,
+    })
     throw err
   }
 }
