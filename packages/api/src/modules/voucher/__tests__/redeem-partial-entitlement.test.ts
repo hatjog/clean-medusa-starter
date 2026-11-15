@@ -37,6 +37,7 @@ import {
   InMemoryRedeemPartialStore,
   RedeemAmountError,
   RedeemNotRedeemableError,
+  RedeemEntitlementStateError,
   RedeemChoiceSetItemError,
   RedeemEntitlementNotFoundError,
   RedemptionBalanceError,
@@ -1291,5 +1292,36 @@ describe("C2-M-1/C2-M-4 — VOUCHER_SERVICE: posting i odwrót (ADR-212)", () =>
       })
     ).rejects.toBeInstanceOf(RedemptionBalanceError)
     expect(store.get("ent_amount_1")!.state).toBe("REDEEMED_FULL")
+  })
+})
+
+// ──────────────────────────────────────────────────────────────────────────
+// v1.16.0 Story 5.5 (AC3, ADR-219 §4 człon 3, DW-15-210): gałąź
+// `RedeemEntitlementStateError` — do tej story bez ani jednej asercji.
+// ──────────────────────────────────────────────────────────────────────────
+describe("Story 5.5 — RedeemEntitlementStateError dla prezentu ISSUED", () => {
+  it("ISSUED (przed aktywacją) ⇒ RedeemEntitlementStateError ze stanem jako wartością", async () => {
+    const { op, store } = makeOp({
+      rows: [makeEntitlement({ state: EntitlementInstanceState.ISSUED })],
+    })
+    const attempt = op.redeem(baseInput({ idempotency_key: "issued-1" }))
+    await expect(attempt).rejects.toThrow(RedeemEntitlementStateError)
+    const err = await op
+      .redeem(baseInput({ idempotency_key: "issued-2" }))
+      .catch((e: unknown) => e)
+    expect(err).toBeInstanceOf(RedeemEntitlementStateError)
+    // Podtyp — istniejące `catch (RedeemNotRedeemableError)` działają dalej.
+    expect(err).toBeInstanceOf(RedeemNotRedeemableError)
+    expect((err as RedeemEntitlementStateError).entitlement_state).toBe("ISSUED")
+    // Odmowa fail-closed: saldo i stan bez zmian.
+    expect(store.get("ent_amount_1")!.state).toBe("ISSUED")
+    expect(store.get("ent_amount_1")!.remaining_amount).toBe(300)
+  })
+
+  it("ACTIVE nie wpada w gałąź stanową (kontrola ujemna)", async () => {
+    const { op } = makeOp()
+    await expect(
+      op.redeem(baseInput({ idempotency_key: "active-1" }))
+    ).resolves.toBeDefined()
   })
 })

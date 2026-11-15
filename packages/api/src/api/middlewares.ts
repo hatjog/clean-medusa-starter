@@ -1151,6 +1151,15 @@ export default defineMiddlewares({
         operatorAuthMiddleware,
       ],
     },
+    // v1.16.0 Story 4.7: jedno wejście odczytu trzech populacji recovery pod RLS.
+    {
+      method: ["GET"],
+      matcher: "/admin/recovery",
+      middlewares: [
+        authenticate("user", ["session", "bearer"]),
+        operatorAuthMiddleware,
+      ],
+    },
     {
       method: ["POST"],
       matcher: "/auth/customer/emailpass/register",
