@@ -9,6 +9,26 @@ import {
   type RecordConsentInput,
   type VoucherPiiService,
 } from "../../../modules/voucher-pii";
+import {
+  RecipientPiiMarketAccessDeniedError,
+  type RecipientPiiMarketDenialReason,
+} from "../../../modules/voucher-pii/recipient-pii-market-guard";
+
+/**
+ * v1.16.0 Story 6.5 (AC1, fix R-1/R-2): named 403 for recipient-PII market
+ * denial. The body carries ONLY the stable codes — never the guard message
+ * (it names the PII table) nor any request detail.
+ */
+function sendRecipientPiiMarketDenied(
+  res: MedusaResponse,
+  reason: RecipientPiiMarketDenialReason
+): void {
+  res.status(403).json({
+    error: "forbidden",
+    code: reason,
+    error_code: "GP_RECIPIENT_PII_MARKET_ACCESS_DENIED",
+  });
+}
 
 /**
  * Resolve a per-request correlation id from caller-supplied headers (Story 4.4
@@ -432,6 +452,19 @@ export async function POST(
     return;
   }
 
+  // Story 6.5 fix R-1/R-2: legacy-body grant carries its own market_id; it must
+  // agree with the market context (ALS) before anything reaches the service —
+  // same rule as the pause path and the token paths.
+  if (
+    validation.action === "grant" &&
+    validation.source === "legacy-body" &&
+    marketId !== null &&
+    validation.market_id !== marketId
+  ) {
+    sendRecipientPiiMarketDenied(res, "market_mismatch");
+    return;
+  }
+
   const service = resolveService(req);
   if (!service) {
     res.status(503).json({
@@ -573,6 +606,10 @@ export async function POST(
       latency_ms: result.latency_ms,
     });
   } catch (err) {
+    if (err instanceof RecipientPiiMarketAccessDeniedError) {
+      sendRecipientPiiMarketDenied(res, err.reason);
+      return;
+    }
     if (err instanceof ConsentTransactionError) {
       res.status(500).json({
         error: "error-audit-failed",

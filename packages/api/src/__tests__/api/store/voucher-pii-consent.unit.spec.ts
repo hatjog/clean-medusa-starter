@@ -16,6 +16,7 @@ import { describe, it, expect, jest, beforeEach, afterEach } from "@jest/globals
 const vi = jest
 import { POST } from "../../../api/store/voucher-pii-consent/route"
 import * as marketContextModule from "../../../lib/market-context"
+import { RecipientPiiMarketAccessDeniedError } from "../../../modules/voucher-pii/recipient-pii-market-guard"
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -662,4 +663,64 @@ describe("POST /store/voucher-pii-consent — security headers (NFR-SEC-5/6)", (
     expect(headerNames).toContain("Content-Security-Policy-Report-Only")
     expect(headerNames).toContain("X-Frame-Options")
   })
+})
+
+describe("POST /store/voucher-pii-consent — recipient PII market denial (Story 6.5 fix R-1/R-2)", () => {
+  const legacyBody = {
+    market_id: "testmarketb",
+    order_id: "ord_abc",
+    entitlement_id: "ent_xyz",
+    locale: "pl",
+    is_gift: true,
+  }
+
+  function expectNamedDenial(json: unknown, code: string) {
+    expect(json).toEqual({
+      error: "forbidden",
+      code,
+      error_code: "GP_RECIPIENT_PII_MARKET_ACCESS_DENIED",
+    })
+    expect(JSON.stringify(json)).not.toMatch(/voucher_recipient_pii/)
+  }
+
+  it("legacy body market_id ≠ market context → 403 market_mismatch before the service", async () => {
+    marketContextSpy.mockReturnValue({
+      market_id: "bonbeauty",
+      sales_channel_id: "sc_bonbeauty",
+    } as never)
+    const service = makeService()
+    const res = makeRes()
+    await POST(makeReq(legacyBody, service), res)
+    expect(res._calls.status).toBe(403)
+    expectNamedDenial(res._calls.json, "market_mismatch")
+    expect(service.recordConsentTransaction).not.toHaveBeenCalled()
+  })
+
+  it("legacy body market_id = market context → 201 (no regression)", async () => {
+    marketContextSpy.mockReturnValue({
+      market_id: "testmarketb",
+      sales_channel_id: "sc_b",
+    } as never)
+    const service = makeService()
+    const res = makeRes()
+    await POST(makeReq(legacyBody, service), res)
+    expect(res._calls.status).toBe(201)
+    expect(service.recordConsentTransaction).toHaveBeenCalledTimes(1)
+  })
+
+  it.each(["market_mismatch", "missing_market_context"] as const)(
+    "guard error %s from the adapter → 403 named code, no table name, no PII write",
+    async (reason) => {
+      const service = makeService({
+        recordConsentTransaction: vi.fn(async () => {
+          throw new RecipientPiiMarketAccessDeniedError(reason)
+        }),
+      })
+      const res = makeRes()
+      await POST(makeReq(legacyBody, service), res)
+      expect(res._calls.status).toBe(403)
+      expectNamedDenial(res._calls.json, reason)
+      expect(service.recordConsentTransaction).toHaveBeenCalledTimes(1)
+    }
+  )
 })

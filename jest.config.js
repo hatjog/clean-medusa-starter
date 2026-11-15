@@ -247,6 +247,12 @@ if (process.env.TEST_TYPE === "integration:http") {
   module.exports.testMatch = [
     "**/packages/api/src/__tests__/integration/story-5-7-redemption-trail-pg.integration.test.[jt]s",
   ];
+} else if (process.env.TEST_TYPE === "story-6-5-recipient-pii-rls-pg") {
+  // v1.16.0 Story 6.5 (FR-20, NFR-3, ADR-248) — RLS na voucher_recipient_pii na
+  // realnym PG, rynki A/B; DATABASE_URL musi wskazywac baze `*_test` (suita kasuje wlasne dane).
+  module.exports.testMatch = [
+    "**/packages/api/src/__tests__/integration/story-6-5-recipient-pii-rls-pg.integration.test.[jt]s",
+  ];
 } else if (process.env.TEST_TYPE === "unit") {
   module.exports.testMatch = [
     "**/packages/api/src/**/__tests__/**/*.unit.spec.[jt]s",
