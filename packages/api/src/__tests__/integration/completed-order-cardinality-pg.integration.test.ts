@@ -313,6 +313,57 @@ runOrSkip("Story 3.6 — endpoint mostkowy niesie KOLEKCJĘ zamówień (realny P
     expect(body.purchase_state).toBe("incomplete")
   })
 
+  // 8.6 review-fix (MEDIUM): lista DOZWOLONYCH statusów płatności. Mutant
+  // „powrót do listy zakazanej" czerwieni przypadki partially_authorized i nieznany.
+  async function stateFor(statusA: string, statusB: string) {
+    await db("payment_collection").insert([
+      { id: "pc_a", status: statusA },
+      { id: "pc_b", status: statusB },
+    ])
+    await db("order_payment_collection").insert([
+      { order_id: ORDER_A, payment_collection_id: "pc_a" },
+      { order_id: ORDER_B, payment_collection_id: "pc_b" },
+    ])
+    return (await callRoute(db, CART_TWO_SELLERS)).body as {
+      orders: Array<{ order_id: string; terminal: boolean; terminal_reason: string }>
+      open_order_ids: string[]
+      purchase_state: string
+    }
+  }
+
+  it("8.6 fix: `partially_authorized` (wspólna kolekcja, jeden PI otwarty) ⇒ `incomplete`, powód nazwany", async () => {
+    const body = await stateFor("partially_authorized", "partially_authorized")
+    expect(body.orders.every((o) => o.terminal === false)).toBe(true)
+    expect(body.orders.map((o) => o.terminal_reason)).toEqual([
+      "payment_status_non_terminal",
+      "payment_status_non_terminal",
+    ])
+    expect(new Set(body.open_order_ids)).toEqual(new Set([ORDER_A, ORDER_B]))
+    expect(body.purchase_state).toBe("incomplete")
+  })
+
+  it("8.6 fix: status płatności nieznany ⇒ nieterminalny z powodem `payment_status_unknown`", async () => {
+    const body = await stateFor("authorized", "some_future_status")
+    const b = body.orders.find((o) => o.order_id === ORDER_B)
+    expect(b?.terminal).toBe(false)
+    expect(b?.terminal_reason).toBe("payment_status_unknown")
+    expect(body.open_order_ids).toEqual([ORDER_B])
+    expect(body.purchase_state).toBe("incomplete")
+  })
+
+  it("8.6 fix: `partially_captured` ⇒ nieterminalny (fail-closed)", async () => {
+    const body = await stateFor("authorized", "partially_captured")
+    expect(body.orders.find((o) => o.order_id === ORDER_B)?.terminal).toBe(false)
+    expect(body.purchase_state).toBe("incomplete")
+  })
+
+  it("8.6 fix: `authorized` i `completed` ⇒ terminalne, `purchase_state` complete", async () => {
+    const body = await stateFor("authorized", "completed")
+    expect(body.orders.every((o) => o.terminal && o.terminal_reason === "terminal")).toBe(true)
+    expect(body.open_order_ids).toEqual([])
+    expect(body.purchase_state).toBe("complete")
+  })
+
   it("brak identyfikatora koszyka → 400 `invalid_request`", async () => {
     const captured = await callRoute(db, undefined)
 

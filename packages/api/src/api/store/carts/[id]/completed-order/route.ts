@@ -62,22 +62,74 @@ export const NON_TERMINAL_ORDER_STATUSES: ReadonlySet<string> = new Set([
   "canceled",
   "requires_action",
 ])
-export const NON_TERMINAL_PAYMENT_STATUSES: ReadonlySet<string> = new Set([
+/**
+ * v1.16.0 Story 8.6 review-fix (MEDIUM, round 1/2): payment side is classified
+ * by an ALLOW-list ("money settled"), never by a deny-list. A deny-list was
+ * fail-open: `partially_authorized` (set by @medusajs/payment 2.14.2
+ * `maybeUpdatePaymentCollection_` when 0 < authorized < amount — exactly the
+ * N sessions/PIs case, and Mercur split orders share ONE cart collection) and
+ * any future status counted as terminal.
+ *
+ * - `authorized`: authorized amount >= collection amount — the whole purchase
+ *   amount is held by the PSP; nothing is open on the money side.
+ * - `completed`: captured amount >= collection amount — money fully captured.
+ *
+ * Deliberately NOT terminal:
+ * - `partially_authorized`: part of the amount still has no authorization.
+ * - `partially_captured`: Medusa 2.14.2 never writes it from the collection
+ *   maintenance; if it appears, the captured part is < amount and nothing
+ *   proves the rest is authorized — fail closed.
+ * - `not_paid`, `awaiting`, `requires_action`, `canceled`, `failed`: open or
+ *   dead money.
+ * - anything else (unknown / future status, null): unknown ⇒ not terminal.
+ */
+export const TERMINAL_PAYMENT_STATUSES: ReadonlySet<string> = new Set([
+  "authorized",
+  "completed",
+])
+
+export type OrderTerminalReason =
+  | "terminal"
+  | "order_status_non_terminal"
+  | "payment_status_non_terminal"
+  | "payment_status_unknown"
+
+/** Statuses known to be non-terminal; used only to NAME the reason. */
+const KNOWN_NON_TERMINAL_PAYMENT_STATUSES: ReadonlySet<string> = new Set([
   "not_paid",
   "awaiting",
   "requires_action",
   "canceled",
   "failed",
+  "partially_authorized",
+  "partially_captured",
 ])
+
+export function classifyOrderTerminal(
+  status: string | null,
+  paymentStatuses: ReadonlyArray<string | null>
+): { terminal: boolean; reason: OrderTerminalReason } {
+  if (typeof status === "string" && NON_TERMINAL_ORDER_STATUSES.has(status)) {
+    return { terminal: false, reason: "order_status_non_terminal" }
+  }
+  for (const ps of paymentStatuses) {
+    if (typeof ps === "string" && TERMINAL_PAYMENT_STATUSES.has(ps)) continue
+    return {
+      terminal: false,
+      reason:
+        typeof ps === "string" && KNOWN_NON_TERMINAL_PAYMENT_STATUSES.has(ps)
+          ? "payment_status_non_terminal"
+          : "payment_status_unknown",
+    }
+  }
+  return { terminal: true, reason: "terminal" }
+}
 
 export function isOrderTerminal(
   status: string | null,
   paymentStatuses: ReadonlyArray<string | null>
 ): boolean {
-  if (typeof status === "string" && NON_TERMINAL_ORDER_STATUSES.has(status)) return false
-  return paymentStatuses.every(
-    (ps) => !(typeof ps === "string" && NON_TERMINAL_PAYMENT_STATUSES.has(ps))
-  )
+  return classifyOrderTerminal(status, paymentStatuses).terminal
 }
 
 export async function GET(
@@ -161,7 +213,10 @@ export async function GET(
       order_group_id: row.order_group_id ?? null,
       status: row.status ?? null,
       payment_statuses: paymentStatuses,
-      terminal: isOrderTerminal(row.status ?? null, paymentStatuses),
+      ...(() => {
+        const c = classifyOrderTerminal(row.status ?? null, paymentStatuses)
+        return { terminal: c.terminal, terminal_reason: c.reason }
+      })(),
     }
   })
 
