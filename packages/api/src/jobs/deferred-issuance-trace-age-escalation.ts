@@ -12,11 +12,20 @@
  * instrukcji (`LIST_DEFERRED_ISSUANCE_TRACES_OVER_AGE_THRESHOLD_SQL`,
  * `statement_timestamp()`); ten plik nie bierze `Date` do zapytania.
  *
- * ── Bez mutacji stanu (D-35 p.16) ──────────────────────────────────────────
- * Job NIE zapisuje znacznika eskalacji ani nie zmienia `state` — to
- * wymagałoby decyzji o kolumnie/przejściu, a ta partia nie ma migracji.
+ * ── Bez mutacji stanu — decyzja Story 4.3 (DW-15-333 p.3) ──────────────────
+ * CHECK `deferred_issuance_trace_state_check` (4.4) ma już stan `escalated`,
+ * więc przejście NIE wymaga migracji. Decyzja 4.3: job go NIE wykonuje i NIE
+ * deduplikuje WARN. Powód: przejście stanu populacji recovery to mutacja
+ * naprawcza, która należy do Epiku 11 (kernel `applyRecoveryIntent`, 11.3) —
+ * job alarmowy pisałby stan z pominięciem audytu i wersji kontraktu 4.1;
+ * deduplikacja w pamięci procesu ginie przy restarcie, a trwała wymaga zapisu.
  * Konsekwencja nazwana: ślad ponad progiem jest eskalowany przy KAŻDYM
  * przebiegu, dopóki nie zostanie domknięty (alarm powtarzalny, nie jednorazowy).
+ *
+ * ── Izolacja porażki per rynek (Story 4.3, DW-15-333 p.1) ─────────────────
+ * Wyjątek odczytu na rynku A nie przerywa oceny rynku B: każdy rynek ma
+ * wynik w `per_market` (`evaluated: true|false`). Status przebiegu to `ok`
+ * tylko, gdy oceniono każdy zadeklarowany rynek.
  *
  * ── NFR-4: porażka ma skutek ───────────────────────────────────────────────
  * Job nie wywraca schedulera, ale każda porażka (brak deklaracji rynków,
@@ -69,18 +78,24 @@ type JobLogger = {
   error: (message: string, err?: unknown) => void
 }
 
+export type AgeEscalationMarketResult =
+  | { market_id: string; evaluated: true; over_threshold: number }
+  | { market_id: string; evaluated: false; reason: "read_failed"; error: string }
+
 export type AgeEscalationRunResult =
   | {
       status: "ok"
       threshold_seconds: number
       markets: string[]
       escalated: Array<{ market_id: string; trace_id: string; age_seconds: number }>
+      per_market: AgeEscalationMarketResult[]
     }
   | {
       status: "failed"
       reason: string
       error: string
       markets: string[]
+      per_market: AgeEscalationMarketResult[]
     }
 
 export type AgeEscalationDeps = {
@@ -168,41 +183,57 @@ export async function runDeferredIssuanceTraceAgeEscalation(
   } satisfies SystemMarketScope
 
   const escalated: Array<{ market_id: string; trace_id: string; age_seconds: number }> = []
+  const perMarket: AgeEscalationMarketResult[] = []
   let thresholdSeconds = 0
 
   try {
     await runInSystemMarketContext(scope, async (marketId) => {
-      const store = marketContextStorage.getStore()
-      const instanceId = store?.instance_id
-      if (!instanceId) {
-        throw new Error(`brak instance_id w kontekscie rynku ${marketId}`)
-      }
-      const client = clientForMarket(container, { market_id: marketId, instance_id: instanceId })
-      const population = await listDeferredIssuanceTracesOverAgeThreshold(client, thresholdConfig)
-      thresholdSeconds = population.threshold_seconds
-      for (const row of population.rows) {
-        const ageSeconds = toAgeSeconds(row)
+      try {
+        const store = marketContextStorage.getStore()
+        const instanceId = store?.instance_id
+        if (!instanceId) {
+          throw new Error(`brak instance_id w kontekscie rynku ${marketId}`)
+        }
+        const client = clientForMarket(container, { market_id: marketId, instance_id: instanceId })
+        const population = await listDeferredIssuanceTracesOverAgeThreshold(client, thresholdConfig)
+        thresholdSeconds = population.threshold_seconds
+        for (const row of population.rows) {
+          const ageSeconds = toAgeSeconds(row)
+          emit({
+            severity: "WARN",
+            code: ALERT_CODE_THRESHOLD_EXCEEDED,
+            message:
+              `Slad platnosci bez zamowienia ${row.trace_id} przekroczyl prog wieku ` +
+              `(${ageSeconds}s > ${population.threshold_seconds}s) — eskalacja do ${row.owner_id}`,
+            context: {
+              trace_id: row.trace_id,
+              market_id: row.market_id,
+              instance_id: row.instance_id,
+              owner_id: row.owner_id,
+              payment_intent_id: row.payment_intent_id,
+              age_seconds: ageSeconds,
+              threshold_seconds: population.threshold_seconds,
+              age_source: row.age_source,
+              measured_at: row.measured_at,
+            },
+          })
+          escalated.push({ market_id: marketId, trace_id: row.trace_id, age_seconds: ageSeconds })
+        }
+        logger.info(`market=${marketId} over_threshold=${population.rows.length}`)
+        perMarket.push({ market_id: marketId, evaluated: true, over_threshold: population.rows.length })
+      } catch (err) {
+        // Izolacja per rynek (DW-15-333 p.1): porażka ma skutek (ERROR + wynik
+        // rynku), a pozostałe rynki są oceniane dalej.
+        const message = err instanceof Error ? err.message : String(err)
         emit({
-          severity: "WARN",
-          code: ALERT_CODE_THRESHOLD_EXCEEDED,
-          message:
-            `Slad platnosci bez zamowienia ${row.trace_id} przekroczyl prog wieku ` +
-            `(${ageSeconds}s > ${population.threshold_seconds}s) — eskalacja do ${row.owner_id}`,
-          context: {
-            trace_id: row.trace_id,
-            market_id: row.market_id,
-            instance_id: row.instance_id,
-            owner_id: row.owner_id,
-            payment_intent_id: row.payment_intent_id,
-            age_seconds: ageSeconds,
-            threshold_seconds: population.threshold_seconds,
-            age_source: row.age_source,
-            measured_at: row.measured_at,
-          },
+          severity: "ERROR",
+          code: ALERT_CODE_RUN_FAILED,
+          message: `Eskalacja wieku sladow: rynek ${marketId} nieoceniony (read_failed)`,
+          context: { reason: "read_failed", error: message, market_id: marketId, markets_env_var: MARKETS_ENV_VAR },
         })
-        escalated.push({ market_id: marketId, trace_id: row.trace_id, age_seconds: ageSeconds })
+        logger.error(`market=${marketId} escalation FAILED (read_failed); populacja rynku nieoceniona`, err)
+        perMarket.push({ market_id: marketId, evaluated: false, reason: "read_failed", error: message })
       }
-      logger.info(`market=${marketId} over_threshold=${population.rows.length}`)
     })
   } catch (err) {
     const reason =
@@ -215,13 +246,24 @@ export async function runDeferredIssuanceTraceAgeEscalation(
       context: { reason, error: message, markets: declared ?? null, markets_env_var: MARKETS_ENV_VAR },
     })
     logger.error(`escalation FAILED (${reason}); populacja ponad progiem nieoceniona`, err)
-    return { status: "failed", reason, error: message, markets: declared ?? [] }
+    return { status: "failed", reason, error: message, markets: declared ?? [], per_market: perMarket }
+  }
+
+  const failedMarket = perMarket.find((m) => !m.evaluated)
+  if (failedMarket && !failedMarket.evaluated) {
+    return {
+      status: "failed",
+      reason: "read_failed",
+      error: failedMarket.error,
+      markets: declared ?? [],
+      per_market: perMarket,
+    }
   }
 
   logger.info(
     `markets=${(declared ?? []).join(",")} threshold_seconds=${thresholdSeconds} escalated=${escalated.length}`
   )
-  return { status: "ok", threshold_seconds: thresholdSeconds, markets: declared ?? [], escalated }
+  return { status: "ok", threshold_seconds: thresholdSeconds, markets: declared ?? [], escalated, per_market: perMarket }
 }
 
 export default async function deferredIssuanceTraceAgeEscalation(

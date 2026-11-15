@@ -92,7 +92,9 @@ import {
   classifyEventFailure,
   type EventFailureClassification,
 } from "../lib/events/event-failure-classification"
-import { DeadLetterRefusedError, recordEventDeadLetter } from "../lib/events/event-dead-letter"
+import { DeadLetterRefusedError, isEventDeadLettered, recordEventDeadLetter } from "../lib/events/event-dead-letter"
+import { deliverAlert, type AlertDeliveryResult, type DeliverAlertDeps } from "../lib/alert-channel"
+import { emitStructuredAlert, type StructuredAlertPayload } from "../lib/alert-emit"
 
 /** `source_job` wierszy DLQ z tego konsumenta (Story 4.6, ADR-239). */
 export const STRIPE_RETRY_DLQ_SOURCE = "subscriber:on-order-placed-stripe-retry"
@@ -107,6 +109,12 @@ export const STRIPE_RETRY_DLQ_SOURCE = "subscriber:on-order-placed-stripe-retry"
  */
 export const DLQ_WRITE_FAILED_CODE = "dlq_write_failed" as const
 
+/** Story 4.7 (DW-15-321): nazwany kod pominięcia zdarzenia, które ma wiersz DLQ. */
+export const DLQ_EXCLUDED_CODE = "dlq_excluded_from_work_selection" as const
+
+/** Story 4.7 (DW-15-320 p.4): domknięcie rekordu śladu dopasowało 0 wierszy. */
+export const TRACE_CLOSE_NO_MATCH_CODE = "deferred_issuance_trace_close_no_match" as const
+
 export type DlqWriteFailure = {
   order_id: string
   event_id: string
@@ -116,7 +124,41 @@ export type DlqWriteFailure = {
   message: string
 }
 
-export type StripeRetryRunResult = { dlq_write_failures: DlqWriteFailure[] }
+export type StripeRetryRunResult = {
+  dlq_write_failures: DlqWriteFailure[]
+  /** Wynik dostarczenia alarmu `dlq_write_failed` kanałem 4.3; obecny tylko przy porażkach. */
+  dlq_write_failed_alarm?: AlertDeliveryResult
+}
+
+/** Kod alarmu kanału 4.3 dla porażki zapisu DLQ (DW-15-316). */
+export const DLQ_WRITE_FAILED_ALERT_CODE = "RECOVERY_DLQ_WRITE_FAILED" as const
+
+/**
+ * Story 4.3 (DW-15-316): porażki zapisu DLQ idą — oprócz `logger.error` —
+ * alarmem strukturalnym (ring buffer) i trwałym kanałem z fallbackiem
+ * (`deliverAlert`, D-33). Brak kanału = ERROR `ALERT_CHANNEL_*` z `deliverAlert`.
+ */
+export async function alarmDlqWriteFailures(
+  failures: DlqWriteFailure[],
+  deps: { emit?: (payload: StructuredAlertPayload) => void; deliver?: typeof deliverAlert; deliverDeps?: DeliverAlertDeps } = {}
+): Promise<AlertDeliveryResult | null> {
+  if (failures.length === 0) return null
+  const emit = deps.emit ?? emitStructuredAlert
+  const deliver = deps.deliver ?? deliverAlert
+  const payload: StructuredAlertPayload = {
+    severity: "ERROR",
+    code: DLQ_WRITE_FAILED_ALERT_CODE,
+    message: `${DLQ_WRITE_FAILED_CODE}: ${failures.length} porazek zapisu DLQ w ${STRIPE_RETRY_DLQ_SOURCE}`,
+    context: {
+      log_code: DLQ_WRITE_FAILED_CODE,
+      source_job: STRIPE_RETRY_DLQ_SOURCE,
+      count: failures.length,
+      failures: failures.map((f) => ({ order_id: f.order_id, event_id: f.event_id, cause: f.cause, event_class: f.event_class })),
+    },
+  }
+  emit(payload)
+  return deliver(payload, deps.deliverDeps ?? { emit })
+}
 
 function dlqWriteFailure(
   orderId: string,
@@ -670,6 +712,24 @@ export default async function onOrderPlacedStripeRetry({
         }
 
         for (const row of deferred) {
+          // Story 4.7 (DW-15-321 p.1): zdarzenie z wierszem DLQ tego konsumenta
+          // (poza `replayed`) jest wyłączone z wyboru pracy — należy do ops, nie
+          // do kolejnego `order.placed`. Sygnał nazwany, nie ciche pominięcie.
+          if (
+            await isEventDeadLettered(client, {
+              instance_id: resolveRuntimeInstanceId(),
+              market_id: row.market_id,
+              source_job: STRIPE_RETRY_DLQ_SOURCE,
+              event_id: row.event_id,
+              subject_id: orderId,
+            })
+          ) {
+            logger.warn?.(
+              `[on-order-placed-stripe-retry] code=${DLQ_EXCLUDED_CODE} order_id=${orderId} ` +
+                `event_id=${row.event_id} — zdarzenie w DLQ, pominięte w wyborze pracy`
+            )
+            continue
+          }
           try {
             if (row.provider === STRIPE_PATH_Y_WEBHOOK_PROVIDER) {
               const input = buildPathYRecoveryInput(row, orderId)
@@ -731,12 +791,19 @@ export default async function onOrderPlacedStripeRetry({
                     `[on-order-placed-stripe-retry] order_id=${orderId} trace=${row.event_id} ` +
                       `domkniecie rekordu deferred_issuance_trace NIEUDANE (wystawienie zachowane): ${closed.error}`
                   )
+                } else if (closed.version === null) {
+                  // Story 4.7 (DW-15-320 p.4): 0 dopasowań (rekord nieobecny, już
+                  // domknięty dla tego zamówienia albo rynek rekordu ≠ scope koperty)
+                  // — rekord zostaje w populacji; sygnał NAZWANY, nie info.
+                  logger.warn?.(
+                    `[on-order-placed-stripe-retry] code=${TRACE_CLOSE_NO_MATCH_CODE} order_id=${orderId} ` +
+                      `trace=${row.event_id} market_id=${input.scope.market_id} — domkniecie rekordu ` +
+                      `deferred_issuance_trace dopasowalo 0 wierszy`
+                  )
                 } else {
                   logger.info?.(
                     `[on-order-placed-stripe-retry] order_id=${orderId} trace=${row.event_id} ` +
-                      (closed.version === null
-                        ? "rekord deferred_issuance_trace nieobecny albo juz domkniety dla tego zamowienia"
-                        : `rekord deferred_issuance_trace domkniety (issued_after_link, version=${closed.version})`)
+                      `rekord deferred_issuance_trace domkniety (issued_after_link, version=${closed.version})`
                   )
                 }
               }
@@ -1077,7 +1144,8 @@ export default async function onOrderPlacedStripeRetry({
         `order_ids=${[...new Set(dlqWriteFailures.map((f) => f.order_id))].join(",")}`
     )
   }
-  return { dlq_write_failures: dlqWriteFailures }
+  const dlqAlarm = await alarmDlqWriteFailures(dlqWriteFailures)
+  return dlqAlarm ? { dlq_write_failures: dlqWriteFailures, dlq_write_failed_alarm: dlqAlarm } : { dlq_write_failures: dlqWriteFailures }
 }
 
 type EventBusLike = {
