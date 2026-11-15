@@ -56,7 +56,7 @@
  *   P6 (Robert), NIE agent / NIE CI.
  *
  * GRANICE (AC2, D-5): NIE zmienia taksonomii stanów (`ALL_ENTITLEMENT_INSTANCE_STATES`,
- * 13 stanów) ani grafu `ALLOWED_ENTITLEMENT_TRANSITIONS` — `void` używa ISTNIEJĄCEJ krawędzi
+ * 14 stanów (ADR-245)) ani grafu `ALLOWED_ENTITLEMENT_TRANSITIONS` — `void` używa ISTNIEJĄCEJ krawędzi
  * `{ISSUED,ACTIVE} → VOIDED`, `issue` używa istniejącej GENEZY → ISSUED (Path Y 3.3 wiring).
  * NIE rusza hard-gate'ów `MPV_MULTI_VENDOR` (ADR-134) / `SUBSCRIPTION_B2C` (ADR-136) —
  * recovery single-vendor / bonbeauty-only. NIE reimplementuje writera/VAT.

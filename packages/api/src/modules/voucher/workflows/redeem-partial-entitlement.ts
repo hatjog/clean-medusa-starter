@@ -1361,6 +1361,19 @@ export class RedeemPartialEntitlementOperation {
         REDEMPTION_KIND_REDEMPTION
       )
       if (prior) {
+        // v1.16.0 Story 5.8 (DW-15-359 p.1): replay pierwotnej realizacji PO
+        // korekcie (ADR-245 `Proposed`). Uprawnienie jest w `REDEMPTION_REVERSED`
+        // — kod znów nadaje się do realizacji, więc odpowiedź „zrealizowano”
+        // (replay 200) byłaby fałszywym sygnałem. Odmowa NAZWANA stanem
+        // uprawnienia; skutku nadal brak (idempotencja nienaruszona), a nowa
+        // realizacja wymaga nowego klucza.
+        if (ent.state === EntitlementInstanceState.REDEMPTION_REVERSED) {
+          throw new RedeemEntitlementStateError(
+            "redeem: replay klucza idempotencji realizacji skorygowanej " +
+              "(REDEMPTION_REVERSED) — pierwotna realizacja została cofnięta",
+            ent.state
+          )
+        }
         // L6: wykryj dryf parametrów — reużyty idempotency_key z innym amount_minor
         // to sygnał błędu po stronie callera (fail-loud, NIE cichy pierwszy-skutek).
         if (

@@ -24,6 +24,7 @@ import { Migration1779020000000 } from "../../modules/voucher/migrations/1779020
 import { VoucherService } from "../../modules/voucher/service"
 import {
   createRedeemPartialOperationFromPool,
+  RedeemEntitlementStateError,
   RedemptionCorrectionRefusedError,
 } from "../../modules/voucher/workflows/redeem-partial-entitlement"
 import { createPgRefundedScanner } from "../../jobs/voucher-ledger-reconciliation"
@@ -209,6 +210,23 @@ maybe("Story 5.7 — ślad realizacji i korekta na realnym PG", () => {
     expect(again.state).toBe("REDEEMED_FULL")
     expect(again.status).toBe("claimed")
     expect(again.rows.map((r) => r.kind)).toEqual(["REDEMPTION", "REVERSAL", "REDEMPTION"])
+  })
+
+  it("Story 5.8 (DW-15-359 p.1): replay pierwotnego klucza PO korekcie ⇒ nazwana odmowa REDEMPTION_REVERSED, zero skutku", async () => {
+    const code = `${RUN}_replay`
+    const ent = await seed(code)
+    const req = { voucher_code: code, redeem_full: true, idempotency_key_header: "s58-replay-key-1", redemption_market_id: "bonbeauty", actor: "vendor" } as const
+    await op().redeem(req)
+    await op().correct({ voucher_code: code, actor: "vendor" })
+    const corrected = await snapshot(code, ent)
+
+    const err = await op().redeem(req).then(() => null, (e: unknown) => e)
+    expect(err).toBeInstanceOf(RedeemEntitlementStateError)
+    expect((err as RedeemEntitlementStateError).entitlement_state).toBe("REDEMPTION_REVERSED")
+    const after = await snapshot(code, ent)
+    expect(after.state).toBe("REDEMPTION_REVERSED")
+    expect(after.status).toBe("idle")
+    expect(after.rows).toEqual(corrected.rows)
   })
 
   /** Zwrot Stripe (`payment.refunded`) w jednej transakcji — jak `stripe-payment-audit`. */

@@ -37,7 +37,7 @@
  *   WYŁĄCZNIE ręczna decyzja P6 (Robert), NIE agent / NIE CI.
  *
  * GRANICE (AC3, D-5): NIE zmienia taksonomii stanów (`ALL_ENTITLEMENT_INSTANCE_STATES`,
- * 13 stanów) ani grafu `ALLOWED_ENTITLEMENT_TRANSITIONS` — używa ISTNIEJĄCEJ tranzycji
+ * 14 stanów (ADR-245)) ani grafu `ALLOWED_ENTITLEMENT_TRANSITIONS` — używa ISTNIEJĄCEJ tranzycji
  * `ISSUED → ACTIVE`. NIE rusza hard-gate'ów `MPV_MULTI_VENDOR` (ADR-134) /
  * `SUBSCRIPTION_B2C` (ADR-136) — transfer single-vendor / bonbeauty-only (NIE
  * cross-vendor wallet = e-money/EMI). NIE buduje nowego UI (reuse v1.8.0 P4).

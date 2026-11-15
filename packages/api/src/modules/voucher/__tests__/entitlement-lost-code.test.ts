@@ -1003,7 +1003,7 @@ describe("L4 — granice czasowe anti-fraud (AI-Review-4)", () => {
 })
 
 // ---------------------------------------------------------------------------
-// D-5 — taksonomia stanów NIEZMIENIONA (13 stanów); brak nowego enuma/krawędzi
+// D-5 — taksonomia stanów NIEZMIENIONA (14 stanów (ADR-245)); brak nowego enuma/krawędzi
 // ---------------------------------------------------------------------------
 
 describe("granice D-5 — taksonomia stanów niezmieniona", () => {

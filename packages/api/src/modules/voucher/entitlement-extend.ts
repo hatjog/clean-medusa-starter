@@ -33,7 +33,7 @@
  * wymyślamy księgowania. Tranzycja extend routuje przez TEN SAM jednolity punkt
  * okablowania co reszta L4 (envelope + audit + posting hook — `buildTransitionEnvelopes`
  * / `runTransitionPostingHook` z 3.4), BEZ dodawania stanu/krawędzi do taksonomii
- * (`ALL_ENTITLEMENT_INSTANCE_STATES` — 13 stanów, D-5, niezmienione: extend
+ * (`ALL_ENTITLEMENT_INSTANCE_STATES` — 14 stanów (ADR-245), D-5, niezmienione: extend
  * zmienia `expires_at`/licznik, NIE stan).
  *
  * Podstawa normatywna (NFR4 — referencja, NIE autorstwo): ADR-139 (D3 posting hook
@@ -660,7 +660,7 @@ export type BuildExtendWiringInput = {
 /**
  * Buduje `TransitionInput` dla tranzycji extend routowanej przez JEDNOLITY punkt
  * okablowania (3.4). KRYTYCZNE: extend NIE zmienia stanu (`from === to` = bieżący
- * stan) — D-5, taksonomia 13 stanów NIEZMIENIONA (extend zmienia `expires_at`/licznik,
+ * stan) — D-5, taksonomia 14 stanów (ADR-245) NIEZMIENIONA (extend zmienia `expires_at`/licznik,
  * NIE dodaje stanu/krawędzi). Posting payload jest CELOWO pominięty (`posting`
  * undefined) — extend = entitlement liability bez zmiany ⇒ hook jest audit-only
  * (`attempted:false`); opłata = money-ledger (deferred, patrz {@link buildExtendPostingDeferral}).

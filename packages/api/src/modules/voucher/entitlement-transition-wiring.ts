@@ -27,7 +27,7 @@
  *   co NIE modyfikuje produkcyjnej stałej ani nie aktywuje postingu w runtime.
  *
  * NIE zmienia taksonomii stanów (AC3): konsumuje istniejące `assertTransition` /
- * `ALLOWED_ENTITLEMENT_TRANSITIONS` / `ALL_ENTITLEMENT_INSTANCE_STATES` (13 stanów,
+ * `ALLOWED_ENTITLEMENT_TRANSITIONS` / `ALL_ENTITLEMENT_INSTANCE_STATES` (14 stanów (ADR-245),
  * D-5) — dodaje WYŁĄCZNIE okablowanie efektów ubocznych.
  *
  * Podstawa normatywna (NFR4 — referencja, NIE autorstwo): ADR-137 (Path Y events /
@@ -67,7 +67,7 @@ import {
  * tworzy `entitlement_instance` od razu w ISSUED — to NIE jest tranzycja grafu
  * (do ISSUED nie prowadzi żadna krawędź `ALLOWED_ENTITLEMENT_TRANSITIONS`), lecz
  * geneza. Modelujemy ją jawnym sentinelem zamiast naciągać graf (AC3: taksonomia
- * 13 stanów + krawędzie pozostają NIEZMIENIONE — sentinel żyje wyłącznie w
+ * 14 stanów (ADR-245) + krawędzie pozostają NIEZMIENIONE — sentinel żyje wyłącznie w
  * warstwie okablowania, NIE w `models/entitlement.ts`).
  *
  * Fail-closed: JEDYNYM legalnym celem genezy jest ISSUED (patrz

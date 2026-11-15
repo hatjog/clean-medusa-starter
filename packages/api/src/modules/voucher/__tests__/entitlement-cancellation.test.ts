@@ -618,7 +618,7 @@ describe("buildCancellationWiring — CR-4: posting no-op z bramką ON (brak pay
 })
 
 // ---------------------------------------------------------------------------
-// D-5 — taksonomia stanów NIEZMIENIONA (13 stanów)
+// D-5 — taksonomia stanów NIEZMIENIONA (14 stanów (ADR-245))
 // ---------------------------------------------------------------------------
 
 describe("granice D-5 — taksonomia stanów niezmieniona", () => {

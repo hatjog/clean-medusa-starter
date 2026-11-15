@@ -10,7 +10,7 @@
  *         kto-zclaimował + posting hook no-op); idempotencja claim (replay = no-op),
  *         claim token jednorazowy (double-claim ⇒ fail-closed); personalized match.
  *   AC3 — transfer/claim = binding-only ⇒ posting hook NO-OP derecognition (audit-only,
- *         runtime_enabled=false, zero zapisu ledgera); taksonomia 13 stanów + tranzycja
+ *         runtime_enabled=false, zero zapisu ledgera); taksonomia 14 stanów (ADR-245) + tranzycja
  *         ISSUED→ACTIVE niezmienne (D-5); brak zmiany salda.
  */
 

@@ -8,7 +8,7 @@
  *         symulacja "on" (wstrzyknięta bramka) ⇒ pisze przez writer idempotentnie.
  *   AC1 — replay tranzycji ⇒ no-op posting (writer dedup, NIE podwaja ledger).
  *   AC2 — niedozwolona tranzycja → fail-closed, ZERO efektów ubocznych.
- *   AC3 — inwariant taksonomii: 13 stanów + graf tranzycji niezmienne (D-5).
+ *   AC3 — inwariant taksonomii: 14 stanów (ADR-245) + graf tranzycji niezmienne (D-5).
  */
 
 import { describe, it, expect, jest } from "@jest/globals"
@@ -331,7 +331,7 @@ describe("Story 3.4 — posting hook bez payloadu (tranzycja niefinansowa)", () 
 })
 
 // ===========================================================================
-// AC3 — inwariant taksonomii: 13 stanów + graf tranzycji niezmienne (D-5)
+// AC3 — inwariant taksonomii: 14 stanów (ADR-245) + graf tranzycji niezmienne (D-5)
 // ===========================================================================
 
 describe("Story 3.4 AC3 — inwariant taksonomii (wyłącznie okablowanie, D-5)", () => {
@@ -364,7 +364,7 @@ describe("Story 3.4 AC3 — inwariant taksonomii (wyłącznie okablowanie, D-5)"
     // aktualizowany JAWNIE, z nazwanym ADR-em, a nie „dociągnięty do zieleni":
     // pomiar zasięgu tej zmiany (pełna suita tranzycji) pokazał, że pęka
     // DOKŁADNIE ten jeden snapshot i nic poza nim — żadna inna dziedzina nie
-    // czyta tej krawędzi. Liczba stanów pozostaje 13 (asercja wyżej).
+    // czyta tej krawędzi. Liczba stanów to 14 (ADR-245; asercja wyżej).
     expect(ALLOWED_ENTITLEMENT_TRANSITIONS).toEqual({
       ISSUED: ["ACTIVE", "VOIDED", "EXPIRED"],
       ACTIVE: [

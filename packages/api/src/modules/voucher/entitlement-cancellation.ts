@@ -39,7 +39,7 @@
  * NIE agent / NIE CI.
  *
  * GRANICE (D-5): anulacja/no-show/rebook NIE zmieniają taksonomii stanów
- * (`ALL_ENTITLEMENT_INSTANCE_STATES`, 13 stanów) ani grafu — to operacje na booking
+ * (`ALL_ENTITLEMENT_INSTANCE_STATES`, 14 stanów (ADR-245)) ani grafu — to operacje na booking
  * pointerze (`from === to` = bieżący stan, jak extend 4.4). NIE rusza hard-gate'ów
  * `MPV_MULTI_VENDOR` (ADR-134) / `SUBSCRIPTION_B2C` (ADR-136). Scope: single-vendor,
  * bonbeauty-only.
@@ -526,7 +526,7 @@ export type BuildCancellationWiringInput = {
 /**
  * Buduje `TransitionInput` dla tranzycji anulacji/no-show/rebook routowanej przez
  * JEDNOLITY punkt okablowania (3.4). KRYTYCZNE: `from === to` (= bieżący stan) — D-5,
- * taksonomia 13 stanów NIEZMIENIONA (anulacja/no-show/rebook to operacje na booking
+ * taksonomia 14 stanów (ADR-245) NIEZMIENIONA (anulacja/no-show/rebook to operacje na booking
  * pointerze, NIE dodają stanu/krawędzi). Posting payload CELOWO pominięty (`posting`
  * undefined) — liability bez zmiany ⇒ hook audit-only (patrz {@link buildCancellationPostingNoop}).
  */

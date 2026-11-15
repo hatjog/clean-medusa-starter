@@ -463,7 +463,7 @@ export type {
 // entitlement liability BEZ ZMIANY ⇒ audit-only (BRAK payloadu postingu); opłata =
 // money-ledger (deferred, wymaga osobnego ADR + E6/P6). Tranzycja routuje przez
 // JEDNOLITY punkt okablowania (3.4) — from===to (extend NIE zmienia stanu, D-5,
-// taksonomia 13 stanów niezmieniona). NIE flipuje runtime_enabled (E6/P6).
+// taksonomia 14 stanów (ADR-245) niezmieniona). NIE flipuje runtime_enabled (E6/P6).
 export {
   EXTEND_FEE_PCT_MIN,
   EXTEND_FEE_PCT_MAX,
@@ -517,7 +517,7 @@ export type {
 // (NIE derecognition; liability bez zmiany, brak ruchu pieniądza) ⇒ posting hook = no-op
 // derecognition (BRAK payloadu); runtime_enabled zostaje false (flip = E6/P6). RODO: dane
 // recipienta minimalne (wyłącznie recipient_customer_id). Single-vendor / bonbeauty-only
-// (NIE cross-vendor wallet); taksonomia 13 stanów + hard-gate'y nietknięte (D-5).
+// (NIE cross-vendor wallet); taksonomia 14 stanów (ADR-245) + hard-gate'y nietknięte (D-5).
 export {
   TRANSFER_POSTING_NOOP_REASON,
   CLAIM_IDENTITY_AUTH_CONTRACT,
@@ -613,7 +613,7 @@ export type {
 // CELOWO pominięty (audit-only, attempted:false); runtime_enabled zostaje false (flip =
 // E6/P6). Obie tranzycje routują przez JEDNOLITY punkt wireEntitlementTransition (3.4) —
 // void = istniejąca krawędź {ISSUED,ACTIVE}→VOIDED, issue = istniejąca geneza → ISSUED
-// (D-5, taksonomia 13 stanów niezmieniona). NIE rusza hard-gate'ów MPV_MULTI_VENDOR/
+// (D-5, taksonomia 14 stanów (ADR-245) niezmieniona). NIE rusza hard-gate'ów MPV_MULTI_VENDOR/
 // SUBSCRIPTION_B2C. Single-vendor / bonbeauty-only.
 export {
   LOST_CODE_REPORT_WINDOW_DAYS,
