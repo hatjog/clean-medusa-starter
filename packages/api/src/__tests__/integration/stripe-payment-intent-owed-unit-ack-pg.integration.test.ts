@@ -481,7 +481,9 @@ runWithIsolatedDatabase("Story 3.1 AC3 — kontrakt ACK vs jednostki należne na
 
     // 3. ponowienie Stripe (ten sam event.id): kontrakt żąda nie-2xx, route odmawia ACK.
     const retry = await deliver(client, queue)
-    expect(queue).toHaveLength(0)
+    // Story 3.4 (AC4): ponowienie emituje ponownie WYŁĄCZNIE kopertę brakującej
+    // jednostki B (naprawa); ACK nadal wstrzymany do równości zbiorów.
+    expect(queue.map((d) => d.data.payload.order_id)).toEqual([ORDER_B])
     expect(retry.statusCode).toBe(ackStatusForVerdict(afterPartial.verdict))
     expect(retry.statusCode).toBeGreaterThanOrEqual(500)
     expect(retry.body).toMatchObject({

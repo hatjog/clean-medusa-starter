@@ -22,7 +22,11 @@ jest.mock("../../../../../lib/payment/stripe-payment-intent-metadata-stamp", () 
   stampPaymentIntentOrderFacts: jest.fn(async () => true),
 }))
 
-import { PAYMENT_INTENT_SUCCEEDED_EMIT_OPTIONS, POST } from "../route"
+import {
+  OWED_UNIT_RESERVATION_MISMATCH_ALARM,
+  PAYMENT_INTENT_SUCCEEDED_EMIT_OPTIONS,
+  POST,
+} from "../route"
 import { STRIPE_SIGNATURE_HEADER } from "../helpers"
 import {
   ackStatusForVerdict,
@@ -179,9 +183,14 @@ function makeRes(): FakeRes {
  * emit tylko kolejkuje, a subscriber pracuje osobno i może paść na jednej
  * z N kopert.
  */
-function makeWorld(opts: { rlsHook?: boolean; settlementError?: string } = {}) {
+function makeWorld(
+  opts: { rlsHook?: boolean; settlementError?: string; stampError?: string; emitErrorAfter?: number } = {}
+) {
   const rlsHook = opts.rlsHook ?? true
   const reservations = new Set<string>()
+  /** Story 3.4: utrwalone stany rozliczenia w kopercie rezerwacji (UPDATE). */
+  const stamps: { event_id: string; provider: string; state: Record<string, unknown> }[] = []
+  let emitted = 0
   const settled = new Set<string>()
   const queue: {
     name: string
@@ -194,6 +203,17 @@ function makeWorld(opts: { rlsHook?: boolean; settlementError?: string } = {}) {
         const key = `${values[0]}|${values[1]}`
         if (reservations.has(key)) return { rows: [], rowCount: 0 }
         reservations.add(key)
+        return { rows: [], rowCount: 1 }
+      }
+      if (new RegExp(`UPDATE ${WEBHOOK_DELIVERY_BARRIER_TABLE}`, "i").test(sql)) {
+        if (opts.stampError) throw new Error(opts.stampError)
+        const key = `${values[0]}|${values[1]}`
+        if (!reservations.has(key)) return { rows: [], rowCount: 0 }
+        stamps.push({
+          event_id: String(values[0]),
+          provider: String(values[1]),
+          state: JSON.parse(String(values[2])) as Record<string, unknown>,
+        })
         return { rows: [], rowCount: 1 }
       }
       if (/FROM money_path_compensation_failure/i.test(sql)) return { rows: [], rowCount: 0 }
@@ -211,13 +231,18 @@ function makeWorld(opts: { rlsHook?: boolean; settlementError?: string } = {}) {
           rowCount: 2,
         }
       }
-      if (/FROM event_processed/i.test(sql)) {
+      // Story 3.4 (DW-15-318 R-4): route czyta rozliczone jednostki ze WSPÓLNEJ
+      // bariery skutku, nie z `event_processed`.
+      if (/FROM owed_unit_effect_barrier/i.test(sql)) {
         if (opts.settlementError) throw new Error(opts.settlementError)
         expect(values).toEqual([PI])
         return {
-          rows: [...settled].sort().map((external_id) => ({ external_id })),
+          rows: [...settled].sort().map((owed_business_unit_key) => ({ owed_business_unit_key })),
           rowCount: settled.size,
         }
+      }
+      if (/FROM event_processed/i.test(sql)) {
+        throw new Error("Story 3.4: odczyt ACK poziomu 2 z event_processed zamiast z bariery")
       }
       return { rows: [], rowCount: 0 }
     },
@@ -235,7 +260,15 @@ function makeWorld(opts: { rlsHook?: boolean; settlementError?: string } = {}) {
             return { connect: async () => (rlsHook ? withAcquiredRlsContext(client) : client) }
           }
           if (key === Modules.EVENT_BUS) {
-            return { emit: async (e: (typeof queue)[number]) => queue.push(e) }
+            return {
+              emit: async (e: (typeof queue)[number]) => {
+                if (opts.emitErrorAfter !== undefined && emitted >= opts.emitErrorAfter) {
+                  throw new Error("event bus niedostępny")
+                }
+                emitted += 1
+                queue.push(e)
+              },
+            }
           }
           throw new Error(`unresolved ${key}`)
         },
@@ -254,7 +287,7 @@ function makeWorld(opts: { rlsHook?: boolean; settlementError?: string } = {}) {
       }
     }
   }
-  return { deliver, consume, settled, queue }
+  return { deliver, consume, settled, queue, stamps }
 }
 
 describe("Story 3.1 AC3 — route Path Y steruje ACK werdyktem jednostek należnych", () => {
@@ -278,8 +311,10 @@ describe("Story 3.1 AC3 — route Path Y steruje ACK werdyktem jednostek należn
     expect(afterPartial.missing_units).toEqual([UNIT_B])
 
     // Dostawa 2 (ponowienie Stripe, ten sam event.id): kontrakt żąda nie-2xx.
+    // Story 3.4 (AC4): ponowienie NAPRAWIA — w kolejce ląduje wyłącznie
+    // koperta brakującej jednostki B.
     const retry = await world.deliver("evt_ack_1")
-    expect(world.queue).toHaveLength(0)
+    expect(world.queue.map((e) => e.data.payload.order_id)).toEqual([ORDER_B])
     expect(retry.statusCode).toBe(ackStatusForVerdict(afterPartial.verdict))
     expect(retry.statusCode).toBeGreaterThanOrEqual(500)
     expect(retry.body).toMatchObject({
@@ -309,7 +344,8 @@ describe("Story 3.1 AC3 — route Path Y steruje ACK werdyktem jednostek należn
     expect(noSettlement.missing_units).toEqual([UNIT_A, UNIT_B])
 
     const retry = await world.deliver("evt_ack_no_settlement")
-    expect(world.queue).toHaveLength(2)
+    // Story 3.4: 2 koperty pierwszej dostawy + 2 koperty naprawy brakujących jednostek.
+    expect(world.queue).toHaveLength(4)
     expect(retry.statusCode).toBe(ackStatusForVerdict(noSettlement.verdict))
     expect(retry.statusCode).toBeGreaterThanOrEqual(500)
     expect(retry.body).toMatchObject({
@@ -353,14 +389,16 @@ describe("Story 8.4 fix — emisja niesie attempts/backoff, ponowienie Stripe NI
     }
   })
 
-  it("ponowienie Stripe po częściowym rozliczeniu daje 5xx i ZERO ponownych emisji (odzysk = bus, nie Stripe)", async () => {
+  it("Story 3.4: ponowienie Stripe po częściowym rozliczeniu daje 5xx i emituje ponownie WYŁĄCZNIE brakującą jednostkę z opcjami busa", async () => {
     const world = makeWorld()
     await world.deliver("evt_s84_no_reemit")
     world.consume([ORDER_A])
     const retry = await world.deliver("evt_s84_no_reemit")
     expect(retry.statusCode).toBeGreaterThanOrEqual(500)
     expect((retry.body as { reason?: string }).reason).toBe("owed_units_unsettled")
-    expect(world.queue).toHaveLength(0)
+    expect(world.queue).toHaveLength(1)
+    expect(world.queue[0].data.payload.order_id).toBe(ORDER_B)
+    expect(world.queue[0].options).toEqual({ ...PAYMENT_INTENT_SUCCEEDED_EMIT_OPTIONS })
   })
 })
 
@@ -452,7 +490,8 @@ describe("Story 3.3 — czysty duplikat bez settlement (D-35 p.4) i kontrakt wsp
     const retry = await world.deliver("evt_3_3_pure_duplicate")
     expect(retry.statusCode).toBe(500)
     expect((retry.body as { duplicate?: boolean }).duplicate).toBeUndefined()
-    expect(world.queue).toHaveLength(2)
+    // Story 3.4: ponowienie naprawia — obie brakujące jednostki wracają do kolejki.
+    expect(world.queue).toHaveLength(4)
   })
 
   it("SemVer kontraktu bariery 1.1.0; jedna instrukcja rezerwuje klucz jednostki i znacznik skutku", () => {
@@ -478,5 +517,85 @@ describe("Story 3.3 — czysty duplikat bez settlement (D-35 p.4) i kontrakt wsp
         { owed_business_unit_key: key, payment_intent_id: PI, order_id: ORDER_A, ...scope, market_id: " ", claimed_by_path: "r" }
       )
     ).toThrow(/market_id/)
+  })
+})
+
+// ── Story 3.4 AC4 / AC1: alarm-bramka niezgodności rezerwacja ↔ skutek ──────
+
+describe("Story 3.4 AC4 — niezgodność rezerwacji transportu i skutku jest bramką, a ponowienie naprawia", () => {
+  beforeEach(() => {
+    process.env.GP_INSTANCE_ID = "gp-test"
+    process.env.STRIPE_WEBHOOK_SECRET = SECRET
+  })
+
+  it("AC1: stan porażki UTRWALONY w rezerwacji (owed_unit_settlement.state='unsettled'), nie tylko w logu", async () => {
+    const world = makeWorld()
+    await world.deliver("evt_3_4_stamp")
+    world.consume([ORDER_A])
+    expect(world.stamps).toHaveLength(0)
+    const retry = await world.deliver("evt_3_4_stamp")
+    expect(retry.statusCode).toBe(500)
+    expect(world.stamps).toHaveLength(1)
+    expect(world.stamps[0]).toMatchObject({
+      event_id: "evt_3_4_stamp",
+      state: {
+        state: "unsettled",
+        alarm: OWED_UNIT_RESERVATION_MISMATCH_ALARM,
+        missing_units: [UNIT_B],
+        unexpected_units: [],
+        repair_dispatched_units: [UNIT_B],
+      },
+    })
+    expect(retry.body).toMatchObject({
+      alarm: OWED_UNIT_RESERVATION_MISMATCH_ALARM,
+      alarm_persisted: true,
+      repair_dispatched_units: [UNIT_B],
+    })
+  })
+
+  it("AC4: ponowne doręczenie po porażce naprawia stan; dopiero po równości zbiorów 200 (wcześniej nigdy 200 duplicate)", async () => {
+    const world = makeWorld()
+    await world.deliver("evt_3_4_repair")
+    world.consume([ORDER_A])
+    const retry = await world.deliver("evt_3_4_repair")
+    expect(retry.statusCode).toBe(500)
+    expect((retry.body as { duplicate?: boolean }).duplicate).toBeUndefined()
+    // konsument przetwarza kopertę naprawy ⇒ stan naprawiony
+    world.consume([ORDER_A, ORDER_B])
+    expect([...world.settled].sort()).toEqual([UNIT_A, UNIT_B])
+    const after = await world.deliver("evt_3_4_repair")
+    expect(after.statusCode).toBe(200)
+    expect(world.queue).toHaveLength(0)
+  })
+
+  it("AC4 (D-35 p.4): nieudany zapis alarmu ⇒ nadal HTTP 500 z alarm_persisted=false (bramka nie zależy od logu)", async () => {
+    const world = makeWorld({ stampError: "webhook_event_processed: permission denied" })
+    await world.deliver("evt_3_4_alarm_fail")
+    const retry = await world.deliver("evt_3_4_alarm_fail")
+    expect(retry.statusCode).toBe(500)
+    expect(retry.body).toMatchObject({
+      type: "owed_unit_ack_incomplete",
+      alarm: OWED_UNIT_RESERVATION_MISMATCH_ALARM,
+      alarm_persisted: false,
+    })
+    expect(JSON.stringify(retry.body)).not.toContain("permission denied")
+  })
+
+  it("AC4: nieudana ponowna emisja naprawy ⇒ HTTP 500 z nazwanym repair_error_code (catch ze skutkiem)", async () => {
+    const world = makeWorld({ emitErrorAfter: 2 })
+    await world.deliver("evt_3_4_emit_fail")
+    const retry = await world.deliver("evt_3_4_emit_fail")
+    expect(retry.statusCode).toBe(500)
+    expect(retry.body).toMatchObject({ repair_error_code: "repair_emit_failed", repair_dispatched_units: [] })
+  })
+
+  it("AC4: stan nieczytelny (UNKNOWN) nie naprawia na ślepo i nie stempluje", async () => {
+    const world = makeWorld({ settlementError: "boom" })
+    await world.deliver("evt_3_4_unknown")
+    const retry = await world.deliver("evt_3_4_unknown")
+    expect(retry.statusCode).toBe(500)
+    expect(world.queue).toHaveLength(2)
+    expect(world.stamps).toHaveLength(0)
+    expect((retry.body as { alarm?: string }).alarm).toBeUndefined()
   })
 })

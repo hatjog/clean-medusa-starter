@@ -83,7 +83,10 @@ import {
   MissingEntitlementProfileError,
   VoucherIssuanceBlockedError,
 } from "../workflows/entitlements/issue-entitlement"
-import { liveIssueEntitlementsPerLineWithinTx } from "../workflows/entitlements/live-issue-from-payment-intent"
+import {
+  liveIssueEntitlementsPerLineWithinTx,
+  PATH_Y_RECOVERY_PATH,
+} from "../workflows/entitlements/live-issue-from-payment-intent"
 import {
   numericMinorStringToSafeInteger,
   readNumericMinorString,
@@ -638,6 +641,9 @@ export function buildPathYRecoveryInput(
       psp_occurred_at: pspOccurredAt,
     },
     scope: { instance_id: instanceId, market_id: row.market_id },
+    // Story 3.4 (DW-15-331 p.3): bariera zapisuje rzeczywistą trasę — odzysk,
+    // nie subscriber `voucher-live-issue`.
+    claimed_by_path: PATH_Y_RECOVERY_PATH,
   }
 }
 

@@ -22,6 +22,7 @@ import {
 } from "../../../modules/voucher/entitlement-transition-wiring"
 import { assertEventEnvelopeMatchesContract } from "../../../modules/gp-core/market-lifecycle-events"
 import { EntitlementInstanceState } from "../../../modules/voucher/models/entitlement"
+import { handleOwedUnitBarrierSql } from "./owed-unit-barrier-fake"
 
 // Story 11.2 (ADR-240): producent `entitlement_state_changed` bierze
 // `scope.instance_id` WYŁĄCZNIE z GP_INSTANCE_ID; brak = odmowa emisji.
@@ -48,6 +49,9 @@ class FakeClient {
     params: ReadonlyArray<unknown> = []
   ) {
     this.sequence.push({ kind: "sql", value: sql.trim().split("\n")[0] })
+    // Story 3.4 (DW-15-318): wspólna bariera skutku na trasie natywnej.
+    const owedUnitBarrier = handleOwedUnitBarrierSql(this, sql, params)
+    if (owedUnitBarrier) return owedUnitBarrier as unknown as { rows: T[]; rowCount: number }
     if (sql.includes("INSERT INTO webhook_event_processed")) {
       const key = `${params[0]}:stripe`
       if (this.rows.has(key)) return { rows: [] as T[], rowCount: 0 }

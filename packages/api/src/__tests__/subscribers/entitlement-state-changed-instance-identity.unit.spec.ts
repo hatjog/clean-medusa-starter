@@ -109,6 +109,8 @@ function genericClient(rows: unknown[] = []) {
       if (sql === FIND_DEFERRED_CAPTURES_SQL) return { rows, rowCount: rows.length }
       if (sql.includes("SET state = 'ACTIVE'")) return { rows: [{ id: values[0] }], rowCount: 1 }
       if (sql.includes("INSERT INTO webhook_event_processed")) return { rows: [], rowCount: 1 }
+      // Story 3.4 (DW-15-318): trasa natywna rezerwuje jednostkę we wspólnej barierze skutku.
+      if (sql.includes("INSERT INTO owed_unit_effect_barrier")) return { rows: [], rowCount: 1 }
       return { rows: [], rowCount: 0 }
     }),
     release: jest.fn(),
