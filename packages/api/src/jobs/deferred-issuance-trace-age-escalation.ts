@@ -40,6 +40,12 @@
  */
 import type { MedusaContainer } from "@medusajs/framework/types"
 
+import {
+  deliverAlert,
+  sanitizeAttemptError,
+  type AlertDeliveryResult,
+  type DeliverAlertDeps,
+} from "../lib/alert-channel"
 import { emitStructuredAlert, type StructuredAlertPayload } from "../lib/alert-emit"
 import { marketContextStorage } from "../lib/market-context"
 import { queryUnderMarketContext } from "../lib/payment/stripe-payment-intent-transport"
@@ -89,6 +95,7 @@ export type AgeEscalationRunResult =
       markets: string[]
       escalated: Array<{ market_id: string; trace_id: string; age_seconds: number }>
       per_market: AgeEscalationMarketResult[]
+      run_failed_deliveries: AlertDeliveryResult[]
     }
   | {
       status: "failed"
@@ -96,12 +103,16 @@ export type AgeEscalationRunResult =
       error: string
       markets: string[]
       per_market: AgeEscalationMarketResult[]
+      run_failed_deliveries: AlertDeliveryResult[]
     }
 
 export type AgeEscalationDeps = {
   env?: NodeJS.ProcessEnv
   thresholdConfig?: Partial<DeferredIssuanceTraceAgeThresholdConfig>
   emit?: (payload: StructuredAlertPayload) => void
+  /** Story 11.3 (DW-15-342 p.5): RUN_FAILED idzie trwałym kanałem, nie tylko do logu. */
+  deliver?: (alert: StructuredAlertPayload, deps?: DeliverAlertDeps) => Promise<AlertDeliveryResult>
+  deliverDeps?: DeliverAlertDeps
   /** Klient odczytu pod kontekstem rynku; domyślnie `queryUnderMarketContext`. */
   clientForMarket?: (
     container: MedusaContainer,
@@ -169,6 +180,13 @@ export async function runDeferredIssuanceTraceAgeEscalation(
   const clientForMarket = deps.clientForMarket ?? defaultClientForMarket
   const thresholdConfig = deps.thresholdConfig ?? DEFERRED_ISSUANCE_TRACE_AGE_THRESHOLD
   const declared = readDeclaredMarkets(deps.env ?? process.env)
+  const deliver = deps.deliver ?? deliverAlert
+  const deliverDeps = deps.deliverDeps ?? { env: deps.env ?? process.env }
+  const runFailedDeliveries: AlertDeliveryResult[] = []
+  const raiseRunFailed = async (payload: StructuredAlertPayload): Promise<void> => {
+    emit(payload)
+    runFailedDeliveries.push(await deliver(payload, deliverDeps))
+  }
 
   const scope = {
     // `undefined` jedzie do nośnika CELOWO — odmowę wystawia nośnik (AD-21).
@@ -224,8 +242,8 @@ export async function runDeferredIssuanceTraceAgeEscalation(
       } catch (err) {
         // Izolacja per rynek (DW-15-333 p.1): porażka ma skutek (ERROR + wynik
         // rynku), a pozostałe rynki są oceniane dalej.
-        const message = err instanceof Error ? err.message : String(err)
-        emit({
+        const message = sanitizeAttemptError(err instanceof Error ? err.message : String(err))
+        await raiseRunFailed({
           severity: "ERROR",
           code: ALERT_CODE_RUN_FAILED,
           message: `Eskalacja wieku sladow: rynek ${marketId} nieoceniony (read_failed)`,
@@ -238,15 +256,15 @@ export async function runDeferredIssuanceTraceAgeEscalation(
   } catch (err) {
     const reason =
       err instanceof SystemMarketContextError ? `market_context_denied:${err.reason}` : "read_failed"
-    const message = err instanceof Error ? err.message : String(err)
-    emit({
+    const message = sanitizeAttemptError(err instanceof Error ? err.message : String(err))
+    await raiseRunFailed({
       severity: "ERROR",
       code: ALERT_CODE_RUN_FAILED,
       message: `Eskalacja wieku sladow nie wykonala sie (${reason}) — populacja nieoceniona`,
       context: { reason, error: message, markets: declared ?? null, markets_env_var: MARKETS_ENV_VAR },
     })
     logger.error(`escalation FAILED (${reason}); populacja ponad progiem nieoceniona`, err)
-    return { status: "failed", reason, error: message, markets: declared ?? [], per_market: perMarket }
+    return { status: "failed", reason, error: message, markets: declared ?? [], per_market: perMarket, run_failed_deliveries: runFailedDeliveries }
   }
 
   const failedMarket = perMarket.find((m) => !m.evaluated)
@@ -257,13 +275,14 @@ export async function runDeferredIssuanceTraceAgeEscalation(
       error: failedMarket.error,
       markets: declared ?? [],
       per_market: perMarket,
+      run_failed_deliveries: runFailedDeliveries,
     }
   }
 
   logger.info(
     `markets=${(declared ?? []).join(",")} threshold_seconds=${thresholdSeconds} escalated=${escalated.length}`
   )
-  return { status: "ok", threshold_seconds: thresholdSeconds, markets: declared ?? [], escalated, per_market: perMarket }
+  return { status: "ok", threshold_seconds: thresholdSeconds, markets: declared ?? [], escalated, per_market: perMarket, run_failed_deliveries: runFailedDeliveries }
 }
 
 export default async function deferredIssuanceTraceAgeEscalation(

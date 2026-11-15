@@ -165,6 +165,27 @@ export function mapDeferredIssuanceTraceRow(r: Raw): RecoveryPopulationRow {
   })
 }
 
+/**
+ * Story 11.3 (DW-15-341 p.1): redakcja `reason` przy odczycie. Wiersze zapisane
+ * przed redakcją writera (format `${err.name}: ${err.message}`) cytują wartość
+ * wejścia. Zostają wyłącznie wiodące segmenty kodu (`[A-Za-z0-9_.-]`, separator
+ * `:`) — dokładnie kształt `classifyEventFailure`; reszta = znacznik `redacted`.
+ */
+const DLQ_REASON_SEGMENT = /^[A-Za-z0-9_.-]{1,64}$/
+export const DLQ_REASON_REDACTED_MARKER = "redacted" as const
+
+export function redactDlqReason(reason: unknown): string {
+  const raw = typeof reason === "string" ? reason : ""
+  const kept: string[] = []
+  for (const segment of raw.split(":")) {
+    if (!DLQ_REASON_SEGMENT.test(segment)) break
+    kept.push(segment)
+  }
+  if (kept.length === 0) return DLQ_REASON_REDACTED_MARKER
+  const joined = kept.join(":")
+  return joined.length === raw.length ? joined : `${joined}:${DLQ_REASON_REDACTED_MARKER}`
+}
+
 export function mapDlqEntryRow(r: Raw): RecoveryPopulationRow {
   return base("dlq_entry", r, {
     tier: r.tier,
@@ -172,7 +193,7 @@ export function mapDlqEntryRow(r: Raw): RecoveryPopulationRow {
     failure_mode: r.failure_mode,
     sqlstate: (r.sqlstate as string | null) ?? null,
     is_retryable: r.is_retryable === true,
-    reason: r.reason,
+    reason: redactDlqReason(r.reason),
     source_job: r.source_job,
   })
 }

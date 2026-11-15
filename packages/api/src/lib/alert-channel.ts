@@ -65,7 +65,7 @@ export type AlertChannelAttempt =
   | { channel: AlertChannelKind | "unknown"; ok: false; error: string }
 
 export type AlertDeliveryResult =
-  | { status: "delivered"; delivered_via: AlertChannelKind; attempts: AlertChannelAttempt[] }
+  | { status: "delivered"; delivered_via: AlertChannelKind; attempts: AlertChannelAttempt[]; trace_emit_failed?: true }
   | {
       status: "failed"
       code: typeof ALERT_CODE_CHANNEL_ALL_FAILED | typeof ALERT_CODE_CHANNEL_NOT_CONFIGURED
@@ -232,21 +232,10 @@ export async function deliverAlert(
   }))
 
   for (const channel of resolved.channels) {
+    let delivered = false
     try {
       await channel.deliver(alert)
-      attempts.push({ channel: channel.kind, ok: true })
-      // AC3: wynik dostarczenia jest ZAPISANY (log + ring buffer), a porażka
-      // wcześniejszej próby przy sukcesie fallbacku zostawia nazwany ślad WARN.
-      const afterFailure = attempts.some((a) => !a.ok)
-      emit({
-        severity: afterFailure ? "WARN" : "INFO",
-        code: afterFailure ? ALERT_CODE_CHANNEL_DELIVERED_AFTER_FAILURE : ALERT_CODE_CHANNEL_DELIVERED,
-        message: afterFailure
-          ? `Alarm ${alert.code} dostarczony kanalem ${channel.kind} dopiero po porazce ${attempts.length - 1} wczesniejszej proby`
-          : `Alarm ${alert.code} dostarczony kanalem ${channel.kind}`,
-        context: { alert_code: alert.code, alert_severity: alert.severity, delivered_via: channel.kind, attempts },
-      })
-      return { status: "delivered", delivered_via: channel.kind, attempts }
+      delivered = true
     } catch (err) {
       attempts.push({
         channel: channel.kind,
@@ -256,6 +245,30 @@ export async function deliverAlert(
         ),
       })
     }
+    if (!delivered) continue
+    // Story 11.3 (DW-15-342 p.7): ślad dostarczenia emitowany POZA `try` wysyłki —
+    // wyjątek `emit` nie może oznaczyć udanego kanału jako porażki ani wysłać
+    // duplikatu fallbackiem.
+    attempts.push({ channel: channel.kind, ok: true })
+    // AC3: wynik dostarczenia jest ZAPISANY (log + ring buffer), a porażka
+    // wcześniejszej próby przy sukcesie fallbacku zostawia nazwany ślad WARN.
+    const afterFailure = attempts.some((a) => !a.ok)
+    const result: AlertDeliveryResult = { status: "delivered", delivered_via: channel.kind, attempts }
+    try {
+      emit({
+        severity: afterFailure ? "WARN" : "INFO",
+        code: afterFailure ? ALERT_CODE_CHANNEL_DELIVERED_AFTER_FAILURE : ALERT_CODE_CHANNEL_DELIVERED,
+        message: afterFailure
+          ? `Alarm ${alert.code} dostarczony kanalem ${channel.kind} dopiero po porazce ${attempts.length - 1} wczesniejszej proby`
+          : `Alarm ${alert.code} dostarczony kanalem ${channel.kind}`,
+        context: { alert_code: alert.code, alert_severity: alert.severity, delivered_via: channel.kind, attempts },
+      })
+    } catch (emitErr) {
+      // NFR-4: porażka zapisu śladu nie ginie — trafia do stderr i do wyniku.
+      console.error(`[alert-channel] emit sladu dostarczenia nie powiodl sie: ${sanitizeAttemptError(String((emitErr as Error)?.message ?? emitErr))}`)
+      return { ...result, trace_emit_failed: true } as AlertDeliveryResult
+    }
+    return result
   }
 
   const code = resolved.channels.length === 0 ? ALERT_CODE_CHANNEL_NOT_CONFIGURED : ALERT_CODE_CHANNEL_ALL_FAILED

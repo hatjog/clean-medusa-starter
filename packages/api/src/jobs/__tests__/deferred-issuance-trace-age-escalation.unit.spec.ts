@@ -105,6 +105,8 @@ describe("Story 4.5 AC2 — job deferred-issuance-trace-age-escalation", () => {
       error: "connection refused",
       markets: ["mkt_a"],
       per_market: [{ market_id: "mkt_a", evaluated: false, reason: "read_failed", error: "connection refused" }],
+      // Story 11.3 (DW-15-342 p.5): RUN_FAILED idzie trwałym kanałem; bez GP_ALERT_* = nazwany NOT_CONFIGURED.
+      run_failed_deliveries: [expect.objectContaining({ status: "failed", code: "ALERT_CHANNEL_NOT_CONFIGURED" })],
     })
     expect(alerts).toEqual([expect.objectContaining({ severity: "ERROR", code: ALERT_CODE_RUN_FAILED })])
     expect(errors.some((m) => /FAILED/.test(m))).toBe(true)
@@ -148,5 +150,27 @@ describe("DEKLARACJA ISTNIEJE POZA KODEM (finding checkpointu, wzorzec R-4.1-H3)
     expect(line).toBeDefined()
     const value = (line as string).slice(MARKETS_ENV_VAR.length + 1).trim()
     expect(value.split(",").map((m) => m.trim())).toContain("bonbeauty")
+  })
+})
+
+describe("Story 11.3 — RUN_FAILED joba 4.5 przez deliver (DW-15-342 p.5)", () => {
+  it("porażka odczytu ⇒ RUN_FAILED dostarczony wstrzykniętym kanałem z oczyszczonym error", async () => {
+    const delivered: StructuredAlertPayload[] = []
+    const result = await runDeferredIssuanceTraceAgeEscalation({ resolve: () => ({ info: () => undefined, warn: () => undefined, error: () => undefined }) } as never, {
+      env: { [MARKETS_ENV_VAR]: "mkt_a", GP_INSTANCE_ID: "gp_test" },
+      emit: () => undefined,
+      deliver: async (p) => {
+        delivered.push(p)
+        return { status: "delivered", delivered_via: "webhook", attempts: [{ channel: "webhook", ok: true }] }
+      },
+      clientForMarket: () => ({
+        query: async () => {
+          throw new Error("connect postgres://db.internal:5432/x failed")
+        },
+      }),
+    })
+    expect(delivered.map((d) => d.code)).toEqual([ALERT_CODE_RUN_FAILED])
+    expect(JSON.stringify(delivered[0].context)).not.toContain("db.internal")
+    expect(result.run_failed_deliveries).toHaveLength(1)
   })
 })

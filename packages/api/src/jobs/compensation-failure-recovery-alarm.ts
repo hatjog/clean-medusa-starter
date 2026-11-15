@@ -31,7 +31,7 @@
  */
 import type { MedusaContainer } from "@medusajs/framework/types"
 
-import { deliverAlert, type AlertDeliveryResult, type DeliverAlertDeps } from "../lib/alert-channel"
+import { deliverAlert, sanitizeAttemptError, type AlertDeliveryResult, type DeliverAlertDeps } from "../lib/alert-channel"
 import { emitStructuredAlert, type StructuredAlertPayload } from "../lib/alert-emit"
 import { marketContextStorage } from "../lib/market-context"
 import { queryUnderMarketContext } from "../lib/payment/stripe-payment-intent-transport"
@@ -175,7 +175,11 @@ export async function runCompensationFailureRecoveryAlarm(
    * AC3: porażka samego alarmu nie degraduje się do logu — RUN_FAILED idzie
    * tym samym kanałem trwałym co alarm populacji.
    */
-  async function raiseRunFailed(payload: StructuredAlertPayload, reason: string, marketId: string | null) {
+  async function raiseRunFailed(raw: StructuredAlertPayload, reason: string, marketId: string | null) {
+    // Story 11.3 (DW-15-342 p.6): `context.error` idzie kanałem zewnętrznym tylko po sanitizacji.
+    const ctx = raw.context ?? {}
+    const payload: StructuredAlertPayload =
+      typeof ctx.error === "string" ? { ...raw, context: { ...ctx, error: sanitizeAttemptError(ctx.error) } } : raw
     emit(payload)
     const delivery = await deliver(payload, deliverDeps)
     result.run_failed_alarms.push({ reason, market_id: marketId, delivery })

@@ -793,3 +793,82 @@ describe("test-the-test: klucz idempotencji musi wynikać z intencji", () => {
     ).rejects.toThrow(RecoveryRecordNotFoundError)
   })
 })
+
+// ── Story 11.3 AC-4 (rozszerzenie): klucze kroków D-37, wiązanie evidence, reguły w backendzie ──
+import {
+  EVIDENCE_KINDS_BY_TARGET,
+  httpStatusForStepOutcome,
+  RECOVERY_ACTION_TARGETS,
+  stepKey,
+  verifyEvidenceBinding,
+} from "../../lib/recovery/recovery-action-runtime"
+import { RECOVERY_TRANSITIONS } from "../../lib/recovery/recovery-action-contract"
+
+describe("Story 11.3 — kontrakt kroków propose → approve (D-37)", () => {
+  const intentKey = buildRecoveryIdempotencyKey({
+    population_type: "compensation_failure",
+    population_id: "mpcf_1",
+    action: "retry",
+    expected_version: 1,
+  })
+
+  it("propose i approve mają OSOBNE klucze idempotencji wyprowadzone z tej samej intencji", () => {
+    expect(stepKey("propose", intentKey)).toBe(`propose:${intentKey}`)
+    expect(stepKey("approve", intentKey)).toBe(`approve:${intentKey}`)
+    expect(stepKey("propose", intentKey)).not.toBe(stepKey("approve", intentKey))
+  })
+
+  it("każdy cel retry/resolve jest dozwolonym przejściem tabeli 4.1, a każdy cel terminalny ma rodzaj evidence", () => {
+    for (const [population, pairs] of Object.entries(RECOVERY_ACTION_TARGETS)) {
+      for (const targets of Object.values(pairs)) {
+        for (const target of targets) {
+          const fromAny = Object.keys(RECOVERY_TRANSITIONS[population as keyof typeof RECOVERY_TRANSITIONS].allowed).some((from) =>
+            RECOVERY_TRANSITIONS[population as keyof typeof RECOVERY_TRANSITIONS].allowed[from].includes(target)
+          )
+          expect(fromAny).toBe(true)
+          if (RECOVERY_TRANSITIONS[population as keyof typeof RECOVERY_TRANSITIONS].terminal.includes(target)) {
+            expect(EVIDENCE_KINDS_BY_TARGET[target]?.length).toBeGreaterThan(0)
+          }
+        }
+      }
+    }
+  })
+
+  it("evidence związane z faktem wiersza: obca płatność / obce zdarzenie ⇒ odmowa", () => {
+    const actor = { actor_type: "user" as const, actor_id: "u", auth_identity_id: null, session_source: "medusa_admin_session" as const }
+    const ev = (kind: "refund_confirmed" | "replayed_successfully" | "written_off_with_approval", reference: string) => ({
+      kind,
+      reference,
+      recorded_at: "2026-11-15T00:00:00Z",
+      recorded_by: actor,
+    })
+    expect(verifyEvidenceBinding(ev("refund_confirmed", "pi_1"), "compensation_failure", "resolved_recovered", { payment_intent_id: "pi_1" })).toBe(true)
+    expect(verifyEvidenceBinding(ev("refund_confirmed", "pi_2"), "compensation_failure", "resolved_recovered", { payment_intent_id: "pi_1" })).toBe(false)
+    expect(verifyEvidenceBinding(ev("written_off_with_approval", "INC-1"), "compensation_failure", "resolved_recovered", { payment_intent_id: "pi_1" })).toBe(false)
+    expect(verifyEvidenceBinding(ev("replayed_successfully", "evt_1"), "dlq_entry", "replayed", { event_id: "evt_1" })).toBe(true)
+    expect(verifyEvidenceBinding(ev("replayed_successfully", "evt_1"), "dlq_entry", "replayed", { event_id: null })).toBe(false)
+  })
+
+  it("konflikt jest jawny (409), odmowa rynku 403, powtórka 200", () => {
+    expect(httpStatusForStepOutcome("refused_version_conflict")).toBe(409)
+    expect(httpStatusForStepOutcome("refused_market_forbidden")).toBe(403)
+    expect(httpStatusForStepOutcome("replayed")).toBe(200)
+    expect(httpStatusForStepOutcome("proposed")).toBe(201)
+  })
+
+  it("AC-4: żadna reguła domenowa recovery nie mieszka w CLI (gp-ops/cli/src)", () => {
+    const cliRoot = path.resolve(__dirname, "../../../../../../../gp-ops/cli/src")
+    const hits: string[] = []
+    const walk = (dir: string) => {
+      if (!fs.existsSync(dir)) return
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        const p = path.join(dir, entry.name)
+        if (entry.isDirectory()) walk(p)
+        else if (/\.(ts|js)$/.test(entry.name) && /RECOVERY_TRANSITIONS|resolved_recovered|closed_order_never_created|discarded_with_evidence|EVIDENCE_KINDS_BY_TARGET/.test(fs.readFileSync(p, "utf8"))) hits.push(p)
+      }
+    }
+    walk(cliRoot)
+    expect(fs.existsSync(cliRoot)).toBe(true)
+    expect(hits).toEqual([])
+  })
+})

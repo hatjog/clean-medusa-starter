@@ -202,6 +202,12 @@ if (process.env.TEST_TYPE === "integration:http") {
   module.exports.testMatch = [
     "**/packages/api/src/__tests__/integration/story-4-7-recovery-read-pg.integration.test.[jt]s",
   ];
+} else if (process.env.TEST_TYPE === "story-11-3-recovery-actions-pg") {
+  // v1.16.0 Story 11.3 — autoryzowane akcje recovery (propose → approve) pod RLS na
+  // realnym PostgreSQL; suita DROP-uje i odtwarza tabele populacji (DB *_test).
+  module.exports.testMatch = [
+    "**/packages/api/src/__tests__/integration/story-11-3-recovery-actions-pg.integration.test.[jt]s",
+  ];
 } else if (process.env.TEST_TYPE === "story-4-6-dlq-pg") {
   // v1.16.0 Story 4.6 — nośnik DLQ (mor_policy_dlq_entry) pod RLS na realnym
   // PostgreSQL; wyłącznie własna suita (DATABASE_URL = izolowana DB *_test).

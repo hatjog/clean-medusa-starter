@@ -30,9 +30,12 @@ export const RECOVERY_POPULATION_ADAPTER_MISSING = "RECOVERY_POPULATION_ADAPTER_
  */
 export const COMPENSATION_FAILURE_SOURCE_TABLE = "compensation_failure" as const
 export const COMPENSATION_FAILURE_SOURCE_QUARANTINE = "backfill_quarantine" as const
+/** Story 11.3: wiersz tabeli populacji `deferred_issuance_trace` / `mor_policy_dlq_entry`. */
+export const RECOVERY_ALARM_SOURCE_POPULATION_TABLE = "population_table" as const
 export type RecoveryAlarmSource =
   | typeof COMPENSATION_FAILURE_SOURCE_TABLE
   | typeof COMPENSATION_FAILURE_SOURCE_QUARANTINE
+  | typeof RECOVERY_ALARM_SOURCE_POPULATION_TABLE
 
 export type RecoveryAlarm = {
   population_type: RecoveryPopulationType
@@ -48,12 +51,21 @@ export type RecoveryAlarm = {
   state: string
 }
 
+export type RecoveryAlarmSeverity = "WARN" | "ERROR" | "CRITICAL"
+
 export type RecoveryPopulationAdapter<Row = unknown> = {
   population_type: RecoveryPopulationType
   alarmCode: string
   loader: (client: TraceQueryClient) => Promise<Row[]>
   deadlineOf: (row: Row) => string
   toAlarm: (row: Row) => RecoveryAlarm
+  /**
+   * Story 11.3 AC-2: eskalacja per populacja (poziom alarmu wiersza). Opcjonalna
+   * wyłącznie dla zgodności kształtu 4.3; adaptery 11.3 ją niosą.
+   */
+  escalationOf?: (row: Row) => RecoveryAlarmSeverity
+  /** Story 11.3 AC-2: klucz deduplikacji wiersza w przebiegu (jeden wpis na klucz). */
+  dedupKeyOf?: (row: Row) => string
 }
 
 export class RecoveryPopulationAdapterMissingError extends Error {
@@ -176,3 +188,178 @@ export const COMPENSATION_ALARM_REQUIRED_POPULATIONS: readonly RecoveryPopulatio
 export const DEFAULT_RECOVERY_POPULATION_ADAPTERS = createRecoveryPopulationAdapterRegistry([
   COMPENSATION_FAILURE_ADAPTER,
 ])
+
+// ── Story 11.3 AC-2: adaptery deferred_issuance_trace i dlq_entry ───────────
+
+/** Wiersz po terminie dłużej niż ta liczba sekund = CRITICAL (eskalacja ponad SLA 24 h, D-35 p.9). */
+export const RECOVERY_ALARM_CRITICAL_OVERDUE_SECONDS = 24 * 3600
+
+export type OverduePopulationRow = {
+  population_id: string
+  instance_id: string
+  market_id: string
+  owner_type: RecoveryOwner["owner_type"]
+  owner_id: string
+  deadline: string | Date
+  state: string
+  overdue_seconds: number | string
+}
+
+function openStatesOf(population: RecoveryPopulationType): string[] {
+  const t = RECOVERY_TRANSITIONS[population]
+  return Object.keys(t.allowed).filter((s) => !t.terminal.includes(s))
+}
+
+export const DEFERRED_ISSUANCE_TRACE_ALARMABLE_STATES: readonly string[] = openStatesOf("deferred_issuance_trace")
+export const DLQ_ENTRY_ALARMABLE_STATES: readonly string[] = openStatesOf("dlq_entry")
+
+export const ALERT_CODE_DEFERRED_ISSUANCE_TRACE_OVERDUE = "RECOVERY_DEFERRED_ISSUANCE_TRACE_OVERDUE" as const
+export const ALERT_CODE_DLQ_ENTRY_OVERDUE = "RECOVERY_DLQ_ENTRY_OVERDUE" as const
+
+/** Termin i wiek po terminie liczy BAZA (`statement_timestamp()`), zakres daje RLS. */
+export const LIST_OVERDUE_DEFERRED_ISSUANCE_TRACES_SQL = `
+  SELECT trace_id AS population_id, instance_id, market_id, owner_type, owner_id, deadline, state,
+         EXTRACT(EPOCH FROM (statement_timestamp() - deadline))::bigint AS overdue_seconds
+    FROM deferred_issuance_trace
+   WHERE state = ANY($1::text[])
+     AND deadline < statement_timestamp()
+   ORDER BY deadline ASC, trace_id ASC
+`
+
+export const LIST_OVERDUE_DLQ_ENTRIES_SQL = `
+  SELECT population_id, instance_id, market_id, owner_type, owner_id, deadline, state,
+         EXTRACT(EPOCH FROM (statement_timestamp() - deadline))::bigint AS overdue_seconds
+    FROM mor_policy_dlq_entry
+   WHERE state = ANY($1::text[])
+     AND deadline < statement_timestamp()
+   ORDER BY deadline ASC, population_id ASC
+`
+
+function overdueEscalation(row: OverduePopulationRow, escalatedState: string): RecoveryAlarmSeverity {
+  const overdue = Number(row.overdue_seconds)
+  if (Number.isFinite(overdue) && overdue >= RECOVERY_ALARM_CRITICAL_OVERDUE_SECONDS) return "CRITICAL"
+  return row.state === escalatedState ? "ERROR" : "WARN"
+}
+
+function overdueAdapter(
+  population: "deferred_issuance_trace" | "dlq_entry",
+  alarmCode: string,
+  sql: string,
+  states: readonly string[],
+  escalatedState: string
+): RecoveryPopulationAdapter<OverduePopulationRow> {
+  return {
+    population_type: population,
+    alarmCode,
+    loader: async (client) => (await client.query<OverduePopulationRow>(sql, [[...states]])).rows,
+    deadlineOf: (row) => toIso(row.deadline),
+    escalationOf: (row) => overdueEscalation(row, escalatedState),
+    dedupKeyOf: (row) => `${population}:${row.instance_id}:${row.market_id}:${row.population_id}`,
+    toAlarm: (row) => ({
+      population_type: population,
+      source: RECOVERY_ALARM_SOURCE_POPULATION_TABLE,
+      failure_id: row.population_id,
+      instance_id: row.instance_id,
+      market_id: row.market_id,
+      owner_type: row.owner_type,
+      owner_id: row.owner_id,
+      deadline: toIso(row.deadline),
+      state: row.state,
+    }),
+  }
+}
+
+export const DEFERRED_ISSUANCE_TRACE_ADAPTER = overdueAdapter(
+  "deferred_issuance_trace",
+  ALERT_CODE_DEFERRED_ISSUANCE_TRACE_OVERDUE,
+  LIST_OVERDUE_DEFERRED_ISSUANCE_TRACES_SQL,
+  DEFERRED_ISSUANCE_TRACE_ALARMABLE_STATES,
+  "escalated"
+)
+
+export const DLQ_ENTRY_ADAPTER = overdueAdapter(
+  "dlq_entry",
+  ALERT_CODE_DLQ_ENTRY_OVERDUE,
+  LIST_OVERDUE_DLQ_ENTRIES_SQL,
+  DLQ_ENTRY_ALARMABLE_STATES,
+  "dlq_pending_ops_review"
+)
+
+/** Populacje alarmu runtime 11.3 (compensation_failure ma własny scheduler 4.3). */
+export const RECOVERY_ALARM_REQUIRED_POPULATIONS: readonly RecoveryPopulationType[] = ["deferred_issuance_trace", "dlq_entry"]
+
+export const DEFAULT_RECOVERY_ALARM_ADAPTERS = createRecoveryPopulationAdapterRegistry([
+  DEFERRED_ISSUANCE_TRACE_ADAPTER,
+  DLQ_ENTRY_ADAPTER,
+])
+
+/**
+ * Walidacja rejestru przy STARCIE (ładowanie modułu joba) — DW-15-342 p.1: brak
+ * adaptera albo adapter bez eskalacji/deduplikacji = wyjątek startu z nazwanym kodem.
+ */
+export function validateRecoveryAlarmRegistryAtStartup(
+  registry: RecoveryPopulationAdapterRegistry,
+  required: ReadonlyArray<RecoveryPopulationType> = RECOVERY_ALARM_REQUIRED_POPULATIONS
+): void {
+  assertRecoveryPopulationAdapters(registry, required)
+  const incomplete = required.filter((p) => {
+    const a = registry.get(p)!
+    return typeof a.escalationOf !== "function" || typeof a.dedupKeyOf !== "function"
+  })
+  if (incomplete.length > 0) throw new RecoveryPopulationAdapterMissingError(incomplete)
+}
+
+export const RECOVERY_ALARM_MAX_IDS_PER_ALARM = 50
+const SEVERITY_RANK: Record<RecoveryAlarmSeverity, number> = { WARN: 1, ERROR: 2, CRITICAL: 3 }
+
+export type AggregatedRecoveryAlarm = {
+  population_type: RecoveryPopulationType
+  alarm_code: string
+  severity: RecoveryAlarmSeverity
+  market_id: string
+  instance_id: string
+  overdue_count: number
+  /** Zdeduplikowane identyfikatory (limit `RECOVERY_ALARM_MAX_IDS_PER_ALARM`). */
+  population_ids: string[]
+  truncated: boolean
+  earliest_deadline: string
+}
+
+/**
+ * Agregacja per przebieg (DW-15-342 p.3): N wierszy jednej populacji w rynku ⇒
+ * JEDEN alarm z listą identyfikatorów; poziom = najwyższa eskalacja wiersza.
+ */
+export function aggregateRecoveryAlarm<Row>(
+  adapter: RecoveryPopulationAdapter<Row>,
+  rows: Row[],
+  scope: { market_id: string; instance_id: string }
+): AggregatedRecoveryAlarm | null {
+  if (!adapter.escalationOf || !adapter.dedupKeyOf) throw new RecoveryPopulationAdapterMissingError([adapter.population_type])
+  const seen = new Set<string>()
+  const ids: string[] = []
+  let severity: RecoveryAlarmSeverity = "WARN"
+  let earliest: string | null = null
+  for (const row of rows) {
+    const key = adapter.dedupKeyOf(row)
+    if (seen.has(key)) continue
+    seen.add(key)
+    const alarm = adapter.toAlarm(row)
+    ids.push(alarm.failure_id)
+    const level = adapter.escalationOf(row)
+    if (SEVERITY_RANK[level] > SEVERITY_RANK[severity]) severity = level
+    const deadline = adapter.deadlineOf(row)
+    if (earliest === null || deadline < earliest) earliest = deadline
+  }
+  if (ids.length === 0) return null
+  return {
+    population_type: adapter.population_type,
+    alarm_code: adapter.alarmCode,
+    severity,
+    market_id: scope.market_id,
+    instance_id: scope.instance_id,
+    overdue_count: ids.length,
+    population_ids: ids.slice(0, RECOVERY_ALARM_MAX_IDS_PER_ALARM),
+    truncated: ids.length > RECOVERY_ALARM_MAX_IDS_PER_ALARM,
+    earliest_deadline: earliest!,
+  }
+}
