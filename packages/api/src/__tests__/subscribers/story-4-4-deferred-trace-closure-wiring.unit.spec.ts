@@ -36,6 +36,12 @@ jest.mock("../../workflows/entitlements/issue-entitlement", () => {
 
 jest.mock("../../workflows/entitlements/live-issue-from-payment-intent", () => ({
   __esModule: true,
+  // Story 3.4: `buildOwedBusinessUnitKey` (stempel rezerwacji transportu w
+  // `voucher-live-issue`) używa czystej funkcji klucza z tego modułu — zostaje
+  // prawdziwa; dubler dotyczy wyłącznie skutku wystawienia.
+  buildPaymentIntentOrderExternalId: jest.requireActual(
+    "../../workflows/entitlements/live-issue-from-payment-intent"
+  ).buildPaymentIntentOrderExternalId,
   liveIssueEntitlementsPerLineWithinTx: jest.fn(),
 }))
 
