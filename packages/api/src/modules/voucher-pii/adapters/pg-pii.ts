@@ -7,15 +7,28 @@
  * policy on `voucher_recipient_pii` gates every SELECT/INSERT by
  * the current market. This adapter never sets GUC itself.
  *
+ * v1.16.0 Story 6.5 (ADR-248 `Proposed`): every operation first asserts on the
+ * same transaction that the session market (`app.gp_market_id`) is present and
+ * equals the requested market — a foreign or missing market is a NAMED denial
+ * (`RecipientPiiMarketAccessDeniedError`, 403), never a silent empty result.
+ *
  * Table was created by STORY-2-2 migration.
  */
 
 import type { Knex } from "knex";
 import { randomUUID } from "node:crypto";
 import type { VoucherPiiPort } from "../ports";
+import { assertRecipientPiiMarketAccess } from "../recipient-pii-market-guard";
 
 export class PgVoucherPiiAdapter implements VoucherPiiPort {
   constructor(private readonly db: Knex) {}
+
+  /** Runs `fn` in one transaction so the market assertion and the query share a connection. */
+  private async inMarketTransaction<T>(
+    fn: (trx: Knex.Transaction) => Promise<unknown>
+  ): Promise<T> {
+    return (await this.db.transaction((trx) => fn(trx))) as T;
+  }
 
   async insertRecipientPii(input: {
     market_id: string;
@@ -26,7 +39,9 @@ export class PgVoucherPiiAdapter implements VoucherPiiPort {
     locale: string;
     is_gift: boolean;
   }): Promise<{ recipient_pii_id: string }> {
-    const [row] = await this.db("voucher_recipient_pii")
+    const [row] = await this.inMarketTransaction<Array<{ id: string }>>(async (trx) => {
+      await assertRecipientPiiMarketAccess(trx, input.market_id);
+      return await trx("voucher_recipient_pii")
       .insert({
         id: randomUUID(),
         market_id: input.market_id,
@@ -40,6 +55,7 @@ export class PgVoucherPiiAdapter implements VoucherPiiPort {
         updated_at: new Date(),
       })
       .returning("id");
+    });
 
     return { recipient_pii_id: row.id ?? row };
   }
@@ -48,10 +64,13 @@ export class PgVoucherPiiAdapter implements VoucherPiiPort {
     market_id: string;
     order_id: string;
   }): Promise<{ rows_affected: number }> {
-    const rows_affected = await this.db("voucher_recipient_pii")
-      .where({ market_id: args.market_id, order_id: args.order_id })
-      .whereNull("tombstoned_at")
-      .update({ tombstoned_at: new Date(), updated_at: new Date() });
+    const rows_affected = await this.inMarketTransaction<number>(async (trx) => {
+      await assertRecipientPiiMarketAccess(trx, args.market_id);
+      return await trx("voucher_recipient_pii")
+        .where({ market_id: args.market_id, order_id: args.order_id })
+        .whereNull("tombstoned_at")
+        .update({ tombstoned_at: new Date(), updated_at: new Date() });
+    });
     return { rows_affected };
   }
 
@@ -60,28 +79,35 @@ export class PgVoucherPiiAdapter implements VoucherPiiPort {
     cutoff: Date;
     batch_size: number;
   }): Promise<{ rows_deleted: number }> {
-    const rows_deleted = await this.db("voucher_recipient_pii")
-      .where({ market_id: args.market_id })
-      .whereNotNull("tombstoned_at")
-      .where("created_at", "<", args.cutoff)
-      .limit(args.batch_size)
-      .delete();
+    const rows_deleted = await this.inMarketTransaction<number>(async (trx) => {
+      await assertRecipientPiiMarketAccess(trx, args.market_id);
+      return await trx("voucher_recipient_pii")
+        .where({ market_id: args.market_id })
+        .whereNotNull("tombstoned_at")
+        .where("created_at", "<", args.cutoff)
+        .limit(args.batch_size)
+        .delete();
+    });
     return { rows_deleted };
   }
 
   async cleanupOrphans(args: {
     batch_size: number;
   }): Promise<{ rows_deleted: number }> {
-    const rows_deleted = await this.db("voucher_recipient_pii as p")
-      .whereNotExists(
-        this.db("voucher_pii_consent_audit as a")
-          .select("a.id")
-          .whereRaw("a.payload->>'recipient_pii_id' = p.id::text")
-          .limit(1)
-      )
-      .whereNotNull("p.tombstoned_at")
-      .limit(args.batch_size)
-      .delete();
+    const rows_deleted = await this.inMarketTransaction<number>(async (trx) => {
+      const marketId = await assertRecipientPiiMarketAccess(trx, null);
+      return await trx("voucher_recipient_pii as p")
+        .where("p.market_id", marketId)
+        .whereNotExists(
+          trx("voucher_pii_consent_audit as a")
+            .select("a.id")
+            .whereRaw("a.payload->>'recipient_pii_id' = p.id::text")
+            .limit(1)
+        )
+        .whereNotNull("p.tombstoned_at")
+        .limit(args.batch_size)
+        .delete();
+    });
     return { rows_deleted };
   }
 }
