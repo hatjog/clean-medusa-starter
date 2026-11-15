@@ -62,6 +62,11 @@ import { ContainerRegistrationKeys } from "@medusajs/framework/utils";
 import type { Knex } from "knex";
 
 import { PgAuditAdapter } from "../modules/voucher-pii/adapters/pg-audit";
+import {
+  assertRecipientPiiMarketAccess,
+  RecipientPiiMarketAccessDeniedError,
+} from "../modules/voucher-pii/recipient-pii-market-guard";
+import { GP_MARKET_SESSION_VAR } from "../lib/rls-pool-hook";
 
 /** Ścieżka runbooka wymaganego przez bramkę `consent-privacy-dsar-integrity`. */
 export const DSAR_RUNBOOK_PATH = "specs/legal/recipient-dsar-runbook.md";
@@ -259,10 +264,26 @@ export default async function dataExportRecipient({
     );
   }
 
-  const db = container.resolve(ContainerRegistrationKeys.PG_CONNECTION) as Knex;
+  const pg = container.resolve(ContainerRegistrationKeys.PG_CONNECTION) as Knex;
 
-  // Krok 1 — zlokalizuj wiersze PII.
-  const piiRows = await findRecipientPiiRows(db, parsed);
+  // v1.16.0 Story 11.6 (DW-15-362 p.1): eksport DSAR czyta dane obdarowanej
+  // WYŁĄCZNIE w jawnie zadeklarowanym rynku (`market=`), przez guard nazwanej
+  // odmowy — także ścieżka `voucher=`. Brak rynku = odmowa, nie eksport
+  // przekrojowy; log odmowy bez PII.
+  const market = parsed.market ?? null;
+  if (!market) {
+    console.warn(
+      "[data-export-recipient] recipient pii market access denied",
+      { error_code: "GP_RECIPIENT_PII_MARKET_ACCESS_DENIED", reason: "missing_market_context" }
+    );
+    throw new RecipientPiiMarketAccessDeniedError("missing_market_context");
+  }
+  await pg.transaction(async (db) => {
+  await db.raw(`SELECT set_config('${GP_MARKET_SESSION_VAR}', ?, true)`, [market]);
+  await assertRecipientPiiMarketAccess(db, market);
+
+  // Krok 1 — zlokalizuj wiersze PII (tylko rynku z deklaracji).
+  const piiRows = (await findRecipientPiiRows(db, parsed)).filter((r) => r.market_id === market);
 
   if (piiRows.length === 0) {
     process.stdout.write(
@@ -323,4 +344,5 @@ export default async function dataExportRecipient({
       2
     ) + "\n"
   );
+  });
 }

@@ -25,6 +25,10 @@ import { Modules } from "@medusajs/framework/utils";
 import { NOTIFICATION_TEMPLATE_KEYS } from "@gp/messaging";
 
 import type { NotificationDispatchPort } from "../ports";
+import {
+  assertRecipientPiiMarketAccess,
+  RecipientPiiMarketAccessDeniedError,
+} from "../recipient-pii-market-guard";
 
 type NotificationModuleLike = {
   createNotifications?: (data: unknown, ...rest: unknown[]) => Promise<unknown>;
@@ -129,7 +133,18 @@ export class MedusaNotificationDispatchAdapter implements NotificationDispatchPo
     marketId: string,
   ): Promise<{ recipient_email?: unknown; locale?: unknown } | undefined> {
     return this.db.transaction(async (trx) => {
+      // v1.16.0 Story 11.6 (DW-15-362 p.1): rynek z argumentu wewnętrznego wolno
+      // przypiąć WYŁĄCZNIE, gdy sesja nie niesie innego rynku (hook / kontekst
+      // systemowy). Obcy rynek sesji = nazwana odmowa, nie cichy `undefined`.
+      const session = (await trx.raw(
+        "SELECT NULLIF(current_setting('app.gp_market_id', true), '') AS market_id",
+      )) as { rows?: Array<{ market_id: string | null }> };
+      const sessionMarket = session.rows?.[0]?.market_id ?? null;
+      if (sessionMarket !== null && sessionMarket !== marketId) {
+        throw new RecipientPiiMarketAccessDeniedError("market_mismatch");
+      }
       await trx.raw("SELECT set_config('app.gp_market_id', ?, true)", [marketId]);
+      await assertRecipientPiiMarketAccess(trx, marketId);
       return trx("voucher_recipient_pii")
         .select("recipient_email", "locale")
         .where({ id: recipientId, market_id: marketId })

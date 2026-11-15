@@ -253,6 +253,13 @@ if (process.env.TEST_TYPE === "integration:http") {
   module.exports.testMatch = [
     "**/packages/api/src/__tests__/integration/story-6-5-recipient-pii-rls-pg.integration.test.[jt]s",
   ];
+} else if (process.env.TEST_TYPE === "story-11-6-recipient-retention-pg") {
+  // v1.16.0 Story 11.6 (FR-20, AD-49, D-35 p.15) — retencja danych obdarowanego
+  // na realnym PG, rynki A/B, rola medusa_store; DATABASE_URL musi wskazywac baze
+  // `*_test` (suita pracuje na wlasnych danych i je sprzata, bez DROP TABLE).
+  module.exports.testMatch = [
+    "**/packages/api/src/__tests__/integration/story-11-6-recipient-retention-pg.integration.test.[jt]s",
+  ];
 } else if (process.env.TEST_TYPE === "unit") {
   module.exports.testMatch = [
     "**/packages/api/src/**/__tests__/**/*.unit.spec.[jt]s",

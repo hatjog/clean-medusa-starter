@@ -1,4 +1,13 @@
 import type { MedusaContainer } from "@medusajs/framework/types";
+import { ContainerRegistrationKeys } from "@medusajs/framework/utils";
+import type { Knex } from "knex";
+
+import { runInSystemMarketContext } from "../lib/system-market-context";
+import {
+  formatRetentionCarrierLog,
+  runRecipientRetentionForMarket,
+  type RecipientRetentionResult,
+} from "../modules/voucher-pii/recipient-retention-runtime";
 
 /**
  * voucher-pii-orphan-cleanup — STORY-2-2 D-70 orphan PII detection.
@@ -16,13 +25,7 @@ import type { MedusaContainer } from "@medusajs/framework/types";
 export const SCHEDULE_NAME = "voucher-pii-orphan-cleanup" as const;
 export const SCHEDULE_CRON = "0 * * * *" as const; // hourly
 
-interface VoucherPiiServiceLike {
-  purgeExpiredPii(args: {
-    market_id: string;
-    cutoff: Date;
-    batch_size: number;
-  }): Promise<{ rows_deleted: number; orphans_deleted: number }>;
-}
+
 
 interface JobLogger {
   info: (msg: string) => void;
@@ -53,50 +56,65 @@ function resolveLogger(container: MedusaContainer | undefined): JobLogger {
   return fallback;
 }
 
-function resolveService(
-  container: MedusaContainer | undefined
-): VoucherPiiServiceLike | null {
-  try {
-    return (
-      (container?.resolve?.("voucher_pii") as VoucherPiiServiceLike | undefined) ??
-      null
-    );
-  } catch {
-    return null;
-  }
-}
-
+/**
+ * v1.16.0 Story 11.6 (DW-15-360 `scope_extension_6_5`): wcześniej job wołał
+ * `voucher_pii.purgeExpiredPii` (klucz nierejestrowany w runtime — martwe
+ * wiring) z pustym „sentinel” rynkiem, czyli BEZ kontekstu rynku: pod hookiem
+ * RLS taka praca jest odmową. Teraz: te same rynki co sweep dzienny
+ * (`VOUCHER_PII_RETENTION_MARKETS`), `runInSystemMarketContext`, rola
+ * `medusa_store`; cutoff = epoch, więc składowe terminowe są no-opem, a liczy
+ * się wyłącznie `voucher_recipient_pii.orphans`.
+ */
 export default async function voucherPiiOrphanCleanup(
   container: MedusaContainer
-): Promise<void> {
+): Promise<RecipientRetentionResult[]> {
   const logger = resolveLogger(container);
-  const service = resolveService(container);
-  if (!service) {
-    logger.warn(
-      "voucher_pii service not resolved — skipping orphan cleanup " +
-        "(TODO(MEDUSA-CONTAINER): wire voucher_pii loader)"
-    );
-    return;
-  }
-
-  // The orphan-cleanup helper on the port runs cross-market — pass a sentinel
-  // that the adapter recognises as "all markets" via the bypass code path
-  // (cutoff is unused for orphan-only invocations; rows_deleted will be 0
-  // for the time-window purge component).
-  const sentinelMarket = process.env.VOUCHER_PII_ORPHAN_MARKET ?? "";
-  if (!sentinelMarket) {
-    logger.info("orphan cleanup invoked across-markets via service.purgeExpiredPii");
-  }
+  let db: Knex | null = null;
   try {
-    const result = await service.purgeExpiredPii({
-      market_id: sentinelMarket,
-      cutoff: new Date(0), // far past — purge component is a no-op
-      batch_size: 10_000,
-    });
-    logger.info(`orphan cleanup orphans_deleted=${result.orphans_deleted}`);
+    db = (container?.resolve?.(ContainerRegistrationKeys.PG_CONNECTION) as Knex | undefined) ?? null;
   } catch (err) {
-    logger.error("orphan cleanup error", err);
+    logger.error("GP_RECIPIENT_RETENTION_NO_PG_CONNECTION: orphan cleanup NOT executed", err);
+    return [];
   }
+  if (!db) {
+    logger.error("GP_RECIPIENT_RETENTION_NO_PG_CONNECTION: orphan cleanup NOT executed");
+    return [];
+  }
+  const markets = (process.env.VOUCHER_PII_RETENTION_MARKETS ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (markets.length === 0) {
+    logger.warn(
+      "GP_RECIPIENT_RETENTION_NO_MARKETS: VOUCHER_PII_RETENTION_MARKETS empty — orphan cleanup skipped"
+    );
+    return [];
+  }
+  const results: RecipientRetentionResult[] = [];
+  const pg = db;
+  await runInSystemMarketContext(
+    {
+      markets,
+      instanceId: process.env.GP_INSTANCE_ID,
+      origin: { surface: "job", name: SCHEDULE_NAME },
+      logger,
+    },
+    async (market_id) => {
+      try {
+        const result = await runRecipientRetentionForMarket(pg, {
+          market_id,
+          cutoff: new Date(0),
+          batch_size: 10_000,
+        });
+        results.push(result);
+        logger.info(formatRetentionCarrierLog(result));
+      } catch (err) {
+        const code = (err as { error_code?: string })?.error_code ?? (err as Error)?.name;
+        logger.error(`market=${market_id} orphan cleanup error error_code=${code}`, err);
+      }
+    }
+  );
+  return results;
 }
 
 export const config = {

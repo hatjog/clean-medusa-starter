@@ -81,11 +81,19 @@ export class PgVoucherPiiAdapter implements VoucherPiiPort {
   }): Promise<{ rows_deleted: number }> {
     const rows_deleted = await this.inMarketTransaction<number>(async (trx) => {
       await assertRecipientPiiMarketAccess(trx, args.market_id);
+      // v1.16.0 Story 11.6: knex odrzuca `limit` na DELETE w PG („Aborted query
+      // compilation: `limit` has no effect on a `delete` statement”) — zmierzone
+      // pierwszym przebiegiem pod realnym PG. Paczka przez podzapytanie po `id`.
       return await trx("voucher_recipient_pii")
-        .where({ market_id: args.market_id })
-        .whereNotNull("tombstoned_at")
-        .where("created_at", "<", args.cutoff)
-        .limit(args.batch_size)
+        .whereIn(
+          "id",
+          trx("voucher_recipient_pii")
+            .select("id")
+            .where({ market_id: args.market_id })
+            .whereNotNull("tombstoned_at")
+            .where("created_at", "<", args.cutoff)
+            .limit(args.batch_size)
+        )
         .delete();
     });
     return { rows_deleted };
@@ -96,16 +104,23 @@ export class PgVoucherPiiAdapter implements VoucherPiiPort {
   }): Promise<{ rows_deleted: number }> {
     const rows_deleted = await this.inMarketTransaction<number>(async (trx) => {
       const marketId = await assertRecipientPiiMarketAccess(trx, null);
-      return await trx("voucher_recipient_pii as p")
-        .where("p.market_id", marketId)
-        .whereNotExists(
-          trx("voucher_pii_consent_audit as a")
-            .select("a.id")
-            .whereRaw("a.payload->>'recipient_pii_id' = p.id::text")
-            .limit(1)
+      // v1.16.0 Story 11.6: paczka przez podzapytanie po `id` (knex odrzuca
+      // `limit` na DELETE); SELECT na audycie daje migracja 20261115160000.
+      return await trx("voucher_recipient_pii")
+        .whereIn(
+          "id",
+          trx("voucher_recipient_pii as p")
+            .select("p.id")
+            .where("p.market_id", marketId)
+            .whereNotExists(
+              trx("voucher_pii_consent_audit as a")
+                .select("a.id")
+                .whereRaw("a.payload->>'recipient_pii_id' = p.id::text")
+                .limit(1)
+            )
+            .whereNotNull("p.tombstoned_at")
+            .limit(args.batch_size)
         )
-        .whereNotNull("p.tombstoned_at")
-        .limit(args.batch_size)
         .delete();
     });
     return { rows_deleted };

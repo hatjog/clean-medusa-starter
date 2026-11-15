@@ -19,10 +19,38 @@ import {
  * denial. The body carries ONLY the stable codes — never the guard message
  * (it names the PII table) nor any request detail.
  */
+/**
+ * v1.16.0 Story 11.6 (DW-15-362 p.2): odmowa rynku PII zostawia ślad po stronie
+ * serwera — `warn` z `error_code`, powodem i rynkiem KONTEKSTU (nigdy body ani PII).
+ */
+export const RECIPIENT_PII_DENIAL_LOG = "recipient pii market access denied" as const
+
+function logRecipientPiiMarketDenied(
+  res: MedusaResponse,
+  reason: RecipientPiiMarketDenialReason
+): void {
+  const req = (res as unknown as { req?: { scope?: { resolve?: (k: string) => unknown } } }).req;
+  const meta = {
+    error_code: "GP_RECIPIENT_PII_MARKET_ACCESS_DENIED",
+    reason,
+    context_market_id: marketContextStorage.getStore()?.market_id ?? null,
+  };
+  let logger: { warn?: (m: string, meta?: unknown) => void } | undefined;
+  try {
+    logger = req?.scope?.resolve?.("logger") as typeof logger;
+  } catch (err) {
+    console.warn(`${RECIPIENT_PII_DENIAL_LOG} (logger unresolved: ${(err as Error)?.name})`, meta);
+    return;
+  }
+  if (typeof logger?.warn === "function") logger.warn(RECIPIENT_PII_DENIAL_LOG, meta);
+  else console.warn(RECIPIENT_PII_DENIAL_LOG, meta);
+}
+
 function sendRecipientPiiMarketDenied(
   res: MedusaResponse,
   reason: RecipientPiiMarketDenialReason
 ): void {
+  logRecipientPiiMarketDenied(res, reason);
   res.status(403).json({
     error: "forbidden",
     code: reason,

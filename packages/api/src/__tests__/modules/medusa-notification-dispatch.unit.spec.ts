@@ -21,7 +21,7 @@ import {
 
 type RawCall = { sql: string; bindings: unknown[] };
 
-function makeDb(row: Record<string, unknown> | undefined) {
+function makeDb(row: Record<string, unknown> | undefined, initialSessionMarket: string | null = null) {
   const raws: RawCall[] = [];
   const wheres: Array<Record<string, unknown>> = [];
   const tables: string[] = [];
@@ -44,11 +44,16 @@ function makeDb(row: Record<string, unknown> | undefined) {
     return qb;
   }) as unknown as Record<string, unknown> & ((table: string) => unknown);
 
+  let sessionMarket: string | null = initialSessionMarket;
   (trx as unknown as { raw: unknown }).raw = async (
     sql: string,
     bindings: unknown[],
   ) => {
     raws.push({ sql, bindings });
+    // Story 11.6 (DW-15-362 p.1): odczyt rynku sesji przez guard — symulacja GUC.
+    if (sql.includes("set_config")) sessionMarket = String(bindings?.[0] ?? "");
+    if (sql.includes("current_setting")) return { rows: [{ market_id: sessionMarket }] };
+    return undefined;
   };
 
   // Zapytanie POZA transakcją = brak kontekstu rynku → test ma to wykryć.
@@ -81,6 +86,17 @@ const ARGS = {
 };
 
 describe("MedusaNotificationDispatchAdapter (AC4 / R-2.2-H2)", () => {
+  it("Story 11.6 (DW-15-362 p.1): obcy rynek sesji ⇒ nazwana odmowa market_mismatch, zero odczytu PII i wysyłki", async () => {
+    const createNotifications = jest.fn(async () => ({ id: "notif-x" }));
+    const { db, tables } = makeDb({ recipient_email: "buyer@example.test", locale: "pl" }, "other-market");
+    const adapter = new MedusaNotificationDispatchAdapter(makeScope({ createNotifications }), db);
+    await expect(adapter.dispatch(ARGS)).rejects.toMatchObject({
+      error_code: "GP_RECIPIENT_PII_MARKET_ACCESS_DENIED",
+      reason: "market_mismatch",
+    });
+    expect(tables).toEqual([]);
+    expect(createNotifications).not.toHaveBeenCalled();
+  });
   it("ustawia app.gp_market_id w transakcji PRZED odczytem voucher_recipient_pii", async () => {
     const createNotifications = jest.fn(async () => ({ id: "notif-1" }));
     const { db, raws, wheres, tables } = makeDb({
@@ -94,11 +110,12 @@ describe("MedusaNotificationDispatchAdapter (AC4 / R-2.2-H2)", () => {
 
     await adapter.dispatch(ARGS);
 
-    expect(raws).toHaveLength(1);
-    expect(raws[0].sql).toContain("set_config('app.gp_market_id'");
+    // Story 11.6: [odczyt rynku sesji] → set_config → [guard] → SELECT.
+    const setCfg = raws.filter((r) => r.sql.includes("set_config('app.gp_market_id'"));
+    expect(setCfg).toHaveLength(1);
     // `is_local = true` — GUC znika z transakcją, zero wycieku na pulę połączeń.
-    expect(raws[0].sql).toContain("true");
-    expect(raws[0].bindings).toEqual(["bonbeauty"]);
+    expect(setCfg[0].sql).toContain("true");
+    expect(setCfg[0].bindings).toEqual(["bonbeauty"]);
     expect(tables).toEqual(["voucher_recipient_pii"]);
     expect(wheres[0]).toEqual({ id: "pii-1", market_id: "bonbeauty" });
   });

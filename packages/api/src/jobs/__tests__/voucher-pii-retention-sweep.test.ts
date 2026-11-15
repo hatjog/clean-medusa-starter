@@ -14,13 +14,13 @@ function containerForRetentionSweep(observedScopes: Array<unknown>, calls: strin
   return {
     resolve: (key: string) => {
       if (key === "gp_market_loader") return { listActive: async () => ["market-a"] }
-      if (key === "voucher_pii") {
-        return {
-          purgeExpiredPii: async ({ market_id }: { market_id: string }) => {
-            calls.push(market_id)
-            observedScopes.push(marketContextStorage.getStore())
-            return { rows_deleted: 0, orphans_deleted: 0 }
-          },
+      if (key === "voucher_pii_retention_runner") {
+        // v1.16.0 Story 11.6: job nie zależy już od klucza `voucher_pii`
+        // (nierejestrowanego w runtime) — seam wykonawcy per rynek.
+        return async ({ market_id, cutoff }: { market_id: string; cutoff: Date }) => {
+          calls.push(market_id)
+          observedScopes.push(marketContextStorage.getStore())
+          return { market_id, cutoff: cutoff.toISOString(), carriers: {} }
         }
       }
       if (key === "logger") return { info: () => undefined, warn: () => undefined, error: () => undefined }
@@ -56,5 +56,30 @@ describe("Story 11.1 — job retention ustanawia systemowy scope", () => {
     ).rejects.toThrow(/instance_id/)
     expect(calls).toEqual([])
     expect(observedScopes).toEqual([])
+  })
+})
+
+describe("Story 11.6 — wynik per nośnik i brak martwego wiring", () => {
+  it("zwraca wynik wykonawcy per rynek (liczniki per nośnik), bez klucza voucher_pii", async () => {
+    process.env.GP_INSTANCE_ID = "instance-job"
+    const observedScopes: Array<unknown> = []
+    const calls: string[] = []
+    const results = await voucherPiiRetentionSweep(containerForRetentionSweep(observedScopes, calls) as never)
+    expect(results).toEqual([expect.objectContaining({ market_id: "market-a", carriers: {} })])
+  })
+
+  it("brak PG_CONNECTION i wykonawcy = głośny error, zero pracy (nie cichy no-op)", async () => {
+    process.env.GP_INSTANCE_ID = "instance-job"
+    const errors: string[] = []
+    const container = {
+      resolve: (key: string) => {
+        if (key === "gp_market_loader") return { listActive: async () => ["market-a"] }
+        if (key === "logger") return { info: () => undefined, warn: () => undefined, error: (m: string) => errors.push(m) }
+        throw new Error(`unresolved ${key}`)
+      },
+    }
+    const results = await voucherPiiRetentionSweep(container as never)
+    expect(results).toEqual([])
+    expect(errors.join("\n")).toMatch(/GP_RECIPIENT_RETENTION_NO_PG_CONNECTION/)
   })
 })
