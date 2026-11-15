@@ -74,6 +74,15 @@ if (process.env.TEST_TYPE === "integration:http") {
   module.exports.testMatch = [
     "**/packages/api/src/__tests__/integration/completed-order-cardinality-pg.integration.test.[jt]s",
   ];
+} else if (process.env.TEST_TYPE === "cart-completion-psp-authority-pg") {
+  // v1.16.0 Story 8.2/8.6 — autorytet PSP i blokada completion (ADR-233) na realnym
+  // Postgresie (TEMP-lustra, schemat fixture puli sagi, proces potomny trzymajacy blokade).
+  // Suita zaklada i kasuje dane fixture, wiec DATABASE_URL musi wskazywac IZOLOWANA DB
+  // testowa (warstwa A w integration-tests/setup.js). Przeniesiona z profilu unit:
+  // bramka `test-db-isolation` (DW-15-138) czerwienila ja jako suite bezprofilowa.
+  module.exports.testMatch = [
+    "**/packages/api/src/api/middlewares/__tests__/cart-completion-psp-authority-pg.integration.test.[jt]s",
+  ];
 } else if (process.env.TEST_TYPE === "voucher-rls-pg") {
   // v1.15.0 Story 2.6 (FR-14e) — moduł voucher pod RLS na REALNYM Postgresie.
   // Profil istnieje, bo `packages/api/src/__tests__/rls/**` NIE JEST objęte
