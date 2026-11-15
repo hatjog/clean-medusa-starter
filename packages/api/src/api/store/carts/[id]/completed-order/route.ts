@@ -183,10 +183,16 @@ export async function GET(
     .join({ o: "order" }, "o.id", "ogo.order_id")
     .whereNull("o.deleted_at")
     .whereNull("ogo.deleted_at")
+    // Story 8.3 (DW-15-344 p.2): a soft-deleted group or a soft-deleted
+    // membership in ANOTHER group must not pull foreign orders into the set.
+    .whereNull("og.deleted_at")
     .where((q) => {
       q.where("og.cart_id", cartId).orWhereIn(
         "og.id",
-        db("order_group_order").select("order_group_id").whereIn("order_id", receivedIds)
+        db("order_group_order")
+          .select("order_group_id")
+          .whereIn("order_id", receivedIds)
+          .whereNull("deleted_at")
       )
     })
     .orderBy("ogo.order_id", "asc")

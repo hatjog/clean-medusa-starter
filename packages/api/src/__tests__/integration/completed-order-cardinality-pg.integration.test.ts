@@ -112,7 +112,8 @@ runOrSkip("Story 3.6 — endpoint mostkowy niesie KOLEKCJĘ zamówień (realny P
       );
       CREATE TABLE IF NOT EXISTS ${FIXTURE_SCHEMA}.order_group (
         id text PRIMARY KEY,
-        cart_id text NULL
+        cart_id text NULL,
+        deleted_at timestamptz NULL
       );
       CREATE TABLE IF NOT EXISTS ${FIXTURE_SCHEMA}.order_group_order (
         order_id text NOT NULL,
@@ -291,6 +292,30 @@ runOrSkip("Story 3.6 — endpoint mostkowy niesie KOLEKCJĘ zamówień (realny P
     expect(new Set(body.expected_order_ids)).toEqual(new Set([ORDER_A, ORDER_C]))
     expect(body.open_order_ids).toEqual([ORDER_C])
     expect(body.purchase_state).toBe("incomplete")
+  })
+
+  it("8.3 (DW-15-344 p.2): soft-deleted członkostwo w INNEJ grupie nie wciąga cudzych zamówień", async () => {
+    const FOREIGN = "order_01STORY83FOREIGN"
+    const OTHER_GROUP = "ordgrp_01STORY83OTHER"
+    await db("order").insert([{ id: FOREIGN, created_at: new Date("2026-08-06T10:00:04Z") }])
+    await db("order_group").insert([{ id: OTHER_GROUP, cart_id: "cart_01STORY83OTHER" }])
+    await db("order_group_order").insert([
+      { order_id: ORDER_A, order_group_id: OTHER_GROUP, deleted_at: new Date() },
+      { order_id: FOREIGN, order_group_id: OTHER_GROUP },
+    ])
+    const body = (await callRoute(db, CART_TWO_SELLERS)).body as { expected_order_ids: string[]; open_order_ids: string[] }
+    expect(new Set(body.expected_order_ids)).toEqual(new Set([ORDER_A, ORDER_B]))
+    expect(body.open_order_ids).not.toContain(FOREIGN)
+  })
+
+  it("8.3 (DW-15-344 p.2): soft-deleted grupa nie jest źródłem zbioru oczekiwanego", async () => {
+    const FOREIGN = "order_01STORY83FOREIGN2"
+    const DEAD_GROUP = "ordgrp_01STORY83DEAD"
+    await db("order").insert([{ id: FOREIGN, created_at: new Date("2026-08-06T10:00:04Z") }])
+    await db("order_group").insert([{ id: DEAD_GROUP, cart_id: CART_TWO_SELLERS, deleted_at: new Date() }])
+    await db("order_group_order").insert([{ order_id: FOREIGN, order_group_id: DEAD_GROUP }])
+    const body = (await callRoute(db, CART_TWO_SELLERS)).body as { expected_order_ids: string[] }
+    expect(new Set(body.expected_order_ids)).toEqual(new Set([ORDER_A, ORDER_B]))
   })
 
   it("8.6 AC1: jedno zamówienie order-setu nieterminalne ⇒ `incomplete` i wskazane otwarte zamówienie", async () => {
