@@ -583,6 +583,27 @@ export async function proposeRecoveryAction(
     ? { kind: request.evidence.kind, reference: request.evidence.reference, recorded_at: now, recorded_by: actor }
     : null
 
+  // Story 11.4 (runda fix 1): intencja z zajętym claimem `approve` dla TEGO SAMEGO celu
+  // jest już zastosowana — wersja wiersza przesunęła się właśnie o ten skutek. Powtórka
+  // propose (np. po timeoucie odpowiedzi approve) oddaje poprzedni wynik propozycji
+  // PRZED kontrolą wersji; inne evidence ⇒ nadal jawny konflikt treści.
+  if (authorization.decision === "granted") {
+    const approved = await readClaimed(client, scope, stepKey("approve", intentKey))
+    if (approved && approved.target_state === request.target_state) {
+      await lockStepKey(client, scope, key)
+      const prior = await readClaimed(client, scope, key)
+      if (prior) {
+        const auditId = deps.newAuditId()
+        if (!sameEvidence(prior.resolution_evidence, evidence)) {
+          await insertStepAudit(client, stepRow(auditId, "refused_idempotency_payload_mismatch", false, { prior_audit_id: prior.audit_id }))
+          return { ...base, outcome: "refused_idempotency_payload_mismatch", audit_id: auditId, record: snapshotOf(record), domain_effects: 0 }
+        }
+        await insertStepAudit(client, stepRow(auditId, "replayed", false, { approved_audit_id: approved.audit_id }))
+        return { ...base, outcome: "replayed", audit_id: prior.audit_id, record: snapshotOf(record), domain_effects: 0 }
+      }
+    }
+  }
+
   let outcome: RecoveryStepOutcome = "proposed"
   const pending = authorization.decision === "granted" ? await readPendingPartialEffect(client, record) : null
   if (authorization.decision !== "granted") outcome = "refused_market_forbidden"
