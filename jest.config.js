@@ -118,6 +118,13 @@ if (process.env.TEST_TYPE === "integration:http") {
   module.exports.testMatch = [
     "**/packages/api/src/__tests__/integration/story-4-5-trace-age-snapshot-pg.integration.test.[jt]s",
   ];
+} else if (process.env.TEST_TYPE === "story-4-3-compensation-alarm-pg") {
+  // v1.16.0 Story 4.3 (FR-11, AD-32, AD-48) — runtime alarm compensation_failure po terminie
+  // (deadline < statement_timestamp()), pusta populacja mierzalna, kontrola dodatnia.
+  // DATABASE_URL musi wskazywac IZOLOWANA DB testowa (*_test).
+  module.exports.testMatch = [
+    "**/packages/api/src/__tests__/integration/story-4-3-compensation-alarm-pg.integration.test.[jt]s",
+  ];
 } else if (process.env.TEST_TYPE === "compensation-failure-pg") {
   // v1.15.0 Story 3.5 (FR-6c, NFR-3, AD-22) — rejestr nieudanych kompensacji
   // sciezki pieniadza wykonany przez sam modul na realnym Postgresie
@@ -156,6 +163,12 @@ if (process.env.TEST_TYPE === "integration:http") {
   module.exports.testMatch = [
     "**/packages/api/src/__tests__/integration/dispatch-window-provider.integration.test.[jt]s",
   ];
+} else if (process.env.TEST_TYPE === "addressing-axis-pg") {
+  // v1.16.0 Story 6.4 (AC2) — oś (a) adresowania z kontrolą dodatnią na realnym
+  // PostgreSQL (DATABASE_URL = izolowana gp_story_6_4_test; własny schemat).
+  module.exports.testMatch = [
+    "**/packages/api/src/__tests__/integration/addressing-axis-pg.integration.test.[jt]s",
+  ];
 } else if (process.env.TEST_TYPE === "story-3-6-canonical-state-pg") {
   module.exports.testMatch = [
     "**/packages/api/src/__tests__/integration/story-3-6-canonical-state-provenance-pg.integration.test.[jt]s",
@@ -174,6 +187,11 @@ if (process.env.TEST_TYPE === "integration:http") {
     "**/packages/api/src/__tests__/integration/voucher-service-redeem-single-act.integration.spec.[jt]s",
     "**/packages/api/src/__tests__/integration/voucher-service-redeem-atomicity.integration.spec.[jt]s",
     "**/packages/api/src/__tests__/integration/voucher-redeem-branch-disjointness.integration.spec.[jt]s",
+  ];
+} else if (process.env.TEST_TYPE === "story-4-7-recovery-read-pg") {
+  // v1.16.0 Story 4.7 — jedno wejście odczytu trzech populacji pod RLS (DB *_test).
+  module.exports.testMatch = [
+    "**/packages/api/src/__tests__/integration/story-4-7-recovery-read-pg.integration.test.[jt]s",
   ];
 } else if (process.env.TEST_TYPE === "story-4-6-dlq-pg") {
   // v1.16.0 Story 4.6 — nośnik DLQ (mor_policy_dlq_entry) pod RLS na realnym

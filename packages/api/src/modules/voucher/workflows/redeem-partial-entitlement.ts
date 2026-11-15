@@ -353,9 +353,17 @@ export class RedeemNotRedeemableError extends Error {
  * (i mapowanie na `422 REDEMPTION_REFUSED`) działają dalej bez zmian.
  */
 export class RedeemEntitlementStateError extends RedeemNotRedeemableError {
-  constructor(message: string) {
+  /**
+   * v1.16.0 Story 5.5 (AC3): stan uprawnienia jako WARTOŚĆ, a nie tylko
+   * fragment `message`. Trasa wyprowadza z niego maszynowy `reason`
+   * (`not_yet_active` dla `ISSUED`) i nie musi wysyłać surowego komunikatu
+   * domenowego z identyfikatorem uprawnienia.
+   */
+  readonly entitlement_state: string | null
+  constructor(message: string, entitlementState: string | null = null) {
     super(message)
     this.name = "RedeemEntitlementStateError"
+    this.entitlement_state = entitlementState
   }
 }
 
@@ -1348,7 +1356,8 @@ export class RedeemPartialEntitlementOperation {
       if (!REDEEMABLE_SOURCE_STATES.has(ent.state)) {
         throw new RedeemEntitlementStateError(
           `redeem: entitlement ${ent.id} w stanie ${ent.state} nie jest ` +
-            `redeemowalny (dozwolone: ACTIVE / REDEEMED_PARTIAL)`
+            `redeemowalny (dozwolone: ACTIVE / REDEEMED_PARTIAL)`,
+          ent.state
         )
       }
 

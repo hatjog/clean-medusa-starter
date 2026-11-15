@@ -99,9 +99,30 @@ describe("Story 4.5 AC2 — job deferred-issuance-trace-age-escalation", () => {
       emit: (p) => alerts.push(p),
       clientForMarket: () => client(new Error("connection refused")),
     })
-    expect(result).toEqual({ status: "failed", reason: "read_failed", error: "connection refused", markets: ["mkt_a"] })
+    expect(result).toEqual({
+      status: "failed",
+      reason: "read_failed",
+      error: "connection refused",
+      markets: ["mkt_a"],
+      per_market: [{ market_id: "mkt_a", evaluated: false, reason: "read_failed", error: "connection refused" }],
+    })
     expect(alerts).toEqual([expect.objectContaining({ severity: "ERROR", code: ALERT_CODE_RUN_FAILED })])
     expect(errors.some((m) => /FAILED/.test(m))).toBe(true)
+  })
+
+  it("Story 4.3 DW-15-333 p.1: porażka rynku A nie wstrzymuje oceny rynku B; wynik per rynek", async () => {
+    const alerts: StructuredAlertPayload[] = []
+    const result = await runDeferredIssuanceTraceAgeEscalation(container() as never, {
+      env: { [MARKETS_ENV_VAR]: "mkt_a,mkt_b", GP_INSTANCE_ID: "gp_test" },
+      emit: (p) => alerts.push(p),
+      clientForMarket: (_c, ctx) => (ctx.market_id === "mkt_a" ? client(new Error("connection refused")) : client([])),
+    })
+    expect(result.per_market).toEqual([
+      { market_id: "mkt_a", evaluated: false, reason: "read_failed", error: "connection refused" },
+      { market_id: "mkt_b", evaluated: true, over_threshold: 0 },
+    ])
+    expect(result.status).toBe("failed")
+    expect(alerts.map((a) => a.code)).toEqual([ALERT_CODE_RUN_FAILED])
   })
 
   it("NFR-4 negatywny: brak deklaracji rynków = odmowa z alarmem, zero odczytu", async () => {
