@@ -26,6 +26,16 @@ export type PaymentChargeReadDeps = {
   retrievePaymentIntentStatus: typeof defaultRetrievePaymentIntentStatusForMarket
 }
 
+type LoggerLike = { warn: (msg: string) => void }
+
+function resolveLogger(req: MedusaRequest): LoggerLike {
+  try {
+    return (req.scope.resolve("logger") as LoggerLike | undefined) ?? console
+  } catch {
+    return console
+  }
+}
+
 export async function handlePaymentChargeRead(
   req: MedusaRequest,
   res: MedusaResponse,
@@ -47,11 +57,18 @@ export async function handlePaymentChargeRead(
       .map(r => r.payment_intent_id)
       .filter((id): id is string => typeof id === "string" && id.length > 0)
   } catch (err) {
+    // Story 8.3 fix R-4: unauthenticated route — the DB error detail goes to the
+    // logger (error name/message only, no query parameters), never to the body.
+    resolveLogger(req).warn(
+      `[payment-charge] charge_read_failed cart=${cartId} error=${
+        err instanceof Error ? `${err.name}: ${err.message}` : "non_error_thrown"
+      }`
+    )
     res.status(503).json({
       charge: "unknown",
       reason: "charge_read_failed",
       code: "charge_read_failed",
-      message: err instanceof Error ? err.message : String(err),
+      message: "charge read failed",
     })
     return
   }

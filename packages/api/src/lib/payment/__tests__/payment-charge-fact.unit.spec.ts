@@ -81,6 +81,30 @@ describe("Story 8.3 — GET /store/carts/:id/payment-charge", () => {
     expect(r.body).toMatchObject({ charge: "unknown", code: "charge_read_failed" })
   })
 
+  it("R-4: 503 nie ujawnia treści błędu bazy; szczegół idzie do loggera", async () => {
+    const r = res()
+    const warned: string[] = []
+    const scope = { resolve: (k: string) => (k === "logger" ? { warn: (m: string) => warned.push(m) } : undefined) }
+    await handlePaymentChargeRead({ params: { id: "cart_1" }, scope } as never, r as never, {
+      readQuery: async () => {
+        throw new Error('relation "secret_table" does not exist at host db-internal')
+      },
+      retrievePaymentIntentStatus: async () => "succeeded",
+    })
+    expect(r.statusCode).toBe(503)
+    expect(JSON.stringify(r.body)).not.toContain("secret_table")
+    expect(JSON.stringify(r.body)).not.toContain("db-internal")
+    expect(r.body).toEqual({
+      charge: "unknown",
+      reason: "charge_read_failed",
+      code: "charge_read_failed",
+      message: "charge read failed",
+    })
+    expect(warned).toHaveLength(1)
+    expect(warned[0]).toContain("charge_read_failed")
+    expect(warned[0]).toContain("secret_table")
+  })
+
   it("identyfikator spoza dziedziny ⇒ 400", async () => {
     const r = res()
     await handlePaymentChargeRead({ params: { id: "order_1" }, scope: {} } as never, r as never, {
