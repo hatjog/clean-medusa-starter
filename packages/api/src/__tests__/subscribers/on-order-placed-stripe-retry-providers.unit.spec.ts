@@ -65,9 +65,17 @@ import onOrderPlacedStripeRetry, {
   FIND_DEFERRED_CAPTURES_SQL,
   MARK_DEFERRED_RESOLVED_SQL,
   DLQ_WRITE_FAILED_CODE,
+  DLQ_EXCLUDED_CODE,
+  STRIPE_RETRY_DLQ_SOURCE,
+  TRACE_CLOSE_NO_MATCH_CODE,
   type StripeRetryRunResult,
 } from "../../subscribers/on-order-placed-stripe-retry"
-import { INSERT_DLQ_ENTRY_SQL } from "../../lib/events/event-dead-letter"
+import {
+  dlqEntryId,
+  INSERT_DLQ_ENTRY_SQL,
+  SELECT_EXCLUDING_DLQ_ENTRY_SQL,
+} from "../../lib/events/event-dead-letter"
+import { CLOSE_DEFERRED_ISSUANCE_TRACE_SQL } from "../../lib/recovery/deferred-issuance-trace"
 
 const SOURCE = readFileSync(
   join(__dirname, "../../subscribers/on-order-placed-stripe-retry.ts"),
@@ -243,7 +251,14 @@ const ACTIVATION_SQL_MARKER = "SET state = 'ACTIVE'"
  */
 function makeHarness(
   rows: DeferredRow[],
-  options: { activation?: "applied" | "noop"; dlqInsertError?: Error } = {}
+  options: {
+    activation?: "applied" | "noop"
+    dlqInsertError?: Error
+    /** Story 4.7 fix: `dlq_entry_id`, dla których istnieje wiersz DLQ (≠ replayed). */
+    deadLetteredIds?: string[]
+    /** Story 4.7 fix: `version` zwracane przez domknięcie śladu (brak ⇒ 0 wierszy). */
+    traceCloseVersion?: number
+  } = {}
 ) {
   const sent: SentQuery[] = []
   const client = {
@@ -255,6 +270,13 @@ function makeHarness(
       if (sql === INSERT_DLQ_ENTRY_SQL) {
         if (options.dlqInsertError) throw options.dlqInsertError
         return { rows: [{ dlq_entry_id: values[0] }], rowCount: 1 }
+      }
+      if (sql === SELECT_EXCLUDING_DLQ_ENTRY_SQL) {
+        const hit = (options.deadLetteredIds ?? []).includes(String(values[0]))
+        return hit ? { rows: [{ state: "open" }], rowCount: 1 } : { rows: [], rowCount: 0 }
+      }
+      if (sql === CLOSE_DEFERRED_ISSUANCE_TRACE_SQL && options.traceCloseVersion !== undefined) {
+        return { rows: [{ version: options.traceCloseVersion }], rowCount: 1 }
       }
       if (sql.includes(ACTIVATION_SQL_MARKER)) {
         const applied = (options.activation ?? "applied") === "applied"
@@ -792,6 +814,9 @@ describe("Story 4.6 runda fix 1 (R-1/R-2/R-6) — porażka zapisu DLQ: bez rethr
       dlq_write_failures: [
         expect.objectContaining({ order_id: "order_1", cause: "db_error", message: expect.stringContaining("does not exist") }),
       ],
+      // Story 4.3 (DW-15-316): porażka zapisu DLQ idzie kanałem alarmu; bez
+      // GP_ALERT_CHANNELS wynik kanału jest nazwanym ERROR, nie ciszą.
+      dlq_write_failed_alarm: expect.objectContaining({ status: "failed", code: "ALERT_CHANNEL_NOT_CONFIGURED" }),
     })
     expect(h.sent.filter((q) => q.sql === FIND_DEFERRED_CAPTURES_SQL).map((q) => q.values[0])).toEqual([
       "order_1",
@@ -938,5 +963,107 @@ describe("Story 8.4 — odzysk Path Y z częściową porażką pozycji", () => {
 
     expect(h.sent.some((q) => q.sql === MARK_DEFERRED_RESOLVED_SQL)).toBe(true)
     expect(h.logger.error).not.toHaveBeenCalled()
+  })
+})
+
+/**
+ * Story 4.7 runda fix 1 (checkpoint PO, DW-15-321 p.1 i DW-15-320 p.4): gałęzie
+ * `continue` wykluczenia DLQ i `warn` domknięcia bez dopasowania wykonywane
+ * przez REALNEGO subskrybenta — harness zwraca wiersz dla
+ * `SELECT_EXCLUDING_DLQ_ENTRY_SQL` / wersję dla `CLOSE_DEFERRED_ISSUANCE_TRACE_SQL`.
+ */
+describe("Story 4.7 fix — wykluczenie DLQ z wyboru pracy i domknięcie śladu bez dopasowania", () => {
+  const pathY = (event_id: string): DeferredRow =>
+    makeRow({
+      event_id,
+      provider: STRIPE_PATH_Y_WEBHOOK_PROVIDER,
+      envelope: {
+        entitlement_issue_deferred_reason: "webhook_before_order",
+        psp_occurred_at: "2026-08-12T12:34:56.000Z",
+      },
+    })
+  const issued = () => ({
+    event_processed: true,
+    line_outcomes: [],
+    failed_lines: [],
+    issued: [],
+  })
+  const dlqId = (eventId: string) =>
+    dlqEntryId("gp-test", "bonbeauty", STRIPE_RETRY_DLQ_SOURCE, eventId, "order_1")
+
+  it("DW-15-321 p.1: zdarzenie z wierszem DLQ nie jest ponownie wystawiane ani domykane; warn z kodem", async () => {
+    const liveIssue = liveIssueEntitlementsPerLineWithinTx as jest.Mock
+    liveIssue.mockReset()
+    liveIssue.mockResolvedValue(issued())
+    const h = makeHarness([pathY("evt_dlq#deferred-issuance"), pathY("evt_ok#deferred-issuance")], {
+      deadLetteredIds: [dlqId("evt_dlq#deferred-issuance")],
+    })
+
+    await run(h.container, { id: "order_1" })
+
+    // Zapytanie wykluczenia poszło z identyfikatorem wiersza DLQ tego konsumenta.
+    const probes = h.sent.filter((q) => q.sql === SELECT_EXCLUDING_DLQ_ENTRY_SQL)
+    expect(probes.map((q) => q.values[0])).toEqual([
+      dlqId("evt_dlq#deferred-issuance"),
+      dlqId("evt_ok#deferred-issuance"),
+    ])
+    // Brak ponownej próby wystawienia dla zdarzenia w DLQ — tylko evt_ok.
+    expect(liveIssue).toHaveBeenCalledTimes(1)
+    expect(liveIssue.mock.calls[0][1].payload.payment_intent_id).toBe("pi_1")
+    const marks = h.sent.filter((q) => q.sql === MARK_DEFERRED_RESOLVED_SQL)
+    expect(marks.map((q) => q.values[0])).toEqual(["evt_ok#deferred-issuance"])
+    // Brak nowego zapisu DLQ i brak domknięcia śladu dla evt_dlq.
+    expect(h.sent.some((q) => q.sql === INSERT_DLQ_ENTRY_SQL)).toBe(false)
+    const closes = h.sent.filter((q) => q.sql === CLOSE_DEFERRED_ISSUANCE_TRACE_SQL)
+    expect(closes.map((q) => q.values[0])).not.toContain("evt_dlq#deferred-issuance")
+    expect(h.logger.warn).toHaveBeenCalledWith(
+      expect.stringMatching(new RegExp(`code=${DLQ_EXCLUDED_CODE} .*event_id=evt_dlq#deferred-issuance`))
+    )
+    const excludedWarns = (h.logger.warn as jest.Mock).mock.calls.filter((c) =>
+      String(c[0]).includes(DLQ_EXCLUDED_CODE)
+    )
+    expect(excludedWarns).toHaveLength(1)
+  })
+
+  it("kontrola: bez wiersza DLQ oba zdarzenia są wystawiane i brak kodu wykluczenia", async () => {
+    const liveIssue = liveIssueEntitlementsPerLineWithinTx as jest.Mock
+    liveIssue.mockReset()
+    liveIssue.mockResolvedValue(issued())
+    const h = makeHarness([pathY("evt_dlq#deferred-issuance"), pathY("evt_ok#deferred-issuance")])
+
+    await run(h.container, { id: "order_1" })
+
+    expect(liveIssue).toHaveBeenCalledTimes(2)
+    expect(h.logger.warn).not.toHaveBeenCalledWith(expect.stringContaining(DLQ_EXCLUDED_CODE))
+  })
+
+  it("DW-15-320 p.4: domknięcie dopasowujące 0 wierszy (np. rozjazd rynku) daje warn z kodem", async () => {
+    const liveIssue = liveIssueEntitlementsPerLineWithinTx as jest.Mock
+    liveIssue.mockReset()
+    liveIssue.mockResolvedValue(issued())
+    const h = makeHarness([pathY("evt_pathy#deferred-issuance")])
+
+    await run(h.container, { id: "order_1" })
+
+    const close = h.sent.find((q) => q.sql === CLOSE_DEFERRED_ISSUANCE_TRACE_SQL)
+    expect(close).toBeDefined()
+    expect(close!.values[4]).toBe("bonbeauty")
+    expect(h.logger.warn).toHaveBeenCalledWith(
+      expect.stringMatching(
+        new RegExp(`code=${TRACE_CLOSE_NO_MATCH_CODE} order_id=order_1 trace=evt_pathy#deferred-issuance market_id=bonbeauty`)
+      )
+    )
+  })
+
+  it("kontrola: domknięcie z wersją NIE daje kodu no_match (info z version)", async () => {
+    const liveIssue = liveIssueEntitlementsPerLineWithinTx as jest.Mock
+    liveIssue.mockReset()
+    liveIssue.mockResolvedValue(issued())
+    const h = makeHarness([pathY("evt_pathy#deferred-issuance")], { traceCloseVersion: 3 })
+
+    await run(h.container, { id: "order_1" })
+
+    expect(h.logger.warn).not.toHaveBeenCalledWith(expect.stringContaining(TRACE_CLOSE_NO_MATCH_CODE))
+    expect(h.logger.info).toHaveBeenCalledWith(expect.stringContaining("version=3"))
   })
 })

@@ -26,6 +26,7 @@ import {
   createCartCompletionPspAuthorityMiddleware,
   defaultAcquireConnection,
   createFenceAcquirer,
+  openPaymentIntentIds,
   CART_COMPLETE_LOCK_NAMESPACE,
   FENCE_APPLICATION_NAME,
   PSP_AUTHORITY_FENCE_CONNECTION_LOST,
@@ -628,3 +629,72 @@ async function lockIsFreeOn(c: Client, cartId: string): Promise<boolean> {
   }
   return false
 }
+
+// ── v1.16.0 Story 8.6 (FR-17, AD-16, DW-15-329 p.2) ─────────────────────────
+// Koszyk order-setu może nieść N PaymentIntent. Reguła „wszystkie terminalne",
+// nie „którykolwiek": jeden otwarty PI zatrzymuje domknięcie i jest NAZWANY.
+async function seedExtraStripeIntent(cartId: string, intentId: string) {
+  await client.query(
+    "INSERT INTO pg_temp.payment_session(payment_collection_id, provider_id, data) VALUES ($1, 'pp_stripe_stripe', $2)",
+    [`paycol_${cartId}`, JSON.stringify({ id: intentId })]
+  )
+}
+
+describe("Story 8.6 — stan terminalny dla WSZYSTKICH PaymentIntent koszyka (DW-15-329 p.2)", () => {
+  it("N PaymentIntent, jeden nieterminalny ⇒ 409 payment_not_terminal z identyfikatorem otwartego", async () => {
+    await seedStripeSession(CART, "pi_story86_a_ok")
+    await seedExtraStripeIntent(CART, "pi_story86_b_open")
+    await seedExtraStripeIntent(CART, "pi_story86_c_ok")
+    const statusById: Record<string, string> = {
+      pi_story86_a_ok: "succeeded",
+      pi_story86_b_open: "requires_action",
+      pi_story86_c_ok: "requires_capture",
+    }
+    const asked: string[] = []
+    const { res, nextCalled } = await run({
+      retrievePaymentIntentStatus: async ({ paymentIntentId }) => {
+        asked.push(paymentIntentId)
+        return statusById[paymentIntentId]
+      },
+    })
+    expect(nextCalled).toBe(false)
+    expect(res.statusCode).toBe(409)
+    expect(res.body?.type).toBe("payment_not_terminal")
+    expect(res.body?.open_payment_intent_ids).toEqual(["pi_story86_b_open"])
+    expect([...asked].sort()).toEqual(["pi_story86_a_ok", "pi_story86_b_open", "pi_story86_c_ok"])
+    expect(releases).toBe(1)
+  })
+
+  it("N PaymentIntent, wszystkie terminalne ⇒ przepuszczone do handlera", async () => {
+    await seedStripeSession(CART, "pi_story86_x_ok")
+    await seedExtraStripeIntent(CART, "pi_story86_y_ok")
+    const { res, nextCalled } = await run({
+      retrievePaymentIntentStatus: async ({ paymentIntentId }) =>
+        paymentIntentId === "pi_story86_x_ok" ? "succeeded" : "requires_capture",
+    })
+    expect(nextCalled).toBe(true)
+    expect(res.body).toBeNull()
+    res.emit("finish")
+    await new Promise(r => setTimeout(r, 50))
+    expect(releases).toBe(1)
+  })
+
+  it("N PaymentIntent, wszystkie nieterminalne ⇒ odmowa nazywa CAŁY zbiór otwartych (bez redukcji do jednego)", async () => {
+    await seedStripeSession(CART, "pi_story86_p_open")
+    await seedExtraStripeIntent(CART, "pi_story86_q_open")
+    const { res, nextCalled } = await run({ retrievePaymentIntentStatus: async () => "processing" })
+    expect(nextCalled).toBe(false)
+    expect(res.statusCode).toBe(409)
+    expect([...((res.body?.open_payment_intent_ids as string[] | undefined) ?? [])].sort()).toEqual([
+      "pi_story86_p_open",
+      "pi_story86_q_open",
+    ])
+  })
+
+  it("openPaymentIntentIds: reguła every (mutant some czerwieni) i brak dowodu dla elementu = otwarty", () => {
+    expect(openPaymentIntentIds(["pi_a", "pi_b"], ["succeeded", "requires_action"])).toEqual(["pi_b"])
+    expect(openPaymentIntentIds(["pi_a", "pi_b"], ["succeeded", "requires_capture"])).toEqual([])
+    // Rozjazd długości (brak statusu dla elementu) nie jest cichym przejściem.
+    expect(openPaymentIntentIds(["pi_a", "pi_b"], ["succeeded"])).toEqual(["pi_a", "pi_b"])
+  })
+})

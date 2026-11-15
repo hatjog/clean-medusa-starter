@@ -150,3 +150,33 @@ async function setScope(client: DlqQueryClient, instanceId: string, marketId: st
   await client.query("SELECT set_config('app.gp_instance_id', $1, true)", [instanceId])
   await client.query("SELECT set_config('app.gp_market_id', $1, true)", [marketId])
 }
+
+/**
+ * Story 4.7 (DW-15-321 p.1): czy zdarzenie tego konsumenta ma już wiersz DLQ,
+ * który wyklucza je z wyboru pracy. Wiersz `replayed` NIE wyklucza (odtworzenie
+ * jest jawną akcją operatora). Odczyt pod scope'em wiersza (RLS na obu osiach),
+ * GUC przywracane jak w `recordEventDeadLetter`.
+ */
+export const SELECT_EXCLUDING_DLQ_ENTRY_SQL =
+  `SELECT state FROM ${DLQ_ENTRY_TABLE} WHERE dlq_entry_id = $1 AND state <> 'replayed'`
+
+export async function isEventDeadLettered(
+  client: DlqQueryClient,
+  input: { instance_id: string | null; market_id: string | null; source_job: string; event_id: string; subject_id: string }
+): Promise<boolean> {
+  const instanceId = input.instance_id?.trim() ?? ""
+  const marketId = input.market_id?.trim() ?? ""
+  if (!instanceId || !marketId) return false
+  const previous = await client.query<{ instance_id: string | null; market_id: string | null }>(
+    "SELECT current_setting('app.gp_instance_id', true) AS instance_id, current_setting('app.gp_market_id', true) AS market_id"
+  )
+  const prior = previous.rows[0] ?? { instance_id: null, market_id: null }
+  await setScope(client, instanceId, marketId)
+  try {
+    const id = dlqEntryId(instanceId, marketId, input.source_job, input.event_id, input.subject_id)
+    const result = await client.query<{ state: string }>(SELECT_EXCLUDING_DLQ_ENTRY_SQL, [id])
+    return result.rows.length > 0
+  } finally {
+    await setScope(client, prior.instance_id ?? "", prior.market_id ?? "")
+  }
+}

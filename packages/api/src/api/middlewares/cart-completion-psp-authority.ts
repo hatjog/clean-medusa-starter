@@ -346,9 +346,28 @@ function refuse(
   res: MedusaResponse,
   status: number,
   type: PspAuthorityRefusal,
-  message: string
+  message: string,
+  extra?: Record<string, unknown>
 ): void {
-  res.status(status).json({ type, code: type, message })
+  res.status(status).json({ ...(extra ?? {}), type, code: type, message })
+}
+
+/**
+ * v1.16.0 Story 8.6 (FR-17, AD-16, DW-15-329 p.2): the cart may carry N
+ * PaymentIntents. Completion is allowed only when EVERY one of them is in a
+ * terminal success state — "any one terminal" let a cart through while another
+ * PaymentIntent was still open. Returns the ids that are NOT terminal (empty =
+ * all terminal), in the order of `intentIds`, so a refusal can name them.
+ */
+export function openPaymentIntentIds(
+  intentIds: ReadonlyArray<string>,
+  statuses: ReadonlyArray<string>
+): string[] {
+  if (intentIds.length === 0 || intentIds.length !== statuses.length) {
+    // No proof for some element = not terminal; never a silent pass.
+    return [...intentIds]
+  }
+  return intentIds.filter((_, index) => !PSP_TERMINAL_SUCCESS_STATUSES.has(statuses[index]))
 }
 
 export function createCartCompletionPspAuthorityMiddleware(deps: PspAuthorityDeps = defaultDeps) {
@@ -469,9 +488,12 @@ export function createCartCompletionPspAuthorityMiddleware(deps: PspAuthorityDep
           refuse(res, 503, "psp_status_unavailable", "Payment status could not be verified")
           return
         }
-        if (!statuses.some(status => PSP_TERMINAL_SUCCESS_STATUSES.has(status))) {
+        const openIntents = openPaymentIntentIds(intentIds, statuses)
+        if (openIntents.length > 0) {
           await releaseAll()
-          refuse(res, 409, "payment_not_terminal", "Payment is not confirmed by the provider")
+          refuse(res, 409, "payment_not_terminal", "Payment is not confirmed by the provider", {
+            open_payment_intent_ids: openIntents,
+          })
           return
         }
       }
