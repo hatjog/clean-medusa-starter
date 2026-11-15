@@ -57,6 +57,9 @@ import {
   StripePaymentAuditWorkflow,
 } from "../../workflows/payment/stripe-payment-audit"
 import { buildPathYRecoveryInput } from "../../subscribers/on-order-placed-stripe-retry"
+import voucherLiveIssueSubscriber from "../../subscribers/voucher-live-issue"
+import { _resetRingBuffer, getRingBuffer, injectLogger } from "../../lib/alert-emit"
+import { OWED_UNIT_CONSUMER_FAILURE_SOURCE } from "../../lib/payment/stripe-payment-intent-transport"
 import { Migration20261114140000SharedIdempotencyBarrier } from "../../migrations/Migration20261114140000SharedIdempotencyBarrier"
 
 const INSTANCE_ID = "gp_test"
@@ -193,6 +196,51 @@ async function consumePathY(
       await client.query("ROLLBACK TO SAVEPOINT story_3_4_consumer")
     }
   }
+}
+
+/**
+ * Konsument Path Y przez PRODUKCYJNY subscriber `voucher-live-issue` (fix
+ * checkpointu PO): tx subscribera (BEGIN/COMMIT/ROLLBACK) mapowana na savepoint;
+ * `failCommitFor` = awaria przejściowa przed COMMIT dla kopert tych zamówień.
+ * Porażka jest rzucana dalej (jak do busa), test ją tylko zbiera.
+ */
+async function consumeViaSubscriber(
+  client: PoolClient,
+  queue: QueuedEnvelope[],
+  failCommitFor: string[] = []
+): Promise<string[]> {
+  const failures: string[] = []
+  for (const delivery of queue.splice(0)) {
+    const orderId = delivery.data.payload.order_id as string
+    const wrapped = {
+      query: async (sql: string, values?: ReadonlyArray<unknown>) => {
+        const text = sql.trim()
+        if (text === "BEGIN") return client.query("SAVEPOINT story_3_4_subscriber_tx")
+        if (text === "COMMIT") {
+          if (failCommitFor.includes(orderId)) throw new Error("awaria przejściowa konsumenta przed COMMIT")
+          return client.query("RELEASE SAVEPOINT story_3_4_subscriber_tx")
+        }
+        if (text === "ROLLBACK") return client.query("ROLLBACK TO SAVEPOINT story_3_4_subscriber_tx")
+        return client.query(sql, values as unknown[])
+      },
+      release: () => {},
+    }
+    const container = {
+      resolve: (key: string) => {
+        if (key === "logger") return { info() {}, warn() {}, error() {} }
+        if (key === "__pg_pool__") return { connect: async () => wrapped }
+        if (key === Modules.EVENT_BUS) return { emit: async () => undefined }
+        throw new Error(`unresolved ${key}`)
+      },
+    }
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await voucherLiveIssueSubscriber({ event: { name: delivery.name, data: delivery.data }, container } as any)
+    } catch {
+      failures.push(orderId)
+    }
+  }
+  return failures
 }
 
 /**
@@ -439,6 +487,9 @@ describeOrNotRun("Story 3.4 — rezerwacja transportu nie wyprzedza konsumpcji (
       const failed = await state(client)
       expect(failed.barrier).toEqual([unit(ORDER_A), unit(ORDER_B)])
       expect(failed.reservations.map((r) => r.provider)).toEqual([STRIPE_PATH_Y_WEBHOOK_PROVIDER])
+      // Ten przypadek woła rdzeń konsumenta wprost (bez subscribera), więc stempla
+      // porażki konsumenta tu nie ma — ścieżkę subscribera mierzy test
+      // „pierwsza dostawa 200, konsument pada, BEZ redelivery” niżej.
       expect(failed.reservations[0].envelope[OWED_UNIT_SETTLEMENT_ENVELOPE_KEY]).toBeUndefined()
 
       // Redelivery: bramka (500 + alarm utrwalony) i naprawa (emisja WYŁĄCZNIE C).
@@ -469,6 +520,58 @@ describeOrNotRun("Story 3.4 — rezerwacja transportu nie wyprzedza konsumpcji (
       expect(repaired.effectsPerOrder).toEqual({ [ORDER_A]: 1, [ORDER_B]: 1, [ORDER_C]: 1 })
       const ack = await deliverPathY(client, queue, "evt_3_4_redelivery")
       expect(ack.statusCode).toBe(200)
+      expect(queue).toHaveLength(0)
+    })
+
+    it("AC1 (fix checkpointu): pierwsza dostawa 200, konsument pada, BEZ redelivery ⇒ rezerwacja ostemplowana 'unsettled' + alarm", async () => {
+      injectLogger({ info() {}, warn() {}, error() {} })
+      _resetRingBuffer()
+      await seed(client, { [ORDER_A]: 1, [ORDER_B]: 1, [ORDER_C]: 1 })
+      const queue: QueuedEnvelope[] = []
+      const first = await deliverPathY(client, queue, "evt_3_4_no_redelivery")
+      expect(first.statusCode).toBe(200)
+      expect(queue).toHaveLength(3)
+
+      // Realny konsument; Stripe po 200 NIE ponawia — żadnej drugiej dostawy.
+      expect(await consumeViaSubscriber(client, queue, [ORDER_C])).toEqual([ORDER_C])
+
+      const after = await state(client)
+      expect(after.barrier).toEqual([unit(ORDER_A), unit(ORDER_B)])
+      expect(after.reservations).toHaveLength(1)
+      // Rezerwacja NIE świadczy „przyjęte” — stan porażki jest w ZAPISIE.
+      expect(after.reservations[0].envelope[OWED_UNIT_SETTLEMENT_ENVELOPE_KEY]).toMatchObject({
+        state: "unsettled",
+        alarm: OWED_UNIT_RESERVATION_MISMATCH_ALARM,
+        source: OWED_UNIT_CONSUMER_FAILURE_SOURCE,
+        consumer_failed_units: [unit(ORDER_C)],
+        consumer_failure_attempts: 1,
+        last_consumer_error: "Error",
+      })
+      const alarms = getRingBuffer().filter((a) => a.code === OWED_UNIT_RESERVATION_MISMATCH_ALARM)
+      expect(alarms).toHaveLength(1)
+      expect(alarms[0]).toMatchObject({
+        severity: "CRITICAL",
+        context: { stripe_event_id: "evt_3_4_no_redelivery", owed_unit: unit(ORDER_C), stamp_persisted: true },
+      })
+
+      // Kolejna próba busa (attempts:5) pada znowu ⇒ licznik rośnie, zbiór bez duplikatu.
+      const retryEnvelope = (after.reservations[0].envelope as { envelopes: QueuedEnvelope["data"][] }).envelopes
+        .find((e) => e.payload.order_id === ORDER_C)
+      expect(retryEnvelope).toBeDefined()
+      queue.push({ name: "gp.stripe.payment_intent_succeeded.v1", data: retryEnvelope as QueuedEnvelope["data"] })
+      expect(await consumeViaSubscriber(client, queue, [ORDER_C])).toEqual([ORDER_C])
+      expect((await state(client)).reservations[0].envelope[OWED_UNIT_SETTLEMENT_ENVELOPE_KEY]).toMatchObject({
+        consumer_failed_units: [unit(ORDER_C)],
+        consumer_failure_attempts: 2,
+      })
+
+      // Trasa natywna rozlicza jednostkę bez podwójnego skutku (bariera 3.3);
+      // potem dostawa (resend) dostaje ACK, bo zbiory są równe.
+      const nativeC = await deliverNative(client, { event_id: "evt_3_4_no_redelivery_native_c", order_id: ORDER_C })
+      expect(nativeC.entitlements_all).toHaveLength(1)
+      expect((await state(client)).effectsPerOrder).toEqual({ [ORDER_A]: 1, [ORDER_B]: 1, [ORDER_C]: 1 })
+      const resend = await deliverPathY(client, queue, "evt_3_4_no_redelivery")
+      expect(resend.statusCode).toBe(200)
       expect(queue).toHaveLength(0)
     })
 

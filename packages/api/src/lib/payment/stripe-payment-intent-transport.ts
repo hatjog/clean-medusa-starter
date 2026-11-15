@@ -168,6 +168,83 @@ export async function releaseWebhookDelivery(
   ])
 }
 
+/**
+ * Story 3.4 (FR-10, AD-33, DW-15-201): klucz w kopercie rezerwacji
+ * `webhook_event_processed`, pod którym UTRWALANY jest stan rozliczenia jednostek
+ * należnych dostawy. Rezerwacja transportu nie jest dowodem skutku — ten wpis
+ * odróżnia w ZAPISIE (nie w logu) dostawę z nierozliczonymi jednostkami
+ * (`state: 'unsettled'`) od dostawy, której skutek jest kompletny. Pisze go route
+ * (gałąź `reserved=false`) ORAZ konsument Path Y przy własnej porażce.
+ */
+export const OWED_UNIT_SETTLEMENT_ENVELOPE_KEY = "owed_unit_settlement" as const
+
+/**
+ * Story 3.4 (AC4): nazwa alarmu-bramki niezgodności rezerwacja transportu ↔
+ * skutek biznesowy. Bramka = utrwalony stan w rezerwacji (+ nie-2xx na trasie);
+ * log i alarm strukturalny są dodatkiem, nie nośnikiem.
+ */
+export const OWED_UNIT_RESERVATION_MISMATCH_ALARM =
+  "owed_unit_reservation_mismatch" as const
+
+/** Źródło stempla zapisanego przez konsumenta (odróżnialne od stempla route'u). */
+export const OWED_UNIT_CONSUMER_FAILURE_SOURCE = "consumer_failure" as const
+
+/**
+ * Story 3.4 fix (checkpoint PO, AC1/AC4): stempel porażki KONSUMENTA Path Y.
+ *
+ * Pierwsza dostawa dostaje `200` zanim subscriber skonsumuje kopertę, a Stripe
+ * po 200 nie ponawia — gałąź `reserved=false` route'u nie jest więc wyzwalaczem
+ * na realnej ścieżce. Ten zapis biegnie w ścieżce porażki subscribera (każda
+ * próba busa), poza wycofaną tx skutku: rezerwacja przestaje świadczyć „przyjęte”
+ * — dostaje `state: 'unsettled'` i zbiór jednostek, których konsumpcja padła.
+ * Scalanie z istniejącym kluczem (`||`) zachowuje pola stempla route'u; zbiór
+ * jednostek jest sumą (DISTINCT), licznik prób rośnie. Brak wiersza (dostawa nie
+ * pochodzi z route'u) = `rowCount 0`, wołający raportuje to jawnie.
+ */
+export const STAMP_CONSUMER_FAILURE_SQL = `
+  UPDATE webhook_event_processed
+     SET envelope = envelope || jsonb_build_object(
+           '${OWED_UNIT_SETTLEMENT_ENVELOPE_KEY}',
+           COALESCE(envelope->'${OWED_UNIT_SETTLEMENT_ENVELOPE_KEY}', '{}'::jsonb) || jsonb_build_object(
+             'state', 'unsettled',
+             'alarm', $3::text,
+             'source', '${OWED_UNIT_CONSUMER_FAILURE_SOURCE}',
+             'consumer_failed_units', COALESCE((
+               SELECT jsonb_agg(DISTINCT u ORDER BY u)
+                 FROM jsonb_array_elements_text(
+                        COALESCE(envelope->'${OWED_UNIT_SETTLEMENT_ENVELOPE_KEY}'->'consumer_failed_units', '[]'::jsonb)
+                        || jsonb_build_array($4::text)
+                      ) AS failed(u)
+             ), '[]'::jsonb),
+             'consumer_failure_attempts',
+             COALESCE((envelope->'${OWED_UNIT_SETTLEMENT_ENVELOPE_KEY}'->>'consumer_failure_attempts')::int, 0) + 1,
+             'last_consumer_error', $5::text,
+             'consumer_failed_at', NOW()
+           )
+         )
+   WHERE event_id = $1
+     AND provider = $2
+`
+
+/**
+ * Utrwala porażkę konsumenta Path Y w rezerwacji dostawy. `true` = wiersz
+ * rezerwacji ostemplowany; `false` = brak wiersza tej dostawy. Błąd SQL jest
+ * rzucany — wołający nazywa go w alarmie.
+ */
+export async function stampPathYConsumerFailure(
+  client: PaymentLinkQueryClient,
+  input: { event_id: string; owed_unit: string; error_name: string }
+): Promise<boolean> {
+  const result = await client.query(STAMP_CONSUMER_FAILURE_SQL, [
+    input.event_id,
+    STRIPE_PATH_Y_WEBHOOK_PROVIDER,
+    OWED_UNIT_RESERVATION_MISMATCH_ALARM,
+    input.owed_unit,
+    input.error_name,
+  ])
+  return (result.rowCount ?? 0) > 0
+}
+
 type PgPoolLike = { connect: () => Promise<PgClientLike> }
 type PgClientLike = PaymentLinkQueryClient & { release?: () => void }
 type KnexDriverLike = {

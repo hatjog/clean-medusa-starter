@@ -73,6 +73,8 @@ import { recordWebhookDeferredIssuanceTrace } from "../../../../lib/recovery/def
 import {
   persistDeferredIssuanceMarker,
   queryUnderMarketContext,
+  OWED_UNIT_RESERVATION_MISMATCH_ALARM,
+  OWED_UNIT_SETTLEMENT_ENVELOPE_KEY,
   releaseWebhookDelivery,
   reserveWebhookDelivery,
   resolveWebhookPgHandle,
@@ -106,22 +108,9 @@ import {
 
 export const AUTHENTICATE = false
 
-/**
- * Story 3.4 (FR-10, AD-33, DW-15-201): klucz w kopercie rezerwacji
- * `webhook_event_processed`, pod którym route UTRWALA stan rozliczenia jednostek
- * należnych tej dostawy. Rezerwacja transportu nie jest dowodem skutku — ten
- * wpis odróżnia w ZAPISIE (nie w logu) dostawę z nierozliczonymi jednostkami
- * (`state: 'unsettled'`) od dostawy, której skutek jest kompletny.
- */
-export const OWED_UNIT_SETTLEMENT_ENVELOPE_KEY = "owed_unit_settlement" as const
-
-/**
- * Story 3.4 (AC4): nazwa alarmu-bramki niezgodności rezerwacja transportu ↔
- * skutek biznesowy. Bramka = odpowiedź nie-2xx (ACK wstrzymany) + utrwalony
- * stan w rezerwacji; log jest dodatkiem, nie nośnikiem.
- */
-export const OWED_UNIT_RESERVATION_MISMATCH_ALARM =
-  "owed_unit_reservation_mismatch" as const
+// Story 3.4: klucz stempla i nazwa alarmu mają JEDEN nośnik (transport lib),
+// bo piszą je dwie strony — route (`reserved=false`) i konsument Path Y.
+export { OWED_UNIT_RESERVATION_MISMATCH_ALARM, OWED_UNIT_SETTLEMENT_ENVELOPE_KEY }
 
 const PERSIST_OWED_UNIT_SETTLEMENT_SQL =
   `UPDATE webhook_event_processed
