@@ -32,6 +32,7 @@ import {
   QUARANTINE_RETENTION_DAYS,
 } from "../../migrations/Migration20261115100000RecoveryPopulationReadEntry"
 import { handleRecoveryRead, RECOVERY_READ_CODES } from "../../api/admin/recovery/route"
+import { recordDeferredIssuanceTrace } from "../../lib/recovery/deferred-issuance-trace"
 import { __setKnexForAdminMarketTests } from "../../lib/admin-market-context"
 import { installRlsPoolHook } from "../../lib/rls-pool-hook"
 import { dlqEntryId, isEventDeadLettered } from "../../lib/events/event-dead-letter"
@@ -319,5 +320,51 @@ describeOrNotRun("Story 4.7 — wejście odczytu populacji pod RLS (PG)", () => 
       `${MKT_B}:evt_dit_${MKT_B}#deferred-issuance`,
     ])
     for (const e of emitted) expect(e.context?.market_id).toBeDefined()
+  })
+
+  // Story 8.3 AC2 (T5): przerwany powrót z pobranymi pieniędzmi (PI `succeeded`,
+  // koszyk bez zamówienia) zostawia ślad zapisany przez Path Y (`link_unresolved`
+  // ⇒ `recordDeferredIssuanceTrace`). Ślad jest odnajdywalny przez GET /admin/recovery
+  // po `payment_intent_id` w ISTNIEJĄCEJ populacji `deferred_issuance_trace` — bez
+  // nowej tabeli i kolumny. Kontrola ujemna: rynek B go nie widzi.
+  it("Story 8.3 AC2: ślad przerwanego powrotu jest odnajdywalny przez GET /admin/recovery po payment_intent_id", async () => {
+    const PI = "pi_story83_interrupted_return"
+    const EVT = "evt_story83_interrupted_return"
+    await admin.query("BEGIN")
+    try {
+      await admin.query("SELECT set_config('app.gp_market_id', $1, true), set_config('app.gp_instance_id', $2, true)", [MKT_A, INSTANCE])
+      const created = await recordDeferredIssuanceTrace(admin as never, {
+        stripe_event_id: EVT,
+        payment_intent_id: PI,
+        instance_id: INSTANCE,
+        market_id: MKT_A,
+        psp_occurred_at: new Date().toISOString(),
+        sla_seconds: 3600,
+      })
+      expect(created).toBe(true)
+      await admin.query("COMMIT")
+    } catch (err) {
+      await admin.query("ROLLBACK")
+      throw err
+    }
+    try {
+      const r = res()
+      await handleRecoveryRead(req(MKT_A), r as never)
+      expect(r.statusCode).toBe(200)
+      const body = r.body as { populations: Record<string, Array<{ payload: Record<string, unknown>; state: string }>> }
+      const found = body.populations.deferred_issuance_trace.filter((row) => row.payload.payment_intent_id === PI)
+      expect(found).toHaveLength(1)
+      expect(found[0].state).toBe("awaiting_order")
+      expect(found[0].payload.deferral_reason).toBe("webhook_before_order")
+
+      await admin.query("INSERT INTO admin_market_grants (admin_user_id, market_id) VALUES ($1, $2) ON CONFLICT DO NOTHING", [ACTOR, MKT_B])
+      const rb = res()
+      await handleRecoveryRead(req(MKT_B), rb as never)
+      const bodyB = rb.body as { populations: Record<string, Array<{ payload: Record<string, unknown> }>> }
+      expect(bodyB.populations.deferred_issuance_trace.some((row) => row.payload.payment_intent_id === PI)).toBe(false)
+    } finally {
+      await admin.query("DELETE FROM admin_market_grants WHERE admin_user_id = $1 AND market_id = $2", [ACTOR, MKT_B])
+      await admin.query("DELETE FROM deferred_issuance_trace WHERE payment_intent_id = $1", [PI])
+    }
   })
 })

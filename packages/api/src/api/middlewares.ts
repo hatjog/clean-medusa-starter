@@ -24,6 +24,7 @@ import { upstreamOrderAccessGuardMiddleware } from "./middlewares/upstream-order
 import { cartCompletionAuthorizationGuardMiddleware } from "./middlewares/cart-completion-authorization-guard";
 import { voucherLineQuantityGuardMiddleware } from "./middlewares/voucher-line-quantity-guard";
 import { cartCompletionPspAuthorityMiddleware } from "./middlewares/cart-completion-psp-authority";
+import { paymentSessionReinitGuardMiddleware } from "./middlewares/payment-session-reinit-guard";
 import {
   CUSTOMER_MARKET_FORBIDDEN_MESSAGE,
   isScopedToMarket,
@@ -1001,6 +1002,13 @@ export default defineMiddlewares({
       // Story 8.2 (ADR-233): PSP authority + cross-instance fence BEFORE the
       // guard, so a refusal never looks like an unreversed authorization.
       middlewares: [cartCompletionPspAuthorityMiddleware, cartCompletionAuthorizationGuardMiddleware],
+    },
+    // Story 8.3 (FR-15, AD-18): re-initialising payment sessions creates a NEW
+    // PaymentIntent; refuse it while the existing one is charged or in flight.
+    {
+      method: ["POST"],
+      matcher: "/store/payment-collections/:id/payment-sessions",
+      middlewares: [paymentSessionReinitGuardMiddleware],
     },
     // Story 3.3 AC2 runda fix 2 (ADR-242 p.5): linia voucherowa ma quantity=1
     // egzekwowane PRZED płatnością — odmowa 400 `voucher_line_quantity_unsupported`.

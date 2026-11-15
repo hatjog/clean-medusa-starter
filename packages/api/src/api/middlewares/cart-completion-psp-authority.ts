@@ -536,3 +536,9 @@ export function createCartCompletionPspAuthorityMiddleware(deps: PspAuthorityDep
 }
 
 export const cartCompletionPspAuthorityMiddleware = createCartCompletionPspAuthorityMiddleware()
+
+/**
+ * v1.16.0 Story 8.3: the same backend PSP read (market secret) for the
+ * payment-session re-initialisation guard and the charge-fact read route.
+ */
+export const defaultRetrievePaymentIntentStatusForMarket = defaultRetrievePaymentIntentStatus
