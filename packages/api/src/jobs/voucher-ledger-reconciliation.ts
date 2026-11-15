@@ -514,6 +514,10 @@ export function createPgRefundedScanner(
                   EXISTS (
                     SELECT 1 FROM voucher_redemption r
                      WHERE r.entitlement_id = e.id AND r.kind = 'REVERSAL'
+                       -- v1.16.0 Story 5.7 runda fix 1: wiersz KOREKTY
+                       -- (resulting_state='REDEMPTION_REVERSED', D-36) nie jest
+                       -- odwroceniem zwrotem i nie moze gasic alarmu M1.
+                       AND r.resulting_state IS DISTINCT FROM 'REDEMPTION_REVERSED'
                   )          AS has_reversal_row,
                   EXISTS (
                     SELECT 1 FROM ledger_posting_applied a

@@ -26,6 +26,8 @@ import {
   createRedeemPartialOperationFromPool,
   RedemptionCorrectionRefusedError,
 } from "../../modules/voucher/workflows/redeem-partial-entitlement"
+import { createPgRefundedScanner } from "../../jobs/voucher-ledger-reconciliation"
+import { revokeEntitlementsOnRefund } from "../../workflows/entitlements/issue-entitlement"
 
 const DATABASE_URL = process.env.DATABASE_URL ?? ""
 const isTestDb = /\/[A-Za-z0-9_]*_test(\?|$)/.test(DATABASE_URL)
@@ -75,7 +77,7 @@ maybe("Story 5.7 — ślad realizacji i korekta na realnym PG", () => {
       },
     })
 
-  async function seed(code: string): Promise<string> {
+  async function seed(code: string, orderId: string | null = null): Promise<string> {
     const ent = `${code}_ent`
     await pool.query(
       `INSERT INTO voucher (code, market_id, seller_id, seller_name, seller_handle, product_title,
@@ -85,9 +87,9 @@ maybe("Story 5.7 — ślad realizacji i korekta na realnym PG", () => {
     )
     await pool.query(
       `INSERT INTO entitlement_instance (id, entitlement_profile_id, entitlement_type, state,
-                                         policy_snapshot, market_id, vat_classification)
-       VALUES ($1, 'prof_s57', 'VOUCHER_SERVICE', 'ACTIVE', $2::jsonb, 'bonbeauty', 'MPV')`,
-      [ent, JSON.stringify({ voucher_code: code, market_id: "bonbeauty", amount_minor: GROSS, currency_code: "PLN", transferability: "bearer" })]
+                                         policy_snapshot, market_id, vat_classification, order_id)
+       VALUES ($1, 'prof_s57', 'VOUCHER_SERVICE', 'ACTIVE', $2::jsonb, 'bonbeauty', 'MPV', $3)`,
+      [ent, JSON.stringify({ voucher_code: code, market_id: "bonbeauty", amount_minor: GROSS, currency_code: "PLN", transferability: "bearer" }), orderId]
     )
     return ent
   }
@@ -207,5 +209,86 @@ maybe("Story 5.7 — ślad realizacji i korekta na realnym PG", () => {
     expect(again.state).toBe("REDEEMED_FULL")
     expect(again.status).toBe("claimed")
     expect(again.rows.map((r) => r.kind)).toEqual(["REDEMPTION", "REVERSAL", "REDEMPTION"])
+  })
+
+  /** Zwrot Stripe (`payment.refunded`) w jednej transakcji — jak `stripe-payment-audit`. */
+  async function refund(orderId: string) {
+    const client = await pool.connect()
+    try {
+      await client.query("BEGIN")
+      const out = await revokeEntitlementsOnRefund(client as never, orderId, new Date())
+      await client.query("COMMIT")
+      return out
+    } catch (err) {
+      await client.query("ROLLBACK")
+      throw err
+    } finally {
+      client.release()
+    }
+  }
+
+  it("runda fix 1 (HIGH AC2): realizacja → korekta → zwrot ⇒ REFUNDED i kod `refunded` (korekta ≠ zwrot)", async () => {
+    const code = `${RUN}_corr_refund`
+    const order = `${RUN}_order_a`
+    const ent = await seed(code, order)
+    await op().redeem({ voucher_code: code, redeem_full: true, idempotency_key_header: "s57-cr-key-1", redemption_market_id: "bonbeauty", actor: "vendor" })
+    await op().correct({ voucher_code: code, actor: "vendor" })
+    expect((await snapshot(code, ent)).state).toBe("REDEMPTION_REVERSED")
+
+    const out = await refund(order)
+    expect(out.revoked_entitlement_ids).toEqual([ent])
+    // Brak odwrócenia kwotowego: skorygowana realizacja nie jest „do zwrotu”.
+    expect(out.reversal_redemption_ids).toEqual([])
+    const after = await snapshot(code, ent)
+    expect(after.state).toBe("REFUNDED")
+    expect(after.status).toBe("refunded")
+    // Ślad bez nowego wiersza: REDEMPTION + korekta, append-only.
+    expect(after.rows.map((r) => [r.kind, r.resulting_state])).toEqual([
+      ["REDEMPTION", "REDEEMED_FULL"],
+      ["REVERSAL", "REDEMPTION_REVERSED"],
+    ])
+    // Voucher po zwrocie NIE jest realizowalny.
+    await expect(
+      op().redeem({ voucher_code: code, redeem_full: true, idempotency_key_header: "s57-cr-key-2", redemption_market_id: "bonbeauty", actor: "vendor" })
+    ).rejects.toThrow()
+    expect((await snapshot(code, ent)).state).toBe("REFUNDED")
+
+    // runda fix 1 (LOW reconciliation): wiersz KOREKTY nie jest odwróceniem
+    // zwrotem — skaner nie może go liczyć jako `has_reversal_row` (inaczej
+    // REFUNDED bez odwrócenia kwotowego trafia do noop zamiast alarmu M1).
+    const scanned = await createPgRefundedScanner(pool as never).scanRefundedTerminal()
+    expect(scanned.find((r) => r.entitlement_id === ent)).toEqual(
+      expect.objectContaining({ entitlement_id: ent, has_reversal_row: false })
+    )
+  })
+
+  it("runda fix 1 (HIGH AC2): realizacja → korekta → ponowna realizacja → zwrot ⇒ odwrócenie kwotowe TYLKO ponownej realizacji", async () => {
+    const code = `${RUN}_corr_rr_refund`
+    const order = `${RUN}_order_b`
+    const ent = await seed(code, order)
+    await op().redeem({ voucher_code: code, redeem_full: true, idempotency_key_header: "s57-crr-key-1", redemption_market_id: "bonbeauty", actor: "vendor" })
+    await op().correct({ voucher_code: code, actor: "vendor" })
+    await op().redeem({ voucher_code: code, redeem_full: true, idempotency_key_header: "s57-crr-key-2", redemption_market_id: "bonbeauty", actor: "vendor" })
+    const before = await snapshot(code, ent)
+    expect(before.state).toBe("REDEEMED_FULL")
+    const second = before.rows.filter((r) => r.kind === "REDEMPTION")[1]
+
+    const out = await refund(order)
+    expect(out.revoked_entitlement_ids).toEqual([ent])
+    expect(out.reversal_redemption_ids).toHaveLength(1)
+    const after = await snapshot(code, ent)
+    expect(after.state).toBe("REFUNDED")
+    expect(after.status).toBe("refunded")
+    const refundReversals = after.rows.filter(
+      (r) => r.kind === "REVERSAL" && r.resulting_state !== "REDEMPTION_REVERSED"
+    )
+    expect(refundReversals).toHaveLength(1)
+    expect(refundReversals[0].reverses_redemption_id).toBe(second.redemption_id)
+    expect(refundReversals[0].redemption_id).toBe(out.reversal_redemption_ids[0])
+    // Kontrola dodatnia skanera: odwrócenie zwrotem JEST `has_reversal_row`.
+    const scanned = await createPgRefundedScanner(pool as never).scanRefundedTerminal()
+    expect(scanned.find((r) => r.entitlement_id === ent)).toEqual(
+      expect.objectContaining({ entitlement_id: ent, has_reversal_row: true })
+    )
   })
 })

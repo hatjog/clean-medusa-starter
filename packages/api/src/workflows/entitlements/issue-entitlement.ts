@@ -1089,9 +1089,19 @@ export async function revokeEntitlementsOnRefund(
       continue
     }
 
+    // v1.16.0 Story 5.7 runda fix 1 (HIGH AC2): wiersz `kind='REVERSAL'` ma
+    // DWA znaczenia. Odwrócenie ZWROTEM niesie `resulting_state` odwracanej
+    // realizacji (REDEEMED_*), a KOREKTA pomyłki (D-36, ADR-245) niesie
+    // `resulting_state = 'REDEMPTION_REVERSED'`. Korekta NIE jest zwrotem:
+    // skorygowana realizacja jest zneutralizowana (jednostka wróciła), więc
+    // zwrot nie ma jej czego odwracać, ale uprawnienie nadal trzeba zwrócić
+    // przez maszynę stanów (gałąź REDEMPTION_REVERSED niżej). Bez tego
+    // rozróżnienia zwrot po korekcie rzucał i `payment.refunded` przerywał się,
+    // zostawiając voucher realizowalny po zwrocie pieniędzy (fail-open).
     const redemptionRows = await client.query<{
       redemption_id: string
-      already_reversed: boolean
+      refund_reversed: boolean
+      corrected: boolean
     }>(
       `SELECT redemption.redemption_id,
               EXISTS (
@@ -1099,7 +1109,15 @@ export async function revokeEntitlementsOnRefund(
                   FROM voucher_redemption reversal
                  WHERE reversal.reverses_redemption_id = redemption.redemption_id
                    AND reversal.kind = 'REVERSAL'
-              ) AS already_reversed
+                   AND reversal.resulting_state IS DISTINCT FROM 'REDEMPTION_REVERSED'
+              ) AS refund_reversed,
+              EXISTS (
+                SELECT 1
+                  FROM voucher_redemption correction
+                 WHERE correction.reverses_redemption_id = redemption.redemption_id
+                   AND correction.kind = 'REVERSAL'
+                   AND correction.resulting_state = 'REDEMPTION_REVERSED'
+              ) AS corrected
          FROM voucher_redemption redemption
         WHERE redemption.entitlement_id = $1
           AND redemption.kind = 'REDEMPTION'
@@ -1108,10 +1126,16 @@ export async function revokeEntitlementsOnRefund(
       [row.id]
     )
 
-    if (redemptionRows.rows.length > 0) {
-      const outstandingRedemptions = redemptionRows.rows.filter(
-        (redemption) => !redemption.already_reversed
-      )
+    const outstandingRedemptions = redemptionRows.rows.filter(
+      (redemption) => !redemption.refund_reversed && !redemption.corrected
+    )
+    const anyRefundReversed = redemptionRows.rows.some(
+      (redemption) => redemption.refund_reversed
+    )
+    // Same realizacje skorygowane (bez odwróceń zwrotem) ⇒ nic do odwracania
+    // kwotowo; uprawnienie idzie ścieżką stanu (REDEMPTION_REVERSED →
+    // REFUND_REQUESTED → REFUNDED) i kod przechodzi na `refunded`.
+    if (outstandingRedemptions.length > 0 || anyRefundReversed) {
       if (outstandingRedemptions.length === 0) {
         throw new Error(
           `revokeEntitlementsOnRefund: entitlement ${row.id} has only reversed ` +
@@ -1170,12 +1194,15 @@ export async function revokeEntitlementsOnRefund(
         terminalState = EntitlementInstanceState.REFUNDED
       } else if (
         currentState === EntitlementInstanceState.ACTIVE ||
+        // v1.16.0 Story 5.7 (D-36): po korekcie uprawnienie zachowuje się jak
+        // ACTIVE; krawędź REDEMPTION_REVERSED → REFUND_REQUESTED jest w grafie.
+        currentState === EntitlementInstanceState.REDEMPTION_REVERSED ||
         currentState === EntitlementInstanceState.EXPIRED ||
         currentState === EntitlementInstanceState.REDEEMED_PARTIAL ||
         currentState === EntitlementInstanceState.REDEEMED_FULL ||
         currentState === EntitlementInstanceState.SETTLED
       ) {
-        // ACTIVE/EXPIRED/REDEEMED_*/SETTLED → REFUND_REQUESTED → REFUNDED.
+        // ACTIVE/REDEMPTION_REVERSED/EXPIRED/REDEEMED_*/SETTLED → REFUND_REQUESTED → REFUNDED.
         assertTransition(currentState, EntitlementInstanceState.REFUND_REQUESTED)
         assertTransition(
           EntitlementInstanceState.REFUND_REQUESTED,

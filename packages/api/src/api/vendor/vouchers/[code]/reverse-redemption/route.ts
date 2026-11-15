@@ -15,7 +15,10 @@
  * `REDEMPTION` NIE jest kasowany ani aktualizowany (append-only, ADR-178 §2.3).
  *
  * Odpowiedzi:
- *   - 200 `{ ok, status: "REDEMPTION_REVERSED", correction: { corrected_at, actor, market_id } }`
+ *   - 200 `{ ok, status: "REDEMPTION_REVERSED", voucher_status, correction: { corrected_at, actor, market_id } }`
+ *     — `voucher_status` to stan kodu PRZYWRÓCONY przez producenta w tej samej
+ *     transakcji (`idle` albo `consent_pending`); panel bierze go z odpowiedzi,
+ *     zamiast zakładać `idle` (runda fix 1, LOW panel).
  *   - 400 INVALID_INPUT — brak/krótki kod
  *   - 404 VOUCHER_NOT_FOUND — kod nieznany LUB cudzy
  *   - 404 ENTITLEMENT_NOT_FOUND / 409 ENTITLEMENT_AMBIGUOUS — most kod → uprawnienie
@@ -114,10 +117,11 @@ async function correctInSellerMarket(
     req.scope,
     ContainerRegistrationKeys.PG_CONNECTION,
   )
+  let restoredVoucherStatus: string | null = null
   const operation = createRedeemPartialOperationFromPool(connectionSource, {
     async writeCorrectionProjection(client, context) {
       try {
-        await voucherService.restoreAfterCorrectionForSeller(
+        restoredVoucherStatus = await voucherService.restoreAfterCorrectionForSeller(
           sellerId,
           context.voucher_code,
           { client, now: context.now },
@@ -177,6 +181,7 @@ async function correctInSellerMarket(
   res.status(200).json({
     ok: true,
     status: result.entitlement_state_after,
+    voucher_status: restoredVoucherStatus,
     correction: {
       corrected_at: result.corrected_at,
       actor: "own_seller",

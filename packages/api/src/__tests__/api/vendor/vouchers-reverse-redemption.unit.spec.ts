@@ -226,6 +226,20 @@ describe("Story 5.7 AC2 — POST /vendor/vouchers/:code/reverse-redemption", () 
     })
     expect(w.world.state).toBe("REDEMPTION_REVERSED")
     expect(w.world.voucherStatus).toBe("idle")
+    expect((res.body as { voucher_status: string }).voucher_status).toBe("idle")
+  })
+
+  it("runda fix 1: 200 niesie PRZYWRÓCONY status kodu z producenta (consent_pending, nie stałe idle)", async () => {
+    const w = createWorld()
+    const s = serviceFor(w)
+    await redeem(w, s, "panel-corr-key-0099")
+    s.restoreAfterCorrectionForSeller.mockImplementationOnce(async () => {
+      w.world.voucherStatus = "consent_pending"
+      return "consent_pending"
+    })
+    const res = await correct(w, s)
+    expect(res.statusCode).toBe(200)
+    expect((res.body as { voucher_status: string }).voucher_status).toBe("consent_pending")
   })
 
   it("ślad append-only: wiersz REVERSAL wskazuje pierwotny, pierwotny nienaruszony", async () => {
