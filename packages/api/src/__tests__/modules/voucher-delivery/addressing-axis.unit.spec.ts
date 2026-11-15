@@ -4,6 +4,7 @@
 import { describe, expect, it } from "@jest/globals"
 
 import {
+  ADDRESSING_AXIS_TARGET_ROWS_SQL,
   ADDRESSING_AXIS_TEMPLATE_KEY,
   buildAddressingAxisProofQuery,
   checkAddressingAxis,
@@ -62,44 +63,68 @@ describe("Story 6.4 AC1 — oś (a): adresat powiadomienia różny od płatnika"
   })
 })
 
-describe("Story 6.4 AC2 (logika) — kontrola dodatnia poprzedza (0 rows)", () => {
-  function fakeDb(rowsByEntitlement: Record<string, number>): QueryRunner & { calls: string[] } {
+describe("Story 6.4 AC2 (logika) — kontrola dodatnia, wiersz badanego, potem (0 rows)", () => {
+  type Row = { dispatch_id: string; entitlement_id: string; recipient_hash: string }
+  /** Atrapa ledgera: filtruje WIERSZE, a nie zwraca liczby — zapytanie badanego bez filtra hasha. */
+  function fakeDb(table: Row[]): QueryRunner & { calls: string[] } {
     const calls: string[] = []
     return {
       calls,
-      async query(_text, values) {
+      async query(text, values) {
         const ent = String(values[0])
-        calls.push(ent)
+        const isTarget = text === ADDRESSING_AXIS_TARGET_ROWS_SQL
+        calls.push(`${isTarget ? "target" : "hash"}:${ent}`)
         return {
-          rows: Array.from({ length: rowsByEntitlement[ent] ?? 0 }, (_, i) => ({
-            dispatch_id: `d_${i}`,
-            recipient_hash: String(values[2]),
-          })),
+          rows: table.filter(
+            (r) => r.entitlement_id === ent && (isTarget || r.recipient_hash === String(values[2])),
+          ),
         }
       },
     }
   }
+  const row = (ent: string, email: string): Row => ({
+    dispatch_id: `d_${ent}`,
+    entitlement_id: ent,
+    recipient_hash: hashRecipientEmail(email),
+  })
+  const run = (db: QueryRunner, entitlement_id = "ent") =>
+    runAddressingAxisProof(db, { entitlement_id, control_entitlement_id: "ent_ctrl", payer_email: PAYER })
 
-  it("kontrola znaleziona, zapytanie właściwe puste ⇒ PASS, kolejność: kontrola, potem dowód", async () => {
-    const db = fakeDb({ ent_ctrl: 1 })
-    const r = await runAddressingAxisProof(db, { entitlement_id: "ent", control_entitlement_id: "ent_ctrl", payer_email: PAYER })
-    expect(db.calls).toEqual(["ent_ctrl", "ent"])
+  it("wiersz badanego z adresatem ≠ płatnik ⇒ PASS; kolejność: kontrola, badany, dowód", async () => {
+    const db = fakeDb([row("ent_ctrl", PAYER), row("ent", RECIPIENT)])
+    const r = await run(db)
+    expect(db.calls).toEqual(["hash:ent_ctrl", "target:ent", "hash:ent"])
     expect(r.verdict).toBe("PASS")
-    expect(r.positive_control.row_count).toBe(1)
-    expect(r.proof).toEqual({ entitlement_id: "ent", row_count: 0, executed_seq: 2 })
+    expect(r.target.row_count).toBe(1)
+    expect(r.target.rows).toEqual([
+      { dispatch_id: "d_ent", entitlement_id: "ent", recipient_hash: hashRecipientEmail(RECIPIENT), axis_verdict: "PASS" },
+    ])
+    expect(r.proof).toEqual({ entitlement_id: "ent", row_count: 0, executed_seq: 3 })
   })
 
-  it("kontrola dodatnia pusta ⇒ CONTROL_FAILED, pusty wynik nie jest uznany", async () => {
-    const db = fakeDb({})
-    const r = await runAddressingAxisProof(db, { entitlement_id: "ent", control_entitlement_id: "ent_ctrl", payer_email: PAYER })
-    expect(r.verdict).toBe("CONTROL_FAILED")
+  it("brak wiersza handoffu badanego entitlementu ⇒ TARGET_ROW_MISSING, nie PASS (pusty join)", async () => {
+    const db = fakeDb([row("ent_ctrl", PAYER), row("ent", RECIPIENT)])
+    const r = await run(db, "literowka")
+    expect(r.verdict).toBe("TARGET_ROW_MISSING")
+    expect(r.target.row_count).toBe(0)
     expect(r.proof.executed_seq).toBeNull()
-    expect(db.calls).toEqual(["ent_ctrl"])
+    expect(db.calls).toEqual(["hash:ent_ctrl", "target:literowka"])
   })
 
   it("wiersz handoffu zaadresowany do płatnika ⇒ FAIL", async () => {
-    const db = fakeDb({ ent_ctrl: 1, ent: 1 })
-    const r = await runAddressingAxisProof(db, { entitlement_id: "ent", control_entitlement_id: "ent_ctrl", payer_email: PAYER })
+    const db = fakeDb([row("ent_ctrl", PAYER), row("ent", ` ${PAYER.toUpperCase()}`)])
+    const r = await run(db)
     expect(r.verdict).toBe("FAIL")
+    expect(r.target.rows[0]?.axis_verdict).toBe("FAIL")
+    expect(r.proof.row_count).toBe(1)
+  })
+
+  it("kontrola dodatnia pusta ⇒ CONTROL_FAILED, nic dalej nie jest uznane", async () => {
+    const db = fakeDb([row("ent", RECIPIENT)])
+    const r = await run(db)
+    expect(r.verdict).toBe("CONTROL_FAILED")
+    expect(r.proof.executed_seq).toBeNull()
+    expect(r.target.executed_seq).toBeNull()
+    expect(db.calls).toEqual(["hash:ent_ctrl"])
   })
 })

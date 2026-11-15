@@ -80,14 +80,40 @@ export function buildAddressingAxisProofQuery(input: {
   }
 }
 
+/**
+ * Zapytanie wierszy BADANEGO entitlementu (fix D-31, finding „pusty join”):
+ * wszystkie wiersze handoffu entitlementu, BEZ filtra hasha płatnika. Zero
+ * wierszy to odmowa `TARGET_ROW_MISSING`, nie PASS — inaczej literówka w
+ * `entitlement_id` albo niezapisany handoff dawałyby `(0 rows)` zapytania
+ * właściwego, czyli zieleń bez zjawiska.
+ */
+export const ADDRESSING_AXIS_TARGET_ROWS_SQL = `SELECT dispatch_id, entitlement_id, recipient_hash
+  FROM ${VOUCHER_DELIVERY_DISPATCH_TABLE}
+ WHERE entitlement_id = $1
+   AND template_key = $2
+ ORDER BY dispatch_id`
+
 export type QueryRunner = {
-  query(text: string, values: unknown[]): Promise<{ rows: Array<{ dispatch_id: string; recipient_hash: string }> }>
+  query(
+    text: string,
+    values: unknown[],
+  ): Promise<{ rows: Array<{ dispatch_id: string; recipient_hash: string; entitlement_id?: string }> }>
 }
+
+export type AddressingAxisTargetRow = {
+  dispatch_id: string
+  entitlement_id: string
+  recipient_hash: string
+  axis_verdict: AddressingAxisVerdict["verdict"]
+}
+
+export type AddressingAxisProofVerdict = "PASS" | "FAIL" | "CONTROL_FAILED" | "TARGET_ROW_MISSING"
 
 export type AddressingAxisProof = {
   axis: typeof ADDRESSING_AXIS_ID
   is_delivery_proof: false
   query_sql: string
+  target_query_sql: string
   template_key: string
   payer_hash: string
   positive_control: {
@@ -96,18 +122,26 @@ export type AddressingAxisProof = {
     recipient_hashes: string[]
     executed_seq: 1
   }
+  target: {
+    entitlement_id: string
+    row_count: number
+    rows: AddressingAxisTargetRow[]
+    executed_seq: 2 | null
+  }
   proof: {
     entitlement_id: string
     row_count: number
-    executed_seq: 2 | null
+    executed_seq: 3 | null
   }
-  verdict: "PASS" | "FAIL" | "CONTROL_FAILED"
+  verdict: AddressingAxisProofVerdict
 }
 
 /**
- * Wykonuje kontrolę dodatnią, a dopiero potem zapytanie właściwe. Jeśli
- * kontrola dodatnia nie znajdzie wiersza kontrolnego, zapytanie właściwe NIE
- * jest uznawane (verdict CONTROL_FAILED, proof.executed_seq = null).
+ * Kolejność: (1) kontrola dodatnia, (2) wiersze BADANEGO entitlementu,
+ * (3) zapytanie właściwe. Pusta kontrola ⇒ CONTROL_FAILED; brak wiersza
+ * badanego ⇒ TARGET_ROW_MISSING (nazwana odmowa, nie PASS). PASS wyłącznie,
+ * gdy każdy wiersz badanego przechodzi `checkAddressingAxis` po wartości
+ * i zapytanie właściwe zwraca `(0 rows)`.
  */
 export async function runAddressingAxisProof(
   db: QueryRunner,
@@ -122,6 +156,7 @@ export async function runAddressingAxisProof(
     axis: ADDRESSING_AXIS_ID as typeof ADDRESSING_AXIS_ID,
     is_delivery_proof: false as const,
     query_sql: ADDRESSING_AXIS_PROOF_SQL,
+    target_query_sql: ADDRESSING_AXIS_TARGET_ROWS_SQL,
     template_key: ADDRESSING_AXIS_TEMPLATE_KEY,
     payer_hash: control.values[2],
     positive_control: {
@@ -131,21 +166,41 @@ export async function runAddressingAxisProof(
       executed_seq: 1 as const,
     },
   }
+  const emptyTarget = { entitlement_id: input.entitlement_id, row_count: 0, rows: [], executed_seq: null }
+  const notRun = { entitlement_id: input.entitlement_id, row_count: 0, executed_seq: null }
   if (controlResult.rows.length < 1) {
-    return {
-      ...base,
-      proof: { entitlement_id: input.entitlement_id, row_count: 0, executed_seq: null },
-      verdict: "CONTROL_FAILED",
-    }
+    return { ...base, target: emptyTarget, proof: notRun, verdict: "CONTROL_FAILED" }
   }
+
+  const targetResult = await db.query(ADDRESSING_AXIS_TARGET_ROWS_SQL, [
+    input.entitlement_id,
+    ADDRESSING_AXIS_TEMPLATE_KEY,
+  ])
+  const rows: AddressingAxisTargetRow[] = targetResult.rows.map((row) => ({
+    dispatch_id: row.dispatch_id,
+    entitlement_id: String(row.entitlement_id ?? ""),
+    recipient_hash: row.recipient_hash,
+    axis_verdict: checkAddressingAxis({
+      notification_recipient_hash: row.recipient_hash,
+      payer_email: input.payer_email,
+    }).verdict,
+  }))
+  const target = { entitlement_id: input.entitlement_id, row_count: rows.length, rows, executed_seq: 2 as const }
+  if (rows.length < 1) {
+    return { ...base, target, proof: notRun, verdict: "TARGET_ROW_MISSING" }
+  }
+
   const proof = buildAddressingAxisProofQuery({
     entitlement_id: input.entitlement_id,
     payer_email: input.payer_email,
   })
   const proofResult = await db.query(proof.text, proof.values)
+  const rowsBelongToTarget = rows.every((row) => row.entitlement_id === input.entitlement_id)
+  const allRowsPass = rows.every((row) => row.axis_verdict === "PASS")
   return {
     ...base,
-    proof: { entitlement_id: input.entitlement_id, row_count: proofResult.rows.length, executed_seq: 2 },
-    verdict: proofResult.rows.length === 0 ? "PASS" : "FAIL",
+    target,
+    proof: { entitlement_id: input.entitlement_id, row_count: proofResult.rows.length, executed_seq: 3 },
+    verdict: proofResult.rows.length === 0 && allRowsPass && rowsBelongToTarget ? "PASS" : "FAIL",
   }
 }
