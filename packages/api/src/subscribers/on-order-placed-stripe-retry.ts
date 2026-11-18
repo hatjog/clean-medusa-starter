@@ -49,6 +49,8 @@
  * tutaj jest ścieżka odzysku Stripe, tam no-op breadcrumb po rewersie Wave-B
  * (H-8).
  */
+import { isRlsPoolHookInstalled } from "../lib/rls-pool-hook"
+import { runPerRosterMarket } from "../lib/system-market-roster"
 import type { SubscriberArgs, SubscriberConfig } from "@medusajs/framework"
 import { ContainerRegistrationKeys, Modules } from "@medusajs/framework/utils"
 
@@ -775,6 +777,30 @@ export async function closePathYRecoveryTrace(
   return "closed"
 }
 
+/**
+ * Story 8.7 (DW-15-374): odzysk Path Y pod zainstalowanym hookiem RLS biegnie
+ * per rynek z rosteru instancji (`runPerRosterMarket`), z filtrem wierszy po
+ * rynku — połączenie dostaje rolę runtime i GUC rynku wiersza. Bez hooka
+ * (pula `__pg_pool__`, testy jednostkowe) — jedno wykonanie bez filtra.
+ */
+async function runOrderRecoveryScoped(
+  db: PgPool | KnexLike,
+  container: { resolve: (key: string) => unknown },
+  logger: { error?: (m: string, meta?: unknown) => void },
+  work: (marketFilter: string | null) => Promise<void>
+): Promise<void> {
+  if (!isPgPool(db) && isRlsPoolHookInstalled(db as never)) {
+    await runPerRosterMarket(
+      container,
+      { surface: "subscriber", name: "on-order-placed-stripe-retry" },
+      { error: (m, meta) => logger.error?.(m, meta) },
+      (marketId) => work(marketId)
+    )
+    return
+  }
+  await work(null)
+}
+
 export default async function onOrderPlacedStripeRetry({
   event,
   container,
@@ -797,8 +823,12 @@ export default async function onOrderPlacedStripeRetry({
     // ATOMOWOŚCI w `entitlement-transition-wiring`).
     const transitionEvents: TransitionEventEnvelope[] = []
     try {
-      await withTransaction(db, async (client) => {
-        const deferred = await findDeferredCapturesForOrder(client, orderId)
+      // Story 8.7 (DW-15-374): pod zainstalowanym hookiem RLS wybór i odzysk
+      // biegną PER RYNEK (kontekst rynku wiersza); bez hooka — jedna transakcja.
+      await runOrderRecoveryScoped(db, scope, logger, (marketFilter) => withTransaction(db, async (client) => {
+        const found = await findDeferredCapturesForOrder(client, orderId)
+        const deferred =
+          marketFilter === null ? found : found.filter((row) => row.market_id === marketFilter)
         if (deferred.length === 0) {
           return
         }
@@ -1122,7 +1152,7 @@ export default async function onOrderPlacedStripeRetry({
             throw new DeadLetterPendingError(row, orderId, classification, err)
           }
         }
-      })
+      }))
     } catch (err) {
       if (err instanceof DeadLetterPendingError) {
         try {

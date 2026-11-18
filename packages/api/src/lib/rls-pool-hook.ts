@@ -378,6 +378,16 @@ export function installRlsPoolHook(
   };
 }
 
+/**
+ * Story 8.7 (DW-15-374): czy hook jest zainstalowany na kliencie tego
+ * `PG_CONNECTION` — powierzchnie asynchroniczne przechodzą wtedy na wykonanie
+ * per rynek (bez kontekstu rynku hook odmawia acquire).
+ */
+export function isRlsPoolHookInstalled(pgConnection: PgConnectionLike | null | undefined): boolean {
+  const client = pgConnection?.client;
+  return !!client && installedClients.has(client);
+}
+
 /** Reset installed flag — for testing only */
 export function _resetRlsPoolHook(): void {
   installedClients = new WeakSet<object>();

@@ -80,6 +80,7 @@
  * zjadały batcha) i widoczne osobnym licznikiem zaparkowanych.
  */
 
+import { runPerRosterMarket } from "../lib/system-market-roster"
 import type { MedusaContainer } from "@medusajs/framework/types"
 import { ContainerRegistrationKeys, Modules } from "@medusajs/framework/utils"
 
@@ -1707,12 +1708,21 @@ export default async function voucherDeliveryReconciliationSweepJob(
       env: process.env,
     }
 
-    await runVoucherDeliveryReconciliationSweep({
-      scanner: ledger,
-      delivery,
-      logger,
-      metrics: resolveSweepMetrics(container, logger),
-    })
+    // Story 8.7 (DW-15-374): przebieg PER RYNEK z rosteru instancji, pod
+    // kontekstem rynku — hook RLS odmawia połączeń bez rynku, a sweep bez
+    // kontekstu kończył się odmową acquire przy każdym przebiegu.
+    await runPerRosterMarket(
+      container as unknown as { resolve: (key: string) => unknown },
+      { surface: "job", name: SCHEDULE_NAME },
+      { error: (m, meta) => logger.error(m, meta as Record<string, unknown>) },
+      async () =>
+        runVoucherDeliveryReconciliationSweep({
+          scanner: ledger,
+          delivery,
+          logger,
+          metrics: resolveSweepMetrics(container, logger),
+        }),
+    )
   } catch (error) {
     logger.error(
       `[${SCHEDULE_NAME}] przebieg przerwany błędem zależności — scheduler ` +

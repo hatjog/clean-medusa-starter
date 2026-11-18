@@ -1,6 +1,8 @@
 import type { MedusaContainer } from "@medusajs/framework/types"
 import { ContainerRegistrationKeys } from "@medusajs/framework/utils"
 
+import { runPerRosterMarket } from "../lib/system-market-roster"
+
 /**
  * voucher-consent-retention-sweep — v1.9.0 Wave F6 / Epic-2 HIGH-13.
  *
@@ -92,80 +94,85 @@ export default async function voucherConsentRetentionSweep(
     return
   }
 
-  let attemptsDeleted = 0
-  let ipHashed = 0
-  let uaCleared = 0
-  let emailCleared = 0
+  // Story 8.7 (DW-15-374): przebieg PER RYNEK z rosteru instancji, pod
+  // kontekstem rynku (hook RLS odmawia połączeń bez rynku). Każda porażka jest
+  // zbierana i na końcu RZUCANA — wcześniej `catch` logował i job kończył się
+  // sukcesem (maskowanie błędu retencji PII jako sukces).
+  const failures: Array<{ market_id: string; step: string; error: string }> = []
+  const totals = { attemptsDeleted: 0, ipHashed: 0, uaCleared: 0, emailCleared: 0 }
 
-  try {
-    const r1 = await db.raw(
-      `DELETE FROM voucher_consent_attempt
-        WHERE created_at < NOW() - INTERVAL '${ATTEMPT_TTL_DAYS} days'`
-    )
-    attemptsDeleted = rowCount(r1)
-  } catch (err) {
-    logger.error("voucher_consent_attempt cleanup failed", err)
-  }
-
-  try {
-    // Hash ip_address with sha256 once past the IP retention window. We store
-    // the hash back into the same column (keeps schema flat) but prefix with
-    // `sha256:` so callers can distinguish raw IP from hashed IP. Idempotent
-    // — once prefixed, the WHERE clause skips the row.
-    const r2 = await db.raw(
-      `UPDATE voucher_consent
-          SET ip_address = ('sha256:' || encode(digest(host(ip_address)::text, 'sha256'), 'hex'))::inet
-        WHERE ip_address IS NOT NULL
-          AND created_at < NOW() - INTERVAL '${IP_HASH_AFTER_DAYS} days'
-          AND host(ip_address)::text NOT LIKE 'sha256:%'`
-    )
-    ipHashed = rowCount(r2)
-  } catch (err) {
-    // pgcrypto's `digest` may be unavailable in some deployments. Fall back to
-    // NULLing the ip_address column on failure (preserves PII minimisation
-    // posture even if pgcrypto isn't enabled).
-    logger.warn(`voucher_consent ip_address hash failed; falling back to NULL: ${(err as Error).message}`)
-    try {
-      const fallback = await db.raw(
-        `UPDATE voucher_consent
-            SET ip_address = NULL
-          WHERE ip_address IS NOT NULL
-            AND created_at < NOW() - INTERVAL '${IP_HASH_AFTER_DAYS} days'`
+  await runPerRosterMarket(
+    container as unknown as { resolve: (key: string) => unknown },
+    { surface: "job", name: SCHEDULE_NAME },
+    { error: (m, e) => logger.error(m, e) },
+    async (marketId) => {
+      const step = async (name: string, run: () => Promise<number>) => {
+        try {
+          return await run()
+        } catch (err) {
+          failures.push({ market_id: marketId, step: name, error: (err as Error).message })
+          logger.error(`market=${marketId} ${name} failed`, err)
+          return 0
+        }
+      }
+      totals.attemptsDeleted += await step("voucher_consent_attempt cleanup", async () =>
+        rowCount(await db.raw(
+          `DELETE FROM voucher_consent_attempt
+            WHERE market_id = ? AND created_at < NOW() - INTERVAL '${ATTEMPT_TTL_DAYS} days'`,
+          [marketId]
+        ))
       )
-      ipHashed = rowCount(fallback)
-    } catch (fallbackErr) {
-      logger.error("voucher_consent ip_address fallback NULL failed", fallbackErr)
+      totals.ipHashed += await step("voucher_consent ip_address minimisation", async () => {
+        try {
+          return rowCount(await db.raw(
+            `UPDATE voucher_consent
+                SET ip_address = ('sha256:' || encode(digest(host(ip_address)::text, 'sha256'), 'hex'))::inet
+              WHERE market_id = ? AND ip_address IS NOT NULL
+                AND created_at < NOW() - INTERVAL '${IP_HASH_AFTER_DAYS} days'
+                AND host(ip_address)::text NOT LIKE 'sha256:%'`,
+            [marketId]
+          ))
+        } catch (err) {
+          // pgcrypto może być niedostępne — fallback NULL (minimalizacja PII);
+          // porażka fallbacku wraca do `step` jako porażka przebiegu.
+          logger.warn(`market=${marketId} voucher_consent ip_address hash failed; falling back to NULL: ${(err as Error).message}`)
+          return rowCount(await db.raw(
+            `UPDATE voucher_consent SET ip_address = NULL
+              WHERE market_id = ? AND ip_address IS NOT NULL
+                AND created_at < NOW() - INTERVAL '${IP_HASH_AFTER_DAYS} days'`,
+            [marketId]
+          ))
+        }
+      })
+      totals.uaCleared += await step("voucher_consent user_agent cleanup", async () =>
+        rowCount(await db.raw(
+          `UPDATE voucher_consent SET user_agent = NULL
+            WHERE market_id = ? AND user_agent IS NOT NULL
+              AND created_at < NOW() - INTERVAL '${UA_NULL_AFTER_DAYS} days'`,
+          [marketId]
+        ))
+      )
+      totals.emailCleared += await step("voucher_consent guardian_email cleanup", async () =>
+        rowCount(await db.raw(
+          `UPDATE voucher_consent SET guardian_email = NULL
+            WHERE market_id = ? AND guardian_email IS NOT NULL
+              AND created_at < NOW() - INTERVAL '${EMAIL_NULL_AFTER_DAYS} days'`,
+          [marketId]
+        ))
+      )
     }
-  }
-
-  try {
-    const r3 = await db.raw(
-      `UPDATE voucher_consent
-          SET user_agent = NULL
-        WHERE user_agent IS NOT NULL
-          AND created_at < NOW() - INTERVAL '${UA_NULL_AFTER_DAYS} days'`
-    )
-    uaCleared = rowCount(r3)
-  } catch (err) {
-    logger.error("voucher_consent user_agent cleanup failed", err)
-  }
-
-  try {
-    const r4 = await db.raw(
-      `UPDATE voucher_consent
-          SET guardian_email = NULL
-        WHERE guardian_email IS NOT NULL
-          AND created_at < NOW() - INTERVAL '${EMAIL_NULL_AFTER_DAYS} days'`
-    )
-    emailCleared = rowCount(r4)
-  } catch (err) {
-    logger.error("voucher_consent guardian_email cleanup failed", err)
-  }
+  )
 
   logger.info(
-    `attempts_deleted=${attemptsDeleted} ip_hashed=${ipHashed} ` +
-      `ua_cleared=${uaCleared} email_cleared=${emailCleared}`
+    `attempts_deleted=${totals.attemptsDeleted} ip_hashed=${totals.ipHashed} ` +
+      `ua_cleared=${totals.uaCleared} email_cleared=${totals.emailCleared} failures=${failures.length}`
   )
+  if (failures.length > 0) {
+    throw new Error(
+      `${SCHEDULE_NAME}: ${failures.length} krok(ów) retencji nieudanych: ` +
+        failures.map((f) => `${f.market_id}/${f.step}`).join(", ")
+    )
+  }
 }
 
 export const config = {

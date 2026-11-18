@@ -13,6 +13,9 @@ import knexFactory, { type Knex } from "knex"
 
 import { installRlsPoolHook, RlsMarketContextRequiredError } from "../../lib/rls-pool-hook"
 import { marketContextStorage } from "../../lib/market-context"
+import sweep from "../../jobs/voucher-consent-retention-sweep"
+import onOrderPlaced from "../../subscribers/on-order-placed-stripe-retry"
+import handoffSweep from "../../jobs/voucher-delivery-reconciliation-sweep"
 
 const DATABASE_URL = process.env.DATABASE_URL ?? ""
 const isTestDb = /\/[A-Za-z0-9_]*_test(\?|$)/.test(DATABASE_URL)
@@ -64,5 +67,115 @@ maybe("Story 8.7 DW-15-370 — odmowy hooka RLS nie wyczerpują puli (PG)", () =
     expect(result.rows[0]).toEqual({ market: "bonbeauty", who: "medusa_store" })
     expect(elapsed).toBeLessThan(ACQUIRE_TIMEOUT_MS)
     expect(pool.numUsed()).toBe(0)
+  })
+})
+
+/**
+ * Story 8.7 (DW-15-374, retro E11-X-10/X-11): trzy powierzchnie asynchroniczne
+ * z ZAINSTALOWANYM hookiem RLS — odzysk Path Y (`order.placed`), sweep handoffu
+ * dostawy i sweep retencji zgód. Pomiar: każda powierzchnia musi dostać
+ * połączenie z kontekstem rynku (brak logu `RLS pool hook acquire denied`),
+ * a sweep zgód nie może zakończyć się sukcesem przy porażce.
+ *
+ * Dane: własne wiersze z prefiksem przebiegu (sprzątane w `afterAll`). Rola
+ * runtime `medusa_store` dostaje granty jak w bootstrapie
+ * `infra/postgres/migrations/003-rls-market-isolation.sql` (klon bazy `*_test`
+ * ich nie niesie dla tabel spoza modułów RLS).
+ */
+maybe("Story 8.7 DW-15-374 — powierzchnie asynchroniczne pod zainstalowanym hookiem RLS (PG)", () => {
+  const RUN = `s874_${Date.now().toString(36)}`
+  const MARKET = "bonbeauty"
+  let knex: Knex
+  let admin: Knex
+  const logs: string[] = []
+  const logger = {
+    info: (m: string) => logs.push(`info ${m}`),
+    warn: (m: string) => logs.push(`warn ${m}`),
+    error: (m: string, meta?: unknown) => logs.push(`error ${m} ${meta ? JSON.stringify(meta) : ""}`),
+    debug: (m: string) => logs.push(`debug ${m}`),
+  }
+  const container = {
+    resolve: (key: string) => {
+      if (key === "pg_connection" || key === "__pg_connection__") return knex
+      if (key === "logger") return logger
+      if (key === "gp_market_loader") return { listActive: async () => [MARKET] }
+      if (key === "notification") return { createNotifications: async () => [] }
+      if (key === "voucher") return {}
+      throw new Error(`unexpected resolve(${key})`)
+    },
+  }
+  const denials = () => logs.filter((l) => l.includes("RLS pool hook acquire denied"))
+
+  beforeAll(async () => {
+    admin = knexFactory({ client: "pg", connection: DATABASE_URL, pool: { min: 0, max: 1 } })
+    await admin.raw("GRANT USAGE ON SCHEMA public TO medusa_store")
+    await admin.raw("GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO medusa_store")
+    knex = knexFactory({ client: "pg", connection: DATABASE_URL, pool: { min: 0, max: 4 }, acquireConnectionTimeout: 5_000 })
+    installRlsPoolHook(knex as never, logger)
+  })
+
+  afterAll(async () => {
+    await admin?.raw("DELETE FROM voucher_consent_attempt WHERE token_jti LIKE ?", [`${RUN}%`])
+    await admin?.raw("DELETE FROM webhook_event_processed WHERE event_id LIKE ?", [`${RUN}%`])
+    await admin?.raw("DELETE FROM order_payment_collection WHERE id LIKE ?", [`${RUN}%`])
+    await admin?.raw("DELETE FROM payment WHERE id LIKE ?", [`${RUN}%`])
+    await knex?.destroy()
+    await admin?.destroy()
+  })
+
+  it("sweep zgód: pod hookiem kasuje przeterminowane próby rynku i NIE kończy się sukcesem przy porażce", async () => {
+    await admin.raw(
+      `INSERT INTO voucher_consent_attempt (token_jti, recipient_id, market_id, sales_channel_id, created_at)
+       VALUES (?, ?, ?, 'sc_s874', now() - interval '30 days')`,
+      [`${RUN}_jti`, `${RUN}_rcp`, MARKET]
+    )
+    logs.length = 0
+    await sweep(container as never)
+    expect(denials()).toEqual([])
+    const left = await admin.raw("SELECT count(*)::int AS n FROM voucher_consent_attempt WHERE token_jti = ?", [`${RUN}_jti`])
+    expect(left.rows[0].n).toBe(0)
+
+    // Porażka (brak rynków w rosterze) ⇒ odrzucenie, nie cichy sukces.
+    const noMarkets = { resolve: (key: string) => (key === "gp_market_loader" ? { listActive: async () => [] } : container.resolve(key)) }
+    await expect(sweep(noMarkets as never)).rejects.toThrow()
+  })
+
+  it("odzysk Path Y (`order.placed`): wybór pracy biegnie z kontekstem rynku wiersza", async () => {
+    const evt = `${RUN}_evt`
+    const pi = `pi_${RUN}`
+    const order = `${RUN}_order`
+    await admin.transaction(async (trx) => {
+      await trx.raw("SET LOCAL session_replication_role = replica")
+      await trx.raw(
+        `INSERT INTO payment (id, amount, raw_amount, currency_code, provider_id, payment_collection_id, payment_session_id, data)
+         VALUES (?, 10000, '{"value":"10000","precision":20}'::jsonb, 'pln', 'pp_stripe', ?, ?, ?::jsonb)`,
+        [`${RUN}_pay`, `${RUN}_pc`, `${RUN}_ps`, JSON.stringify({ id: pi })]
+      )
+      await trx.raw(
+        `INSERT INTO order_payment_collection (id, order_id, payment_collection_id) VALUES (?, ?, ?)`,
+        [`${RUN}_opc`, order, `${RUN}_pc`]
+      )
+      await trx.raw(
+        `INSERT INTO webhook_event_processed (event_id, provider, market_id, envelope)
+         VALUES (?, 'stripe_payment_intent_webhook', ?, ?::jsonb)`,
+        [
+          `${evt}#deferred-issuance`,
+          MARKET,
+          JSON.stringify({ scope: `payment_intent:${pi}`, event_type: "payment.captured", entitlement_issue_deferred_reason: "order_not_yet_created" }),
+        ]
+      )
+    })
+    logs.length = 0
+    await onOrderPlaced({ event: { name: "order.placed", data: { id: order } }, container } as never)
+    expect(denials()).toEqual([])
+    // Kontrola dodatnia: wiersz rynku został wybrany do pracy (log niesie jego event_id).
+    expect(logs.some((l) => l.includes(`${evt}#deferred-issuance`))).toBe(true)
+  })
+
+  it("sweep handoffu dostawy: przebieg pod hookiem nie dostaje odmowy połączenia", async () => {
+    logs.length = 0
+    await handoffSweep(container as never)
+    expect(denials()).toEqual([])
+    expect(logs.some((l) => l.includes("przebieg przerwany"))).toBe(false)
   })
 })
