@@ -49,11 +49,45 @@ export async function runPerRosterMarket<T>(
   container: ContainerLike,
   origin: SystemExecutionOrigin,
   logger: RosterLogger & { warn?: (m: string, meta?: Record<string, unknown>) => void },
-  work: (marketId: string) => Promise<T>
+  work: (marketId: string, roster: readonly string[]) => Promise<T>
 ): Promise<T[]> {
   const markets = await resolveSystemMarketRoster(container, origin, logger)
   return runInSystemMarketContext(
     { markets, instanceId: process.env.GP_INSTANCE_ID, origin, logger: { error: (m, meta) => logger.error(m, meta) } },
-    work
+    (marketId) => work(marketId, markets)
   )
+}
+
+/**
+ * Story 8.7 fix (R-3/R-7, AD-21): wiersz bez rynku albo z rynkiem spoza rosteru
+ * nie trafia do żadnego przebiegu per rynek. To NAZWANY sygnał, nie ciche
+ * pominięcie — kod błędu w logu, liczony raz na wywołanie (pierwszy rynek rosteru).
+ */
+export const SYSTEM_ROSTER_ROW_OUTSIDE_ROSTER_CODE = "GP_SYSTEM_ROW_OUTSIDE_ROSTER" as const
+
+export function isOutsideRoster(marketId: string | null | undefined, roster: readonly string[]): boolean {
+  return !marketId || !roster.includes(marketId)
+}
+
+/**
+ * Story 8.7 fix (R-3): jedno wykonanie w kontekście DOKŁADNIE jednego rynku
+ * (np. zapis DLQ po wyjściu z przebiegu per rynek). Rynek pusty jest odmową
+ * (`SystemMarketContextError`), nie wykonaniem bez kontekstu.
+ */
+export async function runInSingleMarketContext<T>(
+  marketId: string | null | undefined,
+  origin: SystemExecutionOrigin,
+  logger: RosterLogger,
+  work: () => Promise<T>
+): Promise<T> {
+  const [result] = await runInSystemMarketContext(
+    {
+      markets: marketId ? [marketId] : [],
+      instanceId: process.env.GP_INSTANCE_ID,
+      origin,
+      logger: { error: (m, meta) => logger.error(m, meta) },
+    },
+    () => work()
+  )
+  return result
 }

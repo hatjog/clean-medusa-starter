@@ -50,7 +50,12 @@
  * (H-8).
  */
 import { isRlsPoolHookInstalled } from "../lib/rls-pool-hook"
-import { runPerRosterMarket } from "../lib/system-market-roster"
+import {
+  isOutsideRoster,
+  runInSingleMarketContext,
+  runPerRosterMarket,
+  SYSTEM_ROSTER_ROW_OUTSIDE_ROSTER_CODE,
+} from "../lib/system-market-roster"
 import type { SubscriberArgs, SubscriberConfig } from "@medusajs/framework"
 import { ContainerRegistrationKeys, Modules } from "@medusajs/framework/utils"
 
@@ -129,8 +134,13 @@ export type DlqWriteFailure = {
   message: string
 }
 
+/** Story 8.7 fix (R-3): marker poza rosterem instancji (AD-21) — nazwany sygnał. */
+export type OutsideRosterMarker = { order_id: string; event_id: string; market_id: string | null }
+
 export type StripeRetryRunResult = {
   dlq_write_failures: DlqWriteFailure[]
+  /** Obecne tylko pod hookiem RLS, gdy marker nie należy do żadnego rynku rosteru. */
+  outside_roster?: OutsideRosterMarker[]
   /** Wynik dostarczenia alarmu `dlq_write_failed` kanałem 4.3; obecny tylko przy porażkach. */
   dlq_write_failed_alarm?: AlertDeliveryResult
 }
@@ -787,18 +797,42 @@ async function runOrderRecoveryScoped(
   db: PgPool | KnexLike,
   container: { resolve: (key: string) => unknown },
   logger: { error?: (m: string, meta?: unknown) => void },
-  work: (marketFilter: string | null) => Promise<void>
+  work: (marketFilter: string | null, roster: readonly string[] | null) => Promise<void>
 ): Promise<void> {
-  if (!isPgPool(db) && isRlsPoolHookInstalled(db as never)) {
+  if (isHookScoped(db)) {
     await runPerRosterMarket(
       container,
-      { surface: "subscriber", name: "on-order-placed-stripe-retry" },
+      STRIPE_RETRY_ORIGIN,
       { error: (m, meta) => logger.error?.(m, meta) },
-      (marketId) => work(marketId)
+      (marketId, roster) => work(marketId, roster)
     )
     return
   }
-  await work(null)
+  await work(null, null)
+}
+
+const STRIPE_RETRY_ORIGIN = { surface: "subscriber", name: "on-order-placed-stripe-retry" } as const
+
+function isHookScoped(db: PgPool | KnexLike): boolean {
+  return !isPgPool(db) && isRlsPoolHookInstalled(db as never)
+}
+
+/**
+ * Story 8.7 fix (R-3): zapis DLQ po `DeadLetterPendingError` biegnie POZA
+ * przebiegiem per rynek. Pod hookiem musi dostać kontekst rynku wiersza — bez
+ * niego acquire kończy się odmową `missing_market_context`, wiersz DLQ nie
+ * powstaje, a marker jest ponawiany przy każdym `order.placed`. Wiersz bez
+ * rynku pod hookiem = nazwana odmowa (`SystemMarketContextError`), łapana
+ * jako `dlq_write_failure` — nigdy zapis bez kontekstu.
+ */
+async function runDlqWriteScoped<T>(
+  db: PgPool | KnexLike,
+  marketId: string | null,
+  logger: { error?: (m: string, meta?: unknown) => void },
+  work: () => Promise<T>
+): Promise<T> {
+  if (!isHookScoped(db)) return work()
+  return runInSingleMarketContext(marketId, STRIPE_RETRY_ORIGIN, { error: (m, meta) => logger.error?.(m, meta) }, work)
 }
 
 export default async function onOrderPlacedStripeRetry({
@@ -807,6 +841,7 @@ export default async function onOrderPlacedStripeRetry({
 }: SubscriberArgs<OrderPlacedPayload>): Promise<StripeRetryRunResult> {
   const logger = resolveLogger(container as unknown as Record<string, unknown>)
   const dlqWriteFailures: DlqWriteFailure[] = []
+  const outsideRoster: OutsideRosterMarker[] = []
   const orderIds = extractOrderIds(event.data)
   if (orderIds.length === 0) {
     return { dlq_write_failures: dlqWriteFailures }
@@ -825,8 +860,22 @@ export default async function onOrderPlacedStripeRetry({
     try {
       // Story 8.7 (DW-15-374): pod zainstalowanym hookiem RLS wybór i odzysk
       // biegną PER RYNEK (kontekst rynku wiersza); bez hooka — jedna transakcja.
-      await runOrderRecoveryScoped(db, scope, logger, (marketFilter) => withTransaction(db, async (client) => {
+      await runOrderRecoveryScoped(db, scope, logger, (marketFilter, roster) => withTransaction(db, async (client) => {
         const found = await findDeferredCapturesForOrder(client, orderId)
+        // Story 8.7 fix (R-3, AD-21): marker bez rynku albo spoza rosteru nie
+        // trafi do żadnego przebiegu per rynek — sygnał nazwany (raz, w
+        // przebiegu pierwszego rynku rosteru), nie ciche pominięcie.
+        if (marketFilter !== null && roster && marketFilter === roster[0]) {
+          for (const row of found) {
+            if (!isOutsideRoster(row.market_id, roster)) continue
+            outsideRoster.push({ order_id: orderId, event_id: row.event_id, market_id: row.market_id })
+            logger.error?.(
+              `[on-order-placed-stripe-retry] code=${SYSTEM_ROSTER_ROW_OUTSIDE_ROSTER_CODE} ` +
+                `order_id=${orderId} event_id=${row.event_id} market_id=${row.market_id ?? "null"} ` +
+                `— marker poza rosterem instancji, nieobsłużony przez odzysk per rynek`
+            )
+          }
+        }
         const deferred =
           marketFilter === null ? found : found.filter((row) => row.market_id === marketFilter)
         if (deferred.length === 0) {
@@ -1156,16 +1205,18 @@ export default async function onOrderPlacedStripeRetry({
     } catch (err) {
       if (err instanceof DeadLetterPendingError) {
         try {
-          const written = await withTransaction(db, (client) =>
-            recordEventDeadLetter(client, {
-              instance_id: resolveRuntimeInstanceId(),
-              market_id: err.row.market_id,
-              source_job: STRIPE_RETRY_DLQ_SOURCE,
-              event_id: err.row.event_id,
-              subject_id: err.order_id,
-              classification: err.classification,
-              occurred_at: new Date(),
-            })
+          const written = await runDlqWriteScoped(db, err.row.market_id, logger, () =>
+            withTransaction(db, (client) =>
+              recordEventDeadLetter(client, {
+                instance_id: resolveRuntimeInstanceId(),
+                market_id: err.row.market_id,
+                source_job: STRIPE_RETRY_DLQ_SOURCE,
+                event_id: err.row.event_id,
+                subject_id: err.order_id,
+                classification: err.classification,
+                occurred_at: new Date(),
+              })
+            )
           )
           logger.error?.(
             `[on-order-placed-stripe-retry] order_id=${orderId} ` +
@@ -1236,7 +1287,11 @@ export default async function onOrderPlacedStripeRetry({
     )
   }
   const dlqAlarm = await alarmDlqWriteFailures(dlqWriteFailures)
-  return dlqAlarm ? { dlq_write_failures: dlqWriteFailures, dlq_write_failed_alarm: dlqAlarm } : { dlq_write_failures: dlqWriteFailures }
+  const result: StripeRetryRunResult = dlqAlarm
+    ? { dlq_write_failures: dlqWriteFailures, dlq_write_failed_alarm: dlqAlarm }
+    : { dlq_write_failures: dlqWriteFailures }
+  if (outsideRoster.length > 0) result.outside_roster = outsideRoster
+  return result
 }
 
 type EventBusLike = {

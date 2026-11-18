@@ -77,10 +77,13 @@ maybe("Story 8.7 DW-15-370 — odmowy hooka RLS nie wyczerpują puli (PG)", () =
  * połączenie z kontekstem rynku (brak logu `RLS pool hook acquire denied`),
  * a sweep zgód nie może zakończyć się sukcesem przy porażce.
  *
- * Dane: własne wiersze z prefiksem przebiegu (sprzątane w `afterAll`). Rola
- * runtime `medusa_store` dostaje granty jak w bootstrapie
- * `infra/postgres/migrations/003-rls-market-isolation.sql` (klon bazy `*_test`
- * ich nie niesie dla tabel spoza modułów RLS).
+ * Dane: własne wiersze z prefiksem przebiegu (sprzątane w `afterAll`).
+ *
+ * Granty (Story 8.7 fix R-5/R-6, DW-15-363): suita nadaje `medusa_store` DML
+ * w `public` tylko na czas przebiegu i COFA w ostatnim teście dokładnie te
+ * uprawnienia, których rola nie miała przed suitą (migawka
+ * `has_table_privilege`). Ostatni test asertuje, że migawka po == przed —
+ * w tym least-privilege tabel append-only z bootstrapu 003.
  */
 maybe("Story 8.7 DW-15-374 — powierzchnie asynchroniczne pod zainstalowanym hookiem RLS (PG)", () => {
   const RUN = `s874_${Date.now().toString(36)}`
@@ -105,9 +108,13 @@ maybe("Story 8.7 DW-15-374 — powierzchnie asynchroniczne pod zainstalowanym ho
     },
   }
   const denials = () => logs.filter((l) => l.includes("RLS pool hook acquire denied"))
+  let grantsBefore: string[] = []
+  let schemaUsageBefore = true
 
   beforeAll(async () => {
     admin = knexFactory({ client: "pg", connection: DATABASE_URL, pool: { min: 0, max: 1 } })
+    grantsBefore = await snapshotGrants(admin)
+    schemaUsageBefore = await hasSchemaUsage(admin)
     await admin.raw("GRANT USAGE ON SCHEMA public TO medusa_store")
     await admin.raw("GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO medusa_store")
     knex = knexFactory({ client: "pg", connection: DATABASE_URL, pool: { min: 0, max: 4 }, acquireConnectionTimeout: 5_000 })
@@ -115,6 +122,9 @@ maybe("Story 8.7 DW-15-374 — powierzchnie asynchroniczne pod zainstalowanym ho
   })
 
   afterAll(async () => {
+    // Idempotentne: ostatni test już przywrócił granty; tu na wypadek przerwania.
+    if (admin) await restoreGrants(admin, grantsBefore, schemaUsageBefore)
+    await admin?.raw("DELETE FROM mor_policy_dlq_entry WHERE event_id LIKE ?", [`${RUN}%`])
     await admin?.raw("DELETE FROM voucher_consent_attempt WHERE token_jti LIKE ?", [`${RUN}%`])
     await admin?.raw("DELETE FROM webhook_event_processed WHERE event_id LIKE ?", [`${RUN}%`])
     await admin?.raw("DELETE FROM order_payment_collection WHERE id LIKE ?", [`${RUN}%`])
@@ -178,4 +188,147 @@ maybe("Story 8.7 DW-15-374 — powierzchnie asynchroniczne pod zainstalowanym ho
     expect(denials()).toEqual([])
     expect(logs.some((l) => l.includes("przebieg przerwany"))).toBe(false)
   })
+
+  async function seedPathYMarker(tag: string, marketId: string | null, envelopeExtra: Record<string, unknown>) {
+    const evt = `${RUN}_${tag}_evt`
+    const pi = `pi_${RUN}_${tag}`
+    const order = `${RUN}_${tag}_order`
+    await admin.transaction(async (trx) => {
+      await trx.raw("SET LOCAL session_replication_role = replica")
+      await trx.raw(
+        `INSERT INTO payment (id, amount, raw_amount, currency_code, provider_id, payment_collection_id, payment_session_id, data)
+         VALUES (?, 10000, '{"value":"10000","precision":20}'::jsonb, 'pln', 'pp_stripe', ?, ?, ?::jsonb)`,
+        [`${RUN}_${tag}_pay`, `${RUN}_${tag}_pc`, `${RUN}_${tag}_ps`, JSON.stringify({ id: pi })]
+      )
+      await trx.raw(
+        `INSERT INTO order_payment_collection (id, order_id, payment_collection_id) VALUES (?, ?, ?)`,
+        [`${RUN}_${tag}_opc`, order, `${RUN}_${tag}_pc`]
+      )
+      await trx.raw(
+        `INSERT INTO webhook_event_processed (event_id, provider, market_id, envelope)
+         VALUES (?, 'stripe_payment_intent_webhook', ?, ?::jsonb)`,
+        [
+          `${evt}#deferred-issuance`,
+          marketId,
+          JSON.stringify({
+            scope: `payment_intent:${pi}`,
+            event_type: "payment.captured",
+            entitlement_issue_deferred_reason: "order_not_yet_created",
+            ...envelopeExtra,
+          }),
+        ]
+      )
+    })
+    return { eventId: `${evt}#deferred-issuance`, order }
+  }
+
+  it("R-3: zapis DLQ po trwałej porażce odzysku biegnie z kontekstem rynku wiersza (wiersz DLQ powstaje)", async () => {
+    // Marker kompletny (psp_occurred_at) — przechodzi walidację i pada w wystawieniu
+    // (zamówienie fikcyjne) klasą trwałą ⇒ ścieżka `DeadLetterPendingError`, czyli
+    // zapis DLQ w NOWEJ transakcji, poza przebiegiem per rynek.
+    const { eventId, order } = await seedPathYMarker("dlq", MARKET, { psp_occurred_at: "2026-11-18T10:00:00.000Z" })
+    logs.length = 0
+    const res = await onOrderPlaced({ event: { name: "order.placed", data: { id: order } }, container } as never)
+    // Warunek wstępny: przebieg rzeczywiście doszedł do ścieżki DLQ poza transakcją.
+    expect(logs.some((l) => l.includes(`event_id=${eventId} class=`) && l.includes("dlq_entry_id="))).toBe(true)
+    expect(res.dlq_write_failures).toEqual([])
+    expect(denials()).toEqual([])
+    const dlq = await admin.raw(
+      "SELECT market_id FROM mor_policy_dlq_entry WHERE event_id = ? AND subject_id = ?",
+      [eventId, order]
+    )
+    expect(dlq.rows).toEqual([{ market_id: MARKET }])
+  })
+
+  it("R-3: marker bez rynku i spoza rosteru ⇒ nazwany sygnał GP_SYSTEM_ROW_OUTSIDE_ROSTER, nie ciche pominięcie", async () => {
+    const nul = await seedPathYMarker("nul", null, {})
+    logs.length = 0
+    const r1 = await onOrderPlaced({ event: { name: "order.placed", data: { id: nul.order } }, container } as never)
+    expect(r1.outside_roster).toEqual([{ order_id: nul.order, event_id: nul.eventId, market_id: null }])
+    expect(logs.filter((l) => l.includes("GP_SYSTEM_ROW_OUTSIDE_ROSTER") && l.includes(nul.eventId))).toHaveLength(1)
+
+    const other = await seedPathYMarker("oth", "obcy_rynek", {})
+    logs.length = 0
+    const r2 = await onOrderPlaced({ event: { name: "order.placed", data: { id: other.order } }, container } as never)
+    expect(r2.outside_roster).toEqual([{ order_id: other.order, event_id: other.eventId, market_id: "obcy_rynek" }])
+  })
+
+  it("R-4 (pomiar): pod zainstalowanym hookiem zapytanie bez kontekstu rynku (powierzchnia admin / job bez nośnika) dostaje odmowę", async () => {
+    // Nazwana powierzchnia, która ODMAWIA przy instalacji hooka na boocie:
+    // każde połączenie poza `/store/*` i poza `runPerRosterMarket` — trasy
+    // `/admin/*` oraz joby/subscribery bez nośnika kontekstu (inwentarz w
+    // evidence/8-7/r4-boot-install-surface.json). Kontrola dodatnia: test DW-15-370.
+    await expect(knex.raw("SELECT 1 AS admin_probe")).rejects.toBeInstanceOf(RlsMarketContextRequiredError)
+  })
+
+  it("R-7: bez hooka sweep handoffu robi JEDEN przebieg niezależnie od liczby rynków w rosterze", async () => {
+    const plain = knexFactory({ client: "pg", connection: DATABASE_URL, pool: { min: 0, max: 2 } })
+    try {
+      const countQueries = async (roster: string[]) => {
+        let n = 0
+        const onQuery = () => { n += 1 }
+        plain.on("query", onQuery)
+        const c = {
+          resolve: (key: string) => {
+            if (key === "pg_connection" || key === "__pg_connection__") return plain
+            if (key === "gp_market_loader") return { listActive: async () => roster }
+            return container.resolve(key)
+          },
+        }
+        logs.length = 0
+        await handoffSweep(c as never)
+        plain.removeListener("query", onQuery)
+        expect(logs.some((l) => l.includes("przebieg przerwany"))).toBe(false)
+        return n
+      }
+      const one = await countQueries([MARKET])
+      const two = await countQueries([MARKET, "drugi_rynek"])
+      expect(one).toBeGreaterThan(0)
+      expect(two).toBe(one)
+    } finally {
+      await plain.destroy()
+    }
+  })
+
+  it("R-5/R-6: granty medusa_store w public po suicie == przed suitą (least-privilege append-only zachowane)", async () => {
+    await restoreGrants(admin, grantsBefore, schemaUsageBefore)
+    expect(await snapshotGrants(admin)).toEqual(grantsBefore)
+    expect(await hasSchemaUsage(admin)).toBe(schemaUsageBefore)
+  })
 })
+
+const PRIVS = ["SELECT", "INSERT", "UPDATE", "DELETE"] as const
+
+/** Migawka `relname:PRIV` dla każdego uprawnienia, które `medusa_store` MA na tabeli w `public`. */
+async function snapshotGrants(db: Knex): Promise<string[]> {
+  const res = await db.raw<{ rows: Array<{ k: string }> }>(
+    `SELECT c.relname || ':' || p.priv AS k
+       FROM pg_class c
+       JOIN pg_namespace n ON n.oid = c.relnamespace
+       CROSS JOIN unnest(?::text[]) AS p(priv)
+      WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p', 'v', 'm')
+        AND has_table_privilege('medusa_store', c.oid, p.priv)
+      ORDER BY 1`,
+    [PRIVS as unknown as string[]]
+  )
+  return res.rows.map((r) => r.k)
+}
+
+async function hasSchemaUsage(db: Knex): Promise<boolean> {
+  const res = await db.raw<{ rows: Array<{ ok: boolean }> }>(
+    "SELECT has_schema_privilege('medusa_store', 'public', 'USAGE') AS ok"
+  )
+  return res.rows[0].ok
+}
+
+/** Cofa uprawnienia nadane przez suitę: wszystko, czego nie było w migawce `before`. */
+async function restoreGrants(db: Knex, before: string[], schemaUsage: boolean): Promise<void> {
+  const keep = new Set(before)
+  for (const key of await snapshotGrants(db)) {
+    if (keep.has(key)) continue
+    const [table, priv] = key.split(":")
+    if (!(PRIVS as readonly string[]).includes(priv)) continue
+    await db.raw(`REVOKE ${priv} ON TABLE public.?? FROM medusa_store`, [table])
+  }
+  if (!schemaUsage) await db.raw("REVOKE USAGE ON SCHEMA public FROM medusa_store")
+}

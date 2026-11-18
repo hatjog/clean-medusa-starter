@@ -80,7 +80,12 @@
  * zjadały batcha) i widoczne osobnym licznikiem zaparkowanych.
  */
 
-import { runPerRosterMarket } from "../lib/system-market-roster"
+import { isRlsPoolHookInstalled } from "../lib/rls-pool-hook"
+import {
+  isOutsideRoster,
+  runPerRosterMarket,
+  SYSTEM_ROSTER_ROW_OUTSIDE_ROSTER_CODE,
+} from "../lib/system-market-roster"
 import type { MedusaContainer } from "@medusajs/framework/types"
 import { ContainerRegistrationKeys, Modules } from "@medusajs/framework/utils"
 
@@ -1651,6 +1656,49 @@ export function resolveSweepMetrics(
 }
 
 /**
+ * Story 8.7 fix (R-7, AD-21): skaner zawężony do kandydatów JEDNEGO rynku.
+ * Kandydat bez rynku albo spoza rosteru nie należy do żadnego przebiegu —
+ * nazwany sygnał (raz, w przebiegu pierwszego rynku rosteru), nie ciche
+ * pominięcie.
+ */
+export function scopeScannerToMarket(
+  scanner: DeliveryGapScanPort,
+  marketId: string,
+  roster: readonly string[],
+  logger: Pick<SweepLogger, "error">,
+): DeliveryGapScanPort {
+  const reportOutside = marketId === roster[0]
+  const keep = (candidates: DeliveryGapCandidate[]): DeliveryGapCandidate[] => {
+    if (reportOutside) {
+      for (const c of candidates) {
+        if (!isOutsideRoster(c.market_id, roster)) continue
+        logger.error(
+          `[${SCHEDULE_NAME}] code=${SYSTEM_ROSTER_ROW_OUTSIDE_ROSTER_CODE} ` +
+            `entitlement_id=${c.entitlement_id} market_id=${c.market_id ?? "null"} ` +
+            "— kandydat poza rosterem instancji, nieobsłużony przez przebieg per rynek",
+        )
+      }
+    }
+    return candidates.filter((c) => c.market_id === marketId)
+  }
+  return {
+    scanDeliveryGaps: async (input) => {
+      const result = await scanner.scanDeliveryGaps(input)
+      return { ...result, candidates: keep(result.candidates) }
+    },
+    countGapsBeyondSourceStates: (input) => scanner.countGapsBeyondSourceStates(input),
+    abandonStaleQueued: (input) => scanner.abandonStaleQueued(input),
+    scanStalledDispatches: async (input) => keep(await scanner.scanStalledDispatches(input)),
+    // Pozostałe metody portu: bez zmian (granica R-10 — poza zakresem tej naprawy).
+    listParkedDispatches: (...a) => scanner.listParkedDispatches(...a),
+    countParkedDispatchesByMarket: (...a) => scanner.countParkedDispatchesByMarket(...a),
+    claimAttemptPolicyEscalations: (...a) => scanner.claimAttemptPolicyEscalations(...a),
+    releaseEscalationClaims: (...a) => scanner.releaseEscalationClaims(...a),
+    releaseParkedConfigurationFailureBudgets: (...a) => scanner.releaseParkedConfigurationFailureBudgets(...a),
+  }
+}
+
+/**
  * Kontenerowe wejście crona. Cienkie: rozwiązuje zależności dokładnie tak, jak
  * robi to subscriber (ten sam ledger, ten sam reader locale, ten sam dispatcher
  * na `Modules.NOTIFICATION`), i oddaje sterowanie czystej funkcji.
@@ -1711,18 +1759,27 @@ export default async function voucherDeliveryReconciliationSweepJob(
     // Story 8.7 (DW-15-374): przebieg PER RYNEK z rosteru instancji, pod
     // kontekstem rynku — hook RLS odmawia połączeń bez rynku, a sweep bez
     // kontekstu kończył się odmową acquire przy każdym przebiegu.
-    await runPerRosterMarket(
-      container as unknown as { resolve: (key: string) => unknown },
-      { surface: "job", name: SCHEDULE_NAME },
-      { error: (m, meta) => logger.error(m, meta as Record<string, unknown>) },
-      async () =>
-        runVoucherDeliveryReconciliationSweep({
-          scanner: ledger,
-          delivery,
-          logger,
-          metrics: resolveSweepMetrics(container, logger),
-        }),
-    )
+    // Story 8.7 fix (R-7): bez hooka (przed pierwszym `/store`, proces
+    // worker) — JEDEN przebieg globalny; N przebiegów bez wiązania wiersza z
+    // rynkiem dosyłało ten sam wiersz N razy. Pod hookiem każdy przebieg widzi
+    // wyłącznie kandydatów SWOJEGO rynku (`scopeScannerToMarket`).
+    const metrics = resolveSweepMetrics(container, logger)
+    if (!isRlsPoolHookInstalled(sql as never)) {
+      await runVoucherDeliveryReconciliationSweep({ scanner: ledger, delivery, logger, metrics })
+    } else {
+      await runPerRosterMarket(
+        container as unknown as { resolve: (key: string) => unknown },
+        { surface: "job", name: SCHEDULE_NAME },
+        { error: (m, meta) => logger.error(m, meta as Record<string, unknown>) },
+        async (marketId, roster) =>
+          runVoucherDeliveryReconciliationSweep({
+            scanner: scopeScannerToMarket(ledger, marketId, roster, logger),
+            delivery,
+            logger,
+            metrics,
+          }),
+      )
+    }
   } catch (error) {
     logger.error(
       `[${SCHEDULE_NAME}] przebieg przerwany błędem zależności — scheduler ` +
