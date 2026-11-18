@@ -7,6 +7,7 @@
  * Pattern follows gp-core/service.ts (raw pg Pool, no MedusaService ORM).
  */
 
+import { currentRedemptionEvent } from "./current-redemption"
 import { randomUUID } from "node:crypto"
 import { requireRuntimeInstanceId } from "../../lib/runtime-instance-identity"
 import { ContainerRegistrationKeys, Modules } from "@medusajs/framework/utils"
@@ -2314,15 +2315,19 @@ export class VoucherService {
     code: string,
     opts: { client: Queryable; now: Date }
   ): Promise<VoucherStatus> {
-    const prior = await opts.client.query<{ prior: string | null }>(
-      `SELECT payload->>'prior_status' AS prior
+    // Story 8.7 (DW-15-369): ta sama funkcja „bieżącej realizacji" co koperta
+    // i odmowa trasy redeem (`currentRedemptionEvent`).
+    const claimed = await opts.client.query<{
+      event_type: string
+      occurred_at: Date | string
+      payload: Record<string, unknown> | null
+    }>(
+      `SELECT event_type, occurred_at, payload
          FROM voucher_event
-        WHERE voucher_code = $1 AND event_type = 'claimed'
-        ORDER BY occurred_at DESC
-        LIMIT 1`,
+        WHERE voucher_code = $1 AND event_type = 'claimed'`,
       [code]
     )
-    const candidate = prior.rows[0]?.prior as VoucherStatus | null | undefined
+    const candidate = currentRedemptionEvent(claimed.rows)?.prior_status
     const restoreTo: VoucherStatus =
       candidate && VOUCHER_REDEMPTION_INPUT_STATES.has(candidate)
         ? candidate

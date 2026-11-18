@@ -69,6 +69,10 @@ import {
 } from "../../../../../lib/vendor-seller-context"
 import { appendNotificationLog } from "../../../../../lib/vendor-notification-log"
 import {
+  currentRedemptionEvent,
+  type ClaimedEventLike,
+} from "../../../../../modules/voucher/current-redemption"
+import {
   VOUCHER_MODULE,
   type VoucherService,
   type RedeemRefusalReason,
@@ -185,40 +189,15 @@ function readIdempotencyKeyHeader(req: MedusaRequest): string | null {
 }
 
 /**
- * Czas NAJWCZEŚNIEJSZEGO zdarzenia `claimed` z projekcji — jedno źródło dla
- * pierwszego żądania i dla replayu. „Najwcześniejsze", nie „ostatnie": koperta
- * opisuje zdarzenie realizacji, a ono zaszło raz.
+ * Story 8.7 (DW-15-369): BIEŻĄCA realizacja po ostatniej korekcie — jedno źródło
+ * (`currentRedemptionEvent`) dla pierwszego żądania, replayu, odmowy
+ * `already_redeemed` i korekty 5.7. Wcześniej „najwcześniejsze `claimed`"
+ * wskazywało po realizacja → korekta → realizacja czas realizacji COFNIĘTEJ.
  */
-function earliestClaimedEvent(
-  events:
-    | Array<{
-        event_type: string
-        occurred_at: Date | string
-        payload?: Record<string, unknown> | null
-      }>
-    | undefined
-): { at: string; prior_status: VoucherStatus | null } | null {
-  const claimed = (events ?? [])
-    .filter((e) => e.event_type === "claimed")
-    .filter((e) => Number.isFinite(new Date(e.occurred_at).getTime()))
-    .sort(
-      (a, b) =>
-        new Date(a.occurred_at).getTime() - new Date(b.occurred_at).getTime()
-    )[0]
-  if (!claimed) return null
-  const prior = claimed.payload?.prior_status
-  return {
-    at: new Date(claimed.occurred_at).toISOString(),
-    prior_status: typeof prior === "string" ? (prior as VoucherStatus) : null,
-  }
-}
-
-function earliestClaimedAt(
-  events:
-    | Array<{ event_type: string; occurred_at: Date | string }>
-    | undefined
+function currentClaimedAt(
+  events: ClaimedEventLike[] | undefined
 ): string | null {
-  return earliestClaimedEvent(events)?.at ?? null
+  return currentRedemptionEvent(events)?.at ?? null
 }
 
 export const POST = async (
@@ -753,7 +732,7 @@ async function redeemInSellerMarket(
       }
       priorStatus = result.prior_status
       claimedAt =
-        earliestClaimedAt(result.voucher.events) ?? context.now.toISOString()
+        currentClaimedAt(result.voucher.events) ?? context.now.toISOString()
     },
   })
 
@@ -877,7 +856,7 @@ async function redeemInSellerMarket(
     // czyli INNĄ kopertę niż pierwsze żądanie, dokładnie ten defekt, przed
     // którym to pole miało chronić. Cichy fallback zamieniony na jawny brak.
     prior_status:
-      priorStatus ?? earliestClaimedEvent(existing.events)?.prior_status ?? null,
+      priorStatus ?? currentRedemptionEvent(existing.events)?.prior_status ?? null,
     // Koperta opisuje ZDARZENIE REALIZACJI, a to zdarzenie zaszło raz i miało
     // jeden skutek. `already_claimed` opisuje ODPOWIEDŹ na to żądanie i żyje
     // w polu `status` odpowiedzi — nie w kopercie, bo inaczej retry
@@ -890,7 +869,7 @@ async function redeemInSellerMarket(
     // ma obejmować CAŁĄ kopertę, więc czas realizacji jest odczytywany
     // z istniejącego `voucher_event`, pobranego PRZED realizacją.
     claimed_at:
-      claimedAt ?? earliestClaimedAt(existing.events) ?? new Date().toISOString(),
+      claimedAt ?? currentClaimedAt(existing.events) ?? new Date().toISOString(),
     redemption_id: redemption.redemption_id,
     amount_minor: redemption.amount_minor,
     remaining_after_minor: redemption.remaining_after_minor,
@@ -1000,26 +979,16 @@ type RedemptionFactEvent = {
   payload?: Record<string, unknown> | null
 }
 
-function earliestVendorClaimedAt(
-  events: RedemptionFactEvent[] | undefined,
-): string | null {
-  const vendorEvents = (events ?? []).filter(
-    (e) =>
-      e.event_type === "claimed" &&
-      typeof e.payload?.prior_status === "string" &&
-      Number.isFinite(new Date(e.occurred_at).getTime()),
-  )
-  return earliestClaimedAt(vendorEvents)
-}
-
-function redemptionFactFor(
+export function redemptionFactFor(
   reason: RedeemRefusalReason,
   events: RedemptionFactEvent[] | undefined,
 ): RedemptionFact | null {
   if (reason !== "already_redeemed") return null
-  const vendorAt = earliestVendorClaimedAt(events)
-  if (vendorAt) return { redeemed_at: vendorAt, redeemed_by: "own_seller" }
-  return { redeemed_at: earliestClaimedAt(events), redeemed_by: null }
+  // Story 8.7 (DW-15-369): `own_seller` wyłącznie, gdy BIEŻĄCA realizacja jest
+  // zdarzeniem ścieżki vendor — zdarzenie vendorowe sprzed korekty go nie daje.
+  const current = currentRedemptionEvent(events)
+  if (!current) return { redeemed_at: null, redeemed_by: null }
+  return { redeemed_at: current.at, redeemed_by: current.by_vendor ? "own_seller" : null }
 }
 
 /**

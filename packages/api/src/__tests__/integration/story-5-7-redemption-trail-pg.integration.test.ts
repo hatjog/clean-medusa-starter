@@ -29,6 +29,8 @@ import {
 } from "../../modules/voucher/workflows/redeem-partial-entitlement"
 import { createPgRefundedScanner } from "../../jobs/voucher-ledger-reconciliation"
 import { revokeEntitlementsOnRefund } from "../../workflows/entitlements/issue-entitlement"
+import { redemptionFactFor } from "../../api/vendor/vouchers/[code]/redeem/route"
+import { currentRedemptionEvent } from "../../modules/voucher/current-redemption"
 
 const DATABASE_URL = process.env.DATABASE_URL ?? ""
 const isTestDb = /\/[A-Za-z0-9_]*_test(\?|$)/.test(DATABASE_URL)
@@ -308,5 +310,53 @@ maybe("Story 5.7 — ślad realizacji i korekta na realnym PG", () => {
     expect(scanned.find((r) => r.entitlement_id === ent)).toEqual(
       expect.objectContaining({ entitlement_id: ent, has_reversal_row: true })
     )
+  })
+
+  // Story 8.7 (DW-15-369, retro E5-X-1): po realizacja → korekta → realizacja
+  // koperta, odmowa `already_redeemed` i korekta czytają BIEŻĄCĄ realizację
+  // (najnowsze `claimed`), nie realizację cofniętą; zdarzenie vendorowe sprzed
+  // korekty nie daje `own_seller`.
+  it("DW-15-369: realizacja → korekta → realizacja ⇒ czas bieżącej realizacji w odmowie i kopercie; vendor sprzed korekty ≠ own_seller", async () => {
+    const code = `${RUN}_dw369`
+    await seed(code)
+    const claimedEvents = async () =>
+      (
+        await pool.query(
+          `SELECT event_type, occurred_at, payload FROM voucher_event
+            WHERE voucher_code = $1 AND event_type = 'claimed' ORDER BY occurred_at`,
+          [code]
+        )
+      ).rows
+    await op().redeem({ voucher_code: code, redeem_full: true, idempotency_key_header: "s87-369-key-1", redemption_market_id: "bonbeauty", actor: "vendor" })
+    const [first] = await claimedEvents()
+    await op().correct({ voucher_code: code, actor: "vendor" })
+    await new Promise((r) => setTimeout(r, 15))
+    await op().redeem({ voucher_code: code, redeem_full: true, idempotency_key_header: "s87-369-key-2", redemption_market_id: "bonbeauty", actor: "vendor" })
+    const events = await claimedEvents()
+    expect(events).toHaveLength(2)
+    const secondAt = new Date(events[1].occurred_at).toISOString()
+    const firstAt = new Date(first.occurred_at).toISOString()
+    expect(secondAt > firstAt).toBe(true)
+
+    const fact = redemptionFactFor("already_redeemed", events)
+    expect(fact).toEqual({ redeemed_at: secondAt, redeemed_by: "own_seller" })
+    expect(fact?.redeemed_at).not.toBe(firstAt)
+    expect(currentRedemptionEvent(events)?.at).toBe(secondAt)
+
+    // Druga korekta czyta tę samą bieżącą realizację (prior_status = idle).
+    await op().correct({ voucher_code: code, actor: "vendor" })
+    expect((await pool.query(`SELECT status FROM voucher WHERE code = $1`, [code])).rows[0].status).toBe("idle")
+
+    // Realizacja spoza ścieżki vendor PO korekcie: vendorowe `claimed` sprzed
+    // korekty NIE może dać `own_seller`.
+    await pool.query(
+      `INSERT INTO voucher_event (id, voucher_code, entitlement_id, event_type, payload, occurred_at, created_at)
+       VALUES ($1, $2, NULL, 'claimed', '{}'::jsonb, now() + interval '1 second', now())`,
+      [`${RUN}_dw369_ev`, code]
+    )
+    const after = await claimedEvents()
+    const nonVendor = redemptionFactFor("already_redeemed", after)
+    expect(nonVendor?.redeemed_by).toBeNull()
+    expect(nonVendor?.redeemed_at).toBe(new Date(after[after.length - 1].occurred_at).toISOString())
   })
 })
