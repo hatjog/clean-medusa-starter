@@ -17,6 +17,10 @@ jest.mock("@medusajs/framework/utils", () => ({
 
 jest.mock("../../lib/rls-pool-hook", () => ({
   installRlsPoolHook: (...args: unknown[]) => mockInstallRlsPoolHook(...args),
+  // Story 8.7 R-1: the cache reads through the named exception; the fake keeps
+  // the contract (one raw read, rows returned).
+  readSalesChannelMarketMapWithoutMarketContext: async (db: { raw: (sql: string) => Promise<{ rows: unknown[] }> }) =>
+    (await db.raw("SELECT id, metadata->>'gp_market_id' AS market_id FROM sales_channel WHERE metadata->>'gp_market_id' IS NOT NULL")).rows,
 }));
 
 function createMockContainer() {

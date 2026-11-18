@@ -1,6 +1,10 @@
 import type { MedusaContainer } from "@medusajs/types";
 import { ContainerRegistrationKeys } from "@medusajs/framework/utils";
-import { installRlsPoolHook, type HookLogger } from "../lib/rls-pool-hook";
+import {
+  installRlsPoolHook,
+  readSalesChannelMarketMapWithoutMarketContext,
+  type HookLogger,
+} from "../lib/rls-pool-hook";
 
 const TTL_MS = 60_000;
 
@@ -61,14 +65,14 @@ class MarketContextCache {
       ContainerRegistrationKeys.PG_CONNECTION
     );
 
-    const result = await pgConnection.raw(
-      `SELECT id, metadata->>'gp_market_id' AS market_id
-       FROM sales_channel
-       WHERE metadata->>'gp_market_id' IS NOT NULL`
-    );
+    // Story 8.7 fix round 2 (R-1): this read PRODUCES the market context of
+    // `/store/*`, so it cannot run inside one. It goes through the named
+    // one-shot exception `SALES_CHANNEL_MARKET_MAP_EXCEPTION` of the RLS pool
+    // hook (one fixed query), not around the hook.
+    const rows = await readSalesChannelMarketMapWithoutMarketContext(pgConnection);
 
     const newMap = new Map<string, string>();
-    for (const row of result.rows) {
+    for (const row of rows) {
       if (row.market_id) {
         newMap.set(row.id, row.market_id);
       }

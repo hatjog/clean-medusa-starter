@@ -46,7 +46,12 @@ import {
   MARKET_SCOPE_DENIED_COHORT,
   recordRequest,
 } from "../lib/request-log-aggregator";
-import { installRlsPoolHook, type HookLogger } from "../lib/rls-pool-hook";
+import {
+  installRlsPoolHook,
+  isRlsPoolHookInstalled,
+  readPublishableKeySalesChannelsWithoutMarketContext,
+  type HookLogger,
+} from "../lib/rls-pool-hook";
 import { marketContextCache } from "../loaders/market-context-cache";
 import { listProductIdsForSalesChannel } from "../lib/product-market-scope";
 
@@ -187,31 +192,61 @@ async function ensurePublishableKeyContext(
     return null;
   }
 
-  const query = req.scope.resolve(ContainerRegistrationKeys.QUERY) as {
-    graph: (
-      queryConfig: Record<string, unknown>,
-      options?: Record<string, unknown>
-    ) => Promise<{ data: PublishableApiKeyRecord[] }>;
-  };
-  const { data } = await query.graph(
-    {
-      entity: "api_key",
-      fields: [
-        "id",
-        "token",
-        "revoked_at",
-        "sales_channels_link.sales_channel_id",
-      ],
-      filters: {
-        token: publishableKey,
+  // Story 8.7 fix round 2 (R-1): key -> sales channel resolution PRODUCES the
+  // market context, so under the RLS pool hook it goes through the named
+  // one-shot exception `PUBLISHABLE_KEY_SALES_CHANNELS_EXCEPTION` (one fixed
+  // query). Before the hook is installed on this pool (first request), the
+  // Medusa query graph is used as before.
+  const pgConnection = req.scope.resolve(
+    ContainerRegistrationKeys.PG_CONNECTION
+  ) as Parameters<typeof isRlsPoolHookInstalled>[0];
+  let data: PublishableApiKeyRecord[];
+  if (isRlsPoolHookInstalled(pgConnection)) {
+    const rows = await readPublishableKeySalesChannelsWithoutMarketContext(
+      pgConnection as unknown as Parameters<
+        typeof readPublishableKeySalesChannelsWithoutMarketContext
+      >[0],
+      publishableKey
+    );
+    data = rows.length
+      ? [
+          {
+            token: publishableKey,
+            revoked_at: rows[0].revoked_at,
+            sales_channels_link: rows
+              .filter((r) => typeof r.sales_channel_id === "string")
+              .map((r) => ({ sales_channel_id: r.sales_channel_id as string })),
+          },
+        ]
+      : [];
+  } else {
+    const query = req.scope.resolve(ContainerRegistrationKeys.QUERY) as {
+      graph: (
+        queryConfig: Record<string, unknown>,
+        options?: Record<string, unknown>
+      ) => Promise<{ data: PublishableApiKeyRecord[] }>;
+    };
+    const graphResult = await query.graph(
+      {
+        entity: "api_key",
+        fields: [
+          "id",
+          "token",
+          "revoked_at",
+          "sales_channels_link.sales_channel_id",
+        ],
+        filters: {
+          token: publishableKey,
+        },
       },
-    },
-    {
-      cache: {
-        enable: true,
-      },
-    }
-  );
+      {
+        cache: {
+          enable: true,
+        },
+      }
+    );
+    data = graphResult.data;
+  }
 
   if (!data.length) {
     return null;

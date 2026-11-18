@@ -203,7 +203,7 @@ export function installRlsPoolHook(
       }
       installFixedQueryGuard(connection, grant.allowedSql);
       logger?.info?.("RLS pool hook named exception", {
-        exception: SELLER_MARKET_LOOKUP_EXCEPTION,
+        exception: grant.exception ?? SELLER_MARKET_LOOKUP_EXCEPTION,
       });
       return connection;
     }
@@ -414,7 +414,12 @@ export function _resetRlsPoolHook(): void {
  */
 export const SELLER_MARKET_LOOKUP_EXCEPTION = "seller_market_lookup";
 
-type SellerMarketLookupGrant = { remaining: number; allowedSql: string | null };
+type SellerMarketLookupGrant = {
+  remaining: number;
+  allowedSql: string | null;
+  /** Name of the named exception the grant belongs to (logged on acquire). */
+  exception?: string;
+};
 const sellerMarketLookupStorage = new AsyncLocalStorage<SellerMarketLookupGrant>();
 
 function consumeSellerMarketLookupGrant(): SellerMarketLookupGrant | null {
@@ -463,4 +468,82 @@ export async function lookupSellerMarketIdWithoutMarketContext(
   const row = await sellerMarketLookupStorage.run(grant, async () => await query);
   grant.remaining = 0;
   return row?.market_id ?? null;
+}
+
+/**
+ * Story 8.7 fix round 2 (R-1, ADR-250) — second named one-shot exception:
+ * the sales-channel -> market map read by `MarketContextCache`.
+ *
+ * The cache IS the source of the market context of every `/store/*` request
+ * (publishable key -> sales channel -> market), so its read cannot run inside a
+ * market context. Measured on the live gp-test stack 2026-11-18: with the hook
+ * installed, `MarketContextCache.loadFromDb` was denied
+ * (`missing_market_context`) and EVERY `/store/*` request answered 500.
+ * The exception has the same shape as `SELLER_MARKET_LOOKUP_EXCEPTION`:
+ *   - one connection, under `SET ROLE medusa_store`, no market variable set;
+ *   - that connection admits exactly ONE query whose text equals
+ *     `SALES_CHANNEL_MARKET_MAP_SQL`; any other text is denied and the
+ *     connection is destroyed on release;
+ *   - inside an existing market context it is never consulted.
+ */
+export const SALES_CHANNEL_MARKET_MAP_EXCEPTION = "sales_channel_market_map";
+
+export const SALES_CHANNEL_MARKET_MAP_SQL =
+  "SELECT id, metadata->>'gp_market_id' AS market_id FROM sales_channel WHERE metadata->>'gp_market_id' IS NOT NULL";
+
+type RawQueryable = { raw: (sql: string) => unknown };
+
+export async function readSalesChannelMarketMapWithoutMarketContext(
+  db: RawQueryable
+): Promise<Array<{ id: string; market_id: string | null }>> {
+  const grant: SellerMarketLookupGrant = {
+    remaining: 1,
+    allowedSql: SALES_CHANNEL_MARKET_MAP_SQL,
+    exception: SALES_CHANNEL_MARKET_MAP_EXCEPTION,
+  };
+  const result = (await sellerMarketLookupStorage.run(
+    grant,
+    async () => await db.raw(SALES_CHANNEL_MARKET_MAP_SQL)
+  )) as { rows?: Array<{ id: string; market_id: string | null }> } | undefined;
+  grant.remaining = 0;
+  return result?.rows ?? [];
+}
+
+/**
+ * Story 8.7 fix round 2 (R-1) — third read of the same class: publishable key
+ * -> sales channels. It is the FIRST step of `/store/*` market resolution
+ * (key -> channel -> market), so it cannot run inside a market context either.
+ * Measured live: after the first request installed the hook, every further
+ * `/store/*` request with an uncached key was denied (`missing_market_context`).
+ * One fixed parameterised query; the guard compares the compiled driver text.
+ */
+export const PUBLISHABLE_KEY_SALES_CHANNELS_EXCEPTION = "publishable_key_sales_channels";
+
+export const PUBLISHABLE_KEY_SALES_CHANNELS_SQL =
+  "SELECT k.id, k.revoked_at, l.sales_channel_id FROM api_key k LEFT JOIN publishable_api_key_sales_channel l ON l.publishable_key_id = k.id AND l.deleted_at IS NULL WHERE k.token = ? AND k.type = 'publishable' AND k.deleted_at IS NULL";
+
+type RawWithBindings = {
+  raw: (sql: string, bindings?: unknown[]) => unknown;
+};
+
+export async function readPublishableKeySalesChannelsWithoutMarketContext(
+  db: RawWithBindings,
+  token: string
+): Promise<Array<{ id: string; revoked_at: string | Date | null; sales_channel_id: string | null }>> {
+  const builder = db.raw(PUBLISHABLE_KEY_SALES_CHANNELS_SQL, [token]) as {
+    toSQL?: () => { toNative: () => { sql: string } };
+  } & PromiseLike<unknown>;
+  // A builder that cannot compile gets `null`: every query is denied (fail-closed).
+  const allowedSql =
+    typeof builder.toSQL === "function" ? builder.toSQL().toNative().sql : null;
+  const grant: SellerMarketLookupGrant = {
+    remaining: 1,
+    allowedSql,
+    exception: PUBLISHABLE_KEY_SALES_CHANNELS_EXCEPTION,
+  };
+  const result = (await sellerMarketLookupStorage.run(grant, async () => await builder)) as
+    | { rows?: Array<{ id: string; revoked_at: string | Date | null; sales_channel_id: string | null }> }
+    | undefined;
+  grant.remaining = 0;
+  return result?.rows ?? [];
 }
