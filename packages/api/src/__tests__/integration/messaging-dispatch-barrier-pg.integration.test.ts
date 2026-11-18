@@ -45,12 +45,6 @@ import {
   PgDispatchIdempotencyBarrier,
 } from "../../lib/messaging-dispatch-barrier"
 import { Migration1779002000000 } from "../../modules/voucher/migrations/1779002000000_create_messaging_dispatch_barrier"
-import { Migration1778933000000 } from "../../modules/voucher/migrations/1778933000000_create_voucher_delivery_dispatch"
-import { Migration1778935000000 } from "../../modules/voucher/migrations/1778935000000_preserve_voucher_delivery_first_failure"
-import { Migration1778936000000 } from "../../modules/voucher/migrations/1778936000000_limit_voucher_delivery_configuration_recovery"
-import { Migration1778937000000 } from "../../modules/voucher/migrations/1778937000000_add_provider_response_to_voucher_delivery_dispatch"
-import { Migration1778938000000 } from "../../modules/voucher/migrations/1778938000000_add_correlation_token_to_voucher_delivery_dispatch"
-import { Migration1778939000000 } from "../../modules/voucher/migrations/1778939000000_add_voucher_delivery_provider_error_kind"
 import {
   PgDispatchLedger,
   VOUCHER_DELIVERY_DISPATCH_TABLE,
@@ -61,6 +55,8 @@ const DATABASE_URL = process.env.DATABASE_URL
 const runOrSkip = DATABASE_URL ? describe : describe.skip
 
 const T0 = new Date("2026-08-06T09:00:00.000Z")
+/** Story 8.7 (DW-15-363): własny schemat suity (wzorzec `addressing-axis-pg`). */
+const SUITE_SCHEMA = "story_4_1_dispatch_barrier"
 const BARRIER_KEY = "bonbeauty|voucher_purchase_delivery|email|entitlement-1"
 
 type MigrationLike = { up(): Promise<void>; down(): Promise<void> }
@@ -117,40 +113,41 @@ runOrSkip("Story 4.1 — bariera dostawy na REALNYM Postgresie (knex.raw)", () =
   let db: Knex
 
   beforeAll(async () => {
+    // Story 8.7 (DW-15-363): suita pracuje we WŁASNYM schemacie. Wcześniej
+    // `afterAll` robił `DROP TABLE voucher_delivery_dispatch(_audit)` w `public`
+    // współdzielonej bazy `*_test` — kolejne profile (i stack) traciły tabelę
+    // aplikacji. `searchPath` = [własny, public]: niekwalifikowany DDL migracji
+    // trafia do schematu suity, funkcje rozszerzeń nadal rozwiązują się z public.
+    const admin = knexFactory({ client: "pg", connection: DATABASE_URL as string, pool: { min: 0, max: 1 } })
+    try {
+      await admin.raw(`DROP SCHEMA IF EXISTS ${SUITE_SCHEMA} CASCADE`)
+      await admin.raw(`CREATE SCHEMA ${SUITE_SCHEMA}`)
+    } finally {
+      await admin.destroy()
+    }
     db = knexFactory({
       client: "pg",
       connection: DATABASE_URL as string,
+      searchPath: [SUITE_SCHEMA, "public"],
       pool: { min: 0, max: 4 },
     })
     for (const sql of await migrationSql(Migration1779002000000, "up")) {
       await db.raw(sql)
     }
-    // Ledger wiersza skutku jest potrzebny do kontroli AC2 (wariant (a)) —
-    // zakładany CAŁYM łańcuchem swoich migracji, w kolejności stempli, a nie
-    // przepisanym DDL-em. Kolumny dokładane później (`first_error_code`,
-    // `provider_status_code`, …) są odczytywane przez `SELECT_COLUMNS` ledgera,
-    // więc pominięcie któregokolwiek kroku wywraca `reserveDispatch`.
-    for (const migration of [
-      Migration1778933000000,
-      Migration1778935000000,
-      Migration1778936000000,
-      Migration1778937000000,
-      Migration1778938000000,
-      Migration1778939000000,
-    ]) {
-      for (const sql of await migrationSql(migration, "up")) {
-        await db.raw(sql)
-      }
+    // Ledger wiersza skutku jest potrzebny do kontroli AC2 (wariant (a)).
+    // Story 8.7 (DW-15-363): kopia KSZTAŁTU tabel aplikacji z `public`
+    // (`LIKE … INCLUDING ALL`, wzorzec `addressing-axis-pg`) — pełny zestaw
+    // kolumn, który czyta `SELECT_COLUMNS` ledgera, bez dotykania `public`.
+    for (const table of [VOUCHER_DELIVERY_DISPATCH_TABLE, `${VOUCHER_DELIVERY_DISPATCH_TABLE}_audit`]) {
+      await db.raw(`CREATE TABLE ${SUITE_SCHEMA}.${table} (LIKE public.${table} INCLUDING ALL)`)
     }
   })
 
   afterAll(async () => {
     if (!db) return
-    await db.raw(`DROP TABLE IF EXISTS ${VOUCHER_DELIVERY_DISPATCH_TABLE}_audit`)
-    await db.raw(`DROP TABLE IF EXISTS ${VOUCHER_DELIVERY_DISPATCH_TABLE}`)
-    for (const sql of await migrationSql(Migration1779002000000, "down")) {
-      await db.raw(sql)
-    }
+    // Story 8.7 (DW-15-363): sprzątanie WYŁĄCZNIE własnego schematu — tabele
+    // aplikacji w `public` zostają nietknięte.
+    await db.raw(`DROP SCHEMA IF EXISTS ${SUITE_SCHEMA} CASCADE`)
     await db.destroy()
   })
 
@@ -175,7 +172,7 @@ runOrSkip("Story 4.1 — bariera dostawy na REALNYM Postgresie (knex.raw)", () =
         await db.raw(sql)
       }
       const { rows: gone } = await db.raw(
-        `SELECT to_regclass('public.${MESSAGING_DISPATCH_BARRIER_TABLE}') AS reg`,
+        `SELECT to_regclass('${SUITE_SCHEMA}.${MESSAGING_DISPATCH_BARRIER_TABLE}') AS reg`,
       )
       expect(gone[0].reg).toBeNull()
 
@@ -183,7 +180,7 @@ runOrSkip("Story 4.1 — bariera dostawy na REALNYM Postgresie (knex.raw)", () =
         await db.raw(sql)
       }
       const { rows: back } = await db.raw(
-        `SELECT to_regclass('public.${MESSAGING_DISPATCH_BARRIER_TABLE}') AS reg`,
+        `SELECT to_regclass('${SUITE_SCHEMA}.${MESSAGING_DISPATCH_BARRIER_TABLE}') AS reg`,
       )
       expect(back[0].reg).not.toBeNull()
     })
@@ -387,11 +384,13 @@ runOrSkip("Story 4.1 — bariera dostawy na REALNYM Postgresie (knex.raw)", () =
       const dbA = knexFactory({
         client: "pg",
         connection: DATABASE_URL as string,
+        searchPath: [SUITE_SCHEMA, "public"],
         pool: { min: 0, max: 2 },
       })
       const dbB = knexFactory({
         client: "pg",
         connection: DATABASE_URL as string,
+        searchPath: [SUITE_SCHEMA, "public"],
         pool: { min: 0, max: 2 },
       })
       try {
