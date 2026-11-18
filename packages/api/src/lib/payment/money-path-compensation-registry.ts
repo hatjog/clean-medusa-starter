@@ -162,12 +162,28 @@ export const RECORD_COMPENSATION_FAILURE_SQL = `
  *  - gdy ops-recovery zamknął go stanem terminalnym `closed_by_ops_recovery`
  *    (`backfill_state`; fakt `source_row` zostaje, wiersz nie jest kasowany).
  */
+/**
+ * Story 8.7 (DW-15-375): stany NIETERMINALNE kompensacji — każdy z nich blokuje
+ * emisję i ACK ponowienia (`open` to nie jedyny stan „w toku": retry 11.3
+ * przestawia wiersz na `recovery_in_progress`, a ten też nie jest rozstrzygnięciem).
+ */
+export const COMPENSATION_NONTERMINAL_STATES = ["open", "recovery_in_progress"] as const
+
+/**
+ * Story 8.7 (DW-15-375): stan terminalny rozstrzygnięty ZWROTEM środków
+ * (`resolution_evidence.kind = 'refund_confirmed'`). Pieniądz wrócił do
+ * klientki ⇒ ponowione zdarzenie Stripe'a NIE może już wystawić uprawnienia.
+ */
+export const COMPENSATION_REFUND_EVIDENCE_KIND = "refund_confirmed" as const
+
+const NONTERMINAL_STATES_SQL = COMPENSATION_NONTERMINAL_STATES.map((s) => `'${s}'`).join(", ")
+
 export const FIND_OPEN_COMPENSATION_FAILURES_SQL = `
   SELECT failure_id, attempt_count, order_id
     FROM money_path_compensation_failure
    WHERE delivery_path = $1
      AND stripe_event_id = $2
-     AND resolution_state = 'open'
+     AND resolution_state IN (${NONTERMINAL_STATES_SQL})
   UNION ALL
   SELECT q.source_failure_id AS failure_id,
          (q.source_row->>'attempt_count')::int AS attempt_count,
@@ -183,6 +199,35 @@ export const FIND_OPEN_COMPENSATION_FAILURES_SQL = `
         WHERE c.failure_id = q.source_failure_id
      )
 `
+
+/**
+ * Story 8.7 (DW-15-375): wiersze dostawy rozstrzygnięte terminalnie ZWROTEM.
+ * Ich obecność oznacza: emisja uprawnienia dla tej dostawy jest zakazana na
+ * zawsze (zwrot + voucher = podwójne świadczenie).
+ */
+export const FIND_REFUNDED_COMPENSATION_FAILURES_SQL = `
+  SELECT failure_id, attempt_count, order_id
+    FROM money_path_compensation_failure
+   WHERE delivery_path = $1
+     AND stripe_event_id = $2
+     AND resolution_state NOT IN (${NONTERMINAL_STATES_SQL})
+     AND resolution_evidence->>'kind' = '${COMPENSATION_REFUND_EVIDENCE_KIND}'
+`
+
+export async function findRefundedCompensationFailures(
+  client: PaymentLinkQueryClient,
+  input: { delivery_path: string; stripe_event_id: string }
+): Promise<RecordedCompensationFailure[]> {
+  const result = await client.query<RecordedCompensationFailure>(
+    FIND_REFUNDED_COMPENSATION_FAILURES_SQL,
+    [input.delivery_path, input.stripe_event_id]
+  )
+  return (result.rows ?? []).map((row) => ({
+    failure_id: row.failure_id,
+    attempt_count: Number(row.attempt_count),
+    order_id: row.order_id ?? null,
+  }))
+}
 
 export async function findOpenCompensationFailures(
   client: PaymentLinkQueryClient,

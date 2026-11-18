@@ -138,6 +138,8 @@ function makeHarness(options: {
   deliveryAlreadyReserved?: boolean
   /** Wiersze `resolution_state = 'open'` widziane przez `findOpenCompensationFailures`. */
   openFailures?: Array<{ failure_id: string; attempt_count: number; order_id: string | null }>
+  /** Story 8.7 (DW-15-375): wiersze terminalne rozstrzygnięte zwrotem (`refund_confirmed`). */
+  refundedFailures?: Array<{ failure_id: string; attempt_count: number; order_id: string | null }>
 }) {
   const transport = options.transport ?? "pool"
   const registry = new Map<string, RegistryRow>()
@@ -165,6 +167,13 @@ function makeHarness(options: {
         }
         deliveries.add(key)
         return { rows: [], rowCount: 1 }
+      }
+
+      if (/FROM money_path_compensation_failure/i.test(sql) && /refund_confirmed/.test(sql)) {
+        return {
+          rows: options.refundedFailures ?? [],
+          rowCount: (options.refundedFailures ?? []).length,
+        }
       }
 
       if (/FROM money_path_compensation_failure/i.test(sql)) {
@@ -649,6 +658,29 @@ describe("Story 3.5 AC2/AC3 review-fix — ponowienie Stripe'a NIE ląduje w cis
     expect(rows[0].failure_id).toBe(failureId)
     // Trzy ponowienia = trzy próby na JEDNYM wierszu.
     expect(rows[0].attempt_count).toBe(3)
+  })
+
+  it("Story 8.7 (DW-15-375): kompensacja rozstrzygnięta ZWROTEM ⇒ ponowienie NIE wchodzi w naprawę jednostek i NIE emituje", async () => {
+    const h = makeHarness({
+      failRelease: false,
+      failRegistry: false,
+      deliveryAlreadyReserved: true,
+      openFailures: [],
+      refundedFailures: [
+        { failure_id: "mpcf_zwrot", attempt_count: 2, order_id: "order_3_5_a" },
+      ],
+    })
+    const raw = JSON.stringify(stripePiEvent())
+    const res = makeRes()
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await POST(h.withBody(raw) as any, res as any)
+
+    expect(res.statusCode).toBe(200)
+    expect(res.body?.emission).toBe("blocked_compensation_refunded")
+    expect(res.body?.registry_failure_ids).toEqual(["mpcf_zwrot"])
+    expect(h.emitAttempts).toHaveLength(0)
+    // Ścieżka naprawy jednostek należnych nie została dotknięta (kontrola: bez zwrotu ⇒ `owed_unit_ack_incomplete`).
+    expect(res.body?.type).toBeUndefined()
   })
 
   it("gdy rejestr NIE zna otwartej porażki, czysty duplikat bez settlement ⇒ 500 (D-35 p.4), bez wiersza rejestru", async () => {

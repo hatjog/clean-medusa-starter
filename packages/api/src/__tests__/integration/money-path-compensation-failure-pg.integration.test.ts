@@ -24,6 +24,7 @@ import {
   buildCompensationFailureId,
   buildPurchaseCorrelationKey,
   findOpenCompensationFailures,
+  findRefundedCompensationFailures,
   recordCompensationFailure,
   type CompensationFailureRecord,
 } from "../../lib/payment/money-path-compensation-registry"
@@ -353,5 +354,38 @@ runOrSkip("Story 3.5 review-fix — dialekt Knex (`?` + knex.raw) na realnym sil
       stripe_event_id: EVT,
     })
     expect(afterClose).toEqual([])
+  })
+  it("Story 8.7 (DW-15-375): `recovery_in_progress` NADAL blokuje (nieterminalny), zwrot `refund_confirmed` zakazuje emisji", async () => {
+    const client = createKnexQueryClient(knex)
+    const written = await recordCompensationFailure(client, record())
+    const key = { delivery_path: STRIPE_PATH_Y_WEBHOOK_PROVIDER, stripe_event_id: EVT }
+
+    // Retry 11.3 przestawia wiersz na `recovery_in_progress` — to nie jest rozstrzygnięcie.
+    await pool.query(
+      `UPDATE money_path_compensation_failure SET resolution_state = 'recovery_in_progress' WHERE failure_id = $1`,
+      [written.failure_id]
+    )
+    expect((await findOpenCompensationFailures(client, key)).map((r) => r.failure_id)).toEqual([written.failure_id])
+    expect(await findRefundedCompensationFailures(client, key)).toEqual([])
+
+    // Resolve zwrotem (11.3: `resolved_recovered` + `refund_confirmed`).
+    await pool.query(
+      `UPDATE money_path_compensation_failure
+          SET resolution_state = 'resolved_recovered',
+              resolution_evidence = jsonb_build_object('kind', 'refund_confirmed', 'reference', $2::text)
+        WHERE failure_id = $1`,
+      [written.failure_id, PI]
+    )
+    expect(await findOpenCompensationFailures(client, key)).toEqual([])
+    expect((await findRefundedCompensationFailures(client, key)).map((r) => r.failure_id)).toEqual([written.failure_id])
+
+    // Rozstrzygnięcie BEZ zwrotu (odzysk środków) nie zakazuje emisji.
+    await pool.query(
+      `UPDATE money_path_compensation_failure
+          SET resolution_evidence = jsonb_build_object('kind', 'funds_recovered', 'reference', $2::text)
+        WHERE failure_id = $1`,
+      [written.failure_id, PI]
+    )
+    expect(await findRefundedCompensationFailures(client, key)).toEqual([])
   })
 })

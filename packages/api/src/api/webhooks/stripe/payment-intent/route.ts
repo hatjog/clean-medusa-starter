@@ -92,6 +92,7 @@ export const INSTANCE_UNCONFIGURED_REASON = "gp_instance_id_missing" as const
 import {
   buildPurchaseCorrelationKey,
   findOpenCompensationFailures,
+  findRefundedCompensationFailures,
   reportCompensationFailure,
   type CompensationFailureRecord,
   type RecordedCompensationFailure,
@@ -602,6 +603,42 @@ export async function POST(
                 ),
               }
             : { registry_error: reported.registry_error }),
+        })
+        return
+      }
+
+      // ── Story 8.7 (DW-15-375) ─────────────────────────────────────────────
+      // Kompensacja rozstrzygnięta terminalnie ZWROTEM (`refund_confirmed`)
+      // zamyka tę dostawę na zawsze: ponowienie Stripe'a NIE wchodzi w naprawę
+      // jednostek należnych (zwrot + voucher = podwójne świadczenie). ACK z
+      // nazwanym powodem — wiersz jest terminalny, wieczne 500 nic nie odzyska.
+      let refundedFailures: RecordedCompensationFailure[]
+      try {
+        refundedFailures = await findRefundedCompensationFailures(handle.client, {
+          delivery_path: STRIPE_PATH_Y_WEBHOOK_PROVIDER,
+          stripe_event_id: deliveryEventId,
+        })
+      } catch (err) {
+        logger.error?.(
+          `[stripe/payment-intent] odczyt rozstrzygnięć zwrotem dla ` +
+            `${deliveryEventId} nieudany: ${(err as Error).message}`
+        )
+        res.status(500).json({
+          type: "db_unavailable",
+          reason: "compensation_registry_lookup_failed",
+        })
+        return
+      }
+      if (refundedFailures.length > 0) {
+        logger.warn?.(
+          `[stripe/payment-intent] ponowna dostawa ${deliveryEventId} po ` +
+            `kompensacji rozstrzygniętej zwrotem ` +
+            `(${refundedFailures.map((row) => row.failure_id).join(",")}) — emisja zablokowana`
+        )
+        res.status(200).json({
+          received: true,
+          emission: "blocked_compensation_refunded",
+          registry_failure_ids: refundedFailures.map((row) => row.failure_id),
         })
         return
       }
