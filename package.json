@@ -70,6 +70,7 @@
     "test:integration:story-4-3-compensation-alarm-pg": "GP_RUN_MIGRATION_INTEGRATION=1 TEST_TYPE=story-4-3-compensation-alarm-pg NODE_OPTIONS=--experimental-vm-modules jest --silent=false --runInBand --forceExit",
     "test:integration:compensation-failure-pg": "TEST_TYPE=compensation-failure-pg NODE_OPTIONS=--experimental-vm-modules jest --silent=false --runInBand --forceExit",
     "test:integration:story-8-4-partial-line-failure-pg": "TEST_TYPE=story-8-4-partial-line-failure-pg NODE_OPTIONS=--experimental-vm-modules jest --silent=false --runInBand --forceExit",
+    "test:integration:story-8-7-rls-hook-pg": "TEST_TYPE=story-8-7-rls-hook-pg NODE_OPTIONS=--experimental-vm-modules jest --silent=false --runInBand --forceExit",
     "test:integration:story-5-7-redemption-trail-pg": "TEST_TYPE=story-5-7-redemption-trail-pg NODE_OPTIONS=--experimental-vm-modules jest --silent=false --runInBand --forceExit",
     "test:integration:story-6-5-recipient-pii-rls-pg": "TEST_TYPE=story-6-5-recipient-pii-rls-pg NODE_OPTIONS=--experimental-vm-modules jest --silent=false --runInBand --forceExit",
     "test:integration:story-11-6-recipient-retention-pg": "TEST_TYPE=story-11-6-recipient-retention-pg NODE_OPTIONS=--experimental-vm-modules jest --silent=false --runInBand --forceExit",

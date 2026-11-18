@@ -151,7 +151,10 @@ describe("installRlsPoolHook", () => {
     await harness.client.releaseConnection(connection);
 
     expect(harness.client.destroyRawConnection).toHaveBeenCalledWith(connection);
-    expect(harness.originalReleaseConnection).not.toHaveBeenCalledWith(connection);
+    // Story 8.7 (DW-15-370): brudne polaczenie wraca do puli jako zuzyte (slot zwolniony).
+    expect(harness.originalReleaseConnection).toHaveBeenCalledWith(
+      expect.objectContaining({ __knex__disposed: "RLS pool hook release destroy failed" })
+    );
     expect(harness.logger.error).toHaveBeenCalledWith(
       "RLS pool hook release cleanup failed",
       expect.objectContaining({ error: "reset failed" })

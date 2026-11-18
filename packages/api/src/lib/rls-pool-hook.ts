@@ -123,17 +123,39 @@ function describeError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+/**
+ * Znacznik Knexa (`connectionIsDisposed`): pula odrzuca taki zasob przy walidacji
+ * i niszczy go wlasnym API (`destroy`), zwalniajac slot.
+ */
+const KNEX_DISPOSED_MARKER = "__knex__disposed";
+
+/**
+ * Story 8.7 (DW-15-370): zniszczenie polaczenia MUSI oddac slot puli. Samo
+ * `destroyRawConnection` + `end` zamykalo gniazdo, ale zasob zostawal w puli
+ * tarn jako "w uzyciu" - n odmow hooka wyczerpywalo pule `max = n` (zmierzone:
+ * `KnexTimeoutError` przy odmowie n+1). Teraz polaczenie jest oznaczane jako
+ * zuzyte, zamykane i ZWRACANE do puli, ktora przy walidacji niszczy je
+ * wlasnym API i zwalnia slot.
+ */
 async function destroyConnection(
   client: PgClientLike,
   connection: QueryableConnection,
   logger: HookLogger | undefined,
-  reason: string
+  reason: string,
+  releaseToPool: (connection: QueryableConnection) => Promise<void>
 ): Promise<void> {
+  (connection as unknown as Record<string, unknown>)[KNEX_DISPOSED_MARKER] = reason;
   try {
     await client.destroyRawConnection?.(connection);
     await connection.end?.();
   } catch (error) {
     logger?.error?.(reason, { error: describeError(error) });
+  }
+  try {
+    await releaseToPool(connection);
+  } catch (error) {
+    logger?.error?.(`${reason} (release to pool failed)`, { error: describeError(error) });
+    throw error;
   }
 }
 
@@ -174,7 +196,8 @@ export function installRlsPoolHook(
           client,
           connection,
           logger,
-          "RLS pool hook named exception destroy failed"
+          "RLS pool hook named exception destroy failed",
+          origRelease
         );
         throw error;
       }
@@ -194,7 +217,8 @@ export function installRlsPoolHook(
         client,
         connection,
         logger,
-        "RLS pool hook missing-context destroy failed"
+        "RLS pool hook missing-context destroy failed",
+        origRelease
       );
       throw new RlsMarketContextRequiredError("missing_market_context");
     }
@@ -209,7 +233,8 @@ export function installRlsPoolHook(
         client,
         connection,
         logger,
-        "RLS pool hook invalid-context destroy failed"
+        "RLS pool hook invalid-context destroy failed",
+        origRelease
       );
       throw new RlsMarketContextRequiredError("invalid_market_id");
     }
@@ -224,7 +249,8 @@ export function installRlsPoolHook(
         client,
         connection,
         logger,
-        "RLS pool hook missing-instance destroy failed"
+        "RLS pool hook missing-instance destroy failed",
+        origRelease
       );
       throw new RlsMarketContextRequiredError("missing_instance_id");
     }
@@ -239,7 +265,8 @@ export function installRlsPoolHook(
         client,
         connection,
         logger,
-        "RLS pool hook invalid-instance destroy failed"
+        "RLS pool hook invalid-instance destroy failed",
+        origRelease
       );
       throw new RlsMarketContextRequiredError("invalid_instance_id");
     }
@@ -283,7 +310,8 @@ export function installRlsPoolHook(
         client,
         connection,
         logger,
-        "RLS pool hook acquire destroy failed"
+        "RLS pool hook acquire destroy failed",
+        origRelease
       );
       throw error;
     }
@@ -317,7 +345,8 @@ export function installRlsPoolHook(
           client,
           connection,
           logger,
-          "RLS pool hook named exception destroy failed"
+          "RLS pool hook named exception destroy failed",
+          origRelease
         );
         return;
       }
@@ -337,7 +366,8 @@ export function installRlsPoolHook(
           client,
           connection,
           logger,
-          "RLS pool hook release destroy failed"
+          "RLS pool hook release destroy failed",
+          origRelease
         );
         delete connection[RLS_MARKER];
         return;

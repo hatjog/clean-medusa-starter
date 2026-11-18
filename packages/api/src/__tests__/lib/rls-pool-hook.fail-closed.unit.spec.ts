@@ -51,7 +51,11 @@ describe("rls-pool-hook fail closed", () => {
     expect(harness.connection.queries).toEqual([])
     expect(harness.connection.ended).toBe(true)
     expect(harness.destroyRawConnection).toHaveBeenCalledWith(harness.connection)
-    expect(harness.releaseConnection).not.toHaveBeenCalled()
+    // Story 8.7 (DW-15-370): zniszczone polaczenie WRACA do puli oznaczone jako zuzyte
+    // (`__knex__disposed`) - pula niszczy je wlasnym API i zwalnia slot.
+    expect(harness.releaseConnection).toHaveBeenCalledWith(
+      expect.objectContaining({ __knex__disposed: "RLS pool hook missing-context destroy failed" })
+    )
     expect(harness.logger.error).toHaveBeenCalledWith(
       "RLS pool hook acquire denied",
       expect.objectContaining({ reason: "missing_market_context" })
