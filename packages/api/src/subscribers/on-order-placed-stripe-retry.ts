@@ -689,6 +689,92 @@ export function buildPathYRecoveryInput(
   }
 }
 
+/**
+ * Story 8.7 (DW-15-361): wynik decyzji o domknięciu śladu `deferred_issuance_trace`
+ * po odzysku Path Y. `skipped_partial_failure` = rekord ZOSTAJE w populacji
+ * odczytu `/admin/recovery` (4.7), bo część pozycji nie została wystawiona.
+ */
+export type PathYTraceClosureOutcome =
+  | "closed"
+  | "skipped_partial_failure"
+  | "skipped_not_processed"
+  | "not_a_trace_marker"
+  | "no_match"
+  | "close_failed"
+
+/**
+ * Story 4.4 (AC2) + Story 8.7 (DW-15-361): domknięcie rekordu śladu w tej samej
+ * transakcji co wystawienie — tylko gdy wystawienie było PEŁNE
+ * (`result.event_processed && failed_lines.length === 0`). Częściowa porażka
+ * zostawia rekord otwarty (populacja odzysku), zamiast fałszywie oznaczać go
+ * `issued_after_link`.
+ */
+export async function closePathYRecoveryTrace(
+  client: Parameters<typeof closeDeferredIssuanceTraceGuarded>[0],
+  input: {
+    event_id: string
+    order_id: string
+    scope: { instance_id: string; market_id: string }
+    payment_intent_id: string
+    result: { event_processed: boolean; failed_lines: readonly unknown[]; issued: readonly unknown[] }
+    logger: { info?: (m: string) => void; warn?: (m: string) => void }
+  }
+): Promise<PathYTraceClosureOutcome> {
+  const { event_id, order_id, scope, result, logger } = input
+  const stripeEventId = event_id.endsWith(DEFERRED_ISSUANCE_EVENT_SUFFIX)
+    ? event_id.slice(0, -DEFERRED_ISSUANCE_EVENT_SUFFIX.length)
+    : null
+  if (!stripeEventId) return "not_a_trace_marker"
+  if (result.failed_lines.length > 0) {
+    logger.warn?.(
+      `[on-order-placed-stripe-retry] code=trace_kept_partial_failure order_id=${order_id} trace=${event_id} ` +
+        `failed=${result.failed_lines.length} — rekord deferred_issuance_trace zostaje w populacji odzysku`
+    )
+    return "skipped_partial_failure"
+  }
+  if (!result.event_processed) {
+    logger.warn?.(
+      `[on-order-placed-stripe-retry] code=trace_kept_not_processed order_id=${order_id} trace=${event_id} ` +
+        `— wystawienie nie zostało skonsumowane (event_processed=false); rekord bez zmian`
+    )
+    return "skipped_not_processed"
+  }
+  const closed = await closeDeferredIssuanceTraceGuarded(client, {
+    stripe_event_id: stripeEventId,
+    instance_id: scope.instance_id,
+    market_id: scope.market_id,
+    order_id,
+    closure_path: DEFERRED_ISSUANCE_TRACE_CLOSURE_ORDER_PLACED,
+    evidence: {
+      resolver: "subscriber:on-order-placed-stripe-retry",
+      payment_intent_id: input.payment_intent_id,
+      entitlements_issued: result.issued.length,
+      resolved_at: new Date().toISOString(),
+    },
+  })
+  if (!closed.ok) {
+    logger.warn?.(
+      `[on-order-placed-stripe-retry] order_id=${order_id} trace=${event_id} ` +
+        `domkniecie rekordu deferred_issuance_trace NIEUDANE (wystawienie zachowane): ${closed.error}`
+    )
+    return "close_failed"
+  }
+  if (closed.version === null) {
+    // Story 4.7 (DW-15-320 p.4): 0 dopasowań — sygnał NAZWANY, nie info.
+    logger.warn?.(
+      `[on-order-placed-stripe-retry] code=${TRACE_CLOSE_NO_MATCH_CODE} order_id=${order_id} ` +
+        `trace=${event_id} market_id=${scope.market_id} — domkniecie rekordu ` +
+        `deferred_issuance_trace dopasowalo 0 wierszy`
+    )
+    return "no_match"
+  }
+  logger.info?.(
+    `[on-order-placed-stripe-retry] order_id=${order_id} trace=${event_id} ` +
+      `rekord deferred_issuance_trace domkniety (issued_after_link, version=${closed.version})`
+  )
+  return "closed"
+}
+
 export default async function onOrderPlacedStripeRetry({
   event,
   container,
@@ -771,48 +857,17 @@ export default async function onOrderPlacedStripeRetry({
                 await markDeferredResolved(client, row.event_id, orderId, new Date())
               }
 
-              // Story 4.4 (AC2): domknięcie TRWAŁEGO rekordu śladu w tej samej
-              // transakcji co wystawienie — stan terminalny z zapisaną ścieżką
-              // i evidence; wiersz zostaje (historia czytelna). Marker
-              // Path Y ma klucz `<evt>#deferred-issuance` = `trace_id`.
-              const stripeEventId = row.event_id.endsWith(DEFERRED_ISSUANCE_EVENT_SUFFIX)
-                ? row.event_id.slice(0, -DEFERRED_ISSUANCE_EVENT_SUFFIX.length)
-                : null
-              if (stripeEventId) {
-                const closed = await closeDeferredIssuanceTraceGuarded(client, {
-                  stripe_event_id: stripeEventId,
-                  instance_id: input.scope.instance_id,
-                  market_id: input.scope.market_id,
-                  order_id: orderId,
-                  closure_path: DEFERRED_ISSUANCE_TRACE_CLOSURE_ORDER_PLACED,
-                  evidence: {
-                    resolver: "subscriber:on-order-placed-stripe-retry",
-                    payment_intent_id: input.payload.payment_intent_id,
-                    entitlements_issued: result.issued.length,
-                    resolved_at: new Date().toISOString(),
-                  },
-                })
-                if (!closed.ok) {
-                  logger.warn?.(
-                    `[on-order-placed-stripe-retry] order_id=${orderId} trace=${row.event_id} ` +
-                      `domkniecie rekordu deferred_issuance_trace NIEUDANE (wystawienie zachowane): ${closed.error}`
-                  )
-                } else if (closed.version === null) {
-                  // Story 4.7 (DW-15-320 p.4): 0 dopasowań (rekord nieobecny, już
-                  // domknięty dla tego zamówienia albo rynek rekordu ≠ scope koperty)
-                  // — rekord zostaje w populacji; sygnał NAZWANY, nie info.
-                  logger.warn?.(
-                    `[on-order-placed-stripe-retry] code=${TRACE_CLOSE_NO_MATCH_CODE} order_id=${orderId} ` +
-                      `trace=${row.event_id} market_id=${input.scope.market_id} — domkniecie rekordu ` +
-                      `deferred_issuance_trace dopasowalo 0 wierszy`
-                  )
-                } else {
-                  logger.info?.(
-                    `[on-order-placed-stripe-retry] order_id=${orderId} trace=${row.event_id} ` +
-                      `rekord deferred_issuance_trace domkniety (issued_after_link, version=${closed.version})`
-                  )
-                }
-              }
+              // Story 4.4 (AC2) + Story 8.7 (DW-15-361): domknięcie TRWAŁEGO
+              // rekordu śladu WYŁĄCZNIE przy pełnym wystawieniu — reguła
+              // `voucher-live-issue.ts` (`traceEventId && result.event_processed`).
+              await closePathYRecoveryTrace(client, {
+                event_id: row.event_id,
+                order_id: orderId,
+                scope: input.scope,
+                payment_intent_id: input.payload.payment_intent_id,
+                result,
+                logger,
+              })
 
               const appendAudit = makeTransitionAuditSink(logger)
               const issuedAt = new Date()

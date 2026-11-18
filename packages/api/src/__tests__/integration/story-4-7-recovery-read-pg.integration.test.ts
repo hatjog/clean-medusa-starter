@@ -38,7 +38,7 @@ import { installRlsPoolHook } from "../../lib/rls-pool-hook"
 import { dlqEntryId, isEventDeadLettered } from "../../lib/events/event-dead-letter"
 import { runDeferredIssuanceTraceAgeEscalation, MARKETS_ENV_VAR } from "../../jobs/deferred-issuance-trace-age-escalation"
 import { DEFERRED_ISSUANCE_TRACE_AGE_THRESHOLD_SECONDS } from "../../lib/recovery/recovery-config"
-import { STRIPE_RETRY_DLQ_SOURCE } from "../../subscribers/on-order-placed-stripe-retry"
+import { STRIPE_RETRY_DLQ_SOURCE, closePathYRecoveryTrace } from "../../subscribers/on-order-placed-stripe-retry"
 
 const INSTANCE = process.env.GP_INSTANCE_ID ?? ""
 const enabled = process.env.GP_RUN_MIGRATION_INTEGRATION === "1" && !!process.env.DATABASE_URL && !!INSTANCE
@@ -364,6 +364,66 @@ describeOrNotRun("Story 4.7 — wejście odczytu populacji pod RLS (PG)", () => 
       expect(bodyB.populations.deferred_issuance_trace.some((row) => row.payload.payment_intent_id === PI)).toBe(false)
     } finally {
       await admin.query("DELETE FROM admin_market_grants WHERE admin_user_id = $1 AND market_id = $2", [ACTOR, MKT_B])
+      await admin.query("DELETE FROM deferred_issuance_trace WHERE payment_intent_id = $1", [PI])
+    }
+  })
+  // Story 8.7 (DW-15-361): odzysk Path Y z częściową porażką NIE domyka śladu —
+  // rekord zostaje widoczny w GET /admin/recovery; pełne wystawienie po ponowieniu
+  // domyka go jako `issued_after_link`. Klient pod rolą runtime (RLS).
+  it("DW-15-361: partialFailure ⇒ ślad widoczny w /admin/recovery; pełne wystawienie ⇒ issued_after_link", async () => {
+    const PI = "pi_dw15361_partial"
+    const EVT = "evt_dw15361_partial"
+    const ORDER = "order_dw15361"
+    const scope = { instance_id: INSTANCE, market_id: MKT_A }
+    await admin.query("BEGIN")
+    try {
+      await admin.query("SELECT set_config('app.gp_market_id', $1, true), set_config('app.gp_instance_id', $2, true)", [MKT_A, INSTANCE])
+      await recordDeferredIssuanceTrace(admin as never, {
+        stripe_event_id: EVT, payment_intent_id: PI, instance_id: INSTANCE, market_id: MKT_A,
+        psp_occurred_at: new Date().toISOString(), sla_seconds: 3600,
+      })
+      await admin.query("COMMIT")
+    } catch (err) {
+      await admin.query("ROLLBACK")
+      throw err
+    }
+    const runUnderRuntime = async (result: { event_processed: boolean; failed_lines: unknown[]; issued: unknown[] }) => {
+      await admin.query("BEGIN")
+      try {
+        await admin.query("SET LOCAL ROLE medusa_store")
+        const outcome = await closePathYRecoveryTrace(admin as never, {
+          event_id: `${EVT}#deferred-issuance`, order_id: ORDER, scope, payment_intent_id: PI, result, logger,
+        })
+        await admin.query("COMMIT")
+        return outcome
+      } catch (err) {
+        await admin.query("ROLLBACK")
+        throw err
+      }
+    }
+    const readTrace = async () => {
+      const r = res()
+      await handleRecoveryRead(req(MKT_A), r as never)
+      expect(r.statusCode).toBe(200)
+      const body = r.body as { populations: Record<string, Array<{ payload: Record<string, unknown>; state: string }>> }
+      return body.populations.deferred_issuance_trace.filter((row) => row.payload.payment_intent_id === PI)
+    }
+    try {
+      // 1) Częściowa porażka: 1 linia wystawiona, 1 nieudana, event NIE skonsumowany.
+      expect(await runUnderRuntime({ event_processed: false, failed_lines: [{ line_item_id: "li_b" }], issued: [{ id: "ent_a" }] }))
+        .toBe("skipped_partial_failure")
+      const visible = await readTrace()
+      expect(visible).toHaveLength(1)
+      expect(visible[0].state).toBe("awaiting_order")
+
+      // 2) Ponowienie z pełnym wystawieniem ⇒ domknięcie `issued_after_link`.
+      expect(await runUnderRuntime({ event_processed: true, failed_lines: [], issued: [{ id: "ent_b" }] })).toBe("closed")
+      expect(await readTrace()).toHaveLength(0)
+      const row = await admin.query<{ state: string; closure_path: string }>(
+        "SELECT state, closure_path FROM deferred_issuance_trace WHERE payment_intent_id = $1", [PI]
+      )
+      expect(row.rows).toEqual([{ state: "issued_after_link", closure_path: expect.any(String) }])
+    } finally {
       await admin.query("DELETE FROM deferred_issuance_trace WHERE payment_intent_id = $1", [PI])
     }
   })
