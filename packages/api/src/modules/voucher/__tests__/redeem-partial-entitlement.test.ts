@@ -1271,7 +1271,7 @@ describe("C2-M-1/C2-M-4 — VOUCHER_SERVICE: posting i odwrót (ADR-212)", () =>
         idempotency_key: "svc-rev-bounds-obcy",
         redemption_id: "rdm_obcy_reversal",
         amount_minor: SVC_GROSS,
-        resulting_state: "REDEEMED_FULL",
+        resulting_state: EntitlementInstanceState.REDEEMED_FULL,
         remaining_after_minor: 0,
         issued_gross_minor: SVC_GROSS,
         created_at: FIXED_NOW.getTime(),

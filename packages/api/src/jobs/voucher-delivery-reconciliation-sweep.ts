@@ -105,6 +105,7 @@ import {
   type DeliveryGapCandidate,
   type DeliveryGapScanPort,
   type DispatchLedgerSql,
+  type EscalationClaimRow,
   isParkedDispatch,
 } from "../modules/voucher-delivery/dispatch-ledger"
 import { DISPATCH_STATES_ALLOWING_RETRY } from "../modules/voucher-delivery/delivery-state"

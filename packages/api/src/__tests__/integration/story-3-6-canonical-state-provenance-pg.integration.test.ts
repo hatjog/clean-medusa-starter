@@ -918,7 +918,7 @@ runWithIsolatedDatabase("Story 3.6 AC1 — produkcyjne call-site'y na realnym Po
                 // 3-6-C5-N001: the subscriber stamps entitlement_instance.created_at
                 // from `new Date()`; freeze only Date so the persisted effect time is
                 // deterministic and comparable byte-for-byte with serialized evidence.
-                jest.useFakeTimers({ now: new Date(PATH_Y_EFFECT_TIME), doNotFake: NON_DATE_TIMERS })
+                jest.useFakeTimers({ now: new Date(PATH_Y_EFFECT_TIME), doNotFake: [...NON_DATE_TIMERS] })
                 try {
                   await voucherLiveIssueSubscriber({
                     event: { name: event.name, data: event.data },

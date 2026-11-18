@@ -3537,12 +3537,12 @@ describe("Story 4.6 / review-fix cyklu 1 — kontrole, ktore PEKAJA po cofnieciu
     expect(report.escalations_claim_stuck).toBe(1)
     expect(report.escalations_undelivered).toBe(1)
     const stuck = logger.entries.find((entry) =>
-      String(entry.meta?.error_code) ===
+      String((entry.meta as Record<string, unknown> | undefined)?.error_code) ===
       "VOUCHER_DELIVERY_ESCALATION_CLAIM_STUCK",
     )
     expect(stuck).toBeDefined()
     expect(stuck?.level).toBe("error")
-    expect(stuck?.meta?.dispatch_ids).toEqual(["dispatch-m2-stuck"])
+    expect((stuck?.meta as Record<string, unknown> | undefined)?.dispatch_ids).toEqual(["dispatch-m2-stuck"])
   })
 
   it("M4: wiersz SPRZED okna skanu nie jest zajmowany do eskalacji", async () => {

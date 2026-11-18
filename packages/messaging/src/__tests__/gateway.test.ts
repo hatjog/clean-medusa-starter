@@ -17,6 +17,7 @@
  */
 import {
   DefaultMessagingGateway,
+  type MessagingGatewayOptions,
   DEFAULT_BARRIER_AMBIGUOUS_WINDOW_MS,
   MESSAGING_BARRIER_UNAVAILABLE,
   MESSAGING_DISPATCH_IN_FLIGHT,
@@ -96,7 +97,7 @@ function makeGateway(options: {
   defaultProvider?: NotificationProvider;
   clock?: () => Date;
   uuid?: string[];
-  barrier?: SharedDispatchBarrier;
+  barrier?: MessagingGatewayOptions["barrier"];
   flowKpiTelemetry?: FlowKpiTelemetryHook;
   barrierAmbiguousWindowMs?: number;
   barrierInFlightWindowMs?: number;
